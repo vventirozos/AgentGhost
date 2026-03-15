@@ -1,5 +1,5 @@
 words from the human:
-This agent performs very well with qwen 3.5, and it's specially alligned for Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf which in my tests proved the best uncensored version of the model. the current setup i have is :
+This agent performs very well with qwen 3.5, and it's specially alligned for Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf which (from my tests) proved to be the best uncensored version of the model. the current setup i have is :
 1. a mac mini m4 running llama-server and the agent.
 2. a Jetson nano running Stable diffusion 1.5 for image generation (it's pretty good given it's a 2GB model.)
 3. a raspberry pi hosting TTS and STT (it's all local and it's not that good)
