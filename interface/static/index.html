@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="theme-color" content="#000000">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>Ghost Interface</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;700&display=swap"
+        rel="stylesheet">
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+
+<body>
+    <div id="background-layer">
+        <div id="sphere-container"></div>
+    </div>
+
+    <div id="ui-layer">
+        <div id="render-window" class="hidden">
+            <div id="render-header">
+                <span id="render-title">VISUALIZER</span>
+                <div id="render-controls">
+                    <button id="render-download" class="render-btn" title="Download">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                    </button>
+                    <button id="render-zoom-out" class="render-btn">-</button>
+                    <button id="render-zoom-in" class="render-btn">+</button>
+                    <button id="render-close" class="render-btn">✕</button>
+                </div>
+            </div>
+            <div id="render-content-wrapper">
+                <iframe id="render-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
+                <div id="mermaid-container"></div>
+                <div id="chart-container"><canvas id="render-chart"></canvas></div>
+            </div>
+        </div>
+
+        <header>
+            <div id="status-wrapper">
+                <div id="status-indicator">
+                    <span id="connection-dot"></span>
+                    <span id="status-text">SYSTEM ONLINE</span>
+                </div>
+                <div id="planner-monologue"></div>
+            </div>
+            <div id="header-controls">
+                
+                
+                <select id="face-selector" class="icon-btn" style="width: auto; padding: 0 10px; border-radius: 12px; font-family: var(--font-mono); font-size: 0.8rem; outline: none; margin-bottom: 0; background: var(--surface-bg); color: var(--text-color);">
+                    <option value="matrix">Matrix Graph</option>
+                    <option value="image">Cyber Avatar</option>
+                </select>
+                <button id="tts-toggle-btn" class="icon-btn" title="Toggle AI Voice">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
+                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
+                    </svg>
+                </button>
+                <button id="fullscreen-btn"
+
+ class="icon-btn" title="Toggle Zen Mode">
+                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <path
+                            d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                    </svg>
+                </button>
+                <input type="file" id="file-upload-input" style="display: none;" />
+                <button id="upload-btn" class="icon-btn" title="Upload to Sandbox">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                </button>
+                <button id="download-btn" class="icon-btn" title="Download from Sandbox">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <main id="chat-container">
+            <div id="chat-log">
+                <!-- Chat messages -->
+                <div id="init-msg" class="message system">Initializing Ghost Interface v2.0...</div>
+            </div>
+        </main>
+
+        <footer id="input-area-wrapper">
+            <div id="activity-container">
+                <div id="activity-icon"></div>
+            </div>
+            <div id="input-area">
+                <textarea id="chat-input" placeholder="Enter command or message..." rows="1"></textarea>
+                <button id="mic-btn" title="Hold to Talk">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </button>
+                <button id="send-btn">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="22" y1="2" x2="11" y2="13"></line>
+                        <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                    </svg>
+                </button>
+            </div>
+        </footer>
+    </div>
+
+    <script type="module" src="/static/app.js"></script>
+</body>
+
+</html>

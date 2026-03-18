@@ -1,15 +1,3 @@
-words from the human:
-This agent performs very well with qwen 3.5, and it's specially alligned for Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q6_K.gguf which (from my tests) proved to be the best uncensored version of the model. the current setup i have is :
-1. a mac mini m4 running llama-server and the agent.
-2. a Jetson nano running Stable diffusion 1.5 for image generation (it's pretty good given it's a 2GB model.)
-3. a raspberry pi hosting TTS and STT (it's all local and it's not that good)
-
-The agent has a lot of intricacies and tricks, for example if you ask it to "generate a picture of a dog", and you don't like it you can say i "don't like it, use your imagination to create a new one." The agent will read the picture using the visual part of qwen and generate a new prompt for stable diffusion. 
-Something that the AI forgets to mention in the documentation bellow is that there's a web client included, be sure to check it out, it's pretty cool.
-
-The rest is AI generated:
-
-
 # Ghost Agent 👻
 
 Ghost Agent is an autonomous, scalable, and highly capable AI service designed to operate as a proactive agent. Built on top of `fastapi` and utilizing large language models (LLMs), it goes beyond simple chat completions—it continuously plans, learns, and builds on its experiences through advanced memory systems, tool execution sandboxes, and biological-inspired behavioral hooks.
@@ -76,7 +64,7 @@ Ghost Agent separates concerns heavily between logic extraction and execution mo
     export GHOST_MODEL="qwen-3.5-9b"  # Defaults to qwen
     export TOR_PROXY="socks5://127.0.0.1:9050" # Proxy for anonymous interactions
     export GHOST_SANDBOX_DIR="/tmp/sandbox"
-
+    
     # Slack Support
     export SLACK_BOT_TOKEN="xoxb-your-slack-bot-token"
     export SLACK_APP_TOKEN="xapp-your-slack-app-token"
@@ -107,7 +95,7 @@ python -m src.ghost_agent.main \
 
 ### Running the FastAPI Interface
 
-The API and visual web proxy are available under `interface/server.py`.
+The API and visual web proxy are available under `interface/server.py`. 
 ```bash
 python interface/server.py --agent-log /Users/vasilis/AI/Logs/ghost-agent.log
 ```
@@ -129,4 +117,3 @@ python interface/slack_bot/main.py --log-file /Users/vasilis/AI/Logs/ghost-slack
 ## 🛡️ Telemetry Notice
 
 Ghost Agent aggressively disables tracking natively by hooking into standard environment variables. PostHog, telemetry from ChromaDB, and HF Hub hooks are **disabled by default**, ensuring that your sandbox and memories remain entirely yours.
-

@@ -1,0 +1,11 @@
+{{- '\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>' }}
+{%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}
+{%- for tool_call in message.tool_calls %}
+{%- if tool_call.function is defined %}
+{%- set tool_call = tool_call.function %}
+{{- '\n\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+{{- '<tool_call>\n<function=' + tool_call.name + '>\n' }}
+{{- '\n<tool_call>\n<function=' + tool_call.name + '>\n' }}
+{%- if tool_call.arguments is defined %}
+{%- for args_name, args_value in tool_call.arguments|items %}
+{{- '</function>\n</tool_call>' }}
