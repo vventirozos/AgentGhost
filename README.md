@@ -6,22 +6,24 @@ An autonomous FastAPI-based AI agent service with multi-tier memory, Docker-isol
 
 ## Documentation
 
-The canonical reference lives in [`Documentation/`](Documentation/). Open [`Documentation/index.html`](Documentation/index.html) in a browser for the full reference — every module in `src/ghost_agent/` and `interface/` has a dedicated page.
+Full reference is published on GitHub Pages: **<https://vventirozos.github.io/AgentGhost/>**
+
+Every module in `src/ghost_agent/` and `interface/` has a dedicated page. The HTML sources live in [`docs/`](docs/) on the default branch.
 
 | Entry point | What's there |
 | --- | --- |
-| [Home](Documentation/index.html) | Overview, runtime stance, source map, conceptual model |
-| [Capabilities](Documentation/capabilities.html) | What the agent can do, with example prompts |
-| [System Architecture](Documentation/architecture.html) | End-to-end diagram of interfaces, API, core, memory, sandbox |
-| [Install & Run](Documentation/installation.html) | Prerequisites, env vars, boot sequence, process commands |
-| [CLI Reference](Documentation/cli_reference.html) | Every flag on `python -m src.ghost_agent.main` |
-| [Anonymity & Tor routing](Documentation/index.html#anonymity) | Fetch pipeline, identity rotation, routing table |
-| [Request lifecycle](Documentation/algorithms/request_lifecycle.html) | What happens when a message hits `/api/chat` |
-| [Memory hydration (RRF)](Documentation/algorithms/memory_hydration.html) | How the six memory tiers are fused per turn |
-| [Dream / self-play](Documentation/algorithms/dream_cycle.html) | Idle-time consolidation and skill extraction |
-| [Docker sandbox](Documentation/sandbox/docker.html) | Container lifecycle, mounts, resource limits |
+| [Home](https://vventirozos.github.io/AgentGhost/) | Overview, runtime stance, source map, conceptual model |
+| [Capabilities](https://vventirozos.github.io/AgentGhost/capabilities.html) | What the agent can do, with example prompts |
+| [System Architecture](https://vventirozos.github.io/AgentGhost/architecture.html) | End-to-end diagram of interfaces, API, core, memory, sandbox |
+| [Install & Run](https://vventirozos.github.io/AgentGhost/installation.html) | Prerequisites, env vars, boot sequence, process commands |
+| [CLI Reference](https://vventirozos.github.io/AgentGhost/cli_reference.html) | Every flag on `python -m src.ghost_agent.main` |
+| [Anonymity & Tor routing](https://vventirozos.github.io/AgentGhost/#anonymity) | Fetch pipeline, identity rotation, routing table |
+| [Request lifecycle](https://vventirozos.github.io/AgentGhost/algorithms/request_lifecycle.html) | What happens when a message hits `/api/chat` |
+| [Memory hydration (RRF)](https://vventirozos.github.io/AgentGhost/algorithms/memory_hydration.html) | How the six memory tiers are fused per turn |
+| [Dream / self-play](https://vventirozos.github.io/AgentGhost/algorithms/dream_cycle.html) | Idle-time consolidation and skill extraction |
+| [Docker sandbox](https://vventirozos.github.io/AgentGhost/sandbox/docker.html) | Container lifecycle, mounts, resource limits |
 
-Treat this `README.md` and `CLAUDE.md` as orienting documents. The `Documentation/` tree is the authoritative source.
+Treat this `README.md` and `CLAUDE.md` as orienting documents. The published site (sourced from `docs/`) is the authoritative reference.
 
 ## Quick start
 
@@ -29,7 +31,7 @@ Treat this `README.md` and `CLAUDE.md` as orienting documents. The `Documentatio
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# Required environment (see Documentation/installation.html for the full list)
+# Required environment (see https://vventirozos.github.io/AgentGhost/installation.html for the full list)
 export GHOST_API_KEY="..."
 export GHOST_HOME="$HOME/ghost"
 export GHOST_MODEL="qwen-3.6-35b-a3"
@@ -42,7 +44,7 @@ python -m src.ghost_agent.main \
     --host 0.0.0.0 --port 8000 --verbose
 ```
 
-Companion processes (web UI, Slack bot, voice, image-gen) are documented in [Install & Run](Documentation/installation.html#process-commands).
+Companion processes (web UI, Slack bot, voice, image-gen) are documented in [Install & Run](https://vventirozos.github.io/AgentGhost/installation.html#process-commands).
 
 ## Repository layout
 
@@ -55,7 +57,7 @@ Companion processes (web UI, Slack bot, voice, image-gen) are documented in [Ins
 | `src/ghost_agent/api/` | FastAPI routes |
 | `src/ghost_agent/utils/` | Logging, sanitiser, token counter, Tor helpers |
 | `interface/` | Web UI, Slack bot, voice / image servers, desktop client |
-| `Documentation/` | **Canonical reference — open `index.html`** |
+| `docs/` | **HTML source for the published reference** (served at [vventirozos.github.io/AgentGhost](https://vventirozos.github.io/AgentGhost/)) |
 | `tests/` | Behaviour-organised pytest suite (`asyncio_mode=auto`) |
 
 ## Tests & lint
