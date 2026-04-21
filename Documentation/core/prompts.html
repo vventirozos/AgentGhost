@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.prompts — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="agent_qwen.html">agent_qwen</a>
+    <a class="current" href="prompts.html">prompts</a>
+    <a href="bus.html">bus</a>
+    <a href="planning.html">planning</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / prompts.py</h1>
+  <p class="subtitle">System-prompt templates and per-budget thinking instructions.</p>
+
+  <h2>Templates</h2>
+  <table>
+    <thead><tr><th>Constant</th><th>Use</th></tr></thead>
+    <tbody>
+      <tr><td><code>SYSTEM_PROMPT</code> (line 231)</td><td>Main identity, persona rules, anti-hallucination guard, tool-use protocol.</td></tr>
+      <tr><td><code>SPECIALIST_SYSTEM_PROMPT</code> (line 274)</td><td>DBA / SWE specialist mode — strict observability ("print everything").</td></tr>
+      <tr><td><code>QWEN_TOOL_PROMPT</code> (line 172)</td><td>Qwen-specific XML tool-call syntax with CDATA escape hatch for <code>&lt;</code> / <code>&gt;</code>.</td></tr>
+      <tr><td><code>THINK_BUDGET_TIGHT</code> (line 116)</td><td>≤5 sentences; no brainstorming alternatives.</td></tr>
+      <tr><td><code>THINK_BUDGET_EXTENDED</code> (line 130)</td><td>~15 sentences for debugging / SQL / algorithm work; forbid drafting code in the think block.</td></tr>
+      <tr><td><code>THINK_BUDGET_SELFPLAY</code> (line 158)</td><td>≤6 bullet points for fast bounded self-play exercises.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Helpers</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>build_project_briefing(store, project_id, max_events=3, max_open_tasks=8) -&gt; str</code></td><td>Render a multi-line project context block — open tasks, recent events, current goal — for prompt injection (line 4).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Tool-orchestration routing rules (SYSTEM_PROMPT)</h2>
+  <p>A block of <strong>MANDATORY TRIGGERS</strong> in <code>SYSTEM_PROMPT</code> maps user intents to specific tool calls so the LLM doesn't improvise. Current rules include:</p>
+  <ul>
+    <li><code>SLEEP / REST</code> → <code>dream_mode</code></li>
+    <li><code>SELF-PLAY (one-shot)</code> → <code>self_play</code> — for "practise", "train", "do self-play" (single cycle).</li>
+    <li><code>SELF-PLAY (continuous)</code> → <code>self_play_loop</code> — for "continuously", "in a loop", "back to back", "until I tell you to stop". <code>stop_self_play</code> on explicit user stop while running.</li>
+    <li><code>LESSONS SURFACE</code> → <code>list_lessons</code> — for "what have you learned today/so far/this week". Picks <code>scope</code> ∈ <code>{today, week, all, self_play_only}</code> from phrasing.</li>
+    <li><code>KNOWLEDGE &amp; RAG</code> → <code>recall</code> first.</li>
+    <li><code>WEB FACTS</code> → <code>web_search</code> first; <code>fact_check</code> / <code>deep_research</code> only for complex verification.</li>
+  </ul>
+
+  <h2>Self-play challenge-gen hardening (SYNTHETIC_CHALLENGE_PROMPT)</h2>
+  <p>The challenge-generation system prompt carries explicit rules to prevent LLM-generated validators from being unwinnable:</p>
+  <ul>
+    <li><strong>Float formatting</strong> — always convert both sides to <code>float()</code> with tolerance before comparing; never compare <code>round()</code> output with f-string output directly.</li>
+    <li><strong>Unit suffixes</strong> — if an expected field carries a <code>%</code>, <code>$</code>, <code>ms</code>, or comma-thousand separator, strip it before <code>float()</code>/<code>int()</code>. Includes a concrete WRONG/RIGHT example of the <code>float('60.00%')</code> bug.</li>
+    <li><strong>One convention per field</strong> — either string equality with the suffix kept, or numeric tolerance with the suffix stripped. Never mix.</li>
+    <li><strong>Mental self-test</strong> — the generator is told to trace the validator against a hypothetical <code>solution.py</code> that echoes its own expected output; every parse/comparison line must succeed.</li>
+  </ul>
+  <p>When <a href="../memory/frontier.html">FrontierTracker</a> reports all clusters saturated, the dream loop additionally injects a <strong>CURRICULUM DIVERSITY REQUIREMENT</strong> block telling the generator to pick from <code>{concurrency, algo, regex_parse, sql, bash}</code> and forbidding another data-analysis / CSV-groupby shape.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

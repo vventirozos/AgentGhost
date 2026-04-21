@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.frontier — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a class="current" href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / frontier.py — FrontierTracker</h1>
+  <p class="subtitle">Per-cluster self-play telemetry. Detects mastery, ranks brittleness, scaffolds difficulty tiers, and rotates away from saturated clusters.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>JSON at <code>memory_dir/self_play_frontier.json</code>.</li>
+    <li>Cross-process advisory lock at <code>memory_dir/self_play_frontier.json.lock</code> via <code>fcntl</code>; falls back to threading-only on non-POSIX.</li>
+  </ul>
+
+  <h2>Schema</h2>
+  <pre><code>{
+  "runs": [{ "timestamp", "cluster_key", "challenge", "passed", "attempts_used",
+             "length", "delta", "mistake" }],
+  "clusters": {
+    "&lt;cluster_key&gt;": {
+      "runs": int,
+      "best_length": int,
+      "last_length": int,
+      "last_compression": float,
+      "mastered": bool,
+      "recent_outcomes": [last 10 runs],
+      "recent_hashes":   [last 20 challenge SHA1s],
+      "total_first_try_wins": int,
+      "unlocked_tier_index": int  // monotonic
+    }
+  }
+}</code></pre>
+
+  <h2>Constants</h2>
+  <div class="kv">
+    <dt>MAX_RUNS</dt><dd>200 (tail evict)</dd>
+    <dt>DEDUP_WINDOW</dt><dd>20 challenge hashes</dd>
+    <dt>MASTERED_STREAK</dt><dd>5 consecutive first-try wins + ≥1 run with delta &gt; 0.05</dd>
+    <dt>BRITTLE_WINDOW</dt><dd>3 — rolling window for brittleness scoring</dd>
+    <dt>SATURATION_WINDOW</dt><dd>3 — last N runs all first-try wins with near-zero delta</dd>
+    <dt>SATURATION_DELTA_EPSILON</dt><dd>0.001</dd>
+  </div>
+
+  <h2>Saturation detection</h2>
+  <p>A cluster is <strong>saturated</strong> when <code>_cluster_is_saturated(stats)</code> returns True: its last <code>SATURATION_WINDOW</code> runs are all first-try passes with delta &le; <code>SATURATION_DELTA_EPSILON</code>. Semantics: the template bank has no new learning signal for this cluster — continuing to target it burns cycles on material the agent already aces.</p>
+  <p>Saturated clusters are filtered out of <code>_get_brittle_clusters_scored</code> so the brittleness lottery never re-picks them. <code>pick_seed</code> handles the "everything saturated" case by returning <code>mode="exploration"</code> with a <code>saturated_clusters</code> list attached for the caller:</p>
+  <pre><code>{"mode": "exploration", "cluster_key": None, "saturated_clusters": [...], "hint": "..."}</code></pre>
+  <p>The caller (the dream loop) reads this and chooses a saturation-aware source: bumped journal probability, 50/50 coin-flip between LLM-gen and <code>pick_random_template(exclude_clusters=saturated)</code>.</p>
+
+  <h2>Brittleness scoring</h2>
+  <pre><code>brittleness = failures · 2  +  hard_wins(≥3 attempts) · 2  +  soft_wins(2 attempts) · 1</code></pre>
+  <p>Saturated clusters are excluded from this score regardless of where they'd otherwise rank.</p>
+
+  <h2>Tier unlocks</h2>
+  <p><code>unlocked_tier_index</code> only moves upward — once unlocked, a tier is sticky even after a regression. Tiers: <code>basic</code>, <code>intermediate</code>, <code>advanced</code>, <code>expert</code>. Each unlock costs <code>TIER_UNLOCK_THRESHOLD = 3</code> cumulative first-try wins.</p>
+
+  <h2>Methods</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>get_cluster_stats(key)</code></td><td>Stats blob.</td></tr>
+      <tr><td><code>get_brittle_clusters(limit)</code></td><td>Top brittle clusters by score (saturated clusters filtered out).</td></tr>
+      <tr><td><code>get_difficulty_tier(key)</code></td><td><code>basic</code> / <code>intermediate</code> / <code>advanced</code> / <code>expert</code>.</td></tr>
+      <tr><td><code>get_difficulty_hint(key)</code></td><td>Tier-specific prompt hint.</td></tr>
+      <tr><td><code>_cluster_is_saturated(stats) → bool</code> (classmethod)</td><td>Check if last N runs are all trivial first-try wins.</td></tr>
+      <tr><td><code>list_saturated_clusters() → list</code></td><td>All currently-saturated cluster keys.</td></tr>
+      <tr><td><code>pick_seed(random_explore_prob=0.2)</code></td><td>Choose next cluster + hint for self-play. Returns exploration mode with <code>saturated_clusters</code> when all brittle candidates are saturated.</td></tr>
+      <tr><td><code>record_run(cluster_key, challenge, attempts_used, passed, description_length, mistake) → dict</code></td><td>Log a run; returns <code>{compression_delta, mastered, is_new_cluster, …}</code>.</td></tr>
+      <tr><td><code>adaptive_cooldown(base, floor, ceiling, cluster_key)</code></td><td>Cooldown seconds based on recent progress. Used by both the biological watchdog (minutes–hours) and <code>self_play_loop</code> (5–180 s clamped).</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

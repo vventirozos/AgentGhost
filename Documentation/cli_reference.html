@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CLI Reference — Ghost Agent</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="capabilities.html">Capabilities</a>
+    <a href="architecture.html">System Architecture</a>
+    <a href="installation.html">Install &amp; Run</a>
+    <a class="current" href="cli_reference.html">CLI Reference</a>
+    <h3>Subsystems</h3>
+    <a href="core/agent.html">Core</a>
+    <a href="memory/vector.html">Memory</a>
+    <a href="tools/registry.html">Tools</a>
+    <a href="sandbox/docker.html">Sandbox</a>
+    <a href="api/routes.html">API</a>
+    <a href="interfaces/web_server.html">Interfaces</a>
+  </nav>
+</aside>
+<main>
+  <h1>CLI Reference</h1>
+  <p class="subtitle">Every flag accepted by <code>python -m src.ghost_agent.main</code>, sourced from <code>main.py:61-138</code>.</p>
+
+  <h2>Networking &amp; identity</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--host</code></td><td>str</td><td><code>0.0.0.0</code></td><td>uvicorn bind address.</td></tr>
+      <tr><td><code>--port</code></td><td>int</td><td><code>8000</code></td><td>uvicorn listen port.</td></tr>
+      <tr><td><code>--upstream-url</code></td><td>str</td><td><code>http://127.0.0.1:8080</code></td><td>OpenAI-compatible LLM backend (llama.cpp / Ollama / vLLM).</td></tr>
+      <tr><td><code>--model</code></td><td>str</td><td><code>$GHOST_MODEL</code> or <code>qwen-3.6-35b-a3</code></td><td>Model identifier returned on Ollama compatibility routes (<code>/api/show</code>, <code>/api/tags</code>).</td></tr>
+      <tr><td><code>--api-key</code></td><td>str</td><td><code>$GHOST_API_KEY</code> or <code>ghost-secret-123</code></td><td>Value the agent expects in the <code>X-Ghost-Key</code> header.</td></tr>
+      <tr><td><code>--default-db</code></td><td>str</td><td><code>$GHOST_DEFAULT_DB</code> or local Postgres DSN</td><td>Default DSN for the <code>postgres_admin</code> tool.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Logging &amp; verbosity</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>-d / --daemon</code></td><td>flag</td><td>Suppress stdout logging (file-only).</td></tr>
+      <tr><td><code>--debug</code></td><td>flag</td><td>Set log level to DEBUG.</td></tr>
+      <tr><td><code>-v / --verbose</code></td><td>flag</td><td>Disable per-line truncation; raises <code>LOG_TRUNCATE_LIMIT</code> from 60 chars to 1M.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Memory behaviour</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-memory</code></td><td>off</td><td>Skip vector / graph / profile / episodic / adaptive-threshold / contradiction-log initialisation. Useful for regression tests.</td></tr>
+      <tr><td><code>--smart-memory</code></td><td><code>0.0</code></td><td>Initial value for the <code>AdaptiveThreshold</code> recall gate. The store self-tunes from observations once recording begins (window=100, MIN_OBSERVATIONS=20).</td></tr>
+      <tr><td><code>--max-context</code></td><td><code>65536</code></td><td>Maximum tokens before <code>ContextManager</code> escalates compression (L0..L4).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Tool surface</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--native-tools</code> / <code>--no-native-tools</code></td><td>on</td><td>Whether to advertise OpenAI-style <code>tools</code> array on outbound LLM calls. Off forces XML-only tool dispatch.</td></tr>
+      <tr><td><code>--anonymous</code></td><td>on</td><td>Route web search through Tor / DuckDuckGo (with identity rotation on 401/403/503).</td></tr>
+      <tr><td><code>--deep-reason</code></td><td>off</td><td>Initialise <code>MCTSReasoner</code> (max_candidates=3, max_depth=2) and <code>HypothesisTester</code>.</td></tr>
+      <tr><td><code>--perfect-it</code></td><td>off</td><td>Append a proactive optimisation pass after a session completes.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Swarm topology</h2>
+  <p>Each value is a comma-separated list of <code>url|model</code> pairs. Pools are independent and routed by <code>LLMClient</code>.</p>
+  <table>
+    <thead><tr><th>Flag</th><th>Used for</th><th>Selector</th></tr></thead>
+    <tbody>
+      <tr><td><code>--swarm-nodes</code></td><td>Parallel inference / planning fan-out</td><td><code>chat_completion(use_swarm=True)</code></td></tr>
+      <tr><td><code>--worker-nodes</code></td><td>Cheap classifier / verifier sub-tasks</td><td><code>route(task=...)</code> dispatch</td></tr>
+      <tr><td><code>--visual-nodes</code></td><td>Multimodal vision (PDF + image)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
+      <tr><td><code>--coding-nodes</code></td><td>Code generation specialists</td><td><code>chat_completion(use_coding=True)</code></td></tr>
+      <tr><td><code>--image-gen-nodes</code></td><td>SDXL image generation</td><td><code>generate_image()</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="utils">Utility modules</h2>
+  <p>The <code>src/ghost_agent/utils/</code> package centralises cross-cutting helpers:</p>
+  <table>
+    <thead><tr><th>Module</th><th>Highlights</th></tr></thead>
+    <tbody>
+      <tr><td><code>helpers.py</code></td><td><code>request_new_tor_identity()</code> rotates Tor circuits; <code>helper_fetch_url_content()</code> wraps curl_cffi/httpx with SSRF guards, 5 MB body cap, 20 s timeout, and 3 retry attempts; <code>recursive_split_text</code> + <code>semantic_split_text</code> chunk text for ingestion; <code>get_utc_timestamp</code> / <code>parse_utc_timestamp</code> for ISO timestamps.</td></tr>
+      <tr><td><code>logging.py</code></td><td><code>setup_logging</code> configures rotating file + stdout sinks; <code>pretty_log()</code> emits structured icons-and-tags log lines with per-request tagging via the <code>request_id_context</code> ContextVar; truncation defaults to 60 chars unless <code>--verbose</code>.</td></tr>
+      <tr><td><code>sanitizer.py</code></td><td><code>extract_code_from_markdown</code>, <code>fix_python_syntax</code> (AST-driven repair loop, max 20 retries), and <code>sanitize_code</code> chain that scrubs control characters and heals partial Python before exec.</td></tr>
+      <tr><td><code>token_counter.py</code></td><td><code>load_tokenizer</code> caches Qwen3 35B tokenizer locally with a 15 s download timeout fallback; <code>estimate_tokens</code> uses a bounded LRU cache; <code>check_budget</code> reports per-message token usage.</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

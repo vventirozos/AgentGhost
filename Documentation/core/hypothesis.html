@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.hypothesis — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="planning.html">planning</a>
+    <a href="dream.html">dream</a>
+    <a href="mcts.html">mcts</a>
+    <a class="current" href="hypothesis.html">hypothesis</a>
+    <a href="verifier.html">verifier</a>
+    <a href="uncertainty.html">uncertainty</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / hypothesis.py — HypothesisTester</h1>
+  <p class="subtitle">Parallel-debugging engine: generate competing hypotheses, test them concurrently, ask the LLM to rank survivors.</p>
+
+  <h2>Why</h2>
+  <p>Serial debugging burns 6-8 turns hopping between guesses. Parallelising the test phase collapses the same exploration into 2-3 turns: the worker pool runs every candidate test simultaneously, eliminates obvious losers via heuristic markers, then a single LLM call ranks what's left.</p>
+
+  <h2>Data structures</h2>
+  <table>
+    <thead><tr><th>Type</th><th>Fields</th></tr></thead>
+    <tbody>
+      <tr><td><code>Hypothesis</code> (line 21)</td><td>description · test_action · test_tool · result · consistent · confidence</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Methods</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(llm_client, max_candidates=3, max_depth=2)</code></td><td>Bind LLM client and limits.</td></tr>
+      <tr><td><code>async generate_hypotheses(problem, context, error_output) -&gt; List[Hypothesis]</code></td><td>LLM produces 3-5 candidates with description and recommended test (line 88).</td></tr>
+      <tr><td><code>async test_hypotheses_parallel(hypotheses, executor) -&gt; List[Hypothesis]</code></td><td>Run tests in parallel, set <code>consistent=True</code> when no error markers detected (line 128).</td></tr>
+      <tr><td><code>async evaluate_results(problem, hypotheses) -&gt; dict</code></td><td>LLM ranks survivors; returns most likely root cause + remediation (line 167).</td></tr>
+      <tr><td><code>async backtrack() -&gt; Optional[Hypothesis]</code></td><td>Pop next-best alternative when current pick fails (line 162).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Heuristic consistency check</h2>
+  <p>If the test result lacks any of <code>error · exception · traceback · not found</code>, the hypothesis is provisionally marked consistent and forwarded to LLM evaluation. This avoids wasting an LLM call on hypotheses that are clearly wrong.</p>
+
+  <h2>Concurrency</h2>
+  <p>Fully async; <code>asyncio.gather</code> for parallel tests. The executor argument allows callers to inject a sandbox-aware test runner.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

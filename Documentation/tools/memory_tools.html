@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.memory — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a class="current" href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / memory.py — memory tool wrappers</h1>
+  <p class="subtitle">LLM-facing wrappers around the underlying memory subsystem, plus the self-play control surface.</p>
+
+  <table>
+    <thead><tr><th>Tool</th><th>Backend</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>knowledge_base</code> (insert_fact)</td><td><a href="../memory/vector.html">vector</a> + optionally <a href="../memory/graph.html">graph</a></td><td>Insert fact with MD5 dedup; if <code>memory_bus</code> is present, asynchronously extracts <code>(subject, PREDICATE, object)</code> triplets via the worker LLM.</td></tr>
+      <tr><td><code>knowledge_base</code> (ingest_document)</td><td>vector</td><td>Ingest URL or local file (PDF / text). Hard caps: 100 MB on disk, 5 MB extracted text, 1000 PDF pages. Chunked via <code>semantic_split_text</code> or <code>recursive_split_text</code>.</td></tr>
+      <tr><td><code>knowledge_base</code> (forget / list_docs / reset_all)</td><td>vector</td><td>Library management.</td></tr>
+      <tr><td><code>recall</code></td><td>vector</td><td>Semantic search: <code>memory_system.collection.query(query_texts=[query], n_results=...)</code>.</td></tr>
+      <tr><td><code>update_profile</code></td><td><a href="../memory/profile.html">profile</a></td><td>Persist user facts via the canonical merge.</td></tr>
+      <tr><td><code>learn_skill</code></td><td><a href="../memory/skills.html">skills</a></td><td>Store task / mistake / solution triplet.</td></tr>
+      <tr><td><code>scratchpad</code></td><td><a href="../memory/scratchpad.html">scratchpad</a></td><td>set / get / list / clear KV.</td></tr>
+      <tr><td><code>dream_mode</code></td><td><a href="../core/dream.html">dream</a></td><td>Triggers an active consolidation pass.</td></tr>
+      <tr><td><code>self_play</code></td><td>dream + frontier</td><td>Runs one self-play cycle picked by the <a href="../memory/frontier.html">FrontierTracker</a>. 600 s wall-clock cap.</td></tr>
+      <tr><td><code>self_play_loop(max_cycles=0, model="")</code></td><td>dream + frontier</td><td>Spawns a background <code>asyncio.Task</code> running self-play cycles back-to-back. Stops when the user sends any message (<code>handle_chat</code> sets the stop event) or <code>stop_self_play</code> is called. Not persisted across restarts. Optional <code>model</code> override; <code>max_cycles=0</code> is unbounded.</td></tr>
+      <tr><td><code>stop_self_play</code></td><td>—</td><td>Signals the running loop to exit after its current cycle. No-op if no loop is running.</td></tr>
+      <tr><td><code>list_lessons(scope="today", limit=20)</code></td><td><a href="../memory/skills.html">skills</a></td><td>Surface learned lessons filtered by local-time window. <code>scope ∈ {today, week, all, self_play_only}</code>. Routed automatically when the user asks "what did you learn today / so far?".</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Self-play loop internals</h2>
+  <ul>
+    <li>Cool-off between cycles is adaptive (5–180 s clamped) via <code>FrontierTracker.adaptive_cooldown</code>. Falls back to a 30 s baseline if no tracker is available.</li>
+    <li>The loop task + stop event are stashed on <code>context.selfplay_loop_task</code> and <code>context.selfplay_loop_stop</code>. <code>handle_chat</code> checks these on every user message and sets the stop event — the loop checks it at each cycle boundary and during the cool-off <code>asyncio.wait_for</code>.</li>
+    <li>Between cycles the loop explicitly drains the short-term journal via <code>context.agent.process_journal_queue()</code> so hippocampus doesn't fall behind during long runs. Cheap no-op when the journal is empty.</li>
+    <li>Inside the isolated sub-agent's context, <code>selfplay_loop_*</code> attributes are stripped to prevent the inner solver's <code>handle_chat</code> from tripping the user-message interrupt on the outer loop.</li>
+  </ul>
+
+  <h2>Memory bus pattern</h2>
+  <p>When a <code>MemoryBus</code> is attached, <code>insert_fact</code> calls <code>publish_fact("insert_fact", ...)</code> rather than writing the vector store directly. The bus fans the write out to vector + graph (and other tiers) in parallel, and the dedup-LRU gate prevents re-publishes within a 256-unique-event window.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

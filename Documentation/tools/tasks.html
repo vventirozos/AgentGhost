@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.tasks — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="swarm.html">swarm</a>
+    <a class="current" href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / tasks.py</h1>
+  <p class="subtitle">Cron + interval background-job scheduling via APScheduler.</p>
+
+  <h2>Tool: <code>manage_tasks</code></h2>
+  <table>
+    <thead><tr><th>Action</th><th>Args</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>create</code></td><td>task_name, cron_expression, prompt</td><td>Add a job: <code>"0 9 * * *"</code> → <code>CronTrigger.from_crontab()</code>; <code>"interval:60"</code> → <code>add_job(..., 'interval', seconds=60)</code>.</td></tr>
+      <tr><td><code>list</code></td><td>—</td><td>Returns all active jobs.</td></tr>
+      <tr><td><code>stop</code></td><td>task_identifier</td><td>Remove a single job by id.</td></tr>
+      <tr><td><code>stop_all</code></td><td>—</td><td>Wipe all scheduled jobs.</td></tr>
+    </tbody>
+  </table>
+
+  <p>The job body is the prompt that will be re-injected into the agent on the trigger schedule. APScheduler is bound to the FastAPI lifespan and shut down with <code>wait=False</code> so server restart doesn't block on long-running jobs.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

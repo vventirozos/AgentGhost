@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>3D Agent Face</title>
+    <style>
+        body {
+            background-color: #0a0202;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        canvas {
+            display: block;
+            transition: filter 0.5s;
+        }
+    </style>
+</head>
+<body>
+    <script src="three.min.js"></script>
+    <script src="OBJLoader.js"></script>
+    <script>
+        // =====================================
+        // CONFIGURATION VARIABLES
+        // =====================================
+
+        // 1. TEXTURE STYLE
+        // Choose the visual style of the 3D model. 
+        // 'metal' - Shiny metallic surface
+        // 'matte' - Flat, non-reflective surface
+        // 'plastic' - Shiny, non-metallic surface
+        // 'wireframe' - The original glowing wireframe look
+        // 'wireframe_metal' - A combination of shiny metal and glowing wireframe
+        // 'glass' - Semi-transparent glass-like surface
+        const TEXTURE_STYLE = 'wireframe';
+
+        // 2. COLORS (%x syntax for hexadecimal, e.g. 0xffffff for white)
+        const COLOR_IDLE = 0x850000;
+        const COLOR_GENERATING = 0x0088ff; // Bright neon blue
+
+        // 3. OPACITY (0.0 to 1.0)
+        const OPACITY_IDLE = 0.7;
+        const OPACITY_GENERATING = 1;
+
+        // 4. CAMERA AND POSITIONING
+        const CAMERA_Z = 40;
+        // Wireframes don't hide the back of the head, making the silhouette look bulkier, so we scale it down slightly
+        const MODEL_SCALE_FIT = TEXTURE_STYLE === 'wireframe' ? 100 : 100;  
+        const MODEL_Y_OFFSET = -36;   // Move up/down (negative is down)
+
+        // 5. OFFSET ROTATION (Adjust these if your OBJ is facing the wrong way)
+        // Values are in radians (1.57 = 90 degrees, 3.14 = 180 degrees)
+        const OFFSET_ROT_X = 3.14;
+        const OFFSET_ROT_Y = 3.14;
+        const OFFSET_ROT_Z = 3.14;
+
+//	def face
+//        const OFFSET_ROT_X = 1.57;
+//        const OFFSET_ROT_Y = 3.14;
+//        const OFFSET_ROT_Z = 3.14;
+
+        // 6. ANIMATION SPEED: IDLE (Smaller = slower)
+        const IDLE_ROT_X_SPEED = 0.05;
+        const IDLE_ROT_Y_SPEED = 0.15; // Reduced by 70% to prevent distortion
+        const IDLE_BREATH_SPEED = 1.0;
+
+        // 6. ANIMATION SPEED: GENERATING (Active processing)
+        const GEN_ROT_X_SPEED = 0.05;
+        const GEN_ROT_Y_SPEED = 0.0;
+        const GEN_ROT_Z_SPEED = 0.0;
+        const GEN_PULSE_SPEED = 2.0;
+
+        // 7. GLOW EFFECTS (CSS Filters)
+        const GLOW_IDLE = 'drop-shadow(0 0 10px #850000)';
+//        const GLOW_GENERATING = 'drop-shadow(0 0 10px #850000) drop-shadow(0 0 10px #850000)';
+        const GLOW_GENERATING = 'drop-shadow(0 0 10px #0000C0)';
+        // 8. MESH LINE QUANTITY (0 to 180 degrees)
+        // If your OBJ file is too dense, you can reduce the amount of lines drawn by increasing this angle.
+        // A value of 0 shows all triangles (original behavior). A value between 5 and 30 will only render
+        // the sharper edges, significantly reducing the visual clutter of high-poly meshes!
+        const EDGE_THRESHOLD_ANGLE = 0;
+
+        // 9. BRAIN GLOW EFFECT
+        // Controls how far down the "brain" glow effect goes when generating (0.0 to 1.0).
+        // 0.0 = entire head glows. 0.5 = top half glows. 0.8 = only the very top glows.
+        const BRAIN_GLOW_START = 0.0;
+
+        // 10. LIGHTING (Neon styles for solid materials)
+        // These lights affect all texture styles except 'wireframe'
+        const LIGHT_AMBIENT_COLOR = 0xffffff;
+        const LIGHT_AMBIENT_INTENSITY = 0.4;
+        
+        const LIGHT_NEON_1_COLOR = 0xff00ff; // Neon Pink/Magenta
+        const LIGHT_NEON_1_INTENSITY = 2.0;
+        const LIGHT_NEON_1_POS = [10, 20, 30];
+
+        const LIGHT_NEON_2_COLOR = 0x00ffff; // Neon Cyan
+        const LIGHT_NEON_2_INTENSITY = 1.5;
+        const LIGHT_NEON_2_POS = [-10, -20, -30];
+        // =====================================
+
+        let status = 'idle';
+        let headMesh = null;
+        let time = 0;
+
+        // Scene setup
+        const scene = new THREE.Scene();
+
+        // Add Lighting for solid materials
+        const ambientLight = new THREE.AmbientLight(LIGHT_AMBIENT_COLOR, LIGHT_AMBIENT_INTENSITY);
+        scene.add(ambientLight);
+        
+        const dirLight1 = new THREE.DirectionalLight(LIGHT_NEON_1_COLOR, LIGHT_NEON_1_INTENSITY);
+        dirLight1.position.set(LIGHT_NEON_1_POS[0], LIGHT_NEON_1_POS[1], LIGHT_NEON_1_POS[2]);
+        scene.add(dirLight1);
+        
+        const dirLight2 = new THREE.DirectionalLight(LIGHT_NEON_2_COLOR, LIGHT_NEON_2_INTENSITY);
+        dirLight2.position.set(LIGHT_NEON_2_POS[0], LIGHT_NEON_2_POS[1], LIGHT_NEON_2_POS[2]);
+        scene.add(dirLight2);
+
+        // Use an orthographic or low-FOV perspective camera so it looks more isometric/imposing
+        const camera = new THREE.PerspectiveCamera(40, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = CAMERA_Z;
+
+        const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        document.body.appendChild(renderer.domElement);
+        renderer.domElement.style.filter = GLOW_IDLE;
+
+        // Custom Shader for Brain Glow (World Space)
+        const vertexShader = `
+            varying vec3 vWorldPosition;
+            void main() {
+                vec4 worldPosition = modelMatrix * vec4(position, 1.0);
+                vWorldPosition = worldPosition.xyz;
+                gl_Position = projectionMatrix * viewMatrix * worldPosition;
+            }
+        `;
+
+        const fragmentShader = `
+            uniform vec3 colorIdle;
+            uniform vec3 colorGenerating;
+            uniform float opacityIdle;
+            uniform float opacityGenerating;
+            uniform float isGenerating;
+            uniform float glowStartY;
+            uniform float modelMaxY;
+            uniform float time;
+
+            varying vec3 vWorldPosition;
+
+            void main() {
+                // Smooth gradient for the brain area based on true world Y height
+                float glowFactor = smoothstep(glowStartY, modelMaxY, vWorldPosition.y);
+                float activeGlow = isGenerating * glowFactor;
+                
+                // Add a slight pulse to the generating color
+                float pulse = 1.0 + sin(time * 15.0) * 0.4;
+                vec3 finalGenColor = colorGenerating * pulse;
+
+                vec3 finalColor = mix(colorIdle, finalGenColor, activeGlow);
+                float finalOpacity = mix(opacityIdle, opacityGenerating, activeGlow);
+
+                gl_FragColor = vec4(finalColor, finalOpacity);
+            }
+        `;
+
+        // Load the model
+        const loader = new THREE.OBJLoader();
+        loader.load(
+            'head.obj',
+            function (object) {
+                // Apply scale and offsets FIRST so we compute true world bounds
+                const box = new THREE.Box3().setFromObject(object);
+                const size = box.getSize(new THREE.Vector3());
+                const maxDim = Math.max(size.x, size.y, size.z);
+                const scale = MODEL_SCALE_FIT / maxDim;
+                
+                object.scale.set(scale, scale, scale);
+                object.rotation.set(OFFSET_ROT_X, OFFSET_ROT_Y, OFFSET_ROT_Z);
+
+                // Recompute box after scale and rotation
+                object.updateMatrixWorld(true);
+                const worldBox = new THREE.Box3().setFromObject(object);
+                
+                // Now center based on actual world box
+                const worldCenter = worldBox.getCenter(new THREE.Vector3());
+                object.position.x = -worldCenter.x;
+                object.position.y = -worldCenter.y + MODEL_Y_OFFSET; 
+                object.position.z = -worldCenter.z;
+
+                object.updateMatrixWorld(true);
+                const finalBox = new THREE.Box3().setFromObject(object);
+                const glowStartLocalY = finalBox.min.y + (finalBox.max.y - finalBox.min.y) * BRAIN_GLOW_START;
+
+                const customMaterial = new THREE.ShaderMaterial({
+                    uniforms: {
+                        colorIdle: { value: new THREE.Color(COLOR_IDLE) },
+                        colorGenerating: { value: new THREE.Color(COLOR_GENERATING) },
+                        opacityIdle: { value: OPACITY_IDLE },
+                        opacityGenerating: { value: OPACITY_GENERATING },
+                        isGenerating: { value: 0.0 }, // 0.0 = idle, 1.0 = generating
+                        glowStartY: { value: glowStartLocalY },
+                        modelMaxY: { value: finalBox.max.y },
+                        time: { value: 0.0 }
+                    },
+                    vertexShader: vertexShader,
+                    fragmentShader: fragmentShader,
+                    transparent: true
+                });
+
+                // Find all meshes in the OBJ and apply texture material
+                object.traverse(function (child) {
+                    if (child.isMesh) {
+                        const edges = new THREE.EdgesGeometry(child.geometry, EDGE_THRESHOLD_ANGLE);
+                        const line = new THREE.LineSegments(edges, customMaterial);
+                        
+                        // Default
+                        child.material.visible = false;
+                        
+                        if (TEXTURE_STYLE === 'wireframe') {
+                            child.add(line);
+                        } else if (TEXTURE_STYLE === 'wireframe_metal') {
+                            child.add(line);
+                            child.material = new THREE.MeshStandardMaterial({
+                                color: 0x444444, metalness: 0.9, roughness: 0.2,
+                                polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1
+                            });
+                            child.material.visible = true;
+                        } else if (TEXTURE_STYLE === 'metal') {
+                            child.material = new THREE.MeshStandardMaterial({
+                                color: 0x888888, metalness: 1.0, roughness: 0.2
+                            });
+                            child.material.visible = true;
+                        } else if (TEXTURE_STYLE === 'matte') {
+                            child.material = new THREE.MeshStandardMaterial({
+                                color: 0x666666, metalness: 0.0, roughness: 0.9
+                            });
+                            child.material.visible = true;
+                        } else if (TEXTURE_STYLE === 'plastic') {
+                            child.material = new THREE.MeshStandardMaterial({
+                                color: 0x111111, metalness: 0.1, roughness: 0.1
+                            });
+                            child.material.visible = true;
+                        } else if (TEXTURE_STYLE === 'glass') {
+                            child.material = new THREE.MeshPhysicalMaterial({
+                                color: 0xffffff, metalness: 0.1, roughness: 0.05,
+                                transmission: 0.9, opacity: 1, transparent: true
+                            });
+                            child.material.visible = true;
+                        }
+                    }
+                });
+
+                headMesh = new THREE.Group();
+                headMesh.add(object);
+                scene.add(headMesh);
+            },
+            function (xhr) {
+                console.log((xhr.loaded / xhr.total * 100) + '% loaded');
+            },
+            function (error) {
+                console.error('An error happened loading head.obj', error);
+            }
+        );
+
+        // API for the Python client to call
+        function setStatus(newStatus) {
+            status = newStatus;
+            const isGen = (status === 'generating') ? 1.0 : 0.0;
+            // Removed the whole-face drop-shadow to keep the effect isolated to the BRAIN_GLOW_START
+            
+            if (headMesh) {
+                headMesh.children[0].traverse((c) => {
+                    // Update glowing uniform for wireframe
+                    if (c.isLineSegments || c.type === 'LineSegments') {
+                        c.material.uniforms.isGenerating.value = isGen;
+                    }
+                    // Update solid mesh emissive color
+                    if (c.isMesh && TEXTURE_STYLE !== 'wireframe') {
+                        c.material.emissive.setHex(0x000000);
+                        c.material.emissiveIntensity = 0.0;
+                    }
+                });
+            }
+        }
+
+        // Animation Loop
+        function animate() {
+            requestAnimationFrame(animate);
+
+            time += 0.01;
+
+            if (headMesh) {
+                headMesh.children[0].traverse((c) => {
+                    if (c.isLineSegments || c.type === 'LineSegments') {
+                        c.material.uniforms.time.value = time;
+                    }
+                });
+
+                if (status === 'idle') {
+                    // Slow breathing
+                    headMesh.rotation.y = Math.sin(time * 0.5) * IDLE_ROT_Y_SPEED;
+                    headMesh.rotation.x = Math.sin(time * 0.3) * IDLE_ROT_X_SPEED;
+                    const scaleBreath = 1.0 + Math.sin(time * IDLE_BREATH_SPEED) * 0.01;
+                    headMesh.scale.set(scaleBreath, scaleBreath, scaleBreath);
+                } else if (status === 'generating') {
+                    // Active processing animation: Just a bit faster than idle, no erratic movements
+                    headMesh.rotation.y = Math.sin(time * 1.5) * IDLE_ROT_Y_SPEED * 1.2;
+                    headMesh.rotation.x = Math.sin(time * 1.0) * IDLE_ROT_X_SPEED * 1.2;
+                    const scaleBreath = 1.0 + Math.sin(time * IDLE_BREATH_SPEED * 2.0) * 0.01;
+                    headMesh.scale.set(scaleBreath, scaleBreath, scaleBreath);
+                }
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', onWindowResize, false);
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        animate();
+    </script>
+</body>
+</html>

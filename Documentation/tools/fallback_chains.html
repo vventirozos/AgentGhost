@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.fallback_chains — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a class="current" href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / fallback_chains.py</h1>
+  <p class="subtitle">Suggest alternative tools when a tool fails so the agent doesn't waste a turn.</p>
+
+  <h2>Chains</h2>
+  <table>
+    <thead><tr><th>Failed tool</th><th>Fallback chain</th></tr></thead>
+    <tbody>
+      <tr><td><code>deep_research</code></td><td><code>web_search</code> → <code>recall</code></td></tr>
+      <tr><td><code>web_search</code></td><td><code>deep_research</code> → <code>recall</code></td></tr>
+      <tr><td><code>execute</code></td><td><code>file_system</code></td></tr>
+      <tr><td><code>postgres_admin</code></td><td><code>execute</code></td></tr>
+      <tr><td><code>vision_analysis</code></td><td><code>file_system</code></td></tr>
+      <tr><td><code>delegate_to_swarm</code></td><td><code>execute</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>API</h2>
+  <ul>
+    <li><code>get_fallback_hint(failed_tool, error_text) -&gt; Optional[str]</code> — Skip CAPTCHA failures for <code>web_search</code>, docker errors for <code>execute</code>.</li>
+    <li><code>get_fallback_tool_name(failed_tool) -&gt; Optional[str]</code> — Returns the first fallback in the chain.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Request lifecycle — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a class="current" href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="skill_acquisition.html">Skill acquisition</a>
+    <a href="circuit_breaker.html">Circuit breaker</a>
+  </nav>
+</aside>
+<main>
+  <h1>Request lifecycle</h1>
+  <p class="subtitle">What happens between an HTTP <code>POST /api/chat</code> and the SSE chunk landing in the client.</p>
+
+  <div class="diagram">
+    <svg viewBox="0 0 1000 720" xmlns="http://www.w3.org/2000/svg" font-size="11">
+      <rect width="1000" height="720" fill="#131822"/>
+      <defs><marker id="rl1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1.5 L9,5 L0,8.5 Z" fill="rgba(122,167,255,0.9)"/></marker></defs>
+
+      <rect x="40" y="20" width="920" height="40" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="500" y="45" text-anchor="middle" fill="#e6e9ef">[1] Client POST /api/chat with X-Ghost-Key + OpenAI-format messages</text>
+
+      <rect x="40" y="80" width="920" height="40" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="500" y="105" text-anchor="middle" fill="#e6e9ef">[2] api/routes.py — auth, set request_id ContextVar, choose stream vs JSON</text>
+
+      <rect x="40" y="140" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="165" text-anchor="middle" fill="#e6e9ef">[3] GhostAgent.handle_chat — classify thinking budget, sampling profile</text>
+
+      <rect x="40" y="200" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="225" text-anchor="middle" fill="#e6e9ef">[4] MemoryBus.hydrate_context — parallel fetch from vector / graph / skill / episodic + RRF</text>
+
+      <rect x="40" y="260" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="500" y="285" text-anchor="middle" fill="#e6e9ef">[5] tools.registry.get_active_tool_definitions — base tools + dynamic acquired/composed skills</text>
+
+      <rect x="40" y="320" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="500" y="345" text-anchor="middle" fill="#e6e9ef">[6] ContextManager.compress_if_needed — L0..L4 progressive compression as required</text>
+
+      <rect x="40" y="380" width="920" height="40" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="500" y="405" text-anchor="middle" fill="#e6e9ef">[7] LLMClient.chat_completion(stream=True) — circuit-breaker filtered, round-robin pool</text>
+
+      <rect x="40" y="440" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="465" text-anchor="middle" fill="#e6e9ef">[8] Stream loop — accumulate &lt;tool_call&gt;XML, parse args, dispatch tool</text>
+
+      <rect x="40" y="500" width="920" height="40" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="500" y="525" text-anchor="middle" fill="#e6e9ef">[9] tool_failure.classify → retry / fatal / diagnostic / unknown — fold result back</text>
+
+      <rect x="40" y="560" width="920" height="40" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="500" y="585" text-anchor="middle" fill="#e6e9ef">[10] Verifier.verify_* (worker pool) — confirm/refute substantive evidence</text>
+
+      <rect x="40" y="620" width="920" height="40" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="645" text-anchor="middle" fill="#e6e9ef">[11] Final SSE chunk + DONE marker; UncertaintyTracker may append a risk summary</text>
+
+      <rect x="40" y="680" width="920" height="30" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="500" y="700" text-anchor="middle" fill="#e6e9ef">[12] Background: write events to journal · maybe trigger Dream</text>
+
+      <line x1="500" y1="60" x2="500" y2="80" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="120" x2="500" y2="140" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="180" x2="500" y2="200" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="240" x2="500" y2="260" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="300" x2="500" y2="320" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="360" x2="500" y2="380" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="420" x2="500" y2="440" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="480" x2="500" y2="500" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="540" x2="500" y2="560" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="600" x2="500" y2="620" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+      <line x1="500" y1="660" x2="500" y2="680" stroke="#7aa7ff" marker-end="url(#rl1)"/>
+    </svg>
+    <p class="caption">Figure 10 — Twelve-step request lifecycle.</p>
+  </div>
+
+  <h2>Stage details</h2>
+  <ol>
+    <li><strong>HTTP entry</strong> — <a href="../api/routes.html">routes.py</a> validates the <code>X-Ghost-Key</code> header. Streaming responses set the <code>X-Request-ID</code> response header for correlation with the agent log.</li>
+    <li><strong>Context setup</strong> — the request_id is bound to a <code>contextvars.ContextVar</code> so log lines from inside tool calls inherit it.</li>
+    <li><strong>Sampling decision</strong> — <a href="../core/agent.html"><code>get_sampling_params</code></a> picks coding vs general profile; <a href="../core/agent.html"><code>classify_thinking_budget</code></a> picks tight / extended / selfplay.</li>
+    <li><strong>Hydration</strong> — see <a href="memory_hydration.html">memory hydration (RRF)</a>.</li>
+    <li><strong>Tool list</strong> — built per-turn so semantic skill routing reflects the current query.</li>
+    <li><strong>Compression</strong> — <a href="../core/context_manager.html">ContextManager</a> decides how aggressively to summarise, only escalating beyond L0 if the budget is &gt; 60 % full.</li>
+    <li><strong>Upstream call</strong> — chat completion streamed back through <a href="../core/llm.html">LLMClient</a>; circuit breaker skips OPEN nodes.</li>
+    <li><strong>Tool dispatch</strong> — XML tool blocks parsed; the registry's bound async lambda runs the tool inside the Docker sandbox.</li>
+    <li><strong>Failure handling</strong> — <a href="../tools/tool_failure.html">tool_failure.classify</a> + retry/replan/diagnostic; <a href="../tools/fallback_chains.html">fallback_chains</a> may surface alternative tools.</li>
+    <li><strong>Verification</strong> — only invoked on substantive tool output (skips bookkeeping tools).</li>
+    <li><strong>Final response</strong> — risk summary from <a href="../core/uncertainty.html">UncertaintyTracker</a> appended if any unknown reaches impact ≥ 4.</li>
+    <li><strong>Background</strong> — events appended to the journal; the biological watchdog may decide it's time to trigger a <a href="dream_cycle.html">dream cycle</a>.</li>
+  </ol>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

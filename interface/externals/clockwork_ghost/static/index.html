@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Ghost Web Node</title>
+    <style>
+        body {
+            background-color: #0a0202;
+            margin: 0;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+        }
+        canvas {
+            filter: blur(0px);
+            transition: filter 0.5s;
+        }
+        .generating {
+            filter: drop-shadow(0 0 20px var(--glow-color, #00ffff));
+        }
+    </style>
+</head>
+<body>
+    <canvas id="tesseract" width="800" height="800"></canvas>
+    <script>
+        // ==========================================
+        // CONFIGURATION VARIABLES
+        // ==========================================
+        const COLOR_IDLE = '#660000';
+        const COLOR_GENERATING = '#ff2222';
+        
+        const SPEED_IDLE = 0.005;
+        const SPEED_GENERATING = 0.04;
+        
+        const LINE_WIDTH_IDLE = 3;
+        const LINE_WIDTH_GENERATING = 6;
+        // ==========================================
+
+        const canvas = document.getElementById('tesseract');
+        const ctx = canvas.getContext('2d');
+        let status = 'idle';
+
+        const vertices = [];
+        for(let i = 0; i < 16; i++) {
+            let x = (i & 1) ? 1 : -1;
+            let y = (i & 2) ? 1 : -1;
+            let z = (i & 4) ? 1 : -1;
+            let w = (i & 8) ? 1 : -1;
+            vertices.push([x, y, z, w]);
+        }
+
+        function mat_mult(a, b) {
+            let res = [0, 0, 0, 0];
+            for(let i=0; i<4; i++) {
+                for(let j=0; j<4; j++) {
+                    res[i] += a[i][j] * b[j];
+                }
+            }
+            return res;
+        }
+
+        let angle = 0;
+        
+        function setStatus(newStatus) {
+            status = newStatus;
+            if (status === 'generating') {
+                canvas.classList.add('generating');
+                document.body.style.setProperty('--glow-color', COLOR_GENERATING);
+            } else {
+                canvas.classList.remove('generating');
+            }
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            ctx.save();
+            ctx.translate(canvas.width / 2, canvas.height / 2);
+
+            let speed = status === 'generating' ? SPEED_GENERATING : SPEED_IDLE;
+            angle += speed;
+
+            let breathe = status === 'generating' ? Math.sin(angle * 5) * 0.2 : Math.sin(angle * 2) * 0.05;
+
+            let rotXY = [
+                [Math.cos(angle), -Math.sin(angle), 0, 0],
+                [Math.sin(angle), Math.cos(angle), 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1]
+            ];
+
+            let rotZW = [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, Math.cos(angle), -Math.sin(angle)],
+                [0, 0, Math.sin(angle), Math.cos(angle)]
+            ];
+
+            let rotXW = [
+                [Math.cos(angle*0.5), 0, 0, -Math.sin(angle*0.5)],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [Math.sin(angle*0.5), 0, 0, Math.cos(angle*0.5)]
+            ];
+
+            let projected = [];
+            let dist_4d = 2.5 + breathe;
+
+            for (let i = 0; i < vertices.length; i++) {
+                let v = vertices[i];
+                let rotated = mat_mult(rotXY, v);
+                rotated = mat_mult(rotZW, rotated);
+                rotated = mat_mult(rotXW, rotated);
+
+                let w = 1 / (dist_4d - rotated[3]);
+                let proj3d = [
+                    rotated[0] * w,
+                    rotated[1] * w,
+                    rotated[2] * w
+                ];
+
+                let dist_3d = 2.0;
+                let z = 1 / (dist_3d - proj3d[2]);
+                let proj2d = [
+                    proj3d[0] * z,
+                    proj3d[1] * z
+                ];
+
+                projected.push(proj2d);
+            }
+
+            ctx.strokeStyle = status === 'generating' ? COLOR_GENERATING : COLOR_IDLE;
+            ctx.lineWidth = status === 'generating' ? LINE_WIDTH_GENERATING : LINE_WIDTH_IDLE;
+            if (status === 'generating') {
+                ctx.shadowColor = COLOR_GENERATING;
+                ctx.shadowBlur = 15;
+            } else {
+                ctx.shadowBlur = 5;
+                ctx.shadowColor = COLOR_IDLE;
+            }
+
+            let scale = 450 + (breathe * 150);
+
+            function connect(i, j) {
+                let a = projected[i];
+                let b = projected[j];
+                ctx.beginPath();
+                ctx.moveTo(a[0] * scale, a[1] * scale);
+                ctx.lineTo(b[0] * scale, b[1] * scale);
+                ctx.stroke();
+            }
+
+            for (let i = 0; i < 16; i++) {
+                for (let j = 0; j < 4; j++) {
+                    let neighbor = i ^ (1 << j);
+                    if (neighbor > i) {
+                        connect(i, neighbor);
+                    }
+                }
+            }
+            
+            ctx.restore();
+            requestAnimationFrame(draw);
+        }
+        
+        draw();
+    </script>
+</body>
+</html>

@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.adaptive_threshold — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="skills.html">skills</a>
+    <a href="frontier.html">frontier</a>
+    <a class="current" href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / adaptive_threshold.py — AdaptiveThreshold</h1>
+  <p class="subtitle">Self-tuning recall acceptance threshold. Trades precision for recall based on observed usefulness.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>JSON at <code>memory_dir/adaptive_threshold.json</code>.</li>
+    <li>Atomic temp + <code>os.replace</code>; <code>threading.RLock</code>.</li>
+  </ul>
+
+  <h2>State</h2>
+  <pre><code>{ "threshold": float, "window": [(score, was_useful), ...] }   # window cap = 100</code></pre>
+  <p><code>WINDOW_SIZE = 100</code> · <code>MIN_OBSERVATIONS = 20</code> before recalculation kicks in.</p>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(memory_dir, initial=0.7)</code></td><td>Seed threshold (overridden by <code>--smart-memory</code> CLI flag).</td></tr>
+      <tr><td><code>record(score, was_useful)</code></td><td>Record observation, recalculate threshold.</td></tr>
+      <tr><td><code>get_threshold() -&gt; float</code></td><td>Current threshold.</td></tr>
+      <tr><td><code>get_stats() -&gt; dict</code></td><td>Diagnostics: observations, useful_rate, etc.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Recalculation rule</h2>
+  <p>The threshold is set to <strong>90 % of the minimum useful score</strong>, but never below the median of useless scores. Floor 0.3, ceiling 0.95.</p>
+
+  <h2>Concurrency</h2>
+  <p><code>threading.RLock</code> guards both reads and writes. Writes are atomic via temp file.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

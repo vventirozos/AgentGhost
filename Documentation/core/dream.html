@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.dream — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="llm.html">llm</a>
+    <a href="planning.html">planning</a>
+    <a href="bus.html">bus</a>
+    <a href="context_manager.html">context_manager</a>
+    <a class="current" href="dream.html">dream</a>
+    <a href="mcts.html">mcts</a>
+    <a href="hypothesis.html">hypothesis</a>
+    <a href="verifier.html">verifier</a>
+    <a href="self_play_scoring.html">self_play_scoring</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / dream.py</h1>
+  <p class="subtitle">Idle-time consolidation, synthetic challenge generation, and the full self-play orchestration pipeline.</p>
+
+  <h2>Responsibilities</h2>
+  <ul>
+    <li>Mine failed tasks from the journal into standalone, self-contained challenges via <a href="journal_challenges.html">journal_challenges</a>.</li>
+    <li>Validate LLM-generated challenges before running them — quality gate, preflight, and validator self-test gate.</li>
+    <li>Detect cross-episode tool patterns that should become composed skills.</li>
+    <li>Orchestrate the self-play simulation loop: spawn an isolated temp agent, run the challenge, score with <a href="self_play_scoring.html">correctness_weighted_score</a>, verify and persist any new lesson via <a href="../memory/skills.html">SkillMemory</a>.</li>
+  </ul>
+
+  <h2>Validation stack (three gates, in order)</h2>
+
+  <h3>1. <code>validate_challenge_quality(setup, validator) → (bool, reason)</code></h3>
+  <p>Pattern-based quality gate (line 102). Rejects:</p>
+  <ul>
+    <li>Validators that call <code>random.seed</code>, <code>random.randint</code>, <code>random.uniform</code>, <code>random.choice</code> or <code>np.random</code> — data-generation markers that would make scoring non-deterministic.</li>
+    <li>Validators that depend on dynamic discovery (<code>os.listdir</code>, <code>glob.glob</code>, <code>pathlib.Path</code>) when the setup writes files with explicit names — they must reference at least one shared filename.</li>
+    <li>SQL setup scripts where <code>CREATE TABLE</code> column count doesn't match <code>INSERT</code> value count, or CSV headers that don't match row field count.</li>
+    <li>The unwinnable split pattern: <code>.strip().split('\n')</code> combined with randomness and a <code>len(act) != len(exp)</code> check.</li>
+  </ul>
+  <p>Rejection kinds are returned so the <strong>regeneration loop</strong> can route targeted feedback (files-mismatch → targeted "open file X" hint; data-gen → "don't call random.seed" hint; etc.). Up to 3 generation attempts; a files-mismatch rejection triggers the <strong>validator repair path</strong> which regenerates only the validator with a focused prompt.</p>
+
+  <h3>2. Preflight (<code>.preflight.py</code>)</h3>
+  <p>Runs the validator in the sandbox with <code>__name__ == "__dry_run__"</code> (bypasses any <code>if __name__ == "__main__"</code> guard). Catches module-scope <code>NameError</code> / <code>ImportError</code> / <code>ModuleNotFoundError</code> — unrunnable validators that used to burn a whole solver attempt.</p>
+
+  <h3>3. Validator self-test gate (<code>.validator_selftest.py</code>)</h3>
+  <p>Catches <strong>internal-contradiction</strong> bugs like the canonical <code>float('60.00%')</code> trap, where a validator formats an expected field with a unit suffix and then calls <code>float()</code> on it. Flow:</p>
+  <ol>
+    <li><code>_instrument_validator_for_self_test(src)</code> — AST-find the first <code>subprocess.run(...solution.py...)</code> statement and prepend a probe that dumps the first-resolved <code>expected_*</code> variable between <code>&lt;&lt;&lt;__GHOST_SELFTEST_EXPECTED_START__&gt;&gt;&gt;</code> / <code>&lt;&lt;&lt;__GHOST_SELFTEST_EXPECTED_END__&gt;&gt;&gt;</code> sentinels, then <code>raise SystemExit(42)</code>.</li>
+    <li><code>_extract_selftest_dump(stdout)</code> — pull the dumped block out of the probe's stdout.</li>
+    <li>Write a <code>solution.py</code> that <code>sys.stdout.write(&lt;dumped&gt;)</code>; restore mocks from the post-setup snapshot.</li>
+    <li>Run the <strong>original</strong> validator. <code>_looks_like_validator_crash(out)</code> returns True iff the traceback's innermost frame is <code>.validator.py</code> — in which case the challenge is rejected as unwinnable.</li>
+  </ol>
+  <p>Candidate variable names scanned (in order): <code>expected_output, expected_lines, expected, expected_text, expected_str, expected_result, golden_output, golden, correct_output, answer</code>. The gate is best-effort: unparseable validators or those without a matching <code>subprocess.run</code> skip cleanly.</p>
+
+  <h2>Runtime crash detector (widened)</h2>
+  <p>Even past the three gates, a validator can raise during comparison. The attempt-loop circuit breaker classifies a traceback as a <strong>validator crash</strong> when the tail frame is <code>.validator.py</code>, <code>solution.py</code> is absent from the feedback, and the exception type is one of:</p>
+  <ul>
+    <li><strong>Structural</strong>: <code>SyntaxError, IndentationError, ImportError, ModuleNotFoundError, NameError</code></li>
+    <li><strong>Internal-contradiction</strong>: <code>ValueError, TypeError, KeyError, IndexError, AttributeError</code></li>
+  </ul>
+  <p>Detection aborts the cycle after attempt 1 instead of burning all 3 on the same broken validator.</p>
+
+  <h2>Lesson pipeline</h2>
+
+  <h3><code>_extract_structured_lesson</code></h3>
+  <p>Meta-cognitive LLM call that returns <code>{trigger, anti_pattern, correct_pattern, domains, confidence, task/mistake/solution (legacy mirrors)}</code>. The prompt explicitly requires task-class triggers, forbids copying fixture literals, and mandates a non-empty taxonomy domain set.</p>
+
+  <h3><code>_generalization_guard</code></h3>
+  <p>Last line of defence against overfit lessons. Uses n-gram token overlap (<code>_GENERALIZATION_MIN_NGRAM = 6</code>) to reject lessons whose:</p>
+  <ul>
+    <li><code>trigger</code> copies a 6-token run from the challenge text</li>
+    <li><code>correct_pattern</code> copies a 6-token run from <code>setup_script</code> or the validator</li>
+    <li><code>domains</code> is empty or contains nothing from <code>_VALID_LESSON_DOMAINS</code> (<code>{data_analysis, regex_parse, sql, concurrency, algo, bash, python_general}</code>)</li>
+    <li>trigger or correct_pattern is empty</li>
+  </ul>
+
+  <h3><code>_verify_lesson_helpful</code></h3>
+  <p>For struggled-then-won and failure cases, re-runs the solver once with the lesson prepended under the production <code>### SKILL PLAYBOOK:</code> header. Keeps only if the outcome strictly improves.</p>
+
+  <h2>Isolation markers</h2>
+  <p>The isolated sub-context sets several attributes to prevent production-state writes:</p>
+  <ul>
+    <li><code>ReadOnlySkillMemory.is_read_only = True</code> — class marker that <code>agent.py</code>'s Perfect-It block checks (via <code>is True</code>) to skip the entire ~15 s follow-up LLM call during self-play.</li>
+    <li><code>isolated_context.args.perfect_it = False</code>, <code>smart_memory = 0.0</code>, <code>native_tools = True</code>.</li>
+    <li><code>selfplay_loop_task / selfplay_loop_stop / selfplay_loop_started_at</code> are stripped — otherwise the inner sub-agent's <code>handle_chat</code> would trip the outer loop's user-message interrupt hook.</li>
+    <li><code>verifier, uncertainty_tracker, mcts_reasoner, hypothesis_tester, frontier_tracker</code> set to <code>None</code>.</li>
+  </ul>
+
+  <h2>Public functions</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>validate_challenge_quality(setup, validator) → (bool, reason)</code></td><td>Pattern-based quality gate.</td></tr>
+      <tr><td><code>_instrument_validator_for_self_test(src) → Optional[str]</code></td><td>AST probe injector (module-level, testable).</td></tr>
+      <tr><td><code>_extract_selftest_dump(stdout) → Optional[str]</code></td><td>Pull dumped expected-output from sentinel markers.</td></tr>
+      <tr><td><code>_looks_like_validator_crash(text) → bool</code></td><td>Tail-of-traceback check for <code>.validator.py</code> frame.</td></tr>
+      <tr><td><code>detect_tool_patterns(skill_memory) → list</code></td><td>Cross-episode tool-call sequence detection.</td></tr>
+      <tr><td><code>Dreamer.synthetic_self_play(model_name, is_background)</code></td><td>Full pipeline: seed → source select → gates → run → score → extract → verify → persist.</td></tr>
+      <tr><td><code>Dreamer._try_journal_challenge(probability)</code></td><td>Probabilistic journal mining; probability bumped to 0.75 under saturation.</td></tr>
+      <tr><td><code>Dreamer._generalization_guard(lesson, …) → (bool, reason)</code></td><td>Overfit-lesson rejection.</td></tr>
+      <tr><td><code>Dreamer.dream(model_name)</code></td><td>Journal → long-term consolidation (the REM path).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Concurrency</h2>
+  <p>Async orchestration; the temp agent loop runs synchronously inside the simulation. Triggered by the lifespan-spawned biological watchdog, by the <code>self_play</code> tool (one-shot), or by <code>self_play_loop</code> (continuous). Validator probe / self-test / solver run on the sandbox via <code>asyncio.to_thread</code>.</p>
+
+  <p>End-to-end walkthrough: see <a href="../algorithms/dream_cycle.html">algorithms / dream cycle</a>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

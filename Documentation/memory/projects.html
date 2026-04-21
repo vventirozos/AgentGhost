@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.projects — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a class="current" href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / projects.py — ProjectStore</h1>
+  <p class="subtitle">Multi-session project &amp; task store. SQLite-only; no ORM. Designed for cross-process access from API, Slack bot, dream consolidator.</p>
+
+  <h2>Storage</h2>
+  <p>SQLite at <code>memory_dir/projects.db</code>; <code>threading.RLock</code>; <code>PRAGMA foreign_keys=ON</code>.</p>
+
+  <h2>Tables</h2>
+  <h3>projects</h3>
+  <table>
+    <thead><tr><th>Column</th><th>Type / values</th></tr></thead>
+    <tbody>
+      <tr><td>id</td><td>TEXT PK (12-char hex)</td></tr>
+      <tr><td>title / kind / goal / status</td><td>TEXT (kind ∈ CODING/GENERAL · status ∈ ACTIVE/PAUSED/DONE/ARCHIVED)</td></tr>
+      <tr><td>workspace_dir</td><td>TEXT</td></tr>
+      <tr><td>metadata_json</td><td>TEXT</td></tr>
+      <tr><td>created_at / updated_at</td><td>REAL</td></tr>
+    </tbody>
+  </table>
+
+  <h3>tasks</h3>
+  <table>
+    <thead><tr><th>Column</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>id, project_id, parent_id</td><td>FKs (parent_id NULL = root).</td></tr>
+      <tr><td>description</td><td>TEXT.</td></tr>
+      <tr><td>status</td><td>PENDING / IN_PROGRESS / DONE / BLOCKED.</td></tr>
+      <tr><td>dependency_type</td><td>ALL / ANY (BEST not persisted).</td></tr>
+      <tr><td>alternatives_json / postconditions_json</td><td>list[str].</td></tr>
+      <tr><td>result_summary / failure_reason / actual_tool_used</td><td>TEXT.</td></tr>
+      <tr><td>revision_count, estimated_cost, actual_cost, depth, position</td><td>numeric.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>task_artifacts</h3>
+  <p>id · task_id · project_id · kind ∈ {file, url, note, tool_call} · payload · created_at.</p>
+
+  <h3>project_events</h3>
+  <p>id (auto PK) · project_id · task_id · type · payload_json · ts (REAL).</p>
+
+  <h2>Public API</h2>
+  <h3>Projects</h3>
+  <ul>
+    <li><code>create_project(title, kind, goal, metadata, workspace_dir) -&gt; str</code></li>
+    <li><code>list_projects(status_filter)</code> / <code>get_project(id)</code></li>
+    <li><code>update_project(id, **fields)</code></li>
+    <li><code>delete_project(id, hard=False)</code> — soft = ARCHIVED, hard = cascade delete.</li>
+    <li><code>ensure_workspace(project_id)</code> — create / return workspace path.</li>
+  </ul>
+  <h3>Tasks</h3>
+  <ul>
+    <li><code>add_task(...) -&gt; str</code></li>
+    <li><code>get_task(id)</code> / <code>list_tasks(project_id, status_filter)</code></li>
+    <li><code>update_task(id, **fields)</code></li>
+    <li><code>delete_task(id)</code> — cascade delete descendants.</li>
+  </ul>
+  <h3>Artifacts &amp; events</h3>
+  <ul>
+    <li><code>add_artifact(task_id, kind, payload) -&gt; str</code></li>
+    <li><code>list_artifacts(project_id=None, task_id=None)</code></li>
+    <li><code>log_event(project_id, task_id, event_type, payload) -&gt; int</code></li>
+    <li><code>list_events(project_id, limit, event_type)</code></li>
+  </ul>
+
+  <p>No automatic eviction; archiving via <code>status='ARCHIVED'</code> preserves history. Hard delete cascades via FK ON DELETE CASCADE.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

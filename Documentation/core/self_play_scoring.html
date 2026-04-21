@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.self_play_scoring — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="dream.html">dream</a>
+    <a class="current" href="self_play_scoring.html">self_play_scoring</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / self_play_scoring.py</h1>
+  <p class="subtitle">Correctness-weighted curriculum metric that replaces the naive compression-delta score (which used to reward wrong one-shot solves).</p>
+
+  <h2>Functions</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>count_tool_errors(messages) → int</code></td><td>Count tool-result messages that indicate tool <em>failures</em> (three-tier discrimination, below).</td></tr>
+      <tr><td><code>correctness_weighted_score(passed, compression_delta, tool_errors, alpha=0.4, beta=0.1) → float</code></td><td>Final score used by the frontier tracker and adaptive cooldown.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Formula</h2>
+  <pre><code>score = (1.0 + α · compression_delta if passed else 0.0) − β · tool_errors
+
+α = 0.4   # reward for compressing the description after a successful solve
+β = 0.1   # penalty per tool error</code></pre>
+  <p>When <code>passed=False</code>, the base term is 0 — compression is ignored because a failed run's "efficient plan" wasn't correct. The tool-error penalty still applies so a failed run with many errors is ranked below a failed run with few.</p>
+
+  <h2>Three-tier tool-error discrimination</h2>
+  <p>The old heuristic substring-matched error markers anywhere in any tool content — which produced false positives whenever a fixture legitimately contained <code>ERROR:</code> / <code>WARN</code> / <code>Traceback</code> tokens (a log-counting challenge's log files, for example). The new <code>count_tool_errors</code> uses three tiers:</p>
+
+  <ol>
+    <li><strong>Data-tool whitelist</strong>: tool-result messages whose <code>name</code> is one of <code>{file_system, recall, knowledge_base, web_search, deep_research, fact_check, postgres_admin}</code> are <em>never</em> counted. Their content is retrieved data, not failure output.</li>
+    <li><strong>Unambiguous patterns</strong> (counted anywhere in content): <code>"Traceback (most recent call last)"</code>, <code>"SYSTEM ERROR: Tool"</code>, <code>"SYSTEM ALERT: You have failed"</code>, <code>"CalledProcessError"</code>, <code>"TimeoutExpired"</code>. These don't collide with fixture text.</li>
+    <li><strong>Line-start prefixes</strong> (counted only when they appear at the start of content, after optional whitespace): <code>Error:, ERROR:, error:, AssertionError, SyntaxError, NameError, IndentationError, ImportError, ModuleNotFoundError</code>. Matches the shape the dispatch layer synthesises for genuine tool failures.</li>
+  </ol>
+
+  <p>The old heuristic would score a legitimate log-counting solve as <code>tool_errors=6</code> (5 file reads + 1 execute whose stdout mentions ERROR); the new one correctly scores it as 0.</p>
+
+  <h2>Why</h2>
+  <p>The previous metric rewarded compression even when the agent solved the wrong problem. This formulation makes correctness mandatory and penalises noisy tool use — but only <em>actual</em> tool noise, not fixture content — so brittle clusters are surfaced accurately to the <a href="../memory/frontier.html">FrontierTracker</a> and the adaptive cooldown.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

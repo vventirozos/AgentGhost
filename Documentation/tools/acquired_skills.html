@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.acquired_skills — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a class="current" href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="../algorithms/skill_acquisition.html">algo: skill acquisition</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / acquired_skills.py</h1>
+  <p class="subtitle">Runtime Python tool creation with TDD validation, persistent file + registry storage, vector embedding, and degradation tracking.</p>
+
+  <h2>Tools</h2>
+  <table>
+    <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>create_skill</code></td><td>Validate test_payload, write the skill to <code>acquired_skills/&lt;name&gt;.py</code>, run TDD via <a href="execute.html"><code>tool_execute</code></a>, persist to <code>skills_registry.json</code>, and embed the description in vector memory.</td></tr>
+      <tr><td><code>manage_skills</code></td><td>List active skills or delete by name.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>AcquiredSkillManager</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>save_skill(name, desc, params_schema, python_code)</code></td><td>Write <code>.py</code> file, MD5-hash <code>code+schema</code> for dedup, update registry, embed description in vector memory only if content changed.</td></tr>
+      <tr><td><code>get_all_skills()</code></td><td>Read <code>skills_registry.json</code>.</td></tr>
+      <tr><td><code>log_telemetry(name, success)</code></td><td>Increment <code>usage_count</code>; reset <code>failure_count</code> on success; flip status to <code>"degraded"</code> after 3 consecutive failures.</td></tr>
+      <tr><td><code>retire_degraded_skills()</code></td><td>Auto-archive skills with <code>failure_count ≥ 3</code> OR (<code>failure_count ≥ 5</code> AND <code>usage_count &lt; 10</code>); move <code>.py</code> to <code>retired/</code>; delete from vector store; remove from active registry.</td></tr>
+      <tr><td><code>delete_skill(name)</code></td><td>Manual remove + delete file + clean vector store.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>TDD validation</h2>
+  <p>The skill is written to <code>test_skill.py</code>, executed with <code>test_payload</code> as <code>sys.argv[1]</code> (parsed as JSON inside the script). The payload must produce <code>EXIT CODE: 0</code> with non-empty stdout. A common failure (forgetting <code>if __name__ == "__main__":</code>) is detected and reported with a specific hint.</p>
+
+  <h2>Storage layout</h2>
+  <pre><code>$GHOST_SANDBOX_DIR/acquired_skills/
+├── &lt;name&gt;.py
+├── retired/
+│   └── &lt;name&gt;.py
+└── skills_registry.json   { name: {description, parameters_schema, usage_count, failure_count, status, content_hash}, ... }</code></pre>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.execute — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a class="current" href="execute.html">execute</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / execute.py</h1>
+  <p class="subtitle">Sandboxed code execution with multiple validation guards and stateful Jupyter support.</p>
+
+  <h2>Tool: <code>execute</code></h2>
+  <p>Three execution modes selected from arguments:</p>
+
+  <h3>1. Bash command (line 32-117)</h3>
+  <ul>
+    <li>Auto-strips invalid <code>cd /sandbox</code> / <code>cd /home/user</code> prefixes.</li>
+    <li>Blocks substantive inline <code>-c</code> scripts (≥120 chars, 2+ statements, has import) and forces the file+execute pattern.</li>
+    <li>Executes via <code>sandbox_manager.execute(bash -c ...)</code> with 300 s timeout.</li>
+  </ul>
+
+  <h3>2. File execution (line 119-494)</h3>
+  <ul>
+    <li>Validates extension: only <code>.py</code>, <code>.sh</code>, <code>.js</code>.</li>
+    <li>Syntax check via <a href="../cli_reference.html#utils"><code>sanitize_code()</code></a>.</li>
+    <li><strong>Forbidden module guard</strong>: rejects imports of native tool modules (<code>knowledge_base</code>, <code>execute</code>, <code>postgres_admin</code>, …).</li>
+    <li><strong>HTML guard</strong>: HTML/CSS detected in a <code>.py</code> file → redirect user to <a href="file_system.html"><code>file_system</code></a>.</li>
+    <li>"Stubbornness" guard: skip rewriting an unchanged file.</li>
+  </ul>
+
+  <h3>3. Stateful Jupyter (line 198-306)</h3>
+  <ul>
+    <li>Boots persistent <code>ipykernel_launcher</code> if not running.</li>
+    <li>Wraps via <code>jupyter_client.BlockingKernelClient</code>.</li>
+    <li>Streams stdout / stderr; detects 5-min timeout or kernel death.</li>
+  </ul>
+
+  <h2>Output handling</h2>
+  <p>Truncates output at 512 KB (head 100 KB + tail 400 KB). Extracts error line numbers and produces snippet context for tracebacks. Diagnostic mode shows the surrounding lines around an error.</p>
+
+  <h2>Return shape</h2>
+  <pre><code>--- EXECUTION RESULT ---
+EXIT CODE: {code}
+STDOUT/STDERR:
+{output}</code></pre>
+
+  <h2>Safety guards summary</h2>
+  <ul>
+    <li>Forbidden imports — regex rejection in Python source.</li>
+    <li>HTML/CSS guard — detects and rejects.</li>
+    <li>SQL injection — out of scope (<a href="database.html">database tool</a> uses parameterised queries).</li>
+    <li>Inline script block — rejects substantive <code>-c</code> usage.</li>
+    <li>Output truncation — head + tail capping.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

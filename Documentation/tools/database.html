@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.database — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a class="current" href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / database.py</h1>
+  <p class="subtitle">PostgreSQL administration with parameterised queries, schema introspection, plan analysis, and pooled connections.</p>
+
+  <h2>Tool: <code>postgres_admin</code></h2>
+  <table>
+    <thead><tr><th>Action</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>query</code></td><td>Run arbitrary SQL with a 15 s statement timeout (configurable). Output clamped to 300 rows. Returns tabulated results from a <code>RealDictCursor</code>.</td></tr>
+      <tr><td><code>schema</code></td><td>Dump <code>information_schema.columns</code> for public tables. Filterable by <code>table_name</code> via parameterised query.</td></tr>
+      <tr><td><code>explain_analyze</code></td><td>Prepend <code>EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)</code> if not already present; runs with the same timeout.</td></tr>
+      <tr><td><code>activity</code></td><td>Selects from <code>pg_stat_activity</code>; bounded to 50 longest-running rows.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Security</h2>
+  <ul>
+    <li>All schema introspection uses parameterised queries (<code>cur.execute(sql, (table_name,))</code>).</li>
+    <li>SQL is passed through <a href="../cli_reference.html#utils"><code>extract_code_from_markdown()</code></a> first so fenced SQL blocks are stripped cleanly.</li>
+    <li>Connection pool with autocommit; broken connections are closed and discarded; the next call opens a fresh one.</li>
+  </ul>
+
+  <h2>DSN</h2>
+  <p>Default DSN comes from <code>--default-db</code> / <code>GHOST_DEFAULT_DB</code>. The tool can be invoked with an alternative DSN per-call.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

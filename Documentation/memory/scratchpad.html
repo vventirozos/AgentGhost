@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.scratchpad — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a class="current" href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / scratchpad.py — Scratchpad</h1>
+  <p class="subtitle">In-memory LRU + optional SQLite persistence with per-entry TTL (default 24 h).</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>OrderedDict in process memory (LRU).</li>
+    <li>Optional SQLite at <code>persist_path/scratchpad.db</code> with table <code>scratchpad(key PK, value JSON, created_at REAL, accessed_at REAL)</code>.</li>
+  </ul>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(max_entries=50, persist_path=None, ttl=86400)</code></td><td>LRU + TTL config.</td></tr>
+      <tr><td><code>set(key, value) -&gt; str</code></td><td>Store; LRU evict if over capacity.</td></tr>
+      <tr><td><code>get(key) -&gt; Optional[Any]</code></td><td>Retrieve; TTL check; refresh <code>accessed_at</code> (sliding-window TTL).</td></tr>
+      <tr><td><code>list_all() / count() / delete(key) / clear()</code></td><td>Standard helpers.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Eviction model</h2>
+  <ul>
+    <li>Age-based: any read computes <code>cutoff = now − ttl</code>; expired entries are deleted lazily.</li>
+    <li>Capacity-based: oldest LRU entry evicted when capacity exceeded.</li>
+    <li>Initial load on startup re-reads only non-expired entries.</li>
+  </ul>
+
+  <p><code>threading.RLock</code> guards in-memory dict + SQLite.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

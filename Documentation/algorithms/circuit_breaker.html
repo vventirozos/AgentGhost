@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Circuit breaker — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="skill_acquisition.html">Skill acquisition</a>
+    <a class="current" href="circuit_breaker.html">Circuit breaker</a>
+  </nav>
+</aside>
+<main>
+  <h1>Circuit breaker for upstream LLM nodes</h1>
+  <p class="subtitle">Fault isolation across the foreground and pool nodes managed by <a href="../core/llm.html">LLMClient</a>.</p>
+
+  <h2>States</h2>
+  <table>
+    <thead><tr><th>State</th><th>Behaviour</th><th>Transition out</th></tr></thead>
+    <tbody>
+      <tr><td>CLOSED</td><td>Healthy. Requests dispatched normally.</td><td>3 consecutive failures → OPEN.</td></tr>
+      <tr><td>OPEN</td><td>Tripped. Node skipped on round-robin selection.</td><td>After 60 s cooldown → HALF.</td></tr>
+      <tr><td>HALF</td><td>Probing. Single request allowed.</td><td>Success → CLOSED. Failure → OPEN.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Pool selection</h2>
+  <p>Round-robin across each pool's nodes. <code>get_worker_node()</code>, <code>get_vision_node()</code>, <code>get_coding_node()</code>, <code>get_image_gen_node()</code> all skip nodes whose breaker is OPEN. If every node in a pool is OPEN, the call falls back to the foreground client (with the same circuit-breaker treatment).</p>
+
+  <h2>Configuration</h2>
+  <pre><code>NodeCircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)</code></pre>
+  <p>State is process-local; restart resets every breaker to CLOSED. There is no persistence file because pool nodes themselves typically come and go between restarts.</p>
+
+  <h2>Failure source</h2>
+  <p>The breaker records both transport failures (httpx exceptions, 5xx) and per-call timeouts (default 1200 s on chat completion calls). Application errors (401, 403) trip the breaker too — the node is unreachable from this process's perspective.</p>
+
+  <h2>Where it shows up in tools</h2>
+  <p><a href="../tools/swarm.html">delegate_to_swarm</a> records success/failure on the corresponding node directly so background workers also feed the breaker.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

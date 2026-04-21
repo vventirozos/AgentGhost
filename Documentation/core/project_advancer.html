@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.project_advancer — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="planning.html">planning</a>
+    <a class="current" href="project_advancer.html">project_advancer</a>
+    <a href="project_safety.html">project_safety</a>
+    <a href="../memory/projects.html">memory.projects</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / project_advancer.py</h1>
+  <p class="subtitle">Single autoadvance tick for long-running projects. Classifies the next task, runs one constrained step, and bookkeeps budget / runtime / contradictions.</p>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>classify_task(description) -&gt; "needs_user" | "coding" | "research"</code></td><td>Keyword-driven classifier (line 85).</td></tr>
+      <tr><td><code>async advance_once(context, project_id, tool_runner, llm_classifier) -&gt; AdvanceResult</code></td><td>One full advancement tick — returns the result of running one task (line 126).</td></tr>
+      <tr><td><code>project_dream_pass(store, llm_summarize)</code></td><td>Consolidate accumulated project events into a daily digest (line 314).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Classification keywords</h2>
+  <ul>
+    <li><strong>needs_user</strong>: <code>decide · approve · sign off · delete production</code>.</li>
+    <li><strong>coding</strong>: <code>implement · build · fix · debug · deploy</code>.</li>
+    <li><strong>research</strong> (default): <code>research · investigate · compare · analyze</code>.</li>
+  </ul>
+
+  <h2>Tick flow</h2>
+  <ol>
+    <li>Load project plan; find next READY/PENDING leaf.</li>
+    <li>Classify task type.</li>
+    <li>Mark IN_PROGRESS.</li>
+    <li>If <code>needs_user</code>: flip to NEEDS_USER, log event, return.</li>
+    <li>Pick tool: coding → <code>execute</code>, research → <code>web_search</code>.</li>
+    <li>Run tool through the injected runner.</li>
+    <li>Store result as a project artifact.</li>
+    <li>Check human-gate postconditions (<a href="project_safety.html">project_safety</a>) → flip to NEEDS_USER if any fire.</li>
+    <li>Detect contradictions with DONE siblings.</li>
+    <li>Mark DONE; increment <code>steps_used</code>; record runtime + tool_calls.</li>
+  </ol>
+
+  <h2>Budget enforcement</h2>
+  <p><code>_get_budget()</code> reads <code>steps_cap / steps_used</code> from project metadata; <code>_increment_budget()</code> bumps after each tick. Checked via <a href="project_safety.html">check_budget()</a> across <code>steps</code>, <code>runtime_seconds</code>, and <code>tool_calls</code>.</p>
+
+  <h2>AdvanceResult</h2>
+  <pre><code>AdvanceResult(ok: bool, task_id: str, classification: str, summary: str, artifact_id: Optional[str])</code></pre>
+
+  <p>Async; tool_runner and llm_classifier are optional callbacks so the advancer can be tested without a real agent.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

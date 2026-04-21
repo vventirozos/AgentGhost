@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Ghost Cyberdeck UI
+Exec=/home/vasilis/bin/launch_ghost.sh
+X-GNOME-Autostart-enabled=true
+NoDisplay=false
+Hidden=false

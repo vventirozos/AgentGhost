@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.projects — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="tasks.html">tasks</a>
+    <a class="current" href="projects.html">projects</a>
+    <a href="../memory/projects.html">memory.projects</a>
+    <a href="../core/project_advancer.html">project_advancer</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / projects.py</h1>
+  <p class="subtitle">Long-term project state management exposed as a single LLM tool.</p>
+
+  <h2>Tool: <code>manage_projects</code></h2>
+  <h3>Project-level actions</h3>
+  <ul>
+    <li><code>create</code> · <code>list</code> · <code>get</code> · <code>switch</code> · <code>exit</code> · <code>update</code> · <code>delete</code> · <code>resume</code> · <code>status</code></li>
+  </ul>
+  <h3>Task-level actions</h3>
+  <ul>
+    <li><code>task_add</code> · <code>task_update</code> · <code>task_decompose</code> · <code>task_next</code> · <code>task_list</code></li>
+  </ul>
+  <h3>Other</h3>
+  <ul>
+    <li><code>artifact_add</code> · <code>event_log</code></li>
+    <li><code>advance</code> — calls <a href="../core/project_advancer.html"><code>advance_once()</code></a> for one autoadvance tick.</li>
+  </ul>
+
+  <h2>Duplicate guard</h2>
+  <p><code>_DUPLICATE_CREATE_WINDOW_SECONDS = None</code> — any non-ARCHIVED project with the same title is reused rather than re-created.</p>
+
+  <p>Persistence model: see <a href="../memory/projects.html">memory.projects</a>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

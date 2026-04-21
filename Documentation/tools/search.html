@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.search — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="file_system.html">file_system</a>
+    <a class="current" href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / search.py</h1>
+  <p class="subtitle">Anonymous web search via DuckDuckGo + Tor, with reformulated fallbacks and multi-source synthesis.</p>
+
+  <h2>Tools</h2>
+  <table>
+    <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>web_search</code></td><td>DDG search via <code>ddgs</code> with Tor SOCKS proxy. 3 retries on transient errors. <code>request_new_tor_identity()</code> is called on 401/403/503 to rotate Tor circuits.</td></tr>
+      <tr><td><code>deep_research</code></td><td>Searches multiple reformulations and synthesises results via the LLM. Falls back to <code>web_search</code> when synthesis fails.</td></tr>
+      <tr><td><code>fact_check</code></td><td>Verifies a claim by calling <code>deep_research</code> as a sub-process.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Reformulation strategy</h2>
+  <ol>
+    <li>Drop years / version numbers / numbers from the query (broaden).</li>
+    <li>Convert to a question form (<code>"how to X"</code>).</li>
+    <li>Append <code>tutorial</code> / <code>guide</code> / <code>example</code>.</li>
+  </ol>
+
+  <h2>Output cleaning</h2>
+  <p><code>_clean_for_cpp</code> preserves valid JSON but strips control characters and structural braces from non-JSON text. This prevents the C++ JSON parser inside llama.cpp from crashing on stray <code>{…}</code> in scraped page bodies.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

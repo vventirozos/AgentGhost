@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>api.routes — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>API</h3>
+    <a class="current" href="routes.html">routes</a>
+    <a href="projects_routes.html">projects routes</a>
+    <h3>Related</h3>
+    <a href="../core/agent.html">core.agent</a>
+    <a href="../interfaces/web_server.html">web server</a>
+  </nav>
+</aside>
+<main>
+  <h1>api / routes.py</h1>
+  <p class="subtitle">All HTTP routes mounted on the FastAPI app. Ollama-compatible plus Ghost-specific.</p>
+
+  <h2>Auth</h2>
+  <p>Every authed route validates the <code>X-Ghost-Key</code> header against <code>request.app.state.args.api_key</code> (which defaults to <code>$GHOST_API_KEY</code> or <code>ghost-secret-123</code>).</p>
+
+  <h2>CORS</h2>
+  <p>Wildcard origin (<code>allow_origins=["*"]</code>) with credentials disabled. No cookies — auth is header-only.</p>
+
+  <h2>Endpoints</h2>
+  <table>
+    <thead><tr><th>Method · Path</th><th>Auth</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>GET / · HEAD /</td><td>—</td><td>Returns plain text <code>"Ollama is running"</code>. Compatibility shim.</td></tr>
+      <tr><td>GET /api/version</td><td>—</td><td><code>{"version": "0.1.24"}</code>.</td></tr>
+      <tr><td>POST /api/show</td><td>—</td><td>Ollama-compatible model metadata (<code>family: qwen3</code>, <code>format: gguf</code>).</td></tr>
+      <tr><td>GET /api/tags</td><td>—</td><td>Lists models from <code>app.state.args.model</code>.</td></tr>
+      <tr><td>GET /v1/models</td><td>X-Ghost-Key</td><td>OpenAI-style model list.</td></tr>
+      <tr><td>POST /api/generate</td><td>X-Ghost-Key</td><td>Ollama-style single-prompt completion. Internally rewritten to a chat-completion call. Streaming NDJSON or single JSON.</td></tr>
+      <tr><td>POST /chat · POST /v1/chat/completions · POST /api/chat</td><td>X-Ghost-Key</td><td><strong>Main chat endpoint.</strong> Streaming SSE with <code>X-Request-ID</code> correlation header, or JSON when <code>stream=false</code>. Calls <code>agent.handle_chat(body, background_tasks, request_id=...)</code>. Errors shaped as <code>{"error": {"message", "type"}}</code>.</td></tr>
+      <tr><td>POST /api/workspace/save</td><td>X-Ghost-Key</td><td>Packages chat history + scratchpad + sandbox into a streaming zip (64 KB chunks).</td></tr>
+      <tr><td>POST /api/workspace/load</td><td>X-Ghost-Key</td><td>Restores from uploaded zip (100 MB cap, zip-slip protection). Clears sandbox but preserves <code>acquired_skills/</code>.</td></tr>
+      <tr><td>POST /api/upload</td><td>X-Ghost-Key</td><td>Upload a file into the sandbox. Path validated (no <code>..</code>, no absolute paths). 100 MB cap.</td></tr>
+      <tr><td>GET /api/download/{filename:path}</td><td>X-Ghost-Key</td><td>Stream a sandbox file. Path traversal guard.</td></tr>
+      <tr><td>{any other path}</td><td>X-Ghost-Key</td><td><strong>Catch-all proxy</strong> — forwards unknown requests upstream via <code>agent.context.llm_client.http_client</code>. Detects streaming from <code>stream: true</code> JSON body. Sets <code>X-Accel-Buffering: no</code> for SSE so nginx doesn't buffer.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Sequence diagram</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg" font-size="12">
+      <rect width="800" height="280" fill="#131822"/>
+      <line x1="100" y1="40" x2="100" y2="260" stroke="#7aa7ff" stroke-width="1.5"/>
+      <line x1="320" y1="40" x2="320" y2="260" stroke="#7aa7ff" stroke-width="1.5"/>
+      <line x1="540" y1="40" x2="540" y2="260" stroke="#7aa7ff" stroke-width="1.5"/>
+      <line x1="720" y1="40" x2="720" y2="260" stroke="#7aa7ff" stroke-width="1.5"/>
+
+      <rect x="60" y="20" width="80" height="20" fill="#0c0f14" stroke="#7aa7ff" rx="4"/>
+      <text x="100" y="35" text-anchor="middle" fill="#e6e9ef" font-size="11">client</text>
+      <rect x="280" y="20" width="80" height="20" fill="#0c0f14" stroke="#7aa7ff" rx="4"/>
+      <text x="320" y="35" text-anchor="middle" fill="#e6e9ef" font-size="11">routes</text>
+      <rect x="500" y="20" width="80" height="20" fill="#0c0f14" stroke="#7aa7ff" rx="4"/>
+      <text x="540" y="35" text-anchor="middle" fill="#e6e9ef" font-size="11">GhostAgent</text>
+      <rect x="680" y="20" width="80" height="20" fill="#0c0f14" stroke="#7aa7ff" rx="4"/>
+      <text x="720" y="35" text-anchor="middle" fill="#e6e9ef" font-size="11">upstream LLM</text>
+
+      <line x1="100" y1="80" x2="320" y2="80" stroke="#5dd39e"/>
+      <text x="210" y="75" text-anchor="middle" fill="#9aa3b2" font-size="10">POST /api/chat</text>
+
+      <line x1="320" y1="110" x2="540" y2="110" stroke="#5dd39e"/>
+      <text x="430" y="105" text-anchor="middle" fill="#9aa3b2" font-size="10">handle_chat()</text>
+
+      <line x1="540" y1="140" x2="720" y2="140" stroke="#b894ff"/>
+      <text x="630" y="135" text-anchor="middle" fill="#9aa3b2" font-size="10">stream completions</text>
+
+      <line x1="720" y1="170" x2="540" y2="170" stroke="#ffb454" stroke-dasharray="3 3"/>
+      <text x="630" y="165" text-anchor="middle" fill="#9aa3b2" font-size="10">tokens (SSE)</text>
+
+      <line x1="540" y1="200" x2="320" y2="200" stroke="#ffb454" stroke-dasharray="3 3"/>
+      <text x="430" y="195" text-anchor="middle" fill="#9aa3b2" font-size="10">cleaned chunks</text>
+
+      <line x1="320" y1="230" x2="100" y2="230" stroke="#ffb454" stroke-dasharray="3 3"/>
+      <text x="210" y="225" text-anchor="middle" fill="#9aa3b2" font-size="10">SSE response</text>
+    </svg>
+    <p class="caption">Figure 9 — End-to-end chat request.</p>
+  </div>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

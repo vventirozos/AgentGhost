@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.llm — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="agent_qwen.html">agent_qwen</a>
+    <a class="current" href="llm.html">llm</a>
+    <a href="planning.html">planning</a>
+    <a href="prompts.html">prompts</a>
+    <a href="bus.html">bus</a>
+    <a href="context_manager.html">context_manager</a>
+    <a href="dream.html">dream</a>
+    <a href="mcts.html">mcts</a>
+    <a href="hypothesis.html">hypothesis</a>
+    <a href="verifier.html">verifier</a>
+    <a href="uncertainty.html">uncertainty</a>
+    <a href="workspace_model.html">workspace_model</a>
+    <a href="self_play_scoring.html">self_play_scoring</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="project_safety.html">project_safety</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / llm.py</h1>
+  <p class="subtitle">Multi-pool LLM orchestrator. Owns httpx async clients, round-robin scheduling, and per-node circuit breakers.</p>
+
+  <h2>Pool topology</h2>
+  <p>Six logical pools, each backed by zero-or-more <code>(url, model)</code> nodes plus the always-present foreground client.</p>
+  <table>
+    <thead><tr><th>Pool</th><th>Used for</th><th>Selector</th></tr></thead>
+    <tbody>
+      <tr><td>foreground</td><td>Default chat completion</td><td><code>chat_completion()</code> with no flags</td></tr>
+      <tr><td>swarm</td><td>Parallel inference / fan-out</td><td><code>chat_completion(use_swarm=True)</code></td></tr>
+      <tr><td>worker</td><td>Cheap classifier / verifier sub-tasks</td><td><code>route(task, ...)</code></td></tr>
+      <tr><td>visual</td><td>Multi-modal (image / PDF)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
+      <tr><td>coding</td><td>Code-specialist generation</td><td><code>chat_completion(use_coding=True)</code></td></tr>
+      <tr><td>image_gen</td><td>SDXL image generation</td><td><code>generate_image()</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Routing tasks</h2>
+  <p>The <code>RoutingTask</code> enum at line 71 advertises the labels worker pools can fulfil:</p>
+  <ul>
+    <li><code>VALIDATE_TOOL_ARGS</code> — quick JSON-schema sanity check.</li>
+    <li><code>EXPAND_QUERY</code> — sub-query decomposition for memory hydration.</li>
+    <li><code>CLASSIFY_INTENT</code> — factual vs procedural vs contextual.</li>
+    <li><code>SCORE_RELEVANCE</code> — re-rank candidate documents.</li>
+    <li><code>REPAIR_JSON</code> — coerce a malformed payload back to valid JSON.</li>
+    <li><code>VERIFY</code> — used by <a href="verifier.html">Verifier</a>.</li>
+  </ul>
+
+  <h2>Circuit breaker</h2>
+  <p><code>NodeCircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)</code> tracks per-node state:</p>
+  <div class="diagram">
+    <svg viewBox="0 0 700 240" xmlns="http://www.w3.org/2000/svg" font-size="12">
+      <rect width="700" height="240" fill="#131822"/>
+      <defs><marker id="b1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1.5 L9,5 L0,8.5 Z" fill="rgba(122,167,255,0.9)"/></marker></defs>
+      <circle cx="120" cy="120" r="55" fill="#1a2030" stroke="#5dd39e" stroke-width="2"/>
+      <text x="120" y="115" text-anchor="middle" fill="#5dd39e" font-weight="700">CLOSED</text>
+      <text x="120" y="135" text-anchor="middle" fill="#9aa3b2" font-size="10">healthy</text>
+
+      <circle cx="350" cy="120" r="55" fill="#1a2030" stroke="#ff6e6e" stroke-width="2"/>
+      <text x="350" y="115" text-anchor="middle" fill="#ff6e6e" font-weight="700">OPEN</text>
+      <text x="350" y="135" text-anchor="middle" fill="#9aa3b2" font-size="10">tripped</text>
+
+      <circle cx="580" cy="120" r="55" fill="#1a2030" stroke="#ffb454" stroke-width="2"/>
+      <text x="580" y="115" text-anchor="middle" fill="#ffb454" font-weight="700">HALF</text>
+      <text x="580" y="135" text-anchor="middle" fill="#9aa3b2" font-size="10">probing</text>
+
+      <line x1="175" y1="120" x2="295" y2="120" stroke="#7aa7ff" marker-end="url(#b1)"/>
+      <text x="235" y="110" text-anchor="middle" fill="#9aa3b2" font-size="10">3 failures</text>
+
+      <line x1="405" y1="120" x2="525" y2="120" stroke="#7aa7ff" marker-end="url(#b1)"/>
+      <text x="465" y="110" text-anchor="middle" fill="#9aa3b2" font-size="10">cooldown 60 s</text>
+
+      <path d="M580 65 Q 350 30 120 65" fill="none" stroke="#5dd39e" stroke-dasharray="3 3" marker-end="url(#b1)"/>
+      <text x="350" y="38" text-anchor="middle" fill="#5dd39e" font-size="10">success</text>
+
+      <path d="M520 175 Q 350 220 180 175" fill="none" stroke="#ff6e6e" stroke-dasharray="3 3" marker-end="url(#b1)"/>
+      <text x="350" y="220" text-anchor="middle" fill="#ff6e6e" font-size="10">failure → re-OPEN</text>
+    </svg>
+    <p class="caption">Figure 3 — <code>NodeCircuitBreaker</code> state diagram.</p>
+  </div>
+
+  <h2>HTTP client</h2>
+  <p>One <code>httpx.AsyncClient</code> per node with:</p>
+  <div class="kv">
+    <dt>timeout</dt><dd>1 200 s — long-context generations can run for many minutes.</dd>
+    <dt>limits</dt><dd>3 keep-alive, 15 total connections per node.</dd>
+    <dt>keep-alive expiry</dt><dd>30 s.</dd>
+    <dt>proxy</dt><dd>Tor SOCKS proxy used if <code>tor_proxy</code> set in constructor.</dd>
+    <dt>headers</dt><dd>Forwards <code>X-Ghost-Key</code> when calling other Ghost Agent instances.</dd>
+  </div>
+
+  <h2>Public methods</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>async chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, timeout)</code></td><td>Pool-aware dispatch. Falls back across nodes when a circuit is OPEN.</td></tr>
+      <tr><td><code>async route(task, payload, max_tokens=128, temperature=0.0, fallback=None)</code></td><td>Send a small classification / repair task to the worker pool with a low max_tokens to keep cost down.</td></tr>
+      <tr><td><code>async generate_image(payload)</code></td><td>POST to a node from the <code>image_gen</code> pool; returns base64 PNG.</td></tr>
+      <tr><td><code>get_*_node()</code></td><td>Round-robin selection helpers (worker / vision / coding / image_gen).</td></tr>
+      <tr><td><code>async close()</code></td><td>Closes all underlying httpx clients on lifespan shutdown.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Concurrency model</h2>
+  <ul>
+    <li>Fully async; <code>asyncio.Semaphore(3)</code> caps concurrent background routing tasks.</li>
+    <li>Per-node httpx <code>AsyncClient</code> means a single failing node cannot starve the others.</li>
+    <li>The breaker is process-local — restart resets state.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

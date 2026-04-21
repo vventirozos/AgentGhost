@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.vision — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a class="current" href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / vision.py</h1>
+  <p class="subtitle">Multi-modal analysis via the visual LLM pool. PDF rasterisation to JPEG; URL or file inputs.</p>
+
+  <h2>Tool: <code>vision_analysis</code></h2>
+  <p>Auto-registered when the LLM client supports vision.</p>
+  <table>
+    <thead><tr><th>Action</th><th>Default prompt</th></tr></thead>
+    <tbody>
+      <tr><td><code>graph_analysis</code></td><td>Analyse this graph/chart. Extract key data points, trends, legends, and conclusions.</td></tr>
+      <tr><td><code>describe_picture</code></td><td>Describe this image in high detail. Mention objects, text, people, colors, and layout.</td></tr>
+      <tr><td><code>extract_text_picture</code></td><td>Extract all text from this image exactly as written (OCR).</td></tr>
+      <tr><td><code>extract_text_pdf</code></td><td>Extract all text and describe any diagrams from these document pages exactly as written.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>PDF handling</h2>
+  <p>PyMuPDF rasterises the first 10 pages at 2× zoom to JPEG; otherwise the host's vision LLM would balloon context. A single image file is base64-encoded directly.</p>
+
+  <h2>Execution</h2>
+  <p>Calls <code>llm_client.chat_completion({"messages": [...]}, use_vision=True)</code>. Returns <code>"VISION ANALYSIS RESULT:\n{response}"</code>.</p>
+
+  <h2>Safety</h2>
+  <ul>
+    <li>50 MB host file cap.</li>
+    <li>Path-traversal guard via <a href="file_system.html"><code>_get_safe_path</code></a>.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

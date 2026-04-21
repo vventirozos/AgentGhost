@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.swarm — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a class="current" href="swarm.html">swarm</a>
+    <a href="../core/llm.html">core.llm</a>
+    <a href="../algorithms/circuit_breaker.html">circuit breaker</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / swarm.py</h1>
+  <p class="subtitle">Fire-and-forget background task dispatch to swarm nodes with optional blocking await.</p>
+
+  <h2>Tool: <code>delegate_to_swarm</code></h2>
+  <h3>Args</h3>
+  <ul>
+    <li><code>tasks</code>: array of <code>{instruction, input_data, output_key, [worker_persona], [target_model]}</code>.</li>
+    <li><code>await_results</code>: bool — false for fire-and-forget, true to block until all complete.</li>
+  </ul>
+
+  <h2>Execution</h2>
+  <ol>
+    <li>For each task, spawn a <code>_swarm_worker</code> coroutine with 2 retries and exponential backoff.</li>
+    <li>POST to <code>node["client"].post("/v1/chat/completions", {messages:[system: persona, user: instruction + input_data]})</code>.</li>
+    <li>On success, write the response into <a href="../memory/scratchpad.html">scratchpad</a> at <code>output_key</code>.</li>
+    <li>Record success/failure with the per-node <a href="../algorithms/circuit_breaker.html">circuit breaker</a>.</li>
+  </ol>
+
+  <h2>Registry</h2>
+  <p><code>_swarm_task_registry</code> tracks <code>asyncio.Task</code> objects by id and auto-cleans via a done callback.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

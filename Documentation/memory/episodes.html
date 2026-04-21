@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.episodes — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a class="current" href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / episodes.py — EpisodicMemory</h1>
+  <p class="subtitle">Structured episodes — sequences of actions and outcomes — with optional vector search for trigger similarity.</p>
+
+  <h2>Storage</h2>
+  <p>SQLite at <code>memory_dir/episodic_memory.db</code>; <code>threading.RLock</code> guards all access.</p>
+
+  <h2>Tables</h2>
+  <h3>episodes</h3>
+  <table>
+    <thead><tr><th>Column</th><th>Type</th></tr></thead>
+    <tbody>
+      <tr><td>id</td><td>INTEGER PK</td></tr>
+      <tr><td>trigger / context / outcome / lesson / cluster_id</td><td>TEXT</td></tr>
+      <tr><td>outcome_success</td><td>0/1</td></tr>
+      <tr><td>timestamp</td><td>REAL</td></tr>
+      <tr><td>consolidated</td><td>0/1</td></tr>
+    </tbody>
+  </table>
+  <p>Indexes on trigger, cluster_id, timestamp.</p>
+
+  <h3>episode_actions</h3>
+  <table>
+    <thead><tr><th>Column</th><th>Type</th></tr></thead>
+    <tbody>
+      <tr><td>id</td><td>INTEGER PK</td></tr>
+      <tr><td>episode_id</td><td>FK → episodes.id</td></tr>
+      <tr><td>action_order</td><td>INT</td></tr>
+      <tr><td>tool_name</td><td>TEXT</td></tr>
+      <tr><td>tool_args</td><td>JSON</td></tr>
+      <tr><td>result</td><td>TEXT</td></tr>
+      <tr><td>success</td><td>0/1</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Retention</h2>
+  <p><code>MAX_EPISODES = 500</code>. When exceeded the oldest non-lesson, non-consolidated episodes are deleted first. <code>MAX_ACTIONS_PER_EPISODE = 20</code>.</p>
+
+  <h2>Public API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>record_episode(trigger, context, actions, outcome, success, lesson, cluster_id) -&gt; int</code></td><td>Insert episode + action rows; return id.</td></tr>
+      <tr><td><code>search_similar(trigger, limit, vector_memory=None) -&gt; list[dict]</code></td><td>Vector search if <code>vector_memory</code> available; else substring match.</td></tr>
+      <tr><td><code>search_by_outcome(success, limit)</code></td><td>Filter by success/failure.</td></tr>
+      <tr><td><code>search_recoveries(error_context, limit, vector_memory=None)</code></td><td>Find recovery strategies for similar past errors.</td></tr>
+      <tr><td><code>get_episode(id)</code></td><td>Full episode + actions.</td></tr>
+      <tr><td><code>get_recent_episodes(limit)</code></td><td>Most recent episodes (no actions).</td></tr>
+      <tr><td><code>get_episodes_by_cluster(cluster_id, limit)</code></td><td>Cluster-grouped.</td></tr>
+      <tr><td><code>mark_consolidated(ids)</code> / <code>get_unconsolidated(limit)</code></td><td>Dream-cycle markers.</td></tr>
+      <tr><td><code>format_for_context(episodes, max_chars)</code></td><td>LLM-injection format.</td></tr>
+      <tr><td><code>count()</code></td><td>Total episodes.</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Skill acquisition — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a class="current" href="skill_acquisition.html">Skill acquisition</a>
+    <a href="circuit_breaker.html">Circuit breaker</a>
+  </nav>
+</aside>
+<main>
+  <h1>Skill acquisition</h1>
+  <p class="subtitle">Two parallel paths: <code>create_skill</code> writes permanent Python tools; self-play writes retrieval-aware lessons. Both flow into the same utility-ranked retention.</p>
+
+  <h2>Path A: <code>create_skill</code> — permanent Python tools</h2>
+  <ol>
+    <li>The LLM emits <code>create_skill(name, description, parameters_schema, python_code, test_payload)</code>.</li>
+    <li>The skill body is written to <code>$GHOST_SANDBOX_DIR/acquired_skills/&lt;name&gt;.py</code>.</li>
+    <li><strong>TDD validation</strong> — the file is executed via <a href="../tools/execute.html"><code>execute</code></a> with <code>test_payload</code> JSON-encoded as <code>sys.argv[1]</code>. The skill must produce <code>EXIT CODE: 0</code> with non-empty stdout. If it fails, registration is rejected.</li>
+    <li>Persisted into <code>skills_registry.json</code> with <code>status="active"</code>, <code>usage_count=0</code>, <code>failure_count=0</code>, and a content hash.</li>
+    <li>The description is embedded into <a href="../memory/vector.html">VectorMemory</a> with <code>metadata.type = "acquired_skill"</code>.</li>
+  </ol>
+
+  <h3>Routing</h3>
+  <p>On each turn, <a href="../tools/registry.html"><code>registry.get_active_tool_definitions(query)</code></a> queries vector memory for skills semantically related to the user query and injects only those into the LLM-facing tool list. This keeps the prompt short while still giving the LLM access to the entire archive.</p>
+
+  <h3>Telemetry</h3>
+  <p>Each invocation calls <code>manager.log_telemetry(name, success)</code>:</p>
+  <ul>
+    <li>Successful run: bump <code>usage_count</code>, reset <code>failure_count</code>.</li>
+    <li>Failure: bump <code>failure_count</code>; after 3 consecutive failures status flips to <code>"degraded"</code>.</li>
+  </ul>
+
+  <h3>Retire</h3>
+  <p><code>retire_degraded_skills()</code> archives any skill matching <code>failure_count ≥ 3</code> OR (<code>failure_count ≥ 5</code> AND <code>usage_count &lt; 10</code>). Retired skills move to <code>acquired_skills/retired/</code> and are removed from both the active registry and the vector store so they no longer appear in semantic routing.</p>
+
+  <h2>Path B: Self-play lessons</h2>
+  <p>Dream-cycle self-play writes lessons into the <a href="../memory/skills.html">SkillMemory</a> playbook, subject to a three-gate extraction pipeline designed to prevent overfit or unhelpful entries.</p>
+
+  <ol>
+    <li><strong>Extract</strong> — <code>Dreamer._extract_structured_lesson</code> runs a meta-cognitive LLM call returning <code>{trigger, anti_pattern, correct_pattern, domains, confidence, source_challenge_hash}</code>. The prompt requires task-class triggers, forbids copying fixture literals, and mandates a non-empty taxonomy-compliant domain set.</li>
+    <li><strong>Generalization guard</strong> — <code>Dreamer._generalization_guard</code> uses token n-gram overlap (<code>_GENERALIZATION_MIN_NGRAM = 6</code>) to reject lessons that restate the challenge or copy-paste constants from the setup / validator. Empty triggers, empty correct-patterns, and off-taxonomy domains are also rejected here.</li>
+    <li><strong>Verification</strong> — <code>Dreamer._verify_lesson_helpful</code> re-runs the solver once with the lesson prepended under the production <code>### SKILL PLAYBOOK:</code> header. The lesson is marked <code>verified=True</code> only if the outcome strictly improves (original-fail → verify-pass, or original ≥ 2 attempts → verify on attempt 1). Verified lessons pin in the playbook regardless of retrieval stats.</li>
+  </ol>
+
+  <h3>Retrieval feedback loop</h3>
+  <ul>
+    <li><code>SkillMemory.get_playbook_context(query)</code> — vector-search (distance &lt; 0.45) + BM25-lite re-rank, top 5 injected under the <code>### SKILL PLAYBOOK:</code> header in both the planner and execution system prompts.</li>
+    <li><code>record_retrieval(trigger)</code> fires on every injection and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — lets us answer "is this self-play lesson ever actually used?" empirically.</li>
+    <li><code>record_helpful_retrieval(trigger)</code> / <code>credit_recent_retrievals(window_seconds=300)</code> bump <code>helpful_retrievals</code> when a turn succeeds shortly after a lesson was surfaced.</li>
+    <li><code>prune_low_utility(min_retrievals=5, max_drop_fraction=0.25)</code> drops lessons that have been surfaced many times but never marked helpful — non-verified only.</li>
+  </ul>
+
+  <h3>Retention formula</h3>
+  <pre><code>utility = confidence·0.5 + hit_rate·0.8 + (0.3 if verified) + log(freq)·0.1 + stale_penalty</code></pre>
+  <p>Playbook capped at <code>PLAYBOOK_MAX = 50</code>. Trim order: head pin → verified pins → highest-utility unverified.</p>
+
+  <h3>User-facing surface</h3>
+  <p>The <code>list_lessons(scope, limit)</code> tool exposes the playbook directly. Phrases like <em>"what did you learn today?"</em> / <em>"what have you learned so far?"</em> are routed to this tool via <a href="../core/prompts.html">SYSTEM_PROMPT</a>. Read-only surface tools (<code>list_lessons</code>, <code>recall</code>, <code>manage_skills</code>) discharge the meta-task compliance nudge so the agent doesn't loop writing redundant no-op skills just to satisfy the "did you call learn_skill?" check.</p>
+
+  <h2>Composed skills</h2>
+  <p>Recurring tool-call sequences are pulled into <a href="../tools/composed_skills.html">ComposedSkill</a> macros. A composed skill defines steps with parameter templates and conditional branches, executed via <code>execute(skill_name, executor_fn, params)</code>. Up to 50 composed skills are kept; the least-used is evicted on overflow.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.agent — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a class="current" href="agent.html">agent</a>
+    <a href="agent_qwen.html">agent_qwen</a>
+    <a href="llm.html">llm</a>
+    <a href="planning.html">planning</a>
+    <a href="prompts.html">prompts</a>
+    <a href="bus.html">bus</a>
+    <a href="context_manager.html">context_manager</a>
+    <a href="dream.html">dream</a>
+    <a href="mcts.html">mcts</a>
+    <a href="hypothesis.html">hypothesis</a>
+    <a href="verifier.html">verifier</a>
+    <a href="uncertainty.html">uncertainty</a>
+    <a href="workspace_model.html">workspace_model</a>
+    <a href="self_play_scoring.html">self_play_scoring</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="project_safety.html">project_safety</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / agent.py</h1>
+  <p class="subtitle">The reasoning loop. Drives streaming chat completion, parses tool-call XML, dispatches tools, and re-injects results.</p>
+
+  <h2>Purpose</h2>
+  <p><code>GhostAgent</code> is the orchestrator that the FastAPI route hands a chat payload to. It owns the turn loop: it asks the upstream LLM for a streaming completion, watches the stream for <code>&lt;tool_call&gt;</code> XML blocks, parses arguments, runs the tool against the registry, captures output, and folds the result back into the conversation as a tool message. Sampling temperature, top-p, and the size of the "thinking" budget are all derived dynamically from a query classifier.</p>
+
+  <h2>Public surface (selected)</h2>
+  <table>
+    <thead><tr><th>Symbol</th><th>Signature / type</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>GhostAgent.__init__</code></td><td><code>(context: GhostContext)</code></td><td>Captures all subsystems via <code>context</code>: LLM client, sandbox, memory bus, planner, MCTS, verifier, uncertainty tracker, scratchpad, scheduler, project store.</td></tr>
+      <tr><td><code>GhostAgent.handle_chat</code></td><td><code>async (body: dict, background_tasks, request_id: str)</code></td><td>Entry point invoked by <code>/api/chat</code>. Returns a <code>StreamingResponse</code> generator (when <code>stream=true</code>) or a JSON body. Owns the turn loop.</td></tr>
+      <tr><td><code>_classify_coding_task</code></td><td><code>(query: str) -&gt; "creative" | "precise" | "balanced"</code></td><td>Keyword-based classifier (line 84) that picks the sampling profile.</td></tr>
+      <tr><td><code>classify_thinking_budget</code></td><td><code>(query, has_coding_intent, is_meta_task, in_active_project) -&gt; "tight" | "extended" | "selfplay"</code></td><td>Selects which think-block budget prompt to inject (line 155).</td></tr>
+      <tr><td><code>get_sampling_params</code></td><td><code>(is_tool_turn, query, is_coding) -&gt; dict</code></td><td>Returns temperature / top_p / top_k / presence_penalty appropriate for the situation (line 210).</td></tr>
+      <tr><td><code>_find_substantive_tool_for_verifier</code></td><td><code>(tools_run) -&gt; Optional[dict]</code></td><td>Skips bookkeeping tools (<code>scratchpad</code>, <code>manage_projects</code>, …) when picking evidence to hand the verifier.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Sampling profiles</h2>
+  <table>
+    <thead><tr><th>Profile</th><th>Temperature</th><th>top_p</th><th>top_k / extras</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td><code>CODING_SAMPLING_PARAMS</code></td><td>0.6</td><td>0.95</td><td>top_k=20</td><td>"precise" coding turns; tool turns; SQL/regex/algorithm intents.</td></tr>
+      <tr><td><code>GENERAL_SAMPLING_PARAMS</code></td><td>1.0</td><td>—</td><td>presence_penalty=1.5</td><td>Free-form / creative turns.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Thinking budgets</h2>
+  <p>Set via <code>core/prompts.py</code> and selected per turn:</p>
+  <ul>
+    <li><strong>tight</strong> — ≤5 sentences, no brainstorming. Default for short answers.</li>
+    <li><strong>extended</strong> — ~15 sentences for debugging / SQL / algorithm work. Forbids drafting code inside the think block.</li>
+    <li><strong>selfplay</strong> — ≤6 bullet points; cheap fast loop used in dream / self-play synthetic exercises.</li>
+  </ul>
+  <p>The <code>_EXTENDED_THINK_KEYWORDS</code> list (agent.py:103) decides which user queries trigger the extended budget.</p>
+
+  <h2>Constants</h2>
+  <div class="kv">
+    <dt>MAX_THINKING_CHARS</dt><dd>32 000 (line 242)</dd>
+    <dt>MAX_THINKING_CHARS_EXTENDED</dt><dd>64 000 (line 243)</dd>
+    <dt>DEFAULT_TOOL_TURN_MAX_TOKENS</dt><dd>16 384 (line 262)</dd>
+    <dt>_BOOKKEEPING_TOOL_NAMES</dt><dd><code>{"manage_projects","scratchpad",…}</code> excluded from the verifier evidence search.</dd>
+  </div>
+
+  <h2>Turn flow</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 900 480" xmlns="http://www.w3.org/2000/svg" font-size="12">
+      <rect width="900" height="480" fill="#131822"/>
+      <defs>
+        <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M0,1.5 L9,5 L0,8.5 Z" fill="rgba(122,167,255,0.9)"/>
+        </marker>
+      </defs>
+      <rect x="40" y="20" width="820" height="50" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="450" y="50" text-anchor="middle" fill="#e6e9ef">handle_chat(body) — auth, request_id, ContextVar set</text>
+
+      <rect x="40" y="90" width="380" height="50" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="230" y="120" text-anchor="middle" fill="#e6e9ef">MemoryBus.hydrate_context (RRF fan-out)</text>
+
+      <rect x="480" y="90" width="380" height="50" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="670" y="120" text-anchor="middle" fill="#e6e9ef">classify_thinking_budget + get_sampling_params</text>
+
+      <rect x="40" y="160" width="820" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="450" y="190" text-anchor="middle" fill="#e6e9ef">ContextManager.compress_if_needed (L0..L4 progressive compression)</text>
+
+      <rect x="40" y="230" width="820" height="50" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="450" y="260" text-anchor="middle" fill="#e6e9ef">LLMClient.chat_completion(stream=True) — upstream + circuit breaker</text>
+
+      <rect x="40" y="300" width="380" height="50" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="230" y="330" text-anchor="middle" fill="#e6e9ef">Stream parser: collect &lt;tool_call&gt; XML</text>
+      <rect x="480" y="300" width="380" height="50" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="670" y="330" text-anchor="middle" fill="#e6e9ef">Tool dispatch via registry (sandboxed)</text>
+
+      <rect x="40" y="370" width="380" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="230" y="400" text-anchor="middle" fill="#e6e9ef">tool_failure.classify → retry / fatal / diagnostic</text>
+      <rect x="480" y="370" width="380" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="670" y="400" text-anchor="middle" fill="#e6e9ef">Verifier (worker pool) — confirm/refute substantive tool result</text>
+
+      <line x1="450" y1="70" x2="450" y2="90" stroke="#7aa7ff" marker-end="url(#a1)"/>
+      <line x1="450" y1="140" x2="450" y2="160" stroke="#7aa7ff" marker-end="url(#a1)"/>
+      <line x1="450" y1="210" x2="450" y2="230" stroke="#7aa7ff" marker-end="url(#a1)"/>
+      <line x1="450" y1="280" x2="450" y2="300" stroke="#7aa7ff" marker-end="url(#a1)"/>
+      <line x1="450" y1="350" x2="450" y2="370" stroke="#7aa7ff" marker-end="url(#a1)"/>
+      <line x1="450" y1="420" x2="450" y2="445" stroke="#7aa7ff"/>
+      <text x="455" y="465" fill="#9aa3b2" font-size="10">→ next iteration or final SSE chunk</text>
+    </svg>
+    <p class="caption">Figure 2 — Per-turn dispatch within <code>GhostAgent.handle_chat</code>.</p>
+  </div>
+
+  <h2>Concurrency</h2>
+  <p>Single-task asyncio. The streaming generator is consumed inside the FastAPI request task; tool execution is awaited inline (the tool itself may use threads / subprocess). The agent does <em>not</em> spawn parallel turns — concurrency lives in <a href="bus.html">MemoryBus</a> (parallel hydration) and <a href="llm.html">LLMClient</a> (parallel pool dispatch).</p>
+
+  <h2>Self-play control hooks</h2>
+  <p><code>handle_chat</code> carries two small but load-bearing hooks that coordinate with the self-play subsystem:</p>
+  <ul>
+    <li><strong>Continuous-loop interrupt</strong> — at the top of every turn, if <code>context.selfplay_loop_task</code> is active, the incoming user message flips <code>context.selfplay_loop_stop</code>. The background loop checks the event at each cycle boundary and during cool-off, so the loop pauses cleanly before answering the user.</li>
+    <li><strong>Perfect-It skip during simulation</strong> — the Perfect-It follow-up LLM call (which writes optimisation suggestions into <a href="../memory/skills.html">SkillMemory</a>) is gated on <code>getattr(ctx.skill_memory, "is_read_only", False) is True</code>. During self-play the isolated context's <code>ReadOnlySkillMemory</code> class carries that marker; the block is skipped entirely so the ~15 s follow-up LLM call and its misleading "Saved optimization strategy to playbook" log don't fire on no-op writes.</li>
+  </ul>
+
+  <h2>Checklist nudge &amp; read-only tool exemption</h2>
+  <p>The agent's meta-task compliance nudge (<em>"you mentioned learning but didn't call learn_skill"</em>) is intentionally suppressed when the turn's tools include a <strong>read-only surface tool</strong> — <code>list_lessons</code>, <code>recall</code>, <code>manage_skills</code>. Otherwise a user query like "what have you learned today?" would loop for 5+ turns as the nudge pushes the agent to write a redundant skill it just deduplicates. The exemption keeps "surface a lesson" distinct from "persist a new one".</p>
+
+  <h2>Validator crash detector</h2>
+  <p>When the self-play solver gets a validator rejection, <code>handle_chat</code>'s attempt-loop runs a circuit-breaker check for <strong>validator-frame crashes</strong> — tracebacks whose innermost frame is <code>.validator.py</code> and that don't mention <code>solution.py</code>. Classified as crashes: <code>SyntaxError, IndentationError, ImportError, ModuleNotFoundError, NameError, ValueError, TypeError, KeyError, IndexError, AttributeError</code>. Matched crashes abort the cycle after attempt 1 instead of burning the remaining attempts on an unwinnable challenge. See <a href="../algorithms/dream_cycle.html">dream_cycle</a> for the upstream gates that catch most of these earlier.</p>
+
+  <h2>Cross-module dependencies</h2>
+  <ul>
+    <li><a href="planning.html">core.planning</a> — <code>TaskTree</code> for hierarchical decomposition.</li>
+    <li><a href="prompts.html">core.prompts</a> — <code>SYSTEM_PROMPT</code> and per-budget templates.</li>
+    <li><a href="bus.html">core.bus</a> — memory hydration.</li>
+    <li><a href="context_manager.html">core.context_manager</a> — token-budget compression.</li>
+    <li><a href="llm.html">core.llm</a> — upstream calls.</li>
+    <li><a href="../tools/registry.html">tools.registry</a> — tool discovery + dispatch.</li>
+    <li><a href="verifier.html">core.verifier</a> &amp; <a href="uncertainty.html">core.uncertainty</a> — adjudication and metacognition.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

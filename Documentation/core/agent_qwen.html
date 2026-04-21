@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.agent_qwen — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a class="current" href="agent_qwen.html">agent_qwen</a>
+    <a href="prompts.html">prompts</a>
+    <a href="../tools/qwen_bridge.html">qwen_bridge</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / agent_qwen.py — GhostQwenAgent</h1>
+  <p class="subtitle">Thin <code>qwen_agent.agents.ReActChat</code> wrapper specialised for Qwen3.6 with native file_system / execute / knowledge_base tools.</p>
+
+  <h2>Class</h2>
+  <pre><code>class GhostQwenAgent(qwen_agent.agents.ReActChat):
+    def __init__(self, context, llm_cfg): ...
+    def _run(self, messages, lang='en', **kwargs) -&gt; Iterator[List[Dict[str, Any]]]:
+        ...</code></pre>
+  <p>Constructor binds the active <code>GhostContext</code> via <a href="../tools/qwen_bridge.html">qwen_bridge.set_context()</a> so the bridged tools have access to sandbox / memory / scratchpad. Registers a tool list of <code>file_system</code>, <code>execute</code>, <code>knowledge_base</code> via the qwen-agent registry, then delegates the chat loop to <code>ReActChat._run()</code>.</p>
+
+  <h2>When used</h2>
+  <p>Activated when the upstream LLM is Qwen and the agent runs in Qwen's native ReAct mode (XML tool-call syntax handled by the Qwen library rather than the agent's own parser). The tool bridge is documented in <a href="../tools/qwen_bridge.html">tools / qwen_bridge</a>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

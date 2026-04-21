@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memory hydration (RRF) — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a class="current" href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="skill_acquisition.html">Skill acquisition</a>
+    <a href="circuit_breaker.html">Circuit breaker</a>
+  </nav>
+</aside>
+<main>
+  <h1>Memory hydration with Reciprocal Rank Fusion</h1>
+  <p class="subtitle">How a query becomes a sectioned markdown injection of vector + graph + skill + episodic results.</p>
+
+  <h2>RRF formula</h2>
+  <pre><code>combined_score(doc) = Σ_ranker  weight_ranker / (k + rank_in_ranker + 1)
+k = 60  (rrf_k default)</code></pre>
+  <p>The constant <code>k = 60</code> is the canonical RRF "tie-breaker"; a smaller value heavily favours the top result of each ranker, a larger one flattens the curve.</p>
+
+  <h2>Intent weights</h2>
+  <p>The bus first classifies the query as <em>factual</em>, <em>procedural</em>, or <em>contextual</em> using the <a href="../core/llm.html">worker pool</a> (<code>RoutingTask.CLASSIFY_INTENT</code>). The weight matrix:</p>
+  <table>
+    <thead><tr><th>Intent</th><th>graph</th><th>vector</th><th>skill</th><th>episodic</th></tr></thead>
+    <tbody>
+      <tr><td>factual</td><td>2.0</td><td>1.0</td><td>0.5</td><td>0.3</td></tr>
+      <tr><td>procedural</td><td>0.5</td><td>1.0</td><td>2.0</td><td>1.5</td></tr>
+      <tr><td>contextual</td><td>1.0</td><td>1.5</td><td>1.0</td><td>1.0</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Section budgets</h2>
+  <p>Final markdown is capped at <code>max_chars</code> (default 6000). Per-section share:</p>
+  <ul>
+    <li>graph — 25 %</li>
+    <li>vector — 40 %</li>
+    <li>skill — 20 %</li>
+    <li>episodic — 15 %</li>
+  </ul>
+  <p>Each section truncates independently so a noisy vector store can't crowd out factual graph hits.</p>
+
+  <h2>Step-by-step</h2>
+  <ol>
+    <li><strong>Decompose</strong> the user query into 2-3 sub-queries (LLM call or "and also" / "as well as" heuristic).</li>
+    <li><strong>Fan-out</strong>: <code>asyncio.gather</code> hits each available memory tier with each sub-query.</li>
+    <li><strong>Per-source ranking</strong>: each tier returns its own ordered list (cross-encoder re-rank for vector; spreading-activation BFS for graph; BM25-augmented vector for skills; trigger-similarity for episodes).</li>
+    <li><strong>Fuse</strong>: RRF scores each candidate across rankers; intent weights bias the sum.</li>
+    <li><strong>Format</strong>: produce <code>### Knowledge Graph</code>, <code>### Vector Recall</code>, <code>### Playbook</code>, <code>### Episodes</code> sections.</li>
+    <li><strong>Inject</strong>: prepended to the system prompt before the LLM call.</li>
+  </ol>
+
+  <h2>Dedup gate (write side)</h2>
+  <p><code>publish_fact</code> uses an LRU of 256 most-recent <code>(event_type, fact_data)</code> MD5 signatures to short-circuit replays. Without it, an LLM that repeats itself across turns would re-write the same triplet to the graph and accumulate weight unnecessarily.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

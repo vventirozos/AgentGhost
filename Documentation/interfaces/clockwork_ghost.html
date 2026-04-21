@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clockwork Ghost — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Interfaces</h3>
+    <a href="web_server.html">Web server</a>
+    <a href="slack_bot.html">Slack bot</a>
+    <a href="voice_server.html">Voice server</a>
+    <a href="image_gen_server.html">Image-gen server</a>
+    <a class="current" href="clockwork_ghost.html">Clockwork Ghost</a>
+  </nav>
+</aside>
+<main>
+  <h1>interface / externals / clockwork_ghost</h1>
+  <p class="subtitle">PyQt6 desktop client (Raspberry Pi cyberdeck) with 3D visualisation, voice I/O, camera capture, and TTS playback.</p>
+
+  <h2>client.py</h2>
+  <h3>Outbound HTTP</h3>
+  <table>
+    <thead><tr><th>Endpoint</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>POST /api/chat</code></td><td>Streaming chat. SSE chunks accumulated in <code>conversation_history</code>; sentence boundaries (<code>.?!</code>) push to TTS queue.</td></tr>
+      <tr><td><code>POST /api/workspace/save · /load</code></td><td>State zip.</td></tr>
+      <tr><td><code>POST $STT_SERVER_URL/stt</code></td><td>multipart audio upload.</td></tr>
+      <tr><td><code>POST $TTS_SERVER_URL/tts</code></td><td>JSON text → audio bytes.</td></tr>
+      <tr><td><code>GET /api/download/{image_path}</code></td><td>Fetch agent-generated images.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>UI layout</h3>
+  <ul>
+    <li><strong>Left</strong>: chat display + text input with up/down history.</li>
+    <li><strong>Right</strong>: stacked widget — MatrixFaceWidget · QWebEngineView dashboard · QWebEngineView 3D face.</li>
+    <li><strong>Top</strong>: workspace, face toggle, fullscreen.</li>
+    <li><strong>Bottom</strong>: camera snap, push-to-talk, TTS toggle + stats.</li>
+  </ul>
+
+  <h3>Voice queues</h3>
+  <ul>
+    <li><code>audio_queue</code> (<code>asyncio.Queue</code>) — text chunks to TTS.</li>
+    <li><code>playback_queue</code> — audio bytes awaiting <code>aplay</code>.</li>
+    <li><code>audio_fetch_task()</code> — POSTs each chunk to TTS, queues result.</li>
+    <li><code>audio_worker_task()</code> — pipes audio bytes to <code>aplay</code> subprocess.</li>
+  </ul>
+
+  <h3>Camera</h3>
+  <p><code>CameraPreviewDialog</code> via OpenCV <code>VideoCapture</code> on <code>/dev/video0</code> at 1920×1080 60 fps MJPG. Ctrl+Esc snaps a frame; the user can optionally upload + add a prompt.</p>
+
+  <h3>Input shortcuts</h3>
+  <ul>
+    <li><code>Esc</code> — toggle PTT recording.</li>
+    <li><code>Alt+Esc</code> — toggle TTS.</li>
+    <li><code>Ctrl+Esc</code> — snap camera.</li>
+    <li>Slash commands: <code>/clear</code>, <code>/shutdown</code>, <code>/reboot</code>, <code>/exit</code>.</li>
+  </ul>
+
+  <h3>Stats</h3>
+  <p>Timer every 5 s reads battery from <code>/sys/class/power_supply/*/capacity</code> and shows time + battery + network icon.</p>
+
+  <h3>Concurrency</h3>
+  <p><code>qasync.QEventLoop</code> wraps the QApplication so asyncio and Qt cooperate. Async tasks for <code>audio_fetch_task()</code>, <code>audio_worker_task()</code>, <code>send_chat_request()</code>. Signal/slot pattern for cross-thread UI updates.</p>
+
+  <h2>matrix_face.py — 3D Animated Visualization</h2>
+  <ul>
+    <li>OpenGL ES 3.0 inside <code>QOpenGLWidget</code>.</li>
+    <li>75 nodes on a random sphere; idle vs. busy speeds: 0.75 vs. 2.75.</li>
+    <li>Three render passes: scene → bloom blur → tone-mapped composite.</li>
+    <li>State controlled by <code>set_state(active=bool, error=bool)</code> — error flips all nodes magenta.</li>
+    <li>Physics: each node = base sphere position + 3 phase-shifted sine waves; lines drawn between nodes within 2.5 distance.</li>
+    <li>Driven by a <code>QTimer</code> firing every 16 ms.</li>
+  </ul>
+
+  <h2>External dependencies</h2>
+  <ul>
+    <li>PyQt6 + qasync + PyOpenGL.</li>
+    <li>httpx, OpenCV (cv2), markdown, subprocess (arecord/aplay).</li>
+  </ul>
+
+  <div class="note warn"><strong>Heads-up:</strong> URLs and the <code>X-Ghost-Key</code> in <code>client.py</code> are hardcoded placeholders ("YOUR_KEY_HERE", "http://eva:8000", "http://192.168.0.24:8000"). These should be wired to env vars before deployment.</div>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

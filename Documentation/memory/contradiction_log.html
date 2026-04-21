@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.contradiction_log — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a class="current" href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / contradiction_log.py — ContradictionLog</h1>
+  <p class="subtitle">Append-only audit log of belief revisions. Drives "I previously thought X, but updated because…" explanations.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>JSON at <code>memory_dir/contradiction_log.json</code>.</li>
+    <li>FIFO cap <code>MAX_ENTRIES = 200</code>.</li>
+    <li>Atomic temp + <code>os.replace</code>; <code>threading.RLock</code>.</li>
+  </ul>
+
+  <h2>Entry shape</h2>
+  <pre><code>{
+  "timestamp":   "ISO",
+  "new_fact":    str,
+  "superseded":  [{ "id": str, "text": str }],
+  "deleted_ids": [str],
+  "reason":      str
+}</code></pre>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(memory_dir)</code></td><td>Open log file.</td></tr>
+      <tr><td><code>record(new_fact, old_facts, deleted_ids, reason="")</code></td><td>Append revision.</td></tr>
+      <tr><td><code>get_recent(limit=10)</code></td><td>Most recent entries.</td></tr>
+      <tr><td><code>explain_belief_change(query)</code></td><td>Search recent entries by substring.</td></tr>
+      <tr><td><code>clear()</code></td><td>Wipe.</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

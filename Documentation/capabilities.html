@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capabilities — Ghost Agent</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Overview</h3>
+    <a href="index.html">Home</a>
+    <a class="current" href="capabilities.html">Capabilities</a>
+    <a href="architecture.html">System Architecture</a>
+    <a href="installation.html">Install &amp; Run</a>
+    <a href="cli_reference.html">CLI Reference</a>
+    <h3>Subsystems</h3>
+    <a href="core/agent.html">Core</a>
+    <a href="memory/vector.html">Memory</a>
+    <a href="tools/registry.html">Tools</a>
+    <a href="sandbox/docker.html">Sandbox</a>
+    <a href="api/routes.html">API</a>
+    <a href="interfaces/web_server.html">Interfaces</a>
+    <h3>Algorithms</h3>
+    <a href="algorithms/request_lifecycle.html">Request lifecycle</a>
+    <a href="algorithms/memory_hydration.html">Memory hydration</a>
+    <a href="algorithms/dream_cycle.html">Dream / self-play</a>
+    <a href="algorithms/skill_acquisition.html">Skill acquisition</a>
+    <a href="algorithms/circuit_breaker.html">Circuit breaker</a>
+  </nav>
+</aside>
+<main>
+  <h1>What Ghost Agent Can Do</h1>
+  <p class="subtitle">Practical capabilities grouped by what a user might ask for. Each entry shows an example prompt, what happens under the hood, and which subsystems it exercises.</p>
+
+  <h2>At a glance</h2>
+  <div class="card-grid">
+    <a class="card" href="#research"><h3>Research &amp; synthesis</h3><p>Multi-source web search, PDF &amp; page ingestion, cross-referenced summaries.</p></a>
+    <a class="card" href="#code"><h3>Code &amp; data analysis</h3><p>Run Python / shell inside a Docker sandbox on files you upload.</p></a>
+    <a class="card" href="#projects"><h3>Multi-step projects</h3><p>Scaffold, implement, test, and iterate on deliverables over many turns.</p></a>
+    <a class="card" href="#image"><h3>Image generation</h3><p>SDXL-backed visuals through a dedicated GPU swarm pool.</p></a>
+    <a class="card" href="#vision"><h3>Vision &amp; OCR</h3><p>Describe screenshots, extract tables from PDFs, caption photos.</p></a>
+    <a class="card" href="#memory"><h3>Long-term memory</h3><p>Remembers preferences, facts, and hard-won procedures across sessions.</p></a>
+    <a class="card" href="#schedule"><h3>Scheduling &amp; autonomy</h3><p>Cron-style recurring tasks that run the agent against a stored prompt.</p></a>
+    <a class="card" href="#db"><h3>Database admin</h3><p>Query and introspect Postgres instances with safety rails.</p></a>
+    <a class="card" href="#voice"><h3>Voice I/O</h3><p>Talk to the agent through a TTS/STT server on a companion box.</p></a>
+  </div>
+
+  <h2 id="research">Research &amp; synthesis</h2>
+  <p>Ghost Agent issues web searches through DuckDuckGo (over Tor when <code>--anonymous</code> is on), fetches the top results with SSRF-guarded HTTP, and folds the content into a single synthesised answer. PDFs are parsed with PyMuPDF; image-heavy pages are routed to the vision pool for OCR.</p>
+  <pre><code>&gt; Find the three most-cited 2025 papers on mixture-of-experts routing
+  and give me a one-paragraph summary of each, with DOIs.</code></pre>
+  <p><strong>Under the hood:</strong> <code>web_search</code> → <code>fetch_url</code> (retry + identity rotation on 401/403/503) → <code>vision</code> on any PDFs → vector memory for de-duplication → synthesis turn.</p>
+  <p><strong>Tools:</strong> <a href="tools/search.html"><code>search</code></a>, <a href="tools/vision.html"><code>vision</code></a>. <strong>See also:</strong> <a href="algorithms/memory_hydration.html">Memory hydration (RRF)</a>.</p>
+
+  <h2 id="code">Code execution &amp; data analysis</h2>
+  <p>Every emitted snippet runs inside an ephemeral Alpine/Python container bind-mounted to <code>$GHOST_HOME/sandbox</code>. The host filesystem is never touched; network egress is optional and goes through Tor when enabled. The agent reads back stdout, stderr, exit codes, and any files it wrote.</p>
+  <pre><code>&gt; I uploaded sales_2025.csv. Compute monthly retention cohorts and
+  plot them as a heatmap. Save the figure as retention.png.</code></pre>
+  <p><strong>Under the hood:</strong> <code>file_system.read</code> → <code>execute</code> (Python in sandbox, pandas + matplotlib) → <code>file_system.write</code> → returns the PNG path plus a prose reading of the chart.</p>
+  <p><strong>Tools:</strong> <a href="tools/execute.html"><code>execute</code></a>, <a href="tools/file_system.html"><code>file_system</code></a>. <strong>See also:</strong> <a href="sandbox/docker.html">Docker sandbox</a>.</p>
+
+  <h2 id="projects">Multi-step projects</h2>
+  <p>For anything that takes more than one turn, the planner builds a hierarchical <code>TaskTree</code> with postcondition gates. The agent picks up the plan across sessions via the project store, checkpointing progress after each gated step.</p>
+  <pre><code>&gt; Build a Flask app with JWT auth and SQLite persistence. Put it in
+  /workspace/auth-app, add pytest coverage, and make sure the tests
+  pass before you tell me you're done.</code></pre>
+  <p><strong>Under the hood:</strong> <a href="core/planning.html"><code>planning</code></a> decomposes the goal → <code>projects</code> tool scaffolds state → coding-pool LLM writes files → <code>execute</code> runs pytest → <a href="core/verifier.html"><code>verifier</code></a> confirms each postcondition before advancing.</p>
+  <p><strong>Tools:</strong> <a href="tools/projects.html"><code>projects</code></a>, <a href="tools/execute.html"><code>execute</code></a>, <a href="tools/file_system.html"><code>file_system</code></a>. <strong>See also:</strong> <a href="memory/projects.html">Project store</a>.</p>
+
+  <h2 id="image">Image generation</h2>
+  <p>Image requests are routed to a dedicated SDXL swarm pool (<code>--image-gen-nodes</code>). The image is saved into the sandbox and returned as a path; the agent can then re-read it through the vision pool for critique-and-iterate loops.</p>
+  <pre><code>&gt; Draft a landing-page hero banner: retro-futurist, teal-and-gold,
+  1600×600, no text overlay. Iterate if the composition feels
+  bottom-heavy.</code></pre>
+  <p><strong>Under the hood:</strong> <a href="tools/image_gen.html"><code>image_gen</code></a> → SDXL server → <code>file_system.read</code> → <a href="tools/vision.html"><code>vision</code></a> critique → optional second generation pass.</p>
+  <p><strong>Tools:</strong> <a href="tools/image_gen.html"><code>image_gen</code></a>, <a href="tools/vision.html"><code>vision</code></a>, <a href="tools/swarm.html"><code>swarm</code></a>.</p>
+
+  <h2 id="vision">Vision &amp; OCR</h2>
+  <p>Drop a screenshot, a PDF page, or a photo into the conversation and the agent routes it through the visual pool for description, table extraction, or debugging help.</p>
+  <pre><code>&gt; Here's a screenshot of a failing Grafana panel — what's wrong
+  with the query, and what would fix the missing-series gap?</code></pre>
+  <p><strong>Under the hood:</strong> file upload → sandbox storage → <code>vision</code> tool with image attachment → visual-pool LLM returns structured analysis.</p>
+  <p><strong>Tools:</strong> <a href="tools/vision.html"><code>vision</code></a>.</p>
+
+  <h2 id="memory">Long-term memory</h2>
+  <p>Six independent stores keep different kinds of knowledge: semantic (<a href="memory/vector.html">vector</a>), factual (<a href="memory/graph.html">graph</a>), user-specific (<a href="memory/profile.html">profile</a>), procedural (<a href="memory/skills.html">skills</a>), chronological (<a href="memory/episodes.html">episodes</a>), and short-term (<a href="memory/journal.html">journal</a> + <a href="memory/scratchpad.html">scratchpad</a>). An adaptive threshold decides what is worth committing.</p>
+  <pre><code>&gt; Remember that I prefer ISO-8601 dates everywhere, that my primary
+  Postgres is at 10.0.1.4, and that I'm working from Athens (UTC+3).</code></pre>
+  <p><strong>Under the hood:</strong> facts land in <a href="memory/profile.html">profile</a>; every subsequent system prompt includes them automatically. Observations from conversation also drop into the <a href="memory/journal.html">journal</a> and get consolidated during the <a href="algorithms/dream_cycle.html">dream cycle</a>.</p>
+  <p><strong>See also:</strong> <a href="algorithms/memory_hydration.html">Memory hydration</a>, <a href="core/bus.html">Memory bus</a>.</p>
+
+  <h2 id="schedule">Scheduling &amp; autonomy</h2>
+  <p>APScheduler is wired into the agent at startup. Any prompt can be parked on a cron expression and will run unattended against a fresh session.</p>
+  <pre><code>&gt; Every weekday at 09:00 Athens time, fetch my Slack DMs from the
+  last 12 hours and post a three-bullet digest to the #me channel.</code></pre>
+  <p><strong>Under the hood:</strong> <a href="tools/tasks.html"><code>tasks</code></a> tool persists the schedule → APScheduler fires → agent runs the stored prompt with its full tool surface → posts result back.</p>
+  <p><strong>Tools:</strong> <a href="tools/tasks.html"><code>tasks</code></a>, <a href="interfaces/slack_bot.html">Slack bot</a>.</p>
+
+  <h2 id="db">Database administration</h2>
+  <p>The <code>postgres_admin</code> tool wraps SQLAlchemy with a default DSN from <code>$GHOST_DEFAULT_DB</code>. Queries are read-only unless the user explicitly authorises a mutation.</p>
+  <pre><code>&gt; On the analytics DB, show me any table over 1 GB and the top three
+  largest indexes for each.</code></pre>
+  <p><strong>Under the hood:</strong> <a href="tools/database.html"><code>database</code></a> → SQL built from <code>pg_class</code> / <code>pg_stat_user_indexes</code> → returned as a formatted table.</p>
+  <p><strong>Tools:</strong> <a href="tools/database.html"><code>database</code></a>.</p>
+
+  <h2 id="voice">Voice I/O</h2>
+  <p>When the voice server is reachable (<code>$PI_VOICE_URL</code>) the agent can answer spoken prompts and stream TTS audio back. Works great on a Raspberry Pi with a USB mic on the desk.</p>
+  <pre><code>🎙  "Hey ghost, what's the weather in Athens and what's on my calendar?"</code></pre>
+  <p><strong>Under the hood:</strong> STT captures the prompt → normal agent turn → TTS streams the reply. All memory and tools are available as usual.</p>
+  <p><strong>See also:</strong> <a href="interfaces/voice_server.html">Voice server</a>.</p>
+
+  <h2 id="self">Self-improvement</h2>
+  <p>During idle time, the <a href="core/dream.html">dream cycle</a> drains the journal into long-term stores, extracts reusable tool sequences as new "skills", and ranks them by observed utility. Skills that repeatedly fail get auto-retired to <code>acquired_skills/retired/</code>.</p>
+  <pre><code>&gt; (internal) After the third time the agent parsed Slack HTML into
+  markdown, it saves the sequence as the "slack_html_to_md" skill.
+  Future runs call it as a single tool.</code></pre>
+  <p><strong>Under the hood:</strong> <a href="algorithms/skill_acquisition.html">Skill acquisition</a> pipeline → <a href="tools/acquired_skills.html"><code>acquired_skills</code></a> registry → registered as a first-class tool on the next turn.</p>
+
+  <h2>What it doesn't do</h2>
+  <ul>
+    <li><strong>Arbitrary host access.</strong> Every tool that touches the filesystem or spawns a process goes through the Docker sandbox. The host's <code>$HOME</code> is unreachable.</li>
+    <li><strong>Unauthenticated mutations.</strong> Destructive Postgres and filesystem operations require explicit user confirmation in the turn.</li>
+    <li><strong>Training.</strong> Ghost Agent uses its upstream LLM as-is; it doesn't fine-tune weights. Skill acquisition is pure symbolic reuse.</li>
+  </ul>
+
+  <footer><a href="index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

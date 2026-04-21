@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slack bot — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Interfaces</h3>
+    <a href="web_server.html">Web server</a>
+    <a class="current" href="slack_bot.html">Slack bot</a>
+    <a href="voice_server.html">Voice server</a>
+    <a href="image_gen_server.html">Image-gen server</a>
+    <a href="clockwork_ghost.html">Clockwork Ghost</a>
+  </nav>
+</aside>
+<main>
+  <h1>interface / externals / slack_bot / main.py</h1>
+  <p class="subtitle">Async Slack bot using <code>slack_bolt</code> Socket Mode. Maintains per-thread context, downloads user files into the sandbox, posts emoji status updates while streaming.</p>
+
+  <h2>Event handlers</h2>
+  <table>
+    <thead><tr><th>Event</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>app_mention</code></td><td>Build full thread context, run <code>_process_message()</code>.</td></tr>
+      <tr><td><code>message</code> (DM only)</td><td>Same flow, filtered to non-bot DMs.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Per-message flow</h2>
+  <ol>
+    <li>Generate an 8-char <code>request_id</code>.</li>
+    <li>Spawn <code>tail_logs</code> task to monitor the agent log file for matching <code>request_id</code> markers and update emoji status.</li>
+    <li>Download any file attachments via <code>download_slack_file()</code> into <code>$GHOST_SANDBOX_DIR</code>; inject system notes about the new files.</li>
+    <li>POST to <code>$GHOST_API_URL</code> with <code>X-Ghost-Key</code>.</li>
+    <li>Strip image-markdown from the response and re-upload extracted images via <code>files_upload_v2()</code>.</li>
+    <li>Cancel <code>tail_logs</code> on completion.</li>
+  </ol>
+
+  <h2>State</h2>
+  <ul>
+    <li><code>USER_CACHE</code> — user_id → real_name mapping.</li>
+    <li><code>BOT_USER_ID</code> — cached bot identity.</li>
+    <li><code>MAINTENANCE_MODE</code> — flag to skip processing (set with <code>--maintenance</code> CLI flag).</li>
+    <li><code>LOG_FILE_PATH</code> — agent log path (<code>--log-file</code>).</li>
+  </ul>
+
+  <h2>Slash command router</h2>
+  <p><code>interface/slack_project_commands.py</code> is a stateless <code>shlex</code>-based router for <code>/project ...</code> commands:</p>
+  <ul>
+    <li><code>list [status]</code> · <code>new &lt;title&gt;</code> · <code>resume &lt;pid&gt;</code> · <code>switch &lt;pid&gt;</code> · <code>exit</code> · <code>status</code></li>
+    <li><code>task add &lt;desc&gt;</code> · <code>task done &lt;tid&gt; [summary]</code> · <code>events [limit]</code></li>
+    <li><code>advance</code> — async-only; the placeholder response triggers <code>advance_async()</code> in the bot handler, which calls <code>core.project_advancer.advance_once()</code>.</li>
+  </ul>
+
+  <h2>Environment</h2>
+  <div class="kv">
+    <dt>SLACK_BOT_TOKEN</dt><dd>bot token for API calls.</dd>
+    <dt>SLACK_APP_TOKEN</dt><dd>app-level token for Socket Mode.</dd>
+    <dt>GHOST_API_URL</dt><dd>Default <code>http://localhost:8000/api/chat</code>.</dd>
+    <dt>GHOST_API_KEY</dt><dd>Same value the agent expects.</dd>
+    <dt>GHOST_SANDBOX_DIR</dt><dd>Where uploads land (default <code>/tmp/sandbox</code>).</dd>
+  </div>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

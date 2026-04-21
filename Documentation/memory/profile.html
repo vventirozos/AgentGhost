@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.profile — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a class="current" href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / profile.py — ProfileMemory</h1>
+  <p class="subtitle">Canonical user profile with multi-value merge semantics.</p>
+
+  <h2>Storage</h2>
+  <p>JSON at <code>path/user_profile.json</code>; atomic temp + <code>os.replace</code>; <code>threading.RLock</code> guards reads / writes.</p>
+
+  <h2>Schema</h2>
+  <pre><code>{
+  "root":          { "name": str },
+  "relationships": { "wife|husband|son|daughter": str | list[str] },
+  "interests":     { "science|general|...": str | list[str] },
+  "assets":        { "car|...": str | list[str] }
+}</code></pre>
+
+  <h2>Canonicalisation</h2>
+  <p>Common synonyms remap at write time: <code>wife → relationships.wife</code>, <code>vehicle → assets.car</code>, etc. The caller receives the rewritten key in the return message so the agent can keep its mental model synced.</p>
+
+  <h2>Merge semantics</h2>
+  <p>Scalar → scalar: replace if different, else promote both to a list. Lists are deduped and order-preserved.</p>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>load() / save(data)</code></td><td>Whole-file read / write.</td></tr>
+      <tr><td><code>update(category, key, value) -&gt; str</code></td><td>Merge-semantic update; returns sync message describing canonical mapping.</td></tr>
+      <tr><td><code>delete(category, key) -&gt; str</code></td><td>Remove key; status string.</td></tr>
+      <tr><td><code>get_context_string() -&gt; str</code></td><td>Format for LLM injection.</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

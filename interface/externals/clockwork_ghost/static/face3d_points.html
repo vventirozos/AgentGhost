@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>3D Agent Face — Point Cloud</title>
+    <style>
+        html, body { margin: 0; padding: 0; height: 100%; background: #03060d; overflow: hidden; }
+        canvas { display: block; }
+        #status {
+            position: fixed; top: 10px; left: 10px;
+            color: #8fd0ff; font: 12px monospace; z-index: 10;
+            background: rgba(0,0,0,0.4); padding: 4px 8px; border-radius: 4px;
+            max-width: calc(100% - 40px); white-space: pre-wrap;
+        }
+        #status.err { color: #ff7070; }
+    </style>
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+      }
+    }
+    </script>
+</head>
+<body>
+<div id="status">booting…</div>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
+import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass }    from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass }    from 'three/addons/postprocessing/OutputPass.js';
+
+const statusEl = document.getElementById('status');
+const setStatusText = (msg, err=false) => {
+    statusEl.textContent = msg;
+    statusEl.classList.toggle('err', err);
+};
+window.addEventListener('error', e => setStatusText('JS error: ' + (e.message || e), true));
+window.addEventListener('unhandledrejection', e => setStatusText('promise: ' + (e.reason?.message || e.reason), true));
+
+// ============ CONFIG ============
+const COLOR_IDLE      = new THREE.Color(0x6cc2ff);
+const COLOR_GEN       = new THREE.Color(0xff3a3a);
+const TARGET_POINTS   = 22000;     // fewer overlaps → crisper points
+const POINT_SIZE      = 1.4;
+const POINT_OPACITY   = 0.55;      // normal blending now, so keep some transparency
+const SHIMMER_AMP     = 0.005;
+const SHIMMER_SPEED   = 1.2;
+const CAMERA_Z        = 3.2;
+const BLOOM_STRENGTH  = 0.35;      // was 1.1 — killed the blowout
+const BLOOM_RADIUS    = 0.4;
+const BLOOM_THRESHOLD = 0.85;      // only the brightest cores bloom
+const IDLE_ROT_Y_AMP  = 0.25;
+const IDLE_ROT_X_AMP  = 0.06;
+// =================================
+
+let status = 'idle';
+let pointsMaterial = null;
+let headGroup = null;
+let time = 0;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(35, window.innerWidth / window.innerHeight, 0.01, 100);
+camera.position.set(0, 0, CAMERA_Z);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setClearColor(0x03060d, 1);
+document.body.appendChild(renderer.domElement);
+
+// Post-processing: bloom is doing a LOT of heavy lifting on the reference look
+const composer = new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new UnrealBloomPass(
+    new THREE.Vector2(window.innerWidth, window.innerHeight),
+    BLOOM_STRENGTH, BLOOM_RADIUS, BLOOM_THRESHOLD
+));
+composer.addPass(new OutputPass());
+
+// Shaders
+const vertexShader = /* glsl */`
+    uniform float time;
+    uniform float pointSize;
+    uniform float shimmerAmp;
+    uniform float shimmerSpeed;
+    varying float vDepth;
+
+    float hash(vec3 p) {
+        return fract(sin(dot(p, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+    }
+
+    void main() {
+        float phase = hash(position) * 6.2831;
+        float s = sin(time * shimmerSpeed + phase);
+        vec3 n = normalize(position + vec3(1e-4));
+        vec3 displaced = position + n * s * shimmerAmp;
+
+        vec4 mv = modelViewMatrix * vec4(displaced, 1.0);
+        gl_Position = projectionMatrix * mv;
+        gl_PointSize = pointSize * (150.0 / -mv.z);
+        vDepth = -mv.z;
+    }
+`;
+
+const fragmentShader = /* glsl */`
+    uniform vec3 colorIdle;
+    uniform vec3 colorGen;
+    uniform float isGen;
+    uniform float time;
+    uniform float opacity;
+    varying float vDepth;
+
+    void main() {
+        vec2 uv = gl_PointCoord - vec2(0.5);
+        float d = length(uv);
+        if (d > 0.5) discard;
+        float alpha = smoothstep(0.5, 0.0, d);
+        alpha *= alpha;   // sharpen the core
+
+        float pulse = 1.0 + sin(time * 6.0) * 0.3 * isGen;
+        vec3 base = mix(colorIdle, colorGen * pulse, isGen);
+
+        float depthFade = clamp(1.6 - (vDepth - 2.5) * 0.8, 0.35, 1.2);
+        gl_FragColor = vec4(base * depthFade, alpha * opacity);
+    }
+`;
+
+// --- Surface-sampling helper ---
+// Area-weighted triangle sampling gives an even distribution regardless of
+// how the original mesh was laid out.
+function sampleSurface(geometry, count) {
+    const pos = geometry.attributes.position.array;
+    const idx = geometry.index ? geometry.index.array : null;
+    const triCount = idx ? idx.length / 3 : pos.length / 9;
+
+    const areas = new Float32Array(triCount);
+    let total = 0;
+    const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+    const ab = new THREE.Vector3(), ac = new THREE.Vector3(), cross = new THREE.Vector3();
+
+    for (let t = 0; t < triCount; t++) {
+        const i0 = idx ? idx[t*3]   : t*3;
+        const i1 = idx ? idx[t*3+1] : t*3+1;
+        const i2 = idx ? idx[t*3+2] : t*3+2;
+        a.fromArray(pos, i0*3); b.fromArray(pos, i1*3); c.fromArray(pos, i2*3);
+        ab.subVectors(b, a); ac.subVectors(c, a); cross.crossVectors(ab, ac);
+        areas[t] = cross.length() * 0.5;
+        total += areas[t];
+    }
+
+    // CDF
+    const cdf = new Float32Array(triCount);
+    let acc = 0;
+    for (let t = 0; t < triCount; t++) { acc += areas[t] / total; cdf[t] = acc; }
+
+    const out = new Float32Array(count * 3);
+    for (let i = 0; i < count; i++) {
+        const r = Math.random();
+        // binary search on cdf
+        let lo = 0, hi = triCount - 1;
+        while (lo < hi) { const m = (lo+hi) >> 1; if (cdf[m] < r) lo = m+1; else hi = m; }
+        const t = lo;
+        const i0 = idx ? idx[t*3]   : t*3;
+        const i1 = idx ? idx[t*3+1] : t*3+1;
+        const i2 = idx ? idx[t*3+2] : t*3+2;
+        a.fromArray(pos, i0*3); b.fromArray(pos, i1*3); c.fromArray(pos, i2*3);
+
+        let u = Math.random(), v = Math.random();
+        if (u + v > 1) { u = 1-u; v = 1-v; }
+        const w = 1 - u - v;
+        out[i*3]   = a.x*w + b.x*u + c.x*v;
+        out[i*3+1] = a.y*w + b.y*u + c.y*v;
+        out[i*3+2] = a.z*w + b.z*u + c.z*v;
+    }
+    return out;
+}
+
+// --- Load facecap.glb (female face scan) ---
+// facecap.glb REQUIRES EXT_meshopt_compression + KHR_texture_basisu,
+// so we have to register the matching decoders or GLTFLoader bails silently.
+const ktx2 = new KTX2Loader()
+    .setTranscoderPath('https://unpkg.com/three@0.160.0/examples/jsm/libs/basis/')
+    .detectSupport(renderer);
+
+const gltfLoader = new GLTFLoader()
+    .setKTX2Loader(ktx2)
+    .setMeshoptDecoder(MeshoptDecoder);
+
+setStatusText('loading facecap.glb…');
+gltfLoader.load('facecap.glb', (gltf) => {
+    // Inspect every mesh in the GLB so we can pick the right one.
+    const meshes = [];
+    gltf.scene.traverse((o) => {
+        if (o.isMesh) {
+            const g = o.geometry;
+            g.computeBoundingBox();
+            const s = new THREE.Vector3(); g.boundingBox.getSize(s);
+            meshes.push({
+                obj: o,
+                name: o.name || '(unnamed)',
+                verts: g.attributes.position.count,
+                size: s.clone(),
+                geom: g,
+            });
+        }
+    });
+    if (!meshes.length) { setStatusText('no mesh in facecap.glb', true); return; }
+
+    // Dump every mesh so we can confirm which one is the face.
+    const info = meshes.map((m,i) =>
+        `#${i} ${m.name}  verts=${m.verts}  size=${m.size.x.toFixed(3)}x${m.size.y.toFixed(3)}x${m.size.z.toFixed(3)}`
+    ).join('\n');
+    console.log(info);
+    setStatusText(info);
+
+    // Pick the mesh with the largest bounding box (the face, not the eyes/teeth).
+    let pick = meshes[0];
+    let bestVol = 0;
+    for (const m of meshes) {
+        const v = m.size.x * m.size.y * m.size.z;
+        if (v > bestVol) { bestVol = v; pick = m; }
+    }
+    const faceGeom = pick.geom.clone();
+    const bestCount = pick.verts;
+    setStatusText(`picked "${pick.name}" (${bestCount} verts, bbox ${pick.size.x.toFixed(2)}x${pick.size.y.toFixed(2)}x${pick.size.z.toFixed(2)})`);
+
+    // Auto-center and scale so head fits camera
+    faceGeom.computeBoundingBox();
+    const bb = faceGeom.boundingBox;
+    const size = new THREE.Vector3(); bb.getSize(size);
+    const center = new THREE.Vector3(); bb.getCenter(center);
+    const scale = 1.4 / Math.max(size.x, size.y, size.z);
+
+    const positions = faceGeom.attributes.position.array;
+    for (let i = 0; i < positions.length; i += 3) {
+        positions[i]   = (positions[i]   - center.x) * scale;
+        positions[i+1] = (positions[i+1] - center.y) * scale;
+        positions[i+2] = (positions[i+2] - center.z) * scale;
+    }
+    faceGeom.attributes.position.needsUpdate = true;
+    faceGeom.computeBoundingBox();
+
+    // Sample a dense point cloud on the surface
+    const sampled = sampleSurface(faceGeom, TARGET_POINTS);
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(sampled, 3));
+
+    pointsMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+            time:         { value: 0 },
+            pointSize:    { value: POINT_SIZE },
+            shimmerAmp:   { value: SHIMMER_AMP },
+            shimmerSpeed: { value: SHIMMER_SPEED },
+            colorIdle:    { value: COLOR_IDLE },
+            colorGen:     { value: COLOR_GEN },
+            isGen:        { value: 0 },
+            opacity:      { value: POINT_OPACITY }
+        },
+        vertexShader, fragmentShader,
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.NormalBlending   // additive + bloom was creating a solid white blob
+    });
+
+    const pts = new THREE.Points(geom, pointsMaterial);
+    headGroup = new THREE.Group();
+    headGroup.add(pts);
+    scene.add(headGroup);
+
+    // Keep the overlay so we can confirm the pick
+    setTimeout(() => setStatusText(statusEl.textContent + ` — rendering ${TARGET_POINTS} pts`), 300);
+},
+(xhr) => { if (xhr.total) setStatusText(`loading… ${Math.round(xhr.loaded/xhr.total*100)}%`); },
+(err) => setStatusText('GLTF load failed: ' + (err.message || err), true));
+
+// --- Public API ---
+window.setStatus = function(newStatus) {
+    status = newStatus;
+    if (pointsMaterial) pointsMaterial.uniforms.isGen.value = (status === 'generating') ? 1.0 : 0.0;
+};
+
+// --- Animate ---
+function animate() {
+    requestAnimationFrame(animate);
+    time += 0.016;
+    if (pointsMaterial) pointsMaterial.uniforms.time.value = time;
+
+    if (headGroup) {
+        const speedMul = status === 'generating' ? 1.8 : 1.0;
+        headGroup.rotation.y = Math.sin(time * 0.5 * speedMul) * IDLE_ROT_Y_AMP;
+        headGroup.rotation.x = Math.sin(time * 0.3 * speedMul) * IDLE_ROT_X_AMP;
+    }
+
+    composer.render();
+}
+animate();
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    composer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>

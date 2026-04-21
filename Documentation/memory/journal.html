@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.journal — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a class="current" href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / journal.py — MemoryJournal</h1>
+  <p class="subtitle">FIFO work queue consumed by the dream consolidator.</p>
+
+  <h2>Storage</h2>
+  <p>JSON at <code>path/memory_journal.json</code>; atomic temp + <code>os.replace</code>; <code>threading.RLock</code>.</p>
+
+  <h2>Schema</h2>
+  <pre><code>[
+  { "type": "post_mortem" | "failure" | str, "data": {...} },
+  ...
+]</code></pre>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(path, max_capacity=50)</code></td><td>Bind path, set FIFO cap.</td></tr>
+      <tr><td><code>append(item_type, data)</code></td><td>Enqueue. Tail-evict on overflow.</td></tr>
+      <tr><td><code>pop_all() / drain()</code></td><td>Atomically read + clear (used by dream).</td></tr>
+      <tr><td><code>push_front(items)</code></td><td>Re-queue items at head if dream couldn't process them; preserves order, drops new appends if needed.</td></tr>
+      <tr><td><code>load()</code></td><td>Read current journal without clearing.</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>api.projects_routes — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>API</h3>
+    <a href="routes.html">routes</a>
+    <a class="current" href="projects_routes.html">projects routes</a>
+    <h3>Related</h3>
+    <a href="../memory/projects.html">memory.projects</a>
+    <a href="../core/project_advancer.html">project_advancer</a>
+  </nav>
+</aside>
+<main>
+  <h1>api / projects_routes.py</h1>
+  <p class="subtitle">REST surface over the <code>ProjectStore</code>. Used by the Slack <code>project</code> commands and the web UI's Projects tab.</p>
+
+  <p>All endpoints require <code>X-Ghost-Key</code>.</p>
+
+  <h2>Project endpoints</h2>
+  <table>
+    <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>GET /api/projects</td><td>List, optionally filtered by status.</td></tr>
+      <tr><td>POST /api/projects</td><td>201 Create. Required: title; optional: kind (default GENERAL), goal.</td></tr>
+      <tr><td>GET /api/projects/{pid}</td><td>Fetch.</td></tr>
+      <tr><td>PATCH /api/projects/{pid}</td><td>Update title, goal, kind, status, metadata.</td></tr>
+      <tr><td>DELETE /api/projects/{pid}</td><td>Soft delete (status=ARCHIVED). <code>?hard=true</code> for cascade hard delete.</td></tr>
+      <tr><td>POST /api/projects/{pid}/switch</td><td>Set as current; returns project briefing.</td></tr>
+      <tr><td>POST /api/projects/{pid}/resume</td><td>Resume + log a project event.</td></tr>
+      <tr><td>POST /api/projects/{pid}/advance</td><td>Run one task-advancement cycle via <a href="../core/project_advancer.html"><code>advance_once()</code></a>.</td></tr>
+      <tr><td>GET /api/projects/{pid}/events</td><td>List project events. Query: <code>limit</code>, <code>type</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Task endpoints</h2>
+  <table>
+    <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>GET /api/projects/{pid}/tasks</td><td>List with optional <code>status</code> filter.</td></tr>
+      <tr><td>POST /api/projects/{pid}/tasks</td><td>201 Create. Body: description, parent_id, dependency_type=ALL, alternatives, postconditions.</td></tr>
+      <tr><td>PATCH /api/projects/{pid}/tasks/{tid}</td><td>Update. Status transitions go through <code>ProjectPlan.update_status()</code> so postconditions / parent propagation fire.</td></tr>
+      <tr><td>DELETE /api/projects/{pid}/tasks/{tid}</td><td>Cascade-delete descendants.</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Image-gen server — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Interfaces</h3>
+    <a href="web_server.html">Web server</a>
+    <a href="slack_bot.html">Slack bot</a>
+    <a href="voice_server.html">Voice server</a>
+    <a class="current" href="image_gen_server.html">Image-gen server</a>
+    <a href="clockwork_ghost.html">Clockwork Ghost</a>
+  </nav>
+</aside>
+<main>
+  <h1>interface / externals / image_generation / img_gen_server.py</h1>
+  <p class="subtitle">Stable Diffusion XL Lightning server. Runs on a Mac (MPS) or Jetson (CUDA) box.</p>
+
+  <h2>Endpoints</h2>
+  <table>
+    <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>POST /generate · POST / · POST /v1/images/generations</td><td>Body: <code>{"prompt", "negative_prompt", "steps"}</code>. Steps clamped 3-8. Guidance 1.5. 832×1216 output. Returns <code>{"time": float, "data": [{"b64_json": ...}]}</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Model &amp; scheduler</h2>
+  <ul>
+    <li><code>StableDiffusionXLPipeline</code> from <code>juggernaut_xl_lightning.safetensors</code>.</li>
+    <li><code>EulerDiscreteScheduler</code> with <strong>trailing</strong> timestep — required for Lightning models.</li>
+    <li><code>torch.float16</code> for memory.</li>
+  </ul>
+
+  <h2>Lifespan</h2>
+  <p><code>asynccontextmanager</code> loads the pipeline on startup, enables CPU offload + VAE slicing, runs a warmup pass. Garbage-collects + clears MPS/CUDA cache between generations. Sets <code>PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0</code> for Mac.</p>
+
+  <h2>Dependencies</h2>
+  <ul>
+    <li><code>diffusers</code> (StableDiffusionXLPipeline, EulerDiscreteScheduler)</li>
+    <li><code>torch</code> (float16, mps.empty_cache)</li>
+    <li><code>PIL</code></li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

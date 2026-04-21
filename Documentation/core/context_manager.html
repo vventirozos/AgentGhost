@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.context_manager — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="llm.html">llm</a>
+    <a href="planning.html">planning</a>
+    <a href="prompts.html">prompts</a>
+    <a href="bus.html">bus</a>
+    <a class="current" href="context_manager.html">context_manager</a>
+    <a href="dream.html">dream</a>
+    <a href="mcts.html">mcts</a>
+    <a href="hypothesis.html">hypothesis</a>
+    <a href="verifier.html">verifier</a>
+    <a href="uncertainty.html">uncertainty</a>
+    <a href="workspace_model.html">workspace_model</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / context_manager.py</h1>
+  <p class="subtitle">Progressive context compression. Avoids the binary "fits" / "emergency-prune" cliff by compressing in five graduated levels.</p>
+
+  <h2>Levels</h2>
+  <table>
+    <thead><tr><th>Level</th><th>Used-token ratio</th><th>Effect</th><th>Full-fidelity turns</th></tr></thead>
+    <tbody>
+      <tr><td>L0</td><td>&lt; 60 %</td><td>No compression.</td><td>all</td></tr>
+      <tr><td>L1</td><td>&lt; 75 %</td><td>Summarize tool outputs (keep first &amp; last 3 lines, error markers).</td><td>last 6</td></tr>
+      <tr><td>L2</td><td>&lt; 85 %</td><td>Collapse verbose assistant messages.</td><td>last 4</td></tr>
+      <tr><td>L3</td><td>&lt; 95 %</td><td>Compress user messages too.</td><td>last 2</td></tr>
+      <tr><td>L4</td><td>≥ 95 %</td><td>Emergency prune — keep only system + last user + last tool output.</td><td>1</td></tr>
+    </tbody>
+  </table>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__(max_tokens=65536, token_estimator=None)</code></td><td>Inject estimator (defaults to ~4 chars per token).</td></tr>
+      <tr><td><code>compress_if_needed(messages, llm_summarizer=None) -&gt; List[dict]</code></td><td>Apply progressive compression if used / max &gt; 60 %.</td></tr>
+      <tr><td><code>_estimate_tokens(messages)</code></td><td>Rough sum across messages.</td></tr>
+      <tr><td><code>_emergency_prune(messages)</code></td><td>L4 emergency strategy.</td></tr>
+      <tr><td><code>_summarize_tool_output(msg)</code></td><td>L1 — keep error / first-3 / last-3 lines.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Configuration constants</h2>
+  <p><code>FULL_FIDELITY_TURNS = {0: 999, 1: 6, 2: 4, 3: 2, 4: 1}</code></p>
+
+  <h2>Concurrency</h2>
+  <p>Synchronous; <code>llm_summarizer</code> can optionally be an async callable for L1 compression of tool outputs.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

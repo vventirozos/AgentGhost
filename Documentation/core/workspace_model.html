@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.workspace_model — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="planning.html">planning</a>
+    <a class="current" href="workspace_model.html">workspace_model</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / workspace_model.py — WorkspaceModel</h1>
+  <p class="subtitle">Structured snapshot of sandbox state so the agent doesn't re-read every file every turn.</p>
+
+  <h2>Data shapes</h2>
+  <table>
+    <thead><tr><th>Type</th><th>Fields</th></tr></thead>
+    <tbody>
+      <tr><td><code>FileState</code> (line 21)</td><td>path · size · content_hash · file_type · last_modified · last_read_turn · summary · columns · row_count</td></tr>
+      <tr><td><code>WorkspaceDiff</code> (line 47)</td><td>added · removed · modified lists, plus a <code>summary()</code> helper</td></tr>
+    </tbody>
+  </table>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>scan(sandbox_dir) -&gt; WorkspaceDiff</code></td><td>Walk filesystem, stat files, return diff vs. last snapshot.</td></tr>
+      <tr><td><code>record_read(path, summary, columns, row_count)</code></td><td>Mark a file as inspected this turn.</td></tr>
+      <tr><td><code>record_write(path, summary)</code></td><td>Note an outgoing write.</td></tr>
+      <tr><td><code>what_do_i_know(path) -&gt; str</code></td><td>Return cached summary so the LLM doesn't re-read.</td></tr>
+      <tr><td><code>what_am_i_missing(goal) -&gt; List[str]</code></td><td>Keyword-match unread files to the current goal.</td></tr>
+      <tr><td><code>get_recently_modified(turns_back=3)</code></td><td>Files touched in the last N turns.</td></tr>
+      <tr><td><code>get_context_for_prompt(max_files=20) -&gt; str</code></td><td>Markdown section for prompt injection.</td></tr>
+      <tr><td><code>advance_turn()</code></td><td>Increment internal turn counter.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Skip rules</h2>
+  <p>The scanner ignores hidden directories, <code>__pycache__</code>, <code>node_modules</code>, and <code>.git</code>. Synchronous.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

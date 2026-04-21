@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.qwen_bridge — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="file_system.html">file_system</a>
+    <a class="current" href="qwen_bridge.html">qwen_bridge</a>
+    <a href="../core/agent_qwen.html">agent_qwen</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / qwen_bridge.py</h1>
+  <p class="subtitle">Adapts Ghost Agent's async tools to Qwen Agent's synchronous <code>BaseTool</code> interface, threading the runtime context through ContextVars.</p>
+
+  <h2>Why</h2>
+  <p>Qwen Agent's ReAct loop calls tools synchronously. Ghost Agent's tools are async and need access to live context (sandbox, memory, scratchpad). The bridge:</p>
+  <ol>
+    <li>Detects whether an event loop is already running and, if so, runs the coroutine in a worker thread with a fresh loop (<code>_run_coro_blocking</code>, line 14-55).</li>
+    <li>Threads the active <code>GhostContext</code> via <code>contextvars.ContextVar</code> (<code>_CTX</code>), so sibling async tasks each see their own context (line 58-88).</li>
+  </ol>
+
+  <h2>Bridged tools</h2>
+  <table>
+    <thead><tr><th>Qwen tool class</th><th>Backend</th></tr></thead>
+    <tbody>
+      <tr><td><code>GhostFileSystem.call()</code></td><td><a href="file_system.html"><code>tool_file_system</code></a></td></tr>
+      <tr><td><code>GhostExecute.call()</code></td><td><a href="execute.html"><code>tool_execute</code></a></td></tr>
+      <tr><td><code>GhostKnowledgeBase.call()</code></td><td><a href="memory_tools.html"><code>tool_knowledge_base</code></a></td></tr>
+    </tbody>
+  </table>
+  <p>Named parameters are extracted from the Qwen call; unknown extras are passed via <code>**extra</code>.</p>
+
+  <h2>Back-compat</h2>
+  <p><code>GLOBAL_CONTEXT</code> is exposed as a property that returns <code>_CTX.get()</code>, so older callsites continue to work without per-task isolation.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

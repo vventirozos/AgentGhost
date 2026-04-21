@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.image_gen — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="vision.html">vision</a>
+    <a class="current" href="image_gen.html">image_gen</a>
+    <a href="../interfaces/image_gen_server.html">image-gen server</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / image_gen.py</h1>
+  <p class="subtitle">Stable Diffusion XL image generation routed to an external GPU node.</p>
+
+  <h2>Tool: <code>image_generation</code></h2>
+  <p>Auto-registered when <code>context.llm_client.image_gen_clients</code> exists.</p>
+  <ul>
+    <li>Heals missing prompt by checking related kwargs (<code>image</code>, <code>description</code>, <code>subject</code>, <code>text</code>).</li>
+    <li>Clamps <code>steps</code> to <code>[4, 8]</code> (Lightning models hate longer schedules).</li>
+    <li>Calls <code>llm_client.generate_image({"prompt", "steps"})</code>.</li>
+    <li>Decodes base64 PNG, writes to sandbox as <code>gen_UUID.png</code>.</li>
+    <li>Returns markdown embed: <code>![prompt](/api/download/gen_UUID.png)</code></li>
+  </ul>
+
+  <p>Backend topology and SDXL model config: <a href="../interfaces/image_gen_server.html">image-gen server</a>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

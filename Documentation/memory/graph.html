@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.graph — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a class="current" href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / graph.py — GraphMemory</h1>
+  <p class="subtitle">SQLite-persisted knowledge graph mirrored into NetworkX for spreading-activation retrieval. Temporal triplet versioning handles belief updates.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>SQLite at <code>memory_dir/knowledge_graph.db</code>.</li>
+    <li>In-memory <code>networkx.MultiDiGraph</code> rebuilt at startup via <code>initialize_graph()</code>.</li>
+  </ul>
+
+  <h2>Schema</h2>
+  <table>
+    <thead><tr><th>Column</th><th>Type</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>subject / predicate / object</td><td>TEXT</td><td>UNIQUE composite key. Subjects/objects lowercased; predicates uppercased.</td></tr>
+      <tr><td>timestamp</td><td>REAL</td><td>Last-touched epoch.</td></tr>
+      <tr><td>weight</td><td>REAL</td><td>Reinforcement counter.</td></tr>
+      <tr><td>valid_from</td><td>REAL</td><td>Creation time.</td></tr>
+      <tr><td>valid_until</td><td>REAL nullable</td><td>NULL until superseded.</td></tr>
+    </tbody>
+  </table>
+  <p>Indexes on <code>subject</code> and <code>object</code>.</p>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>add_triplets(triplets) -&gt; int</code></td><td>Bulk insert / reinforce. Functional predicates (WORKS_AT, LIVES_IN, DRIVES, …) auto-expire prior values.</td></tr>
+      <tr><td><code>delete_by_target(target)</code></td><td>Substring match deletion.</td></tr>
+      <tr><td><code>wipe_all()</code></td><td>Truncate.</td></tr>
+      <tr><td><code>get_recent_triplets(limit)</code></td><td>Most recent edges.</td></tr>
+      <tr><td><code>get_expired_triplets(subject, limit)</code></td><td>Superseded facts.</td></tr>
+      <tr><td><code>execute_graph_compression(merges)</code></td><td>Merge synonym nodes (line 216-266).</td></tr>
+      <tr><td><code>get_neighborhood(words, global_limit)</code></td><td>Spreading-activation BFS retrieval.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Spreading-activation retrieval</h2>
+  <ol>
+    <li>Word-to-node fuzzy match: exact → substring → <code>difflib.get_close_matches</code>.</li>
+    <li>3-hop BFS from each seed.</li>
+    <li>Score paths by sum of edge weights.</li>
+    <li>Format winners as <code>(subject)-[PREDICATE]-&gt; (object) -[P2]-&gt; (target)</code>.</li>
+  </ol>
+
+  <h2>Functional vs. non-functional predicates</h2>
+  <p>One-to-one predicates (WORKS_AT, LIVES_IN, DRIVES) auto-expire old values when a new fact arrives. Many-to-many predicates (LIKES, KNOWS, HAS) accumulate.</p>
+
+  <h2>Concurrency</h2>
+  <p><code>threading.RLock</code> guards both SQLite and the networkx mirror. <code>initialize_graph()</code> rebuilds the entire mirror from disk.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Web server — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Interfaces</h3>
+    <a class="current" href="web_server.html">Web server</a>
+    <a href="slack_bot.html">Slack bot</a>
+    <a href="voice_server.html">Voice server</a>
+    <a href="image_gen_server.html">Image-gen server</a>
+    <a href="clockwork_ghost.html">Clockwork Ghost</a>
+  </nav>
+</aside>
+<main>
+  <h1>interface / server.py</h1>
+  <p class="subtitle">Browser-facing FastAPI proxy on port 8080. Handles auth, streaming, file I/O, log tailing, voice forwarding.</p>
+
+  <h2>Endpoints</h2>
+  <table>
+    <thead><tr><th>Method · Path</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td>GET /</td><td>Auth gate (<code>?key=…</code>). Renders index.html and injects the API key into a script.</td></tr>
+      <tr><td>GET /sw.js</td><td>Service worker for offline / PWA.</td></tr>
+      <tr><td>WS /ws</td><td>Persistent websocket — log line broadcast.</td></tr>
+      <tr><td>POST /api/chat</td><td>Streaming or non-streaming chat. Returns <code>task_id</code> for streams.</td></tr>
+      <tr><td>GET /api/chat/resume/{task_id}</td><td>Resume after disconnect at offset.</td></tr>
+      <tr><td>POST /api/chat/cancel/{task_id}</td><td>Cancel an in-flight task.</td></tr>
+      <tr><td>POST /api/workspace/save · /load</td><td>Zip download / upload of state.</td></tr>
+      <tr><td>POST /api/upload · GET /api/download/{path}</td><td>File I/O against the agent.</td></tr>
+      <tr><td>POST /api/stt</td><td>Audio → text via the Raspberry Pi voice server.</td></tr>
+      <tr><td>POST /api/tts</td><td>Text → audio stream via the Raspberry Pi voice server.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Streaming model</h2>
+  <ul>
+    <li>Per-task state dict keyed by UUID in global <code>active_chat_tasks</code>.</li>
+    <li>Background worker spawned on POST /api/chat with <code>stream=true</code>, sharing a pooled <code>httpx.AsyncClient</code>.</li>
+    <li>The worker reads upstream chunks and appends bytes to <code>task["buffer"]</code>; an <code>asyncio.Event</code> signals new data.</li>
+    <li>The stream generator yields by chunk index (not byte index) and clears the event before draining to avoid races.</li>
+    <li>Truncation is detected via <code>task["truncated"]</code> and surfaces as an SSE error marker.</li>
+    <li>Resume endpoint accepts an offset for reconnection.</li>
+    <li>A janitor task evicts done tasks past 10-min TTL or hard cap of 200.</li>
+  </ul>
+
+  <h2>Buffer &amp; payload limits</h2>
+  <ul>
+    <li>Per-task stream buffer cap 50 MB (<code>GHOST_INTERFACE_STREAM_CAP</code>).</li>
+    <li>Request body: max 500 chat messages.</li>
+    <li>Upload body: 100 MB hard cap via <code>_read_capped_upload()</code>; 64 KB chunks; rejects non-bytes.</li>
+  </ul>
+
+  <h2>Log streaming</h2>
+  <p>A <code>log_streamer()</code> task spawns <code>tail -f</code> on the agent log and broadcasts to connected websockets. Detects <code>ERROR</code>/<code>Exception</code> and tags <code>is_error</code> for client reactivity. Subprocess is cleaned up with timeout-then-kill on shutdown.</p>
+
+  <h2>Auth</h2>
+  <ul>
+    <li><code>GHOST_API_KEY</code> mandatory; the module fails to import without it.</li>
+    <li>All state-mutating endpoints depend on <code>verify_interface_key()</code> which compares <code>X-Ghost-Key</code>.</li>
+    <li>The page itself is gated by a query parameter check (browsers send keys in URL on first load only).</li>
+    <li>CORS: <code>allow_origins=*</code>, <code>allow_credentials=False</code>.</li>
+  </ul>
+
+  <h2>Concurrency</h2>
+  <ul>
+    <li>asyncio throughout; one shared <code>httpx.AsyncClient</code> pool.</li>
+    <li>FastAPI <code>Depends(verify_interface_key)</code> for auth.</li>
+    <li>StreamingResponse with custom generator for back-pressure.</li>
+    <li>Background tasks for upstream polling + log streaming.</li>
+  </ul>
+
+  <h2>Static assets</h2>
+  <p><code>interface/static/</code> holds <code>index.html</code> (three.js, marked, dompurify, mermaid, papaparse, chart.js via CDN), <code>app.js</code> (auth wrapper that injects <code>X-Ghost-Key</code> on every <code>/api/</code> fetch, voice queue management, monologue display, renderer iframe), <code>style.css</code> (cyan/magenta cyber theme), <code>matrix_graph.js</code> (three.js particle system), <code>image_face.js</code>, <code>cyber_face.png</code>, and <code>sw.js</code> (service worker).</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

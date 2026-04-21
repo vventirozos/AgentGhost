@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost Agent — Documentation</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Overview</h3>
+    <a class="current" href="index.html">Home</a>
+    <a href="capabilities.html">Capabilities</a>
+    <a href="architecture.html">System Architecture</a>
+    <a href="installation.html">Install &amp; Run</a>
+    <a href="cli_reference.html">CLI Reference</a>
+
+    <h3>Core</h3>
+    <a href="core/agent.html">agent</a>
+    <a href="core/agent_qwen.html">agent_qwen</a>
+    <a href="core/llm.html">llm</a>
+    <a href="core/planning.html">planning</a>
+    <a href="core/prompts.html">prompts</a>
+    <a href="core/bus.html">bus (memory)</a>
+    <a href="core/context_manager.html">context_manager</a>
+    <a href="core/dream.html">dream</a>
+    <a href="core/mcts.html">mcts</a>
+    <a href="core/hypothesis.html">hypothesis</a>
+    <a href="core/verifier.html">verifier</a>
+    <a href="core/uncertainty.html">uncertainty</a>
+    <a href="core/workspace_model.html">workspace_model</a>
+    <a href="core/self_play_scoring.html">self_play_scoring</a>
+    <a href="core/challenge_templates.html">challenge_templates</a>
+    <a href="core/journal_challenges.html">journal_challenges</a>
+    <a href="core/project_advancer.html">project_advancer</a>
+    <a href="core/project_safety.html">project_safety</a>
+
+    <h3>Memory</h3>
+    <a href="memory/vector.html">vector</a>
+    <a href="memory/graph.html">graph</a>
+    <a href="memory/profile.html">profile</a>
+    <a href="memory/skills.html">skills</a>
+    <a href="memory/journal.html">journal</a>
+    <a href="memory/scratchpad.html">scratchpad</a>
+    <a href="memory/episodes.html">episodes</a>
+    <a href="memory/frontier.html">frontier</a>
+    <a href="memory/projects.html">projects</a>
+    <a href="memory/adaptive_threshold.html">adaptive_threshold</a>
+    <a href="memory/contradiction_log.html">contradiction_log</a>
+
+    <h3>Tools</h3>
+    <a href="tools/registry.html">registry</a>
+    <a href="tools/execute.html">execute</a>
+    <a href="tools/file_system.html">file_system</a>
+    <a href="tools/search.html">search</a>
+    <a href="tools/database.html">database</a>
+    <a href="tools/memory_tools.html">memory tools</a>
+    <a href="tools/system.html">system</a>
+    <a href="tools/vision.html">vision</a>
+    <a href="tools/image_gen.html">image_gen</a>
+    <a href="tools/swarm.html">swarm</a>
+    <a href="tools/tasks.html">tasks (scheduler)</a>
+    <a href="tools/projects.html">projects</a>
+    <a href="tools/qwen_bridge.html">qwen_bridge</a>
+    <a href="tools/acquired_skills.html">acquired_skills</a>
+    <a href="tools/composed_skills.html">composed_skills</a>
+    <a href="tools/tool_failure.html">tool_failure</a>
+    <a href="tools/fallback_chains.html">fallback_chains</a>
+
+    <h3>Sandbox &amp; API</h3>
+    <a href="sandbox/docker.html">Docker sandbox</a>
+    <a href="api/routes.html">HTTP routes</a>
+    <a href="api/projects_routes.html">Projects routes</a>
+
+    <h3>Interfaces</h3>
+    <a href="interfaces/web_server.html">Web server</a>
+    <a href="interfaces/slack_bot.html">Slack bot</a>
+    <a href="interfaces/voice_server.html">Voice (TTS/STT)</a>
+    <a href="interfaces/image_gen_server.html">Image-gen server</a>
+    <a href="interfaces/clockwork_ghost.html">Clockwork Ghost</a>
+
+    <h3>Algorithms</h3>
+    <a href="algorithms/request_lifecycle.html">Request lifecycle</a>
+    <a href="algorithms/memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="algorithms/dream_cycle.html">Dream / self-play</a>
+    <a href="algorithms/skill_acquisition.html">Skill acquisition</a>
+    <a href="algorithms/circuit_breaker.html">Circuit breaker</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <div class="eyebrow">Documentation</div>
+    <h1>Ghost Agent</h1>
+    <p class="subtitle">An autonomous FastAPI service that wraps an OpenAI-compatible LLM with multi-tier memory, Docker-isolated tool execution, swarm inference, and biological-rhythm self-play.</p>
+    <div class="hero-meta">
+      <span class="badge">Qwen 3.6 35B-A3</span>
+      <span class="badge">Tor-only egress</span>
+      <span class="badge">Python 3.10+</span>
+      <span class="badge">FastAPI</span>
+      <span class="badge">Docker</span>
+      <span class="badge good">Reference</span>
+    </div>
+  </section>
+
+  <div class="note">
+    <strong>Runtime stance.</strong> Ghost Agent is designed and tuned around an
+    <strong>uncensored Qwen 3.6 35B-A3</strong> upstream model, and every outbound
+    network request the agent issues is mandated through <strong>Tor</strong>.
+    Anonymity is not an add-on — it is enforced at the HTTP layer for every tool
+    that reaches the open internet, with automatic circuit rotation on refusal.
+    See <a href="#anonymity">Anonymity &amp; Tor routing</a> for the mechanics.
+  </div>
+
+  <p>Ghost Agent wraps an upstream OpenAI-compatible LLM endpoint (llama.cpp / Ollama / vLLM) with a full agentic stack: a hierarchical task planner, a six-tier memory subsystem backed by ChromaDB and SQLite, a Docker-API container sandbox for code execution, a swarm router for fanning work out across specialised LLM pools, and three separate user-facing interfaces (web UI, Slack bot, desktop "Clockwork Ghost").</p>
+
+  <p>This documentation set was reverse-engineered directly from the source under <code>src/ghost_agent/</code> and <code>interface/</code>. Use the navigation on the left to drill into individual modules, or follow the links below for a guided tour.</p>
+
+  <h2>Quick links</h2>
+  <div class="card-grid">
+    <a class="card" href="architecture.html"><h3>System Architecture</h3><p>End-to-end diagram of how interfaces, API, core, memory and sandbox interact.</p></a>
+    <a class="card" href="algorithms/request_lifecycle.html"><h3>Request lifecycle</h3><p>What happens when a user message hits <code>/api/chat</code>.</p></a>
+    <a class="card" href="installation.html"><h3>Install &amp; Run</h3><p>Environment variables, dependencies, container prerequisites.</p></a>
+    <a class="card" href="cli_reference.html"><h3>CLI flags</h3><p>Every <code>python -m src.ghost_agent.main</code> argument explained.</p></a>
+    <a class="card" href="core/agent.html"><h3>The reasoning loop</h3><p><code>agent.py</code> — streaming, tool dispatch, sampling profiles.</p></a>
+    <a class="card" href="memory/vector.html"><h3>Vector memory</h3><p>ChromaDB-backed semantic store with spaced-repetition.</p></a>
+    <a class="card" href="tools/registry.html"><h3>Tool registry</h3><p>How tools are advertised, dispatched, and validated.</p></a>
+    <a class="card" href="sandbox/docker.html"><h3>Docker sandbox</h3><p>Container lifecycle, mounts, Tor networking, resource limits.</p></a>
+    <a class="card" href="#anonymity"><h3>Anonymity &amp; Tor</h3><p>Identity-rotation policy, what's routed through Tor, and the fetch pipeline.</p></a>
+  </div>
+
+  <h2>Source map</h2>
+  <table>
+    <thead><tr><th>Path</th><th>Purpose</th><th>Doc section</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/ghost_agent/main.py</code></td><td>CLI entrypoint &amp; FastAPI lifespan</td><td><a href="cli_reference.html">CLI reference</a></td></tr>
+      <tr><td><code>src/ghost_agent/core/</code></td><td>Reasoning loop, planning, dream, MCTS, swarm router</td><td><a href="core/agent.html">Core</a></td></tr>
+      <tr><td><code>src/ghost_agent/memory/</code></td><td>Vector + graph + profile + skill + journal + episodic stores</td><td><a href="memory/vector.html">Memory</a></td></tr>
+      <tr><td><code>src/ghost_agent/tools/</code></td><td>Tool registry &amp; per-tool implementations</td><td><a href="tools/registry.html">Tools</a></td></tr>
+      <tr><td><code>src/ghost_agent/sandbox/</code></td><td>Docker container manager</td><td><a href="sandbox/docker.html">Sandbox</a></td></tr>
+      <tr><td><code>src/ghost_agent/api/</code></td><td>FastAPI routes</td><td><a href="api/routes.html">API</a></td></tr>
+      <tr><td><code>src/ghost_agent/utils/</code></td><td>Logging, sanitiser, token counter, helpers</td><td><a href="cli_reference.html#utils">Utilities</a></td></tr>
+      <tr><td><code>interface/</code></td><td>Web UI, Slack bot, voice/image servers, desktop client</td><td><a href="interfaces/web_server.html">Interfaces</a></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Conceptual model</h2>
+  <p>Ghost Agent is best understood as <strong>five concentric layers</strong>:</p>
+  <ol>
+    <li><strong>Interface layer</strong> — web/Slack/desktop clients that talk HTTP/SSE to the FastAPI core.</li>
+    <li><strong>API layer</strong> — Ollama-compatible HTTP routes that authenticate (<code>X-Ghost-Key</code>) and stream agent responses.</li>
+    <li><strong>Reasoning core</strong> — <code>GhostAgent</code> drives a streaming chat loop, parses tool calls from <code>&lt;tool_call&gt;</code> XML, dispatches tools, and re-injects results.</li>
+    <li><strong>Memory + planning</strong> — six memory tiers fused via Reciprocal Rank Fusion, plus a hierarchical <code>TaskTree</code> with postcondition gating, MCTS lookahead, and uncertainty tracking.</li>
+    <li><strong>Execution substrate</strong> — Docker containers for tool calls, swarm/worker LLM pools for parallel inference, and Tor for anonymous outbound traffic.</li>
+  </ol>
+
+  <p>The <a href="architecture.html">Architecture page</a> contains the full diagram.</p>
+
+  <h2 id="anonymity">Anonymity &amp; Tor routing</h2>
+  <p>Ghost Agent treats Tor as the default transport for outbound traffic — not as an optional flag. The proxy endpoint is declared once via the <code>TOR_PROXY</code> env var (canonical value: <code>socks5h://127.0.0.1:9050</code>) and is honoured by every HTTP-touching tool in the codebase. The <code>--anonymous</code> CLI switch is enabled by default and additionally routes <code>web_search</code> through DuckDuckGo, which keeps no query logs.</p>
+
+  <h3>The fetch pipeline</h3>
+  <p>Every outbound call funnels through <code>utils/helpers.helper_fetch_url_content()</code>, which wraps <code>curl_cffi</code> and <code>httpx</code> with:</p>
+  <ul>
+    <li><strong>SOCKS5h routing</strong> — DNS is resolved <em>over Tor</em>, not by the local resolver, so the operator's DNS server never sees the target hostname.</li>
+    <li><strong>SSRF guards</strong> — private, link-local, and loopback ranges are refused before the SOCKS layer is touched. A tool call can't become a host-network scanner.</li>
+    <li><strong>5 MB body cap</strong> and <strong>20 s timeout</strong> — bounds the damage a hostile exit node or target server can do by serving slow or unbounded bodies.</li>
+    <li><strong>3-retry budget</strong> — transient failures are retried with a fresh Tor identity between attempts.</li>
+  </ul>
+
+  <h3>Identity rotation (NEWNYM)</h3>
+  <p><code>request_new_tor_identity()</code> in <code>utils/helpers.py</code> is the agent's circuit-burn primitive. Mechanically, it speaks the Tor control protocol to the local daemon and issues a <code>SIGNAL NEWNYM</code>: Tor marks the current circuit dirty, and every subsequent stream opens through a brand-new entry-guard / middle / exit chain. The agent's previous exit node is no longer reachable from the next hop.</p>
+  <p>Rotation fires:</p>
+  <ul>
+    <li><strong>Automatically on HTTP 401 / 403 / 503</strong> from <a href="tools/search.html"><code>web_search</code></a> — a gateway or exit refusal usually clears on a different chain.</li>
+    <li><strong>Between retries</strong> in <a href="tools/system.html"><code>check_weather</code></a> (3 attempts with identity refresh) and any tool that elects to re-enter the pool rather than hammer the same circuit.</li>
+    <li><strong>Between parallel reformulations</strong> in <code>deep_research</code> — the N parallel queries do not all emerge from the same exit.</li>
+    <li><strong>On explicit agent intent</strong> — the agent can invoke rotation as a tool step when a task's anonymity posture demands it (e.g. before re-visiting a site that just saw traffic).</li>
+  </ul>
+
+  <h3>What is and isn't routed through Tor</h3>
+  <table>
+    <thead><tr><th>Traffic</th><th>Transport</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td>Web search (<code>ddgs</code> → DuckDuckGo)</td><td><span class="badge good">Tor</span></td><td>Every request; identity rotated on refusal or rate-limit.</td></tr>
+      <tr><td>Page / document fetch (<code>fetch_url</code>)</td><td><span class="badge good">Tor</span></td><td>SOCKS5h — DNS also leaves via Tor.</td></tr>
+      <tr><td>Weather &amp; geolocation</td><td><span class="badge good">Tor</span></td><td>Open-Meteo primary, <code>wttr.in</code> fallback; both honour <code>TOR_PROXY</code>.</td></tr>
+      <tr><td>Sandbox container egress</td><td><span class="badge good">Tor</span></td><td>When the container has network access, it inherits the Tor SOCKS namespace.</td></tr>
+      <tr><td>Upstream LLM inference</td><td><span class="badge">Local</span></td><td>llama.cpp / vLLM runs on <code>127.0.0.1</code>. Never traverses a network boundary, Tor or otherwise.</td></tr>
+      <tr><td>Slack / voice / image-gen servers</td><td><span class="badge">LAN</span></td><td>Operator-owned companion services on the private network; intentionally direct so the agent can reach them behind Tor's default deny.</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Sanity check &amp; failure mode</h3>
+  <p>The <a href="tools/system.html"><code>check_health</code></a> tool probes the configured circuit on demand and reports whether <code>check.torproject.org</code> sees the request as Tor traffic, plus the current exit-node country. The probe is part of the default health readout — if the circuit is down or leaking to clearnet, the tool surfaces it loudly rather than silently degrading.</p>
+  <div class="note warn">
+    <strong>Fail-closed, not fail-open.</strong> If <code>TOR_PROXY</code> is unset or the Tor daemon is unreachable at startup, outbound tools refuse to fire rather than fall back to clearnet. This is intentional: a silently-cleartext agent is worse than a stalled one.
+  </div>
+
+  <footer>
+    <p>Generated from source on 2026-04-19. Self-play section refreshed 2026-04-20 &mdash; continuous-loop tool, saturation detection, validator self-test gate, <code>list_lessons</code> surface, tool-error discrimination.</p>
+    <p>Treat <code>README.md</code> and <code>CLAUDE.md</code> as historical artefacts; this documentation set is the canonical reference.</p>
+  </footer>
+</main>
+</body>
+</html>

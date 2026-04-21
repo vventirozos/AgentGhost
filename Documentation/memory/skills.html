@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.skills — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a class="current" href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / skills.py — SkillMemory</h1>
+  <p class="subtitle">Lessons learned from past mistakes. Vector-backed retrieval with BM25 re-rank; utility-driven retention; verified-first pinning.</p>
+
+  <h2>Storage</h2>
+  <ul>
+    <li>JSON at <code>memory_dir/skills_playbook.json</code>.</li>
+    <li>Vector embeddings stored alongside in <a href="vector.html">VectorMemory</a> with <code>metadata.type = "skill"</code>.</li>
+    <li><code>threading.RLock</code> for JSON reads/writes; lazy-init fallback for tests.</li>
+  </ul>
+
+  <h2>Lesson schema (v2)</h2>
+  <pre><code>{
+  "schema_version":      2,
+  "timestamp":           "ISO",
+  "task":                str,
+  "trigger":             str,
+  "mistake":             str,
+  "anti_pattern":        str,
+  "solution":            str,
+  "correct_pattern":     str,
+  "code_example":        str,
+  "domains":             list[str],
+  "confidence":          float (0-1),
+  "source_challenge_hash": str,
+  "verified":            bool,
+  "verification_attempted": bool,
+  "retrievals":          int,
+  "helpful_retrievals":  int,
+  "last_retrieved_at":   "ISO",
+  "source":              str,
+  "frequency":           int,
+  "graduated":           bool
+}</code></pre>
+
+  <h2>Retention &amp; eviction</h2>
+  <p><code>PLAYBOOK_MAX = 50</code>. Trim policy:</p>
+  <ol>
+    <li>Newest lesson is always kept (head pin).</li>
+    <li>Verified lessons pinned next.</li>
+    <li>Remaining slots filled by unverified, ranked by utility.</li>
+  </ol>
+
+  <h3>Utility formula</h3>
+  <pre><code>utility = confidence·0.5 + hit_rate·0.8 + (0.3 if verified) + log(freq)·0.1 + stale_penalty</code></pre>
+
+  <h2>Retrieval</h2>
+  <p><code>get_playbook_context(query, memory_system, distance_threshold=0.45, limit, record_retrievals)</code> performs a Chroma query, then BM25 re-rank with a keyword bonus. Default distance threshold is <code>DEFAULT_RETRIEVAL_DISTANCE = 0.45</code>. When a lesson is surfaced, <code>record_retrieval</code> increments the counter and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — so the "is this self-play lesson ever actually used?" question has data to answer.</p>
+
+  <h2>Dedup</h2>
+  <p>Vector similarity check (distance &lt; 0.15) or exact task match merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate.</p>
+
+  <h2>Listing lessons (user-facing surface)</h2>
+  <p><code>list_lessons(scope, source, limit)</code> returns lessons filtered by time window and source, most-recent first. Boundaries use <strong>local wall-clock</strong>:</p>
+  <ul>
+    <li><code>scope="today"</code> — since local midnight.</li>
+    <li><code>scope="week"</code> / <code>"7d"</code> — last 7 days.</li>
+    <li><code>scope="all"</code> — entire playbook.</li>
+    <li><code>source="self_play"</code> (etc.) — filter by provenance.</li>
+  </ul>
+  <p>Surfaced to the LLM via the <code>list_lessons</code> tool (see <a href="../tools/memory_tools.html">tools / memory</a>). Phrases like <em>"what did you learn today?"</em> / <em>"what have you learned so far?"</em> are routed to this tool via <a href="../core/prompts.html">SYSTEM_PROMPT</a>.</p>
+
+  <h2>Public methods</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>build_lesson(task, trigger, anti_pattern, correct_pattern, domains, confidence, source_challenge_hash, verified, source) → dict</code></td><td>Factory.</td></tr>
+      <tr><td><code>learn_lesson(task, mistake, solution, memory_system=None, **structured)</code></td><td>Write lesson with dedup, merge, trim.</td></tr>
+      <tr><td><code>list_lessons(scope="all", source="", limit=20) → list</code></td><td>Time-window + source filter; local-time boundaries; most-recent first.</td></tr>
+      <tr><td><code>record_retrieval(trigger)</code> / <code>record_helpful_retrieval(trigger)</code></td><td>Hit-rate accounting. <code>record_retrieval</code> emits a debug log with <code>source_challenge_hash</code> for observability.</td></tr>
+      <tr><td><code>credit_recent_retrievals(window_seconds=300)</code></td><td>Bulk credit (idempotent per window).</td></tr>
+      <tr><td><code>prune_low_utility(min_retrievals=5, max_drop_fraction=0.25)</code></td><td>Drop bottom-quartile.</td></tr>
+      <tr><td><code>get_recent_failures(limit) → str</code></td><td>Format for LLM injection.</td></tr>
+      <tr><td><code>find_by_trigger(trigger)</code> / <code>mark_verified</code> / <code>remove_by_trigger</code></td><td>Index helpers used by the verification-grounded lesson flow in <a href="../core/dream.html">dream.py</a>.</td></tr>
+    </tbody>
+  </table>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

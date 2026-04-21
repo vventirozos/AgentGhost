@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.file_system — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a class="current" href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / file_system.py</h1>
+  <p class="subtitle">Unified file operations with binary sniffing, PDF chunking, downloads, and path-traversal guards.</p>
+
+  <h2>Tool: <code>file_system</code></h2>
+  <p>One LLM-facing tool that dispatches to a sub-handler by the <code>operation</code> argument.</p>
+  <table>
+    <thead><tr><th>Operation</th><th>Handler</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>read</td><td><code>tool_read_file</code></td><td>Binary sniff first 8 KB; errors on binary; clamps to <code>max_context · 3.5 · 0.5</code> chars.</td></tr>
+      <tr><td>read_chunked</td><td><code>tool_read_document_chunked</code></td><td>PyMuPDF for PDF pages; text-file byte chunking with overlap.</td></tr>
+      <tr><td>inspect</td><td><code>tool_inspect_file</code></td><td>First N lines (default 10).</td></tr>
+      <tr><td>write</td><td><code>tool_write_file</code></td><td>Auto-serialise JSON, strip markdown, auto-create parent dirs, fixture summary for data files.</td></tr>
+      <tr><td>replace</td><td><code>tool_replace_text</code></td><td>Exact match → flexible (whitespace-insensitive) → nearest snippet; auto-promote to write if missing target.</td></tr>
+      <tr><td>search</td><td><code>tool_file_search</code></td><td>ripgrep with 40 KB output cap (head 10 KB + tail 30 KB).</td></tr>
+      <tr><td>find</td><td><code>tool_find_files</code></td><td><code>find(1)</code> with 100-result limit; filters hidden / node_modules / __pycache__.</td></tr>
+      <tr><td>download</td><td><code>tool_download_file</code></td><td>curl_cffi (Chrome impersonation) or httpx; 50 MB cap; Tor + identity refresh on 401/403/503.</td></tr>
+      <tr><td>copy / rename / move / delete</td><td><code>shutil</code>-backed</td><td>Refuses overwrite on copy.</td></tr>
+      <tr><td>list</td><td><code>tool_list_files</code></td><td>Walks sandbox; extracts AST signatures for <code>.py</code> files; 200-file limit.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Path-safety</h2>
+  <p><code>_get_safe_path</code> resolves all paths relative to <code>sandbox_dir</code> and rejects path traversal via <code>Path.is_relative_to()</code>. Leading <code>/</code> is stripped and treated as relative.</p>
+
+  <h2>Binary sniffing</h2>
+  <p><code>_looks_like_binary</code>: NUL byte → binary; otherwise count non-text control chars (everything &lt; 0x20 except TAB/LF/CR/FF) — &gt; 5 % → binary.</p>
+
+  <h2>PDF handling</h2>
+  <ul>
+    <li><code>read</code> blocks PDFs with a hint to use <code>read_chunked</code>.</li>
+    <li><code>read_chunked</code> uses PyMuPDF; max 1000 pages.</li>
+    <li>For ingestion via <code>knowledge_base</code>, the PDF is chunked into the vector store.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

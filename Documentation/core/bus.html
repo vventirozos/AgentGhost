@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.bus — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="agent_qwen.html">agent_qwen</a>
+    <a href="llm.html">llm</a>
+    <a href="planning.html">planning</a>
+    <a href="prompts.html">prompts</a>
+    <a class="current" href="bus.html">bus</a>
+    <a href="context_manager.html">context_manager</a>
+    <a href="dream.html">dream</a>
+    <a href="mcts.html">mcts</a>
+    <a href="hypothesis.html">hypothesis</a>
+    <a href="verifier.html">verifier</a>
+    <a href="uncertainty.html">uncertainty</a>
+    <a href="workspace_model.html">workspace_model</a>
+    <a href="self_play_scoring.html">self_play_scoring</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="project_safety.html">project_safety</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / bus.py — MemoryBus</h1>
+  <p class="subtitle">In-memory pub/sub façade over Vector / Graph / Skill / Profile / Episodic stores. Hydrates context with Reciprocal Rank Fusion; publishes facts in parallel.</p>
+
+  <h2>Public surface</h2>
+  <table>
+    <thead><tr><th>Member</th><th>Signature</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>__init__</code></td><td><code>(vector_memory, graph_memory, skill_memory, profile_memory, episodic_memory)</code></td><td>All five tiers are optional — missing ones are skipped at fan-out time.</td></tr>
+      <tr><td><code>async hydrate_context</code></td><td><code>(query, max_chars=6000, rrf_k=60, context_budget=0, llm_client=None) -&gt; str</code></td><td>Fetch all tiers in parallel, fuse with RRF, return sectioned markdown for prompt injection.</td></tr>
+      <tr><td><code>async publish_fact</code></td><td><code>(event_type, fact_data) -&gt; Dict[str, Any]</code></td><td>Fan-out write to vector, graph, profile, skill stores in parallel. Dedup-LRU gate prevents replays.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>RRF (Reciprocal Rank Fusion)</h2>
+  <p>For each ranker (vector, graph, skill, episodic) the bus computes:</p>
+  <pre><code>score(doc) = Σ_ranker  weight_ranker / (k + rank_in_ranker + 1)</code></pre>
+  <p><code>k = rrf_k</code> defaults to <strong>60</strong> (line 130s). Per-source weights depend on a query intent classification:</p>
+
+  <table>
+    <thead><tr><th>Intent</th><th>graph</th><th>vector</th><th>skill</th><th>episodic</th></tr></thead>
+    <tbody>
+      <tr><td>factual</td><td>2.0</td><td>1.0</td><td>0.5</td><td>0.3</td></tr>
+      <tr><td>procedural</td><td>0.5</td><td>1.0</td><td>2.0</td><td>1.5</td></tr>
+      <tr><td>contextual</td><td>1.0</td><td>1.5</td><td>1.0</td><td>1.0</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Section budgets</h2>
+  <p>Total <code>max_chars</code> is split across sources before truncation:</p>
+  <ul>
+    <li>graph — 25 %</li>
+    <li>vector — 40 %</li>
+    <li>skill — 20 %</li>
+    <li>episodic — 15 %</li>
+  </ul>
+
+  <h2>Dedup LRU</h2>
+  <p><code>_DEDUP_LRU_MAX = 256</code>. Each <code>publish_fact</code> hashes <code>(event_type, fact_data)</code> with MD5 before the fan-out — a recently-seen signature short-circuits and writes nothing. Prevents re-emission storms when the LLM repeats itself.</p>
+
+  <h2>Fan-out diagram</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 900 360" xmlns="http://www.w3.org/2000/svg" font-size="12">
+      <rect width="900" height="360" fill="#131822"/>
+      <defs><marker id="bus1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1.5 L9,5 L0,8.5 Z" fill="rgba(122,167,255,0.9)"/></marker></defs>
+
+      <rect x="350" y="20" width="200" height="50" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="450" y="50" text-anchor="middle" fill="#e6e9ef">user query</text>
+
+      <rect x="300" y="100" width="300" height="50" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="450" y="130" text-anchor="middle" fill="#e6e9ef">decompose into 2-3 sub-queries</text>
+
+      <rect x="60" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="140" y="220" text-anchor="middle" fill="#e6e9ef">VectorMemory</text>
+      <rect x="240" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="320" y="220" text-anchor="middle" fill="#e6e9ef">GraphMemory</text>
+      <rect x="420" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="500" y="220" text-anchor="middle" fill="#e6e9ef">SkillMemory</text>
+      <rect x="600" y="190" width="160" height="50" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="680" y="220" text-anchor="middle" fill="#e6e9ef">EpisodicMemory</text>
+
+      <rect x="300" y="280" width="300" height="50" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="450" y="310" text-anchor="middle" fill="#e6e9ef">RRF fusion + intent weights → markdown</text>
+
+      <line x1="450" y1="70" x2="450" y2="100" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="380" y1="150" x2="140" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="410" y1="150" x2="320" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="490" y1="150" x2="500" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="520" y1="150" x2="680" y2="190" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="140" y1="240" x2="380" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="320" y1="240" x2="410" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="500" y1="240" x2="490" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+      <line x1="680" y1="240" x2="520" y2="280" stroke="#7aa7ff" marker-end="url(#bus1)"/>
+    </svg>
+    <p class="caption">Figure 5 — Memory-bus hydration: parallel fetch across tiers, RRF fusion at the end.</p>
+  </div>
+
+  <h2>Concurrency</h2>
+  <p><code>asyncio.gather</code> drives the parallel fetches; sync-only memory stores are wrapped via <code>asyncio.to_thread</code>.</p>
+
+  <p>Detailed RRF derivation in <a href="../algorithms/memory_hydration.html">algorithms / memory hydration</a>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>
