@@ -59,7 +59,8 @@
   <ul>
     <li>Boots persistent <code>ipykernel_launcher</code> if not running.</li>
     <li>Wraps via <code>jupyter_client.BlockingKernelClient</code>.</li>
-    <li>Streams stdout / stderr; detects 5-min timeout or kernel death.</li>
+    <li><strong>Calls <code>kc.wait_for_ready(timeout=10)</code> BEFORE <code>kc.execute()</code></strong> — without this, <code>is_alive()</code> false-negatives for ~1 s after <code>start_channels()</code> while the heartbeat channel hasn't exchanged yet. The runner's <code>except queue.Empty</code> branch reads <code>is_alive()</code> as a "kernel died?" probe, so every FIRST stateful execute of a session used to emit <code>[SYSTEM ERROR: Kernel Terminated Abruptly (Did the script call os._exit()?)]</code> even though the script hadn't run. <code>wait_for_ready</code> closes the race; a genuine launch failure surfaces as a distinct <code>[SYSTEM ERROR: Kernel did not become ready within 10s]</code> message so reflection can distinguish launch failure from runtime crash. Covered by <code>tests/test_execute_jupyter_wait_for_ready.py</code>.</li>
+    <li>Streams stdout / stderr; detects 5-min timeout or mid-execution kernel death.</li>
   </ul>
 
   <h2>Output handling</h2>

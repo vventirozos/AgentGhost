@@ -183,6 +183,7 @@ async def test_self_play_loop_starts_and_stops_on_signal(tmp_path, monkeypatch):
         selfplay_loop_task=None,
         selfplay_loop_stop=None,
         selfplay_loop_started_at=None,
+        last_user_content="run self-play loop",
     )
 
     # Shrink the cool-off floor so stop_self_play's shield-wait can actually
@@ -239,6 +240,7 @@ async def test_self_play_loop_idempotent(tmp_path, monkeypatch):
         selfplay_loop_task=None,
         selfplay_loop_stop=None,
         selfplay_loop_started_at=None,
+        last_user_content="run self-play loop",
     )
     try:
         first = await tool_self_play_loop(ctx, max_cycles=0)
@@ -351,6 +353,7 @@ async def test_self_play_loop_consolidates_between_cycles(tmp_path, monkeypatch)
         selfplay_loop_started_at=None,
         journal=FakeJournal(),
         agent=FakeAgent(),
+        last_user_content="run self-play loop",
     )
     await tool_self_play_loop(ctx, max_cycles=2)
     task = ctx.selfplay_loop_task
@@ -388,6 +391,7 @@ async def test_self_play_loop_respects_max_cycles(tmp_path, monkeypatch):
         selfplay_loop_task=None,
         selfplay_loop_stop=None,
         selfplay_loop_started_at=None,
+        last_user_content="run self-play loop",
     )
     await tool_self_play_loop(ctx, max_cycles=3)
 

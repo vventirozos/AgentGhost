@@ -79,6 +79,7 @@
   <ul>
     <li><code>{"action":"goto","url":"...","wait_until":"load"}</code> — navigate mid-sequence (e.g. follow a link into a subpage).</li>
     <li><code>{"action":"click","selector":"..."}</code></li>
+    <li><code>{"action":"dblclick","selector":"..."}</code> — required for <code>ondblclick</code>-bound UIs (desktop-icon launchers etc.). A plain <code>click</code> never fires dblclick listeners; the 2026-04-24 webOS session produced 8 identical screenshots because the agent fired single clicks on <code>.desktop-icon</code> elements whose <code>openApp()</code> handler was wired to dblclick only.</li>
     <li><code>{"action":"extract_text","selector":"...","max_chars":65536}</code> — each extraction is preserved in the results so you can read multiple points in the flow.</li>
     <li><code>{"action":"fill","selector":"input[name='email']","text":"a@b"}</code> — real text input (atomic ops don't support typing).</li>
     <li><code>{"action":"wait_for_selector","selector":"...","timeout_ms":5000}</code> — handy after an animation-gated window open.</li>
@@ -132,6 +133,16 @@ TITLE: Example Domain</code></pre>
     <li>Runner exits non-zero with a sentinel → the error is surfaced verbatim, plus a timeout/install hint.</li>
     <li>Chromium crashes before printing a sentinel → raw tail of stderr is returned so the agent has something to debug with.</li>
   </ul>
+
+  <h2>Interact abort semantics (navigation failures are terminal)</h2>
+  <p>Under the default <code>stop_on_error=False</code>, a per-action failure (e.g. a click on a missing selector) is recorded and the loop continues — useful for "try all these selectors, tell me which matched" exploratory flows.</p>
+  <p><strong>Navigation failures are the one exception: they always abort the sequence, regardless of <code>stop_on_error</code>.</strong> A <code>page.goto(...)</code> that raises (<code>ERR_FILE_NOT_FOUND</code>, <code>ERR_CONNECTION_REFUSED</code>, DNS failure, …) leaves Chromium on an error page; every subsequent click / fill / extract_text would just wait the full per-action timeout for elements that don't exist. Before the fix, a 54-action sequence whose first goto 404'd hung for ~108 minutes (54 × 120 s per-action timeout) before the outer subprocess watchdog killed it.</p>
+  <p>The fix: <code>op_interact</code> catches the <code>goto</code> exception, records <code>aborted_sequence: True</code> on the result entry, and breaks out of the loop immediately. The agent-facing output gains a banner:</p>
+  <pre><code>⚠ SEQUENCE ABORTED: goto_failed. Remaining actions were NOT executed
+  because the initial navigation failed — page.click/fill/extract on an
+  error page would have just timed out one-by-one. Fix the URL and
+  retry the whole interact call.</code></pre>
+  <p>…so the next-turn planner reads the failure as "bad URL, retry the whole interact" rather than misinterpreting it as 53 mysterious per-action selector bugs. The return dict grows two fields: <code>aborted: bool</code> and <code>abort_reason: "goto_failed" | "initial_goto_failed" | None</code>. Non-navigation failures still honour the <code>stop_on_error</code> contract. Covered by <code>tests/test_browser_interact_abort.py</code> (9 cases including initial-goto failure, explicit-goto failure, implicit-nav failure, mid-sequence goto, <code>stop_on_error</code> preservation, and happy path).</p>
 
   <h2>Related</h2>
   <ul>

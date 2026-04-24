@@ -334,6 +334,8 @@ async def op_interact(op):
     params:
       {"action": "goto", "url": "...", "wait_until": "load"}
       {"action": "click", "selector": "..."}
+      {"action": "dblclick", "selector": "..."}  # required for
+          # ondblclick-bound UIs (desktop-icon launchers etc.)
       {"action": "extract_text", "selector": "...", "max_chars": N}
       {"action": "fill", "selector": "...", "text": "..."}
       {"action": "wait_for_selector", "selector": "...", "timeout_ms": N}
@@ -344,6 +346,18 @@ async def op_interact(op):
     abort the whole sequence by default (``stop_on_error=False``),
     so the caller sees "step 3 failed; steps 4-6 ran anyway". Set
     ``stop_on_error`` true in the op dict to short-circuit instead.
+
+    **Navigation failures are ALWAYS fatal**, regardless of
+    ``stop_on_error``. If ``page.goto(...)`` raises (ERR_FILE_NOT_FOUND,
+    connection refused, DNS failure, …), every subsequent click/fill/
+    extract_text would be operating on Chromium's error page and would
+    just time out one by one. This used to cause multi-hour hangs: a
+    54-action sequence whose first goto 404'd ran clicks that each
+    waited the full per-action timeout (120 s) trying to find elements
+    that don't exist on the error page — 54 × 120 s ≈ 108 min. The
+    rule now is: a failed goto aborts the sequence immediately with
+    the original error surfaced clearly. Actions AFTER a successful
+    goto still honour the per-action ``stop_on_error`` contract.
     """
     actions = op.get("actions")
     if not isinstance(actions, list) or not actions:
@@ -367,9 +381,28 @@ async def op_interact(op):
     results = []
 
     async def run(page):
+        # Implicit initial navigation (when the first action is NOT a
+        # `goto`). Same rule as explicit goto: if it fails, the whole
+        # sequence is un-salvageable — abort with a single clear
+        # error rather than running dozens of actions against an
+        # error page.
         if initial_url is not None:
-            await page.goto(initial_url, wait_until=initial_wait_until)
-            _write_last_url(op["profile_dir"], page.url)
+            try:
+                await page.goto(initial_url, wait_until=initial_wait_until)
+                _write_last_url(op["profile_dir"], page.url)
+            except Exception as e:
+                return {
+                    "actions": [{
+                        "index": -1, "action": "goto", "ok": False,
+                        "error": f"initial navigation failed ({type(e).__name__}): {e}",
+                        "url": initial_url,
+                    }],
+                    "aborted": True,
+                    "abort_reason": "initial_goto_failed",
+                    "final_url": initial_url,
+                    "final_title": "",
+                    "used_last_url": used_fallback,
+                }
 
         for idx, step in enumerate(actions):
             if not isinstance(step, dict):
@@ -387,7 +420,22 @@ async def op_interact(op):
                     if not url:
                         raise ValueError("goto requires 'url'")
                     wu = step.get("wait_until", "load")
-                    await page.goto(url, wait_until=wu)
+                    try:
+                        await page.goto(url, wait_until=wu)
+                    except Exception as nav_exc:
+                        # A failed navigation is terminal for the whole
+                        # sequence — see the docstring above. Record
+                        # the failure and break out of the loop REGARDLESS
+                        # of stop_on_error. The final snapshot at the
+                        # end of `run` still fires so the caller gets
+                        # a consistent shape.
+                        results.append({
+                            "index": idx, "action": "goto", "ok": False,
+                            "error": f"{type(nav_exc).__name__}: {nav_exc}",
+                            "url": url,
+                            "aborted_sequence": True,
+                        })
+                        break
                     _write_last_url(op["profile_dir"], page.url)
                     results.append({
                         "index": idx, "action": "goto", "ok": True,
@@ -400,6 +448,25 @@ async def op_interact(op):
                     await page.click(sel)
                     results.append({
                         "index": idx, "action": "click", "ok": True,
+                        "selector": sel,
+                    })
+                elif name == "dblclick":
+                    # Double-click — required for "desktop-icon" UIs that
+                    # bind their open/launch handler to `ondblclick` (the
+                    # common pattern in OS-style web apps). Without this
+                    # action type the LLM has to choose between (a)
+                    # emitting `click` and watching nothing happen, or
+                    # (b) dispatching synthetic events via evaluate(),
+                    # which doesn't trigger native handlers reliably.
+                    # Playwright's `page.dblclick` fires a proper
+                    # mousedown-mouseup-mousedown-mouseup sequence that
+                    # cross-browser dblclick listeners actually receive.
+                    sel = step.get("selector")
+                    if not sel:
+                        raise ValueError("dblclick requires 'selector'")
+                    await page.dblclick(sel)
+                    results.append({
+                        "index": idx, "action": "dblclick", "ok": True,
                         "selector": sel,
                     })
                 elif name == "extract_text":
@@ -464,8 +531,8 @@ async def op_interact(op):
                 else:
                     raise ValueError(
                         f"unknown action {name!r}; valid: "
-                        "goto, click, extract_text, fill, wait_for_selector, "
-                        "screenshot, sleep"
+                        "goto, click, dblclick, extract_text, fill, "
+                        "wait_for_selector, screenshot, sleep"
                     )
             except Exception as e:
                 results.append({
@@ -479,11 +546,22 @@ async def op_interact(op):
         # action just to learn where the sequence landed.
         final_url = page.url
         _write_last_url(op["profile_dir"], final_url)
+        # A terminal goto failure sets `aborted_sequence` on the last
+        # result entry — surface that up to the caller as a top-level
+        # `aborted` flag so the agent-facing formatter can render the
+        # summary as "sequence aborted at step N" instead of "N-1
+        # successes and one mysterious failure".
+        aborted = bool(
+            results and isinstance(results[-1], dict)
+            and results[-1].get("aborted_sequence")
+        )
         return {
             "actions": results,
             "final_url": final_url,
             "final_title": await page.title(),
             "used_last_url": used_fallback,
+            "aborted": aborted,
+            "abort_reason": "goto_failed" if aborted else None,
         }
 
     return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)
@@ -829,8 +907,21 @@ async def tool_browser(
             f"FINAL_TITLE: {parsed.get('final_title')}",
             f"ACTIONS: {ok_count} OK, {err_count} error{'s' if err_count != 1 else ''} "
             f"(of {len(action_results)} total)",
-            "--- PER-ACTION RESULTS ---",
         ]
+        # Aborted sequences get a loud banner so the agent's next-turn
+        # planner can't miss the abort. Without this the "5 OK / 48 err"
+        # summary could be mistaken for a partial success that needs
+        # retry of individual actions, when the right fix is to retry
+        # the whole sequence with a corrected goto URL.
+        if parsed.get("aborted"):
+            lines.append(
+                f"⚠ SEQUENCE ABORTED: {parsed.get('abort_reason') or 'goto_failed'}. "
+                "Remaining actions were NOT executed because the initial "
+                "navigation failed — page.click/fill/extract on an error "
+                "page would have just timed out one-by-one. Fix the URL "
+                "and retry the whole interact call."
+            )
+        lines.append("--- PER-ACTION RESULTS ---")
         for r in action_results:
             status = "OK" if r.get("ok") else "ERR"
             idx = r.get("index")

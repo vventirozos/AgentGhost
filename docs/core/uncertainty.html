@@ -34,13 +34,27 @@
   <table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>flag_unknown(what, impact=3, resolution="ask user") -&gt; Unknown</code></td><td>Record an unknown the agent encountered.</td></tr>
-      <tr><td><code>flag_assumption(claim, confidence=0.5, basis="") -&gt; Assumption</code></td><td>Record an unverified belief.</td></tr>
+      <tr><td><code>flag_unknown(what, impact=3, resolution="ask user") -&gt; Unknown</code></td><td>Record an unknown the agent encountered. Returns the <code>Unknown</code> object so the caller can resolve it later without tracking indices.</td></tr>
+      <tr><td><code>resolve_unknown(index_or_unknown, value) -&gt; bool</code></td><td>Mark an unknown resolved. Accepts EITHER an int index into <code>self.unknowns</code> OR the <code>Unknown</code> object returned by <code>flag_unknown</code>. Returns <code>False</code> on out-of-range int, orphan object, or unexpected types — never raises.</td></tr>
+      <tr><td><code>flag_assumption(claim, confidence=0.5, basis="") -&gt; Assumption</code></td><td>Record an unverified belief. Returns the <code>Assumption</code>.</td></tr>
+      <tr><td><code>verify_assumption(index_or_assumption, was_correct) -&gt; bool</code></td><td>Same dual-dispatch shape as <code>resolve_unknown</code>: int index or returned <code>Assumption</code>.</td></tr>
       <tr><td><code>should_ask_user() -&gt; Optional[str]</code></td><td>Returns the question to ask if any unknown has impact ≥ 4 and resolution=="ask user".</td></tr>
       <tr><td><code>get_risk_summary() -&gt; str</code></td><td>Human-readable summary appended to the agent's final response.</td></tr>
       <tr><td><code>get_context_for_prompt() -&gt; str</code></td><td>Markdown for prompt injection (critical unknowns + risky assumptions).</td></tr>
     </tbody>
   </table>
+
+  <h2>Dual-dispatch API (object-or-index)</h2>
+  <p>Before the fix, <code>flag_unknown</code> returned an <code>Unknown</code> but <code>resolve_unknown</code> only accepted an int. Holding the returned object and passing it back — the natural call shape — raised <code>TypeError: '&lt;=' not supported between instances of 'int' and 'Unknown'</code>.</p>
+<pre><code># Both now work, pick whichever is natural for the caller:
+u = tracker.flag_unknown("timezone?", impact=4)
+tracker.resolve_unknown(u, "UTC")            # object form (preferred)
+tracker.resolve_unknown(0, "UTC")            # index form (backwards-compat)
+
+a = tracker.flag_assumption("user wants python", confidence=0.4)
+tracker.verify_assumption(a, was_correct=True)
+</code></pre>
+  <p>Matching uses identity (<code>is</code>), NOT equality — two legitimately-distinct unknowns with the same <code>what</code> text are separate entries and must not both resolve on one call. Covered by <code>tests/test_uncertainty_object_api.py</code> (13 cases including orphan rejection, negative-index rejection, type-coercion rejection, duplicate-text identity check, mixed-mode usage).</p>
 
   <h2>Concurrency</h2>
   <p>Synchronous; per-process tracker (no persistence between sessions).</p>

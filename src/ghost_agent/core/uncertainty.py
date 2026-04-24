@@ -71,13 +71,42 @@ class UncertaintyTracker:
         logger.debug("Uncertainty: flagged unknown (impact=%d): %s", impact, what[:100])
         return unknown
 
-    def resolve_unknown(self, index: int, value: str) -> bool:
-        """Mark an unknown as resolved with the given value."""
-        if 0 <= index < len(self.unknowns):
-            self.unknowns[index].resolved = True
-            self.unknowns[index].resolved_value = value
-            return True
-        return False
+    def resolve_unknown(self, index_or_unknown, value: str) -> bool:
+        """Mark an unknown as resolved.
+
+        Accepts EITHER an int index into `self.unknowns` OR the
+        `Unknown` object returned from `flag_unknown`. The latter is
+        the ergonomic path:
+
+            u = tracker.flag_unknown("timezone?")
+            ...
+            tracker.resolve_unknown(u, "UTC")
+
+        Before the fix, only the int-index form worked — passing the
+        returned object raised `TypeError: '<=' not supported between
+        instances of 'int' and 'Unknown'`. Since `flag_unknown` is
+        documented to RETURN an `Unknown`, holding the reference and
+        passing it back is the natural call shape, so we accept it.
+
+        Returns True if the item was found and marked resolved,
+        False otherwise (out-of-range index, or object not in list).
+        """
+        target: Optional[Unknown] = None
+        if isinstance(index_or_unknown, Unknown):
+            # Identity check, not equality — multiple unknowns with
+            # the same text are legitimately distinct entries.
+            for u in self.unknowns:
+                if u is index_or_unknown:
+                    target = u
+                    break
+        elif isinstance(index_or_unknown, int):
+            if 0 <= index_or_unknown < len(self.unknowns):
+                target = self.unknowns[index_or_unknown]
+        if target is None:
+            return False
+        target.resolved = True
+        target.resolved_value = value
+        return True
 
     def flag_assumption(self, claim: str, confidence: float = 0.5,
                         basis: str = "") -> Assumption:
@@ -88,13 +117,31 @@ class UncertaintyTracker:
         logger.debug("Uncertainty: flagged assumption (conf=%.2f): %s", confidence, claim[:100])
         return assumption
 
-    def verify_assumption(self, index: int, was_correct: bool) -> bool:
-        """Mark an assumption as verified with its correctness."""
-        if 0 <= index < len(self.assumptions):
-            self.assumptions[index].verified = True
-            self.assumptions[index].was_correct = was_correct
-            return True
-        return False
+    def verify_assumption(self, index_or_assumption, was_correct: bool) -> bool:
+        """Mark an assumption as verified.
+
+        Mirrors `resolve_unknown`: accepts either an int index or the
+        `Assumption` object returned from `flag_assumption`. See the
+        sister method's docstring for the rationale — the API surfaces
+        were asymmetric before the fix (`flag_*` returned objects but
+        `verify_*`/`resolve_*` only accepted int indices), which made
+        the natural "hold a reference, come back to it later" pattern
+        raise a TypeError.
+        """
+        target: Optional[Assumption] = None
+        if isinstance(index_or_assumption, Assumption):
+            for a in self.assumptions:
+                if a is index_or_assumption:
+                    target = a
+                    break
+        elif isinstance(index_or_assumption, int):
+            if 0 <= index_or_assumption < len(self.assumptions):
+                target = self.assumptions[index_or_assumption]
+        if target is None:
+            return False
+        target.verified = True
+        target.was_correct = was_correct
+        return True
 
     def get_critical_unknowns(self, min_impact: int = 4) -> List[Unknown]:
         """Return unresolved unknowns with impact >= min_impact."""

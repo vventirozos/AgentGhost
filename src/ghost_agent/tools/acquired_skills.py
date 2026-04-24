@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import threading
 import os
 from pathlib import Path
@@ -7,6 +8,45 @@ from pathlib import Path
 from ..utils.logging import pretty_log, Icons
 
 logger = logging.getLogger("GhostAgent")
+
+
+# Skill names are used as bare filenames (`<skills_dir>/<name>.py`) and
+# as registry keys visible in the tool catalogue shown to the LLM. They
+# must be pure identifiers — no separators, no traversal.
+#
+# Prior behaviour wrote `<skills_dir>/../../escaped.py` when the LLM
+# hallucinated a name containing `..`, which landed the file OUTSIDE
+# the sandbox. Confirmed exploitable: a `learn_skill(name="../../pwn",
+# python_code="...")` call would write to the sandbox's parent dir on
+# disk. The validation below makes any such name raise before it
+# touches the filesystem.
+_SAFE_SKILL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+class SkillNameError(ValueError):
+    """Raised when a skill name fails the identifier-shape check."""
+
+
+def _validate_skill_name(name: str) -> str:
+    """Return `name` if it is a safe identifier; raise otherwise.
+
+    Rules:
+      * Non-empty string.
+      * Starts with ASCII letter or underscore.
+      * Body is ASCII alphanumerics or underscores only (no separators,
+        no dots, no `..`).
+      * At most 64 chars (generous but caps registry-key bloat).
+    """
+    if not isinstance(name, str) or not name:
+        raise SkillNameError(f"skill name must be a non-empty string, got {name!r}")
+    if not _SAFE_SKILL_NAME_RE.match(name):
+        raise SkillNameError(
+            f"skill name {name!r} rejected: must match "
+            f"[A-Za-z_][A-Za-z0-9_]{{0,63}} (no slashes, no '..', no dots, "
+            f"no punctuation). This guards the `<skills_dir>/<name>.py` "
+            f"write path against traversal."
+        )
+    return name
 
 class AcquiredSkillManager:
     def __init__(self, sandbox_dir: Path, memory_system):
@@ -37,14 +77,39 @@ class AcquiredSkillManager:
 
     def save_skill(self, name: str, description: str, parameters_schema: dict, python_code: str):
         try:
+            # Hard-fail on traversal-shaped or separator-bearing names
+            # BEFORE any write. See `_validate_skill_name` for the
+            # exploit this guards against.
+            try:
+                name = _validate_skill_name(name)
+            except SkillNameError as ve:
+                logger.error(f"Rejected unsafe skill name: {ve}")
+                pretty_log(
+                    "Skill Rejected",
+                    f"Unsafe skill name: {name!r}. Must be an identifier.",
+                    level="WARNING", icon=Icons.SHIELD,
+                )
+                return
+
             import hashlib as _hashlib
             import json as _json
             new_hash = _hashlib.md5(
                 (python_code + _json.dumps(parameters_schema, sort_keys=True, default=str) + (description or "")).encode("utf-8")
             ).hexdigest()
 
-            # 1. Write the Python code
-            skill_path = self.skills_dir / f"{name}.py"
+            # 1. Write the Python code. Belt-and-braces: even with the
+            # name validated above, re-confirm the resolved path sits
+            # under `skills_dir` so any future widening of the name
+            # regex can't accidentally re-open the traversal.
+            skill_path = (self.skills_dir / f"{name}.py").resolve()
+            skills_dir_resolved = self.skills_dir.resolve()
+            try:
+                skill_path.relative_to(skills_dir_resolved)
+            except ValueError:
+                logger.error(
+                    f"Skill path {skill_path} escapes skills_dir {skills_dir_resolved}; refusing write"
+                )
+                return
             skill_path.write_text(python_code, encoding="utf-8")
 
             # 2. Add/Update the JSON registry

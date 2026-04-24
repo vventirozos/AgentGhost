@@ -72,6 +72,29 @@
     </tbody>
   </table>
 
+  <h2>Stage-1 self-improvement pipeline</h2>
+  <p>Local-only trajectory logging, self-critique reflection, and complexity-routed dispatch. All three default to ON (opt-out shape) when <code>--no-memory</code> is not set; the pipeline is fully local — no external teacher, no hosted embedder. See <a href="self_improvement.md">self-improvement pipeline</a> for the architecture.</p>
+  <table>
+    <thead><tr><th>Flag</th><th>Type</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-trajectories</code></td><td>flag</td><td>off</td><td>Disable the JSONL trajectory log at <code>$GHOST_HOME/system/trajectories/</code>. Also implicitly disables reflection (which reads from the log).</td></tr>
+      <tr><td><code>--no-reflection</code></td><td>flag</td><td>off</td><td>Disable the reflection biological phase (2.5) even if trajectory logging is on. Trajectories still write to disk but the Reflector never fires.</td></tr>
+      <tr><td><code>--router-model</code></td><td>path</td><td>unset</td><td>Path to a persisted <code>ComplexityClassifier</code> JSON. When unset, the dispatcher acts as a pass-through that always escalates to the full swarm pool list — never less capable, just never cheaper. Train a classifier via trajectories collected with <code>--no-trajectories</code> off.</td></tr>
+      <tr><td><code>--router-confidence-threshold</code></td><td>float</td><td><code>0.3</code></td><td>Minimum router confidence required to route a request to the cheap path. Below this, the dispatcher escalates to the full swarm (fail-safe).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Helper scripts</h2>
+  <p>Python entry points under <code>scripts/</code>:</p>
+  <table>
+    <thead><tr><th>Script</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>scripts/eval_baseline.py freeze|compare</code></td><td>Run the offline eval suite (<code>--suite {default,post_learning}</code>) via a stub runner or HTTP against a running agent. Freeze the result as a baseline or diff a subsequent run. Flags: <code>--runner {stub,http}</code>, <code>--base-url</code>, <code>--api-key</code>, <code>--model</code>, <code>--timeout N</code> (default 300s — template tasks on a local Qwen-scale model commonly run 80–250s).</td></tr>
+      <tr><td><code>scripts/run_gepa.py --signature &lt;name&gt;</code></td><td>Run DSPy / GEPA prompt optimisation on one of the allow-listed signatures (<code>planning.decompose</code>, <code>tool_selection.pick</code>, <code>reflection.critique</code>). Reads trajectories from <code>$GHOST_HOME/trajectories</code>, uses Ghost's own upstream as the optimiser LM (no external teacher), writes the tuned instruction JSON to <code>$GHOST_HOME/system/optim/</code>.</td></tr>
+      <tr><td><code>scripts/build_sandbox_image.sh</code></td><td>Build <code>ghost-agent-base:latest</code> from <code>sandbox/Dockerfile</code> — bakes apt deps, Python stack, and Playwright Chromium (with <code>--with-deps</code>) into the image. Runs a Chromium smoke test at the end. One-shot per Ghost version; the runtime sandbox wrapper picks up the freshly-built image on next <code>ensure_running</code>.</td></tr>
+    </tbody>
+  </table>
+
   <h2>Swarm topology</h2>
   <p>Each value is a comma-separated list of <code>url|model</code> pairs. Pools are independent and routed by <code>LLMClient</code>.</p>
   <table>

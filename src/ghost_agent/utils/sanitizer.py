@@ -4,7 +4,7 @@ import io
 import ast
 from typing import Optional, Tuple, List
 
-def extract_code_from_markdown(text: str) -> str:
+def extract_code_from_markdown(text: str, filename: str = "") -> str:
     """
     Extracts code from markdown blocks if present.
 
@@ -47,6 +47,33 @@ def extract_code_from_markdown(text: str) -> str:
     matches.extend(secondary_pattern.findall(text))
 
     if matches:
+        # Guard against mangling raw-code files that contain fenced
+        # examples inside docstrings (sphinx / mkdocs style).
+        # Previously `extract_code_from_markdown` always pulled the
+        # longest fence match, so a perfectly valid Python file whose
+        # docstring embedded ```python … ``` got REPLACED by just the
+        # inner `x = 1` snippet — the rest of the file silently
+        # dropped. The agent would then write `x = 1` to disk,
+        # execute it, and get a meaningless success with none of the
+        # real logic.
+        #
+        # The fix: if the input, taken as a whole, already parses
+        # cleanly in the target language, treat it as raw code that
+        # HAPPENS to contain markdown-style examples — return the
+        # input unchanged. Only when the whole thing is unparseable
+        # (i.e. the fence IS the intended payload, wrapped in prose)
+        # do we extract.
+        ext = str(filename).split('.')[-1].lower() if filename else ""
+        if ext == "py":
+            import ast
+            try:
+                ast.parse(text)
+                # The whole input is valid Python → keep it whole.
+                # The trailing `.strip()` here matches the old return
+                # shape (downstream expects stripped content).
+                return text.strip()
+            except SyntaxError:
+                pass
         best = max(matches, key=len)
         return best.strip().strip('`')
 
@@ -274,8 +301,11 @@ def sanitize_code(content: str, filename: str) -> Tuple[str, Optional[str]]:
     """
     ext = str(filename).split('.')[-1].lower()
 
-    # 1. Extract from Markdown
-    content = extract_code_from_markdown(content)
+    # 1. Extract from Markdown. Pass the filename so the extractor
+    # can skip extraction when the input is already valid code for
+    # the target language — protects against mangling raw files that
+    # embed fenced examples in their docstrings.
+    content = extract_code_from_markdown(content, filename=filename)
 
     # 1.5 Scrub Control Characters (Prevent ^H / Backspace injection)
     # We allow: \n (10), \r (13), \t (9) and everything >= 32 (Space)

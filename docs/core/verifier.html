@@ -43,6 +43,12 @@
   <h2>Concurrency</h2>
   <p>Async; safe to call concurrently per request because the underlying httpx client per node already pools connections.</p>
 
+  <h2>Executed-code reconstruction from <code>tool_call_id</code></h2>
+  <p>When the verifier gate in <code>handle_chat</code> classifies a turn as code-shape (last substantive tool was <code>execute</code> / <code>postgres_*</code>), it calls <code>verify_code_output(code, output, intent)</code>. The <code>code</code> slot MUST be the actual program that was submitted.</p>
+  <p>Prior to the fix, the call site at <code>agent.py:4835</code> passed <code>code=tool_name</code> — literally the string <code>"execute"</code>. With nothing real to audit, the verifier LLM hallucinated plausible-sounding rejections (<em>"appears to be a directory listing"</em>, <em>"missing expected field"</em>) and emitted <code>REFUTED (95%)</code> verdicts on CORRECT turns. The user then saw <code>Verifier note: …</code> contradicting their right answer.</p>
+  <p>The fix is <code>_reconstruct_executed_code(messages, tool_msg)</code> in <code>agent.py</code>: walk <code>messages</code> backwards from the tool result, match <code>tool_call_id</code> to the assistant's <code>tool_calls[i].function.arguments</code>, and extract <code>content</code> / <code>code</code> / <code>script_content</code> / <code>text</code> / <code>command</code> / <code>cmd</code> (first non-empty wins). Capped at 4000 chars. When the lookup fails — malformed arguments, missing id, non-dict messages — the gate falls back to <code>verify_claim</code>, which doesn't need a code slot.</p>
+  <p>Covered by <code>tests/test_verifier_code_reconstruction.py</code> (14 cases including dict-vs-string arguments, alias preference, traversal past unrelated messages, oversize cap, identity-based dedup on duplicate tool-call ids).</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

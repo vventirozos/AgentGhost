@@ -739,6 +739,82 @@ async def tool_dream_mode(context):
 SELF_PLAY_CYCLE_TIMEOUT_S = 600.0
 
 
+#: Substrings that count as an explicit self-play request from the user.
+#: Matching is done on a lowercased, whitespace-normalised version of
+#: ``context.last_user_content``. The list is deliberately conservative —
+#: these are phrasings that map unambiguously to "run the self-play
+#: curriculum". Plain words like "practice" alone are NOT enough (the user
+#: might say "practice good git hygiene" with zero intent to train).
+_SELF_PLAY_INTENT_PHRASES = (
+    "self play",
+    "self-play",
+    "selfplay",
+    "run self play",
+    "run self-play",
+    "start self play",
+    "start self-play",
+    "practice self-play",
+    "practice self play",
+    "synthetic self-play",
+    "synthetic self play",
+    "train yourself",
+    "train on your own",
+    "run a training cycle",
+    "run training cycle",
+    "training cycle",
+    "run a practice cycle",
+    "practice cycle",
+    "practice round",
+    "practice session",
+    "keep practicing",
+    "keep training",
+    "train until stopped",
+    "train in a loop",
+    "training loop",
+)
+
+
+def _user_asked_for_self_play(context) -> bool:
+    """Return True iff the current turn's user text explicitly asked for
+    self-play. Used as a hallucination guard on the ``self_play`` /
+    ``self_play_loop`` tools.
+
+    The tool is powerful and expensive — a spontaneous call by the LLM
+    burns an LLM cycle (or many, in loop mode) and can hijack a
+    user-facing turn. In the 2026-04-24 webOS incident the LLM
+    fabricated "The user wants me to run self-play" 33 minutes into a
+    webOS-building session where the user had never mentioned it.
+
+    The biological watchdog's self-play phase bypasses this check
+    because it never goes through ``tool_self_play`` — it calls
+    ``Dreamer.synthetic_self_play`` directly. Background-launched loops
+    launched via the tool WILL be guarded, which is the intent: only
+    an explicit user ask should kick one off.
+    """
+    raw = getattr(context, "last_user_content", "") or ""
+    if not raw:
+        # No user turn in flight at all → refuse. The watchdog path
+        # doesn't touch this helper, so this is correct.
+        return False
+    lc = " ".join(str(raw).lower().split())
+    return any(phrase in lc for phrase in _SELF_PLAY_INTENT_PHRASES)
+
+
+#: Standard refusal body returned to the LLM when the guard trips.
+#: Phrased to redirect the model back to the original request rather
+#: than apologise or loop. Kept as a module constant so tests can pin
+#: the wording (the LLM's behaviour depends on seeing keywords like
+#: "REFUSED" and "did not request").
+_SELF_PLAY_INTENT_REFUSAL = (
+    "SYSTEM: SELF-PLAY REFUSED — the user did not request self-play or a "
+    "training cycle in this turn. The `self_play` / `self_play_loop` tools "
+    "are only for explicit user asks (e.g. 'run self-play', 'train until "
+    "stopped', 'practice cycle'). Do NOT call this tool again unless the "
+    "user's most recent message explicitly asks for it. Resume the "
+    "original task."
+)
+
+
 async def tool_self_play(context):
     """
     Manually triggers the Synthetic Self-Play curriculum.
@@ -746,6 +822,14 @@ async def tool_self_play(context):
     import asyncio
     from ..core.dream import Dreamer
     from ..utils.logging import pretty_log, Icons
+    if not _user_asked_for_self_play(context):
+        pretty_log(
+            "Self-Play Refused",
+            "LLM invoked `self_play` but the user's current turn doesn't ask for it. "
+            "Refusing and redirecting the model back to the original task.",
+            level="WARNING", icon=Icons.STOP,
+        )
+        return _SELF_PLAY_INTENT_REFUSAL
     dreamer = Dreamer(context)
     try:
         result = await asyncio.wait_for(
@@ -959,6 +1043,14 @@ async def tool_self_play_loop(context, max_cycles: int = 0, model: str = ""):
     """Start a background continuous self-play loop. Idempotent: if one is
     already running, returns a status line instead of launching a second.
     """
+    if not _user_asked_for_self_play(context):
+        pretty_log(
+            "Self-Play Loop Refused",
+            "LLM invoked `self_play_loop` but the user's current turn doesn't ask for it. "
+            "Refusing and redirecting the model back to the original task.",
+            level="WARNING", icon=Icons.STOP,
+        )
+        return _SELF_PLAY_INTENT_REFUSAL
     existing = getattr(context, "selfplay_loop_task", None)
     if existing is not None and not existing.done():
         return (

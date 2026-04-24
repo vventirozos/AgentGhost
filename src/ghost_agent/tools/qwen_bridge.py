@@ -4,7 +4,34 @@ import json
 import threading
 from typing import Dict, Any, Optional
 
-from qwen_agent.tools.base import BaseTool, register_tool
+try:
+    from qwen_agent.tools.base import BaseTool, register_tool
+except ModuleNotFoundError as _qwen_import_err:  # pragma: no cover — defensive
+    # `qwen_agent` pulls in `soundfile` transitively at module load time
+    # (see `qwen_agent.utils.utils` top-level `import soundfile`). If
+    # that's missing, the user sees a cryptic `No module named
+    # 'soundfile'` here — but the real fix is to install the requirement.
+    # Surface a helpful message instead. `soundfile>=0.12.0` is pinned
+    # in requirements.txt for exactly this reason; this wrapper catches
+    # the case where someone installed the main deps but skipped it
+    # (venv partial install, caches in CI, etc.).
+    #
+    # NOTE: this module is only used by the `agent_qwen.py` variant.
+    # The default agent path doesn't import qwen_bridge, so an
+    # unsatisfied dep here does NOT break normal Ghost startup —
+    # only the Qwen variant entry point or tests that touch this file.
+    raise ImportError(
+        "qwen_bridge requires qwen-agent and its transitive deps. "
+        "The import chain failed with: "
+        f"{type(_qwen_import_err).__name__}: {_qwen_import_err}. "
+        "This almost always means `soundfile` (a qwen-agent transitive "
+        "dep) isn't installed. Run `pip install soundfile>=0.12.0`. On "
+        "Linux you also need the system package `libsndfile1` "
+        "(apt: `sudo apt-get install libsndfile1`). "
+        "macOS / Windows wheels include libsndfile — pip alone is enough. "
+        "The default agent path (ghost_agent.main) does NOT need "
+        "qwen_bridge; only `agent_qwen.py` does."
+    ) from _qwen_import_err
 
 from src.ghost_agent.tools.file_system import tool_file_system
 from src.ghost_agent.tools.execute import tool_execute

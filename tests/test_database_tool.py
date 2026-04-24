@@ -3,10 +3,27 @@ import sys
 from unittest.mock import MagicMock, patch
 from ghost_agent.tools.database import tool_postgres_admin
 
-# Mock modules that might not be installed in the test environment
-sys.modules["psycopg2"] = MagicMock()
-sys.modules["psycopg2.extras"] = MagicMock()
-sys.modules["tabulate"] = MagicMock()
+
+# Autouse fixture: patch `psycopg2` / `tabulate` only for the duration
+# of each test in this file, then roll the change back.
+#
+# BEFORE: this module patched `sys.modules["psycopg2"] = MagicMock()`
+# at import time, which permanently poisoned the interpreter's module
+# cache. Any test file imported AFTER this one that tried a normal
+# `import tabulate` got the `MagicMock` back and failed pytest
+# collection with `ValueError: tabulate.__spec__ is not set`. The
+# failure was pytest-order-dependent and flaky: the full suite
+# sometimes passed, but running `test_database_tool.py` before
+# `test_vision_integration.py` in isolation always tripped it.
+# Moving the patch into a fixture with `patch.dict(...)` guarantees
+# the original modules (or their absence) are restored when the test
+# finishes.
+@pytest.fixture(autouse=True)
+def _mock_db_modules(monkeypatch):
+    monkeypatch.setitem(sys.modules, "psycopg2", MagicMock())
+    monkeypatch.setitem(sys.modules, "psycopg2.extras", MagicMock())
+    monkeypatch.setitem(sys.modules, "tabulate", MagicMock())
+    yield
 
 @pytest.mark.asyncio
 async def test_postgres_admin_missing_deps():

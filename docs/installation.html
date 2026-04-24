@@ -51,8 +51,9 @@
       <tr><td><code>duckduckgo-search</code></td><td>Web search</td></tr>
       <tr><td><code>transformers</code>, <code>torch</code>, <code>sentencepiece</code>, <code>huggingface-hub</code></td><td>Tokeniser, embeddings, image-gen server</td></tr>
       <tr><td><code>apscheduler</code></td><td>Scheduled background tasks</td></tr>
-      <tr><td><code>qwen-agent</code></td><td>Optional Qwen ReAct bridge (<code>core/agent_qwen.py</code>)</td></tr>
+      <tr><td><code>qwen-agent</code>, <code>soundfile</code></td><td>Optional Qwen ReAct bridge (<code>core/agent_qwen.py</code> → <code>tools/qwen_bridge.py</code>). <code>soundfile</code> is a transitive dep of qwen-agent (its <code>utils/utils.py</code> does <code>import soundfile</code> at module load); pinned explicitly so fresh installs don't hit a cryptic <code>ModuleNotFoundError</code> when the Qwen variant is used. On Linux also install the system package <code>libsndfile1</code> (apt: <code>sudo apt-get install libsndfile1</code>); macOS / Windows wheels ship libsndfile bundled. The default agent path (<code>ghost_agent.main</code>) does NOT need qwen_bridge.</td></tr>
       <tr><td><code>slack-bolt</code>, <code>slack-sdk</code></td><td>Slack interface</td></tr>
+      <tr><td><code>dspy-ai</code></td><td>Prompt optimisation (<code>ghost_agent.optim</code>, <code>scripts/run_gepa.py</code>). <code>_require_dspy()</code> surfaces a clear install error if the transitive chain (litellm / gepa / asyncer) is broken.</td></tr>
       <tr><td><code>black</code>, <code>pylint</code>, <code>pytest</code>, <code>pytest-asyncio</code></td><td>Dev tooling</td></tr>
     </tbody>
   </table>
@@ -80,12 +81,19 @@
 <pre><code>$GHOST_HOME/
 ├── sandbox/                      # bind-mounted into container as /workspace
 │   ├── acquired_skills/          # generated tool .py files
-│   │   ├── &lt;name&gt;.py
+│   │   ├── &lt;name&gt;.py             # (name strictly validated — see tools/acquired_skills)
 │   │   ├── retired/              # auto-archived degraded skills
 │   │   └── skills_registry.json
 │   └── ... user/agent files
+├── trajectories/                 # Stage-1 distill log (day-partitioned JSONL)
+│   └── YYYY-MM-DD/
+│       └── session-&lt;sid&gt;.jsonl   # redacted turn-level traces
 └── system/
     ├── ghost-agent.log
+    ├── eval/
+    │   └── baseline.json         # frozen SuiteResult (scripts/eval_baseline.py)
+    ├── optim/
+    │   └── &lt;signature&gt;.json      # tuned GEPA instructions (scripts/run_gepa.py)
     └── memory/
         ├── chroma.sqlite3        # ChromaDB persistent store
         ├── knowledge_graph.db    # Graph triplets (SQLite)
@@ -148,6 +156,15 @@ python interface/externals/image_generation/img_gen_server.py
 </code></pre>
 
   <div class="note warn"><strong>Heads-up:</strong> the agent's lifespan stops the sandbox container with <code>remove=False</code> so subsequent restarts resume in seconds. Pass <code>--remove-on-shutdown</code> equivalent only if you need a clean image.</div>
+
+  <h2>Pre-provisioned sandbox image (optional, recommended)</h2>
+  <p>The runtime sandbox wrapper can provision Chromium + apt deps + the full pip stack on first boot, but this takes 2–3 minutes the first time and can silently rot if committed before <code>--with-deps</code> was added. The repeatable path is to build a proper image:</p>
+<pre><code>scripts/build_sandbox_image.sh
+# → builds ghost-agent-base:latest (~2 GB first run; ~5 min on warm cache)
+# → runs a Chromium launch smoke test at the end
+</code></pre>
+  <p>The image bakes apt system packages, the deep-learning pip stack, and <code>playwright install --with-deps chromium</code> at build time — self-play + browser tasks start instantly. The runtime gate checks both the <code>/root/.supercharged.v2</code> marker AND that the Chromium binary is actually on disk; if the marker is present but the binary is missing (the exact silent-failure mode the <code>v2</code> bump exists to catch), a full reinstall fires on next <code>ensure_running</code>.</p>
+  <p>If you skip this step, the fallback inline provisioning still produces a correct image; it just takes longer on the first turn.</p>
 
   <h2>Test runner</h2>
 <pre><code>pytest                                   # full suite (asyncio_mode=auto)

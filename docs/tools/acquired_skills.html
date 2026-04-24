@@ -35,13 +35,18 @@
   <table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>save_skill(name, desc, params_schema, python_code)</code></td><td>Write <code>.py</code> file, MD5-hash <code>code+schema</code> for dedup, update registry, embed description in vector memory only if content changed.</td></tr>
+      <tr><td><code>save_skill(name, desc, params_schema, python_code)</code></td><td>Validate <code>name</code> against <code>[A-Za-z_][A-Za-z0-9_]{0,63}</code>, then write <code>.py</code> file, MD5-hash <code>code+schema</code> for dedup, update registry, embed description in vector memory only if content changed.</td></tr>
       <tr><td><code>get_all_skills()</code></td><td>Read <code>skills_registry.json</code>.</td></tr>
       <tr><td><code>log_telemetry(name, success)</code></td><td>Increment <code>usage_count</code>; reset <code>failure_count</code> on success; flip status to <code>"degraded"</code> after 3 consecutive failures.</td></tr>
       <tr><td><code>retire_degraded_skills()</code></td><td>Auto-archive skills with <code>failure_count ≥ 3</code> OR (<code>failure_count ≥ 5</code> AND <code>usage_count &lt; 10</code>); move <code>.py</code> to <code>retired/</code>; delete from vector store; remove from active registry.</td></tr>
       <tr><td><code>delete_skill(name)</code></td><td>Manual remove + delete file + clean vector store.</td></tr>
     </tbody>
   </table>
+
+  <h2>Skill-name validation (path-traversal guard)</h2>
+  <p>Skill names are used as bare filenames (<code>&lt;skills_dir&gt;/&lt;name&gt;.py</code>) AND as registry keys visible in the tool catalogue shown to the LLM. They must therefore be <strong>pure identifiers</strong>: no separators, no traversal, no punctuation.</p>
+  <p>Prior behaviour wrote to the resolved path with no validation. A name like <code>"../../pwn"</code> escaped <code>skills_dir</code> — confirmed exploitable: <code>save_skill(name="../../pwn", python_code="...")</code> wrote the payload to the sandbox's PARENT directory on disk.</p>
+  <p>Fix: <code>_validate_skill_name(name)</code> enforces <code>^[A-Za-z_][A-Za-z0-9_]{0,63}$</code> before any filesystem write. Belt-and-braces: the resolved <code>skill_path</code> is ALSO checked against <code>skills_dir.resolve()</code> so any future regex widening can't silently re-open the hole. Invalid names are rejected via <code>pretty_log("Skill Rejected", ...)</code> so reflection can learn to use identifier-shaped names. Covered by <code>tests/test_acquired_skills_name_traversal.py</code> (20+ bad shapes rejected, 8 good shapes accepted, full FS escape probe, boundary + belt-and-braces doc assertion).</p>
 
   <h2>TDD validation</h2>
   <p>The skill is written to <code>test_skill.py</code>, executed with <code>test_payload</code> as <code>sys.argv[1]</code> (parsed as JSON inside the script). The payload must produce <code>EXIT CODE: 0</code> with non-empty stdout. A common failure (forgetting <code>if __name__ == "__main__":</code>) is detected and reported with a specific hint.</p>

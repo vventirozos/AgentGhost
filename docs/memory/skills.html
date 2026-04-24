@@ -71,8 +71,15 @@
   <h3>Utility formula</h3>
   <pre><code>utility = confidence·0.5 + hit_rate·0.8 + (0.3 if verified) + log(freq)·0.1 + stale_penalty</code></pre>
 
-  <h2>Retrieval</h2>
-  <p><code>get_playbook_context(query, memory_system, distance_threshold=0.45, limit, record_retrievals)</code> performs a Chroma query, then BM25 re-rank with a keyword bonus. Default distance threshold is <code>DEFAULT_RETRIEVAL_DISTANCE = 0.45</code>. When a lesson is surfaced, <code>record_retrieval</code> increments the counter and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — so the "is this self-play lesson ever actually used?" question has data to answer.</p>
+  <h2>Retrieval (three-tier, picked by <code>query</code> + <code>memory_system</code> presence)</h2>
+  <p><code>get_playbook_context(query, memory_system, distance_threshold=0.45, limit, record_retrievals)</code> dispatches to one of three paths:</p>
+  <ol>
+    <li><strong>Vector path</strong> — <code>memory_system</code> AND <code>query</code> both present. Runs a Chroma query over <code>type="skill"</code> docs, tightens by <code>DEFAULT_RETRIEVAL_DISTANCE = 0.45</code>, then re-ranks with a BM25-lite keyword-overlap bonus. Best path; used whenever the bus wires a vector tier.</li>
+    <li><strong>BM25 fallback</strong> — <code>query</code> is present but <code>memory_system</code> is <code>None</code> (vector store offline, init failed, or a bus is wired without a vector tier). Does pure token-overlap against each lesson's <code>trigger</code>. Returns <code>""</code> if no lesson shares tokens — <strong>never</strong> falls through to recency.</li>
+    <li><strong>Recency fallback</strong> — no query supplied (system-prompt-injection usage). Returns the N most recent lessons regardless of content, under the <code>## RECENT LESSONS</code> header.</li>
+  </ol>
+  <p>Before the fix, the recency fallback fired <em>whenever</em> the vector path was unavailable — including on a real query. A question like <em>"what's the capital of France?"</em> would surface an unrelated Python-syntax lesson just because it happened to be the most recent entry, polluting context with junk. The new three-tier dispatch preserves the recency path ONLY for the no-query case (the <code>SYSTEM_PROMPT</code> cold-inject). Covered by <code>tests/test_skills_bm25_fallback.py</code>.</p>
+  <p>When a lesson is surfaced, <code>record_retrieval</code> increments the counter and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — so the "is this self-play lesson ever actually used?" question has data to answer.</p>
 
   <h2>Dedup</h2>
   <p>Vector similarity check (distance &lt; 0.15) or exact task match merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate.</p>

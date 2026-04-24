@@ -64,11 +64,25 @@
   </table>
 
   <h2>Provisioned packages</h2>
+  <p>Preferred: build <code>ghost-agent-base:latest</code> via the authoritative Dockerfile one-shot; the runtime wrapper then only verifies and reuses it.</p>
+  <pre><code>scripts/build_sandbox_image.sh
+# reads sandbox/Dockerfile, runs a Chromium smoke test at the end,
+# ~5 min on a warm docker cache</code></pre>
   <ul>
-    <li><strong>apt</strong>: <code>sudo · git · nodejs · npm · postgresql-client · tor · ripgrep · sqlite3</code>.</li>
-    <li><strong>pip</strong>: <code>numpy · pandas · torch · scikit-learn · matplotlib · seaborn · plotly · networkx · requests · beautifulsoup4 · sqlalchemy · pytest · playwright · html2text · lxml</code>.</li>
-    <li><strong>browser</strong>: Chromium installed via <code>python3 -m playwright install chromium --with-deps</code>. Runs <strong>unconditionally</strong> inside the first-provision block (gated only by the outer <code>/root/.supercharged</code> marker). A previous library-import probe was removed: <code>pip install playwright</code> makes the Python lib importable without installing the Chromium binary, so the probe always passed and the binary install was silently skipped on first boot — the 2026-04-23 eval hit "headless_shell not found" for exactly this reason. <strong>Fail-loud:</strong> a non-zero exit code raises and refuses to touch the <code>/root/.supercharged</code> marker, so a failed download cannot silently poison future boots into believing Chromium is ready.</li>
+    <li><strong>apt</strong>: <code>sudo · git · nodejs · npm · postgresql-client · tor · ripgrep · sqlite3 · libpq-dev</code>.</li>
+    <li><strong>pip</strong>: <code>numpy · pandas · scipy · matplotlib · seaborn · plotly · scikit-learn · yfinance · beautifulsoup4 · networkx · requests · pylint · black · mypy · bandit · dill · ipykernel · jupyter_client · pytest · pytest-asyncio · psycopg2-binary · asyncpg · sqlalchemy · tabulate · sqlglot · playwright · html2text · lxml · pysocks</code>.</li>
+    <li><strong>browser</strong>: Chromium installed via <code>python3 -m playwright install --with-deps chromium</code>. The <code>--with-deps</code> is the key — it installs the system libs (<code>libnss3</code>, <code>libatk1.0-0</code>, <code>libdrm2</code>, …) that <code>headless_shell</code> dynamic-links against. Without them, the binary exists but can't launch; self-play would rediscover this at task time and burn ~100 s re-installing via <code>playwright install chromium</code> (no deps) before failing again. Baked into the Dockerfile so it can't be skipped.</li>
   </ul>
+
+  <h2>Provision marker is versioned (<code>/root/.supercharged.v2</code>)</h2>
+  <p>The runtime gate in <code>ensure_running</code> checks TWO things, not one:</p>
+  <ol>
+    <li><code>test -f /root/.supercharged.v2</code> — the version-bumped marker. Legacy <code>.supercharged</code> (v1) images — which may have been committed before <code>--with-deps</code> was in the bootstrap — are treated as un-provisioned, forcing a clean reinstall on next boot.</li>
+    <li><code>_chromium_binary_present()</code> — <code>find /root/.cache/ms-playwright -type f \( -name headless_shell -o -name chrome \) -print -quit</code>. Defends against the silent-failure mode where a prior install exited 0 but the binary isn't actually on disk (network flake, mid-extract disk-full, etc.).</li>
+  </ol>
+  <p>If the marker is present but the binary is missing, the gate logs <code>⚠ Provision marker present but Chromium binary missing. Reinstalling...</code> and re-runs the full install. Post-install, <code>_chromium_binary_present()</code> is checked AGAIN before the marker is touched — <strong>fail-loud:</strong> the v2 marker is never set unless the binary actually verifies on disk, so a failed install cannot silently poison future boots.</p>
+  <p>Bump the marker to <code>.v3</code> (in both <code>sandbox/Dockerfile</code> AND <code>sandbox/docker.py</code>) any time the install surface genuinely changes. The meta-test <code>tests/test_sandbox_chromium_gate.py::test_v2_marker_gate_name_pinned</code> asserts the two paths stay in sync.</p>
+  <p>Covered by <code>tests/test_sandbox_chromium_gate.py</code> (12 cases including binary-present/absent probes, legacy-marker handling, post-install verification refusing to mark a broken image, and Dockerfile-level assertions about <code>--with-deps</code>).</p>
 
   <h2>Resource caps</h2>
   <div class="kv">

@@ -455,11 +455,16 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
         elif not isinstance(content, str):
             content = str(content)
 
-        # Strip accidental markdown wrappers for code/data files
+        # Strip accidental markdown wrappers for code/data files.
+        # We pass `filename` so the extractor can skip the strip when
+        # the payload is already valid code for the target language —
+        # this protects raw .py files whose docstrings embed fenced
+        # examples (sphinx / mkdocs style) from having their content
+        # replaced by the inner example snippet.
         ext = str(filename).split('.')[-1].lower()
         if ext in ["py", "html", "css", "js", "ts", "json", "sh", "yaml", "yml", "csv", "xml"]:
             from ..utils.sanitizer import extract_code_from_markdown
-            content = extract_code_from_markdown(content)
+            content = extract_code_from_markdown(content, filename=filename)
 
         path = _get_safe_path(sandbox_dir, filename)
 

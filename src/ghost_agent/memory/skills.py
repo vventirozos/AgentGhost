@@ -6,6 +6,7 @@ import threading
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
+from typing import List, Tuple
 from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
@@ -744,7 +745,41 @@ class SkillMemory:
         if not playbook_snapshot:
             return "No lessons learned yet."
 
-        # Fallback: most-recent lessons.
+        # BM25 fallback: when the caller has a query but the vector
+        # path wasn't attempted (memory_system is None — common when
+        # VectorMemory init failed or is disabled), do keyword-overlap
+        # filtering on the playbook's triggers BEFORE falling back to
+        # recency. Without this, a query like "what's the capital of
+        # France?" would surface a Python-syntax lesson just because
+        # it happened to be the most recent. The recency fallback is
+        # only appropriate when there's NO query — i.e. the caller
+        # wants a generic "any recent lesson" injection for the system
+        # prompt, not a per-turn retrieval.
+        if query and str(query).strip():
+            scored: List[Tuple[float, dict]] = []
+            for p in playbook_snapshot:
+                trig = _trigger_of(p)
+                score = _bm25_like_score(query, trig or "")
+                if score > 0:
+                    scored.append((score, p))
+            if scored:
+                scored.sort(key=lambda t: -t[0])
+                lines = ["## RELEVANT LESSONS LEARNED (Follow these to avoid repeats):"]
+                for i, (_, p) in enumerate(scored[:limit]):
+                    lines.append(f"{i+1}. {render_lesson_for_prompt(p)}")
+                    if record_retrievals:
+                        trig = _trigger_of(p)
+                        if trig:
+                            try:
+                                self.record_retrieval(trig)
+                            except Exception:
+                                pass
+                return "\n".join(lines)
+            # Had a query, zero BM25 hits → no lesson is relevant to
+            # this turn. Return empty instead of dumping recency.
+            return ""
+
+        # No query supplied → recency fallback (system-prompt injection style).
         lines = ["## RECENT LESSONS LEARNED (Follow these to avoid repeats):"]
         for i, p in enumerate(playbook_snapshot[:limit]):
             lines.append(f"{i+1}. {render_lesson_for_prompt(p)}")

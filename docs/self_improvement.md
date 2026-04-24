@@ -272,6 +272,34 @@ broken. The runtime gate now detects this (marker present + binary
 absent) and forces a re-install on next `ensure_running`; if the
 behaviour persists, rebuild the image: `scripts/build_sandbox_image.sh`.
 
+## Browser `interact` abort semantics
+
+The `browser.interact` op runs a list of sub-actions inside a single
+Chromium context. Under the default `stop_on_error=False`, a failed
+per-action step (e.g. a click on a missing selector) is recorded and
+the loop continues — useful for "try all these selectors, tell me
+which ones matched" exploratory flows.
+
+**Navigation failures are the one exception: they always abort the
+sequence, regardless of `stop_on_error`.** A `page.goto(...)` that
+raises (ERR_FILE_NOT_FOUND, ERR_CONNECTION_REFUSED, DNS failure, …)
+leaves Chromium on an error page; every subsequent click/fill/
+extract_text would just wait the full per-action timeout for elements
+that don't exist. Before the fix a 54-action sequence whose first
+goto 404'd hung for ~108 minutes (54 × 120 s) before the outer
+subprocess timeout fired.
+
+The fix: `op_interact` in the runner catches the `goto` exception,
+records `aborted_sequence: True` on the result, and breaks out of
+the loop immediately. The agent-facing output now shows
+`⚠ SEQUENCE ABORTED: goto_failed` as a banner so the next-turn
+planner reads the failure as "bad URL, retry the whole interact"
+rather than "53 mysterious click failures".
+
+Covered by `tests/test_browser_interact_abort.py` — the tests exec
+the runner source inline (with a stubbed Playwright import) so the
+production code path itself is under test, not a reimplementation.
+
 ## Stage 2 hook (future work)
 
 The trajectory log is the ingredient Stage 2 (local SFT via rejection

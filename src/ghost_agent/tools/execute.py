@@ -247,6 +247,29 @@ kc = BlockingKernelClient(connection_file='/workspace/.kernel.json')
 kc.load_connection_file()
 kc.start_channels()
 
+# Block until the kernel heartbeat is established before doing anything
+# else. Without this call, `kc.is_alive()` returns False during the
+# first ~1s of every brand-new kernel's lifetime (heartbeat hasn't
+# had a chance to exchange yet). The `except queue.Empty` path below
+# reads `kc.is_alive()` as a "kernel died?" probe, so the startup
+# race produced a spurious `[SYSTEM ERROR: Kernel Terminated Abruptly]`
+# on the FIRST stateful execute of every session — agent would
+# conclude its code killed the kernel when in fact the code hadn't
+# run yet. `wait_for_ready` closes the race; if it times out the
+# kernel really is broken.
+try:
+    kc.wait_for_ready(timeout=10)
+except RuntimeError as _ready_err:
+    # wait_for_ready raises RuntimeError when the kernel didn't
+    # handshake in time. Distinct from "kernel died mid-execution" —
+    # surface a separate error so the agent knows to check the
+    # kernel launch, not the code it tried to run.
+    sys.stdout.write("\\n[SYSTEM ERROR: Kernel did not become ready within 10s: " + str(_ready_err) + "]\\n")
+    sys.stdout.flush()
+    try: kc.stop_channels()
+    except: pass
+    sys.exit(1)
+
 msg_id = kc.execute(code)
 has_error = False
 start_time = time.time()
@@ -257,10 +280,10 @@ while True:
         msg = kc.get_iopub_msg(timeout=1)
         if msg['parent_header'].get('msg_id') != msg_id:
             continue
-            
+
         msg_type = msg['header']['msg_type']
         content = msg['content']
-        
+
         if msg_type == 'stream':
             sys.stdout.write(content['text'])
             sys.stdout.flush()

@@ -153,6 +153,59 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
     return None
 
 
+def _reconstruct_executed_code(
+    messages: Optional[list],
+    tool_msg: Optional[dict],
+) -> str:
+    """Walk `messages` backwards from the tool result to its matching
+    assistant tool-call and return the code/command that was actually
+    submitted to the tool.
+
+    Previously the verifier gate at `handle_chat` called
+    `verify_code_output(code=tool_name, ...)` — i.e. it passed the
+    literal string "execute" as the code to audit. With nothing to
+    reason about, the verifier hallucinated reasons the output didn't
+    match ("appears to be a directory listing", "missing expected
+    field", etc.) and REFUTED correct turns at high confidence. The
+    fix: recover the actual code from the tool-call arguments via the
+    `tool_call_id`, cap at 4000 chars, hand it to the verifier.
+
+    Returns "" when the code can't be reconstructed — caller then
+    falls back to `verify_claim` (no code slot, purely "does the
+    evidence support the claim?" shape).
+    """
+    if not tool_msg or not messages:
+        return ""
+    tool_id = tool_msg.get("tool_call_id")
+    if not tool_id:
+        return ""
+    for m in reversed(messages):
+        if not isinstance(m, dict) or m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if not isinstance(tc, dict) or tc.get("id") != tool_id:
+                continue
+            fn = tc.get("function") or {}
+            args_raw = fn.get("arguments")
+            args: dict = {}
+            if isinstance(args_raw, str):
+                try:
+                    args = json.loads(args_raw)
+                except Exception:
+                    # Not valid JSON — surface the raw string so the
+                    # verifier has at least something to audit.
+                    return args_raw[:4000]
+            elif isinstance(args_raw, dict):
+                args = args_raw
+            # Common execute-tool arg shapes, in order of preference.
+            for key in ("content", "code", "script_content", "text", "command", "cmd"):
+                v = args.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v[:4000]
+            return ""
+    return ""
+
+
 def classify_thinking_budget(query: str,
                              has_coding_intent: bool = False,
                              is_meta_task: bool = False,
@@ -632,6 +685,15 @@ class GhostContext:
         self.trajectory_collector = None
         self.reflector = None
         self.complexity_dispatcher = None
+        # Most-recent user message for the current turn. Stashed by
+        # handle_chat right after it extracts it from the request body so
+        # tools can inspect user intent without re-parsing the message
+        # list. Used by `tools.memory.tool_self_play*` to refuse calls the
+        # LLM hallucinated mid-session — the watchdog's biological
+        # self-play path does NOT go through the tool layer, so clearing
+        # this field is harmless for internal firing. Empty string when
+        # no user turn is in flight (e.g. background tasks).
+        self.last_user_content = ""
 
 class GhostAgent:
     def __init__(self, context: GhostContext):
@@ -1828,6 +1890,12 @@ class GhostAgent:
                 else:
                     last_user_content = str(last_user_content_raw)
                 lc = last_user_content.lower()
+                # Expose the current turn's user text to tools via the
+                # context. Tools that need to validate user intent
+                # (e.g. `tool_self_play`'s LLM-hallucination guard) read
+                # `context.last_user_content`. Set BEFORE any tool
+                # dispatch path can run in this turn.
+                self.context.last_user_content = last_user_content
 
                 # Stage-1 self-improvement: consult the complexity
                 # router (if wired) and stash the decision on body so
@@ -4831,11 +4899,29 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         tool_output = str(last_tool.get("content", ""))[:4000]
                         tool_name = str(last_tool.get("name", ""))[:80]
                         if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
-                            v_result = await verifier.verify_code_output(
-                                code=tool_name,
-                                output=tool_output,
-                                intent=last_user_content or "",
-                            )
+                            # Recover the code that was actually executed.
+                            # Previously this slot held `tool_name` ("execute"),
+                            # which the verifier couldn't audit — it
+                            # hallucinated reasons the output didn't
+                            # match. `_reconstruct_executed_code` walks
+                            # messages → assistant → tool_calls[tool_id]
+                            # and returns the content/code/command arg.
+                            code_text = _reconstruct_executed_code(messages, last_tool)
+                            if code_text:
+                                v_result = await verifier.verify_code_output(
+                                    code=code_text,
+                                    output=tool_output,
+                                    intent=last_user_content or "",
+                                )
+                            else:
+                                # Couldn't recover the submitted code —
+                                # fall back to claim-shape verification,
+                                # which doesn't need a code slot.
+                                v_result = await verifier.verify_claim(
+                                    claim=final_ai_content[:2000],
+                                    evidence=tool_output,
+                                    context=(last_user_content or "")[:1000],
+                                )
                         else:
                             v_result = await verifier.verify_claim(
                                 claim=final_ai_content[:2000],

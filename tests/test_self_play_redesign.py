@@ -121,6 +121,7 @@ class TestSelfPlayCycleTimeout:
         monkeypatch.setattr(Dreamer, "synthetic_self_play", _never_returns)
 
         fake_ctx = MagicMock()
+        fake_ctx.last_user_content = "run self-play"
         result = await memory_tool.tool_self_play(fake_ctx)
 
         assert "SELF PLAY ABORTED" in result
@@ -139,6 +140,7 @@ class TestSelfPlayCycleTimeout:
         from ghost_agent.core.dream import Dreamer
         monkeypatch.setattr(Dreamer, "synthetic_self_play", _returns_quickly)
         fake_ctx = MagicMock()
+        fake_ctx.last_user_content = "run self-play"
         result = await memory_tool.tool_self_play(fake_ctx)
         assert "simulated result" in result
         assert "SELF PLAY DONE" in result

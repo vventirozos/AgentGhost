@@ -52,6 +52,9 @@ async def test_terminal_tool_uses_direct_summary_not_llm_summary(monkeypatch):
     ctx.args.use_planning = False
     ctx.args.native_tools = False
     ctx.args.deep_reason = False
+    # tool_self_play now refuses unless the turn's user text mentions
+    # self-play; this mock run simulates a user explicitly asking for it.
+    ctx.last_user_content = "run self-play"
     ctx.profile_memory = MagicMock()
     ctx.profile_memory.get_context_string.return_value = ""
     ctx.scratchpad = MagicMock()

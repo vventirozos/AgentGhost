@@ -45,6 +45,15 @@
   <h2>Back-compat</h2>
   <p><code>GLOBAL_CONTEXT</code> is exposed as a property that returns <code>_CTX.get()</code>, so older callsites continue to work without per-task isolation.</p>
 
+  <h2>Transitive <code>soundfile</code> dependency</h2>
+  <p><code>qwen-agent</code>'s <code>utils/utils.py</code> does <code>import soundfile</code> at module load, so importing anything under <code>qwen_agent.*</code> (including <code>qwen_agent.tools.base</code> used by this module) fails with <code>ModuleNotFoundError: No module named 'soundfile'</code> unless the transitive dep is installed. The default agent path (<code>ghost_agent.main</code>) does NOT touch <code>qwen_bridge</code>; only the <code>core/agent_qwen.py</code> variant does.</p>
+  <ul>
+    <li><code>soundfile&gt;=0.12.0</code> is pinned in <code>requirements.txt</code> so fresh installs never hit the bug.</li>
+    <li>The module wraps the <code>from qwen_agent.tools.base import ...</code> line in a <code>try/except</code> that re-raises as <code>ImportError</code> with an actionable message (pip install instruction, Linux <code>libsndfile1</code> note, clarification that the default path is unaffected).</li>
+    <li>On Linux the system package <code>libsndfile1</code> is also required: <code>sudo apt-get install libsndfile1</code>. macOS / Windows wheels ship libsndfile bundled.</li>
+  </ul>
+  <p>Covered by <code>tests/test_qwen_bridge_import_error.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>
