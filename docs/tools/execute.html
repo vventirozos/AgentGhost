@@ -43,6 +43,7 @@
   <ul>
     <li>Auto-strips invalid <code>cd /sandbox</code> / <code>cd /home/user</code> prefixes.</li>
     <li>Blocks substantive inline <code>-c</code> scripts (≥120 chars, 2+ statements, has import) and forces the file+execute pattern.</li>
+    <li><strong>Acquired-skill invocation nudge (2026-04-24).</strong> When the blocked body looks like a failed attempt to call an acquired skill — <code>from X import X</code> where module and symbol names match, or <code>acquired_skills/X.py</code> in a subprocess call — the SYSTEM BLOCK error appends a targeted <code>HINT:</code> pointing at the canonical invocation: <em>"Acquired skills are TOP-LEVEL TOOLS. Invoke it directly as <code>X(...)</code>."</em> This shortcut exists because after the skill-storage relocation (skills live under <code>$GHOST_HOME/system/memory/acquired_skills/</code>, not inside the sandbox), the LLM can no longer see the skill via <code>ls</code> and its first instinct is often to wrap the call in <code>python -c</code> / subprocess. Hint fires only on the narrow patterns above — unrelated inline bodies keep the generic message. Covered by <code>tests/test_acquired_skill_invocation_nudge.py</code>.</li>
     <li>Executes via <code>sandbox_manager.execute(bash -c ...)</code> with 300 s timeout.</li>
   </ul>
 
