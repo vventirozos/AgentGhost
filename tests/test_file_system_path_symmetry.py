@@ -227,3 +227,81 @@ async def test_replace_flexible_whitespace_still_works(tmp_path):
         "x.py", "if foo == 1:", "if foo == 2:", tmp_path,
     )
     assert "SUCCESS" in res
+
+
+# ---------------------------------------------------------------------------
+# /workspace/ prefix handling
+#
+# The sandbox bind-mounts the host sandbox root at /workspace inside the
+# container. So /workspace/foo.py (the path the LLM sees in every shell
+# command it emits) is the same file as foo.py at the sandbox root on
+# the host. Before the fix, _get_safe_path preserved the workspace/
+# segment literally, producing a phantom workspace/ directory on disk
+# and breaking write-then-read symmetry (the LLM wrote to
+# /workspace/skills/x.py, then `python3 /workspace/skills/x.py` in the
+# container hit ENOENT because the real host file was at
+# <sandbox>/workspace/skills/x.py → container /workspace/workspace/
+# skills/x.py). Confirmed in the 2026-04-24 in_gr_news session.
+# ---------------------------------------------------------------------------
+
+
+def test_workspace_prefix_is_stripped(tmp_path):
+    """/workspace/foo.py must resolve to <sandbox>/foo.py so the same
+    path works from the container (cwd=/workspace)."""
+    p = _get_safe_path(tmp_path, "/workspace/foo.py")
+    assert p == (tmp_path / "foo.py").resolve()
+
+
+def test_bare_workspace_prefix_is_stripped(tmp_path):
+    """The LLM sometimes drops the leading slash. Same intent, same
+    strip."""
+    p = _get_safe_path(tmp_path, "workspace/skills/in_gr_news.py")
+    assert p == (tmp_path / "skills" / "in_gr_news.py").resolve()
+
+
+def test_workspace_alone_is_sandbox_root(tmp_path):
+    """`/workspace` with no trailing segment resolves to the sandbox
+    root itself. Useful when the LLM queries the root dir via the
+    file_system list op."""
+    p = _get_safe_path(tmp_path, "/workspace")
+    assert p == tmp_path.resolve()
+
+
+def test_workspace_prefix_is_exact_segment_only(tmp_path):
+    """`workspaces/` (plural) or `workspace_backup/` (different name)
+    must NOT be stripped — it would be a real subdir the LLM created
+    deliberately."""
+    p1 = _get_safe_path(tmp_path, "/workspaces/foo.py")
+    assert p1 == (tmp_path / "workspaces" / "foo.py").resolve()
+    p2 = _get_safe_path(tmp_path, "workspace_backup/x.py")
+    assert p2 == (tmp_path / "workspace_backup" / "x.py").resolve()
+
+
+def test_workspace_prefix_double_slashes_collapse(tmp_path):
+    """Multiple leading slashes (LLM typo / OS-style path) still
+    collapse to the same sandbox-root-relative path."""
+    p = _get_safe_path(tmp_path, "//workspace/foo.py")
+    assert p == (tmp_path / "foo.py").resolve()
+
+
+def test_workspace_prefix_traversal_still_blocked(tmp_path):
+    """Traversal inside a workspace-prefixed path is still blocked."""
+    with pytest.raises(ValueError):
+        _get_safe_path(tmp_path, "/workspace/../escape.txt")
+
+
+async def test_workspace_write_then_read_is_symmetric(tmp_path):
+    """The incident regression: LLM writes to /workspace/skills/x.py;
+    a script in the container then runs `python3 /workspace/skills/x.py`
+    and must find the same file. The host file must live at
+    <sandbox>/skills/x.py (NOT <sandbox>/workspace/skills/x.py)."""
+    res = await tool_write_file("/workspace/skills/in_gr_news.py", "print('ok')\n", tmp_path)
+    assert "SUCCESS" in res
+    # Host-side: the skills/ dir lives at sandbox root, not nested
+    # under a phantom workspace/.
+    assert (tmp_path / "skills" / "in_gr_news.py").exists()
+    assert not (tmp_path / "workspace").exists()
+
+    # Reading back with the same /workspace/... path must work.
+    read_res = await tool_read_file("/workspace/skills/in_gr_news.py", tmp_path)
+    assert "print('ok')" in read_res

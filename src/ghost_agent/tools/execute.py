@@ -90,6 +90,45 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     f"Rejected inline `-c` body ({reason_str})",
                     level="WARNING", icon=Icons.SHIELD,
                 )
+
+                # Heuristic: does the blocked body look like a failed
+                # attempt to call an acquired skill? Patterns seen in
+                # the 2026-04-24 EA incident:
+                #
+                #   from greece_top_news import greece_top_news; ...
+                #   python3 acquired_skills/foo.py ...
+                #
+                # Acquired skills are TOP-LEVEL callable tools — the
+                # LLM should just invoke them by name. Append a
+                # targeted hint so the retry goes there directly
+                # instead of falling back to file_system(write) +
+                # execute, which would be a correct but still-wrong
+                # second-best path for this class of request.
+                _skill_hint = ""
+                _skill_pattern = re.search(
+                    r'from\s+([a-zA-Z_][\w]*)\s+import\s+\1\b',
+                    _body_compact,
+                )
+                _subprocess_pattern = re.search(
+                    r'acquired_skills/([a-zA-Z_][\w]*)\.py',
+                    _body_compact,
+                )
+                _candidate_name = None
+                if _skill_pattern:
+                    _candidate_name = _skill_pattern.group(1)
+                elif _subprocess_pattern:
+                    _candidate_name = _subprocess_pattern.group(1)
+                if _candidate_name:
+                    _skill_hint = (
+                        f"\n\nHINT: The body looks like an attempt to call "
+                        f"the `{_candidate_name}` skill as a module / file. "
+                        f"Acquired skills are TOP-LEVEL TOOLS. Invoke it "
+                        f"directly as `{_candidate_name}(...)` — the same way "
+                        f"you'd call a built-in like `web_search`. Don't "
+                        f"import it, don't run its .py file, don't write a "
+                        f"wrapper script."
+                    )
+
                 return _format_error(
                     f"SYSTEM BLOCK: Inline `python -c '...'` / `bash -c '...'` "
                     f"scripts are restricted. Trigger: {reason_str}. Bash "
@@ -103,6 +142,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     f"For TRUE one-liners (<120 chars, single statement, no "
                     f"imports) like `python3 -c \"import sys; print(sys.path)\"` "
                     f"the inline form is still allowed."
+                    f"{_skill_hint}"
                 )
 
         pretty_log("Shell Command", command, icon=Icons.TOOL_SHELL)

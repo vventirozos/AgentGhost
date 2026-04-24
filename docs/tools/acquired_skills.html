@@ -52,11 +52,13 @@
   <p>The skill is written to <code>test_skill.py</code>, executed with <code>test_payload</code> as <code>sys.argv[1]</code> (parsed as JSON inside the script). The payload must produce <code>EXIT CODE: 0</code> with non-empty stdout. A common failure (forgetting <code>if __name__ == "__main__":</code>) is detected and reported with a specific hint.</p>
 
   <h2>Storage layout</h2>
-  <pre><code>$GHOST_SANDBOX_DIR/acquired_skills/
+  <p>Canonical storage lives under <code>$GHOST_HOME/system/memory/acquired_skills/</code> — <strong>outside</strong> the Docker bind-mount. A sandbox wipe (<code>docker volume rm</code>, <code>rm -rf $GHOST_SANDBOX_DIR</code>, container recreation) no longer destroys learned skills. Execution is still sandboxed: the registry's skill-runner closure reads the canonical file and passes <code>content=</code> to <code>tool_execute</code>, which writes it into the sandbox just-in-time and runs it.</p>
+  <pre><code>$GHOST_HOME/system/memory/acquired_skills/
 ├── &lt;name&gt;.py
 ├── retired/
 │   └── &lt;name&gt;.py
 └── skills_registry.json   { name: {description, parameters_schema, usage_count, failure_count, status, content_hash}, ... }</code></pre>
+  <p>Migration: if an earlier install left skills at the legacy path <code>$GHOST_SANDBOX_DIR/acquired_skills/</code>, they're copied over on first <code>AcquiredSkillManager</code> construction when the canonical dir is empty. Idempotent: a second construction with a populated canonical store does nothing. Legacy files are left in place (to be cleaned up manually once the operator confirms the move). Unsafe-named legacy entries (anything the identifier-shape regex rejects) are skipped and logged.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

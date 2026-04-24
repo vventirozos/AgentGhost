@@ -287,6 +287,101 @@ def fix_python_syntax(code: str) -> str:
 
     return code
 
+def _strip_cdata_envelope(content: str) -> str:
+    """If ``content`` is wrapped by a ``<![CDATA[...]]>`` envelope
+    (fully or partially), strip it and return the inner body.
+    Otherwise return ``content`` unchanged.
+
+    Three shapes are handled:
+
+      1. **Fully wrapped**: ``<![CDATA[ body ]]>`` — strip both
+         markers, return body. No AST gate needed because the markers
+         are unambiguous.
+      2. **Orphan opener**: ``<![CDATA[ body`` (closer missing). The
+         LLM forgot ``]]>`` but the body is still valid Python. Strip
+         the opener ONLY if the result parses as Python — AST-gated
+         so a legitimate string literal like ``s = "<![CDATA["``
+         (improbable but defensible) is never corrupted.
+      3. **Orphan closer**: ``body ]]>`` (opener missing). The
+         XML-parse fallback sometimes grabs only the tail. Strip the
+         closer ONLY if the result parses as Python.
+
+    The 2026-04-24 in_gr_news skill session went through 18+ turns
+    because the XML tool-call parser's CDATA regex requires both the
+    ``<parameter>`` open AND close tag; any shape that broke the
+    enclosing parameter tag (truncation, nested ``</parameter>`` in a
+    docstring, partial stream) let the CDATA envelope through into
+    ``test_skill.py``. Strict-marker-only strip caught the fully-
+    wrapped case but left orphans. This wider strip + AST gate closes
+    that gap without perturbing any well-formed Python.
+    """
+    if not content:
+        return content
+    stripped = content.lstrip()
+
+    # Case 1 — fully wrapped.
+    if stripped.startswith("<![CDATA[") and "]]>" in stripped:
+        end = stripped.rfind("]]>")
+        if end > len("<![CDATA["):
+            return stripped[len("<![CDATA["):end]
+
+    # Case 2 — orphan opener.
+    if stripped.startswith("<![CDATA["):
+        candidate = stripped[len("<![CDATA["):]
+        try:
+            ast.parse(candidate)
+            return candidate
+        except SyntaxError:
+            pass
+
+    # Case 3 — orphan closer.
+    right_stripped = content.rstrip()
+    if right_stripped.endswith("]]>"):
+        idx = right_stripped.rfind("]]>")
+        candidate = right_stripped[:idx]
+        try:
+            ast.parse(candidate)
+            return candidate
+        except SyntaxError:
+            pass
+
+    return content
+
+
+def _try_html_unescape_rescue(content: str, ext: str) -> str:
+    """If `content` fails to parse and contains HTML entities, try
+    decoding them — but only commit the decode if the decoded content
+    ACTUALLY parses. This is the other half of the XML-leak-through
+    case: the LLM emits ``&quot;`` / ``&amp;`` inside a parameter body
+    and the tool-call parser's ``unescape_xml_values`` post-pass misses
+    it (edge cases: arguments that couldn't be round-tripped through
+    ``json.loads``, e.g. trailing garbage in the XML tool call).
+
+    Only fires for Python (``ext == "py"``) so the gate is meaningful —
+    other languages have different syntactic shapes that ``ast.parse``
+    can't validate.
+    """
+    if ext != "py":
+        return content
+    if "&" not in content or ";" not in content:
+        return content  # quick reject: no HTML entities possible
+    # Cheap parse-check first: if we ALREADY parse, don't touch.
+    try:
+        ast.parse(content)
+        return content
+    except SyntaxError:
+        pass
+    import html as _html
+    decoded = _html.unescape(content)
+    if decoded == content:
+        return content
+    try:
+        ast.parse(decoded)
+        return decoded
+    except SyntaxError:
+        return content  # decode didn't help — leave original
+
+
 def sanitize_code(content: str, filename: str) -> Tuple[str, Optional[str]]:
     """
     Sanitizes code content.
@@ -300,6 +395,15 @@ def sanitize_code(content: str, filename: str) -> Tuple[str, Optional[str]]:
     original at least preserves the model's intent.
     """
     ext = str(filename).split('.')[-1].lower()
+
+    # 0. Defense-in-depth strips for XML tool-call parse escapes that
+    # leaked through. Both are AST-gated (CDATA strip is marker-gated;
+    # HTML-entity rescue only commits when ast.parse succeeds after
+    # decode), so clean content is never perturbed. Ordered BEFORE
+    # markdown extraction so a ``<![CDATA[ ```python\n... ``` ]]>``
+    # double-wrap still reaches the fence extractor.
+    content = _strip_cdata_envelope(content)
+    content = _try_html_unescape_rescue(content, ext)
 
     # 1. Extract from Markdown. Pass the filename so the extractor
     # can skip extraction when the input is already valid code for

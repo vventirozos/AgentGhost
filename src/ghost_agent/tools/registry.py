@@ -322,8 +322,17 @@ def get_active_tool_definitions(context, query: str = None):
     if context and getattr(context, 'sandbox_dir', None) and getattr(context, 'memory_system', None):
         try:
             import json
-            manager = AcquiredSkillManager(context.sandbox_dir, context.memory_system)
-            
+            # Canonical storage lives under memory_dir so skills
+            # persist across sandbox wipes. Fall back to sandbox_dir
+            # only when memory_dir isn't wired (early-init contexts
+            # in tests etc.); the legacy-migration path inside the
+            # manager handles moving any pre-existing skills over.
+            _skills_base = getattr(context, 'memory_dir', None) or context.sandbox_dir
+            manager = AcquiredSkillManager(
+                _skills_base, context.memory_system,
+                legacy_sandbox_dir=context.sandbox_dir,
+            )
+
             # Semantic RAG Retrieval if query provided
             target_skill_names = None
             if query:
@@ -360,7 +369,30 @@ def get_active_tool_definitions(context, query: str = None):
                         try: schema = json.loads(schema)
                         except Exception: schema = {}
 
-                    description = f"[ACQUIRED SKILL] {skill_info.get('description', 'Acquired dynamic skill.')}"
+                    # Description hardening (2026-04-24 EA incident):
+                    # the LLM saw `[ACQUIRED SKILL] {desc}` but didn't
+                    # realise the skill was a TOP-LEVEL TOOL. It burned
+                    # 8 turns wrapping the call in `python -c`, reading
+                    # `acquired_skills/<name>.py` from the sandbox (the
+                    # file now lives in memory_dir, not sandbox), and
+                    # writing a stub that tried to `import greece_top_news`.
+                    # Fix: make the tool description aggressively
+                    # explicit about invocation mode, include a concrete
+                    # example using the skill's own name, and forbid the
+                    # wrong patterns.
+                    user_desc = skill_info.get('description', 'Acquired dynamic skill.')
+                    description = (
+                        f"[ACQUIRED SKILL — CALL BY NAME] {user_desc}\n\n"
+                        f"USAGE: This IS a top-level tool. Invoke it directly: "
+                        f"`{skill_name}(...)`. Do NOT wrap it in `execute`, "
+                        f"`python -c`, or `file_system` — the implementation "
+                        f"lives OUTSIDE the sandbox (in "
+                        f"$GHOST_HOME/system/memory/acquired_skills/) so "
+                        f"`import {skill_name}` and "
+                        f"`python3 acquired_skills/{skill_name}.py` will both "
+                        f"fail with ModuleNotFoundError / ENOENT. Just call "
+                        f"`{skill_name}` the way you'd call any built-in tool."
+                    )
 
                     active_tools.append({
                         "type": "function",
@@ -445,8 +477,8 @@ def get_available_tools(context):
         "abort_attempt": _abort_attempt,
         "postgres_admin": lambda **kwargs: tool_postgres_admin(default_uri=getattr(context.args, 'default_db', 'postgresql://ghost@127.0.0.1:5432/agent'), **kwargs),
         "delegate_to_swarm": lambda **kwargs: tool_delegate_to_swarm(llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), scratchpad=context.scratchpad, **kwargs),
-        "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
-        "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_system=context.memory_system, **kwargs)
+        "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
+        "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs)
     }
     
     from .vision import tool_vision_analysis
@@ -458,7 +490,11 @@ def get_available_tools(context):
         
     if context and getattr(context, 'sandbox_dir', None) and getattr(context, 'memory_system', None):
         try:
-            manager = AcquiredSkillManager(context.sandbox_dir, context.memory_system)
+            _skills_base = getattr(context, 'memory_dir', None) or context.sandbox_dir
+            manager = AcquiredSkillManager(
+                _skills_base, context.memory_system,
+                legacy_sandbox_dir=context.sandbox_dir,
+            )
             skills = manager.get_all_skills()
             
             _BUILTIN_TOOL_NAMES = frozenset(tools.keys())
@@ -469,7 +505,7 @@ def get_available_tools(context):
                             f"Acquired skill '{skill_name}' shadows a built-in tool — skipping."
                         )
                         continue
-                    def make_skill_runner(name=skill_name):
+                    def make_skill_runner(name=skill_name, _mgr=manager):
                         async def _run(**kwargs):
                             import json
                             args_str = json.dumps(kwargs)
@@ -477,12 +513,40 @@ def get_available_tools(context):
                             logger.info(f"Executing Acquired Skill: {name}")
                             pretty_log("Executing Skill", f"Running custom tool: {name}", icon=Icons.TOOL_CODE)
 
+                            # Canonical skill file lives under memory_dir
+                            # (outside the sandbox). Read it, then pass
+                            # `content=` to tool_execute so the execution
+                            # still happens inside the sandbox — the
+                            # source of truth stays safe across sandbox
+                            # wipes. If the file is missing (deleted out
+                            # from under us, manager/registry drift), we
+                            # report a clear error instead of running a
+                            # stale sandbox copy.
+                            try:
+                                canonical_path = _mgr.skills_dir / f"{name}.py"
+                                skill_src = canonical_path.read_text(encoding="utf-8")
+                            except FileNotFoundError:
+                                msg = (
+                                    f"Acquired skill '{name}' source file not found at "
+                                    f"{canonical_path}. The registry entry is stale; call "
+                                    f"manage_skills(action='delete', skill_name='{name}') "
+                                    f"or re-create it via create_skill."
+                                )
+                                logger.error(msg)
+                                pretty_log("Skill Missing", msg, level="ERROR", icon=Icons.FAIL)
+                                return msg
+                            except Exception as e:
+                                msg = f"Could not read acquired skill {name}: {type(e).__name__}: {e}"
+                                logger.error(msg)
+                                return msg
+
                             try:
                                 result = await tool_execute(
                                     sandbox_dir=context.sandbox_dir,
                                     sandbox_manager=context.sandbox_manager,
                                     memory_dir=getattr(context, "memory_dir", None),
                                     filename=f"acquired_skills/{name}.py",
+                                    content=skill_src,
                                     args=[args_str]
                                 )
                                 # Telemetry: Log success

@@ -104,9 +104,36 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
     ``foo.txt`` at sandbox root) but stop rewriting ``sandbox/``
     prefixes: whatever path the agent names, we honor it literally.
     Write-then-read symmetry is more valuable than heal-the-confused.
+
+    Exception: ``/workspace/`` (and bare ``workspace/``) IS stripped.
+    ``/workspace`` is the container's WORKDIR where the sandbox root
+    is bind-mounted, so ``/workspace/foo.py`` inside the container is
+    the same file as ``foo.py`` at the host's sandbox root. The LLM
+    sees ``/workspace/...`` in every shell command it emits (the
+    prompt tells it to), so when it calls ``file_system(path=
+    "/workspace/foo.py")`` the intent is unambiguous: "sandbox root /
+    foo.py". Without this strip, the path resolved to ``$SANDBOX_DIR
+    /workspace/foo.py`` — a phantom ``workspace/`` subdir on host —
+    and later ``execute`` calls using the same ``/workspace/foo.py``
+    path inside the container got ENOENT because the real file was
+    at ``/workspace/workspace/foo.py``. Confirmed 2026-04-24 in an
+    in_gr_news skill session: the LLM burned ~60 s rediscovering the
+    mismatch ("python3: can't open file '/workspace/skills/in_gr_news.py'").
+    Write-then-read symmetry is still preserved: both tools now
+    interpret ``/workspace/...`` as sandbox-root-relative.
     """
     # 1. Strip leading slashes to treat as relative
     clean_name = str(filename).strip().lstrip("/")
+
+    # 1a. Strip a leading ``workspace/`` prefix (container WORKDIR).
+    # Case-sensitive and exact-segment: ``workspaces/`` or
+    # ``workspace_xyz/`` are untouched. Applied AFTER the leading
+    # slash strip so ``/workspace/foo``, ``workspace/foo``, and
+    # ``//workspace/foo`` all collapse identically.
+    if clean_name == "workspace":
+        clean_name = ""
+    elif clean_name.startswith("workspace/"):
+        clean_name = clean_name[len("workspace/"):]
 
     # 2. Resolve to absolute path inside the sandbox root
     target_path = (sandbox_dir / clean_name).resolve()

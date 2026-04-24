@@ -58,10 +58,14 @@ def test_get_active_tool_definitions_with_query(temp_dirs, mock_context):
     assert "skill_one" not in tool_names
     assert "skill_deleted" not in tool_names
     
-    # Verify wrapper token
+    # Verify wrapper token. The prefix was hardened (2026-04-24) to
+    # `[ACQUIRED SKILL — CALL BY NAME]` so the LLM knows the skill is
+    # a top-level tool; this test just pins that any "acquired skill"
+    # marker stays in the description.
     for d in definitions:
         if d["function"]["name"] == "skill_two":
-            assert "[ACQUIRED SKILL]" in d["function"]["description"]
+            assert "ACQUIRED SKILL" in d["function"]["description"]
+            assert "skill_two(" in d["function"]["description"]  # invocation example
 
 def test_get_active_tool_definitions_without_query(temp_dirs, mock_context):
     from ghost_agent.tools.acquired_skills import AcquiredSkillManager

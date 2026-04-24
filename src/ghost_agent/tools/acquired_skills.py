@@ -49,17 +49,147 @@ def _validate_skill_name(name: str) -> str:
     return name
 
 class AcquiredSkillManager:
-    def __init__(self, sandbox_dir: Path, memory_system):
-        self.sandbox_dir = Path(sandbox_dir)
+    """Storage-and-lifecycle manager for acquired (user-learned) skills.
+
+    Historically this class was instantiated with the agent's
+    **sandbox_dir** as its base — skill files lived at
+    ``<sandbox_dir>/acquired_skills/``. That placed them inside the
+    Docker-sandbox bind-mount, where a ``docker volume rm`` or a
+    ``rm -rf $GHOST_SANDBOX_DIR`` during a normal cleanup would
+    destroy persistently-learned tools. Acquired skills are a
+    **memory** artifact — they're produced by the agent's learning
+    loop and should outlive any single sandbox instance.
+
+    Canonical path is now ``$GHOST_HOME/system/memory/acquired_skills/``.
+    Callers pass ``context.memory_dir`` as ``base_dir``. The class
+    itself doesn't know the difference — whatever path is passed, it
+    writes ``<base_dir>/acquired_skills/`` — so existing tests that
+    pass a ``tmp_path`` work unchanged.
+
+    Execution still happens inside the sandbox (the registry's
+    skill-runner closure reads the canonical file and passes
+    ``content=`` to ``tool_execute``), so the "all code runs sandboxed"
+    invariant is preserved.
+
+    Set ``legacy_sandbox_dir`` to the agent's current sandbox_dir to
+    trigger a ONE-TIME idempotent migration: if a legacy
+    ``<legacy_sandbox_dir>/acquired_skills/`` exists and the new
+    ``skills_dir`` is empty, skill files + registry are copied over
+    and the legacy dir is left in place (to be cleaned up manually
+    once the move is verified). The migration is a best-effort
+    operation; any failure is logged but does not raise.
+    """
+
+    def __init__(self, base_dir: Path = None, memory_system=None, legacy_sandbox_dir: Path = None, *, sandbox_dir: Path = None):
+        # Legacy callers used ``sandbox_dir=`` as the first positional
+        # (or keyword) argument. Accept either form so existing tests
+        # keep working; the stored base is just "wherever the caller
+        # said to put skills". New callers pass ``base_dir=memory_dir``
+        # explicitly.
+        if base_dir is None:
+            base_dir = sandbox_dir
+        if base_dir is None:
+            raise TypeError(
+                "AcquiredSkillManager requires a base directory (pass "
+                "memory_dir / base_dir positionally, or sandbox_dir= for "
+                "legacy callers)."
+            )
+        self.base_dir = Path(base_dir)
+        # Kept for backward-compat with callers that read `.sandbox_dir`.
+        # Semantically this is now "whatever base dir you gave me"; for
+        # new callers that's memory_dir. For tests and legacy code that
+        # still pass sandbox_dir, the attribute still reflects the
+        # constructor argument.
+        self.sandbox_dir = self.base_dir
         self.memory_system = memory_system
-        self.skills_dir = self.sandbox_dir / "acquired_skills"
+        self.skills_dir = self.base_dir / "acquired_skills"
         self.skills_dir.mkdir(parents=True, exist_ok=True)
-        
+
         self.registry_path = self.skills_dir / "skills_registry.json"
         self._lock = threading.RLock()
-        
+
         if not self.registry_path.exists():
             self._save_registry({})
+
+        if legacy_sandbox_dir is not None:
+            try:
+                self._migrate_from_legacy_sandbox(Path(legacy_sandbox_dir))
+            except Exception as e:
+                logger.warning(
+                    f"Acquired-skills migration failed (non-fatal): "
+                    f"{type(e).__name__}: {e}"
+                )
+
+    def _migrate_from_legacy_sandbox(self, legacy_sandbox_dir: Path):
+        """Move skills from ``<legacy_sandbox_dir>/acquired_skills/``
+        into the new ``self.skills_dir`` if the new location is empty.
+
+        Policy:
+          * Run only when the new registry has zero skills — we never
+            overwrite a populated canonical store.
+          * Copy ``skills_registry.json`` first, then ``*.py`` files.
+          * Leave the legacy dir intact after the copy; the sandbox
+            may be recreated and the file was tiny anyway. Manual
+            cleanup after the operator confirms the move.
+        """
+        if legacy_sandbox_dir == self.base_dir:
+            return  # callers passed the same path; nothing to migrate
+        legacy_skills_dir = legacy_sandbox_dir / "acquired_skills"
+        if not legacy_skills_dir.is_dir():
+            return
+        legacy_registry = legacy_skills_dir / "skills_registry.json"
+        if not legacy_registry.is_file():
+            return
+        try:
+            current = self._load_registry()
+        except Exception:
+            current = {}
+        if current:
+            return  # new store already populated; don't clobber
+
+        try:
+            legacy_data = json.loads(legacy_registry.read_text() or "{}")
+        except Exception:
+            return
+        if not isinstance(legacy_data, dict) or not legacy_data:
+            return
+
+        import shutil as _shutil
+        migrated_names = []
+        for name in legacy_data:
+            try:
+                _validate_skill_name(name)
+            except SkillNameError:
+                # Skip any legacy skill with an unsafe name — the
+                # traversal guard would reject it anyway.
+                continue
+            src = legacy_skills_dir / f"{name}.py"
+            if not src.is_file():
+                continue
+            dst = self.skills_dir / f"{name}.py"
+            try:
+                _shutil.copy2(src, dst)
+                migrated_names.append(name)
+            except Exception as e:
+                logger.warning(
+                    f"Skipped legacy skill {name!r} during migration: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if not migrated_names:
+            return
+        # Re-write the registry under the lock; keep only the entries
+        # whose .py files actually copied over.
+        with self._lock:
+            new_reg = {k: v for k, v in legacy_data.items() if k in migrated_names}
+            self._save_registry(new_reg)
+
+        pretty_log(
+            "Skills Migrated",
+            f"Moved {len(migrated_names)} acquired skill(s) from sandbox to "
+            f"{self.skills_dir} ({', '.join(migrated_names)}).",
+            icon=Icons.OK,
+        )
 
     def _save_registry(self, registry: dict):
         with self._lock:
@@ -272,7 +402,67 @@ class AcquiredSkillManager:
                 return True
             return False
 
-async def tool_create_skill(sandbox_dir: Path = None, memory_system=None, sandbox_manager=None, name: str = None, description: str = None, parameters_schema: str = None, python_code: str = None, test_payload: str = None, **_extra):
+def _summarise_tdd_failure(execution_result: str) -> str:
+    """Extract a short, human-readable one-line summary from a TDD
+    failure's `execution_result` string.
+
+    `tool_execute` returns output in the shape:
+
+        --- EXECUTION RESULT ---
+        EXIT CODE: N
+        STDOUT/STDERR:
+        <body>
+
+    The `<body>` is typically either (a) a Python traceback whose LAST
+    non-empty line is the useful diagnosis (`ValueError: …`), (b) a
+    "Syntax Error Detected: …" line from the sanitizer, or (c) the
+    sentinel about no stdout. This helper picks the best line without
+    exploding on unusual shapes — it is purely for log-surface polish
+    and must never raise.
+
+    Output is trimmed to 200 chars so a wall-of-stderr can't dominate
+    the trace row.
+    """
+    if not execution_result:
+        return "unknown cause"
+    try:
+        text = str(execution_result)
+
+        # No-stdout sentinel — tell the operator the specific issue
+        # (same advice the LLM already sees).
+        if "(Process executed successfully, but no output was printed to stdout" in text:
+            return "script exited 0 but printed nothing to stdout"
+
+        # Strip the structured header if present.
+        marker = "STDOUT/STDERR:"
+        if marker in text:
+            body = text.split(marker, 1)[1]
+        else:
+            body = text
+        lines = [ln.rstrip() for ln in body.splitlines() if ln.strip()]
+        if not lines:
+            return "no diagnostic output"
+
+        # For a Python traceback, the LAST line is the exception type +
+        # message — the most actionable summary. Cheap heuristic: any
+        # line matching `<Word>Error: …` or `<Word>Exception: …`.
+        import re as _re
+        for ln in reversed(lines):
+            if _re.match(r"^[A-Z]\w*(Error|Exception|Warning):\s*.+", ln):
+                return ln[:200]
+
+        # Sanitizer surface: "Syntax Error Detected: …"
+        for ln in lines:
+            if ln.startswith("Syntax Error Detected") or ln.startswith("SYSTEM ERROR"):
+                return ln[:200]
+
+        # Fallback: first non-empty line.
+        return lines[0][:200]
+    except Exception:
+        return "unknown cause"
+
+
+async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, sandbox_manager=None, name: str = None, description: str = None, parameters_schema: str = None, python_code: str = None, test_payload: str = None, **_extra):
     # Tolerate stray kwargs the LLM sometimes invents (observed: `filename`
     # when the model confuses this tool with `execute`). Without this
     # catch-all the registry's `**kwargs` pass-through would raise a
@@ -307,10 +497,34 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_system=None, sandbo
     except json.JSONDecodeError as e:
         return f"Skill creation failed: invalid test_payload JSON -> {e}. Fix the test payload and try again."
 
+    # Normalize the incoming python_code at the earliest possible
+    # point — BEFORE writing test_skill.py. This is defense-in-depth:
+    # `tool_execute` also runs `sanitize_code` when it re-reads the
+    # file, but any shape it can't heal turns into a `Syntax Error
+    # Detected:` surface that the LLM then has to diagnose blind.
+    # Running the same rescue here lets us (a) fix the common cases
+    # (CDATA wrapper, HTML entities, escaped-newlines-in-one-line
+    # JSON) silently, and (b) surface a specific actionable error if
+    # the code is still unparseable. Without this step, the 2026-04-24
+    # in_gr_news session burned 18+ turns because CDATA leaks from
+    # the tool-call XML parser landed on disk verbatim and every
+    # retry got the same generic test failure.
+    from ..utils.sanitizer import sanitize_code
+    normalized_code, syntax_error = sanitize_code(python_code, "test_skill.py")
+    if syntax_error:
+        return (
+            f"Skill creation failed: python_code didn't parse as valid Python "
+            f"even after normalization ({syntax_error}). Common causes: XML/CDATA "
+            f"wrapper that didn't strip (remove `<![CDATA[` / `]]>`), HTML entities "
+            f"(`&quot;`, `&amp;`) that should be literal characters, truncated stream, "
+            f"or escaped-newline confusion (pass real newlines in the JSON, not `\\\\n`). "
+            f"Send the raw Python source verbatim — no wrappers."
+        )
+
     test_file = sandbox_dir / "test_skill.py"
-    
+
     try:
-        test_file.write_text(python_code, encoding="utf-8")
+        test_file.write_text(normalized_code, encoding="utf-8")
     except Exception as e:
         return f"Skill creation failed: Could not write test file -> {e}"
         
@@ -330,7 +544,16 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_system=None, sandbo
         except Exception:
             pass
         logger.warning(f"TDD failure for '{name}':\n{execution_result}")
-        pretty_log("TEST FAILED", f"Skill '{name}' failed its TDD test.", level="WARNING", icon=Icons.FAIL)
+        # Surface the one-line cause in the trace so the operator
+        # can diagnose without grepping the agent log. Full detail is
+        # still in `logger.warning` above AND in the tool result the
+        # LLM sees.
+        _cause = _summarise_tdd_failure(execution_result)
+        pretty_log(
+            "TEST FAILED",
+            f"Skill '{name}' failed its TDD test — {_cause}",
+            level="WARNING", icon=Icons.FAIL,
+        )
         
         if "(Process executed successfully, but no output was printed to stdout" in execution_result:
             return f"Skill creation failed: The script executed successfully but printed absolutely NOTHING to stdout. You MUST print the final result so the system can read it, and ensure you actually parse sys.argv[1] and call your function inside an 'if __name__ == \"__main__\":' block."
@@ -343,16 +566,26 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_system=None, sandbo
         
     logger.info(f"TDD passed for '{name}'")
     pretty_log("TEST PASSED", f"Skill '{name}' successfully completed TDD verification.", icon=Icons.OK)
-        
-    mgr = AcquiredSkillManager(sandbox_dir, memory_system)
-    mgr.save_skill(name, description, schema_dict, python_code)
-    
+
+    # Canonical storage is `memory_dir/acquired_skills/` so skills
+    # persist across sandbox wipes. Fall back to `sandbox_dir` only
+    # for very old callers that never threaded `memory_dir` in — that
+    # keeps legacy tests passing while new code uses the safe path.
+    storage_base = Path(memory_dir) if memory_dir is not None else Path(sandbox_dir)
+    mgr = AcquiredSkillManager(storage_base, memory_system, legacy_sandbox_dir=sandbox_dir)
+    # Persist the NORMALIZED body (CDATA-stripped, entities decoded)
+    # rather than the raw LLM input, so the canonical .py file on
+    # disk always parses. Future loaders that read the skill back
+    # don't re-run the sanitizer.
+    mgr.save_skill(name, description, schema_dict, normalized_code)
+
     return f"Success: Skill '{name}' acquired and tested successfully."
 
-async def tool_manage_skills(sandbox_dir: Path = None, memory_system=None, action: str = None, skill_name: str = None):
+async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, action: str = None, skill_name: str = None):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
-    mgr = AcquiredSkillManager(sandbox_dir, memory_system)
+    storage_base = Path(memory_dir) if memory_dir is not None else Path(sandbox_dir)
+    mgr = AcquiredSkillManager(storage_base, memory_system, legacy_sandbox_dir=sandbox_dir)
     if action == "list":
         skills = mgr.get_all_skills()
         if not skills:
