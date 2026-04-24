@@ -5,7 +5,7 @@ import json
 import logging
 import re
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from .agent import extract_json_from_text
 from .self_play_scoring import correctness_weighted_score, count_tool_errors
@@ -607,14 +607,35 @@ class Dreamer:
                 include=["documents", "metadatas", "embeddings"]
             )
         except Exception as e:
-            return f"Dream error: {e}"
-            
+            msg = f"Dream error: {e}"
+            pretty_log("Dream Mode", msg, level="ERROR", icon="❌")
+            return msg
+
         ids = results['ids']
         documents = results['documents']
-        
+
         if len(documents) < 3:
-            return "Not enough entropy to dream. (Need > 3 auto-memories to form heuristics)"
-            
+            msg = "Not enough entropy to dream. (Need > 3 auto-memories to form heuristics)"
+            pretty_log("Dream Mode", msg, icon="💤")
+            return msg
+
+        # Idempotency guard: if the auto-memory set hasn't changed since
+        # the last REM cycle, a re-run will at best produce the same
+        # output (often 0 consolidations / 0 heuristics) and at worst
+        # burn an LLM call on noise. Skip until new fragments arrive.
+        # The last set is cached on the agent context so the check
+        # survives the per-tick Dreamer re-instantiation.
+        current_fragment_key = frozenset(ids)
+        last_fragment_key = getattr(self.context, "_last_dream_fragment_ids", None)
+        # Defensive isinstance guard: on a MagicMock context, attribute
+        # access returns a child mock rather than the `None` default, so
+        # an == comparison would silently always be False. Only honour
+        # the cache when it's a real frozenset.
+        if isinstance(last_fragment_key, frozenset) and last_fragment_key == current_fragment_key:
+            msg = f"Skipping REM — fragment set unchanged ({len(ids)} memories, no new input since last cycle)."
+            pretty_log("Dream Mode", msg, icon="⏭️")
+            return msg
+
         mem_list = [f"ID:{i} | {doc}" for i, doc in zip(ids, documents)]
         mem_block = "\n".join(mem_list[:150])
         pretty_log("Dream Mode", f"Analyzing {len(ids)} fragments for meta-patterns...", icon="🧠")
@@ -653,7 +674,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 "temperature": 0.0,
                 "max_tokens": 4096,
             }
-            data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
+            data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=180.0)
             content_text = data["choices"][0]["message"]["content"]
             
             result_json = extract_json_from_text(content_text)
@@ -769,10 +790,20 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 metrics_note += f" ({patterns_found} tool-call patterns detected)"
             if pruned_count > 0:
                 metrics_note += f" ({pruned_count} low-utility lessons pruned)"
-            return f"Dream Complete. Synthesized {applied_consolidations} new meta-memories and extracted {h_count} heuristics.{metrics_note}"
-            
+            # Record the fragment set we just processed so the next REM
+            # cycle can short-circuit if no new auto-memories have arrived.
+            # Only stored on success — a transient LLM error must not
+            # poison the idempotency cache against a valid retry.
+            self.context._last_dream_fragment_ids = current_fragment_key
+
+            msg = f"Dream Complete. Synthesized {applied_consolidations} new meta-memories and extracted {h_count} heuristics.{metrics_note}"
+            pretty_log("Dream Mode", msg, icon="✅")
+            return msg
+
         except Exception as e:
-            return f"Dream error: {e}"
+            msg = f"Dream error: {e}"
+            pretty_log("Dream Mode", msg, level="ERROR", icon="❌")
+            return msg
 
     async def graduate_lessons(self, model_name: str = "qwen-3.6-35b-a3") -> str:
         """Skill graduation pipeline: promote frequently-referenced playbook
@@ -1219,7 +1250,13 @@ Return ONLY a JSON object with:
         seed = {"mode": "cold_start", "cluster_key": None, "hint": ""}
         if frontier_tracker is not None:
             try:
-                picked = frontier_tracker.pick_seed(random_explore_prob=0.2)
+                # Raised 0.2 → 0.35 after observing template saturation in
+                # the log eval: even with the brittle-cluster bias, the
+                # loop kept re-picking the same 1-2 shapes because they
+                # were the only ones with any recent activity. A 35%
+                # exploration roll lets the loop breathe when no cluster
+                # is genuinely struggling.
+                picked = frontier_tracker.pick_seed(random_explore_prob=0.35)
                 if isinstance(picked, dict):
                     seed = picked
             except Exception as e:
@@ -1305,7 +1342,20 @@ Return ONLY a JSON object with:
                     _cluster_key = None
             except Exception as e:
                 logger.debug(f"Saturation re-check failed (non-fatal): {e}")
-        _tpl = try_template(_cluster_key)
+        # Tier resolver: templates now scale problem size + add twists
+        # by difficulty tier. The frontier tracker stores a monotonic
+        # `unlocked_tier_index` per cluster — pipe it through so the
+        # template render at `advanced`/`expert` after the cluster has
+        # earned enough first-try wins, instead of always basic.
+        def _resolve_tier(cluster: str) -> Optional[str]:
+            if not cluster or frontier_tracker is None:
+                return None
+            try:
+                return frontier_tracker.get_difficulty_tier(cluster)
+            except Exception:
+                return None
+        _resolved_tier = _resolve_tier(_cluster_key) if _cluster_key else None
+        _tpl = try_template(_cluster_key, tier=_resolved_tier)
         _tpl_source = "cluster"
         challenge_domains: list = []
         journal_source = False
@@ -1344,24 +1394,36 @@ Return ONLY a JSON object with:
         #     so the expert templates get airtime; the other 50% fall
         #     through to LLM-gen for genuinely novel shapes.
         if _tpl is None and not gen_ok and not _cluster_key and not _saturated:
-            _tpl = pick_random_template(exclude_clusters=_saturated)
+            _tpl = pick_random_template(
+                exclude_clusters=_saturated, tier_resolver=_resolve_tier
+            )
             _tpl_source = "cold_start_random"
         elif _tpl is None and not gen_ok and _saturated:
+            # Saturation coin-flip: previously 50/50 between rotating to
+            # a non-saturated template and falling through to LLM-gen.
+            # The log-eval showed this still produced ~8 near-identical
+            # shop.db / data.csv drills per loop — the template bank is
+            # simply not wide enough, and "non-saturated" rotations often
+            # landed back on shapes the agent already aces. Flipped to
+            # 20/80 in favour of LLM-gen so the loop reaches for novel
+            # material when the bank is exhausted. The expert concurrency /
+            # algo shapes still get their share via the non-saturated
+            # frontier path (seed.cluster_key) and cold_start_random.
             import random as _rnd
-            if _rnd.random() < 0.5:
-                _tpl = pick_random_template(exclude_clusters=_saturated)
+            if _rnd.random() < 0.2:
+                _tpl = pick_random_template(
+                    exclude_clusters=_saturated, tier_resolver=_resolve_tier
+                )
                 _tpl_source = "saturation_template_rotation"
                 pretty_log(
                     "Self-Play Frontier",
-                    "Saturation coin-flip → picking a non-saturated template "
-                    "(expert concurrency / algo / regex-parse shapes get "
-                    "their 50% airtime).",
+                    "Saturation coin-flip (20%) → picking a non-saturated template.",
                     icon=Icons.BRAIN_AIM,
                 )
             else:
                 pretty_log(
                     "Self-Play Frontier",
-                    "Saturation coin-flip → falling through to LLM-generated "
+                    "Saturation coin-flip (80%) → falling through to LLM-generated "
                     "challenge (novel material outside the template bank).",
                     icon=Icons.BRAIN_AIM,
                 )
@@ -2580,13 +2642,6 @@ Return ONLY a JSON object with:
                                 feedback = feedback[:1500] + "\n...[TRUNCATED FOR LENGTH]"
                                 
                             pretty_log("Self-Play Judge Rejection", feedback[:500].replace('\n', ' ') + "...", level="WARNING", icon=Icons.FAIL)
-                            
-                            # Reveal the hidden test to the agent so it can debug the validator's logic.
-                            # Cap the validator script to prevent context bloat — the agent only
-                            # needs to see the comparison logic, not boilerplate imports.
-                            validator_preview = validation_script
-                            if len(validator_preview) > 3000:
-                                validator_preview = validator_preview[:3000] + "\n# ... [TRUNCATED]"
 
                             # Detect float formatting mismatch and add a targeted hint
                             float_hint = ""
@@ -2599,14 +2654,36 @@ Return ONLY a JSON object with:
                                 )
                                 if float_mismatch:
                                     float_hint = (
-                                        "\n\nHINT: The mismatch appears to be a floating-point formatting issue. "
-                                        "Python's round() drops trailing zeros (14428.8) while f\"{:.2f}\" preserves them (14428.80). "
-                                        "Match the validator's formatting exactly: if it uses round(), your output should too. "
-                                        "If it uses f-string with :.2f, use the same."
+                                        "\n\nHINT: The mismatch looks like a floating-point formatting issue. "
+                                        "`round()` drops trailing zeros (14428.8) while `f\"{:.2f}\"` preserves "
+                                        "them (14428.80). Reconcile the format so your output matches exactly."
                                     )
 
-                            rejection_msg = f"SYSTEM JUDGE REJECTION: You did not solve the task. Feedback:\n{feedback}\n\n"
-                            rejection_msg += f"For your reference, here is the hidden `.validator.py` script that evaluated your code. Read it carefully:\n```python\n{validator_preview}\n```\nYou must fix your code and try again.{float_hint}"
+                            # Rejection prompt: feedback ONLY — the hidden .validator.py
+                            # source is NOT revealed. Previously we pasted the full
+                            # validator script into the retry prompt so the agent
+                            # could "debug the validator's logic", but the log-eval
+                            # showed this turned every struggled-then-won cycle into
+                            # an answer-key lookup: the agent literally copied the
+                            # validator's constants (multipliers, SQL query shape)
+                            # instead of reasoning from the expected-vs-actual diff.
+                            # Skill-gate lessons from those cycles were memorised
+                            # constants, not transferable knowledge.
+                            #
+                            # The feedback string below already contains the validator's
+                            # FAIL line + the expected vs actual output. That's enough
+                            # for real reasoning. Some complex challenges will now
+                            # fail their retry — that's correct: a genuine failure
+                            # is better training signal than a cheated pass.
+                            rejection_msg = (
+                                f"SYSTEM JUDGE REJECTION: You did not solve the task.\n\n"
+                                f"Validator feedback (expected vs actual output):\n{feedback}\n\n"
+                                f"Reason from the expected-vs-actual diff above to identify the "
+                                f"gap between your logic and the task spec. Re-read the original "
+                                f"task description carefully — the mismatch often lies in an edge "
+                                f"case, tie-break rule, or formatting detail you overlooked. "
+                                f"You must fix your code and try again.{float_hint}"
+                            )
 
                             # CRITICAL FIX: Wipe the slate clean for the retry to prevent context looping.
                             # Remove ALL prior assistant/tool messages to prevent the agent from

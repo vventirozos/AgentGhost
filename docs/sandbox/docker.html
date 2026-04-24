@@ -66,7 +66,8 @@
   <h2>Provisioned packages</h2>
   <ul>
     <li><strong>apt</strong>: <code>sudo · git · nodejs · npm · postgresql-client · tor · ripgrep · sqlite3</code>.</li>
-    <li><strong>pip</strong>: <code>numpy · pandas · torch · scikit-learn · matplotlib · seaborn · plotly · networkx · requests · beautifulsoup4 · sqlalchemy · pytest · playwright</code>.</li>
+    <li><strong>pip</strong>: <code>numpy · pandas · torch · scikit-learn · matplotlib · seaborn · plotly · networkx · requests · beautifulsoup4 · sqlalchemy · pytest · playwright · html2text · lxml</code>.</li>
+    <li><strong>browser</strong>: Chromium installed via <code>python3 -m playwright install chromium --with-deps</code>. Runs <strong>unconditionally</strong> inside the first-provision block (gated only by the outer <code>/root/.supercharged</code> marker). A previous library-import probe was removed: <code>pip install playwright</code> makes the Python lib importable without installing the Chromium binary, so the probe always passed and the binary install was silently skipped on first boot — the 2026-04-23 eval hit "headless_shell not found" for exactly this reason. <strong>Fail-loud:</strong> a non-zero exit code raises and refuses to touch the <code>/root/.supercharged</code> marker, so a failed download cannot silently poison future boots into believing Chromium is ready.</li>
   </ul>
 
   <h2>Resource caps</h2>
@@ -74,11 +75,11 @@
     <dt>memory</dt><dd>configurable, default 4 g</dd>
     <dt>CPU quota</dt><dd>200000 µs (2 vCPU) at 100000 µs period</dd>
     <dt>output cap</dt><dd>256 KB per execute call</dd>
-    <dt>install time</dt><dd>~60 s on first boot, cached thereafter</dd>
+    <dt>install time</dt><dd>~60 s on first boot (+ ~2 min Chromium on the first-ever boot), cached thereafter</dd>
   </div>
 
   <h2>Tor</h2>
-  <p>If <code>tor_proxy</code> is set in the constructor, the container starts a <code>tor</code> daemon and outbound HTTP from inside the sandbox is routed through it.</p>
+  <p>If <code>tor_proxy</code> is set in the constructor, the container starts a <code>tor</code> daemon and outbound HTTP from inside the sandbox is routed through it. The native <code>browser</code> tool additionally forces DNS-over-SOCKS via Chromium's <code>--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost"</code> and disables non-proxied WebRTC (<code>--webrtc-ip-handling-policy=disable_non_proxied_udp</code>), so the browser path cannot leak DNS or the host IP even if the LLM forgets to configure the proxy correctly.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

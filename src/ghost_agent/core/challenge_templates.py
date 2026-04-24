@@ -31,10 +31,44 @@ returns a self-consistent triple.
 from __future__ import annotations
 
 import random
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 
 ChallengeTriple = Tuple[str, str, str]  # (prompt, setup, validator)
+
+# Tier → size multiplier applied to base row/file counts. Scaling N is
+# the cheapest, most uniform way to make a template harder: more data
+# means the solver's solution has to generalise rather than pattern-
+# match a small fixture. Each tier ~doubles the effective workload over
+# the next-lower one, which is enough to catch solutions that were
+# accidentally O(N²) or relied on reading the whole file into memory.
+_TIER_SIZE_MULTIPLIER: Dict[str, int] = {
+    "basic": 1,
+    "intermediate": 2,
+    "advanced": 3,
+    "expert": 4,
+}
+
+
+def _tier(tier: Optional[str]) -> str:
+    """Normalise an arbitrary tier string to a known key. Unknown /
+    None → 'basic' so every template has a sane default."""
+    if tier in _TIER_SIZE_MULTIPLIER:
+        return tier
+    return "basic"
+
+
+def _size(base: int, tier: Optional[str]) -> int:
+    """Scale a base count by the tier multiplier."""
+    return base * _TIER_SIZE_MULTIPLIER[_tier(tier)]
+
+
+def _is_hard_mode(tier: Optional[str]) -> bool:
+    """Advanced+ tiers add a cluster-specific twist on top of size
+    scaling — malformed rows to filter, stopwords to ignore, NULL
+    columns to handle, etc. The twist is what prevents the solver from
+    just pattern-matching the basic-tier shape at higher sizes."""
+    return _tier(tier) in ("advanced", "expert")
 
 
 def _pick_seed() -> int:
@@ -43,15 +77,32 @@ def _pick_seed() -> int:
     return random.randint(1, 2**31 - 1)
 
 
-def _data_analysis_csv_aggregation() -> ChallengeTriple:
+def _data_analysis_csv_aggregation(tier: Optional[str] = None) -> ChallengeTriple:
     """data_analysis: filter a CSV by date range, group by category,
-    sum a numeric column, print sorted results."""
+    sum a numeric column, print sorted results.
+
+    Tier scaling:
+      * size grows 1× → 4× with tier.
+      * advanced+ injects ~15% rows with ``value`` set to the literal
+        string ``"NA"`` that the solver must filter out (the validator
+        does the same, so the expected answer is the sum ignoring NA).
+    """
     seed = _pick_seed()
-    n_rows = random.randint(40, 80)
+    n_rows = random.randint(_size(40, tier), _size(80, tier))
     categories = random.sample(
         ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"],
         k=random.randint(3, 5),
     )
+    hard = _is_hard_mode(tier)
+    na_fraction = 0.15 if hard else 0.0
+
+    noise_clause = ""
+    if hard:
+        noise_clause = (
+            "\n**Important:** some rows have `value` set to the literal "
+            "string `\"NA\"` (indicating missing data). You MUST skip "
+            "those rows entirely — do NOT include them in any sum.\n"
+        )
 
     challenge_prompt = f"""You are given a CSV file named `data.csv` that already exists in your
 current working directory. Its schema is:
@@ -60,9 +111,9 @@ current working directory. Its schema is:
 
 - `id` is a unique integer
 - `category` is one of: {', '.join(sorted(categories))}
-- `value` is a positive float
+- `value` is a positive float{' (or the literal string "NA" for missing data)' if hard else ''}
 - `date` is in YYYY-MM-DD format
-
+{noise_clause}
 **Task:**
 Write a Python script `solution.py` that:
 1. Reads `data.csv`.
@@ -82,7 +133,10 @@ categories = {categories!r}
 rows = []
 for i in range({n_rows}):
     cat = random.choice(categories)
-    value = round(random.uniform(10.0, 100.0), 2)
+    if random.random() < {na_fraction}:
+        value = "NA"
+    else:
+        value = round(random.uniform(10.0, 100.0), 2)
     month = random.choice(["01", "01", "01", "02", "03"])
     day = random.randint(1, 28)
     date = f"2024-{{month}}-{{day:02d}}"
@@ -103,7 +157,12 @@ with open("data.csv", "r") as f:
     reader = csv.DictReader(f)
     for row in reader:
         if row["date"].startswith("2024-01"):
-            totals[row["category"]] += float(row["value"])
+            try:
+                v = float(row["value"])
+            except (TypeError, ValueError):
+                # Tier-agnostic: basic never has NA, hard-mode tiers do.
+                continue
+            totals[row["category"]] += v
 
 expected = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
 expected_lines = [f"{cat}: {total:.2f}" for cat, total in expected]
@@ -133,19 +192,36 @@ exit(0)
     return challenge_prompt, setup_script, validation_script
 
 
-def _regex_parse_access_log() -> ChallengeTriple:
-    """regex_parse: count 5xx responses per IP in a mock access log."""
-    seed = _pick_seed()
-    n_lines = random.randint(50, 120)
+def _regex_parse_access_log(tier: Optional[str] = None) -> ChallengeTriple:
+    """regex_parse: count 5xx responses per IP in a mock access log.
 
-    challenge_prompt = """You are given a file named `access.log` in the current working directory.
-Each line has the format:
+    Tier scaling:
+      * line count grows with tier.
+      * advanced+ mixes ~15% malformed lines (truncated, missing status)
+        that the solver must skip without crashing.
+    """
+    seed = _pick_seed()
+    n_lines = random.randint(_size(50, tier), _size(120, tier))
+    hard = _is_hard_mode(tier)
+    malformed_fraction = 0.15 if hard else 0.0
+
+    noise_clause = ""
+    if hard:
+        noise_clause = (
+            "\n**Important:** some lines are MALFORMED (truncated, "
+            "missing the status code, or otherwise not matching the "
+            "format above). Your script MUST skip malformed lines "
+            "silently — do NOT crash, and do NOT count them.\n"
+        )
+
+    challenge_prompt = f"""You are given a file named `access.log` in the current working directory.
+Each valid line has the format:
 
     <IP> - - [<timestamp>] "<METHOD> <PATH> HTTP/1.1" <STATUS> <BYTES>
 
 Example:
     10.0.0.5 - - [12/Mar/2024:08:01:23 +0000] "GET /api/users HTTP/1.1" 500 512
-
+{noise_clause}
 **Task:**
 Write a Python script `solution.py` that:
 1. Reads `access.log`.
@@ -164,6 +240,12 @@ paths = ["/api/users", "/api/orders", "/health", "/api/v1/items", "/admin"]
 statuses = [200, 200, 200, 301, 404, 500, 503, 502]
 lines = []
 for _ in range({n_lines}):
+    if random.random() < {malformed_fraction}:
+        # Malformed: truncate the line before the status code so the
+        # solver's regex has to miss it.
+        ip = random.choice(ips)
+        lines.append(f'{{ip}} - - [12/Mar/2024:08:01:23 +0000] "GET /broken')
+        continue
     ip = random.choice(ips)
     m = random.choice(methods)
     p = random.choice(paths)
@@ -221,14 +303,35 @@ exit(0)
     return challenge_prompt, setup_script, validation_script
 
 
-def _python_general_word_frequency() -> ChallengeTriple:
-    """python_general: count word frequencies from a text file, top-N."""
+def _python_general_word_frequency(tier: Optional[str] = None) -> ChallengeTriple:
+    """python_general: count word frequencies from a text file, top-N.
+
+    Tier scaling:
+      * token count grows with tier.
+      * advanced+ mixes in a stopword set (``the``/``and``/``or``/
+        ``to``/``a``) that the solver must EXCLUDE from the top-N.
+        The stopwords are sprinkled into the corpus often enough to
+        dominate a naive count.
+    """
     seed = _pick_seed()
     top_n = random.randint(3, 6)
+    token_low = _size(150, tier)
+    token_high = _size(300, tier)
+    hard = _is_hard_mode(tier)
+    stopwords = ("the", "and", "or", "to", "a") if hard else ()
+
+    noise_clause = ""
+    if hard:
+        noise_clause = (
+            f"\n**Important:** IGNORE these stopwords entirely when "
+            f"counting: {list(stopwords)!r}. They MUST NOT appear in "
+            f"your top-{top_n} output, even if they are the most "
+            "frequent tokens in the file.\n"
+        )
 
     challenge_prompt = f"""You are given a text file named `corpus.txt` in the current working
 directory containing many English sentences.
-
+{noise_clause}
 **Task:**
 Write a Python script `solution.py` that:
 1. Reads `corpus.txt`.
@@ -245,9 +348,14 @@ Exit with code 0 on success."""
 random.seed({seed})
 vocab = ["apple", "banana", "cherry", "date", "elderberry", "fig", "grape",
          "honeydew", "kiwi", "lemon", "mango", "nectarine", "orange"]
+stopwords = {list(stopwords)!r}
 tokens = []
-for _ in range(random.randint(150, 300)):
-    w = random.choice(vocab)
+for _ in range(random.randint({token_low}, {token_high})):
+    # Sprinkle stopwords heavily so they dominate if not filtered.
+    if stopwords and random.random() < 0.4:
+        w = random.choice(stopwords)
+    else:
+        w = random.choice(vocab)
     tokens.append(w if random.random() > 0.3 else w.upper())
 text = " ".join(tokens) + "."
 with open("corpus.txt", "w") as f:
@@ -259,9 +367,11 @@ print(f"SETUP OK: wrote {{len(tokens)}} tokens")
 import re
 from collections import Counter
 
+STOPWORDS = {set(stopwords)!r}
+
 with open("corpus.txt") as f:
     text = f.read()
-words = [w.lower() for w in re.findall(r'[a-zA-Z]+', text)]
+words = [w.lower() for w in re.findall(r'[a-zA-Z]+', text) if w.lower() not in STOPWORDS]
 counts = Counter(words)
 ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
 expected_lines = [f"{{w}}: {{c}}" for w, c in ranked[:{top_n}]]
@@ -291,20 +401,34 @@ exit(0)
     return challenge_prompt, setup_script, validation_script
 
 
-def _algo_kth_largest() -> ChallengeTriple:
+def _algo_kth_largest(tier: Optional[str] = None) -> ChallengeTriple:
     """algo: read integers from a file, return the k-th largest.
 
-    Deterministic, stdlib-only, bounded I/O. Covers the `algo` cluster
-    the frontier tracker targets for algorithmic challenges — before
-    this template was added, `cluster='algo'` runs always fell through
-    to the LLM-generated path (see 23:29 trace: 104s of challenge-gen
-    for a single algo run, with two rejected attempts).
+    Tier scaling:
+      * n grows with tier.
+      * advanced+ switches the ask to k-th largest DISTINCT value
+        (duplicates collapsed), which trips solutions that just do
+        ``sorted(nums, reverse=True)[k-1]``.
     """
     seed = _pick_seed()
-    n = random.randint(20, 60)
-    # `k` must be in [1, n]; the validator computes the expected value
-    # itself so random k is safe.
+    n = random.randint(_size(20, tier), _size(60, tier))
     k = random.randint(1, min(10, n))
+    hard = _is_hard_mode(tier)
+
+    if hard:
+        task_line = (
+            f"Finds the {k}-th LARGEST DISTINCT integer (1-indexed, so k=1 is "
+            f"the max). Duplicates are COLLAPSED — if the list is "
+            f"[9, 9, 7] then the 1st-largest distinct value is 9, the "
+            f"2nd-largest distinct is 7, and k=3 has no answer (print "
+            f"the string `NONE` on a single line in that case)."
+        )
+    else:
+        task_line = (
+            f"Finds the {k}-th LARGEST integer (1-indexed, so k=1 is the max). "
+            f"Duplicates count separately — if the list is [9, 9, 7] then the "
+            f"1st largest is 9, the 2nd largest is also 9, and the 3rd is 7."
+        )
 
     challenge_prompt = f"""You are given a file named `numbers.txt` in the current working
 directory. It contains {n} integers, one per line. Integers can be
@@ -313,9 +437,7 @@ positive, negative, or zero, and duplicates are allowed.
 **Task:**
 Write a Python script `solution.py` that:
 1. Reads `numbers.txt`.
-2. Finds the {k}-th LARGEST integer (1-indexed, so k=1 is the max).
-   Duplicates count separately — if the list is [9, 9, 7] then the
-   1st largest is 9, the 2nd largest is also 9, and the 3rd is 7.
+2. {task_line}
 3. Prints that integer on a single line, no other output.
 
 Exit with code 0 on success."""
@@ -328,56 +450,84 @@ with open("numbers.txt", "w") as f:
 print(f"SETUP OK: wrote {{len(nums)}} integers")
 """
 
-    validation_script = f"""import subprocess
+    if hard:
+        expected_block = (
+            "with open(\"numbers.txt\") as f:\n"
+            "    nums = [int(line.strip()) for line in f if line.strip()]\n"
+            "distinct_desc = sorted(set(nums), reverse=True)\n"
+            f"if {k - 1} < len(distinct_desc):\n"
+            f"    expected_str = str(distinct_desc[{k - 1}])\n"
+            "else:\n"
+            "    expected_str = \"NONE\"\n"
+        )
+    else:
+        expected_block = (
+            "with open(\"numbers.txt\") as f:\n"
+            "    nums = [int(line.strip()) for line in f if line.strip()]\n"
+            "nums_sorted_desc = sorted(nums, reverse=True)\n"
+            f"expected_str = str(nums_sorted_desc[{k - 1}])\n"
+        )
 
-with open("numbers.txt") as f:
-    nums = [int(line.strip()) for line in f if line.strip()]
-nums_sorted_desc = sorted(nums, reverse=True)
-expected = nums_sorted_desc[{k - 1}]
-
-result = subprocess.run(
-    ["python3", "solution.py"], capture_output=True, text=True, timeout=15
-)
-if result.returncode != 0:
-    print(f"SOLUTION FAILED exit={{result.returncode}}")
-    print(f"STDERR: {{result.stderr[:800]}}")
-    exit(1)
-
-out = result.stdout.strip()
-try:
-    actual = int(out)
-except ValueError:
-    print(f"OUTPUT NOT AN INTEGER: {{out!r}}")
-    exit(1)
-
-if actual != expected:
-    print(f"WRONG ANSWER: expected {{expected}}, got {{actual}}")
-    exit(1)
-
-print("SUCCESS: k-th largest matches")
-exit(0)
-"""
+    validation_script = (
+        "import subprocess\n\n"
+        + expected_block
+        + "\n"
+        + "result = subprocess.run(\n"
+        + "    [\"python3\", \"solution.py\"], capture_output=True, text=True, timeout=15\n"
+        + ")\n"
+        + "if result.returncode != 0:\n"
+        + "    print(f\"SOLUTION FAILED exit={result.returncode}\")\n"
+        + "    print(f\"STDERR: {result.stderr[:800]}\")\n"
+        + "    exit(1)\n\n"
+        + "actual_str = result.stdout.strip()\n"
+        + "if actual_str != expected_str:\n"
+        + "    print(f\"WRONG ANSWER: expected {expected_str!r}, got {actual_str!r}\")\n"
+        + "    exit(1)\n\n"
+        + "print(\"SUCCESS: k-th largest matches\")\n"
+        + "exit(0)\n"
+    )
     return challenge_prompt, setup_script, validation_script
 
 
-def _sql_group_by_aggregation() -> ChallengeTriple:
+def _sql_group_by_aggregation(tier: Optional[str] = None) -> ChallengeTriple:
     """sql: build a tiny SQLite database and ask the solver to run a
     GROUP BY aggregation on it. Exercises the `sql` cluster, which had
     no deterministic template before and always fell through to the
     slow LLM generation path. The validator computes the expected
-    result directly from the seeded data so the test remains exact."""
-    seed = _pick_seed()
-    n_rows = random.randint(30, 60)
+    result directly from the seeded data so the test remains exact.
 
-    challenge_prompt = """You are given an SQLite database named `shop.db` in the current
+    Tier scaling:
+      * row count grows with tier.
+      * advanced+ allows the ``amount`` column to be NULL for ~15% of
+        rows; the solver must exclude NULLs (``WHERE amount IS NOT
+        NULL``) or the sums drift. The basic schema remains a single
+        table — deliberately keeping the twist in the data rather than
+        a JOIN, because the Qwen solvers already read the schema from
+        the prompt; the real failure mode is forgetting NULL handling.
+    """
+    seed = _pick_seed()
+    n_rows = random.randint(_size(30, tier), _size(60, tier))
+    hard = _is_hard_mode(tier)
+    amount_col_decl = "amount REAL" if hard else "amount REAL NOT NULL"
+    null_fraction = 0.15 if hard else 0.0
+
+    null_clause = ""
+    if hard:
+        null_clause = (
+            "\n**Important:** some rows have `amount` set to SQL NULL "
+            "(missing sale value). Exclude those rows from your sum — "
+            "use a `WHERE amount IS NOT NULL` predicate or equivalent.\n"
+        )
+
+    challenge_prompt = f"""You are given an SQLite database named `shop.db` in the current
 working directory. It contains a single table with the schema:
 
     CREATE TABLE sales (
         id INTEGER PRIMARY KEY,
         product TEXT NOT NULL,
-        amount REAL NOT NULL
+        {amount_col_decl}
     )
-
+{null_clause}
 **Task:**
 Write a Python script `solution.py` that:
 1. Opens `shop.db` using `sqlite3`.
@@ -395,11 +545,14 @@ import random
 random.seed({seed})
 products = ["widget", "gadget", "sprocket", "gizmo", "doodad"]
 conn = sqlite3.connect("shop.db")
-conn.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY, product TEXT NOT NULL, amount REAL NOT NULL)")
+conn.execute("CREATE TABLE sales (id INTEGER PRIMARY KEY, product TEXT NOT NULL, {amount_col_decl})")
 rows = []
 for i in range({n_rows}):
     p = random.choice(products)
-    a = round(random.uniform(1.0, 50.0), 2)
+    if random.random() < {null_fraction}:
+        a = None
+    else:
+        a = round(random.uniform(1.0, 50.0), 2)
     rows.append((i, p, a))
 conn.executemany("INSERT INTO sales (id, product, amount) VALUES (?, ?, ?)", rows)
 conn.commit()
@@ -413,7 +566,7 @@ from collections import defaultdict
 
 totals = defaultdict(float)
 conn = sqlite3.connect("shop.db")
-for product, amount in conn.execute("SELECT product, amount FROM sales"):
+for product, amount in conn.execute("SELECT product, amount FROM sales WHERE amount IS NOT NULL"):
     totals[product] += amount
 conn.close()
 
@@ -445,35 +598,69 @@ exit(0)
     return challenge_prompt, setup_script, validation_script
 
 
-def _bash_filter_and_count() -> ChallengeTriple:
+def _bash_filter_and_count(tier: Optional[str] = None) -> ChallengeTriple:
     """bash: count distinct words across many text files — the kind of
     task that's idiomatically done with grep/awk. The solver may use
     `subprocess` to call `grep`/`awk`/`sed` OR do it in pure Python;
     either satisfies the validator. The prompt explicitly names
     grep/awk/bash so frontier classification lands on the bash cluster.
+
+    Tier scaling:
+      * file count grows with tier.
+      * advanced+ introduces a third log level (``FATAL``) that the
+        solver must also count, turning 2-line output into 3-line
+        output and forcing the solver to read the prompt carefully.
     """
     seed = _pick_seed()
-    n_files = random.randint(3, 6)
+    n_files = random.randint(_size(3, tier), _size(6, tier))
+    hard = _is_hard_mode(tier)
+
+    if hard:
+        extra_level_clause = (
+            "   `FATAL: <count>`\n\nSome lines also contain `FATAL`, "
+            "which you MUST count in its own `FATAL: <count>` output "
+            "line. `ERROR`, `WARN`, and `FATAL` never appear on the "
+            "same line as each other."
+        )
+        task_output_lines = (
+            "3. Prints exactly three lines:\n"
+            "   `ERROR: <count>`\n"
+            "   `WARN: <count>`\n"
+            f"{extra_level_clause}"
+        )
+    else:
+        task_output_lines = (
+            "3. Prints exactly two lines:\n"
+            "   `ERROR: <count>`\n"
+            "   `WARN: <count>`\n\n"
+            "This is the kind of task typically solved with a bash "
+            "pipeline using `grep -c` or `awk`, but a pure-Python "
+            "solution is fine. Keyword matching is a simple substring "
+            "check; `ERROR` and `WARN` never appear on the same line."
+        )
 
     challenge_prompt = f"""You are given a directory `logs/` containing {n_files} small text
 files named `logs/log1.txt`, `logs/log2.txt`, etc. Each line in each
-file may contain the keyword `ERROR`, `WARN`, or neither.
+file may contain a log-level keyword or none at all.
 
 **Task:**
 Write a Python script `solution.py` that:
 1. Reads every file under `logs/`.
-2. Counts how many lines mention `ERROR` across all files and how
-   many mention `WARN` across all files.
-3. Prints exactly two lines:
-   `ERROR: <count>`
-   `WARN: <count>`
-
-This is the kind of task typically solved with a bash pipeline using
-`grep -c` or `awk`, but a pure-Python solution is fine. Keyword
-matching is a simple substring check; `ERROR` and `WARN` never appear
-on the same line.
+2. Counts log-level occurrences across all files.
+{task_output_lines}
 
 Exit with code 0 on success."""
+
+    # Weights for log-level lines: at basic, FATAL never appears. At
+    # hard mode we carve out a real slice so the validator's expected
+    # FATAL count is non-trivial.
+    fatal_setup = (
+        'elif r < 0.45:\n'
+        '            lines.append("FATAL: process halted immediately")\n        '
+        if hard else ''
+    )
+    error_threshold = 0.25 if hard else 0.35
+    warn_threshold = 0.55 if hard else 0.60
 
     setup_script = f"""import os
 import random
@@ -483,9 +670,9 @@ for i in range(1, {n_files + 1}):
     lines = []
     for _ in range(random.randint(4, 10)):
         r = random.random()
-        if r < 0.35:
+        if r < {error_threshold}:
             lines.append("ERROR: something went wrong in module X")
-        elif r < 0.6:
+        {fatal_setup}elif r < {warn_threshold}:
             lines.append("WARN: degraded performance detected")
         else:
             lines.append("INFO: routine heartbeat tick")
@@ -494,10 +681,26 @@ for i in range(1, {n_files + 1}):
 print(f"SETUP OK: wrote {{i}} log files")
 """
 
-    validation_script = f"""import subprocess
-import os
-
-err_count = 0
+    if hard:
+        expected_block = (
+            f"""err_count = 0
+warn_count = 0
+fatal_count = 0
+for i in range(1, {n_files + 1}):
+    with open(f"logs/log{{i}}.txt") as f:
+        for line in f:
+            if "ERROR" in line:
+                err_count += 1
+            elif "WARN" in line:
+                warn_count += 1
+            elif "FATAL" in line:
+                fatal_count += 1
+expected = [f"ERROR: {{err_count}}", f"WARN: {{warn_count}}", f"FATAL: {{fatal_count}}"]
+"""
+        )
+    else:
+        expected_block = (
+            f"""err_count = 0
 warn_count = 0
 for i in range(1, {n_files + 1}):
     with open(f"logs/log{{i}}.txt") as f:
@@ -507,6 +710,13 @@ for i in range(1, {n_files + 1}):
             elif "WARN" in line:
                 warn_count += 1
 expected = [f"ERROR: {{err_count}}", f"WARN: {{warn_count}}"]
+"""
+        )
+
+    validation_script = f"""import subprocess
+import os
+
+{expected_block}
 
 result = subprocess.run(
     ["python3", "solution.py"], capture_output=True, text=True, timeout=15
@@ -524,6 +734,125 @@ if actual != expected:
     exit(1)
 
 print("SUCCESS: counts match")
+exit(0)
+"""
+    return challenge_prompt, setup_script, validation_script
+
+
+def _web_automation_dom_extract(tier: Optional[str] = None) -> ChallengeTriple:
+    """web_automation: scrape a specific DOM element from a rendered
+    local HTML page using Playwright.
+
+    Basic tier serves a static page — the secret is present in the
+    initial HTML so a naive parser could, in principle, also succeed,
+    but the prompt requires Playwright so the solver practises the
+    browser path.
+
+    Advanced+ tier injects the secret via JS only AFTER
+    `DOMContentLoaded`, and places a decoy string with the same
+    selector shape inside an HTML comment + a `<noscript>` block. A
+    plain regex-over-HTML solver will see the decoy; only a real
+    browser render hits the true secret. This is the twist that forces
+    graduation from "grep the HTML" to "use a DOM-aware tool".
+
+    The page is served via a `file://` URL so the template has no
+    network dependency — the solver's Playwright instance just points
+    at `/workspace/page.html`.
+    """
+    seed = _pick_seed()
+    rng = random.Random(seed)
+    # The secret is deterministic per-seed so the validator can
+    # recompute it without sharing global state with the setup script.
+    secret = "".join(rng.choices("ABCDEFGHJKMNPQRSTUVWXYZ23456789", k=12))
+    decoy = "".join(rng.choices("ABCDEFGHJKMNPQRSTUVWXYZ23456789", k=12))
+    hard = _is_hard_mode(tier)
+
+    twist_clause = ""
+    if hard:
+        twist_clause = (
+            "\n**Twist (advanced/expert):** the page contains a DECOY "
+            "string with the same `id=\"secret\"` shape inside an HTML "
+            "comment and inside a `<noscript>` block. The REAL secret "
+            "is injected into `#secret` by a JavaScript `DOMContentLoaded` "
+            "handler. A solver that greps the raw HTML with `re` / "
+            "`BeautifulSoup` will pick up the decoy; you MUST render "
+            "the page with a real browser (Playwright via the `browser` "
+            "tool, or raw Playwright in a stateful `execute` cell) to "
+            "obtain the true value.\n"
+        )
+
+    challenge_prompt = f"""A rendered HTML page is available at
+`file:///workspace/page.html` (i.e. `page.html` in your current working
+directory).
+
+**Task:**
+Write a Python script `solution.py` that uses Playwright (via the
+native `browser` tool invoked from Python is NOT possible — so use
+`from playwright.async_api import async_playwright` directly) to
+render the page, read the text content of the element whose CSS
+selector is `#secret`, and print that text (stripped) as the only
+line of output.
+{twist_clause}
+Hints:
+  * Use `await p.chromium.launch(headless=True, args=['--no-sandbox','--disable-dev-shm-usage'])`.
+  * Navigate with `await page.goto('file:///workspace/page.html', wait_until='domcontentloaded')` and then (if needed) `await page.wait_for_selector('#secret')`.
+  * Close the browser cleanly: `await browser.close(); await p.stop()`.
+
+Exit with code 0 on success."""
+
+    if hard:
+        # Real secret is written to #secret by JS; the static HTML has
+        # a decoy inline comment + noscript fallback with the same id.
+        setup_script = f"""with open('page.html', 'w') as f:
+    f.write('''<!DOCTYPE html>
+<html><head><title>Self-Play Web Automation</title></head>
+<body>
+<!-- secret = {decoy} -->
+<noscript><div id=\"secret\">{decoy}</div></noscript>
+<div id=\"secret\">loading...</div>
+<script>
+document.addEventListener('DOMContentLoaded', function() {{
+    document.getElementById('secret').textContent = {secret!r};
+}});
+</script>
+</body></html>''')
+print('SETUP OK: wrote page.html with JS-injected secret')
+"""
+    else:
+        setup_script = f"""with open('page.html', 'w') as f:
+    f.write('''<!DOCTYPE html>
+<html><head><title>Self-Play Web Automation</title></head>
+<body>
+<h1>Static Page</h1>
+<div id=\"secret\">{secret}</div>
+</body></html>''')
+print('SETUP OK: wrote page.html with static secret')
+"""
+
+    validation_script = f"""import subprocess
+
+expected = {secret!r}
+
+result = subprocess.run(
+    ['python3', 'solution.py'], capture_output=True, text=True, timeout=120
+)
+if result.returncode != 0:
+    print(f'SOLUTION FAILED exit={{result.returncode}}')
+    print(f'STDERR: {{result.stderr[:800]}}')
+    exit(1)
+
+# Tolerate trailing whitespace / the solver's own debug prints by
+# searching for the expected token anywhere in stdout, then also
+# asserting it appears as its own stripped line (to rule out partial
+# matches of a longer string).
+out = result.stdout
+lines = [l.strip() for l in out.splitlines() if l.strip()]
+if expected not in lines:
+    print(f'WRONG ANSWER: expected {{expected!r}} as an output line')
+    print(f'Got stdout:\\n{{out[:1000]}}')
+    exit(1)
+
+print('SUCCESS: secret extracted correctly')
 exit(0)
 """
     return challenge_prompt, setup_script, validation_script
@@ -1168,10 +1497,50 @@ _CONCURRENCY_VARIANTS = [
 ]
 
 
-def _concurrency_router() -> ChallengeTriple:
-    """Pick a random concurrency variant. Keeps the registry shape
-    `Dict[str, Callable[[], ChallengeTriple]]` so nothing else changes."""
-    return random.choice(_CONCURRENCY_VARIANTS)()
+#: Tier → pool of concurrency variants. The goal is to keep the agent
+#: practising primitives it hasn't mastered rather than letting every
+#: concurrency roll land on `parallel_sum`. Pools overlap deliberately:
+#: a cluster that has just unlocked `advanced` still benefits from the
+#: `intermediate` shapes so we don't starve its still-shaky idioms.
+_CONCURRENCY_POOLS_BY_TIER: Dict[str, list] = {
+    "basic": [
+        _concurrency_parallel_sum,
+        _concurrency_parallel_max_with_source,
+    ],
+    "intermediate": [
+        _concurrency_parallel_sum,
+        _concurrency_parallel_max_with_source,
+        _concurrency_shared_counter,
+        _concurrency_bounded_pool,
+    ],
+    "advanced": [
+        _concurrency_shared_counter,
+        _concurrency_bounded_pool,
+        _concurrency_first_hit_racer,
+        _concurrency_ordered_parallel_map,
+    ],
+    "expert": [
+        _concurrency_first_hit_racer,
+        _concurrency_ordered_parallel_map,
+        _concurrency_producer_consumer_exact_once,
+        _concurrency_cancel_losers,
+    ],
+}
+
+
+def _concurrency_router(tier: Optional[str] = None) -> ChallengeTriple:
+    """Pick a concurrency variant. When ``tier`` is known, draw from
+    the tier-specific pool in ``_CONCURRENCY_POOLS_BY_TIER`` so the
+    challenge difficulty tracks the agent's unlocked tier for this
+    cluster. When ``tier`` is None (no frontier context / legacy
+    callers) the whole bank is in play, preserving the pre-tier
+    uniform sampling that existing tests assume.
+    """
+    if tier is None:
+        pool = _CONCURRENCY_VARIANTS
+    else:
+        pool = _CONCURRENCY_POOLS_BY_TIER.get(_tier(tier), _CONCURRENCY_VARIANTS)
+    return random.choice(pool)()
 
 
 #: Cluster-keyed template registry. Keys match
@@ -1185,19 +1554,41 @@ TEMPLATES: Dict[str, Callable[[], ChallengeTriple]] = {
     "sql": _sql_group_by_aggregation,
     "bash": _bash_filter_and_count,
     "concurrency": _concurrency_router,
+    "web_automation": _web_automation_dom_extract,
 }
 
 
-def try_template(cluster_key: str | None) -> ChallengeTriple | None:
+def _invoke_template(fn: Callable, tier: Optional[str]) -> ChallengeTriple:
+    """Call ``fn`` with ``tier=`` when it accepts that kwarg, else with
+    no args. Every template in ``TEMPLATES`` accepts ``tier`` as of the
+    tier-aware refactor, but external callers (and older tests) may
+    still monkey-patch in a zero-arg template function. The ``TypeError``
+    fallback keeps those paths working."""
+    try:
+        return fn(tier=tier)
+    except TypeError:
+        return fn()
+
+
+def try_template(
+    cluster_key: str | None,
+    tier: Optional[str] = None,
+) -> ChallengeTriple | None:
     """Return a template challenge for `cluster_key`, or None if no
-    template exists for it. Safe to call with `None`."""
+    template exists for it. Safe to call with `None`.
+
+    ``tier`` scales problem size and enables cluster-specific twists
+    (NA rows, NULL columns, malformed lines, stopwords, etc.). Defaults
+    to ``None`` → basic tier, preserving existing behaviour for callers
+    that don't know the frontier tier.
+    """
     if not cluster_key:
         return None
     fn = TEMPLATES.get(cluster_key)
     if fn is None:
         return None
     try:
-        return fn()
+        return _invoke_template(fn, tier)
     except Exception:
         # Template bugs must not break self-play — fall through to LLM.
         return None
@@ -1215,7 +1606,10 @@ def try_template(cluster_key: str | None) -> ChallengeTriple | None:
 _LAST_TEMPLATE_KEY: str = ""
 
 
-def pick_random_template(exclude_clusters=None) -> ChallengeTriple | None:
+def pick_random_template(
+    exclude_clusters=None,
+    tier_resolver: Optional[Callable[[str], Optional[str]]] = None,
+) -> ChallengeTriple | None:
     """Return a random template challenge. Used as the cold-start
     fallback when the frontier tracker has no seed — production trace
     23:38 showed `Mode=cold_start (no frontier seed)` falling into
@@ -1231,6 +1625,12 @@ def pick_random_template(exclude_clusters=None) -> ChallengeTriple | None:
 
     Also avoids drawing the same template TWICE in a row, unless the
     exclusion + dedup would leave the pool empty.
+
+    ``tier_resolver`` is an optional callable that maps a chosen
+    cluster key to the difficulty tier the template should be generated
+    at — typically ``FrontierTracker.get_difficulty_tier``. When
+    omitted, templates render at basic tier (preserving pre-tier
+    behaviour for callers that don't know the frontier state).
     """
     global _LAST_TEMPLATE_KEY
     if not TEMPLATES:
@@ -1248,8 +1648,14 @@ def pick_random_template(exclude_clusters=None) -> ChallengeTriple | None:
 
     key = random.choice(list(pool.keys()))
     fn = pool[key]
+    tier: Optional[str] = None
+    if tier_resolver is not None:
+        try:
+            tier = tier_resolver(key)
+        except Exception:
+            tier = None
     try:
-        result = fn()
+        result = _invoke_template(fn, tier)
     except Exception:
         return None
     _LAST_TEMPLATE_KEY = key

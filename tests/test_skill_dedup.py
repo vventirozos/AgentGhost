@@ -1,0 +1,150 @@
+"""Tests for post-mortem deduplication in skills.py (#8).
+
+Verifies that:
+- _find_duplicate_lesson detects near-identical lessons via vector search
+- _find_duplicate_lesson falls back to JSON substring matching
+- learn_lesson merges duplicates instead of creating new entries
+- learn_lesson creates new entries when no duplicate exists
+"""
+
+import pytest
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+from ghost_agent.memory.skills import SkillMemory
+
+
+@pytest.fixture
+def skill_memory(tmp_path):
+    return SkillMemory(tmp_path)
+
+
+class TestFindDuplicateLesson:
+    def test_detects_vector_duplicate(self, skill_memory):
+        mock_memory = MagicMock()
+        mock_memory.collection = MagicMock()
+        mock_memory.collection.query.return_value = {
+            "ids": [["id1"]],
+            "documents": [["SITUATION: Parse CSV\nMISTAKE: wrong encoding\nSOLUTION: use latin-1"]],
+            "distances": [[0.10]],  # Very similar
+        }
+
+        result = skill_memory._find_duplicate_lesson(
+            "Parse CSV files", "wrong encoding", "use latin-1 encoding",
+            memory_system=mock_memory
+        )
+
+        assert result is not None
+        assert result["source"] == "vector"
+        assert result["distance"] < 0.15
+
+    def test_no_duplicate_when_distance_too_high(self, skill_memory):
+        mock_memory = MagicMock()
+        mock_memory.collection = MagicMock()
+        mock_memory.collection.query.return_value = {
+            "ids": [["id1"]],
+            "documents": [["Something completely different"]],
+            "distances": [[0.80]],  # Not similar
+        }
+
+        result = skill_memory._find_duplicate_lesson(
+            "Parse CSV files", "wrong encoding", "use latin-1",
+            memory_system=mock_memory
+        )
+
+        assert result is None
+
+    def test_falls_back_to_json_matching(self, skill_memory):
+        # Pre-populate playbook
+        skill_memory.save_playbook([{
+            "timestamp": "2025-01-01T00:00:00",
+            "task": "Parse CSV files",
+            "mistake": "wrong encoding",
+            "solution": "use latin-1"
+        }])
+
+        result = skill_memory._find_duplicate_lesson(
+            "Parse CSV files", "encoding error", "use utf-8",
+            memory_system=None
+        )
+
+        assert result is not None
+        assert result["source"] == "json"
+
+    def test_no_duplicate_in_empty_playbook(self, skill_memory):
+        result = skill_memory._find_duplicate_lesson(
+            "Brand new task", "new mistake", "new solution",
+            memory_system=None
+        )
+        assert result is None
+
+
+class TestLearnLessonDedup:
+    def test_merges_json_duplicate(self, skill_memory):
+        # Pre-populate with existing lesson
+        skill_memory.save_playbook([{
+            "timestamp": "2025-01-01T00:00:00",
+            "task": "Parse CSV files",
+            "mistake": "encoding",
+            "solution": "short fix",
+            "frequency": 1
+        }])
+
+        skill_memory.learn_lesson(
+            "Parse CSV files", "encoding", "longer better fix explanation"
+        )
+
+        playbook = json.loads(skill_memory.file_path.read_text())
+        assert len(playbook) == 1  # No new entry added
+        assert playbook[0]["frequency"] == 2
+        # Longer solution should replace shorter one
+        assert "longer better fix" in playbook[0]["solution"]
+
+    def test_creates_new_for_unique_lesson(self, skill_memory):
+        skill_memory.learn_lesson(
+            "Totally new task", "new mistake", "new solution"
+        )
+
+        playbook = json.loads(skill_memory.file_path.read_text())
+        assert len(playbook) == 1
+        assert playbook[0]["task"] == "Totally new task"
+        assert playbook[0]["frequency"] == 1
+
+    def test_skips_vector_duplicate(self, skill_memory):
+        mock_memory = MagicMock()
+        mock_memory.collection = MagicMock()
+        mock_memory.collection.query.return_value = {
+            "ids": [["id1"]],
+            "documents": [["SITUATION: Same task\nMISTAKE: same\nSOLUTION: same"]],
+            "distances": [[0.05]],  # Near-identical
+        }
+
+        initial_playbook = [{
+            "timestamp": "2025-01-01T00:00:00",
+            "task": "Other task",
+            "mistake": "other",
+            "solution": "other",
+            "frequency": 1
+        }]
+        skill_memory.save_playbook(initial_playbook)
+
+        skill_memory.learn_lesson(
+            "Same task", "same mistake", "same solution",
+            memory_system=mock_memory
+        )
+
+        # Playbook should not have a new entry
+        playbook = json.loads(skill_memory.file_path.read_text())
+        assert len(playbook) == 1
+        assert playbook[0]["task"] == "Other task"
+
+    def test_respects_50_lesson_limit(self, skill_memory):
+        # Fill with 50 lessons
+        for i in range(50):
+            skill_memory.learn_lesson(f"Task {i}", f"Mistake {i}", f"Solution {i}")
+
+        playbook = json.loads(skill_memory.file_path.read_text())
+        assert len(playbook) == 50
+        # Most recent should be first
+        assert playbook[0]["task"] == "Task 49"

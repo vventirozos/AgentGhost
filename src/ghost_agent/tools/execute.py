@@ -162,10 +162,10 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     # The LLM frequently hallucinates that native JSON tools are importable Python modules.
     if ext == "py":
         forbidden_modules = [
-            "knowledge_base", "system_utility", "file_system", "manage_tasks", 
-            "postgres_admin", "web_search", "fact_check", "deep_research", 
-            "vision_analysis", "delegate_to_swarm", "recall", "scratchpad", 
-            "learn_skill", "update_profile", "dream_mode", "replan"
+            "knowledge_base", "system_utility", "file_system", "manage_tasks",
+            "postgres_admin", "web_search", "fact_check", "deep_research",
+            "vision_analysis", "delegate_to_swarm", "recall", "scratchpad",
+            "learn_skill", "update_profile", "dream_mode", "replan", "browser"
         ]
         
         # Check for direct imports or pip installs

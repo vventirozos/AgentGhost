@@ -57,25 +57,40 @@
   <h2>Constants</h2>
   <div class="kv">
     <dt>MAX_RUNS</dt><dd>200 (tail evict)</dd>
-    <dt>DEDUP_WINDOW</dt><dd>20 challenge hashes</dd>
+    <dt>DEDUP_WINDOW</dt><dd>20 challenge hashes — used to detect duplicate challenge texts (common on deterministic templates)</dd>
     <dt>MASTERED_STREAK</dt><dd>5 consecutive first-try wins + ≥1 run with delta &gt; 0.05</dd>
     <dt>BRITTLE_WINDOW</dt><dd>3 — rolling window for brittleness scoring</dd>
-    <dt>SATURATION_WINDOW</dt><dd>3 — last N runs all first-try wins with near-zero delta</dd>
+    <dt>SATURATION_WINDOW</dt><dd>2 — last N runs all first-try wins with near-zero delta (lowered from 3 after a 13-cycle loop produced 0 net lessons; at 2 the cluster rotates out one clean cycle after a struggle)</dd>
     <dt>SATURATION_DELTA_EPSILON</dt><dd>0.001</dd>
   </div>
+
+  <h2>Dedup behaviour on duplicate challenges</h2>
+  <p>Deterministic templates (shop.db GROUP BY, data.csv aggregation, logs/ ERROR+WARN counting, etc.) produce byte-identical challenge text on every re-roll, so every re-roll hits <code>recent_hashes</code> as a duplicate. The dedup path splits two concerns:</p>
+  <ul>
+    <li><strong>Protect mastery counters</strong>: <code>runs</code>, <code>total_first_try_wins</code>, <code>best_length</code>, and <code>unlocked_tier_index</code> do NOT advance on a duplicate. Without this guard a deterministic template would ratchet any cluster to "mastered" in a handful of re-rolls.</li>
+    <li><strong>Preserve saturation signal</strong>: the outcome IS still appended to <code>recent_outcomes</code> (tagged <code>duplicate=True</code>, <code>delta=0.0</code>) and state IS persisted. This is what lets <code>_cluster_is_saturated</code> and the brittle-pool decay guard observe that the agent is now acing a template it previously struggled on.</li>
+  </ul>
+  <p>The earlier implementation returned early on dedup without any state update. For deterministic templates the hash is stable across every re-roll, so a single struggled-then-won run would fossilise the cluster's <code>recent_outcomes[-1]</code> forever — no amount of subsequent clean wins could rotate the cluster out of the brittle pool. Incident 2026-04-21 11:56: 5 consecutive sql cycles all targeted the same template because the 09:06 DD struggled-then-won entry was pinned as the most-recent outcome.</p>
 
   <h2>Saturation detection</h2>
   <p>A cluster is <strong>saturated</strong> when <code>_cluster_is_saturated(stats)</code> returns True: its last <code>SATURATION_WINDOW</code> runs are all first-try passes with delta &le; <code>SATURATION_DELTA_EPSILON</code>. Semantics: the template bank has no new learning signal for this cluster — continuing to target it burns cycles on material the agent already aces.</p>
   <p>Saturated clusters are filtered out of <code>_get_brittle_clusters_scored</code> so the brittleness lottery never re-picks them. <code>pick_seed</code> handles the "everything saturated" case by returning <code>mode="exploration"</code> with a <code>saturated_clusters</code> list attached for the caller:</p>
   <pre><code>{"mode": "exploration", "cluster_key": None, "saturated_clusters": [...], "hint": "..."}</code></pre>
-  <p>The caller (the dream loop) reads this and chooses a saturation-aware source: bumped journal probability, 50/50 coin-flip between LLM-gen and <code>pick_random_template(exclude_clusters=saturated)</code>.</p>
+  <p>The caller (the dream loop) reads this and chooses a saturation-aware source: bumped journal probability, or a 20/80 coin-flip between <code>pick_random_template(exclude_clusters=saturated)</code> and LLM-gen (the majority path now falls through to LLM-gen for genuinely novel material instead of rotating to yet another deterministic template).</p>
 
   <h2>Brittleness scoring</h2>
   <pre><code>brittleness = failures · 2  +  hard_wins(≥3 attempts) · 2  +  soft_wins(2 attempts) · 1</code></pre>
   <p>Saturated clusters are excluded from this score regardless of where they'd otherwise rank.</p>
+  <p><strong>Recent-win decay guard</strong>: if the <em>most recent</em> run in the brittleness window is a clean first-try pass with delta &le; <code>SATURATION_DELTA_EPSILON</code>, the cluster is excluded from the brittle pool even if older struggled-then-won runs in the window would otherwise score it. This prevents a single attempts=2 outlier from anchoring a cluster as "brittle" for the next 10+ cycles of clean wins — the pathology that caused a single hard-won sql challenge to keep pulling sql back into the frontier for the rest of a loop.</p>
 
   <h2>Tier unlocks</h2>
   <p><code>unlocked_tier_index</code> only moves upward — once unlocked, a tier is sticky even after a regression. Tiers: <code>basic</code>, <code>intermediate</code>, <code>advanced</code>, <code>expert</code>. Each unlock costs <code>TIER_UNLOCK_THRESHOLD = 3</code> cumulative first-try wins.</p>
+  <p>Tier drives <strong>two</strong> things in the self-play loop:</p>
+  <ol>
+    <li><strong>LLM prompt hint.</strong> <code>get_difficulty_hint(cluster)</code> returns a one-liner from <code>DIFFICULTY_HINTS</code> describing the tier's complexity floor. The dream loop injects this into the challenge-generation prompt when the LLM path is used.</li>
+    <li><strong>Deterministic template scaling.</strong> <code>get_difficulty_tier(cluster)</code> is piped into <a href="../core/challenge_templates.html"><code>try_template</code> / <code>pick_random_template</code></a> as a resolver, and each template scales its problem size (1× / 2× / 3× / 4×) and activates its hard-mode twist (NA rows, malformed lines, stopwords, NULL columns, extra log levels, expert concurrency variants) when tier is <code>advanced</code> or <code>expert</code>.</li>
+  </ol>
+  <p>Before this wiring, the tier was purely cosmetic: the template bank always rendered at basic and the agent 1-shot every cluster in production. Tier is now the mechanism that turns a first-try win at basic into a harder challenge at the next cycle, so a cluster can accumulate real mastery signal rather than saturating on a fixed shape.</p>
 
   <h2>Methods</h2>
   <table>
@@ -87,7 +102,7 @@
       <tr><td><code>get_difficulty_hint(key)</code></td><td>Tier-specific prompt hint.</td></tr>
       <tr><td><code>_cluster_is_saturated(stats) → bool</code> (classmethod)</td><td>Check if last N runs are all trivial first-try wins.</td></tr>
       <tr><td><code>list_saturated_clusters() → list</code></td><td>All currently-saturated cluster keys.</td></tr>
-      <tr><td><code>pick_seed(random_explore_prob=0.2)</code></td><td>Choose next cluster + hint for self-play. Returns exploration mode with <code>saturated_clusters</code> when all brittle candidates are saturated.</td></tr>
+      <tr><td><code>pick_seed(random_explore_prob=0.2)</code></td><td>Choose next cluster + hint for self-play. Returns exploration mode with <code>saturated_clusters</code> when all brittle candidates are saturated. Callers typically pass <code>random_explore_prob=0.35</code> (dream loop default) so even non-saturated picks get breathing room.</td></tr>
       <tr><td><code>record_run(cluster_key, challenge, attempts_used, passed, description_length, mistake) → dict</code></td><td>Log a run; returns <code>{compression_delta, mastered, is_new_cluster, …}</code>.</td></tr>
       <tr><td><code>adaptive_cooldown(base, floor, ceiling, cluster_key)</code></td><td>Cooldown seconds based on recent progress. Used by both the biological watchdog (minutes–hours) and <code>self_play_loop</code> (5–180 s clamped).</td></tr>
     </tbody>

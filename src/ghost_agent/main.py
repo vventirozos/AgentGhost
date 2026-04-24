@@ -2,14 +2,11 @@ import sys
 print("🐍 Python runtime initialized. Loading heavy AI libraries (Transformers, ChromaDB)...", flush=True)
 
 import os
-# Prevent ChromaDB/Posthog from hanging the import process via tracking calls
-os.environ["ANONYMIZED_TELEMETRY"] = "False"
-os.environ["POSTHOG_DISABLED"] = "1"
-os.environ["TELEMETRY_IMPL"] = "none"
-os.environ["CHROMA_TELEMETRY_IMPL"] = "none"
-os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
-# Disable automatic version checking
-os.environ["DISABLE_VERSION_CHECK"] = "1"
+# Telemetry hardening lives in a standalone module whose import-time
+# side-effect sets every env var Ghost insists on. Keeping the source
+# of truth in one place means the eval probe (`probe:telemetry_disabled`)
+# can verify the very same flags we ship.
+from . import _env  # noqa: F401  (import applies the env-var assignments)
 
 print(" - Importing standard libraries...", flush=True)
 import argparse
@@ -53,6 +50,11 @@ from .utils.logging import setup_logging, pretty_log, Icons
 from .utils.token_counter import load_tokenizer
 from .tools.registry import TOOL_DEFINITIONS
 
+print(" - Importing self-improvement pipeline (distill, reflection, router)...", flush=True)
+from .distill import TrajectoryCollector
+from .reflection import Reflector
+from .router import ComplexityClassifier, ComplexityDispatcher
+
 print(" - All modules imported successfully!", flush=True)
 
 logger = logging.getLogger("GhostAgent")
@@ -81,6 +83,14 @@ def parse_args():
     parser.add_argument("--perfect-it", action="store_true", help="Enable proactive optimization suggestions after successful heavy tasks")
     parser.add_argument("--deep-reason", action="store_true", help="Enable MCTS action-candidate lookahead and parallel hypothesis testing on hard problems (costs extra worker calls)")
     parser.add_argument("--native-tools", action=argparse.BooleanOptionalAction, default=True, help="Attach OpenAI-format tools/tool_choice to LLM payload in addition to the XML tool prompt. On by default for Qwen 3.6 35B-A3 and newer models that support native tool-calls natively; use --no-native-tools to disable.")
+    # Stage-1 self-improvement pipeline knobs. All default ON in
+    # privacy-safe modes because the whole pipeline is local-only —
+    # --no-trajectories disables the on-disk log entirely, which also
+    # implicitly disables reflection (it has nothing to read).
+    parser.add_argument("--no-trajectories", action="store_true", help="Disable the distill/trajectory JSONL log. Also disables the reflection biological phase since it depends on the log.")
+    parser.add_argument("--no-reflection", action="store_true", help="Disable the reflection biological phase even if trajectory logging is on.")
+    parser.add_argument("--router-model", default=None, help="Path to a persisted ComplexityClassifier JSON. When set, the router is loaded and consulted; when unset (default), the dispatcher is a no-op that always allows the full swarm pool list.")
+    parser.add_argument("--router-confidence-threshold", type=float, default=0.3, help="Minimum router confidence required to route a request to a cheap path. Below this, the dispatcher escalates to the full swarm.")
     args = parser.parse_args()
     
     swarm_nodes_list = []
@@ -344,6 +354,164 @@ async def lifespan(app):
             )
         except Exception as e:
             pretty_log("Deep Reasoning Failed", str(e), level="WARNING", icon=Icons.WARN)
+
+    # --- Stage-1 self-improvement wiring ---
+    # Trajectory collector: the passive corpus-builder used by
+    # reflection, skills_auto, and optim downstream. Writing to
+    # $GHOST_HOME/trajectories/YYYY-MM-DD/session-<sid>.jsonl via the
+    # collector's day-partitioning + redaction pipeline. Disabled by
+    # --no-trajectories.
+    if not getattr(args, "no_trajectories", False):
+        try:
+            traj_root = context.memory_dir.parent / "trajectories"
+            context.trajectory_collector = TrajectoryCollector(
+                root=traj_root,
+                session_id=None,  # collector generates one per boot
+                enabled=True,
+            )
+            pretty_log(
+                "Trajectory Logger",
+                f"Logging to {traj_root}",
+                icon=Icons.BRAIN_CTX,
+            )
+        except Exception as e:
+            pretty_log("Trajectory Logger Failed", str(e), level="WARNING", icon=Icons.WARN)
+            context.trajectory_collector = None
+    else:
+        context.trajectory_collector = None
+        pretty_log(
+            "Trajectory Logger",
+            "--no-trajectories set: turn-level log disabled (reflection + skills_auto will also skip)",
+            icon=Icons.WARN,
+        )
+
+    # Reflector: self-critique biological phase 2.5. Needs both the
+    # trajectory collector (source of FAILED trajectories) and the
+    # LLM client (for the critique call). When either is missing we
+    # leave `context.reflector = None`; agent.py's watchdog phase 2.5
+    # short-circuits in that case.
+    if (
+        not getattr(args, "no_reflection", False)
+        and not getattr(args, "no_trajectories", False)
+        and context.trajectory_collector is not None
+        and context.llm_client is not None
+    ):
+        try:
+            async def _critique_fn(prompt: str) -> str:
+                """Closure: wraps LLMClient.chat_completion as the
+                `critique_fn` the Reflector expects. `max_tokens=4096`
+                is deliberately generous because Qwen 3.6 35B-A3
+                (Ghost's default) is a reasoning model that separates
+                `reasoning_content` from `content`; the hidden thinking
+                phase alone often consumes 2000+ tokens, and cutting
+                it short leaves the model no budget for the actual
+                answer and produces an empty `content` field. Per-call
+                timeout is still enforced by the Reflector."""
+                payload = {
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 4096,
+                    "stream": False,
+                }
+                res = await context.llm_client.chat_completion(payload)
+                return (
+                    (res or {})
+                    .get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+
+            context.reflector = Reflector(
+                critique_fn=_critique_fn,
+                per_call_timeout_s=45.0,
+                max_failures=3,
+                model=args.model,
+            )
+
+            # The Reflector is handed a COMPOSITE sink — it persists every
+            # reflected trajectory both to the JSONL log (corpus for
+            # Stage-2 distill) AND to SkillMemory as a lesson (retrieved
+            # next time the agent sees a similar user request, via the
+            # existing memory bus). That's the loop that turns a failure
+            # into behaviour change *without* any weight update.
+            _skill_memory = getattr(context, "skill_memory", None)
+            _vector_memory = getattr(context, "memory_system", None)
+            _traj_collector = context.trajectory_collector
+
+            def _reflection_sink(reflected_trajectory):
+                # 1. Always append to the JSONL log.
+                try:
+                    _traj_collector.append(reflected_trajectory)
+                except Exception as e:
+                    logger.warning(f"reflection JSONL sink failed: {e}")
+
+                # 2. If SkillMemory is wired, also write the reflection as
+                # a lesson. The skill store already dedupes via vector
+                # distance, so repeat reflections on the same failure mode
+                # don't flood the playbook.
+                if _skill_memory is None:
+                    return
+                src_reason = reflected_trajectory.extra.get("source_failure_reason", "") or "failure"
+                plan_text = reflected_trajectory.planning_output or reflected_trajectory.final_response
+                try:
+                    _skill_memory.learn_lesson(
+                        task=(reflected_trajectory.user_request or "")[:400],
+                        mistake=str(src_reason)[:400],
+                        solution=str(plan_text)[:1200],
+                        memory_system=_vector_memory,
+                    )
+                except Exception as e:
+                    logger.warning(f"reflection → SkillMemory write failed: {e}")
+
+            context.reflection_sink = _reflection_sink
+            pretty_log(
+                "Reflector",
+                "Biological phase 2.5 enabled (reflections → JSONL + SkillMemory)",
+                icon=Icons.BRAIN_THINK,
+            )
+        except Exception as e:
+            pretty_log("Reflector Failed", str(e), level="WARNING", icon=Icons.WARN)
+            context.reflector = None
+    else:
+        context.reflector = None
+
+    # Complexity router: consulted by core/llm.py before swarm
+    # dispatch. When --router-model points at a valid classifier JSON,
+    # load it; otherwise build a disabled dispatcher (acts as an
+    # always-escalate wrapper so the request path is unchanged).
+    try:
+        clf = None
+        if args.router_model:
+            clf_path = Path(args.router_model)
+            if clf_path.exists():
+                clf = ComplexityClassifier.load(clf_path)
+                pretty_log(
+                    "Complexity Router",
+                    f"Loaded classifier from {clf_path}",
+                    icon=Icons.BRAIN_PLAN,
+                )
+            else:
+                pretty_log(
+                    "Complexity Router",
+                    f"--router-model {clf_path} not found; dispatcher disabled",
+                    level="WARNING",
+                    icon=Icons.WARN,
+                )
+        context.complexity_dispatcher = ComplexityDispatcher(
+            classifier=clf,
+            confidence_threshold=float(args.router_confidence_threshold),
+            disabled=(clf is None),
+        )
+        if clf is None:
+            pretty_log(
+                "Complexity Router",
+                "No model loaded — dispatcher is a pass-through (always escalates to full swarm)",
+                icon=Icons.BRAIN_PLAN,
+            )
+    except Exception as e:
+        pretty_log("Complexity Router Failed", str(e), level="WARNING", icon=Icons.WARN)
+        context.complexity_dispatcher = None
 
     agent = GhostAgent(context)
     app.state.agent = agent

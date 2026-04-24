@@ -30,6 +30,10 @@ CLUSTER_KEYWORDS = [
     ("algo", [r"\balgorithm", r"\bgraph\b", r"\btree\b", r"\bdynamic programming", r"\brecurs", r"\bcomplexity\b"]),
     ("concurrency", [r"\basync", r"\bthread", r"\bconcurren", r"\bprocess pool"]),
     ("regex_parse", [r"\bregex\b", r"\bparse\b", r"\bparser\b", r"\btoken"]),
+    # web_automation before regex_parse would be fine too; any order
+    # works since classify_cluster picks the first match. Placed last
+    # to stay out of the way of broader "parse" / "regex" matches.
+    ("web_automation", [r"\bplaywright\b", r"\bheadless browser", r"\bscrape\b", r"\bselenium\b", r"\bdom\b", r"\bweb automation"]),
 ]
 
 
@@ -81,9 +85,15 @@ class FrontierTracker:
     # current template bank — continuing to target it burns cycles on
     # material the agent already aces. `pick_seed` skips saturated
     # clusters and falls back to exploration so the loop actually
-    # exercises new material. 3 is tight enough to react fast, loose
-    # enough not to misfire on a single fluke run.
-    SATURATION_WINDOW = 3
+    # exercises new material.
+    #
+    # Lowered from 3 → 2 after observing a 13-cycle self-play loop where
+    # sql cluster was picked every single cycle (0 net lessons). A single
+    # struggled-then-won run kept sql in the brittle pool via `soft_wins`
+    # for 10+ first-try-delta-0 cycles before the 3-run saturation window
+    # finally flipped. At window=2, one clean cycle after the struggle
+    # is enough to start rotating elsewhere.
+    SATURATION_WINDOW = 2
     SATURATION_DELTA_EPSILON = 0.001
     # Recent-challenge dedup window. A repeated prompt inflates mastery
     # counters if we record it as a fresh data point, so we refuse to
@@ -203,6 +213,21 @@ class FrontierTracker:
                 continue
             recent = stats.get("recent_outcomes", [])[-self.BRITTLE_WINDOW:]
             if len(recent) < 1:
+                continue
+            # Decay guard: if the MOST recent run was a clean first-try
+            # pass with delta ≤ epsilon, older struggles in the window
+            # shouldn't pull the cluster back into the brittle pool. The
+            # log-eval pathology was exactly this — one struggled-then-won
+            # sql run (attempts_used=2, delta>0) kept sql "brittle" for
+            # 10+ subsequent clean cycles, because soft_wins kept scoring
+            # even though the cluster had clearly stabilised. If the agent
+            # has recovered, stop hammering the cluster.
+            last = recent[-1]
+            if (
+                last.get("passed")
+                and int(last.get("attempts_used", 1)) == 1
+                and float(last.get("delta", 0.0)) <= self.SATURATION_DELTA_EPSILON
+            ):
                 continue
             failures = sum(1 for r in recent if not r.get("passed"))
             hard_wins = sum(
@@ -370,10 +395,43 @@ class FrontierTracker:
                 is_new_cluster = cluster["runs"] == 0
 
                 # M7 dedup: if we've seen this exact challenge recently,
-                # don't record it. Returning a no-op-shaped result keeps
-                # callers stable without polluting mastery counters.
+                # don't let it inflate mastery counters (runs,
+                # total_first_try_wins, best_length). BUT we still append
+                # to recent_outcomes so saturation detection and the
+                # brittle-pool decay guard can observe that the agent is
+                # now acing a template it previously struggled on.
+                #
+                # The older implementation returned early without any
+                # state update, which permanently fossilised the cluster's
+                # most-recent outcome at whatever was there when the
+                # template hash was first seen. For deterministic
+                # templates (shop.db GROUP BY, data.csv aggregation, etc.)
+                # the hash is stable across every re-roll, so a single
+                # struggled-then-won run would pin the cluster in the
+                # brittle pool forever — no amount of subsequent clean
+                # wins could rotate the cluster out because
+                # `recent_outcomes[-1]` never updated.
+                #
+                # Post-fix, a duplicate cycle's outcome lands in
+                # `recent_outcomes` with `duplicate=True` and `delta=0.0`
+                # (no real compression signal on a re-roll), but it DOES
+                # refresh the cluster's recent-state view, which is what
+                # saturation / decay guard / cooldown actually read.
                 recent_hashes = cluster.get("recent_hashes", [])
                 if challenge_hash and challenge_hash in recent_hashes:
+                    outcome = {
+                        "timestamp": datetime.now().isoformat(),
+                        "passed": passed,
+                        "attempts_used": attempts_used,
+                        "length": description_length,
+                        "delta": 0.0,
+                        "mistake": mistake[:300] if mistake else "",
+                        "duplicate": True,
+                    }
+                    cluster["recent_outcomes"] = (
+                        cluster.get("recent_outcomes", []) + [outcome]
+                    )[-10:]
+                    self._save(state)
                     return {
                         "compression_delta": 0.0,
                         "is_new_cluster": False,

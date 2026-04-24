@@ -45,7 +45,7 @@
 
       <rect x="520" y="80" width="440" height="60" fill="#1a2030" stroke="#5dd39e" rx="6"/>
       <text x="740" y="105" text-anchor="middle" fill="#e6e9ef">[c] saturation coin-flip (if all clusters aced)</text>
-      <text x="740" y="125" text-anchor="middle" fill="#9aa3b2" font-size="10">50% template_rotation • 50% LLM-gen</text>
+      <text x="740" y="125" text-anchor="middle" fill="#9aa3b2" font-size="10">20% template_rotation • 80% LLM-gen</text>
 
       <rect x="40" y="160" width="920" height="60" fill="#1a2030" stroke="#b894ff" rx="6"/>
       <text x="500" y="185" text-anchor="middle" fill="#e6e9ef">[d] source selection: template bank → journal mining (0.25/0.75) → LLM generation</text>
@@ -95,14 +95,24 @@
   </div>
 
   <h2>Frontier saturation &amp; rotation</h2>
-  <p>A cluster is <strong>saturated</strong> when its last <code>SATURATION_WINDOW = 3</code> runs are all first-try passes with near-zero compression delta (<code>&lt;= 0.001</code>). A saturated cluster is producing no learning signal — continuing to target it burns cycles on material the agent already aces.</p>
+  <p>A cluster is <strong>saturated</strong> when its last <code>SATURATION_WINDOW = 2</code> runs are all first-try passes with near-zero compression delta (<code>&lt;= 0.001</code>). A saturated cluster is producing no learning signal — continuing to target it burns cycles on material the agent already aces. (Window lowered from 3 → 2 after observing a 13-cycle self-play loop that produced 0 net lessons; at 2 the cluster rotates out one clean cycle after a struggle instead of three.)</p>
 
-  <p>When <code>pick_seed</code> finds every brittle candidate saturated (and the caller isn't rolling the 20% random-exploration dice), it returns <code>mode="exploration"</code> with the saturated list attached. The dream loop then branches:</p>
+  <p>A companion <strong>recent-win decay guard</strong> in <code>_get_brittle_clusters_scored</code> prevents a single stale struggled-then-won run (<code>attempts_used=2</code>, positive delta) from anchoring a cluster in the brittle pool once the cluster has stabilised. If the most recent run in the brittleness window is a clean first-try pass with near-zero delta, older struggles in the window no longer score — the cluster is treated as recovered even if its full window still shows some historical friction.</p>
+
+  <p>When <code>pick_seed</code> finds every brittle candidate saturated (and the caller isn't rolling the 35% random-exploration dice), it returns <code>mode="exploration"</code> with the saturated list attached. The dream loop then branches:</p>
 
   <ol>
     <li><strong>Journal mining probability boost</strong>: <code>_try_journal_challenge</code> is called with <code>probability=0.75</code> instead of the default 0.25. Journal-mined challenges come from real user post-mortems — the richest source of novel, struggle-inducing material.</li>
-    <li><strong>50/50 coin-flip</strong>: if journal mining misses, the loop flips a coin. Heads → <code>pick_random_template(exclude_clusters=saturated)</code> so the expert concurrency / algo / regex-parse templates get their airtime. Tails → fall through to LLM-generated challenges, with a <strong>diversity-requirement prompt injection</strong> telling the generator to pick from <code>{concurrency, algo, regex_parse, sql, bash}</code> and explicitly forbidding another data-analysis / CSV groupby.</li>
+    <li><strong>20/80 coin-flip</strong> (was 50/50, rebalanced toward novelty): if journal mining misses, the loop flips a coin. 20% → <code>pick_random_template(exclude_clusters=saturated)</code> so the expert concurrency / algo / regex-parse templates still get airtime. 80% → fall through to LLM-generated challenges, with a <strong>diversity-requirement prompt injection</strong> telling the generator to pick from <code>{concurrency, algo, regex_parse, sql, bash}</code> and explicitly forbidding another data-analysis / CSV groupby. The rebalance reflects that deterministic templates are now primarily regression-tests rather than training signal — novel LLM-gen shapes are where real learning happens.</li>
   </ol>
+
+  <h2>Tier-aware template scaling</h2>
+  <p>Once a cluster has been picked (frontier, saturated-rotation, or cold-start), the template fast path renders at the cluster's <strong>difficulty tier</strong>. The dream loop builds a <code>_resolve_tier</code> closure over <a href="../memory/frontier.html"><code>FrontierTracker.get_difficulty_tier</code></a> and passes it to both <code>try_template(cluster, tier=...)</code> and <code>pick_random_template(tier_resolver=...)</code>. Each template then:</p>
+  <ul>
+    <li>Multiplies its base problem size (rows / files / tokens) by <code>_TIER_SIZE_MULTIPLIER</code> — 1× at basic, 4× at expert.</li>
+    <li>Activates a cluster-specific <strong>hard-mode twist</strong> at <code>advanced</code> / <code>expert</code>: NA rows in data_analysis, malformed lines in regex_parse, a stopword set in python_general, distinct-k in algo, NULL columns in sql, a third log level (<code>FATAL</code>) in bash, a tighter variant pool in concurrency.</li>
+  </ul>
+  <p>The twist is always described in the challenge prompt — tier escalation is a curriculum, not a trap. Before this wiring (see incident in the 2026-04-22 self-play log: 163 SUCCESS vs 6 FAILURE, almost all first-try), the tier machinery was purely cosmetic: templates always rendered at basic and a Qwen-sized model 1-shot every cluster. The tier is now the mechanism that makes mastery accumulation possible — once a cluster unlocks <code>advanced</code>, subsequent cycles render harder fixtures that a basic-tier solution will fail on.</p>
 
   <h2>Validator self-test gate</h2>
   <p>LLM-generated validators sometimes crash on their own expected output — the canonical bug is formatting an expected field with a <code>%</code> suffix, then calling <code>float()</code> on it. The self-test gate catches this before the solver wastes 3 attempts on an unwinnable challenge.</p>
@@ -156,7 +166,7 @@
   <ul>
     <li><a href="../core/dream.html">validate_challenge_quality</a> — rejects challenges whose validator depends on randomness, references no setup files, or has SQL schema / column-count mismatches. Returns rejection kind so the regeneration loop can give targeted feedback.</li>
     <li><a href="../core/self_play_scoring.html">correctness_weighted_score</a> + three-tier <code>count_tool_errors</code> — wrong-but-compressed answers get zero credit; fixture reads aren't mistaken for errors.</li>
-    <li><a href="../memory/frontier.html">FrontierTracker</a> keeps a <code>recent_hashes</code> dedup list per cluster (window 20) so the same challenge isn't replayed in a tight loop.</li>
+    <li><a href="../memory/frontier.html">FrontierTracker</a> keeps a <code>recent_hashes</code> dedup list per cluster (window 20). Duplicates don't bump mastery counters (<code>runs</code>, <code>total_first_try_wins</code>, <code>best_length</code>) but DO append to <code>recent_outcomes</code> so saturation detection and the decay guard can see pattern changes on deterministic-template re-rolls — an earlier implementation discarded the append and fossilised clusters in the brittle pool forever.</li>
     <li><a href="../core/challenge_templates.html">pick_random_template</a> maintains a module-level <code>_LAST_TEMPLATE_KEY</code> anchor so the sampler doesn't pick the same template twice in a row.</li>
   </ul>
 

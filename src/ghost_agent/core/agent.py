@@ -623,6 +623,15 @@ class GhostContext:
         # is currently scoped to (None == free chat / one-shot mode).
         self.project_store = None
         self.current_project_id = None
+        # Stage-1 self-improvement wiring. Populated by main.py during
+        # lifespan when the corresponding features are enabled; left as
+        # None otherwise so deployments without the trajectory pipeline
+        # can run unchanged. The biological watchdog's phase 2.5
+        # (reflection) reads `reflector` + `trajectory_collector` and is
+        # a no-op when either is None.
+        self.trajectory_collector = None
+        self.reflector = None
+        self.complexity_dispatcher = None
 
 class GhostAgent:
     def __init__(self, context: GhostContext):
@@ -1023,8 +1032,10 @@ class GhostAgent:
 
     # Per-phase cooldowns (in seconds) so the watchdog can't fire two REM
     # cycles or two self-play sessions back-to-back when the user remains AFK.
-    _DREAM_COOLDOWN = 1800   # 30 min between dreams
-    _SELFPLAY_COOLDOWN = 3600  # 60 min between self-plays
+    _DREAM_COOLDOWN = 1800        # 30 min between dreams
+    _REFLECTION_COOLDOWN = 2400   # 40 min between reflections
+    _SKILLS_AUTO_COOLDOWN = 7200  # 2 hours between skill auto-extractions
+    _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
 
     async def _biological_tick(self):
         """One pass of the biological hook state machine. Extracted from the
@@ -1040,6 +1051,10 @@ class GhostAgent:
         # Lazily install per-phase cooldown anchors on the agent instance.
         if not hasattr(self, '_last_dream_at'):
             self._last_dream_at = datetime.datetime.min
+        if not hasattr(self, '_last_reflection_at'):
+            self._last_reflection_at = datetime.datetime.min
+        if not hasattr(self, '_last_skills_auto_at'):
+            self._last_skills_auto_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
         # Adaptive self-play cooldown (curiosity-driven). Starts at the
@@ -1060,7 +1075,12 @@ class GhostAgent:
                 pass
             if has_items:
                 await self.process_journal_queue()
-                ctx.last_activity_time = datetime.datetime.now()
+                # Do NOT reset last_activity_time here: that clock tracks
+                # *user* idleness and is what phases 2/3 gate on. Resetting
+                # it on internal work starves the later phases (phase 3
+                # needs idle_secs > 3600, unreachable if phase 1 keeps
+                # firing every few minutes). Per-phase cooldowns already
+                # prevent immediate refire of this phase.
                 return
 
         # Phase 2: Deep REM Dream (10–60 min idle)
@@ -1079,9 +1099,110 @@ class GhostAgent:
                                    "Agent is idle. Entering spontaneous REM cycle...",
                                    icon=Icons.BRAIN_THINK)
                         dreamer = Dreamer(ctx)
-                        await dreamer.dream(model_name=getattr(ctx.args, 'model', 'default'))
-                        ctx.last_activity_time = datetime.datetime.now()
+                        # Anchor the cooldown BEFORE the await so an exception
+                        # mid-dream doesn't leave `_last_dream_at` at its prior
+                        # value, which would cause the watchdog to re-fire the
+                        # failing dream on every tick until the idle window
+                        # naturally expires. Mirrors the fix already in place
+                        # for synthetic self-play below.
                         self._last_dream_at = datetime.datetime.now()
+                        try:
+                            await dreamer.dream(model_name=getattr(ctx.args, 'model', 'default'))
+                        finally:
+                            # Do NOT reset ctx.last_activity_time here —
+                            # see the comment in phase 1. Resetting it
+                            # made phase 3 (self-play at >60 min idle)
+                            # unreachable, because phase 2 fires every
+                            # ~30 min and kept the idle clock pinned low.
+                            # The `_last_dream_at` cooldown alone is
+                            # sufficient to prevent phase 2 refire.
+                            self._last_dream_at = datetime.datetime.now()
+
+        # Phase 2.5: Reflection on recent failures (15-60 min idle).
+        # Fires AFTER the dream window opens so dream has priority on
+        # fresh idle — reflection operates on stable trajectory state,
+        # not freshly-journalled material. Gated by:
+        #   (a) its own cooldown (`_REFLECTION_COOLDOWN`), mirroring
+        #       the dream/self-play anchor pattern so an exception can't
+        #       leave the anchor un-advanced and cause re-fire every
+        #       tick;
+        #   (b) availability of a trajectory source + reflector on the
+        #       context — the phase is a no-op when the distill
+        #       pipeline isn't wired, which lets us ship the watchdog
+        #       code without requiring the trajectory collector to be
+        #       present in every deployment.
+        # Does NOT reset `ctx.last_activity_time` — same rule as dream.
+        if 900 < idle_secs <= 3600:
+            since_last_reflection = (datetime.datetime.now() - self._last_reflection_at).total_seconds()
+            if since_last_reflection >= self._REFLECTION_COOLDOWN:
+                reflector = getattr(ctx, 'reflector', None)
+                traj_collector = getattr(ctx, 'trajectory_collector', None)
+                if reflector is not None and traj_collector is not None:
+                    pretty_log(
+                        "Biological Hook",
+                        "Agent is idle. Entering reflection cycle on recent failures...",
+                        icon=Icons.BRAIN_THINK,
+                    )
+                    # Anchor BEFORE the await so a crash mid-reflection
+                    # still advances the cooldown — same defensive
+                    # pattern the dream phase uses above.
+                    self._last_reflection_at = datetime.datetime.now()
+                    try:
+                        already = getattr(ctx, '_reflected_trajectory_ids', None)
+                        if already is None:
+                            already = set()
+                            ctx._reflected_trajectory_ids = already
+                        # Prefer the composite sink when main.py wires
+                        # one — it writes the reflection to JSONL AND
+                        # to SkillMemory, closing the "failure → lesson
+                        # retrieved on next similar turn" loop. Falls
+                        # back to the plain collector if the composite
+                        # isn't present.
+                        _sink = getattr(ctx, 'reflection_sink', None) or traj_collector.append
+                        report = await reflector.run(
+                            failed_source=lambda: traj_collector.iter_trajectories(),
+                            sink=_sink,
+                            already_reflected=already,
+                        )
+                        pretty_log(
+                            "Biological Hook",
+                            f"Reflection complete: {report.summary()}",
+                            icon=Icons.BRAIN_THINK,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Reflection phase failed: {e}")
+                    finally:
+                        self._last_reflection_at = datetime.datetime.now()
+
+        # Phase 2.6: Skill auto-extraction (every ~2 hours during idle).
+        # Pure data-level pass — no LLM call, no network, CPU-only —
+        # so it's safe to run opportunistically whenever the idle
+        # window covers it. Gated on `trajectory_collector` presence
+        # (nothing to extract from without it) and on its own cooldown
+        # anchor so a long AFK stretch doesn't produce N redundant
+        # extraction passes back-to-back.
+        if 900 < idle_secs <= 3600:
+            since_last_skills = (datetime.datetime.now() - self._last_skills_auto_at).total_seconds()
+            if since_last_skills >= self._SKILLS_AUTO_COOLDOWN:
+                traj_collector = getattr(ctx, 'trajectory_collector', None)
+                if traj_collector is not None:
+                    self._last_skills_auto_at = datetime.datetime.now()
+                    try:
+                        from ..skills_auto import extract_candidates, consolidate
+                        trajs = list(traj_collector.iter_trajectories())
+                        if trajs:
+                            candidates, report = extract_candidates(trajs, min_support=2)
+                            if candidates:
+                                consolidated, _ = consolidate(candidates)
+                                pretty_log(
+                                    "Skills Auto",
+                                    f"extracted {report.n_candidates_emitted} → consolidated {len(consolidated)} candidates from {report.n_trajectories_seen} trajectories",
+                                    icon=Icons.BRAIN_PLAN,
+                                )
+                    except Exception as e:
+                        logger.warning(f"Skills auto-extraction failed: {e}")
+                    finally:
+                        self._last_skills_auto_at = datetime.datetime.now()
 
         # Phase 3: Synthetic Self-Play (>60 min idle)
         if idle_secs > 3600:
@@ -1707,6 +1828,37 @@ class GhostAgent:
                 else:
                     last_user_content = str(last_user_content_raw)
                 lc = last_user_content.lower()
+
+                # Stage-1 self-improvement: consult the complexity
+                # router (if wired) and stash the decision on body so
+                # downstream dispatchers can pick a cheap / full path.
+                # The dispatcher is FAIL-SAFE: if the router isn't
+                # trained, or the prediction is low-confidence, it
+                # returns `escalated=True` with the full pool list,
+                # so this hook can never downgrade capability — only
+                # reduce cost when the router is both confident AND
+                # recognises an easy request. Non-fatal on error.
+                try:
+                    dispatcher = getattr(self.context, 'complexity_dispatcher', None)
+                    if dispatcher is not None and last_user_content:
+                        prev_ai_for_router = next(
+                            (m.get("content", "") for m in reversed(messages[:-1])
+                             if m.get("role") == "assistant" and isinstance(m.get("content"), str)),
+                            "",
+                        )
+                        decision = dispatcher.route(
+                            last_user_content,
+                            prior_turn_text=str(prev_ai_for_router or "")[:1000],
+                        )
+                        body["_router_decision"] = {
+                            "label": decision.label,
+                            "confidence": decision.confidence,
+                            "allowed_pools": list(decision.allowed_pools),
+                            "escalated": decision.escalated,
+                            "reason": decision.reason,
+                        }
+                except Exception as e:
+                    logger.debug(f"complexity router consultation skipped: {e}")
 
                 coding_keywords = [r"\bpython\b", r"\bbash\b", r"\bsh\b", r"\bscript\b", r"\bcode\b", r"\bdef\b", r"\bimport\b", r"\bhtml\b", r"\bcss\b", r"\bjs\b", r"\bjavascript\b", r"\btypescript\b", r"\breact\b", r"\bweb\b", r"\bfrontend\b"]
                 coding_actions = [r"\bwrite\b", r"\brun\b", r"\bexecute\b", r"\bdebug\b", r"\bfix\b", r"\bcreate\b", r"\bgenerate\b", r"\bcount\b", r"\bcalculate\b", r"\banalyze\b", r"\bscrape\b", r"\bplot\b", r"\bgraph\b", r"\bbuild\b", r"\bdevelop\b"]
@@ -4277,6 +4429,58 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     if is_mutating: seen_tools.clear()
                                     pretty_log("Execution Ok", "Script completed with exit code 0", icon=Icons.OK)
 
+                                    # --- SIMULATION SHORT-CIRCUIT ---
+                                    # In self-play (read-only skill memory
+                                    # sentinel), when the solver has just
+                                    # executed `solution.py` with exit=0 and
+                                    # produced non-empty stdout, the inner
+                                    # agent is done — the outer validator
+                                    # will re-run solution.py directly and
+                                    # ignore any further agent reasoning.
+                                    # Without this gate, every successful
+                                    # cycle burns one extra 15–25s "thinking"
+                                    # turn to emit a "task complete" summary
+                                    # that nobody reads (log-eval: turns 3→4
+                                    # of every cycle were pure dead time).
+                                    _is_sim = getattr(
+                                        getattr(self.context, "skill_memory", None),
+                                        "is_read_only",
+                                        False,
+                                    ) is True
+                                    if _is_sim:
+                                        # Pull the command text from the
+                                        # assistant message that emitted this
+                                        # tool_call — that's where the model
+                                        # embedded `python3 solution.py` (or
+                                        # `python3 -u solution.py`, or a
+                                        # `bash -c "...solution.py..."`).
+                                        _last_asst = ""
+                                        for _m in reversed(messages):
+                                            if _m.get("role") == "assistant":
+                                                _tc = _m.get("tool_calls") or []
+                                                try:
+                                                    _last_asst = json.dumps(_tc, default=str)
+                                                except Exception:
+                                                    _last_asst = str(_tc)
+                                                _last_asst += str(_m.get("content") or "")
+                                                break
+                                        _ran_solution = "solution.py" in _last_asst
+                                        # Non-trivial stdout: strip the
+                                        # EXECUTION RESULT header and check
+                                        # the body has real content.
+                                        _body = str_res.split("STDOUT/STDERR:", 1)[-1].strip()
+                                        if _ran_solution and len(_body) > 0:
+                                            final_ai_content = (
+                                                "solution.py executed successfully (exit 0)."
+                                            )
+                                            force_stop = True
+                                            pretty_log(
+                                                "Self-Play Short-Circuit",
+                                                "Skipped confirmation turn — solution.py ran clean (sim mode).",
+                                                icon=Icons.STOP,
+                                            )
+                                            break  # exit the enumerate(results) loop
+
                             elif str_res.startswith("Error:") or str_res.startswith("ERROR") or str_res.startswith("SYSTEM ERROR") or str_res.startswith("Critical Tool Error"):
                                 turn_has_failure = True
                                 last_error_res = str_res
@@ -4716,6 +4920,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 except Exception:
                     pass
 
+                # Stage-1 self-improvement: append the turn's trajectory
+                # to the distill log. No-op when the collector isn't
+                # wired. Deliberately non-fatal — trajectory logging
+                # must never break a user turn.
+                try:
+                    self._record_turn_trajectory(
+                        messages=messages,
+                        final_content=final_ai_content,
+                        req_id=req_id,
+                        model=model,
+                    )
+                except Exception as e:
+                    # Debug-level: a turn-logging failure must never be
+                    # noisy in production. When diagnosing, bump to
+                    # warning temporarily.
+                    logger.debug(f"trajectory logging skipped: {type(e).__name__}: {e}")
+
                 return final_ai_content, created_time, req_id
 
         finally:
@@ -4726,6 +4947,105 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
             pretty_log("Request Finished", special_marker="END")
             request_id_context.reset(token)
+
+    def _record_turn_trajectory(
+        self,
+        *,
+        messages,
+        final_content,
+        req_id: str,
+        model: str,
+    ) -> None:
+        """Build and persist a Trajectory for the turn that just finished.
+
+        No-op when `ctx.trajectory_collector` isn't wired. Walks the
+        final `messages` list to reconstruct the tool-call sequence
+        (each assistant message with `tool_calls` is paired with the
+        matching `role=tool` responses that follow it in list order).
+
+        All free-text fields go through the collector's redactor before
+        they hit disk; this method only assembles the Trajectory.
+        """
+        collector = getattr(self.context, "trajectory_collector", None)
+        if collector is None:
+            return
+
+        # Lazy import so modules that don't wire distill stay clean.
+        from ..distill.schema import Trajectory, ToolCall, Outcome
+
+        msgs = list(messages or [])
+        system_prompt = ""
+        user_request = ""
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    i.get("text", "") for i in content
+                    if isinstance(i, dict) and i.get("type") == "text"
+                )
+            if role == "system" and not system_prompt:
+                system_prompt = str(content or "")
+            elif role == "user":
+                user_request = str(content or "")
+
+        # Reconstruct tool call pairs. Walk the messages left-to-right;
+        # every assistant with tool_calls gets paired with the tool
+        # responses that follow it (by tool_call_id when present).
+        tool_calls = []
+        pending_calls = {}  # id -> (name, arguments)
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "assistant":
+                for tc in (m.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    name = str(fn.get("name") or tc.get("name") or "").strip()
+                    args_raw = fn.get("arguments")
+                    args: dict = {}
+                    if isinstance(args_raw, str):
+                        try:
+                            args = json.loads(args_raw)
+                        except Exception:
+                            args = {"_raw": args_raw[:500]}
+                    elif isinstance(args_raw, dict):
+                        args = args_raw
+                    pending_calls[tc.get("id") or name] = (name, args, ToolCall(name=name, arguments=args))
+                    tool_calls.append(pending_calls[tc.get("id") or name][2])
+            elif role == "tool":
+                tc_id = m.get("tool_call_id") or m.get("name")
+                entry = pending_calls.get(tc_id)
+                if entry is not None:
+                    _n, _a, obj = entry
+                    obj.result = str(m.get("content") or "")[:4000]
+
+        # Final response content. Non-string (streaming generator) is
+        # logged as empty — the stream path gets richer tool-call data
+        # but the final text lives in the SSE frames, not here.
+        final_response = final_content if isinstance(final_content, str) else ""
+
+        traj = Trajectory(
+            session_id=req_id or "",
+            task_kind="user_request",
+            cluster=None,
+            tier=None,
+            model=str(model or ""),
+            system_prompt=system_prompt[:8000],
+            user_request=user_request[:8000],
+            tool_calls=tool_calls,
+            n_steps=sum(
+                1 for m in msgs
+                if isinstance(m, dict) and m.get("role") == "assistant"
+            ),
+            outcome=Outcome.UNKNOWN.value,  # user turns have no validator
+            final_response=final_response[:16000],
+        )
+        collector.append(traj)
 
     async def _run_system_3_pivot(self, task_context: str, error_context: str, sandbox_state: str, model: str) -> dict:
         """System 3 Crisis Pivot: generate 3 alternative strategies and pick the safest one."""

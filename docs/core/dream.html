@@ -91,11 +91,15 @@
   <h2>Isolation markers</h2>
   <p>The isolated sub-context sets several attributes to prevent production-state writes:</p>
   <ul>
-    <li><code>ReadOnlySkillMemory.is_read_only = True</code> — class marker that <code>agent.py</code>'s Perfect-It block checks (via <code>is True</code>) to skip the entire ~15 s follow-up LLM call during self-play.</li>
+    <li><code>ReadOnlySkillMemory.is_read_only = True</code> — class marker that <code>agent.py</code> checks (via <code>is True</code>) at two points: (a) to skip the entire ~15 s Perfect-It follow-up LLM call during self-play, and (b) to short-circuit the <em>confirmation turn</em> that the solver would otherwise spend re-deriving that <code>solution.py</code> just ran clean. When the solver's last <code>execute</code> tool call exits 0 on <code>solution.py</code> with non-empty stdout, the turn loop sets <code>force_stop = True</code> and synthesises a minimal final message, skipping the ~15–25 s "task complete" thinking turn. The outer validator re-runs <code>solution.py</code> directly and never reads the agent's reasoning, so the confirmation turn was pure dead time.</li>
     <li><code>isolated_context.args.perfect_it = False</code>, <code>smart_memory = 0.0</code>, <code>native_tools = True</code>.</li>
     <li><code>selfplay_loop_task / selfplay_loop_stop / selfplay_loop_started_at</code> are stripped — otherwise the inner sub-agent's <code>handle_chat</code> would trip the outer loop's user-message interrupt hook.</li>
     <li><code>verifier, uncertainty_tracker, mcts_reasoner, hypothesis_tester, frontier_tracker</code> set to <code>None</code>.</li>
   </ul>
+
+  <h2>Rejection prompt contract (retry attempts)</h2>
+  <p>When an attempt fails validation, the retry prompt injected for the next attempt contains the validator's feedback string (the FAIL line with expected-vs-actual output) plus optional float-formatting hints. It does <strong>not</strong> contain the <code>.validator.py</code> source. An earlier revision pasted the full validator script into the retry prompt so the agent could "debug the validator's logic", but this turned every struggled-then-won cycle into an answer-key lookup — the agent copied the validator's constants (multipliers, SQL query shape) instead of reasoning from the expected-vs-actual diff. Skill-gate lessons from those cycles were memorised constants, not transferable knowledge.</p>
+  <p>Retry prompts now force the solver to reason from the diff and the original task description. Some complex challenges will fail their second attempt that previously "succeeded" via copying — that is the intended behaviour: a genuine failure is better training signal than a cheated pass.</p>
 
   <h2>Public functions</h2>
   <table>

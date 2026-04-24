@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.browser — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a class="current" href="browser.html">browser</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / browser.py</h1>
+  <p class="subtitle">Native headless-browser automation via Playwright — Tor-aware, DNS-leak-safe, session-persistent.</p>
+
+  <h2>Why a native tool</h2>
+  <p>Before this tool, headless-browser usage was LLM-authored raw Playwright in <a href="execute.html"><code>execute(stateful=True)</code></a>. Four recurring footguns came with that path:</p>
+  <ol>
+    <li><strong>API shape drift</strong>: <code>await async_playwright().start()</code> vs <code>async with</code>, top-level <code>await</code> rules, cleanup order. Any slip crashed the Jupyter kernel.</li>
+    <li><strong>DNS leaks</strong>: Chromium's SOCKS5 proxy tunnels traffic but can still resolve names via the container's <code>/etc/resolv</code> unless <code>--host-resolver-rules</code> is also set. Easy to miss.</li>
+    <li><strong>WebRTC IP leaks</strong>: STUN/TURN can expose the host IP even over Tor.</li>
+    <li><strong>Concurrency races</strong>: "store <code>browser</code>/<code>page</code> globally" broke when two plan branches both used the kernel.</li>
+  </ol>
+  <p>The <code>browser</code> tool bakes correct-by-construction defaults for all four. Raw Playwright remains available in <code>execute</code> for advanced flows (response interception, custom wait conditions, file uploads).</p>
+
+  <h2>Tool: <code>browser</code></h2>
+  <p>Six operations. The first five are <strong>atomic</strong>: each launches a fresh Chromium context and re-navigates via the <code>.last_url</code> sidecar. The sixth, <code>interact</code>, runs a sequence of sub-actions in a <strong>single</strong> context so transient DOM state survives between steps — required for multi-step SPA flows.</p>
+  <table>
+    <thead><tr><th>operation</th><th>required</th><th>returns</th></tr></thead>
+    <tbody>
+      <tr><td><code>navigate</code></td><td><code>url</code></td><td>HTTP status, final URL, page title</td></tr>
+      <tr><td><code>extract_text</code></td><td>—</td><td>Rendered <code>innerText</code> of body (or a CSS selector), truncated at <code>max_chars</code></td></tr>
+      <tr><td><code>click</code></td><td><code>selector</code></td><td>Post-click URL + title</td></tr>
+      <tr><td><code>screenshot</code></td><td>—</td><td>Writes PNG to <code>out_path</code> inside <code>/workspace</code>; returns <code>/api/download/</code> URL</td></tr>
+      <tr><td><code>close</code></td><td>—</td><td>Deletes the persistent profile so the next session starts fresh</td></tr>
+      <tr><td><code>interact</code></td><td><code>actions</code></td><td>Per-action results (ok/error), final URL, final title. One Chromium context across the whole list.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Atomic ops vs. <code>interact</code></h2>
+  <p>The atomic ops are perfect for single-page scrapes. They are <strong>not</strong> suitable for interactive multi-step flows, because every op's fresh context discards the JS-driven DOM mutations made by the previous op. A click that opens a modal is invisible to the next click, which sees a page just-loaded from its initial HTML. The 2026-04-23 WebOS eval hit this wall: the agent couldn't drive the Calculator because the Calculator window vanished between every click.</p>
+  <p><code>interact</code> solves this by taking a whole sequence in one call:</p>
+  <pre><code>browser(operation="interact",
+        url="file:///workspace/webos/index.html",
+        actions=[
+          {"action": "click", "selector": "[data-app='calc']"},
+          {"action": "wait_for_selector", "selector": "#calc-display"},
+          {"action": "click", "selector": "#calc-btn-7"},
+          {"action": "click", "selector": "#calc-btn-plus"},
+          {"action": "click", "selector": "#calc-btn-3"},
+          {"action": "click", "selector": "#calc-btn-eq"},
+          {"action": "extract_text", "selector": "#calc-display"},
+          {"action": "screenshot", "out_path": "calc_result.png"},
+        ])</code></pre>
+  <p>Sub-action types:</p>
+  <ul>
+    <li><code>{"action":"goto","url":"...","wait_until":"load"}</code> — navigate mid-sequence (e.g. follow a link into a subpage).</li>
+    <li><code>{"action":"click","selector":"..."}</code></li>
+    <li><code>{"action":"extract_text","selector":"...","max_chars":65536}</code> — each extraction is preserved in the results so you can read multiple points in the flow.</li>
+    <li><code>{"action":"fill","selector":"input[name='email']","text":"a@b"}</code> — real text input (atomic ops don't support typing).</li>
+    <li><code>{"action":"wait_for_selector","selector":"...","timeout_ms":5000}</code> — handy after an animation-gated window open.</li>
+    <li><code>{"action":"screenshot","out_path":"..."}</code> — sandbox-safety + host→container path rewriting is applied per sub-action.</li>
+    <li><code>{"action":"sleep","ms":500}</code> — when you need an explicit pause and there's no selector to wait on.</li>
+  </ul>
+  <p>By default (<code>stop_on_error=false</code>) a failing sub-action is recorded and the sequence keeps going — so you get full visibility into which step is flaky. Pass <code>stop_on_error=true</code> to abort on first failure.</p>
+  <p>The subprocess wall-clock budget for <code>interact</code> scales with action count (<code>timeout_ms × len(actions)</code>), so a 20-step flow doesn't hit the single-op default cap.</p>
+
+  <h2>Session persistence</h2>
+  <p>Cookies, <code>localStorage</code>, and auth tokens survive across tool calls via Chromium's <code>launch_persistent_context(user_data_dir=/workspace/.browser_profile)</code>. Each op opens → runs → closes cleanly; there is no long-lived subprocess to manage. Call <code>operation="close"</code> to wipe the profile (e.g. after logging out, or when switching user contexts).</p>
+
+  <h2>Chained-op continuity (<code>.last_url</code> sidecar)</h2>
+  <p><code>launch_persistent_context</code> restores cookies/<code>localStorage</code> but NOT open pages — each op's browser process is a fresh launch. Without extra plumbing, a "step 2 continues where step 1 left off" call pattern would land on <code>about:blank</code> and every selector query would fail (surfaced by the 2026-04-23 eval, which then caused the LLM to burn a turn misattributing the error to a <code>DOMContentLoaded</code> race).</p>
+  <p>To let the LLM chain ops ergonomically, the runner writes the final URL of every successful navigation to <code>&lt;profile_dir&gt;/.last_url</code>. Any subsequent <code>extract_text</code>/<code>click</code>/<code>screenshot</code> without an explicit <code>url</code> reads the sidecar and re-navigates first. Typical usage:</p>
+  <pre><code>browser(operation="navigate", url="https://example.com/login")
+browser(operation="click", selector="#login-btn")      # no url — uses sidecar
+browser(operation="extract_text", selector=".welcome") # no url — uses sidecar
+browser(operation="screenshot", out_path="landed.png") # no url — uses sidecar
+browser(operation="close")                             # wipes profile + sidecar</code></pre>
+  <p>When neither an explicit <code>url</code> nor a sidecar URL is available, the runner errors out with <code>extract_text needs a URL: pass `url=...` or call `operation="navigate"` first</code> — no silent query against <code>about:blank</code>.</p>
+  <p>The sidecar lives inside the profile dir, so <code>operation="close"</code> (which <code>rmtree</code>'s the whole directory) wipes it for free. Empty / <code>None</code> URLs are never written to the sidecar, so a failed op can't blow away the last-known-good URL.</p>
+
+  <h2>Tor &amp; DNS-leak hardening</h2>
+  <p>When the sandbox was started with a <code>tor_proxy</code>, every op forwards it as Chromium's <code>--proxy-server</code>. The in-sandbox runner (<code>_chromium_args</code>) always adds, alongside the Docker-safe flags:</p>
+  <ul>
+    <li><code>--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost"</code> — forces DNS through the SOCKS proxy; <code>EXCLUDE localhost</code> keeps the self-play fixture server + in-container services reachable.</li>
+    <li><code>--webrtc-ip-handling-policy=disable_non_proxied_udp</code> — blocks WebRTC STUN/TURN egress that could expose the host IP.</li>
+    <li><code>--disable-features=WebRtcHideLocalIpsWithMdns</code> — pairs with the above.</li>
+  </ul>
+  <p>Chromium only accepts the <code>socks5://</code> URL scheme. If the caller supplies <code>socks5h://</code> (some repo helpers do, for <code>httpx</code> compatibility), the tool auto-rewrites — DNS-over-proxy is enforced via <code>--host-resolver-rules</code> regardless of URL scheme.</p>
+
+  <h2>Runner protocol</h2>
+  <p>A tiny script <code>.browser_runner.py</code> is written into <code>/workspace</code> on every call and invoked as <code>python3 .browser_runner.py &lt;op_json&gt;</code>. It emits exactly one sentinel line:</p>
+  <pre><code>[BROWSER_OK] {...json payload...}
+[BROWSER_ERR] &lt;message&gt;</code></pre>
+  <p>The tool scans <code>stdout</code> for the sentinel so Chromium's unrelated warnings (GTK, ALSA, libpci) don't corrupt the result.</p>
+
+  <h2>Return shape</h2>
+  <p>Human-readable, deterministic per op, so downstream prompts can pattern-match:</p>
+  <pre><code>--- BROWSER RESULT ---
+STATUS: OK
+OP: navigate
+URL: https://example.com/
+HTTP_STATUS: 200
+TITLE: Example Domain</code></pre>
+
+  <h2>Failure modes surfaced</h2>
+  <ul>
+    <li>Unknown operation → <code>STATUS: ERROR</code> with valid-ops list.</li>
+    <li>Runner exits non-zero with a sentinel → the error is surfaced verbatim, plus a timeout/install hint.</li>
+    <li>Chromium crashes before printing a sentinel → raw tail of stderr is returned so the agent has something to debug with.</li>
+  </ul>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="execute.html">execute</a> — raw Playwright fallback path.</li>
+    <li><a href="search.html">search</a> — for static-HTML fetches; cheaper than a full browser render.</li>
+    <li><a href="../sandbox/docker.html">sandbox/docker</a> — Chromium install + Tor daemon bootstrap.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

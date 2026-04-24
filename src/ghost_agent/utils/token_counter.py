@@ -11,7 +11,7 @@ from functools import lru_cache
 # and uncensored/finetuned variants including qwen-3.6-35b-a3). If the
 # AutoTokenizer load fails, `estimate_tokens` falls back to a `len(text)
 # // 4` heuristic and logs a one-shot warning.
-QWEN_MODEL_ID = "LuffyTheFox/FernflowerAI-35B-A3B-KL-ReLU-GGUF"
+QWEN_MODEL_ID = "Qwen/Qwen3-30B-A3B"
 TOKEN_ENCODER = None
 
 # One-shot warning gate: the first time we silently fall back to the

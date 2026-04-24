@@ -211,9 +211,39 @@ class DockerSandbox:
         # We don't set HTTP_PROXY for the sandbox because we don't want to route
         # heavy package installs through Tor to avoid timeouts and IP blocks.
 
-        exit_code, _ = self.container.exec_run("test -f /root/.supercharged")
-        if exit_code != 0:
+        # Marker version: bump this (and the string in sandbox/Dockerfile)
+        # whenever the provisioning surface changes in a way that prior
+        # committed images can't be trusted to match.
+        #
+        # History:
+        #   v1 (legacy): .supercharged — used `playwright install
+        #                chromium` WITHOUT `--with-deps`, so the cached
+        #                image was missing libnss3/libatk/etc and
+        #                Chromium couldn't actually launch. The self-play
+        #                log caught this: the agent discovered at
+        #                runtime that browsers were broken, re-installed
+        #                Chromium (still without deps), re-ran, still
+        #                failed, burned ~100 s.
+        #   v2 (now):    .supercharged.v2 — ensures `--with-deps` ran.
+        #                Images without the v2 marker are treated as
+        #                un-provisioned and go through a full install.
+        marker_path = "/root/.supercharged.v2"
+
+        marker_ok = (self.container.exec_run(f"test -f {marker_path}")[0] == 0)
+        chromium_ok = self._chromium_binary_present()
+        if not marker_ok or not chromium_ok:
             did_work = True
+            if marker_ok and not chromium_ok:
+                # The cached image claims to be provisioned but the
+                # Chromium binary isn't actually on disk — the exact
+                # silent-failure mode v2 exists to catch. Flag loudly;
+                # the full install flow below will fix it.
+                pretty_log(
+                    "Sandbox",
+                    "Provision marker present but Chromium binary missing. Reinstalling...",
+                    level="WARNING",
+                    icon="⚠️",
+                )
             pretty_log("Sandbox", "Installing Deep Learning Stack (Wait ~60s)...", icon="📦")
             
             apt_cmd = "sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3'"
@@ -243,17 +273,55 @@ class DockerSandbox:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"Python package installation failed: {err_msg}")
                 
-            # Only install Playwright if not already cached. The previous
-            # version always ran `playwright install` which downloads ~150 MB
-            # even when Chromium is already present from a committed image.
-            pw_check, _ = self.container.exec_run("python3 -c 'from playwright.sync_api import sync_playwright; print(\"OK\")'")
-            if pw_check != 0:
-                pretty_log("Sandbox", "Installing Headless Chromium (Wait ~2m)...", icon=Icons.TOOL_DOWN)
-                self.container.exec_run("python3 -m playwright install chromium --with-deps", environment=env_vars)
-            else:
-                pretty_log("Sandbox", "Playwright already cached, skipping install.", icon=Icons.OK)
+            # Unconditionally install Chromium inside this first-boot
+            # block. The previous gate ran `from playwright.sync_api
+            # import sync_playwright` and skipped the install when the
+            # Python library was importable — but library-importable
+            # does NOT imply the Chromium BINARY is on disk. (The pip
+            # install above puts the library in place, which made the
+            # probe pass every time and silently skip the binary
+            # install on first provision.) The eval at 2026-04-23
+            # 09:56 hit "headless_shell not found" for exactly this
+            # reason and burned ~100 s of agent time recovering. We're
+            # already inside the `test -f /root/.supercharged` outer
+            # gate, so this only runs on a container that has never
+            # been provisioned — the "re-download on every boot"
+            # concern the old gate was trying to address can't happen.
+            # If Chromium is somehow already present (e.g. the user
+            # manually deleted the supercharged marker without wiping
+            # the cache), `playwright install` short-circuits in ~1 s.
+            pretty_log("Sandbox", "Installing Headless Chromium (Wait ~2m)...", icon=Icons.TOOL_DOWN)
+            pw_code, pw_out = self.container.exec_run(
+                "python3 -m playwright install chromium --with-deps",
+                environment=env_vars,
+            )
+            if pw_code != 0:
+                # Fail loud: refuse to touch /root/.supercharged so a
+                # failed Chromium download can't silently poison every
+                # future boot into thinking the environment is ready.
+                err_msg = pw_out.decode("utf-8", errors="replace") if pw_out else "Unknown error"
+                raise Exception(
+                    f"Playwright Chromium installation failed (exit {pw_code}): {err_msg}"
+                )
 
-            self.container.exec_run("touch /root/.supercharged")
+            # Post-install sanity: verify the Chromium binary we just
+            # installed is actually on disk before we set the marker.
+            # This is the second line of defence behind `--with-deps
+            # must exit 0` above — if the install exited 0 for some
+            # weird reason but didn't produce a binary (network flake,
+            # disk-full mid-extract), we'd rather fail loud here than
+            # leave a v2-marked image that's still broken.
+            if not self._chromium_binary_present():
+                raise Exception(
+                    "Playwright install reported success but no Chromium "
+                    "binary found under /root/.cache/ms-playwright. "
+                    "Refusing to mark container as provisioned."
+                )
+
+            self.container.exec_run(f"touch {marker_path}")
+            # Remove any legacy v1 marker so a downgrade-then-upgrade
+            # cycle doesn't leave stale state around.
+            self.container.exec_run("rm -f /root/.supercharged")
 
             # Cache the fully installed environment for instant future startups
             if self.image != "ghost-agent-base:latest":
@@ -280,6 +348,39 @@ class DockerSandbox:
         # environment up. Silent on the steady-state common path.
         if did_work:
             pretty_log("Sandbox", "Environment Ready.", icon="✅")
+
+    def _chromium_binary_present(self) -> bool:
+        """Check that Playwright's Chromium `headless_shell` is actually
+        on disk inside the container.
+
+        We cannot trust `/root/.supercharged*` alone: in the old flow,
+        a successful `pip install playwright` (Python library) was the
+        gate for marking the image provisioned, even though the
+        Chromium BINARY was an entirely separate `playwright install`
+        download that often hadn't run. The binary check defends against
+        that silent-failure mode regardless of marker state.
+
+        We glob rather than pin a specific Chromium version directory
+        because Playwright versions bump chromium-NNNN/ numbers on
+        every release.
+        """
+        if self.container is None:
+            return False
+        try:
+            # `find -print -quit` exits as soon as the first match is
+            # printed. Exit code 0 + non-empty stdout → present.
+            code, out = self.container.exec_run(
+                "sh -c '"
+                "find /root/.cache/ms-playwright -type f "
+                "\\( -name headless_shell -o -name chrome \\) "
+                "-print -quit 2>/dev/null'"
+            )
+            if code != 0:
+                return False
+            stdout = (out or b"").decode("utf-8", errors="replace").strip()
+            return bool(stdout)
+        except Exception:
+            return False
 
     def execute(self, cmd: str, timeout: int = 300, memory_limit: str = None):
         try:

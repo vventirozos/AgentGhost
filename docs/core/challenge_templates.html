@@ -23,60 +23,76 @@
   <p class="subtitle">Fast deterministic challenge library used as a drop-in replacement for slow LLM-generated self-play challenges.</p>
 
   <h2>Why</h2>
-  <p>Asking the LLM to invent a self-contained challenge round-trips at 120–150 s with ~30% failure-to-validate rate. The template library produces deterministic, validator-clean challenges in milliseconds. The dream loop falls back to LLM generation only if no template matches the seeded cluster, or if the 50/50 saturation coin-flip lands on the LLM path.</p>
+  <p>Asking the LLM to invent a self-contained challenge round-trips at 120–150 s with ~30% failure-to-validate rate. The template library produces deterministic, validator-clean challenges in milliseconds. The dream loop falls back to LLM generation when no template matches the seeded cluster, or — under saturation — on the 80%-weighted branch of the 20/80 coin-flip (the minority 20% path still picks a non-saturated template so the expert concurrency / algo / regex-parse shapes keep rotating).</p>
 
   <h2>Clusters</h2>
   <table>
-    <thead><tr><th>Cluster</th><th>Template(s)</th><th>Shape</th></tr></thead>
+    <thead><tr><th>Cluster</th><th>Template(s)</th><th>Basic shape</th><th>Advanced+ twist</th></tr></thead>
     <tbody>
-      <tr><td><code>data_analysis</code></td><td><code>_data_analysis_csv_aggregation</code></td><td>CSV: filter by date, group, sum, sort.</td></tr>
-      <tr><td><code>regex_parse</code></td><td><code>_regex_parse_access_log</code></td><td>Count 5xx responses per IP from an access log.</td></tr>
-      <tr><td><code>python_general</code></td><td><code>_python_general_word_frequency</code></td><td>Top-N word frequency.</td></tr>
-      <tr><td><code>algo</code></td><td><code>_algo_kth_largest</code></td><td>k-th largest integer from a file.</td></tr>
-      <tr><td><code>sql</code></td><td><code>_sql_group_by_aggregation</code></td><td>SQLite sales aggregation.</td></tr>
-      <tr><td><code>bash</code></td><td><code>_bash_filter_and_count</code></td><td>Count ERROR / WARN across log files.</td></tr>
-      <tr><td><code>concurrency</code></td><td><code>_concurrency_router</code> → 8 variants</td><td>See below — concurrency is routed through a variant bank so the shape isn't memorised after 2 cycles.</td></tr>
+      <tr><td><code>data_analysis</code></td><td><code>_data_analysis_csv_aggregation</code></td><td>CSV: filter by date, group, sum, sort.</td><td>Injects ~15% rows with <code>value="NA"</code>; solver must skip them before summing.</td></tr>
+      <tr><td><code>regex_parse</code></td><td><code>_regex_parse_access_log</code></td><td>Count 5xx responses per IP from an access log.</td><td>Injects ~15% malformed lines (truncated, missing status); solver must skip without crashing.</td></tr>
+      <tr><td><code>python_general</code></td><td><code>_python_general_word_frequency</code></td><td>Top-N word frequency.</td><td>Injects a stopword set (<code>the/and/or/to/a</code>) at 40% frequency; solver must exclude them from the top-N.</td></tr>
+      <tr><td><code>algo</code></td><td><code>_algo_kth_largest</code></td><td>k-th largest integer from a file.</td><td>Switches to k-th largest <em>distinct</em> value; collapses duplicates, returns <code>NONE</code> when k exceeds the distinct count.</td></tr>
+      <tr><td><code>sql</code></td><td><code>_sql_group_by_aggregation</code></td><td>SQLite sales aggregation.</td><td>Drops <code>NOT NULL</code> on <code>amount</code> and inserts ~15% NULL rows; solver must filter with <code>WHERE amount IS NOT NULL</code>.</td></tr>
+      <tr><td><code>bash</code></td><td><code>_bash_filter_and_count</code></td><td>Count ERROR / WARN across log files.</td><td>Adds a third log level <code>FATAL</code>; output shape grows from 2 to 3 lines.</td></tr>
+      <tr><td><code>concurrency</code></td><td><code>_concurrency_router</code> → 8 variants</td><td>Tier-gated variant pool (see below).</td><td>—</td></tr>
     </tbody>
   </table>
 
-  <h2>Concurrency variant bank</h2>
-  <p>The <code>concurrency</code> entry in <code>TEMPLATES</code> dispatches through <code>_concurrency_router</code>, which picks uniformly from 8 sub-shapes:</p>
+  <h2>Difficulty tiers</h2>
+  <p>Every template accepts a <code>tier=</code> keyword argument (<code>basic</code> | <code>intermediate</code> | <code>advanced</code> | <code>expert</code>). The tier drives two things:</p>
   <ul>
-    <li><strong>Basic</strong>
-      <ul>
-        <li><code>_concurrency_parallel_sum</code> — sum integers from N files concurrently.</li>
-        <li><code>_concurrency_parallel_max_with_source</code> — argmax across files; workers must return index+value.</li>
-        <li><code>_concurrency_shared_counter</code> — count token occurrences into a shared counter (requires <code>threading.Lock</code>).</li>
-        <li><code>_concurrency_bounded_pool</code> — process N files with <code>max_workers=K</code> / semaphore.</li>
-        <li><code>_concurrency_first_hit_racer</code> — race to find a needle; cancel on first hit.</li>
-      </ul>
-    </li>
-    <li><strong>Expert tier</strong> (forces real struggle via primitive use)
-      <ul>
-        <li><code>_concurrency_producer_consumer_exact_once</code> — bounded <code>queue.Queue</code>; every produced item consumed exactly once; validator reproduces the expected sum from the seeded RNG, so any drop/duplication fails the check.</li>
-        <li><code>_concurrency_ordered_parallel_map</code> — parallel processing with output in input order. Traps solutions using <code>as_completed</code> without re-sorting.</li>
-        <li><code>_concurrency_cancel_losers</code> — winner-takes-all race; losers must be cancelled via <code>threading.Event</code> or the script exceeds a wall-clock budget the validator enforces.</li>
-      </ul>
-    </li>
+    <li><strong>Size scaling.</strong> Base row / file / token counts are multiplied by <code>_TIER_SIZE_MULTIPLIER[tier]</code> — 1×, 2×, 3×, 4× respectively. Bigger fixtures catch solutions that accidentally load the whole file, build O(N²) accumulators, or hardcode indices.</li>
+    <li><strong>Hard-mode twist.</strong> At <code>advanced</code> and <code>expert</code>, <code>_is_hard_mode</code> returns true and each template adds its cluster-specific twist (see the table above). The twist is always described in the challenge prompt — it's a curriculum step, not a gotcha — but it's enough to stop a solution that 1-shotted the basic shape from passing without changes.</li>
+  </ul>
+  <p>Tier is resolved per cluster by <a href="../memory/frontier.html"><code>FrontierTracker.get_difficulty_tier</code></a>, which stores a monotonic <code>unlocked_tier_index</code> that advances every <code>TIER_UNLOCK_THRESHOLD</code> first-try wins. The dream loop pipes this resolver into <code>try_template</code> and <code>pick_random_template</code>; unknown or <code>None</code> tiers fall back to basic (preserving behaviour for callers that don't know the frontier state).</p>
+
+  <h2>Concurrency variant bank</h2>
+  <p>The <code>concurrency</code> entry in <code>TEMPLATES</code> dispatches through <code>_concurrency_router(tier=...)</code>. When a tier is known the router draws from <code>_CONCURRENCY_POOLS_BY_TIER</code>; without a tier it falls back to uniform sampling over the full 8-variant bank.</p>
+  <table>
+    <thead><tr><th>Tier</th><th>Pool</th></tr></thead>
+    <tbody>
+      <tr><td><code>basic</code></td><td><code>parallel_sum</code>, <code>parallel_max_with_source</code></td></tr>
+      <tr><td><code>intermediate</code></td><td>basic pool + <code>shared_counter</code>, <code>bounded_pool</code></td></tr>
+      <tr><td><code>advanced</code></td><td><code>shared_counter</code>, <code>bounded_pool</code>, <code>first_hit_racer</code>, <code>ordered_parallel_map</code></td></tr>
+      <tr><td><code>expert</code></td><td><code>first_hit_racer</code>, <code>ordered_parallel_map</code>, <code>producer_consumer_exact_once</code>, <code>cancel_losers</code></td></tr>
+    </tbody>
+  </table>
+  <p>Pool membership is monotonic in difficulty: the basic pool is disjoint from the expert pool, so promoting a cluster to expert actually changes the variant distribution.</p>
+  <p>Variant behaviour:</p>
+  <ul>
+    <li><code>_concurrency_parallel_sum</code> — sum integers from N files concurrently.</li>
+    <li><code>_concurrency_parallel_max_with_source</code> — argmax across files; workers must return index+value.</li>
+    <li><code>_concurrency_shared_counter</code> — count token occurrences into a shared counter (requires <code>threading.Lock</code>).</li>
+    <li><code>_concurrency_bounded_pool</code> — process N files with <code>max_workers=K</code> / semaphore.</li>
+    <li><code>_concurrency_first_hit_racer</code> — race to find a needle; cancel on first hit.</li>
+    <li><code>_concurrency_producer_consumer_exact_once</code> — bounded <code>queue.Queue</code>; every produced item consumed exactly once; validator reproduces the expected sum from the seeded RNG, so any drop/duplication fails the check.</li>
+    <li><code>_concurrency_ordered_parallel_map</code> — parallel processing with output in input order. Traps solutions using <code>as_completed</code> without re-sorting.</li>
+    <li><code>_concurrency_cancel_losers</code> — winner-takes-all race; losers must be cancelled via <code>threading.Event</code> or the script exceeds a wall-clock budget the validator enforces.</li>
   </ul>
 
   <h2>API</h2>
   <table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>try_template(cluster_key) → Optional[ChallengeTriple]</code></td><td>Lookup + instantiate for a specific cluster.</td></tr>
-      <tr><td><code>pick_random_template(exclude_clusters=None) → Optional[ChallengeTriple]</code></td><td>Uniform pick from the full bank (optionally excluding saturated clusters). Maintains a module-level <code>_LAST_TEMPLATE_KEY</code> anchor to avoid drawing the same template twice in a row when alternatives exist.</td></tr>
+      <tr><td><code>try_template(cluster_key, tier=None) → Optional[ChallengeTriple]</code></td><td>Lookup + instantiate for a specific cluster at the given tier. <code>tier=None</code> renders at basic.</td></tr>
+      <tr><td><code>pick_random_template(exclude_clusters=None, tier_resolver=None) → Optional[ChallengeTriple]</code></td><td>Random pick from the bank (optionally excluding saturated clusters). <code>tier_resolver</code> is a callable <code>cluster_key → tier</code> used after the draw — typically <code>FrontierTracker.get_difficulty_tier</code>. Maintains a module-level <code>_LAST_TEMPLATE_KEY</code> anchor to avoid drawing the same template twice in a row when alternatives exist.</td></tr>
       <tr><td><code>reset_template_history()</code></td><td>Clear the recent-template anchor; used by tests for deterministic first-call behaviour.</td></tr>
+      <tr><td><code>_size(base, tier)</code></td><td>Scale a base count by the tier multiplier.</td></tr>
+      <tr><td><code>_is_hard_mode(tier)</code></td><td>True for <code>advanced</code> / <code>expert</code>; gates the twist injection inside each template.</td></tr>
+      <tr><td><code>_invoke_template(fn, tier)</code></td><td>Call <code>fn(tier=...)</code> when accepted, else <code>fn()</code> — preserves zero-arg callers (and zero-arg template monkey-patches in legacy tests).</td></tr>
     </tbody>
   </table>
 
   <h2>Design rules</h2>
   <ol>
-    <li>Each template is a pure function returning <code>(challenge_prompt, setup_script, validator_script)</code>.</li>
+    <li>Each template is a pure function <code>(tier=None) → (challenge_prompt, setup_script, validator_script)</code>.</li>
     <li>The setup uses a fixed seed for reproducibility; the validator computes expected values directly from the setup artefacts (no hardcoded values).</li>
     <li>Setup and validator communicate via the sandbox filesystem only — no shared memory.</li>
     <li>Both must be stdlib-only so they run inside an unprovisioned sandbox.</li>
     <li>Validators that use unit-suffixed numeric formats (%, $, ms) must strip the suffix before <code>float()</code>/<code>int()</code>, or the validator self-test gate in <a href="dream.html">dream.py</a> will reject the template.</li>
+    <li>The hard-mode twist must be described in the challenge prompt. Never hide a new requirement — tier escalation is a curriculum, not a trap.</li>
+    <li>Validators should be tier-agnostic when possible: a single validator that ignores NULL / NA / malformed inputs still produces the correct expected output at basic (where none exist) and at advanced (where many do).</li>
   </ol>
 
   <p><code>ChallengeTriple = Tuple[str, str, str]</code></p>
