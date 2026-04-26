@@ -5131,6 +5131,34 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             outcome=Outcome.UNKNOWN.value,  # user turns have no validator
             final_response=final_response[:16000],
         )
+        # Stage-1 self-improvement: chat trajectories ship with
+        # outcome=UNKNOWN (no validator on free-form chat), which
+        # excludes them from the Reflector's input set — only FAILED
+        # trajectories get reflected. The result is that interactive-
+        # session failures (selector thrashing, repeated tool errors,
+        # runtime-aborted attempts) never produced lessons.
+        # ``apply_chat_outcome_heuristics`` looks at the just-recorded
+        # turn's shape and promotes UNKNOWN → FAILED when the signals
+        # are unambiguous (runtime abort markers, selector thrashing,
+        # repeated identical tool errors, aborted browser sequences).
+        # The classifier is conservative — calibrated against the
+        # 2026-04-26 webOS incident — so a normal exploratory turn is
+        # NOT promoted. See distill/outcome_heuristics.py for the
+        # signal list and thresholds. Failure here must not break the
+        # turn: if classification raises, log and continue with the
+        # original outcome.
+        try:
+            from ..distill.outcome_heuristics import apply_chat_outcome_heuristics
+            if apply_chat_outcome_heuristics(traj):
+                logger.debug(
+                    "trajectory promoted UNKNOWN→FAILED: %s",
+                    traj.failure_reason,
+                )
+        except Exception as e:
+            logger.debug(
+                "outcome heuristics skipped: %s: %s",
+                type(e).__name__, e,
+            )
         collector.append(traj)
 
     async def _run_system_3_pivot(self, task_context: str, error_context: str, sandbox_state: str, model: str) -> dict:

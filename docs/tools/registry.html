@@ -57,13 +57,13 @@
       <tr><td><code>self_play</code></td><td>memory tools</td><td>One synthetic self-training cycle (600 s wall-clock cap).</td></tr>
       <tr><td><code>self_play_loop</code></td><td>memory tools</td><td>Continuous background self-play loop; stops on any user message or <code>stop_self_play</code>. Optional <code>max_cycles</code> and <code>model</code> override.</td></tr>
       <tr><td><code>stop_self_play</code></td><td>memory tools</td><td>Stop the running self-play loop after its current cycle.</td></tr>
-      <tr><td><code>list_lessons</code></td><td>memory tools</td><td>Surface the skill playbook. <code>scope ∈ {today, week, all, self_play_only}</code>. Read-only; exempt from the meta-task compliance nudge.</td></tr>
+      <tr><td><code>list_lessons</code></td><td>memory tools</td><td>Surface the LESSON playbook (mistakes-and-fixes the agent has internalized). <code>scope ∈ {today, week, all, self_play_only}</code>. Read-only; exempt from the meta-task compliance nudge. NOT for "show me your skills" — that is a TOOL list and routes to <code>manage_skills</code>.</td></tr>
       <tr><td><code>replan</code></td><td>core/agent</td><td>Strategy reset signal.</td></tr>
       <tr><td><code>abort_attempt</code></td><td>core/agent</td><td>Escape hatch for unsolvable tasks.</td></tr>
       <tr><td><code>scratchpad</code></td><td>memory tools</td><td>Short-term KV: set / get / list / clear.</td></tr>
       <tr><td><code>postgres_admin</code></td><td><a href="database.html">database</a></td><td>SQL exec, schema dump, EXPLAIN ANALYZE, activity.</td></tr>
       <tr><td><code>create_skill</code></td><td><a href="acquired_skills.html">acquired_skills</a></td><td>TDD-validated skill acquisition.</td></tr>
-      <tr><td><code>manage_skills</code></td><td>acquired_skills</td><td>List / delete acquired skills.</td></tr>
+      <tr><td><code>manage_skills</code></td><td>acquired_skills</td><td>List / delete the agent's acquired SKILLS (custom Python tools created via <code>create_skill</code>). This is the routing target for "show me your skills", "list your skills", "what skills do you have". Distinct from <code>list_lessons</code>: a SKILL is a tool, a LESSON is a mistake-and-fix.</td></tr>
       <tr><td><code>vision_analysis</code></td><td><a href="vision.html">vision</a></td><td>Image / PDF analysis (auto-registered when vision-capable LLM available).</td></tr>
       <tr><td><code>image_generation</code></td><td><a href="image_gen.html">image_gen</a></td><td>SDXL gen (auto-registered when <code>image_gen_clients</code> configured).</td></tr>
     </tbody>

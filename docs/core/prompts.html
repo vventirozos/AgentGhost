@@ -50,7 +50,8 @@
     <li><code>SLEEP / REST</code> → <code>dream_mode</code></li>
     <li><code>SELF-PLAY (one-shot)</code> → <code>self_play</code> — for "practise", "train", "do self-play" (single cycle).</li>
     <li><code>SELF-PLAY (continuous)</code> → <code>self_play_loop</code> — for "continuously", "in a loop", "back to back", "until I tell you to stop". <code>stop_self_play</code> on explicit user stop while running.</li>
-    <li><code>LESSONS SURFACE</code> → <code>list_lessons</code> — for "what have you learned today/so far/this week". Picks <code>scope</code> ∈ <code>{today, week, all, self_play_only}</code> from phrasing.</li>
+    <li><code>LESSONS SURFACE</code> → <code>list_lessons</code> — for "what have you learned today/so far/this week", "show me your lessons", "show me the lesson playbook". Picks <code>scope</code> ∈ <code>{today, week, all, self_play_only}</code> from phrasing. A LESSON is a mistake-and-fix the agent has internalized — distinct from a SKILL (a tool).</li>
+    <li><code>SKILLS SURFACE</code> → <code>manage_skills(action="list")</code> — for "show me your skills", "list your skills", "what skills do you have", "show me your custom skills". A SKILL is a TOOL or set of tools, NOT a lesson. The historical "skill playbook" wording was the conflation that misrouted skill queries to <code>list_lessons</code>; both the tool description and this rule now disambiguate.</li>
     <li><code>KNOWLEDGE &amp; RAG</code> → <code>recall</code> first.</li>
     <li><code>WEB FACTS</code> → <code>web_search</code> first; <code>fact_check</code> / <code>deep_research</code> only for complex verification.</li>
   </ul>

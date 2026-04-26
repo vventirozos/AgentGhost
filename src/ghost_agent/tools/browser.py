@@ -445,7 +445,54 @@ async def op_interact(op):
                     sel = step.get("selector")
                     if not sel:
                         raise ValueError("click requires 'selector'")
-                    await page.click(sel)
+                    # Optional pre-click guard: wait for an overlay
+                    # selector to leave the page before issuing the
+                    # click. The 2026-04-26 webOS session lost ~70 min
+                    # to a sequence like:
+                    #   click(#unlock-btn)   → JS hides #lock-screen
+                    #   click(#start-btn)   → blocked: #lock-screen
+                    #                         still intercepts events
+                    # Playwright's bare ``click`` auto-waits for the
+                    # TARGET to be actionable but doesn't know about
+                    # an unrelated overlay. ``wait_for_hidden`` lets
+                    # the LLM express "make sure this thing is gone
+                    # before I click my real target" without inserting
+                    # a separate sleep+wait_for_selector pair (which
+                    # also works, but is two extra actions).
+                    wait_for_hidden = step.get("wait_for_hidden")
+                    if wait_for_hidden:
+                        try:
+                            await page.wait_for_selector(
+                                wait_for_hidden,
+                                state="hidden",
+                                timeout=int(step.get(
+                                    "wait_for_hidden_ms",
+                                    min(5000, op["timeout_ms"])
+                                )),
+                            )
+                        except Exception as wait_exc:
+                            # The overlay may already be gone (best
+                            # case) — but if it didn't disappear in
+                            # time, surface that as the click failure
+                            # rather than letting the click itself
+                            # report a generic "intercepts pointer
+                            # events" error. The LLM gets a clearer
+                            # signal: "the thing you said was blocking
+                            # you didn't actually go away".
+                            raise RuntimeError(
+                                f"wait_for_hidden({wait_for_hidden!r}) "
+                                f"timed out before click({sel!r}): "
+                                f"{type(wait_exc).__name__}: {wait_exc}"
+                            )
+                    # ``force=True`` skips Playwright's actionability
+                    # check (visibility, stability, hit-test). Use case:
+                    # a CSS transition that Playwright deems "not
+                    # stable" but whose target is still the right
+                    # element — explicit LLM-driven escape hatch.
+                    if step.get("force"):
+                        await page.click(sel, force=True)
+                    else:
+                        await page.click(sel)
                     results.append({
                         "index": idx, "action": "click", "ok": True,
                         "selector": sel,
@@ -464,7 +511,27 @@ async def op_interact(op):
                     sel = step.get("selector")
                     if not sel:
                         raise ValueError("dblclick requires 'selector'")
-                    await page.dblclick(sel)
+                    wait_for_hidden = step.get("wait_for_hidden")
+                    if wait_for_hidden:
+                        try:
+                            await page.wait_for_selector(
+                                wait_for_hidden,
+                                state="hidden",
+                                timeout=int(step.get(
+                                    "wait_for_hidden_ms",
+                                    min(5000, op["timeout_ms"])
+                                )),
+                            )
+                        except Exception as wait_exc:
+                            raise RuntimeError(
+                                f"wait_for_hidden({wait_for_hidden!r}) "
+                                f"timed out before dblclick({sel!r}): "
+                                f"{type(wait_exc).__name__}: {wait_exc}"
+                            )
+                    if step.get("force"):
+                        await page.dblclick(sel, force=True)
+                    else:
+                        await page.dblclick(sel)
                     results.append({
                         "index": idx, "action": "dblclick", "ok": True,
                         "selector": sel,
@@ -497,6 +564,23 @@ async def op_interact(op):
                     text = step.get("text", "")
                     if not sel:
                         raise ValueError("fill requires 'selector'")
+                    wait_for_hidden = step.get("wait_for_hidden")
+                    if wait_for_hidden:
+                        try:
+                            await page.wait_for_selector(
+                                wait_for_hidden,
+                                state="hidden",
+                                timeout=int(step.get(
+                                    "wait_for_hidden_ms",
+                                    min(5000, op["timeout_ms"])
+                                )),
+                            )
+                        except Exception as wait_exc:
+                            raise RuntimeError(
+                                f"wait_for_hidden({wait_for_hidden!r}) "
+                                f"timed out before fill({sel!r}): "
+                                f"{type(wait_exc).__name__}: {wait_exc}"
+                            )
                     await page.fill(sel, text)
                     results.append({
                         "index": idx, "action": "fill", "ok": True,
@@ -505,12 +589,32 @@ async def op_interact(op):
                 elif name == "wait_for_selector":
                     sel = step.get("selector")
                     timeout_ms = int(step.get("timeout_ms", op["timeout_ms"]))
+                    # ``state`` controls what we're waiting FOR. The
+                    # default ("visible") matches Playwright's own
+                    # default. Crucially, "hidden" / "detached" let the
+                    # LLM wait on something to GO AWAY — this is the
+                    # missing primitive that turned the 2026-04-26
+                    # webOS session into a 70-min loop: the LLM kept
+                    # clicking #unlock-btn and immediately #start-btn
+                    # without any way to say "wait for the lock screen
+                    # to actually finish disappearing first." Bare
+                    # wait_for_selector(sel) with no state arg waits
+                    # for the selector to APPEAR — useless for an
+                    # element that's already in the DOM and just needs
+                    # to fade out. Valid values mirror Playwright:
+                    # attached, detached, visible, hidden.
+                    state = step.get("state", "visible")
+                    if state not in ("attached", "detached", "visible", "hidden"):
+                        raise ValueError(
+                            f"wait_for_selector got invalid state {state!r}; "
+                            "valid: attached, detached, visible, hidden"
+                        )
                     if not sel:
                         raise ValueError("wait_for_selector requires 'selector'")
-                    await page.wait_for_selector(sel, timeout=timeout_ms)
+                    await page.wait_for_selector(sel, state=state, timeout=timeout_ms)
                     results.append({
                         "index": idx, "action": "wait_for_selector", "ok": True,
-                        "selector": sel,
+                        "selector": sel, "state": state,
                     })
                 elif name == "screenshot":
                     out_path = step.get("out_path")

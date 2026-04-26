@@ -27,7 +27,7 @@
     <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>create_skill</code></td><td>Validate test_payload, write the skill to <code>acquired_skills/&lt;name&gt;.py</code>, run TDD via <a href="execute.html"><code>tool_execute</code></a>, persist to <code>skills_registry.json</code>, and embed the description in vector memory.</td></tr>
-      <tr><td><code>manage_skills</code></td><td>List active skills or delete by name.</td></tr>
+      <tr><td><code>manage_skills</code></td><td>List active skills or delete by name. This tool is the canonical answer to "show me your skills" / "list your skills" / "what skills do you have" — a SKILL means a tool the agent has acquired, NOT a lesson it has learned. Lesson-shaped queries route to <a href="memory_tools.html"><code>list_lessons</code></a> instead.</td></tr>
     </tbody>
   </table>
 

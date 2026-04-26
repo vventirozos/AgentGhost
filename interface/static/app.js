@@ -459,19 +459,16 @@ function updateStateFromIcon(icon) {
 
     if (WORKING_ICONS.has(icon)) {
         activeFace.setWorkingState(true);
-        activeFace.setWaitingState(true);
         if (activityIcon) activityIcon.classList.add('working');
         clearTimeout(workTimer);
         workTimer = setTimeout(() => {
             if (!isProcessingRequest) {
                 activeFace.setWorkingState(false);
-                activeFace.setWaitingState(false);
                 if (activityIcon) activityIcon.classList.remove('working');
             }
         }, 60000);
     } else if (IDLE_ICONS.has(icon)) {
         activeFace.setWorkingState(false);
-        activeFace.setWaitingState(false);
         if (activityIcon) activityIcon.classList.remove('working');
         clearTimeout(workTimer);
     }
@@ -709,11 +706,17 @@ function loadChatState() {
     }
 }
 
-// Auto-expand textarea height organically
+// Auto-expand textarea height organically. When the field empties,
+// CLEAR the inline height so the `rows="1"` attribute regains control
+// — `height: auto` on an already-styled textarea computes from content
+// and doesn't reliably snap back to the one-row default.
 chatInput.addEventListener('input', function () {
+    if (this.value === '') {
+        this.style.height = '';
+        return;
+    }
     this.style.height = 'auto';
-    this.style.height = (this.scrollHeight) + 'px';
-    if (this.value === '') this.style.height = 'auto';
+    this.style.height = this.scrollHeight + 'px';
 });
 
 async function sendMessage(isResume = false) {
@@ -723,7 +726,7 @@ async function sendMessage(isResume = false) {
 
     if (text === '/clear' && !resuming) {
         chatInput.value = '';
-        chatInput.style.height = 'auto';
+        chatInput.style.height = '';
         chatLog.innerHTML = '';
         chatHistory = [];
         safeStorage.remove('ghost_chat_history');
@@ -743,7 +746,7 @@ async function sendMessage(isResume = false) {
 
     if (!resuming) {
         chatInput.value = '';
-        chatInput.style.height = 'auto'; // Reset height perfectly
+        chatInput.style.height = ''; // Clear inline height → rows="1" takes over
         addMessage('user', text);
         
         currentTaskId = null;
@@ -783,7 +786,6 @@ async function sendMessage(isResume = false) {
     isProcessingRequest = true;
     toggleSendButtonUI(true);
     activeFace.setWorkingState(true);
-    activeFace.setWaitingState(true);
     // Only flip the dot to 'busy' if the WS is actually up — otherwise
     // the 'error' state should stay so the user sees the real problem.
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1004,7 +1006,6 @@ async function sendMessage(isResume = false) {
         currentChatController = null;
         toggleSendButtonUI(false);
         activeFace.setWorkingState(false);
-        activeFace.setWaitingState(false);
         if (ws && ws.readyState === WebSocket.OPEN) {
             setConnectionState('online', 'SYSTEM ONLINE');
         }
@@ -1082,7 +1083,6 @@ if (workspaceBtn && workspaceUploadInput) {
         } else {
             isProcessingRequest = true;
             activeFace.setWorkingState(true);
-            activeFace.setWaitingState(true);
             
             try {
                 const response = await fetch('/api/workspace/save', {
@@ -1117,7 +1117,6 @@ if (workspaceBtn && workspaceUploadInput) {
             } finally {
                 isProcessingRequest = false;
                 activeFace.setWorkingState(false);
-                activeFace.setWaitingState(false);
             }
         }
     });
@@ -1129,7 +1128,6 @@ if (workspaceBtn && workspaceUploadInput) {
         
         isProcessingRequest = true;
         activeFace.setWorkingState(true);
-        activeFace.setWaitingState(true);
         addMessage('system', `Loading workspace from ${file.name}...`);
         
         const formData = new FormData();
@@ -1183,7 +1181,6 @@ if (workspaceBtn && workspaceUploadInput) {
         } finally {
             isProcessingRequest = false;
             activeFace.setWorkingState(false);
-            activeFace.setWaitingState(false);
             scrollToBottom();
         }
     });
@@ -1209,7 +1206,6 @@ if (uploadBtn && fileUploadInput) {
 
         isProcessingRequest = true;
         activeFace.setWorkingState(true);
-        activeFace.setWaitingState(true);
 
         addMessage('system', `Uploading ${file.name} to sandbox...`);
 
@@ -1240,7 +1236,6 @@ if (uploadBtn && fileUploadInput) {
         } finally {
             isProcessingRequest = false;
             activeFace.setWorkingState(false);
-            activeFace.setWaitingState(false);
             scrollToBottom();
         }
     });
@@ -2207,7 +2202,6 @@ if (micBtn) {
                 
                 try {
                     activeFace.setWorkingState(true);
-                    activeFace.setWaitingState(true);
                     updateActivityIcon('🧠');
                     
                     const res = await fetch('/api/stt', {
@@ -2230,7 +2224,6 @@ if (micBtn) {
                     addMessage('system', '🎙️ STT Upload Failed: ' + err.message);
                 } finally {
                     activeFace.setWorkingState(false);
-                    activeFace.setWaitingState(false);
                 }
                 
                 stream.getTracks().forEach(track => track.stop());

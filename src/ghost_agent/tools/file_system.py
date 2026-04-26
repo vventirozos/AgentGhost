@@ -149,6 +149,48 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
 
     return target_path
 
+
+# Container WORKDIR — kept in sync with sandbox.docker.CONTAINER_WORKDIR.
+# Duplicated here as a literal so this module can be imported without a
+# hard dep on the sandbox package (e.g. in unit tests that exercise path
+# translation without spinning Docker).
+_CONTAINER_WORKDIR = "/workspace"
+
+
+def _to_container_path(sandbox_dir: Path, host_path: Path) -> str:
+    """Translate a HOST absolute path into the path the same file has
+    INSIDE the sandbox container.
+
+    The container bind-mounts ``sandbox_dir`` at ``/workspace``, so a
+    host file at ``<sandbox_dir>/foo/bar.py`` is visible at
+    ``/workspace/foo/bar.py`` from inside the container — and ONLY at
+    that path, since the host filesystem is otherwise opaque to the
+    container.
+
+    Used by sandbox-exec callers (``rg``, ``find``, ...) that take a
+    path argument: passing the host-absolute path would make those
+    tools report "no matches" silently because the container can't see
+    that path. The bug was load-bearing in a 2026-04-26 webOS session
+    where six consecutive ``rg`` searches all returned empty against a
+    file the agent had just successfully edited.
+
+    Pre-condition: ``host_path`` already passed ``_get_safe_path``
+    (i.e. is rooted under ``sandbox_dir``). Falls back to a simple
+    ``.`` ("workspace root") when relative_to() raises, so a
+    pathological caller still gets a usable command rather than an
+    exception.
+    """
+    try:
+        rel = host_path.resolve().relative_to(sandbox_dir.resolve())
+    except (ValueError, OSError):
+        # Should never happen post-_get_safe_path, but be defensive
+        # rather than emit a malformed command.
+        return _CONTAINER_WORKDIR
+    rel_str = rel.as_posix()
+    if rel_str in ("", "."):
+        return _CONTAINER_WORKDIR
+    return f"{_CONTAINER_WORKDIR}/{rel_str}"
+
 async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 8192):
     pretty_log("File Read", filename, icon=Icons.TOOL_FILE_R)
     # GUARD 1: Stop model from trying to read URLs as files
@@ -651,20 +693,33 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
 async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None, sandbox_manager=None):
     # 1. Safety check for None
     if not pattern: return "Error: 'content' (search pattern) is required."
-    
+
     try:
-        # 2. Clean filename and pattern from model-injected artifacts
-        if filename: 
+        # 2. Clean filename and pattern from model-injected artifacts.
+        # ``_get_safe_path`` resolves to a HOST absolute path (e.g.
+        # ``/Users/me/sandbox/webos/app.js``), but ``sandbox_manager.
+        # execute`` runs the rg command INSIDE the Docker container at
+        # workdir=/workspace where the host sandbox is bind-mounted. The
+        # container has no visibility into the host filesystem, so a
+        # host-absolute path makes rg report "no matches" silently —
+        # confirmed in a 2026-04-26 webOS session where the agent burned
+        # six search turns chasing the same empty result. Translate to a
+        # container-visible /workspace/<rel> path here so the command rg
+        # sees actually exists. Path safety / traversal protection still
+        # comes from ``_get_safe_path`` rejecting anything that resolves
+        # outside ``sandbox_dir``.
+        if filename:
             search_path = _get_safe_path(sandbox_dir, filename)
-            escaped_path = shlex.quote(str(search_path))
+            container_path = _to_container_path(sandbox_dir, search_path)
+            escaped_path = shlex.quote(container_path)
         else:
             escaped_path = "."
-    
+
         pattern = str(pattern).strip("'\"") # Strip accidental quotes
         escaped_pattern = shlex.quote(pattern)
-        
+
         pretty_log("File Search", f"'{pattern}' in {filename or 'workspace'}", icon=Icons.TOOL_FILE_S)
-    
+
         cmd = f"rg --line-number --no-heading --color=never --max-columns=300 {escaped_pattern} {escaped_path}"
         output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, timeout=20)
         
@@ -698,11 +753,27 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
-async def tool_find_files(pattern: str, sandbox_manager, path: str = "."):
+async def tool_find_files(pattern: str, sandbox_manager, path: str = ".", sandbox_dir: Path = None):
     if not pattern: return "Error: 'pattern' is required for find operation."
     pretty_log("Find Files", f"'{pattern}' in {path}", icon=Icons.TOOL_FILE_S)
     try:
-        cmd = f"find {shlex.quote(path)} -type f -name {shlex.quote(pattern)} -not -path '*/\.*' -not -path '*/node_modules/*' -not -path '*/__pycache__/*' | head -n 100"
+        # Normalize the path the same way `tool_file_search` does: if
+        # the caller hands us a HOST-absolute path that points inside
+        # the sandbox, translate it to its container-visible
+        # /workspace/... form so `find` (running inside the container)
+        # can actually see it. A relative path or a /workspace path is
+        # left alone. ``sandbox_dir`` is required for translation; when
+        # missing we fall through to the legacy behavior.
+        search_path = path
+        if sandbox_dir is not None and path and path != ".":
+            try:
+                resolved = _get_safe_path(sandbox_dir, path)
+                search_path = _to_container_path(sandbox_dir, resolved)
+            except ValueError:
+                # Outside-sandbox traversal — surface clearly rather than
+                # silently searching the wrong tree.
+                return f"Error: path '{path}' resolves outside the sandbox."
+        cmd = f"find {shlex.quote(search_path)} -type f -name {shlex.quote(pattern)} -not -path '*/\.*' -not -path '*/node_modules/*' -not -path '*/__pycache__/*' | head -n 100"
         output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, timeout=15)
         return output if output.strip() else "Report: No files found matching that pattern."
     except Exception as e: return f"Error: {e}"
@@ -902,7 +973,7 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         search_target = pattern or final_content
         if not search_target:
             return "SYSTEM INSTRUCTION: The 'pattern' parameter is MANDATORY for find operations (e.g. '*.py')."
-        return await tool_find_files(search_target, sandbox_manager, target_path or ".")
+        return await tool_find_files(search_target, sandbox_manager, target_path or ".", sandbox_dir=sandbox_dir)
     
     if operation == "download":
         if not url:

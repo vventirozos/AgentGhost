@@ -78,14 +78,35 @@
   <p>Sub-action types:</p>
   <ul>
     <li><code>{"action":"goto","url":"...","wait_until":"load"}</code> — navigate mid-sequence (e.g. follow a link into a subpage).</li>
-    <li><code>{"action":"click","selector":"..."}</code></li>
-    <li><code>{"action":"dblclick","selector":"..."}</code> — required for <code>ondblclick</code>-bound UIs (desktop-icon launchers etc.). A plain <code>click</code> never fires dblclick listeners; the 2026-04-24 webOS session produced 8 identical screenshots because the agent fired single clicks on <code>.desktop-icon</code> elements whose <code>openApp()</code> handler was wired to dblclick only.</li>
+    <li><code>{"action":"click","selector":"...","wait_for_hidden":"#overlay","force":false}</code> — see "Stability guard" below for the optional fields.</li>
+    <li><code>{"action":"dblclick","selector":"..."}</code> — required for <code>ondblclick</code>-bound UIs (desktop-icon launchers etc.). A plain <code>click</code> never fires dblclick listeners; the 2026-04-24 webOS session produced 8 identical screenshots because the agent fired single clicks on <code>.desktop-icon</code> elements whose <code>openApp()</code> handler was wired to dblclick only. Accepts the same <code>wait_for_hidden</code> / <code>force</code> options as <code>click</code>.</li>
     <li><code>{"action":"extract_text","selector":"...","max_chars":65536}</code> — each extraction is preserved in the results so you can read multiple points in the flow.</li>
-    <li><code>{"action":"fill","selector":"input[name='email']","text":"a@b"}</code> — real text input (atomic ops don't support typing).</li>
-    <li><code>{"action":"wait_for_selector","selector":"...","timeout_ms":5000}</code> — handy after an animation-gated window open.</li>
+    <li><code>{"action":"fill","selector":"input[name='email']","text":"a@b","wait_for_hidden":"#busy"}</code> — real text input (atomic ops don't support typing). Same overlay-wait option as <code>click</code>.</li>
+    <li><code>{"action":"wait_for_selector","selector":"...","state":"visible|hidden|attached|detached","timeout_ms":5000}</code> — <code>state</code> defaults to <code>visible</code>; use <code>hidden</code> to wait for an overlay to GO AWAY (the LLM-facing missing primitive that drove the 2026-04-26 incident).</li>
     <li><code>{"action":"screenshot","out_path":"..."}</code> — sandbox-safety + host→container path rewriting is applied per sub-action.</li>
     <li><code>{"action":"sleep","ms":500}</code> — when you need an explicit pause and there's no selector to wait on.</li>
   </ul>
+
+  <h3>Stability guard: <code>wait_for_hidden</code> + <code>force</code> + <code>wait_for_selector(state)</code> (2026-04-26)</h3>
+  <p>Bare <code>page.click()</code> auto-waits for its TARGET to be actionable, but knows nothing about an unrelated overlay still intercepting clicks. The 2026-04-26 webOS session lost ~70 minutes to this exact shape:</p>
+  <pre><code>actions=[
+  {"action": "click", "selector": "#unlock-btn"},   # JS sets #lock-screen.style.display='none'
+  {"action": "click", "selector": "#start-btn"}     # ←  fails: lock screen still intercepts
+]</code></pre>
+  <p>Three new options give the LLM a clean way to express "wait for the overlay to leave, then click":</p>
+  <ul>
+    <li><strong><code>wait_for_hidden</code></strong> on <code>click</code> / <code>dblclick</code> / <code>fill</code>: a CSS selector for the overlay that must disappear before the action fires. Internally calls <code>page.wait_for_selector(overlay, state="hidden")</code> first; if the overlay does NOT go away in time, the action fails with <code>wait_for_hidden(...) timed out before click(...)</code> — a much clearer signal than Playwright's generic "element intercepts pointer events". An optional <code>wait_for_hidden_ms</code> (default <code>min(5000, op.timeout_ms)</code>) tunes the wait.</li>
+    <li><strong><code>force</code></strong> on <code>click</code> / <code>dblclick</code>: skips Playwright's actionability check (visibility, stability, hit-test). Use sparingly — meant for cases where the LLM is certain the target is correct but Playwright is being conservative (mid-CSS-transition, or a target whose stability oracle is overzealous).</li>
+    <li><strong><code>state</code></strong> on <code>wait_for_selector</code>: defaults to <code>visible</code> (Playwright's own default, the prior behaviour). New values <code>hidden</code> / <code>attached</code> / <code>detached</code> mirror Playwright's API. Bare <code>wait_for_selector(sel)</code> waited for the selector to APPEAR — useless for an element that's already in the DOM and just needs to fade out, which was the missing primitive that drove the incident.</li>
+  </ul>
+  <p>Recommended pattern for a flow with a fading overlay:</p>
+  <pre><code>actions=[
+  {"action": "click", "selector": "#unlock-btn"},
+  {"action": "wait_for_selector", "selector": "#lock-screen", "state": "hidden"},
+  {"action": "dblclick", "selector": ".desktop-icon[data-app='calc']"},
+  {"action": "screenshot", "out_path": "calc.png"},
+]</code></pre>
+  <p>Coverage: <code>tests/test_browser_interact_stability_guard.py</code>.</p>
   <p>By default (<code>stop_on_error=false</code>) a failing sub-action is recorded and the sequence keeps going — so you get full visibility into which step is flaky. Pass <code>stop_on_error=true</code> to abort on first failure.</p>
   <p>The subprocess wall-clock budget for <code>interact</code> scales with action count (<code>timeout_ms × len(actions)</code>), so a 20-step flow doesn't hit the single-op default cap.</p>
 

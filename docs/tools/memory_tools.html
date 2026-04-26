@@ -50,7 +50,7 @@
       <tr><td><code>self_play</code></td><td>dream + frontier</td><td>Runs one self-play cycle picked by the <a href="../memory/frontier.html">FrontierTracker</a>. 600 s wall-clock cap.</td></tr>
       <tr><td><code>self_play_loop(max_cycles=0, model="")</code></td><td>dream + frontier</td><td>Spawns a background <code>asyncio.Task</code> running self-play cycles back-to-back. Stops when the user sends any message (<code>handle_chat</code> sets the stop event) or <code>stop_self_play</code> is called. Not persisted across restarts. Optional <code>model</code> override; <code>max_cycles=0</code> is unbounded.</td></tr>
       <tr><td><code>stop_self_play</code></td><td>—</td><td>Signals the running loop to exit after its current cycle. No-op if no loop is running.</td></tr>
-      <tr><td><code>list_lessons(scope="today", limit=20)</code></td><td><a href="../memory/skills.html">skills</a></td><td>Surface learned lessons filtered by local-time window. <code>scope ∈ {today, week, all, self_play_only}</code>. Routed automatically when the user asks "what did you learn today / so far?".</td></tr>
+      <tr><td><code>list_lessons(scope="today", limit=20)</code></td><td><a href="../memory/skills.html">skills</a></td><td>Surface learned LESSONS (mistakes-and-fixes) filtered by local-time window. <code>scope ∈ {today, week, all, self_play_only}</code>. Routed automatically when the user asks "what did you learn today / so far?", "show me your lessons", "show me the lesson playbook". Distinct from <code>manage_skills</code>: a SKILL is a tool, a LESSON is a fix; "show me your skills" routes to <code>manage_skills</code>, NOT here.</td></tr>
     </tbody>
   </table>
 

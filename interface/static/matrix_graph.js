@@ -14,12 +14,12 @@ export const COLORS = {
     background: new THREE.Color('#000000'),
 
     nodeBase: new THREE.Color('#1a0000'),    // Very Dark Red
-    nodeActive: new THREE.Color('#005eff'),  // Dark Red
-    nodeError: new THREE.Color('#ff00ee'),   // Electric Blue
+    nodeActive: new THREE.Color('#005eff'),  // Electric Blue
+    nodeError: new THREE.Color('#ff00ee'),   // Magenta
 
     lineBase: new THREE.Color('#300000'),    // Very Dark Red (lines)
     lineActive: new THREE.Color('#450000'),  // Dark Red (lines)
-    lineError: new THREE.Color('#00fff2'),   // Electric Blue
+    lineError: new THREE.Color('#00fff2'),   // Cyan
 };
 // ---------------------------
 
@@ -45,15 +45,10 @@ let shapeTime = 0;
 let currentShapeSpeed = SPEEDS.idle;
 let animationFrameId;
 
-let spikeStrength = 0.2;
-let targetSpikeStrength = 0.2;
-
 let errorState = 0.0;
 let targetErrorState = 0.0;
 let workingState = 0.0;
 let targetWorkingState = 0.0;
-let waitingState = 0.0;
-let targetWaitingState = 0.0;
 
 // Pulse (shockwave) state. triggerPulse()/triggerSmallPulse() raise
 // pulseT to some peak and then decay toward 0 each frame. The line
@@ -425,9 +420,17 @@ export function updateSphereColor(colorHex) {
     try { accentColor.set(colorHex); } catch (e) { /* ignore */ }
 }
 
+// Spike clear-timeout is tracked so rapid repeat spikes each extend
+// the error window to +2s from the latest call instead of letting the
+// first timeout yank it down while later spikes are still in flight.
+let _spikeClearTimeout;
 export function triggerSpike() {
     targetErrorState = 1.0;
-    setTimeout(() => { targetErrorState = 0.0; }, 2000);
+    if (_spikeClearTimeout) clearTimeout(_spikeClearTimeout);
+    _spikeClearTimeout = setTimeout(() => {
+        targetErrorState = 0.0;
+        _spikeClearTimeout = null;
+    }, 2000);
 }
 
 export function triggerNextColor() { /* retained no-op for compatibility */ }
@@ -461,42 +464,16 @@ export function setWorkingState(isWorking) {
     }
 }
 
-let waitingTimeout;
-export function setWaitingState(isWaiting) {
-    if (isWaiting) {
-        if (targetWaitingState < 0.5 && !waitingTimeout) {
-            waitingTimeout = setTimeout(() => {
-                targetWaitingState = 1.0;
-                waitingTimeout = null;
-            }, 500);
-        }
-    } else {
-        if (waitingTimeout) {
-            clearTimeout(waitingTimeout);
-            waitingTimeout = null;
-        }
-        targetWaitingState = 0.0;
-    }
-}
-
 // --- Main animation loop -------------------------------------------
 
 function animate() {
     animationFrameId = requestAnimationFrame(animate);
 
-    if (targetErrorState > 0.5) {
-        targetSpikeStrength = 1.0;
-    } else {
-        targetSpikeStrength = 0.0;
-    }
+    const isWaking = targetWorkingState > workingState + 0.01;
+    const transitionSpeed = isWaking ? 0.05 : 0.02;
 
-    let isWaking = (targetWorkingState > workingState + 0.01) || (targetWaitingState > waitingState + 0.01);
-    let transitionSpeed = isWaking ? 0.05 : 0.02;
-
-    spikeStrength += (targetSpikeStrength - spikeStrength) * transitionSpeed;
     workingState += (targetWorkingState - workingState) * transitionSpeed;
-    waitingState += (targetWaitingState - waitingState) * transitionSpeed;
-    errorState += (targetErrorState - errorState) * 0.08;
+    errorState   += (targetErrorState   - errorState)   * 0.08;
 
     // Pulse / accent decay. Independent rates so the color lingers past
     // the shockwave for a softer afterimage.

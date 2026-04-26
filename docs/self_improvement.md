@@ -272,6 +272,54 @@ broken. The runtime gate now detects this (marker present + binary
 absent) and forces a re-install on next `ensure_running`; if the
 behaviour persists, rebuild the image: `scripts/build_sandbox_image.sh`.
 
+## Closing the loop on interactive-session failures (2026-04-26)
+
+The Reflector iterates only `outcome=FAILED` trajectories. Chat turns
+ship with `outcome=UNKNOWN` because there's no validator on free-form
+chat — only self-play and self-consistency batches produce explicit
+FAILED. That made the self-improvement loop *blind* to interactive
+sessions: a 70-minute thrash on a misdiagnosed UI bug never produced
+a lesson because the per-turn trajectories all stayed UNKNOWN.
+
+`distill/outcome_heuristics.py::classify_chat_outcome` looks at a
+just-recorded chat trajectory and promotes UNKNOWN → FAILED when one
+of four signals fires:
+
+1. **Runtime abort markers** — `[ATTEMPT_ABORTED_*]` substrings in
+   `final_response` (cross-turn loop, thinking-budget cap, n-gram
+   loop, …). These markers fire only when an in-band guard has
+   already determined the turn was non-productive, so they're a
+   strong signal.
+2. **Browser selector thrash** — the same selector appears in ≥ 4
+   browser tool-call invocations within one turn (atomic ops + every
+   `interact` sub-action are counted). This is the exact shape of the
+   2026-04-26 webOS incident: identical click selectors fired across
+   8 nested `interact` calls.
+3. **Repeated identical tool errors** — the same `(tool, normalized
+   error message)` pair appears ≥ 3 times in one turn. Errors are
+   normalised (whitespace squash, lowercase, leading "Error:"
+   prefix stripped) so two textually-similar errors hash to one key.
+4. **Browser sequence aborted** — the result text contains
+   `⚠ SEQUENCE ABORTED` (set by `op_interact` when a goto fails and
+   cascades through the rest of the action list).
+
+The classifier is **conservative**: existing PASSED / FAILED outcomes
+are never overruled, three repeats of the same selector is below
+threshold, and a single tool error doesn't fire. False positives
+flood the lesson store with bad reflections, so the bar stays high.
+
+`apply_chat_outcome_heuristics(traj)` is the in-place wrapper called
+from `core/agent.py::_record_turn_trajectory` just before
+`collector.append`. It runs after the trajectory is fully assembled;
+classification failure is logged at debug and never blocks the turn.
+Cross-turn signals (e.g. "the same misdiagnosis appears across 5
+turns") need session-scoped state and are deliberately out of scope —
+they belong in a future `session_telemetry.py` keyed by `session_id`.
+
+Coverage: `tests/test_trajectory_failure_heuristic.py` (signal
+matrix, threshold knobs, no-op on healthy turns, end-to-end
+integration with the Reflector).
+
 ## Browser `interact` abort semantics
 
 The `browser.interact` op runs a list of sub-actions inside a single

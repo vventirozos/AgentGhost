@@ -386,6 +386,11 @@ footer#input-area-wrapper {
     max-height: 150px;
     line-height: 1.5;
     font-weight: 300;
+    /* textarea scrollHeight includes vertical padding, so the JS
+       auto-grow assigns padding-inclusive values. Without border-box
+       the element would render (scrollHeight + padding) tall and jump
+       ~28px on the first keystroke. */
+    box-sizing: border-box;
 }
 
 #chat-input::placeholder {

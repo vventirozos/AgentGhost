@@ -56,16 +56,26 @@ Companion processes (web UI, Slack bot, voice, image-gen) are documented in [Ins
 | `src/ghost_agent/sandbox/` | Docker container manager |
 | `src/ghost_agent/api/` | FastAPI routes |
 | `src/ghost_agent/utils/` | Logging, sanitiser, token counter, Tor helpers |
+| `src/ghost_agent/_env.py` | Telemetry-hardening import-time side-effects (PostHog / Chroma / HF Hub opt-outs) |
+| `src/ghost_agent/eval/` | Local-only outcome-eval harness (default + post-learning suites, baseline freeze/diff, network guard) |
+| `src/ghost_agent/distill/` | Redacted trajectory logging + N-sample self-consistency for downstream training |
+| `src/ghost_agent/router/` | Hand-crafted-feature complexity classifier (numpy-only logistic regression, JSON weights) |
+| `src/ghost_agent/optim/` | DSPy / GEPA prompt optimisation, scoped to `{planning, tool_selection, reflection}` |
+| `src/ghost_agent/skills_auto/` | Passive skill mining over validator-passing trajectories |
+| `src/ghost_agent/reflection/` | Idle-time self-critique loop; failures distilled into reusable lessons |
 | `interface/` | Web UI, Slack bot, voice / image servers, desktop client |
 | `docs/` | **HTML source for the published reference** (served at [vventirozos.github.io/AgentGhost](https://vventirozos.github.io/AgentGhost/)) |
 | `tests/` | Behaviour-organised pytest suite (`asyncio_mode=auto`) |
+| `scripts/` | Eval / GEPA / sandbox-image / token-load helper scripts |
+
+The `eval / distill / router / optim / skills_auto / reflection` modules together form Ghost's local-only stage-1 self-improvement substrate. Reflections close the loop by writing into `SkillMemory` so a fresh user turn retrieves the corrected plan via the existing memory bus — no external teacher, no weight update.
 
 ## Tests & lint
 
 ```bash
-pytest                                   # full suite
-pytest tests/test_agent_planning.py      # single file
-pytest -k "memory and not slack"         # filter
+GHOST_API_KEY=test-key pytest                                   # full suite (key is required at collection time — interface/server.py raises on missing key)
+GHOST_API_KEY=test-key pytest tests/test_agent_planning.py      # single file
+GHOST_API_KEY=test-key pytest -k "memory and not slack"         # filter
 black src interface tests
 pylint src/ghost_agent
 ```

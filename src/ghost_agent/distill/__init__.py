@@ -22,6 +22,11 @@ from .schema import Trajectory, ToolCall, Outcome
 from .redact import redact_text, redact_trajectory, RedactionConfig
 from .collector import TrajectoryCollector
 from .self_consistency import SelfConsistencySampler, Sample
+from .outcome_heuristics import (
+    classify_chat_outcome,
+    apply_chat_outcome_heuristics,
+    FailureClassification,
+)
 
 __all__ = [
     "Trajectory",
@@ -33,4 +38,7 @@ __all__ = [
     "TrajectoryCollector",
     "SelfConsistencySampler",
     "Sample",
+    "classify_chat_outcome",
+    "apply_chat_outcome_heuristics",
+    "FailureClassification",
 ]
