@@ -6,10 +6,24 @@ API. The reasoning chain: **measure → log → route → optimise →
 acquire → reflect**, each step producing signal the next needs.
 
 **Status:** wired end-to-end in `main.py`, verified against the live
-agent. A seeded failure produces a reflection whose diagnosis + plan
-is persisted into `SkillMemory`, retrieved by the memory bus on a
-fresh-but-similar user turn, and visibly changes the agent's first
-action — all without any weight update.
+agent on **two complementary timescales**:
+
+* **real-time** (post-turn) — a user-correction-shaped follow-up
+  promotes the prior trajectory to FAILED, schedules
+  `Reflector.reflect_one` as an `asyncio.create_task`, and the
+  composite sink writes the lesson to `SkillMemory` before the user
+  types their next message. No idle window required.
+* **idle backstop** (biological watchdog phase 2.5) — the original
+  path. Trajectories the user never returned to correct (or whose
+  correction was missed by the heuristic gate) get reflected on
+  during the 15-60 min idle window.
+
+Both paths share the composite sink and the `_reflected_trajectory_ids`
+dedup set, so a trajectory reflected by either path is skipped by
+the other. Verified live: a seeded failure produces a reflection
+whose diagnosis + plan is persisted into `SkillMemory`, retrieved by
+the memory bus on a fresh-but-similar user turn, and visibly changes
+the agent's first action — all without any weight update.
 
 ## Module map
 
@@ -41,10 +55,30 @@ action — all without any weight update.
   → TrajectoryCollector
     .append (redacts, day-
      partitioned JSONL)
+  → stash (response_fp → traj)        ◄─ enables real-time path
+    on ctx._recent_trajectories
+            │
+            ▼
+   NEXT user turn arrives
+            │
+            ▼
+   _maybe_promote_prior_turn_via_user_correction:
+     (A) anchored correction-phrase regex
+         on the new user message AND
+     (B) Jaccard token-overlap of new
+         user vs prior user ≥ 0.40
+     ──── BOTH must fire ────
+                │
+                ▼
+        update_outcome → corrections.jsonl  (overlay, audit-safe)
+        traj.outcome   = FAILED              (in-memory)
+        asyncio.create_task(
+            Reflector.reflect_one(traj, sink))    ◄─ fire-and-forget,
+                                                     real-time path
             │
             ▼
    ┌──────────────┐
-   │ biological   │  idle-time phases:
+   │ biological   │  idle-time phases (backstop):
    │   watchdog   │   1.   journal drain       (>120s)
    └──────────────┘   2.   REM dream           (600-3600s, cooldown 30m)
             │         2.5  reflection          (900-3600s, cooldown 40m)
@@ -53,6 +87,7 @@ action — all without any weight update.
             ▼
   FAILED trajectories ─→ Reflector.run ─→ (diagnosis, plan)
                                           │
+                  ─────── BOTH paths converge here ────────
                                           ▼
                          composite sink ──┬──→ JSONL (task_kind=reflection)
                                           └──→ SkillMemory.learn_lesson
@@ -173,7 +208,17 @@ async def critique(prompt: str) -> str:
     return res["choices"][0]["message"]["content"]
 
 ctx.trajectory_collector = TrajectoryCollector()  # writes to $GHOST_HOME/system/trajectories
-ctx.reflector = Reflector(critique_fn=critique, model=args.model)
+ctx.reflector = Reflector(
+    critique_fn=critique,
+    # 120s ceiling: Qwen 3.6 is a reasoning model whose
+    # `reasoning_content` phase regularly burns 30-60s before any
+    # visible content, AND the post-turn reflect_one path competes
+    # with the user-facing turn for the same upstream. 45s was too
+    # tight in practice — observed silent timeout on the post-turn
+    # path even though the structural promotion fired correctly.
+    per_call_timeout_s=120.0,
+    model=args.model,
+)
 
 # The important part — the composite sink is what CLOSES the loop.
 # Without it, reflections just land in JSONL and nothing reads them.
@@ -188,11 +233,24 @@ def reflection_sink(traj):
 ctx.reflection_sink = reflection_sink
 ```
 
-With those set, the watchdog fires reflection every ~40 min on recent
-FAILED trajectories. Each reflection is persisted to JSONL AND to
-`SkillMemory`; on any future user turn whose semantic-neighbourhood
-retrieval surfaces the lesson, the agent enters the turn already
-primed with the corrected plan.
+With those set:
+
+* **The biological watchdog** fires reflection every ~40 min on
+  recent FAILED trajectories that the user never returned to (or
+  whose correction the heuristic gate missed).
+* **The real-time post-turn path** (`_maybe_promote_prior_turn_via_user_correction`)
+  is automatically active once `ctx.reflector` and
+  `ctx.trajectory_collector` are wired — `handle_chat` invokes it
+  on every user turn with no extra opt-in. A correction-shaped
+  follow-up promotes the prior trajectory and schedules
+  `reflect_one` immediately; the lesson typically lands within
+  ~10 s of the correction message returning, on a warm upstream.
+
+Each reflection is persisted to JSONL AND to `SkillMemory`; on any
+future user turn whose semantic-neighbourhood retrieval surfaces the
+lesson (planner pre-fetch at `agent.py:2260`, execution-stage
+fetch at `agent.py:2402`), the agent enters the turn already primed
+with the corrected plan.
 
 ## Cooldown anchor discipline
 
@@ -319,6 +377,221 @@ they belong in a future `session_telemetry.py` keyed by `session_id`.
 Coverage: `tests/test_trajectory_failure_heuristic.py` (signal
 matrix, threshold knobs, no-op on healthy turns, end-to-end
 integration with the Reflector).
+
+## Real-time loop closure: user-correction promotion (2026-04-28)
+
+`outcome_heuristics` (above) catches *mechanically-stuck* failures —
+selector thrash, repeated tool errors, abort markers. It misses the
+dominant interactive-chat failure mode: the agent confidently
+produces an answer that's *wrong*, the user pushes back, and we
+want to learn from that exchange before the user's next message.
+
+The user's next message **is** the cheapest, most reliable supervisor
+for free-form chat. If they're correcting us, the prior turn was
+FAILED — by the user's own verdict, no validator required. Two
+mechanisms make that signal usable:
+
+### 1. The classifier (`distill/user_correction.py`)
+
+Pure-Python, two-signal predicate. **Promotion requires BOTH** to
+fire:
+
+* **Signal A — anchored correction phrase.** Regex anchored at the
+  start of `current_user_text`: `no`, `nope`, `wrong`, `actually`,
+  `that's not right`, `I meant`, `you misunderstood`, `try again`,
+  `redo`, `didn't work`, … A "no" deep inside a sentence does *not*
+  count (anchored start guards against discourse-marker false
+  positives).
+* **Signal B — semantic rephrase.** Token-overlap Jaccard between
+  the prior user message and the current one, computed over
+  content tokens (stopwords stripped — articles, pronouns, common
+  quantifiers, common modal verbs). Threshold ≥ `0.40`. The
+  intuition: if the user is re-asking the same question, that's
+  strong evidence the prior assistant answer was inadequate.
+
+A single signal alone has too many false positives. *"No, I think
+you're right"* is phrase-without-rephrase. *"… and also, what about
+X?"* is rephrase-without-phrase. Both signals together catch the
+genuine corrections while leaving prosaic follow-ups alone. The
+classifier is purely lexical — no LLM call, no embeddings.
+
+Knobs (module-level constants for runtime tuning):
+
+| Constant | Default | Meaning |
+|---|---|---|
+| `JACCARD_REPHRASE_THRESHOLD` | `0.40` | Minimum content-token overlap for Signal B |
+| `MIN_CURRENT_TOKENS_FOR_REPHRASE` | `2` | Floor on current-message content tokens (a bare "no" can't fire B) |
+
+Coverage: `tests/test_user_correction.py` (24 cases — phrase
+coverage, single-signal guards, anchored start, defensive
+normalisation of None / non-string inputs, threshold pinning,
+verdict-shape contract).
+
+### 2. The wiring (`core/agent.py`)
+
+Two new helpers on `GhostAgent`:
+
+* `_stash_trajectory_for_correction_lookup(traj)` — called inside
+  `_record_turn_trajectory` right after `collector.append`. Builds
+  a stable md5 fingerprint of the response prefix (whitespace-
+  collapsed first 500 chars, lowered) and stores
+  `{fingerprint: traj}` on `ctx._recent_trajectories_for_correction`.
+  Bounded LRU at 32 entries — enough for several concurrent
+  conversations without unbounded growth.
+
+* `_maybe_promote_prior_turn_via_user_correction(messages, current_user_text)` —
+  called from `handle_chat` immediately after `last_user_content`
+  is set. Walks `messages[:-1]` to find the prior assistant +
+  prior user, fingerprints the assistant content, looks up the
+  cached trajectory. If the classifier returns
+  `is_correction=True`, it:
+  1. mutates the cached trajectory's `outcome` and `failure_reason`
+     **in memory** (so the immediate `reflect_one` call sees them);
+  2. appends a record to the corrections sidecar (durable);
+  3. drops the cache entry (one promotion per stashed trajectory);
+  4. schedules `Reflector.reflect_one(traj, sink, already_reflected)`
+     via `loop.create_task` — fire-and-forget, the user turn
+     doesn't block on the LLM critique.
+
+The `_pending_reflection_tasks` set on the context tracks in-flight
+tasks (each adds itself, removes on done). A done-callback logs
+the result via `pretty_log("Post-Turn Reflection", …)` — `ok` with
+the diagnosis preview, `no lesson` with the error reason
+(`timeout after Ns`, `unparseable reflection response`), or
+`failed` with the exception type. **Without that callback the
+async task's result is invisible**: a critique timeout silently
+produced no lesson and operators couldn't tell the difference
+between "loop misfired" and "LLM was slow".
+
+The shared `_reflected_trajectory_ids` set is honoured by both
+`Reflector.reflect_one` (real-time) and `Reflector.run` (biological
+backstop) so a trajectory reflected via the real-time path is
+skipped by the watchdog and vice versa.
+
+### 3. The corrections sidecar (`distill/collector.py`)
+
+Outcome promotions discovered AFTER the original JSONL write land
+in **`corrections.jsonl`** at the trajectory tree root, NOT by
+rewriting the original line. `update_outcome(trajectory_id, outcome,
+reason, source=…)` appends a JSON line; `iter_trajectories` overlays
+the latest correction per id on read. Properties:
+
+* The original JSONL line stays byte-identical — the audit trail is
+  preserved.
+* Last-write-wins on repeat updates for the same id.
+* Malformed sidecar lines are skipped without poisoning the overlay.
+* Orphan corrections (id not in any JSONL) are silently ignored on
+  read.
+* `update_outcome` is a no-op when the collector is `enabled=False`
+  (mirrors `append`).
+* The sidecar is a single file (NOT day-partitioned) — the workload
+  is tiny (one record per failed turn) and a single growing file
+  lets readers apply corrections in O(corrections) instead of
+  scanning every day's directory.
+
+Coverage: `tests/test_trajectory_corrections_sidecar.py` (12 cases),
+`tests/test_post_turn_reflection_wiring.py` (12 cases), and the
+end-to-end ratchet `tests/test_self_improvement_loop_e2e.py` (2
+cases).
+
+### 4. `Reflector.reflect_one(traj, sink, already_reflected)`
+
+Single-trajectory entrypoint that bypasses the iterator path used
+by `run()`. Honours the same `already_reflected` dedup set, and
+adds the trajectory id to the set **before** the await — so a
+concurrent biological-tick `run()` can't double-reflect on the same
+trajectory while `reflect_one`'s critique is pending. Sink contract
+matches `run()`: invoked once per ok reflection; sink exceptions
+are logged at WARNING and swallowed.
+
+Coverage: `tests/test_reflect_one.py` (7 cases).
+
+### Live verification (2026-04-28)
+
+Multi-turn against the running agent on `:8000`:
+
+```
+turn 1 user: "Reply with three words exactly: kangaroo trampoline lighthouse..."
+turn 1 ai  : "kangaroo trampoline lighthouse"
+   → trajectory id=46df2dfe... outcome=unknown
+   → fingerprint stashed on ctx cache
+
+turn 2 user: "no, reply with three words exactly: kangaroo trampoline metronome..."
+   → classifier verdict: is_correction=True, signals=[phrase, rephrase(jaccard=0.82)]
+   → corrections.jsonl record:
+     {trajectory_id: "46df2dfe…", outcome: "failed",
+      reason: "user-correction signal: phrase + rephrase(jaccard=0.82)",
+      source: "user_correction"}
+   → TrajectoryCollector overlay yields outcome=FAILED ✓
+   → asyncio.create_task(reflector.reflect_one(...))
+   → done-callback logs:
+     post-turn reflection: ok (traj=46df2dfe): diagnosis='The previous response
+     likely included extra text...'
+   → SkillMemory.learn_lesson → playbook 22 → 23 lessons
+   → similar query "respond with three words exactly" surfaces the new lesson
+```
+
+The first attempt of this exact test failed cleanly with
+`no lesson (traj=…): timeout after 45.0s` (the model was busy
+processing turn 2 on the same upstream). Bumped
+`Reflector.per_call_timeout_s` from 45s → 120s in `main.py` —
+Qwen 3.6 35B-A3 is a reasoning model whose hidden
+`reasoning_content` regularly burns 30-60s before emitting visible
+content, and 45s left no headroom when the user-facing turn was
+saturating the upstream. After the bump, `reflect_one` completes in
+~9s on average and the lesson lands within seconds of the user's
+correction message returning.
+
+## Wrong-question detection: verifier alignment + lesson retraction (2026-04-28)
+
+A user trace exposed a triple failure: user asked *"how can I see how many lines of code is a project? just give me the code"*; the agent ran `wc -l` in its own sandbox and replied *"The project has **1,623 lines of code**"*; the verifier returned **CONFIRMED (100%)**; the Perfection-Protocol then saved an **"Optimization Analysis"** lesson into `SkillMemory` based on that wrong answer. Three layers failed in sequence — the model misread the user, the verifier rubber-stamped it, and the opt-prot baked the misread into long-term memory.
+
+The fix touches all three layers.
+
+### 1. Verifier audits user-request alignment
+
+Before: `verify_code_output(code, output, intent)` asked the LLM "does the OUTPUT contain the information the user asked for?" — a check that's true whenever the printed claim is internally consistent with the tool output, regardless of whether the agent answered a different question than the user asked.
+
+After: `verify_code_output(code, output, intent, *, response="")` takes the agent's user-facing reply as a fourth slot. The prompt rubric leads with **constraint satisfaction**:
+
+> Does the user's wording include explicit constraints on the form of the answer? Examples: "just give me the code", "in one sentence", "without using X", "list only the names", "as JSON". If yes, does the AGENT'S RESPONSE satisfy those constraints? **If the user asked for code and the agent returned a number / prose / a result, that is a REFUTED — the agent answered a different question than the one asked, even if the tool output is internally consistent.**
+
+The prompt enumerates the failure shapes explicitly (user asks for code → agent returns a result; user asks for format X → agent ignores it; tool output is a sandbox-internal artefact the user can't actually use) so the verifier LLM has concrete patterns to match. A CONFIRMED verdict requires BOTH the tool output to be sound AND the response to match what the user asked for. The verifier callsite in `core/agent.py` passes `response=final_ai_content` so the rubric has the agent's reply to audit.
+
+Coverage: `tests/test_verifier_user_intent_alignment.py` (10 cases — prompt content invariants, the response slot rendering, back-compat sentinel for callers that don't pass `response`, response-slot truncation, and a rubric-following stub that pins the exact 12:04 failure shape gets REFUTED under the new prompt format).
+
+### 2. Lesson provenance via `source_trajectory_id`
+
+Every `learn_lesson` write now records the trajectory id of the turn that produced the lesson. Persisted on:
+
+* the JSON playbook entry (`source_trajectory_id` field, populated via `build_lesson` and surfaced through `_normalize_lesson` so legacy lessons read back as `""`);
+* the vector-store metadata (so `collection.delete(where={"source_trajectory_id": ...})` is the one-liner that scrubs the embedding tier).
+
+Two production writers thread the id:
+
+* **Perfection-Protocol** (`core/agent.py::handle_chat` → `learn_lesson(...)`) uses the current turn's pre-allocated `current_trajectory_id`. The id is allocated at the **start of `handle_chat`** with `uuid.uuid4().hex` because the opt-prot fires BEFORE `_record_turn_trajectory` writes the trajectory to disk; both callsites must use the same id or retraction can't link them.
+* **Composite reflection sink** (`main.py`) uses `reflected_trajectory.extra["reflected_from"]` — the *original failed trajectory's* id, not the reflection trajectory's own id. Rationale: the reflection's lesson IS the corrective behaviour for that source failure, so provenance unifies under one id per source-of-failure.
+
+Legacy lessons (written before the schema change) read back as `source_trajectory_id=""`. The empty-string-id case is a **deliberately protected sentinel**: `retract_lessons_from_trajectory("")` returns 0 without touching disk, so a buggy caller passing an empty string can't accidentally scrub every legacy lesson at once.
+
+Coverage: `tests/test_skill_provenance_and_retraction.py` (16 cases across schema, persistence, retraction matching/idempotency, legacy protection, vector-delete `where`-filter shape, error swallowing, and the full poison→correction→retraction integration).
+
+### 3. Retraction on FAILED promotion
+
+`SkillMemory.retract_lessons_from_trajectory(trajectory_id, memory_system=None) -> int` is the scrub primitive. JSON pass under the lock, atomic write of the surviving entries; vector pass via `collection.delete(where={"source_trajectory_id": ...})` (best-effort — JSON is the canonical store). Idempotent. Returns the count removed from the playbook. Logged via `pretty_log("Skill Retracted", …)` so a tail of the agent log makes scrubs visible.
+
+Two callsites in `core/agent.py`:
+
+* **Verifier-driven retraction (preventive)** — when the verifier returns REFUTED with confidence ≥ 0.7, the gate appends the verifier note to `final_ai_content` AND immediately calls `retract_lessons_from_trajectory(current_trajectory_id, memory_system=ctx.memory_system)`. This catches the dominant case at source: the Perfection-Protocol's lesson is on disk, the verifier just disagreed with the response, scrub before the user even sees the reply.
+* **User-correction-driven retraction (recovery)** — `_maybe_promote_prior_turn_via_user_correction` calls retract on the prior turn's id immediately after writing the sidecar correction record and BEFORE scheduling reflect_one. The reflection then writes the corrective lesson with the same `source_trajectory_id` (because `reflected_from` is the prior turn's id), so the playbook ends up with the right entry rather than both. Without retraction, the previous-turn's poisoned lesson and the reflection's corrective lesson would coexist in the playbook with no demotion mechanism, and BM25 / vector ranking would still surface the wrong one for some queries.
+
+Both retraction paths are wrapped in `try/except logger.debug` so a retraction failure can never break the user turn. The verifier-driven path runs synchronously inside `handle_chat`; the user-correction path runs synchronously inside the next-turn classifier helper.
+
+### Live verification against the running agent (2026-04-28)
+
+Re-issued the original failure prompt. The agent's response now leads with the command — *"Here's the command: \`find . -type f \\(-name "\*.js" -o -name "\*.html" -o -name "\*.css" -o -name "\*.py" \\) -exec cat {} + | wc -l\`. For this sandbox, the result is **1,601 lines of code**."* — and the verifier returned CONFIRMED (correctly: the user got the command they asked for). The Perfection-Protocol's eager-write gate didn't fire because the response is now > 50 chars (the gate guards against empty replies, not against verbose ones), so no poisoned lesson was written for this turn. The polluted entry from the original 12:04 trace remains in the playbook with `source_trajectory_id=""` (legacy, pre-schema-change) — the protection sentinel keeps it safe from accidental bulk retraction; future opt-prot writes carry provenance and can be scrubbed cleanly.
+
+The non-reproducibility of the failure is itself a partial validation: the agent improved its answer between runs because the polluted lesson surfaced its previously-cached find/wc one-liner in the system-prompt context, and the agent's own planner used it. We can't tell from this alone whether the verifier alignment fix would have caught the original wrong response, so the prompt-rubric audit lives in the unit test (`test_wrong_question_shape_can_be_refuted` exercises a stub LLM that follows the rubric literally on the exact failure-trace inputs and asserts REFUTED).
 
 ## Browser `interact` abort semantics
 

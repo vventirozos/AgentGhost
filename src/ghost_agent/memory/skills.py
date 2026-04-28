@@ -116,6 +116,13 @@ def _normalize_lesson(lesson: dict) -> dict:
     out["helpful_retrievals"] = int(out.get("helpful_retrievals") or 0)
     out.setdefault("last_retrieved_at", "")
     out.setdefault("source", "")
+    # Trajectory id of the turn that produced this lesson. Used by
+    # `retract_lessons_from_trajectory` to scrub poisoned lessons
+    # when the source trajectory is later promoted to FAILED (e.g.
+    # the user-correction path catches an opt-prot lesson that was
+    # written before the user could push back). Empty string for
+    # legacy lessons / lessons with no clear single source.
+    out.setdefault("source_trajectory_id", "")
     return out
 
 
@@ -130,6 +137,7 @@ def build_lesson(
     source_challenge_hash: str = "",
     verified: bool = False,
     source: str = "",
+    source_trajectory_id: str = "",
 ) -> dict:
     """Construct a canonical structured lesson. Callers that only have
     legacy `task/mistake/solution` can pass those as trigger/
@@ -140,6 +148,12 @@ def build_lesson(
     string — the trigger must stay close to the user's query language
     so semantic retrieval and BM25 re-ranking keep working. Provenance
     is surfaced at render time from this separate field.
+
+    ``source_trajectory_id`` is the trajectory whose turn produced
+    this lesson. Production writers (Perfection-Protocol,
+    reflection sink) thread the current turn's trajectory id
+    through here so the user-correction path can retract poisoned
+    lessons — see ``SkillMemory.retract_lessons_from_trajectory``.
     """
     lesson = {
         "timestamp": _now_iso(),
@@ -162,6 +176,7 @@ def build_lesson(
         "helpful_retrievals": 0,
         "last_retrieved_at": "",
         "source": source or "",
+        "source_trajectory_id": source_trajectory_id or "",
     }
     return lesson
 
@@ -398,6 +413,7 @@ class SkillMemory:
         source_challenge_hash: str = "",
         verified: bool = False,
         source: str = "",
+        source_trajectory_id: str = "",
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
@@ -467,6 +483,7 @@ class SkillMemory:
                 source_challenge_hash=source_challenge_hash,
                 verified=verified,
                 source=source,
+                source_trajectory_id=source_trajectory_id,
             )
 
             with self._get_lock():
@@ -484,6 +501,11 @@ class SkillMemory:
                     "trigger": new_lesson.get("trigger", "")[:200],
                     "domains": ",".join(new_lesson.get("domains", []))[:200],
                     "verified": bool(new_lesson.get("verified")),
+                    # Persist provenance on the vector copy so
+                    # `retract_lessons_from_trajectory` can scrub
+                    # both stores at once via collection.delete with
+                    # a `where` filter on this metadata key.
+                    "source_trajectory_id": new_lesson.get("source_trajectory_id", "") or "",
                 }
                 memory_system.add(text, meta)
 
@@ -513,6 +535,87 @@ class SkillMemory:
                     self._save_playbook_unlocked(playbook)
                     return True
             return False
+
+    def retract_lessons_from_trajectory(
+        self,
+        trajectory_id: str,
+        memory_system=None,
+    ) -> int:
+        """Remove every lesson whose ``source_trajectory_id`` matches.
+
+        Called by the user-correction promotion path: when a turn is
+        promoted to FAILED via the user's next message, any lesson
+        the just-finished turn produced (typically via the
+        Perfection-Protocol's eager ``learn_lesson`` write) was
+        sourced from a now-discredited turn and must be scrubbed
+        before retrieval can surface it on a future user query.
+
+        Scrubs both:
+          1. The JSON playbook (atomic write under the lock).
+          2. The vector store (when ``memory_system`` is wired) via
+             ``collection.delete(where={"source_trajectory_id": ...})``.
+             ChromaDB ignores unknown metadata keys gracefully — a
+             store missing this key is a no-op delete.
+
+        Returns the number of lessons removed from the JSON playbook.
+        Idempotent: a second call with the same id returns 0.
+        Empty / non-string ids return 0 without touching disk
+        (defensive against legacy lessons whose
+        ``source_trajectory_id`` was never set).
+        """
+        if not isinstance(trajectory_id, str) or not trajectory_id:
+            return 0
+        removed = 0
+        try:
+            with self._get_lock():
+                playbook = self._load_playbook()
+                kept = []
+                for entry in playbook:
+                    src = (
+                        entry.get("source_trajectory_id")
+                        if isinstance(entry, dict) else None
+                    )
+                    if isinstance(src, str) and src == trajectory_id:
+                        removed += 1
+                        continue
+                    kept.append(entry)
+                if removed:
+                    self._save_playbook_unlocked(kept)
+        except Exception as e:
+            logger.warning(
+                "retract_lessons_from_trajectory JSON pass failed: %s", e
+            )
+            return 0
+
+        if memory_system is not None and removed > 0:
+            try:
+                coll = getattr(memory_system, "collection", None)
+                if coll is not None and hasattr(coll, "delete"):
+                    coll.delete(where={"source_trajectory_id": trajectory_id})
+            except Exception as e:
+                # Vector scrub is best-effort — the JSON playbook is
+                # the canonical store for retrieval re-ranking, and
+                # a stale vector entry whose JSON twin is gone will
+                # be filtered out by the playbook-snapshot lookup
+                # in get_playbook_context (vector docs without a
+                # JSON match render the raw embedded doc, which
+                # still costs a slot but is recoverable on a later
+                # rebuild).
+                logger.warning(
+                    "retract_lessons_from_trajectory vector pass failed: %s", e
+                )
+
+        if removed:
+            try:
+                pretty_log(
+                    "Skill Retracted",
+                    f"removed {removed} lesson(s) sourced from "
+                    f"trajectory {trajectory_id[:8]}",
+                    icon="🧹",
+                )
+            except Exception:
+                pass
+        return removed
 
     def record_retrieval(self, trigger: str):
         """Mark that a lesson with `trigger` was surfaced to the agent.

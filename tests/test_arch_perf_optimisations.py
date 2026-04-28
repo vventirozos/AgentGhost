@@ -22,7 +22,7 @@ from ghost_agent.core.llm import LLMClient, RoutingTask
 # ============================================================ shared helpers
 
 
-def _make_agent(*, llm_response="ok", with_tools=False):
+def _make_agent(*, llm_response="ok", with_tools=False, native_tools=False):
     ctx = MagicMock(spec=GhostContext)
     ctx.args = MagicMock()
     ctx.args.temperature = 0.5
@@ -31,6 +31,11 @@ def _make_agent(*, llm_response="ok", with_tools=False):
     ctx.args.use_planning = False
     ctx.args.model = "test-model"
     ctx.args.perfect_it = False
+    # Pin native_tools explicitly. Without this the MagicMock returns a
+    # truthy Mock for args.native_tools, which silently drives every test
+    # into the schema-suppressed native-tools branch. Tests that want
+    # to exercise that path pass `native_tools=True`.
+    ctx.args.native_tools = native_tools
 
     ctx.llm_client = AsyncMock()
     ctx.llm_client.chat_completion = AsyncMock(

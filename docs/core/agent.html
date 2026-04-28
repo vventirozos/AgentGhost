@@ -126,6 +126,27 @@
   <h2>Concurrency</h2>
   <p>Single-task asyncio. The streaming generator is consumed inside the FastAPI request task; tool execution is awaited inline (the tool itself may use threads / subprocess). The agent does <em>not</em> spawn parallel turns — concurrency lives in <a href="bus.html">MemoryBus</a> (parallel hydration) and <a href="llm.html">LLMClient</a> (parallel pool dispatch).</p>
 
+  <h2 id="context-compaction">Context compaction (per-turn payload)</h2>
+  <p>Before every upstream LLM call, <code>handle_chat</code> assembles a transient block (tool header + persona + memory hydration + dynamic state) that rides at the top of the last user message. Two predicates decide how aggressively to trim that block <em>before</em> serialisation:</p>
+  <table>
+    <thead><tr><th>Predicate</th><th>Trigger</th><th>What it suppresses</th><th>Per-turn saving</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>_is_final_generation_for_schema</code></td>
+        <td><code>force_final_response</code> set, or planner returned <code>required_tool=="none"</code> / <code>next_action_id=="none"</code>.</td>
+        <td>Entire <code>QWEN_TOOL_PROMPT</code> + XML schema; replaced with a slim "Final-generation turn — DO NOT emit any &lt;tool_call&gt;" stanza that preserves the think-budget guidance. The native <code>payload["tools"]</code> array is also dropped — sending tools when the model is told to answer tempts it to call one instead.</td>
+        <td>~8,700 tokens (XML mode) / ~860 tokens (already-native mode, since the schema is already gone).</td>
+      </tr>
+      <tr>
+        <td><code>_native_tools_active</code></td>
+        <td><code>args.native_tools=True</code> (the default for Qwen 3.6 35B-A3 and newer).</td>
+        <td>The XML <code>&lt;tool_def&gt;</code> blocks inside the prompt's <code>{tool_schemas}</code> slot — schemas arrive via the OpenAI-style <code>payload["tools"]</code> channel instead. The XML format scaffolding (parsing rules, parallel-call guidance, CDATA hint) is preserved so models that still emit the legacy <code>&lt;tool_call&gt;</code> shape are parsed correctly as a fallback.</td>
+        <td>~7,800 tokens.</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>The hoisted predicate runs before the dynamic-state block that <em>also</em> sets <code>force_final_response=True</code>, so it mirrors that line's <code>next_action_id</code> check directly to stay in sync. The canonical <code>is_final_generation</code> assignment further down the loop is unchanged — the schema-skip is a strictly upstream short-circuit. Verified end-to-end by <code>tests/test_context_compaction.py</code> (9 cases pinning XML-only path, native-only path, savings floor, planner-driven final-gen, and the cross-cutting native-suppression on final turns).</p>
+
   <h2>Self-play control hooks</h2>
   <p><code>handle_chat</code> carries two small but load-bearing hooks that coordinate with the self-play subsystem:</p>
   <ul>

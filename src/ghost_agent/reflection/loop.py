@@ -157,6 +157,49 @@ class Reflector:
 
         return report
 
+    async def reflect_one(
+        self,
+        traj: Trajectory,
+        *,
+        sink: Optional[Callable[[Trajectory], Any]] = None,
+        already_reflected: Optional[Set[str]] = None,
+    ) -> ReflectionOutcome:
+        """Reflect on a SINGLE trajectory, bypassing the iterator.
+
+        Used by the post-turn reflection scheduler in ``handle_chat``:
+        once a user-correction promotes the prior trajectory to
+        FAILED we want the lesson to land before the user's *next*
+        message, which means we can't wait for the biological
+        watchdog's 15-60 min idle window. Calling this directly via
+        ``asyncio.create_task`` schedules reflection without blocking
+        the user-facing turn.
+
+        Honours ``already_reflected`` exactly the same way ``run``
+        does: if ``traj.id`` is already in the set, returns a
+        no-op outcome flagged with ``error="already reflected"``;
+        otherwise adds ``traj.id`` to the set BEFORE awaiting the
+        critique so a concurrent ``run`` tick can't double-reflect.
+        """
+        reflected_set: Set[str] = (
+            already_reflected if already_reflected is not None else set()
+        )
+        if traj.id in reflected_set:
+            return ReflectionOutcome(
+                source_trajectory_id=traj.id,
+                error="already reflected",
+            )
+        # Add BEFORE await — racing with the watchdog tick is the
+        # whole point of having a shared dedup set.
+        reflected_set.add(traj.id)
+
+        out = await self._reflect_one(traj)
+        if out.ok and sink is not None and out.reflected_trajectory is not None:
+            try:
+                sink(out.reflected_trajectory)
+            except Exception as e:
+                logger.warning("reflect_one sink failed: %s", e)
+        return out
+
     async def _reflect_one(self, traj: Trajectory) -> ReflectionOutcome:
         out = ReflectionOutcome(source_trajectory_id=traj.id)
         prompt = build_reflection_prompt(traj)

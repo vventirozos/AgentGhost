@@ -67,21 +67,35 @@ Respond ONLY with a JSON object:
   "issues": ["list of specific problems, if any"]
 }}"""
 
-_VERIFY_CODE_PROMPT = """You are a code output auditor. Determine whether the CODE and its OUTPUT actually answer the user's INTENT.
+_VERIFY_CODE_PROMPT = """You are a code output auditor. Determine whether the agent's RESPONSE actually answers the user's INTENT — including any explicit constraints in the user's wording.
 
 USER INTENT:
 {intent}
 
-CODE:
+CODE THE AGENT RAN:
 {code}
 
-OUTPUT:
+TOOL OUTPUT:
 {output}
 
-Check for:
-1. Does the output contain the information the user asked for?
-2. Are the numbers/results plausible (no obvious off-by-one, wrong units, etc.)?
-3. Are there silent errors (empty output, truncated results, wrong columns)?
+AGENT'S RESPONSE TO THE USER:
+{response}
+
+Check, in order:
+
+1. **Constraint satisfaction (highest priority).** Does the user's wording include explicit constraints on the form of the answer? Examples: "just give me the code", "in one sentence", "without using X", "list only the names", "as JSON". If yes, does the AGENT'S RESPONSE satisfy those constraints? If the user asked for code and the agent returned a number / prose / a result, that is a REFUTED — the agent answered a different question than the one asked, even if the tool output is internally consistent.
+2. Does the response contain the information the user asked for?
+3. Are the numbers/results plausible (no obvious off-by-one, wrong units, etc.)?
+4. Are there silent errors (empty output, truncated results, wrong columns)?
+
+Common failure shapes to flag:
+- User asks for code/snippet/command → agent returns a result or summary instead of the snippet
+- User asks for code AND the agent's RESPONSE does not contain a fenced code block — REFUTED regardless of what the tool output says. "The script ran correctly and prints 1 to 10" is NOT a substitute for the script itself; the user cannot paste a confirmation message into their editor. If `intent` contains verbs like give/show/write/draft + nouns like script/code/function/snippet/query/command, the response MUST include the source in a code fence.
+- User asks "how do I X" → agent does X and reports the answer instead of explaining the method
+- User asks for a specific format → agent ignores the format
+- Tool output is a sandbox-internal artefact the user can't actually use
+
+A verdict of CONFIRMED requires BOTH the tool output to be sound AND the response to match what the user asked for. If only the first holds, return REFUTED.
 
 Respond ONLY with a JSON object:
 {{
@@ -246,12 +260,26 @@ class Verifier:
         return self._build_verify_result(data)
 
     async def verify_code_output(self, code: str, output: str,
-                                 intent: str) -> Optional[VerifyResult]:
-        """Check whether *code* and its *output* actually answer *intent*."""
+                                 intent: str,
+                                 *, response: str = "") -> Optional[VerifyResult]:
+        """Check whether the agent's *response* actually answers
+        *intent*, given the *code* it ran and the *output* it
+        observed.
+
+        ``response`` is the agent's user-facing reply. Defaults to
+        empty for back-compat with older callers, but production
+        callers should always pass it — without it, the verifier
+        falls back to "does the output match the claim" auditing
+        which can't catch wrong-question answers (user asks for
+        code, agent gives a number; user asks for format X, agent
+        replies in format Y). Those failure shapes are the dominant
+        wrong-but-confidently-confirmed mode in practice.
+        """
         prompt = _VERIFY_CODE_PROMPT.format(
             intent=intent[:1000],
             code=code[:4000],
             output=output[:4000],
+            response=(response or "(response not provided to verifier)")[:4000],
         )
         data = await self._call_llm(prompt, temperature=0.1)
         return self._build_verify_result(data)

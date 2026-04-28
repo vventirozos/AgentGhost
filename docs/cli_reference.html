@@ -65,7 +65,7 @@
   <table>
     <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><td><code>--native-tools</code> / <code>--no-native-tools</code></td><td>on</td><td>Whether to advertise OpenAI-style <code>tools</code> array on outbound LLM calls. Off forces XML-only tool dispatch.</td></tr>
+      <tr><td><code>--native-tools</code> / <code>--no-native-tools</code></td><td>on</td><td>Whether to advertise OpenAI-style <code>tools</code> array on outbound LLM calls. When on, the equivalent XML <code>&lt;tool_def&gt;</code> schema is suppressed from the prompt to avoid double-shipping the same definitions (~7,800 token saving per turn). The XML format scaffolding stays so the parser still accepts the legacy <code>&lt;tool_call&gt;</code> shape as fallback. Off forces XML-only tool dispatch (no native channel; full schema in prompt). See <a href="core/agent.html#context-compaction">Context compaction</a> in <code>core.agent</code>.</td></tr>
       <tr><td><code>--anonymous</code></td><td>on</td><td>Route web search through Tor / DuckDuckGo (with identity rotation on 401/403/503).</td></tr>
       <tr><td><code>--deep-reason</code></td><td>off</td><td>Initialise <code>MCTSReasoner</code> (max_candidates=3, max_depth=2) and <code>HypothesisTester</code>.</td></tr>
       <tr><td><code>--perfect-it</code></td><td>off</td><td>Append a proactive optimisation pass after a session completes.</td></tr>

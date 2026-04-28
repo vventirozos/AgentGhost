@@ -424,7 +424,18 @@ async def lifespan(app):
 
             context.reflector = Reflector(
                 critique_fn=_critique_fn,
-                per_call_timeout_s=45.0,
+                # 120s ceiling: Qwen 3.6 is a reasoning model whose
+                # `reasoning_content` phase regularly burns 30-60s
+                # before emitting any visible content, AND the
+                # post-turn reflect_one path competes with the
+                # user-facing turn for the same upstream LLM. 45s
+                # was too tight in practice — observed timeout-
+                # induced "no lesson" on the post-turn path even
+                # though the structural promotion (sidecar +
+                # in-memory) fired correctly. The biological-tick
+                # backstop runs at low traffic so a longer ceiling
+                # is essentially free there too.
+                per_call_timeout_s=120.0,
                 max_failures=3,
                 model=args.model,
             )
@@ -454,12 +465,24 @@ async def lifespan(app):
                     return
                 src_reason = reflected_trajectory.extra.get("source_failure_reason", "") or "failure"
                 plan_text = reflected_trajectory.planning_output or reflected_trajectory.final_response
+                # Tag the lesson with the ORIGINAL failed trajectory's
+                # id (`reflected_from`), not the reflection's own id.
+                # Rationale: this lesson is the corrective behaviour
+                # for that source failure. If the source trajectory is
+                # ever later un-promoted (false-positive correction
+                # detected, manual override, etc.), the retraction
+                # path scrubs both this lesson AND any opt-prot lesson
+                # from the same source — keeping provenance unified
+                # under one id per turn.
+                src_traj_id = reflected_trajectory.extra.get("reflected_from", "") or ""
                 try:
                     _skill_memory.learn_lesson(
                         task=(reflected_trajectory.user_request or "")[:400],
                         mistake=str(src_reason)[:400],
                         solution=str(plan_text)[:1200],
                         memory_system=_vector_memory,
+                        source_trajectory_id=str(src_traj_id),
+                        source="reflection",
                     )
                 except Exception as e:
                     logger.warning(f"reflection → SkillMemory write failed: {e}")

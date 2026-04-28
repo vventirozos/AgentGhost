@@ -13,6 +13,11 @@ def mock_context():
     context.args.smart_memory = 0.0
     context.args.use_planning = False
     context.args.max_context = 4000
+    # Pin native_tools=False so the test exercises the legacy XML-only
+    # path. Without this the MagicMock returns a truthy Mock and the
+    # XML schema would be suppressed (sent via payload['tools'] instead),
+    # which is the dual-channel optimisation tested elsewhere.
+    context.args.native_tools = False
     context.profile_memory = MagicMock()
     context.profile_memory.get_context_string.return_value = ""
     context.scratchpad = MagicMock()

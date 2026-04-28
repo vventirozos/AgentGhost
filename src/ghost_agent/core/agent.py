@@ -1879,6 +1879,18 @@ class GhostAgent:
                 pretty_log("Request Initialized", special_marker="BEGIN")
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
 
+                # Pre-allocate the trajectory id for THIS turn. Several
+                # in-turn paths (Perfection-Protocol's lesson save, the
+                # post-turn user-correction retraction on the *next*
+                # turn) need a stable id BEFORE `_record_turn_trajectory`
+                # runs at end-of-turn. Threading the same id through to
+                # the eventual `Trajectory(id=...)` keeps lesson
+                # provenance (`source_trajectory_id`) and the persisted
+                # trajectory in sync — the prerequisite for
+                # `SkillMemory.retract_lessons_from_trajectory` to
+                # actually find the lessons it needs to scrub.
+                current_trajectory_id = uuid.uuid4().hex
+
                 if len(messages) > 500:
                     messages = [m for m in messages if m.get("role") == "system"] + messages[-500:]
                 for m in messages:
@@ -1896,6 +1908,26 @@ class GhostAgent:
                 # `context.last_user_content`. Set BEFORE any tool
                 # dispatch path can run in this turn.
                 self.context.last_user_content = last_user_content
+
+                # Stage-1 self-improvement: user-correction promotion.
+                # If `last_user_content` looks like a correction of the
+                # immediately-prior assistant turn, promote that
+                # trajectory to FAILED via the corrections sidecar AND
+                # schedule single-trajectory reflection. The biological
+                # watchdog phase 2.5 is the 15-60 min idle backstop;
+                # this hook closes the loop in real-time interactive
+                # chat where the user rarely goes idle long enough for
+                # the backstop to trigger. Non-fatal: a failure here
+                # must never break the user turn.
+                try:
+                    self._maybe_promote_prior_turn_via_user_correction(
+                        messages, last_user_content
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "user-correction promotion skipped: %s: %s",
+                        type(e).__name__, e,
+                    )
 
                 # Stage-1 self-improvement: consult the complexity
                 # router (if wired) and stash the decision on body so
@@ -2349,8 +2381,6 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                     from .prompts import QWEN_TOOL_PROMPT
 
-                    minified_schemas = request_state.get_xml_schema(all_tools)
-
                     # ARCHITECTURAL OPTIMISATION #1: NO MORE per-turn system
                     # slot mutation. The system message was already locked at
                     # request start to `stable_system_prompt`. Tool schemas
@@ -2383,12 +2413,103 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 getattr(self.context, "current_project_id", None)
                             ),
                         )
-                    tool_header_block = (
-                        QWEN_TOOL_PROMPT
-                        .replace('{tool_schemas}', minified_schemas)
-                        .replace('{think_budget_guidance}', render_think_budget_guidance(think_budget))
-                        .replace("\r", "")
+
+                    # =====================================================
+                    # CONTEXT-COMPACTION OPTIMISATIONS #1 + #2
+                    # -----------------------------------------------------
+                    # Decide whether to ship the XML tool schema this turn
+                    # BEFORE serialising it, so we never pay the ~7.4K-
+                    # token cost when the model can't / won't tool-call.
+                    #
+                    # #1 — Skip schema on final-generation turns. When the
+                    # planner has set `force_final_response=True` or the
+                    # required_tool is "none", the model is being asked
+                    # to answer in plain text and tool_calls are dropped
+                    # downstream anyway (see the force_final_response /
+                    # is_final_generation guard around `tool_calls` in
+                    # `apply_chat_outcome_heuristics` consumers). Shipping
+                    # the schema in that case is wasted bytes and pollutes
+                    # the model's attention with an option it cannot use.
+                    #
+                    # #2 — Don't double-ship under --native-tools. When
+                    # native_tools is on, schemas are advertised through
+                    # the OpenAI-style `payload["tools"]` channel below,
+                    # so re-emitting the same definitions in the prompt
+                    # XML is pure duplication. The XML format scaffolding
+                    # (parsing rules, parallel-call guidance, CDATA hint)
+                    # is preserved so the agent's XML parser still works
+                    # as a fallback for models that emit the legacy shape.
+                    # =====================================================
+                    # Earliest-correct evaluation of `is_final_generation`.
+                    # The canonical assignment further below stays for
+                    # downstream consumers; this hoisted copy uses the
+                    # same predicate so the two stay in sync. We also
+                    # mirror the dynamic_state block's "next_action_id ==
+                    # none → force_final_response" rule here so that the
+                    # schema-skip kicks in even when the planner only
+                    # signals via next_action_id (the dynamic_state line
+                    # that sets force_final_response runs AFTER us).
+                    _early_required_tool = locals().get("required_tool", "all")
+                    _early_next_action_id = locals().get("next_action_id", "")
+                    _is_final_generation_for_schema = (
+                        force_final_response
+                        or str(_early_required_tool).lower() == "none"
+                        or (
+                            use_plan and not turn_is_conversational
+                            and bool(locals().get("thought_content"))
+                            and str(_early_next_action_id).strip().lower() == "none"
+                        )
                     )
+                    _native_tools_active = bool(
+                        getattr(self.context.args, "native_tools", False)
+                    )
+
+                    if _is_final_generation_for_schema:
+                        # Slim header: drop the entire tool block. The
+                        # model is being asked to answer the user, not
+                        # to call a tool. Keep the think-budget guidance
+                        # so reasoning depth stays controlled.
+                        tool_header_block = (
+                            f"# Final-generation turn\n\n"
+                            f"You are answering the user directly this turn. "
+                            f"DO NOT emit any <tool_call> blocks. Reply in "
+                            f"plain prose only.\n\n"
+                            f"ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
+                            f"{render_think_budget_guidance(think_budget)}\n"
+                        ).replace("\r", "")
+                        minified_schemas = ""  # for downstream visibility
+                    elif _native_tools_active:
+                        # Tool definitions arrive via the native API
+                        # channel below; substitute a compact pointer
+                        # for `{tool_schemas}` so the prompt scaffolding
+                        # remains intact without restating ~7K tokens.
+                        # Keep one-line tool-name list so the model can
+                        # see what's available even if its native-tool
+                        # fence is filtered downstream.
+                        _tool_names = ", ".join(
+                            t["function"]["name"] for t in all_tools
+                        ) or "(none)"
+                        _native_pointer = (
+                            f"(Tool schemas are advertised via the native "
+                            f"`tool_calls` API on this request. Available "
+                            f"tools: {_tool_names}.)"
+                        )
+                        tool_header_block = (
+                            QWEN_TOOL_PROMPT
+                            .replace('{tool_schemas}', _native_pointer)
+                            .replace('{think_budget_guidance}', render_think_budget_guidance(think_budget))
+                            .replace("\r", "")
+                        )
+                        minified_schemas = _native_pointer  # for diagnostics
+                    else:
+                        # Legacy XML-only path: full schema in the prompt.
+                        minified_schemas = request_state.get_xml_schema(all_tools)
+                        tool_header_block = (
+                            QWEN_TOOL_PROMPT
+                            .replace('{tool_schemas}', minified_schemas)
+                            .replace('{think_budget_guidance}', render_think_budget_guidance(think_budget))
+                            .replace("\r", "")
+                        )
                     # --- INTENT-DRIVEN SKILL RECALL ---
                     # ARCHITECTURAL OPTIMISATION #4: the playbook lookup is
                     # cached per (skill_query) inside `request_state`, so a
@@ -2572,13 +2693,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     }
                     # XML tool-call parsing is the primary path. When
                     # ``--native-tools`` is on AND the downstream model
-                    # advertises OpenAI-style tool_calls support, we also
+                    # advertises OpenAI-style tool_calls support, we
                     # attach the native schema so the server can surface
-                    # tool_calls in either `message.content` (XML) or
-                    # `message.tool_calls` (native). Full native-first
-                    # dispatch is an explicit future refactor; this hook
-                    # just makes the schema available when requested.
-                    if getattr(self.context.args, "native_tools", False):
+                    # tool_calls via `message.tool_calls`. The XML
+                    # schema in the prompt is suppressed in that case
+                    # (see CONTEXT-COMPACTION OPTIMISATION #2 above) to
+                    # avoid double-shipping ~7K tokens of definitions on
+                    # every turn.
+                    #
+                    # On final-generation turns (force_final_response or
+                    # required_tool=='none') we ALSO suppress the native
+                    # schema: the model is being told to answer in plain
+                    # text, and `force_final_response` already drops any
+                    # tool_calls the model attempts. Sending tools on
+                    # those turns is wasted bytes AND tempts the model
+                    # to call something instead of answering.
+                    if (
+                        getattr(self.context.args, "native_tools", False)
+                        and not is_final_generation
+                    ):
                         try:
                             payload["tools"] = all_tools
                             payload["tool_choice"] = "auto"
@@ -4834,12 +4967,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                         # 2. Internal Learning (Always)
                         if p_msg and getattr(self.context, 'skill_memory', None):
+                            # Tag the lesson with this turn's trajectory
+                            # id. If the user corrects on the next turn,
+                            # `_maybe_promote_prior_turn_via_user_correction`
+                            # promotes this trajectory to FAILED and
+                            # calls `retract_lessons_from_trajectory`,
+                            # which scrubs this exact entry from both
+                            # the JSON playbook and the vector store.
+                            # Without provenance, the rubber-stamped
+                            # opt-prot lesson would survive the
+                            # correction and poison future retrieval.
                             await asyncio.to_thread(
                                 self.context.skill_memory.learn_lesson,
                                 task=f"Optimization Analysis: {last_user_content[:50]}...",
                                 mistake="Sub-optimal pattern identified via Perfection Protocol",
                                 solution=p_msg,
-                                memory_system=self.context.memory_system
+                                memory_system=self.context.memory_system,
+                                source_trajectory_id=current_trajectory_id,
+                                source="perfection_protocol",
                             )
                             pretty_log("Internal Learning", "Saved optimization strategy to playbook.", icon=Icons.MEM_SAVE)
 
@@ -4912,6 +5057,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     code=code_text,
                                     output=tool_output,
                                     intent=last_user_content or "",
+                                    # Pass the agent's user-facing reply so
+                                    # the verifier can audit whether the
+                                    # RESPONSE matches the user's request,
+                                    # not just whether the tool output
+                                    # matches the agent's printed claim.
+                                    # Catches the "user asked for code,
+                                    # agent gave a number" failure shape.
+                                    response=final_ai_content or "",
                                 )
                             else:
                                 # Couldn't recover the submitted code —
@@ -4939,6 +5092,36 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 f"REFUTED ({v_result.confidence:.0%}): {issues_str[:120]}",
                                 icon=Icons.BRAIN_THINK,
                             )
+                            # Verifier-driven retraction: the
+                            # Perfection-Protocol's `learn_lesson`
+                            # runs BEFORE this gate, so by the time
+                            # we get here a poisoned lesson tagged
+                            # with `current_trajectory_id` may
+                            # already be on disk. The verifier just
+                            # said the response was REFUTED with
+                            # high confidence — scrub anything that
+                            # turn produced before the user even
+                            # sees the response, so the next user
+                            # query can't retrieve a lesson born
+                            # from a turn we just disagreed with.
+                            # Belt-and-braces with the user-
+                            # correction retraction path: the user
+                            # may never go on to correct, and we
+                            # shouldn't depend on them noticing.
+                            try:
+                                _sm = getattr(self.context, "skill_memory", None)
+                                if _sm is not None and current_trajectory_id:
+                                    _sm.retract_lessons_from_trajectory(
+                                        current_trajectory_id,
+                                        memory_system=getattr(
+                                            self.context, "memory_system", None
+                                        ),
+                                    )
+                            except Exception as _e:
+                                logger.debug(
+                                    "verifier-driven retraction skipped: %s: %s",
+                                    type(_e).__name__, _e,
+                                )
                         else:
                             pretty_log(
                                 "Verifier",
@@ -5016,6 +5199,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         final_content=final_ai_content,
                         req_id=req_id,
                         model=model,
+                        trajectory_id=current_trajectory_id,
                     )
                 except Exception as e:
                     # Debug-level: a turn-logging failure must never be
@@ -5034,6 +5218,299 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             pretty_log("Request Finished", special_marker="END")
             request_id_context.reset(token)
 
+    @staticmethod
+    def _response_fingerprint(text: str) -> str:
+        """Stable short fingerprint of an assistant response, used as
+        the lookup key for correction-detection. First 500 chars of
+        the response, lowercased and whitespace-collapsed, then
+        md5-hashed. Empty input → empty string (a never-matched key).
+
+        We hash the prefix, not the full response, because Slack /
+        the web UI sometimes append small footers (timestamps,
+        emoji status) to the assistant message that survive the
+        round-trip back into the next request's `messages`. Matching
+        on a stable prefix tolerates that without false collisions
+        for distinct responses (md5 keeps collision risk negligible
+        at this scale)."""
+        if not isinstance(text, str) or not text:
+            return ""
+        import hashlib
+        norm = re.sub(r"\s+", " ", text[:500]).strip().lower()
+        if not norm:
+            return ""
+        return hashlib.md5(norm.encode("utf-8")).hexdigest()
+
+    def _stash_trajectory_for_correction_lookup(self, traj) -> None:
+        """Cache ``traj`` keyed by its ``final_response`` fingerprint
+        so the next user turn can locate it via ``messages[-2]``.
+
+        Bounded LRU on ``self.context._recent_trajectories_for_correction``
+        (max 32 entries) — enough headroom for a few concurrent
+        conversations on a single Ghost process without unbounded
+        growth. The eviction path is intentionally O(1): we use an
+        OrderedDict and ``popitem(last=False)`` to drop the oldest
+        entry when the cap is reached."""
+        if not getattr(traj, "final_response", "") or not traj.id:
+            return
+        from collections import OrderedDict
+        cache = getattr(self.context, "_recent_trajectories_for_correction", None)
+        if cache is None:
+            cache = OrderedDict()
+            self.context._recent_trajectories_for_correction = cache
+        fp = self._response_fingerprint(traj.final_response)
+        if not fp:
+            return
+        if fp in cache:
+            cache.pop(fp)
+        cache[fp] = traj
+        while len(cache) > 32:
+            cache.popitem(last=False)
+
+    def _maybe_promote_prior_turn_via_user_correction(
+        self,
+        messages,
+        current_user_text: str,
+    ) -> None:
+        """Stage-1 self-improvement: promote the immediately-prior
+        assistant trajectory to FAILED when the current user message
+        looks like a correction.
+
+        Why this exists: the biological watchdog's reflection phase
+        only fires after 15-60 minutes of idle, which means a
+        back-to-back interactive session can never close the
+        learning loop on its own. Treating the user's next message
+        as the FAILED label and reflecting immediately is what makes
+        the loop usable in real chat.
+
+        Conditions (all must hold; on any miss this is a no-op):
+          - ``ctx.trajectory_collector`` is wired
+          - we have a stashed trajectory whose response fingerprint
+            matches the previous assistant message in ``messages``
+          - ``classify_user_correction`` returns ``is_correction=True``
+
+        Side effects when promotion fires:
+          1. The trajectory's in-memory ``outcome`` /
+             ``failure_reason`` are mutated (so the immediate
+             ``reflect_one`` call below sees the corrected state).
+          2. A correction record is appended to the collector's
+             sidecar (durable; future ``iter_trajectories`` walks
+             will yield the corrected outcome).
+          3. If a Reflector is wired, ``reflect_one`` is scheduled
+             via ``asyncio.create_task`` — fire-and-forget. The
+             user's turn doesn't block on it; the lesson lands when
+             the LLM critique returns, typically before the user
+             types their next message.
+
+        Never raises — wrapped in try/except by the caller, but the
+        helper itself swallows individual sub-errors so a failed
+        sidecar write doesn't prevent the in-memory promotion etc."""
+        ctx = self.context
+        collector = getattr(ctx, "trajectory_collector", None)
+        if collector is None:
+            return
+
+        cache = getattr(ctx, "_recent_trajectories_for_correction", None)
+        if not cache:
+            return
+
+        # Walk messages[:-1] (everything before the current user turn)
+        # in reverse to find the most recent assistant + user contents.
+        prev_assistant = ""
+        prev_user = ""
+        msgs = list(messages or [])
+        scope = msgs[:-1] if msgs else []
+        for m in reversed(scope):
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            content = m.get("content", "")
+            if isinstance(content, list):
+                content = " ".join(
+                    i.get("text", "") for i in content
+                    if isinstance(i, dict) and i.get("type") == "text"
+                )
+            content = str(content or "")
+            if role == "assistant" and not prev_assistant:
+                prev_assistant = content
+            elif role == "user" and not prev_user:
+                prev_user = content
+            if prev_assistant and prev_user:
+                break
+
+        if not prev_assistant:
+            return
+
+        fp = self._response_fingerprint(prev_assistant)
+        if not fp:
+            return
+        traj = cache.get(fp)
+        if traj is None:
+            return
+
+        try:
+            from ..distill.user_correction import classify_user_correction
+            from ..distill.schema import Outcome
+        except Exception:
+            return
+
+        verdict = classify_user_correction(
+            prev_user_request=prev_user,
+            prev_assistant_response=prev_assistant,
+            current_user_text=current_user_text or "",
+        )
+        if not verdict.is_correction:
+            return
+
+        # Persist the correction. The sidecar is durable; the in-
+        # memory mutation lets the immediate reflect_one() call see
+        # the corrected outcome + failure_reason without re-reading
+        # disk.
+        if traj.outcome != Outcome.FAILED.value:
+            traj.outcome = Outcome.FAILED.value
+            traj.failure_reason = verdict.reason or "user-correction"
+            try:
+                collector.update_outcome(
+                    traj.id,
+                    Outcome.FAILED.value,
+                    reason=verdict.reason or "user-correction",
+                    source="user_correction",
+                )
+            except Exception as e:
+                logger.debug(
+                    "user-correction sidecar write failed: %s: %s",
+                    type(e).__name__, e,
+                )
+            try:
+                pretty_log(
+                    "Trajectory Promoted",
+                    f"prior turn marked FAILED via user-correction "
+                    f"(confidence={verdict.confidence:.2f}, "
+                    f"signals={','.join(verdict.signals) or 'none'})",
+                    icon=Icons.BRAIN_THINK,
+                )
+            except Exception:
+                pass
+
+        # One promotion per stashed trajectory: drop the entry so a
+        # follow-up user message that's also "correction-shaped"
+        # doesn't re-fire on the same prior turn.
+        cache.pop(fp, None)
+
+        # Scrub any lessons the just-failed trajectory produced
+        # before the user could push back. The dominant case is the
+        # Perfection-Protocol writing an "Optimization Analysis"
+        # lesson at end-of-turn from a turn the user is now
+        # correcting — without retraction, that poisoned lesson
+        # would survive in the playbook and surface on future
+        # similar queries. Best-effort: a failed retraction must
+        # not block the rest of the promotion path. The reflection
+        # task scheduled below will write a CORRECT lesson tagged
+        # with the reflection trajectory's id, so the playbook ends
+        # up with the right entry rather than both.
+        skill_memory = getattr(ctx, "skill_memory", None)
+        vector_memory = getattr(ctx, "memory_system", None)
+        if skill_memory is not None and traj.id:
+            try:
+                skill_memory.retract_lessons_from_trajectory(
+                    traj.id,
+                    memory_system=vector_memory,
+                )
+            except Exception as e:
+                logger.debug(
+                    "lesson retraction skipped: %s: %s",
+                    type(e).__name__, e,
+                )
+
+        # Schedule single-trajectory reflection. Fire-and-forget; the
+        # current user turn must not block on the LLM critique.
+        reflector = getattr(ctx, "reflector", None)
+        if reflector is None:
+            return
+        sink = getattr(ctx, "reflection_sink", None) or collector.append
+        already = getattr(ctx, "_reflected_trajectory_ids", None)
+        if already is None:
+            already = set()
+            ctx._reflected_trajectory_ids = already
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        try:
+            task = loop.create_task(
+                reflector.reflect_one(
+                    traj,
+                    sink=sink,
+                    already_reflected=already,
+                )
+            )
+        except Exception as e:
+            logger.debug(
+                "post-turn reflect_one schedule failed: %s: %s",
+                type(e).__name__, e,
+            )
+            return
+
+        pending = getattr(ctx, "_pending_reflection_tasks", None)
+        if pending is None:
+            pending = set()
+            ctx._pending_reflection_tasks = pending
+        pending.add(task)
+        task.add_done_callback(pending.discard)
+
+        # Observability: reflection runs as a fire-and-forget task —
+        # without a done-callback, a critique timeout or unparseable
+        # response is silent. Log the outcome at INFO so a tail of
+        # the agent log makes the post-turn reflection path visible
+        # without pulling --debug. Errors stay non-fatal: the task's
+        # failure mode is "we don't get a lesson this turn", not
+        # "the user turn breaks".
+        traj_id_for_log = traj.id
+
+        def _log_post_turn_reflection_result(t):
+            try:
+                if t.cancelled():
+                    pretty_log(
+                        "Post-Turn Reflection",
+                        f"cancelled (traj={traj_id_for_log[:8]})",
+                        icon=Icons.WARN,
+                    )
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    pretty_log(
+                        "Post-Turn Reflection",
+                        f"failed (traj={traj_id_for_log[:8]}): "
+                        f"{type(exc).__name__}: {exc}",
+                        icon=Icons.WARN,
+                        level="WARNING",
+                    )
+                    return
+                outcome = t.result()
+                if outcome is None:
+                    return
+                if getattr(outcome, "ok", False):
+                    pretty_log(
+                        "Post-Turn Reflection",
+                        f"ok (traj={traj_id_for_log[:8]}): "
+                        f"diagnosis={outcome.diagnosis[:80]!r}",
+                        icon=Icons.BRAIN_THINK,
+                    )
+                else:
+                    pretty_log(
+                        "Post-Turn Reflection",
+                        f"no lesson (traj={traj_id_for_log[:8]}): "
+                        f"{outcome.error or 'unknown'}",
+                        icon=Icons.WARN,
+                    )
+            except Exception:
+                # The done-callback itself must never raise — that
+                # would propagate into the event loop's exception
+                # handler and surface as noise.
+                pass
+
+        task.add_done_callback(_log_post_turn_reflection_result)
+
     def _record_turn_trajectory(
         self,
         *,
@@ -5041,6 +5518,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         final_content,
         req_id: str,
         model: str,
+        trajectory_id: str = "",
     ) -> None:
         """Build and persist a Trajectory for the turn that just finished.
 
@@ -5115,7 +5593,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # but the final text lives in the SSE frames, not here.
         final_response = final_content if isinstance(final_content, str) else ""
 
-        traj = Trajectory(
+        traj_kwargs = dict(
             session_id=req_id or "",
             task_kind="user_request",
             cluster=None,
@@ -5131,6 +5609,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             outcome=Outcome.UNKNOWN.value,  # user turns have no validator
             final_response=final_response[:16000],
         )
+        # Use the pre-allocated id from `handle_chat` when present so
+        # in-turn writers (Perfection-Protocol's lesson save) and the
+        # eventual on-disk record share one stable id. Falls back to
+        # the Trajectory dataclass's uuid factory when the caller
+        # didn't pre-allocate (legacy callers, isolated unit tests).
+        if trajectory_id:
+            traj_kwargs["id"] = trajectory_id
+        traj = Trajectory(**traj_kwargs)
         # Stage-1 self-improvement: chat trajectories ship with
         # outcome=UNKNOWN (no validator on free-form chat), which
         # excludes them from the Reflector's input set — only FAILED
@@ -5160,6 +5646,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 type(e).__name__, e,
             )
         collector.append(traj)
+        # Stage-1 self-improvement: cache the just-recorded trajectory
+        # keyed by its response fingerprint so the NEXT user message's
+        # correction-classifier hook can locate it via `messages[-2]`.
+        # Non-fatal — the cache is an optimization for the post-turn
+        # reflection path, not a primary persistence layer.
+        try:
+            self._stash_trajectory_for_correction_lookup(traj)
+        except Exception as e:
+            logger.debug(
+                "trajectory stash for correction lookup skipped: %s: %s",
+                type(e).__name__, e,
+            )
 
     async def _run_system_3_pivot(self, task_context: str, error_context: str, sandbox_state: str, model: str) -> dict:
         """System 3 Crisis Pivot: generate 3 alternative strategies and pick the safest one."""
