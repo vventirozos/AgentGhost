@@ -657,7 +657,17 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
     # --- FLEXIBLE PARAMETER MAPPING ---
-    target = kwargs.get("content") or kwargs.get("source") or kwargs.get("filename") or kwargs.get("path")
+    # Schema advertises 'filename' (ingest_document/forget) and 'fact'
+    # (insert_fact); legacy 'content'/'source'/'path'/'topic' kept for
+    # back-compat with older callers and Qwen variants that aliased.
+    target = (
+        kwargs.get("filename")
+        or kwargs.get("fact")
+        or kwargs.get("content")
+        or kwargs.get("source")
+        or kwargs.get("path")
+        or kwargs.get("topic")
+    )
     key = kwargs.get("key")
     value = kwargs.get("value")
     category = kwargs.get("category")

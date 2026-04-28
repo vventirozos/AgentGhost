@@ -4035,6 +4035,55 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         tool_calls = []
                         msg["tool_calls"] = []
 
+                    # Reasoning-channel divergence guard. Some models (Qwen-class
+                    # reasoning variants in particular) emit `reasoning_content`
+                    # explicitly disclaiming tool use ("I can answer directly
+                    # without using any tools") AND still emit a structured
+                    # tool_call in the same response. Trust the reasoning: drop
+                    # the contradicting tool_calls and re-run the turn in
+                    # final-generation mode so the model produces prose. This
+                    # avoids the wasted strike on a tool call the model itself
+                    # said wasn't needed (e.g. spurious `knowledge_base` saves
+                    # of prose the user asked us to compose).
+                    elif tool_calls and not force_final_response:
+                        rc = locals().get("reasoning_content", "") or (msg.get("reasoning_content") or "")
+                        if rc:
+                            _NO_TOOL_DISCLAIM_PATTERNS = (
+                                r"\bwithout\s+(?:needing\s+)?(?:any\s+|using\s+|calling\s+)?tools?\b",
+                                r"\bno\s+tools?\s+(?:are\s+)?(?:needed|required|necessary)\b",
+                                r"\bdon'?t\s+need\s+(?:any\s+|to\s+(?:use|call)\s+)?tools?\b",
+                                r"\banswer\s+(?:this\s+)?directly\s+from\s+(?:my\s+)?knowledge\b",
+                                r"\bI\s+can\s+answer\s+(?:this\s+)?directly\b",
+                            )
+                            if any(re.search(p, rc, re.IGNORECASE) for p in _NO_TOOL_DISCLAIM_PATTERNS):
+                                dropped = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
+                                logger.warning(
+                                    "Dropping %d tool_call(s) — reasoning channel disclaimed tools (names=%s, reasoning_head=%r)",
+                                    len(tool_calls), dropped, rc[:200],
+                                )
+                                tool_calls = []
+                                msg["tool_calls"] = []
+                                force_final_response = True
+                                # Re-run the turn in final-generation mode rather
+                                # than emitting the bad-turn message — its
+                                # think-stripped content is empty, so falling
+                                # through would surface nothing useful.
+                                continue
+
+                    # Telemetry for un-caught divergences. When BOTH channels
+                    # emit and neither drop fired, the regex set above missed
+                    # the phrasing — log a sample at debug so the pattern list
+                    # can be extended as new model phrasings appear.
+                    if tool_calls:
+                        _rc_for_log = locals().get("reasoning_content", "") or (msg.get("reasoning_content") or "")
+                        if _rc_for_log and len(_rc_for_log) > 50:
+                            logger.debug(
+                                "Dual-channel emit: reasoning_content (%d chars) + tool_calls (%d, names=%s); reasoning_head=%r",
+                                len(_rc_for_log), len(tool_calls),
+                                [tc.get("function", {}).get("name", "?") for tc in tool_calls],
+                                _rc_for_log[:120],
+                            )
+
                     if not tool_calls:
                         clean_ui = ui_content.strip("` \n\r")
                         has_img_markdown = bool(re.search(r'!\[.*?\]\(.*?\)', clean_ui))

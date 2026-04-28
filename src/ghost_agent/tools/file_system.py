@@ -193,13 +193,27 @@ def _to_container_path(sandbox_dir: Path, host_path: Path) -> str:
 
 async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 8192):
     pretty_log("File Read", filename, icon=Icons.TOOL_FILE_R)
-    # GUARD 1: Stop model from trying to read URLs as files
+    # GUARD 1: Stop model from trying to read URLs as files. The error
+    # surface PRIMES the model's next tool choice, so we lead with `browser`
+    # (the right answer when the user says "open this page" or "what's on
+    # example.com") and only mention `knowledge_base` as the path for
+    # ingesting a document into long-term memory. The previous one-line
+    # advice misrouted every "use the browser tool to open URL" request to
+    # `knowledge_base(ingest_document, url=...)` because the error didn't
+    # mention `browser` at all.
     if str(filename).startswith("http"):
-        return "Error: You are trying to use read_file on a URL. Use knowledge_base(action='ingest_document') instead."
-    
+        return (
+            f"Error: file_system cannot read URLs. "
+            f"To VIEW a webpage right now, use the `browser` tool "
+            f"(operation='navigate' or 'extract_text', url='{filename}'). "
+            f"To INGEST a document URL into long-term memory, use "
+            f"`knowledge_base(action='ingest_document', filename='{filename}')`. "
+            f"For a one-off page read pick `browser` — that's almost always what you want."
+        )
+
     # GUARD 2: PDF files must be handled by the knowledge base
     if str(filename).lower().endswith(".pdf"):
-        return f"Error: '{filename}' is a PDF. You cannot use read_file on PDFs. To permanently index it into your vector memory, use knowledge_base(action='ingest_document', content='{filename}'). To just read a specific page into your immediate context, use file_system(operation='read_chunked', path='{filename}', page=1)."
+        return f"Error: '{filename}' is a PDF. You cannot use read_file on PDFs. To permanently index it into your vector memory, use knowledge_base(action='ingest_document', filename='{filename}'). To just read a specific page into your immediate context, use file_system(operation='read_chunked', path='{filename}', page=1)."
 
     try:
         path = _get_safe_path(sandbox_dir, filename)
@@ -862,14 +876,23 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
     """
     pretty_log("Chunked Read", f"{filename} [Page {page}]", icon=Icons.TOOL_FILE_R)
     
-    # GUARD 1: Stop model from trying to read URLs as files
+    # GUARD 1: Stop model from trying to read URLs as files. Same logic
+    # as `tool_read_file` — surface `browser` first, `knowledge_base`
+    # only when the user wants to ingest a document.
     if str(filename).startswith("http"):
-        return "Error: You are trying to read a URL. Use knowledge_base(action='ingest_document') instead."
-        
+        return (
+            f"Error: file_system cannot read URLs. "
+            f"To VIEW a webpage right now, use the `browser` tool "
+            f"(operation='navigate' or 'extract_text', url='{filename}'). "
+            f"To INGEST a document URL into long-term memory, use "
+            f"`knowledge_base(action='ingest_document', filename='{filename}')`. "
+            f"For a one-off page read pick `browser` — that's almost always what you want."
+        )
+
     try:
         path = _get_safe_path(sandbox_dir, filename)
         if not path.exists(): return f"Error: '{filename}' not found."
-        
+
         # Ensure page and chunk_size are integers
         try:
             page = int(page)

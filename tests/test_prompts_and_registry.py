@@ -73,8 +73,13 @@ def test_tool_registry_negative_constraints():
     assert "ALWAYS use this to list, read, write." in file_system_tool["function"]["description"]
     assert "Use operation='search' for instantaneous high-performance ripgrep" in file_system_tool["function"]["description"]
     
-    # Knowledge Base constraints
-    assert "ALWAYS use this to ingest_document" in kb_tool["function"]["description"]
+    # Knowledge Base constraints. The description was rewritten to remove
+    # the "ALWAYS use this to ingest_document" attractor (which pulled the
+    # model into spurious knowledge_base saves of prose the user asked it
+    # to write — see test_knowledge_base_schema_param_names.py). New shape
+    # leads with the action surface and explicitly forbids compose-use.
+    assert "imports EXISTING files (ingest_document)" in kb_tool["function"]["description"]
+    assert "NEVER use to compose" in kb_tool["function"]["description"]
     assert "Do NOT write Python scripts to read PDFs or ingest files." in kb_tool["function"]["description"]
 
 def test_tool_schemas_and_properties():
@@ -101,10 +106,20 @@ def test_tool_schemas_and_properties():
     assert "clear" in sp_props["action"]["enum"]
     assert "variable/note" in sp_props["key"]["description"]
     
-    # 3. knowledge_base
+    # 3. knowledge_base. Per-action parameter names: 'filename' for
+    # ingest_document/forget, 'fact' for insert_fact. The old single
+    # 'content' field was a foot-gun (its name attracted prose payloads
+    # for ingest_document, where it actually meant a filename).
     kb_props = kb["function"]["parameters"]["properties"]
     assert "insert_fact" in kb_props["action"]["enum"]
-    assert "raw text to memorize" in kb_props["content"]["description"]
+    assert "content" not in kb_props, (
+        "Legacy 'content' param must not be advertised — handler-level "
+        "aliasing covers back-compat for old callers."
+    )
+    assert "filename" in kb_props
+    assert "fact" in kb_props
+    assert "single discrete fact to memorize" in kb_props["fact"]["description"]
+    assert "EXISTING local filename" in kb_props["filename"]["description"]
     
     # 4. update_profile
     up_props = update_profile["function"]["parameters"]["properties"]
