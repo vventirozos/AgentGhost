@@ -34,6 +34,30 @@ def test_planning_system_prompt_tool_binding():
     assert "3. STATE UPDATE: If a sub-task is complete, you MUST change its status to \"DONE\"" in PLANNING_SYSTEM_PROMPT
 
 
+def test_planning_static_analysis_covers_form_constraints():
+    """Rule 6 must route 'just give me the SQL/code' style requests to a
+    no-tool answer. Without this, "just give me the SQL to count rows in
+    table lala" gets executed against the DB instead of returned as a
+    snippet — see prior regression where the agent ran psql + postgres_admin
+    on a static-knowledge turn."""
+    assert "6. STATIC ANALYSIS:" in PLANNING_SYSTEM_PROMPT
+    assert "FORM-CONSTRAINT REQUESTS" in PLANNING_SYSTEM_PROMPT
+    # A few representative trigger phrases the verifier rubric also recognises
+    for phrase in ("just give me", "just show me", "what's the SQL"):
+        assert phrase in PLANNING_SYSTEM_PROMPT, f"missing trigger phrase: {phrase}"
+    # The rule must say "answer with a fenced block + next_action_id=none"
+    assert "fenced code block" in PLANNING_SYSTEM_PROMPT
+    assert "next_action_id" in PLANNING_SYSTEM_PROMPT
+    # And it must explicitly fence out the tools we saw misfire in the trace.
+    assert "postgres_admin" in PLANNING_SYSTEM_PROMPT
+    assert "execute" in PLANNING_SYSTEM_PROMPT
+    # Negative: the rule must preserve the execution path when the user
+    # actually asks for the *result* — otherwise we'd lock out legitimate
+    # SQL-runs.
+    assert 'run' in PLANNING_SYSTEM_PROMPT.lower()
+    assert "result" in PLANNING_SYSTEM_PROMPT
+
+
 def test_tool_registry_negative_constraints():
     """Verify that critical native tools contain explicit negative execution constraints."""
     execute_tool = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "execute")
