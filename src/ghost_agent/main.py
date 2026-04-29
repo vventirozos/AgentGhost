@@ -17,6 +17,7 @@ import sys
 import json
 import logging
 from pathlib import Path
+from typing import Optional
 from contextlib import asynccontextmanager
 
 print(" - Importing server dependencies (uvicorn)...", flush=True)
@@ -54,6 +55,7 @@ print(" - Importing self-improvement pipeline (distill, reflection, router)...",
 from .distill import TrajectoryCollector
 from .reflection import Reflector
 from .router import ComplexityClassifier, ComplexityDispatcher
+from .prm import PRMScorer, PRMTrainer
 
 print(" - All modules imported successfully!", flush=True)
 
@@ -87,10 +89,19 @@ def parse_args():
     # privacy-safe modes because the whole pipeline is local-only —
     # --no-trajectories disables the on-disk log entirely, which also
     # implicitly disables reflection (it has nothing to read).
-    parser.add_argument("--no-trajectories", action="store_true", help="Disable the distill/trajectory JSONL log. Also disables the reflection biological phase since it depends on the log.")
-    parser.add_argument("--no-reflection", action="store_true", help="Disable the reflection biological phase even if trajectory logging is on.")
+    parser.add_argument("--no-trajectories", action="store_true", help="Disable the distill/trajectory JSONL log. Also disables idle-time self-critique on failed turns, since it depends on the log.")
+    parser.add_argument("--no-reflection", action="store_true", help="Disable idle-time self-critique on failed turns even if trajectory logging is on.")
     parser.add_argument("--router-model", default=None, help="Path to a persisted ComplexityClassifier JSON. When set, the router is loaded and consulted; when unset (default), the dispatcher is a no-op that always allows the full swarm pool list.")
     parser.add_argument("--router-confidence-threshold", type=float, default=0.3, help="Minimum router confidence required to route a request to a cheap path. Below this, the dispatcher escalates to the full swarm.")
+    # Process Reward Model. When --prm-model points at a valid
+    # StepValueModel JSON checkpoint, the scorer is loaded and plugged
+    # into the MCTS reasoner so plan candidates are scored by the PRM
+    # in microseconds instead of paying a worker-LLM simulation per
+    # candidate. When the path is unset/missing, ``context.prm_scorer``
+    # is a no-op (returns a neutral 0.5 for every candidate) so the
+    # existing simulation fallback in MCTS stays in effect.
+    parser.add_argument("--prm-model", default=None, help="Path to a persisted PRM (Process Reward Model) JSON checkpoint. When set, the PRM is loaded and plugged into the MCTS reasoner as a fast scoring path.")
+    parser.add_argument("--prm-train-cooldown", type=int, default=10800, help="Seconds between idle-time PRM retrains. Default 3 hours. Has no effect when --prm-model is unset.")
     args = parser.parse_args()
     
     swarm_nodes_list = []
@@ -355,6 +366,58 @@ async def lifespan(app):
         except Exception as e:
             pretty_log("Deep Reasoning Failed", str(e), level="WARNING", icon=Icons.WARN)
 
+    # Process Reward Model. Always attach a scorer to the context — when
+    # no checkpoint is loaded, the scorer is a fail-safe pass-through
+    # that returns a neutral 0.5 for every candidate. That lets call
+    # sites unconditionally do `ctx.prm_scorer.score(state, action)`
+    # without branching on availability.
+    context.prm_scorer = PRMScorer()
+    prm_path_resolved: Optional[Path] = None
+    if getattr(args, "prm_model", None):
+        prm_path = Path(args.prm_model)
+        prm_path_resolved = prm_path
+        if prm_path.exists():
+            try:
+                context.prm_scorer = PRMScorer.load(prm_path)
+                pretty_log(
+                    "PRM",
+                    f"Loaded Process Reward Model from {prm_path}",
+                    icon=Icons.BRAIN_PLAN,
+                )
+            except Exception as e:
+                pretty_log(
+                    "PRM Failed",
+                    f"could not load {prm_path}: {type(e).__name__}: {e}",
+                    level="WARNING",
+                    icon=Icons.WARN,
+                )
+        else:
+            pretty_log(
+                "PRM",
+                f"--prm-model {prm_path} not found; scorer attached but un-trained",
+                level="WARNING",
+                icon=Icons.WARN,
+            )
+
+    # When MCTS is enabled AND the PRM has a trained model, plug the
+    # scorer in so candidate scoring uses the fast PRM path instead of
+    # a worker-LLM simulation per candidate. Mutating the attribute on
+    # the existing reasoner (rather than re-constructing) keeps the
+    # backtrack stack and any in-flight state intact.
+    if context.mcts_reasoner is not None and context.prm_scorer.has_model:
+        context.mcts_reasoner.prm_scorer = context.prm_scorer
+        pretty_log(
+            "PRM ↔ MCTS",
+            "MCTS reasoner now uses PRM for candidate scoring (LLM simulation bypassed)",
+            icon=Icons.BRAIN_PLAN,
+        )
+
+    # Persist the resolved checkpoint path so the biological retrain
+    # phase knows where to write the next checkpoint. When --prm-model
+    # was unset, the retrain phase still runs but writes under the
+    # default GHOST_HOME path.
+    context._prm_checkpoint_path = prm_path_resolved
+
     # --- Stage-1 self-improvement wiring ---
     # Trajectory collector: the passive corpus-builder used by
     # reflection, skills_auto, and optim downstream. Writing to
@@ -490,7 +553,7 @@ async def lifespan(app):
             context.reflection_sink = _reflection_sink
             pretty_log(
                 "Reflector",
-                "Biological phase 2.5 enabled (reflections → JSONL + SkillMemory)",
+                "self-critique on idle enabled: failed turns become lessons in SkillMemory",
                 icon=Icons.BRAIN_THINK,
             )
         except Exception as e:

@@ -53,6 +53,17 @@ def mock_docker_env(monkeypatch):
     monkeypatch.setitem(sys.modules, "docker", fake_docker)
     monkeypatch.setitem(sys.modules, "docker.errors", fake_docker_errors)
 
+    # Force a fresh import of ghost_agent.sandbox.docker so it picks up
+    # the fake `docker` library above. Use ``monkeypatch.delitem`` so
+    # the change is auto-reverted on test teardown — a raw
+    # ``del sys.modules[...]`` leaks the freshly-imported module into
+    # later tests, and any other test that captured ``DockerSandbox``
+    # at MODULE-IMPORT TIME (notably test_docker_cross_platform.py)
+    # would then have a class whose methods reference a stale globals
+    # dict, breaking ``patch("ghost_agent.sandbox.docker.os")`` on
+    # that class.
+    monkeypatch.delitem(sys.modules, "ghost_agent.sandbox.docker", raising=False)
+
     return {
         "ImageNotFound": _ImageNotFound,
         "APIError": _APIError,
@@ -62,9 +73,12 @@ def mock_docker_env(monkeypatch):
 
 
 def _build_sandbox(tmp_path, errors):
-    """Construct a DockerSandbox with the in-test docker fakes wired in."""
-    if "ghost_agent.sandbox.docker" in sys.modules:
-        del sys.modules["ghost_agent.sandbox.docker"]
+    """Construct a DockerSandbox with the in-test docker fakes wired in.
+
+    The module-cache eviction happens in the ``mock_docker_env``
+    fixture via ``monkeypatch.delitem`` so it gets auto-restored.
+    Here we just trigger a fresh import.
+    """
     from ghost_agent.sandbox import docker as docker_mod
 
     sb = docker_mod.DockerSandbox(host_workspace=tmp_path, tor_proxy=None)

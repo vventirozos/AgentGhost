@@ -140,7 +140,37 @@ async def api_generate(request: Request):
 @router.post("/api/chat", dependencies=[Security(verify_api_key)])
 async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     agent = get_agent(request)
-    body = await request.json()
+    # Body parse failures used to bubble up as a raw 500 with no JSON
+    # payload — clients then saw an HTML error page instead of a
+    # parseable error. Wrap the parse so malformed JSON / empty body
+    # produces an OpenAI-shaped error JSON with a 400 status, matching
+    # the error contract the rest of the route already provides for
+    # handler exceptions.
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        return JSONResponse(
+            {
+                "error": {
+                    "message": f"Invalid JSON in request body: {e}",
+                    "type": type(e).__name__,
+                }
+            },
+            status_code=400,
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {
+                "error": {
+                    "message": (
+                        "Request body must be a JSON object, got "
+                        f"{type(body).__name__}"
+                    ),
+                    "type": "InvalidRequestShape",
+                }
+            },
+            status_code=400,
+        )
     model = body.get("model", agent.context.args.model)
     stream = body.get("stream", False)
     

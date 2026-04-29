@@ -36,6 +36,7 @@ the agent's first action — all without any weight update.
 | `ghost_agent.optim` | DSPy/GEPA prompt optimisation (scope-gated) | Tunes planning / tool-selection / reflection prompts |
 | `ghost_agent.skills_auto` | Passive skill extraction from validator-passing trajectories | Biological phase 2.6 (logs candidates) |
 | `ghost_agent.reflection` | Self-critique biological phase on FAILED trajectories | Biological phase 2.5 → composite sink (JSONL + SkillMemory) |
+| `ghost_agent.prm` | Per-step value model — scores `(state, action)` for MCTS lookahead | Biological phase 2.7 (retrain) → `core.mcts.MCTSReasoner` (fast scoring) |
 
 ## The flow (as wired)
 
@@ -83,6 +84,7 @@ the agent's first action — all without any weight update.
    └──────────────┘   2.   REM dream           (600-3600s, cooldown 30m)
             │         2.5  reflection          (900-3600s, cooldown 40m)
             │         2.6  skills auto-extract (900-3600s, cooldown 2h)
+            │         2.7  PRM retrain         (900-3600s, cooldown 3h)
             │         3.   self-play           (>3600s,   cooldown 60m)
             ▼
   FAILED trajectories ─→ Reflector.run ─→ (diagnosis, plan)
@@ -268,10 +270,11 @@ finally:
     self._last_reflection_at = datetime.datetime.now()
 ```
 
-`_last_dream_at`, `_last_reflection_at`, `_last_skills_auto_at`, and
-`_last_selfplay_at` all follow this shape. The `test_reflection_
-biological_tick` integration test exercises this explicitly — the
-anchor must advance even when the inner call raises.
+`_last_dream_at`, `_last_reflection_at`, `_last_skills_auto_at`,
+`_last_prm_train_at`, and `_last_selfplay_at` all follow this shape.
+The `test_reflection_biological_tick` and `test_prm_biological_phase`
+integration tests exercise this explicitly — the anchor must advance
+even when the inner call raises.
 
 ## Verified end-to-end (2026-04-24)
 
@@ -621,6 +624,65 @@ Covered by `tests/test_browser_interact_abort.py` — the tests exec
 the runner source inline (with a stubbed Playwright import) so the
 production code path itself is under test, not a reimplementation.
 
+## Process Reward Model (`ghost_agent.prm`, 2026-04-29)
+
+The PRM is the third inference-time learner in the pipeline (after
+`router/` for request difficulty and `skills_auto/` for tool
+sequences). It scores per-step `(state, action)` tuples in
+microseconds against a numpy logistic regression model trained on the
+same trajectory store the rest of the pipeline reads — closing the
+loop between past tool-call outcomes and future plan-candidate
+evaluation.
+
+Mechanism in one paragraph: terminal `Outcome.PASSED` / `FAILED` is
+back-propagated to per-step values via the AlphaZero-style γ-discount
+trick (`V(step_i) = γ^(N-i-1) · terminal_value`); features are
+hand-crafted (request shape + plan progress + action shape + tool
+bucket + cross signals); the model is the same numpy LR shape as
+`router/`, with a versioned JSON checkpoint format
+(`ghost.prm.logreg.v1`). Loaded once at startup via
+`PRMScorer.load(--prm-model)`, hot-swapped via `scorer.set_model(...)`
+after each idle retrain pass without an agent restart.
+
+Module layout, training pipeline, and integration details: see
+[`docs/algorithms/prm.md`](algorithms/prm.md).
+
+The PRM is **opt-in but always-attached**: `ctx.prm_scorer` is set
+unconditionally in lifespan (no-op pass-through when no checkpoint is
+loaded), so call sites can score `(state, action)` unconditionally
+without branching on availability. MCTS engages the fast path only
+when (a) `prm_scorer` is attached, (b) `has_model is True`, and (c)
+the caller passes `prm_state=` — falling back to the existing
+LLM-simulation path when any of those conditions miss. Existing
+callers continue working unchanged; no regression to the 15/15 eval.
+
+CLI:
+
+```bash
+# Production: load a previously-trained checkpoint at startup.
+python -m src.ghost_agent.main \
+    --upstream-url "http://127.0.0.1:8080" \
+    --prm-model "$GHOST_HOME/system/prm/checkpoint.json"
+
+# Bootstrap: omit the flag entirely. The biological retrain phase
+# (2.7) will produce a first-ever checkpoint after enough
+# trajectories accumulate (defaults: ≥5 trajectories, ≥20 step
+# samples, ≥5% per class) and hot-swap it into the live scorer.
+
+# Faster retrain cadence for development:
+python -m src.ghost_agent.main --prm-train-cooldown 600
+```
+
+Coverage: `tests/test_prm_*.py` (195 tests across features, labels,
+model, trainer, MCTS integration, biological phase, corner cases, and
+adversarial fuzz/stress). Numerical hardening: NaN/inf inputs are
+neutralised at `_vectorize` (inputs) and `_to_arrays` (labels) so a
+single bad value can't poison the whole gradient or prediction; MCTS
+defensively clamps any scorer return to [0, 1] regardless of the
+scorer implementation; concurrent `score()` during `set_model()` was
+exercised under 4-reader/1-swapper thread thrash. Full agent suite
+remains green at **3248 passing**.
+
 ## Stage 2 hook (future work)
 
 The trajectory log is the ingredient Stage 2 (local SFT via rejection
@@ -632,3 +694,10 @@ only — promoting them into `memory/skills.py` or
 `tools/acquired_skills.py` is a deliberate follow-up step because
 persisting auto-extracted sequences without human review can poison
 retrieval.
+
+The PRM lands as a Stage-1.5 capability: it doesn't fine-tune weights
+(stays inside the no-GPU constraint) but it does close a measurable
+loop — every validator-passing or user-correction-promoted trajectory
+becomes a labelled training example, and the model retrains every 3
+hours of idle time. Watch `pretty_log("PRM Retrain", …)` lines in the
+agent log for visible improvement over time.

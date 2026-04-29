@@ -1097,6 +1097,7 @@ class GhostAgent:
     _DREAM_COOLDOWN = 1800        # 30 min between dreams
     _REFLECTION_COOLDOWN = 2400   # 40 min between reflections
     _SKILLS_AUTO_COOLDOWN = 7200  # 2 hours between skill auto-extractions
+    _PRM_TRAIN_COOLDOWN = 10800   # 3 hours between PRM retrain passes
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
 
     async def _biological_tick(self):
@@ -1117,6 +1118,8 @@ class GhostAgent:
             self._last_reflection_at = datetime.datetime.min
         if not hasattr(self, '_last_skills_auto_at'):
             self._last_skills_auto_at = datetime.datetime.min
+        if not hasattr(self, '_last_prm_train_at'):
+            self._last_prm_train_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
         # Adaptive self-play cooldown (curiosity-driven). Starts at the
@@ -1265,6 +1268,99 @@ class GhostAgent:
                         logger.warning(f"Skills auto-extraction failed: {e}")
                     finally:
                         self._last_skills_auto_at = datetime.datetime.now()
+
+        # Phase 2.7: PRM retrain on accumulated trajectories
+        # (every ~3 hours during idle, configurable via
+        # --prm-train-cooldown). Pure CPU pass — reads the same
+        # trajectory log skills_auto reads, derives MC-discounted
+        # per-step values, fits a logistic regression on hand-crafted
+        # features, hot-swaps the freshly-trained model into the
+        # live ``ctx.prm_scorer``. The MCTS reasoner reads scores via
+        # ``ctx.prm_scorer.score`` so the swap is picked up on the
+        # very next plan it scores — no agent restart required.
+        #
+        # Gated on:
+        #   (a) ``--prm-train-cooldown`` (or the static default) so a
+        #       long AFK stretch produces at most one retrain per
+        #       cooldown — same anchor pattern reflection / skills_auto
+        #       use, advanced BEFORE the await so an exception can't
+        #       leave the cooldown un-reset.
+        #   (b) presence of both a trajectory collector and a scorer
+        #       on the context. When ``--prm-model`` is unset the
+        #       scorer is still attached (fail-safe pass-through), so
+        #       the phase still runs and can produce a first-ever
+        #       checkpoint at the path stored on
+        #       ``ctx._prm_checkpoint_path`` (when set) or under the
+        #       default GHOST_HOME location.
+        # Does NOT reset ``ctx.last_activity_time`` — same rule as
+        # phases 1 / 2 / 2.5 / 2.6: that clock is the user's, not
+        # the agent's.
+        if 900 < idle_secs <= 3600:
+            # Resolve cooldown defensively: ``ctx.args`` is a MagicMock
+            # in many tests, and ``getattr(MagicMock(), 'x', None)``
+            # returns a fresh MagicMock instead of None — comparing
+            # that against a number raises TypeError. Type-gate the
+            # override before using it.
+            cooldown_override = getattr(
+                getattr(ctx, 'args', None), 'prm_train_cooldown', None,
+            )
+            if not isinstance(cooldown_override, (int, float)):
+                cooldown_override = None
+            cooldown = float(cooldown_override) if cooldown_override else float(self._PRM_TRAIN_COOLDOWN)
+            since_last_prm = (datetime.datetime.now() - self._last_prm_train_at).total_seconds()
+            if since_last_prm >= cooldown:
+                traj_collector = getattr(ctx, 'trajectory_collector', None)
+                prm_scorer = getattr(ctx, 'prm_scorer', None)
+                # Tight isinstance check: ``ctx`` may be a MagicMock in
+                # tests, in which case ``getattr`` returns another mock
+                # (truthy) for any unset attribute. Without the type
+                # gate, phase 2.7 would refire on every test that
+                # MagicMock-mocks the context, calling
+                # ``iter_trajectories`` an extra time and inflating
+                # any call-count assertion in unrelated phases.
+                from ..prm.scorer import PRMScorer as _PRMScorer
+                if (
+                    traj_collector is not None
+                    and isinstance(prm_scorer, _PRMScorer)
+                ):
+                    self._last_prm_train_at = datetime.datetime.now()
+                    try:
+                        from ..prm import PRMTrainer
+                        save_path = getattr(ctx, '_prm_checkpoint_path', None)
+                        if save_path is None:
+                            base_mem = getattr(ctx, 'memory_dir', None)
+                            if base_mem is not None:
+                                save_path = base_mem.parent / "prm" / "checkpoint.json"
+                        trainer = PRMTrainer()
+                        report = trainer.run(
+                            trajectories=traj_collector.iter_trajectories(),
+                            save_path=save_path,
+                        )
+                        if report.fit_succeeded and trainer.model is not None:
+                            prm_scorer.set_model(trainer.model)
+                            # Plug into MCTS if it's attached but not yet
+                            # using the PRM (first-ever fit case).
+                            mcts = getattr(ctx, 'mcts_reasoner', None)
+                            mcts_note = ""
+                            if mcts is not None and getattr(mcts, 'prm_scorer', None) is None:
+                                mcts.prm_scorer = prm_scorer
+                                mcts_note = " · MCTS now scoring via PRM"
+                            elif mcts is not None and getattr(mcts, 'prm_scorer', None) is prm_scorer:
+                                mcts_note = " · MCTS weights refreshed"
+                            pretty_log(
+                                "PRM Retrain",
+                                f"value model refit on idle: {report.summary()}{mcts_note}",
+                                icon=Icons.BRAIN_PLAN,
+                            )
+                        else:
+                            logger.debug(
+                                "PRM idle retrain skipped: %s",
+                                report.bail_reason or "unknown",
+                            )
+                    except Exception as e:
+                        logger.warning(f"PRM retrain phase failed: {e}")
+                    finally:
+                        self._last_prm_train_at = datetime.datetime.now()
 
         # Phase 3: Synthetic Self-Play (>60 min idle)
         if idle_secs > 3600:

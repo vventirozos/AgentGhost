@@ -22,7 +22,11 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+if TYPE_CHECKING:  # avoid a runtime cycle: prm imports nothing from core.
+    from ..prm.features import PlanState
+    from ..prm.scorer import PRMScorer
 
 logger = logging.getLogger("GhostAgent")
 
@@ -114,13 +118,35 @@ Return ONLY a JSON object:
 
 
 class MCTSReasoner:
-    """MCTS-style reasoning for action selection."""
+    """MCTS-style reasoning for action selection.
+
+    Two scoring modes:
+
+      * **LLM simulation** (default) — each candidate is rated by a
+        worker-LLM call that predicts progress/cost/risk. Slow but
+        general; the original behaviour.
+      * **PRM scoring** (opt-in) — when a ``prm_scorer`` is wired AND
+        the caller passes ``prm_state`` (a ``PlanState`` from the
+        ``prm.features`` module), candidates are scored by the trained
+        Process Reward Model in microseconds, no LLM round-trip. The
+        scorer is fail-safe: if it has no trained model loaded, it
+        returns a neutral 0.5 for every candidate, which would make
+        all candidates tie and effectively defeat the purpose of
+        MCTS — so callers should only pass ``prm_state`` when
+        ``prm_scorer.has_model`` is true.
+
+    Callers that don't pass ``prm_state`` get the legacy LLM-simulation
+    path even when ``prm_scorer`` is attached. That preserves the
+    existing public contract for callers that haven't been updated.
+    """
 
     def __init__(self, llm_client: Any = None, max_candidates: int = 3,
-                 max_depth: int = 2):
+                 max_depth: int = 2,
+                 prm_scorer: Optional["PRMScorer"] = None):
         self.llm_client = llm_client
         self.max_candidates = max_candidates
         self.max_depth = max_depth
+        self.prm_scorer = prm_scorer
         # Cache of unexplored alternatives for backtracking
         self._backtrack_stack: List[List[ActionCandidate]] = []
 
@@ -130,18 +156,32 @@ class MCTSReasoner:
         plan_state: str,
         available_tools: List[str],
         context: str = "",
+        *,
+        prm_state: Optional["PlanState"] = None,
     ) -> Optional[ActionCandidate]:
-        """Generate candidates, simulate outcomes, return the best action.
+        """Generate candidates, score them, return the best action.
 
-        Returns None if no candidates could be generated.
+        When ``prm_state`` is provided AND a PRM scorer with a trained
+        model is attached, candidates are scored by the PRM. Otherwise
+        the legacy LLM-simulation path is used. Returns None if no
+        candidates could be generated.
         """
         # Step 1: Expand — generate candidate actions
         candidates = await self._expand(task, plan_state, available_tools, context)
         if not candidates:
             return None
 
-        # Step 2: Simulate — predict outcomes in parallel
-        scored = await self._simulate_parallel(candidates, context)
+        # Step 2: Score — PRM fast path or LLM simulation
+        if (
+            prm_state is not None
+            and self.prm_scorer is not None
+            and self.prm_scorer.has_model
+        ):
+            scored = self._score_with_prm(candidates, prm_state)
+            scoring_mode = "prm"
+        else:
+            scored = await self._simulate_parallel(candidates, context)
+            scoring_mode = "sim"
 
         # Step 3: Select — pick the best, cache alternatives for backtracking
         scored.sort(key=lambda c: c.score, reverse=True)
@@ -154,8 +194,8 @@ class MCTSReasoner:
             self._backtrack_stack.append(alternatives)
 
         logger.info(
-            "MCTS: selected '%s' (score=%.2f) over %d alternatives",
-            winner.description[:60], winner.score, len(alternatives),
+            "MCTS[%s]: selected '%s' (score=%.2f) over %d alternatives",
+            scoring_mode, winner.description[:60], winner.score, len(alternatives),
         )
         return winner
 
@@ -226,6 +266,52 @@ class MCTSReasoner:
             ))
         return candidates[:self.max_candidates]
 
+    def _score_with_prm(
+        self,
+        candidates: List[ActionCandidate],
+        prm_state: "PlanState",
+    ) -> List[ActionCandidate]:
+        """Score candidates using the attached PRM. Pure function: each
+        ``ActionCandidate`` gets its ``score`` field populated and a
+        short ``risk_notes`` string explaining the source.
+
+        Falls back gracefully when the scorer raises — the candidate
+        keeps a neutral 0.5 and the failure is logged at debug level.
+        Plan-selection should never crash because the scorer hiccupped.
+
+        Defensive clamp: even though the canonical ``PRMScorer`` returns
+        scores already clamped to [0, 1], MCTS doesn't enforce that
+        callers pass in a ``PRMScorer`` instance — any object with a
+        ``score`` method is accepted (duck typing). A custom scorer
+        returning NaN, -3.0, or 42.0 would otherwise propagate straight
+        into the ranking and break the sort. Clamp here so MCTS is
+        robust against any scorer implementation.
+        """
+        # Local import keeps `core` independent of `prm` at import
+        # time — only the runtime path that USES PRM pays the import.
+        from ..prm.features import ActionFeatures
+
+        scorer = self.prm_scorer
+        for candidate in candidates:
+            try:
+                action = ActionFeatures(
+                    description=candidate.description,
+                    tool_name=candidate.tool_name,
+                    tool_args=candidate.tool_args or {},
+                )
+                raw = scorer.score(prm_state, action)
+                candidate.score = _clamp_unit_score(raw)
+                candidate.simulated_outcome = (
+                    f"PRM: p(success)={candidate.score:.2f}"
+                )
+            except Exception as exc:
+                logger.debug(
+                    "MCTS PRM scoring failed for '%s': %s",
+                    candidate.description[:40], exc,
+                )
+                candidate.score = 0.5
+        return candidates
+
     async def _simulate_parallel(self, candidates: List[ActionCandidate],
                                  context: str) -> List[ActionCandidate]:
         """Simulate outcomes for all candidates in parallel."""
@@ -281,16 +367,42 @@ class MCTSReasoner:
 
     @staticmethod
     def _parse_json(text: str) -> dict:
-        if not text:
-            return {}
+        return _parse_json_static(text)
+
+
+def _clamp_unit_score(x: Any) -> float:
+    """Clamp arbitrary scorer output into a finite float in [0, 1].
+
+    NaN / non-finite values become the neutral 0.5; out-of-range
+    finite values are clipped. Mirrors ``prm.scorer._clamp_unit`` so
+    MCTS is robust against any custom scorer implementation, not just
+    the canonical ``PRMScorer``.
+    """
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return 0.5
+    import math as _m
+    if not _m.isfinite(v):
+        return 0.5
+    if v < 0.0:
+        return 0.0
+    if v > 1.0:
+        return 1.0
+    return v
+
+
+def _parse_json_static(text: str) -> dict:
+    if not text:
+        return {}
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r'\{[\s\S]*\}', text)
+    if match:
         try:
-            return json.loads(text)
+            return json.loads(match.group())
         except json.JSONDecodeError:
             pass
-        match = re.search(r'\{[\s\S]*\}', text)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
-        return {}
+    return {}
