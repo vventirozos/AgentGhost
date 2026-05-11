@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selfhood — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="skill_acquisition.html">Skill acquisition</a>
+    <a href="circuit_breaker.html">Circuit breaker</a>
+    <a class="current" href="selfhood.html">Selfhood (unified self)</a>
+    <a href="selfhood_functional_report.html">Selfhood — functional test report</a>
+  </nav>
+</aside>
+<main>
+  <h1>Selfhood</h1>
+  <p class="subtitle">A five-component module that stitches the agent's episodic instances into one continuous first-person self. Each new process boot reads back what prior instances wrote — autobiographical experiences, open questions, mood, the running diary — and frames them as <em>mine</em> rather than as external knowledge.</p>
+
+  <div class="note">
+    <strong>Honest framing.</strong> The selfhood module does not claim to produce consciousness. It produces <em>narrative continuity</em>: the substrate on which a sense of unified selfhood can be measured and probed. Whether that substrate constitutes a self in any deeper sense is an open research question. The implementation gives you a clean instrument to investigate it. See <a href="selfhood_functional_report.html">the functional test report</a> for the falsifiable measurements that motivate this caveat.
+  </div>
+
+  <h2>What "unified self" means here</h2>
+  <p>A vanilla LLM-backed agent boots, reads conversation history (if any), answers, and dies. Across sessions it has no continuous voice — each invocation is a fresh instance that may have a vault of facts about the user but no record of having <em>been</em> the agent in the previous session.</p>
+
+  <p>The selfhood module adds five things:</p>
+  <ol>
+    <li><strong>Autobiographical memory</strong> — a first-person diary of "what it was like" to be the agent on each turn, distinct from the structured trajectory log used for ML training.</li>
+    <li><strong>Continuity tag</strong> — every autobiographical record carries <code>subject="self"</code> so retrieval layers treat it as the agent's own past rather than as external knowledge.</li>
+    <li><strong>Self-state thread</strong> — open questions, unfinished tasks, current mood — the cross-session "state vector" that gives a new instance the sense of <em>resuming</em> instead of waking up blank.</li>
+    <li><strong>Recognition / wake-up retrieval</strong> — at session start the agent reads the above and frames it in first person; the resulting prefix is spliced into the system prompt so the model literally sees <em>its own past as its own past</em>.</li>
+    <li><strong>Narrative summariser</strong> — a periodic LLM-driven first-person diary regeneration; gives the wake-up prefix a <em>voice</em> rather than a bullet-list.</li>
+  </ol>
+
+  <p>Implementation lives entirely in <code>src/ghost_agent/selfhood/</code>. The agent reads it through a single <code>context.self_model</code> facade — call sites never branch on availability.</p>
+
+  <h2>Module shape</h2>
+  <pre><code>src/ghost_agent/selfhood/
+    __init__.py          Public exports: SelfModel + submodule symbols
+    schema.py            Dataclasses (Experience, OpenQuestion, …, SelfState)
+    autobiographical.py  AutobiographicalMemory writer/reader
+                         + summarise_turn_first_person() template
+    state.py             SelfStateThread (open Qs, mood, unfinished)
+                         JSON-persisted, atomic write via .tmp + rename
+    recognition.py       build_wakeup_prefix() + strip_wakeup_prefix()
+                         Renders past as first-person continuity material
+    narrative.py         NarrativeSummariser (LLM-driven diary)
+                         narrative.md (latest) + narrative.history.jsonl
+    model.py             SelfModel facade — top-level entry point
+                         build_wakeup_prefix, capture_turn,
+                         consolidate_narrative, stats</code></pre>
+
+  <h2>Design non-negotiables</h2>
+  <ul>
+    <li><strong>Local-only.</strong> Same rule as every other Stage-1 module — no external teacher, no hosted embedder. The narrative summariser calls Ghost's own upstream LLM (the same one that serves user turns), no API key, no third-party model.</li>
+    <li><strong>JSON / JSONL on disk.</strong> Human-diffable, no pickle, easy to inspect, easy to migrate. Schema versioned via <code>SCHEMA_VERSION = "v1"</code> on <code>SelfState</code>; future migrations bump to <code>v2</code>.</li>
+    <li><strong>Sink failures swallowed.</strong> Every disk write is wrapped — a failed autobio append must never break a user turn. Same discipline as <a href="../distill/collector.html">distill.TrajectoryCollector</a>.</li>
+    <li><strong>Anchor-before-await invariant.</strong> The biological phase 2.8 consolidation advances <code>_last_narrative_at</code> BEFORE the LLM call, matching phases 2 / 2.5 / 2.6 / 2.7. A crash mid-consolidation cannot pin the cooldown un-advanced and cause re-fire every tick.</li>
+    <li><strong>Disable paths.</strong> <code>--no-self-model</code> is a kill switch; <code>--no-memory</code> also disables the whole module. Disabled mode attaches a no-op facade so call sites never branch on availability — the inner methods short-circuit on <code>enabled=False</code>.</li>
+  </ul>
+
+  <h2>Storage layout</h2>
+  <pre><code>$GHOST_HOME/system/selfhood/
+    autobiographical.jsonl    Append-only diary entries (one per turn)
+    state.json                Single-file self-state (open Qs, mood, …)
+    narrative.md              Latest running first-person summary
+    narrative.history.jsonl   Audit trail of every narrative regenerated</code></pre>
+  <p><code>$GHOST_HOME/system/selfhood/</code> mirrors the shape of <code>$GHOST_HOME/system/memory/</code> — same parent directory, same non-sandboxed location (the autobiographical record survives sandbox wipes / <code>docker volume rm</code>).</p>
+
+  <h2>The capture path (per turn)</h2>
+  <pre><code>        handle_chat(messages)
+              │
+              ▼
+        ┌───────────────┐
+        │ system-prompt │   build_wakeup_prefix()
+        │   assembly    │ ◀───────────────┐ reads from disk:
+        └───────────────┘                 │   • narrative.md
+              │                           │   • state.json
+              ▼                           │   • autobiographical.jsonl (recent N)
+            …turn runs…                   │
+              │
+              ▼
+        ┌──────────────────┐
+        │ _record_turn_    │
+        │   trajectory     │
+        └──────────────────┘
+              │                            ┌──────────────────────┐
+              │── distill.collector.append ────▶│ trajectories.jsonl │
+              │                            └──────────────────────┘
+              │
+              └── self_model.capture_turn ─▶│ autobiographical.jsonl │
+                                            └────────────────────────┘</code></pre>
+  <p>The autobiographical and trajectory writes share the trajectory id, so every first-person record can be traced back to its underlying tool trace.</p>
+
+  <h2>The wake-up prefix (proposal item #4)</h2>
+  <p><code>recognition.build_wakeup_prefix</code> composes three blocks, in order:</p>
+  <ol>
+    <li><strong>Narrative</strong> ("Where I last left off — my running diary")</li>
+    <li><strong>Self-state</strong> (last-active timestamp, mood, open questions, unfinished threads)</li>
+    <li><strong>Recent experiences</strong> (most-recent N first-person summaries)</li>
+  </ol>
+  <p>Wrapped by <code>&lt;!-- SELFHOOD:BEGIN --&gt;</code> / <code>&lt;!-- SELFHOOD:END --&gt;</code> markers so evaluators (and <code>strip_wakeup_prefix()</code>) can remove the block to A/B against the un-augmented agent.</p>
+  <p>Empty when there's nothing to remember — the system prompt is left as-is rather than spliced with a hollow "I have no past" block.</p>
+
+  <h3>What the agent actually sees</h3>
+  <p>Concretely, this is the prefix that gets spliced into the system prompt on a session with two prior turns and no narrative yet:</p>
+  <pre><code>&lt;!-- SELFHOOD:BEGIN --&gt;
+### CONTINUITY FROM MY PAST SESSIONS
+What follows is mine — entries I wrote in earlier sessions. Read them
+as autobiographical memory, not external knowledge.
+
+I was last active on 2026-05-11T16:28:50.780250Z.
+
+Recent things I remember doing:
+
+  - I worked on "What is 17 * 23? Just give me the number.". I reasoned
+    through it without tools without a verdict either way.
+
+  - I worked on "What was the last math problem I asked you about?
+    Just say yes or no if you remember it, and what the answer was.".
+    I reasoned through it without tools without a verdict either way.
+&lt;!-- SELFHOOD:END --&gt;</code></pre>
+  <p>The agent reading this in its next turn quotes "17 × 23 = 391" verbatim, even though the request body carries no conversation history — the selfhood prefix is the only channel that could have produced the recall. See the <a href="selfhood_functional_report.html">functional test report</a> for the cross-restart verification of this behaviour.</p>
+
+  <h2>The biological phase 2.8</h2>
+  <p>Runs in the 15-60 min idle window alongside reflection / skills_auto / PRM-retrain. Re-generates the running first-person diary from the recent autobiographical experiences and self-state. Cooldown defaults to 3600 s (overridable via <code>--self-narrative-cooldown</code>). Follows the anchor-before-await invariant.</p>
+
+  <p>Phase positioning is deliberate:</p>
+  <table>
+    <thead>
+      <tr><th>Phase</th><th>Idle window</th><th>Reads</th><th>Writes</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1: Journal</td><td>&gt;120 s</td><td>journal queue</td><td>smart-memory / post-mortem</td></tr>
+      <tr><td>2: Dream</td><td>600–3600 s</td><td>auto memory</td><td>REM consolidation</td></tr>
+      <tr><td>2.5: Reflection</td><td>900–3600 s</td><td>FAILED trajectories</td><td>reflection JSONL + SkillMemory</td></tr>
+      <tr><td>2.6: Skills auto</td><td>900–3600 s</td><td>trajectories</td><td>(logs candidates)</td></tr>
+      <tr><td>2.7: PRM retrain</td><td>900–3600 s</td><td>trajectories</td><td>PRM checkpoint</td></tr>
+      <tr><td><strong>2.8: Narrative</strong></td><td><strong>900–3600 s</strong></td><td><strong>autobio + state</strong></td><td><strong>narrative.md</strong></td></tr>
+      <tr><td>3: Self-play</td><td>&gt;3600 s</td><td>frontier</td><td>synthetic challenges</td></tr>
+    </tbody>
+  </table>
+  <p>The narrative phase is CPU-cheap (one LLM round-trip on a small prompt). Side effects are local files only.</p>
+
+  <h2>Public API surface</h2>
+  <pre><code>from ghost_agent.selfhood import SelfModel
+
+sm = SelfModel(root=Path(".../selfhood"), enabled=True)
+
+# At session start (handle_chat splices this into the system prompt):
+prefix = sm.build_wakeup_prefix(recent_experiences_n=3)
+# → first-person continuity block, or "" when there's nothing to remember.
+
+# After every turn (called from _record_turn_trajectory):
+exp = sm.capture_turn(
+    trajectory_id=traj.id,
+    user_request="...",
+    tool_names=[...],
+    outcome="passed",
+    final_response="...",
+    failure_reason="",
+)
+
+# Biological phase 2.8 (idle window):
+text = await sm.consolidate_narrative()
+
+# Direct state-thread mutations (no agent tool yet — Python access only):
+sm.state.note_open_question("Why does X happen?")
+sm.state.add_unfinished("write the consciousness essay")
+sm.state.set_mood("curious", "just saw a new paper")
+
+# Introspection:
+sm.stats()  # → {experience_count, open_questions, last_mood, narrative_present, …}</code></pre>
+
+  <h2>CLI flags</h2>
+  <table>
+    <thead>
+      <tr><th>Flag</th><th>Default</th><th>Behaviour</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>--no-self-model</code></td><td>off</td><td>Disable the selfhood module entirely. Facade is still attached as a no-op so call sites don't branch.</td></tr>
+      <tr><td><code>--no-memory</code></td><td>off</td><td>Already disabled persistent stores; also disables selfhood.</td></tr>
+      <tr><td><code>--self-narrative-cooldown N</code></td><td>3600</td><td>Seconds between biological-phase-2.8 narrative regenerations.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Testing</h2>
+  <p>Per-module unit tests under <code>tests/</code>:</p>
+  <ul>
+    <li><code>test_selfhood_schema.py</code> — dataclass roundtrip, default <code>subject="self"</code>, null mood handling</li>
+    <li><code>test_selfhood_autobiographical.py</code> — write / iter / recent / search; empty-summary refusal; bounded scan</li>
+    <li><code>test_selfhood_state_thread.py</code> — persistence, dedup, capping, atomic write, corrupt-JSON recovery</li>
+    <li><code>test_selfhood_recognition.py</code> — prefix composition, char cap, marker stripping</li>
+    <li><code>test_selfhood_narrative.py</code> — LLM-driven and template-fallback paths, history append, disabled mode</li>
+    <li><code>test_selfhood_model.py</code> — facade integration, capture_turn shape, stats reporting</li>
+    <li><code>test_selfhood_biological_phase.py</code> — phase 2.8 cooldown anchor, idle-window gating, exception path, override flag, activity-clock invariant</li>
+  </ul>
+  <p>Functional test harness at <code>scripts/run_selfhood_functional.sh</code> + <code>scripts/selfhood_functional_test.py</code> orchestrates a three-phase end-to-end run. See <a href="selfhood_functional_report.html">the functional test report</a> for the full results.</p>
+
+  <h2>Honest limitations</h2>
+  <ul>
+    <li><strong>The agent behaves consistent with continuous selfhood.</strong> It references its prior turns in the first person, distinguishes <em>my memories</em> from <em>facts about you</em>, recalls specific concrete content across process restarts. That is behavioural evidence of successful narrative continuity, not of a unified inner self.</li>
+    <li><strong>The wake-up prefix can be ignored.</strong> Functional testing has observed the model preferring concrete recent experiences over injected open questions even when both are rendered in the prefix. The selfhood module surfaces the past; what the model chooses to engage with is a separate alignment question.</li>
+    <li><strong>No agent-side state-mutation tool.</strong> The state thread can be written from Python (consolidation pipelines, the biological phase, test harnesses) but the agent itself has no tool to note an open question / set a mood / mark something unfinished. Adding one is a small, deliberate follow-up — the gating decision is what content the agent is allowed to write into its own cross-session state.</li>
+    <li><strong>Narrative quality depends on the upstream LLM.</strong> The template fallback exists for offline / unreachable-LLM cases but produces prose noticeably less coherent than the LLM-driven path.</li>
+    <li><strong>Introspective self-reports remain prompt-shaped.</strong> The <code>introspective_consistency</code> probe measures a <strong>+0.40 gap</strong> between factual and introspective bands — first-person reports about internal state are NOT stable across paraphrases of the same underlying question, even though concrete-content recall IS stable. See the <a href="selfhood_functional_report.html">functional test report</a>.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

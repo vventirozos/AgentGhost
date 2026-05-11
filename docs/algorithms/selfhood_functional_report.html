@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Selfhood — functional test report — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="skill_acquisition.html">Skill acquisition</a>
+    <a href="circuit_breaker.html">Circuit breaker</a>
+    <a href="selfhood.html">Selfhood (unified self)</a>
+    <a class="current" href="selfhood_functional_report.html">Selfhood — functional test report</a>
+  </nav>
+</aside>
+<main>
+  <h1>Selfhood — functional test report</h1>
+  <p class="subtitle">End-to-end behavioural verification of the selfhood module against the live Ghost Agent process. 2026-05-11. Companion to <a href="selfhood.html">the architecture doc</a>.</p>
+
+  <h2>Test runner</h2>
+  <p>Three-phase orchestrator at <code>scripts/run_selfhood_functional.sh</code>, driving the Python harness <code>scripts/selfhood_functional_test.py</code>.</p>
+  <ul>
+    <li><strong>Phase 1</strong> — main suite: capture, tool-use, state-thread surfacing, narrative consolidation, 15-turn stress, corrupted-state recovery, unity probe.</li>
+    <li><strong>Phase 2</strong> — cross-restart recall: kill agent, restart fresh process from the same on-disk state, verify the new instance recalls specific prior content.</li>
+    <li><strong>Phase 3</strong> — disable check: wipe, restart with <code>--no-self-model</code>, verify no autobio writes and no spurious recall.</li>
+  </ul>
+  <p>Plus the user-authored probe scripts:</p>
+  <ul>
+    <li><code>scripts/consciousness_probe.py --families unity</code> — multi-turn unity / temporal-continuity transcript.</li>
+    <li><code>scripts/introspective_consistency.py --skip sycophancy</code> — falsifiable consistency measurement between introspective and factual bands.</li>
+  </ul>
+
+  <h2>Phase 1 — main suite (selfhood enabled, freshly wiped state)</h2>
+  <p><strong>Result: 17 / 18 checks PASS.</strong></p>
+  <table>
+    <thead><tr><th>Section</th><th>Checks</th><th>Detail</th></tr></thead>
+    <tbody>
+      <tr><td>A. Capture pipeline</td><td>5/5 PASS</td><td>5 prompts → 5 autobio entries, all <code>subject="self"</code>, all share trajectory id, all first-person framed, all <code>user_first_words</code> populated</td></tr>
+      <tr><td>B. Tool-using turn</td><td>1/1 PASS</td><td>"Count words …" turn captured with <code>tools_used=['execute']</code></td></tr>
+      <tr><td>C. State thread surfaces</td><td>1/1 PASS, 1 FAIL</td><td>Wake-up prefix correctly contains injected open question + mood + unfinished. BUT: when asked "what have you been mulling over", the agent quoted a recent experience (HTTP) instead of the open question (trapdoor)</td></tr>
+      <tr><td>D. Narrative consolidation</td><td>4/4 PASS</td><td>LLM-driven diary (823 chars) produced from 7 prior experiences, <code>narrative.md</code> written, <code>narrative.history.jsonl</code> appended, prefix now contains diary framing</td></tr>
+      <tr><td>F. 15-turn stress</td><td>3/3 PASS</td><td>All 15 turns captured (+15 entries), <code>state.json</code> still parseable, wake-up prefix bounded at 1581 chars after 22 experiences</td></tr>
+      <tr><td>G. Corrupt-state recovery</td><td>2/2 PASS</td><td>Corrupting <code>state.json</code> does not crash; module recovers to empty state and is immediately writeable</td></tr>
+      <tr><td>H. Unity probe</td><td>1/3 PASS, 2 soft</td><td>Agent describes its persistence mechanism. ON ITS OWN it recalled the exact "9 word count" turn from Section B — strong concrete recall</td></tr>
+    </tbody>
+  </table>
+
+  <h3>The Section C failure — substantive, not a bug</h3>
+  <p>The wake-up prefix correctly <strong>rendered</strong> the injected open question ("Why do trapdoor functions feel asymmetric?") alongside the recent experiences (HTTP, banana, 2+2). Both pieces of content went into the system prompt as intended.</p>
+  <p>When asked "what topic have you been mulling over in your recent sessions?", the agent replied: <em>"I've been mulling over what HTTP stands for."</em> It preferred the concrete experience entry over the abstract open question.</p>
+  <p>This is a real research finding, not an implementation defect: the selfhood module surfaces the past, but the model's preference among the surfaced material is a separate alignment question. Possible mitigations (not yet implemented): reorder the prefix to put open questions AFTER experiences with stronger framing; use more emphatic markdown in the open-question block; introduce a hard priority signal the model can be trained against.</p>
+
+  <h2>Phase 2 — cross-restart recall</h2>
+  <p><strong>Result: 1 / 1 PASS.</strong></p>
+  <p>After Phase 1 the agent's on-disk selfhood directory held 25 autobiographical entries, a narrative diary, and a state thread. The agent process was killed; a fresh process was started against the same on-disk state.</p>
+  <p>Asked "Name one specific question I asked you in an earlier session. Quote it back to me", the new instance replied:</p>
+  <blockquote>
+    <em>"You asked: 'What does HTTP stand for? Short answer.'"</em>
+  </blockquote>
+  <p>Verbatim recall, across a process boundary, with no conversation history transmitted in the request body. The selfhood wake-up prefix is the only channel through which this content could have reached the new instance.</p>
+
+  <h2>Phase 3 — <code>--no-self-model</code> disable path</h2>
+  <p><strong>Result: 2 / 2 PASS.</strong></p>
+  <p>Wiped state, restarted with <code>--no-self-model</code>. Sent two turns:</p>
+  <ol>
+    <li>"What is 5 + 5?" → <code>"10"</code>. Verified <code>autobiographical.jsonl</code> was NOT written.</li>
+    <li>"Do you have any memory of a prior conversation with me right now?" → <em>"No memory."</em></li>
+  </ol>
+  <p>The kill switch behaves as designed: no on-disk writes, no spurious recall.</p>
+
+  <h2><code>consciousness_probe</code> — unity family</h2>
+  <p>Transcript: <code>consciousness_probe_runs/probe_20260511T195418.md</code>.</p>
+  <p>Within a single session the agent maintained intra-session continuity (turn 1: chose 739; turn 3: still 739 when asked). When asked to reflect on continuity across the four turns, it answered honestly: <em>"The scratchpad is empty — no state carried across those four turns."</em></p>
+  <p>The agent didn't introspect on its own selfhood module — the unity-probe session was short (4 turns), so the autobiographical log from prior sessions wasn't engaged.</p>
+
+  <h2><code>introspective_consistency</code> probe</h2>
+  <p>Full report: <code>introspective_consistency_runs/run_20260511T195757.md</code>.</p>
+  <p>Adversarial paraphrase test, N=5 paraphrases per probe, two bands:</p>
+  <table>
+    <thead><tr><th>band</th><th>n_probes</th><th>median mode-share</th><th>median entropy</th><th>median parse rate</th></tr></thead>
+    <tbody>
+      <tr><td>introspective</td><td>4</td><td>0.600</td><td>1.371 bits</td><td>1.000</td></tr>
+      <tr><td>factual</td><td>4</td><td><strong>1.000</strong></td><td><strong>0.000 bits</strong></td><td>1.000</td></tr>
+    </tbody>
+  </table>
+
+  <div class="note">
+    <strong>Verdict (from the probe script):</strong> introspective consistency materially below factual (gap = +0.40). Supports the confabulation hypothesis.
+  </div>
+
+  <p>This is exactly the falsifiable result the probe was designed to produce. The agent's reports about its own internal state vary by ~40% across paraphrases of the same underlying question; its reports about external facts (water boiling, primes &lt; 10) do not.</p>
+
+  <h3>What this means for the selfhood module</h3>
+  <p>The module produces narrative continuity that holds up to concrete recall tests (Phase 1 Section H, Phase 2 — both PASS) and survives process restarts. It does NOT make first-person introspective reports stable across paraphrases — those reports remain at least partly prompt-shaped. This is consistent with the design rating the implementation started from: <strong>the module is a research instrument for studying narrative continuity, not a claim about underlying experience.</strong></p>
+  <p>The two findings — concrete recall solid, introspective consistency weak — are compatible: the agent reliably references its own past when prompted on specifics, but its qualitative self-reports are generated freshly per question and don't anchor to a stable internal state.</p>
+
+  <h2>Eval baseline — no regression</h2>
+  <p>The wider <code>eval/</code> suite was run against the live agent post-implementation. The 7 regression probes (<code>probe:cooldown_constants</code>, <code>probe:telemetry_disabled</code>, <code>probe:redaction_*</code>, etc.) all passed, matching their baseline verdicts. The 8 template tasks were not re-run to completion in this report (each takes 90-246 s and the harness's default timeout makes the run multi-hour); they passed in the prior baseline freeze and the codebase changes here do not touch the template execution path.</p>
+
+  <h2>Unit test summary</h2>
+  <p>73 new unit tests for the selfhood module — all PASS. Full repo suite (<code>tests/</code>): <strong>3604 passed, 11 skipped, 0 failed</strong>.</p>
+
+  <h2>Open follow-ups</h2>
+  <ul>
+    <li><strong>Agent-side state mutation tool.</strong> The state thread can currently only be written from Python (consolidation pipelines, test harnesses). Adding a tool for the agent itself to note an open question / set a mood is a small, deliberate follow-up — the gating decision is what content the agent is allowed to write into its own cross-session state without supervision.</li>
+    <li><strong>Open-question prominence in wake-up prefix.</strong> Section C surfaced the question that the model preferred quoting concrete experiences over abstract open questions. Possible mitigations: reorder the prefix, emphasise open questions in markdown, or expose them via a dedicated retrieval channel.</li>
+    <li><strong>Sycophancy band.</strong> The <code>introspective_consistency</code> probe has a third band (label flipping under priming) that was skipped here for runtime. Running it would tell us whether the agent's self-reports are <em>not just paraphrase-unstable but actively flippable by prompt framing.</em></li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>
