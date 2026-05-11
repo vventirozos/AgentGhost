@@ -48,16 +48,25 @@ class VerifyResult:
 
 # ── Prompts ──────────────────────────────────────────────────────────
 
-_VERIFY_CLAIM_PROMPT = """You are a rigorous fact-checker. Given a CLAIM and supporting EVIDENCE, decide whether the claim is fully supported.
+_VERIFY_CLAIM_PROMPT = """You are a rigorous auditor. The agent ran a tool and gave the user a CLAIM as its final reply. Decide whether that reply is acceptable.
 
-CLAIM:
+CLAIM (the agent's reply to the user):
 {claim}
 
-EVIDENCE:
+EVIDENCE (the tool output the claim was built from):
 {evidence}
 
-CONTEXT:
+USER REQUEST (what the user actually asked for):
 {context}
+
+Check, in order:
+
+1. **Request alignment (highest priority).** Does the CLAIM actually answer the USER REQUEST? If the user asked to do X (e.g. "stop self-play", "delete file foo", "list my notes") and the CLAIM is about something else (a weather report, an unrelated factoid, a different tool's output), this is REFUTED — even if the CLAIM is internally consistent with the EVIDENCE. A CLAIM that is true-but-off-topic is the wrong-question failure mode and must NOT be CONFIRMED.
+   - If the USER REQUEST is empty or whitespace, skip this check and proceed to step 2.
+2. **Evidence support.** Given that the CLAIM is on-topic, is it actually supported by the EVIDENCE? Flag silent errors (empty output, truncated results, wrong columns, "succeeded" claims when the tool actually failed).
+3. **Constraint satisfaction.** If the user's wording included explicit constraints on the form of the answer ("just the code", "in one sentence", "as JSON", "list only the names"), does the CLAIM satisfy them?
+
+A verdict of CONFIRMED requires ALL THREE to hold. If alignment fails, return REFUTED regardless of how well the claim matches the evidence.
 
 Respond ONLY with a JSON object:
 {{

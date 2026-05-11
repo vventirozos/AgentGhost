@@ -338,8 +338,14 @@ async def test_self_play_loop_consolidates_between_cycles(tmp_path, monkeypatch)
     consolidation_calls = {"n": 0}
 
     class FakeAgent:
-        async def process_journal_queue(self):
+        async def process_journal_queue(self, *, respect_idle: bool = True):
             consolidation_calls["n"] += 1
+            # The loop-driven inter-cycle drain MUST bypass the human-idle
+            # heuristic — the dispatching `handle_chat` heartbeat would
+            # otherwise fake "user returned" on the very first drain.
+            assert respect_idle is False, (
+                "self-play loop must call process_journal_queue with respect_idle=False"
+            )
             journal_path.write_text("[]")  # simulate drain
 
     sm = SkillMemory(tmp_path)

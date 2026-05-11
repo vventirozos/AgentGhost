@@ -56,6 +56,7 @@ from .distill import TrajectoryCollector
 from .reflection import Reflector
 from .router import ComplexityClassifier, ComplexityDispatcher
 from .prm import PRMScorer, PRMTrainer
+from .selfhood import SelfModel
 
 print(" - All modules imported successfully!", flush=True)
 
@@ -102,6 +103,15 @@ def parse_args():
     # existing simulation fallback in MCTS stays in effect.
     parser.add_argument("--prm-model", default=None, help="Path to a persisted PRM (Process Reward Model) JSON checkpoint. When set, the PRM is loaded and plugged into the MCTS reasoner as a fast scoring path.")
     parser.add_argument("--prm-train-cooldown", type=int, default=10800, help="Seconds between idle-time PRM retrains. Default 3 hours. Has no effect when --prm-model is unset.")
+    # Selfhood / unified self. The five-piece module (autobiographical
+    # log, self-state thread, recognition layer, narrative summariser,
+    # continuity tag) is on by default but suppressed alongside the
+    # other persistent stores when --no-memory is set. --no-self-model
+    # is a separate kill switch for callers who want trajectory logging
+    # and skill memory but NOT a continuous first-person diary
+    # (privacy-sensitive evals, A/B comparisons, etc.).
+    parser.add_argument("--no-self-model", action="store_true", help="Disable the selfhood module (autobiographical memory + self-state + narrative). When --no-memory is set, the selfhood module is also disabled regardless of this flag.")
+    parser.add_argument("--self-narrative-cooldown", type=int, default=3600, help="Seconds between idle-time narrative consolidations (biological phase 2.8). Default 60 min.")
     args = parser.parse_args()
     
     swarm_nodes_list = []
@@ -599,6 +609,66 @@ async def lifespan(app):
         pretty_log("Complexity Router Failed", str(e), level="WARNING", icon=Icons.WARN)
         context.complexity_dispatcher = None
 
+    # Selfhood module: the five-component "unified self" — first-person
+    # autobiographical log, self-state thread (open questions / mood /
+    # unfinished threads), recognition / wake-up retrieval, and a
+    # periodic narrative summariser. Disabled when --no-memory (the
+    # whole module persists to disk) or when --no-self-model is set
+    # explicitly. The biological watchdog phase 2.8 calls into
+    # `context.self_model.consolidate_narrative` during the same idle
+    # window reflection / skills_auto use; the prompt assembly path
+    # reads `build_wakeup_prefix()` per turn; the trajectory-record
+    # path calls `capture_turn` post-turn. When disabled the facade
+    # is still attached as a no-op object so call sites never branch.
+    # Wrap memory_dir in Path defensively — most callers pass a Path,
+    # but some tests pre-construct the context with a string-typed
+    # memory_dir, and `str.parent` raises AttributeError.
+    self_root = Path(str(context.memory_dir)).parent / "selfhood"
+    self_enabled = not args.no_memory and not getattr(args, "no_self_model", False)
+    try:
+        async def _selfhood_critique_fn(prompt: str) -> str:
+            """LLM critique closure for the narrative summariser.
+            Mirrors the Reflector's pattern: low temperature, generous
+            max_tokens so Qwen 3.6's reasoning_content doesn't crowd
+            out the diary text."""
+            payload = {
+                "model": args.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.6,  # warmer than reflection — diary, not analysis
+                "max_tokens": 1024,
+                "stream": False,
+            }
+            res = await context.llm_client.chat_completion(payload)
+            return (
+                (res or {})
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+
+        context.self_model = SelfModel(
+            root=self_root,
+            enabled=self_enabled,
+            narrative_critique_fn=_selfhood_critique_fn if self_enabled else None,
+        )
+        if self_enabled:
+            stats = context.self_model.stats()
+            pretty_log(
+                "Selfhood",
+                f"unified self model initialised at {self_root}: {stats['experience_count']} prior experiences, "
+                f"{stats['open_questions']} open questions, narrative={'yes' if stats['narrative_present'] else 'no'}",
+                icon=Icons.BRAIN_THINK,
+            )
+        else:
+            pretty_log(
+                "Selfhood",
+                "disabled (--no-memory or --no-self-model)",
+                icon=Icons.WARN,
+            )
+    except Exception as e:
+        pretty_log("Selfhood Failed", str(e), level="WARNING", icon=Icons.WARN)
+        context.self_model = SelfModel(root=self_root, enabled=False)
+
     agent = GhostAgent(context)
     app.state.agent = agent
     # Expose the agent on the context too so scheduled jobs (APScheduler
@@ -627,6 +697,32 @@ async def lifespan(app):
                 pass
             except Exception as e:
                 logger.error(f"Biological daemon shutdown error: {e}")
+        # Drain in-flight post-turn reflection tasks. These are
+        # fire-and-forget tasks scheduled by user-correction
+        # promotion; without an explicit drain they get destroyed
+        # mid-await on shutdown ("Task was destroyed but it is
+        # pending"), aborting their LLM round-trip and potentially
+        # leaving a half-applied SkillMemory write. Bound the wait
+        # so a stuck upstream doesn't pin shutdown indefinitely.
+        # Uses `asyncio.wait` (not `wait_for(gather)`) because gather
+        # blocks until every task finishes — a task that swallows
+        # CancelledError would pin shutdown for its full natural
+        # duration. `wait` with `timeout` returns after the deadline
+        # and reports stragglers in the `pending` set.
+        pending_reflections = getattr(context, "_pending_reflection_tasks", None)
+        if pending_reflections:
+            tasks = list(pending_reflections)
+            for t in tasks:
+                t.cancel()
+            try:
+                _done, still_pending = await asyncio.wait(tasks, timeout=5.0)
+                if still_pending:
+                    logger.warning(
+                        "Pending reflection drain: %d task(s) did not respond to cancel within 5s; abandoning",
+                        len(still_pending),
+                    )
+            except Exception as e:
+                logger.warning(f"Pending reflection drain error: {e}")
         # Cancel any in-flight continuous self-play loop so the
         # process can exit cleanly. The loop is NOT persisted across
         # restarts by design — a fresh session starts with no loop.

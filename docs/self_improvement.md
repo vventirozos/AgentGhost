@@ -37,6 +37,7 @@ the agent's first action — all without any weight update.
 | `ghost_agent.skills_auto` | Passive skill extraction from validator-passing trajectories | Biological phase 2.6 (logs candidates) |
 | `ghost_agent.reflection` | Self-critique biological phase on FAILED trajectories | Biological phase 2.5 → composite sink (JSONL + SkillMemory) |
 | `ghost_agent.prm` | Per-step value model — scores `(state, action)` for MCTS lookahead | Biological phase 2.7 (retrain) → `core.mcts.MCTSReasoner` (fast scoring) |
+| `ghost_agent.selfhood` | First-person autobiographical diary + self-state + recognition / wake-up + narrative consolidation | Biological phase 2.8 (narrative regen) → wake-up prefix on every `handle_chat` |
 
 ## The flow (as wired)
 
@@ -85,6 +86,7 @@ the agent's first action — all without any weight update.
             │         2.5  reflection          (900-3600s, cooldown 40m)
             │         2.6  skills auto-extract (900-3600s, cooldown 2h)
             │         2.7  PRM retrain         (900-3600s, cooldown 3h)
+            │         2.8  selfhood narrative  (900-3600s, cooldown 1h)
             │         3.   self-play           (>3600s,   cooldown 60m)
             ▼
   FAILED trajectories ─→ Reflector.run ─→ (diagnosis, plan)

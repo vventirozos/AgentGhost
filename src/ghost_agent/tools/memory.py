@@ -1,11 +1,14 @@
 import asyncio
 import hashlib
+import logging
 import os
 from pathlib import Path
 from typing import List
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import get_utc_timestamp, helper_fetch_url_content, recursive_split_text, semantic_split_text
 from ..memory.scratchpad import Scratchpad
+
+logger = logging.getLogger("GhostAgent")
 
 
 class _NullCM:
@@ -600,9 +603,25 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     # --- LEGACY DIRECT PATH ---
     if not profile_memory: return "Error: Profile memory not loaded."
     msg = await asyncio.to_thread(profile_memory.update, category, key, value)
+
+    # The vector + graph indexes are best-effort secondary writes;
+    # the canonical store is `profile_memory` (JSON). Track partial
+    # failures explicitly so the caller knows retrieval may not yet
+    # reflect the change. Previously bare `except: pass` silently
+    # masked these and we returned "SUCCESS" anyway — the agent and
+    # user both believed the fact was fully indexed when only the
+    # JSON profile actually got it.
+    partial_failures = []
+
     if memory_system:
-        try: await asyncio.to_thread(memory_system.smart_update, f"User {key} is {value}", "identity")
-        except: pass
+        try:
+            await asyncio.to_thread(memory_system.smart_update, f"User {key} is {value}", "identity")
+        except Exception as e:
+            logger.warning(
+                "smart_update vector index missed for %s.%s: %s: %s",
+                category, key, type(e).__name__, e,
+            )
+            partial_failures.append("vector")
 
     if graph_memory:
         try:
@@ -610,8 +629,19 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
             clean_key = str(key).upper().replace(" ", "_")
             triplet = [{"subject": "user", "predicate": f"HAS_{clean_key}", "object": str(value).lower()}]
             await asyncio.to_thread(graph_memory.add_triplets, triplet)
-        except Exception: pass
+        except Exception as e:
+            logger.warning(
+                "graph triplet write missed for %s.%s: %s: %s",
+                category, key, type(e).__name__, e,
+            )
+            partial_failures.append("graph")
 
+    if partial_failures:
+        return (
+            f"PARTIAL: Profile updated (canonical JSON), but "
+            f"{', '.join(partial_failures)} index(es) lagged. "
+            f"Semantic / graph retrieval may not yet reflect this change."
+        )
     return f"SUCCESS: Profile updated."
 
 async def tool_learn_skill(task: str = None, mistake: str = None, solution: str = None, skill_memory=None, memory_system=None, memory_bus=None, **kwargs):
@@ -915,10 +945,15 @@ async def _consolidate_between_cycles(context):
     items waiting on hippocampus. Doing an explicit drain here gives us
     a predictable "consolidate, then start the next cycle" cadence.
 
-    The journal's own `idle_secs < 30` guard inside `process_journal_queue`
-    still fires, so if the user sent a message a moment ago the drain
-    bails cleanly. And on any error we just log — consolidation failure
-    must never kill the loop.
+    Calls `process_journal_queue(respect_idle=False)`: the journal's
+    `idle_secs < 30` guard exists to stop the watchdog from drowning a
+    LIVE user, but the dispatching `handle_chat` call leaves a fresh
+    `last_activity_time` heartbeat behind that fakes "user returned"
+    inside the first inter-cycle drain — even though no actual user
+    message arrived. Real user interrupts already reach the loop via
+    `selfplay_loop_stop` (set in `handle_chat`); the idle gate here is
+    redundant and just lies to the log. On any error we just log —
+    consolidation failure must never kill the loop.
     """
     journal = getattr(context, "journal", None)
     agent = getattr(context, "agent", None)
@@ -941,7 +976,7 @@ async def _consolidate_between_cycles(context):
             f"Consolidating {items_on_disk} buffered memorie(s) before next cycle.",
             icon=Icons.BRAIN_THINK,
         )
-        await agent.process_journal_queue()
+        await agent.process_journal_queue(respect_idle=False)
     except asyncio.CancelledError:
         raise
     except Exception as e:

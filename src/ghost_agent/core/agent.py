@@ -137,11 +137,22 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
     evidence slot held `{"exited": "..."}`). When every tool this
     turn was bookkeeping, returns ``None`` so the caller skips the
     verifier entirely — no evidence, no verdict.
+
+    Also skips entries flagged ``_synthetic=True``. Those are
+    error/nudge messages the agent loop synthesises when the model
+    malforms a tool call (parse errors, invalid JSON args, unknown
+    tool, idempotency blocks, etc.). They are NOT real tool output —
+    feeding them to the verifier produces "Evidence is irrelevant to
+    the claim" REFUTEDs that leak as a user-visible
+    ``**Verifier note:**`` line at the end of an otherwise-clean
+    conversational reply.
     """
     if not tools_run:
         return None
     for tool in reversed(tools_run):
         if not tool:
+            continue
+        if tool.get("_synthetic"):
             continue
         name = str(tool.get("name", "")).lower().strip()
         # Handle normalization aliases (agent.py has
@@ -727,12 +738,22 @@ class GhostAgent:
 
         outputs = []
         for t in tools_run_this_turn:
+            # Synthetic agent-loop error entries (parse-error nudges,
+            # unknown-tool blocks, idempotency stops, etc.) are NOT
+            # real tool output — feeding their `SYSTEM ERROR:` /
+            # `Error: Invalid JSON arguments` strings to the planner
+            # makes it plan against fabricated evidence and often
+            # repeat the same broken action.
+            if t.get("_synthetic"):
+                continue
             content = str(t.get("content", ""))
             if len(content) > char_limit:
                 # Keep top char_limit so the Planner actually sees the search matches
                 content = content[:char_limit] + "\n\n... [TRUNCATED: Tool output too long. Showing top results only.]"
             outputs.append(f"Tool [{t.get('name', 'unknown')}]: {content}")
 
+        if not outputs:
+            return "None (Start of Task)"
         return "\n\n".join(outputs)
 
     @staticmethod
@@ -1098,7 +1119,14 @@ class GhostAgent:
     _REFLECTION_COOLDOWN = 2400   # 40 min between reflections
     _SKILLS_AUTO_COOLDOWN = 7200  # 2 hours between skill auto-extractions
     _PRM_TRAIN_COOLDOWN = 10800   # 3 hours between PRM retrain passes
+    _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
+    # Belt-and-braces guard for phase 1. The journal-empty self-disarm
+    # already prevents same-batch refire, but a journal write that
+    # raises mid-loop (or a misbehaving consumer that fails to drain)
+    # would otherwise re-fire every tick. The cooldown caps refire
+    # rate at the same shape as the other five phases.
+    _JOURNAL_COOLDOWN = 60        # 60 s between journal-process passes
 
     async def _biological_tick(self):
         """One pass of the biological hook state machine. Extracted from the
@@ -1112,6 +1140,8 @@ class GhostAgent:
             return
 
         # Lazily install per-phase cooldown anchors on the agent instance.
+        if not hasattr(self, '_last_journal_at'):
+            self._last_journal_at = datetime.datetime.min
         if not hasattr(self, '_last_dream_at'):
             self._last_dream_at = datetime.datetime.min
         if not hasattr(self, '_last_reflection_at'):
@@ -1120,6 +1150,8 @@ class GhostAgent:
             self._last_skills_auto_at = datetime.datetime.min
         if not hasattr(self, '_last_prm_train_at'):
             self._last_prm_train_at = datetime.datetime.min
+        if not hasattr(self, '_last_narrative_at'):
+            self._last_narrative_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
         # Adaptive self-play cooldown (curiosity-driven). Starts at the
@@ -1132,21 +1164,34 @@ class GhostAgent:
 
         # Phase 1: Process Short-Term Journal (>120s idle)
         if idle_secs > 120 and getattr(ctx, 'journal', None) is not None:
-            has_items = False
-            try:
-                with ctx.journal._lock:
-                    has_items = len(json.loads(ctx.journal.file_path.read_text())) > 0
-            except Exception:
-                pass
-            if has_items:
-                await self.process_journal_queue()
-                # Do NOT reset last_activity_time here: that clock tracks
-                # *user* idleness and is what phases 2/3 gate on. Resetting
-                # it on internal work starves the later phases (phase 3
-                # needs idle_secs > 3600, unreachable if phase 1 keeps
-                # firing every few minutes). Per-phase cooldowns already
-                # prevent immediate refire of this phase.
-                return
+            since_last_journal = (datetime.datetime.now() - self._last_journal_at).total_seconds()
+            if since_last_journal >= self._JOURNAL_COOLDOWN:
+                has_items = False
+                try:
+                    with ctx.journal._lock:
+                        has_items = len(json.loads(ctx.journal.file_path.read_text())) > 0
+                except Exception:
+                    pass
+                if has_items:
+                    # Anchor BEFORE the await so an exception inside
+                    # `process_journal_queue` doesn't leave
+                    # `_last_journal_at` at its prior value, which would
+                    # cause the watchdog to re-fire the failing
+                    # processor on every tick. Mirrors the pattern in
+                    # phases 2 / 2.5 / 2.6 / 2.7 / 3.
+                    self._last_journal_at = datetime.datetime.now()
+                    try:
+                        await self.process_journal_queue()
+                    finally:
+                        self._last_journal_at = datetime.datetime.now()
+                    # Do NOT reset last_activity_time here: that clock
+                    # tracks *user* idleness and is what phases 2/3 gate
+                    # on. Resetting it on internal work starves the later
+                    # phases (phase 3 needs idle_secs > 3600, unreachable
+                    # if phase 1 keeps firing every few minutes).
+                    # Per-phase cooldowns already prevent immediate refire
+                    # of this phase.
+                    return
 
         # Phase 2: Deep REM Dream (10–60 min idle)
         if 600 < idle_secs <= 3600:
@@ -1362,6 +1407,52 @@ class GhostAgent:
                     finally:
                         self._last_prm_train_at = datetime.datetime.now()
 
+        # Phase 2.8: Selfhood narrative consolidation (15-60 min idle).
+        # Re-generates the agent's first-person running diary from the
+        # recent autobiographical experiences + self-state thread. The
+        # output is what the wake-up prefix reads on each new turn, so
+        # this is how a long-running session evolves its sense of
+        # "what I've been up to" — the load-bearing component for
+        # proposal item #5.
+        # Gated on:
+        #   (a) own cooldown (configurable via --self-narrative-cooldown
+        #       or the static default `_NARRATIVE_COOLDOWN`), advanced
+        #       BEFORE the await so a mid-consolidation crash can't
+        #       leave the anchor un-reset and refire every tick — same
+        #       defensive pattern as phases 2 / 2.5 / 2.6 / 2.7;
+        #   (b) presence of a `self_model` on the context (no-op when
+        #       --no-memory / --no-self-model — the lifespan still
+        #       attaches a disabled facade so the call site doesn't
+        #       branch on availability, and the inner method short-
+        #       circuits on `enabled=False`).
+        # Does NOT reset `ctx.last_activity_time` — same rule as every
+        # other internal phase: that clock is the user's, not the agent's.
+        if 900 < idle_secs <= 3600:
+            cooldown_override = getattr(
+                getattr(ctx, 'args', None), 'self_narrative_cooldown', None,
+            )
+            if not isinstance(cooldown_override, (int, float)):
+                cooldown_override = None
+            cooldown = float(cooldown_override) if cooldown_override else float(self._NARRATIVE_COOLDOWN)
+            since_last_narrative = (datetime.datetime.now() - self._last_narrative_at).total_seconds()
+            if since_last_narrative >= cooldown:
+                self_model = getattr(ctx, 'self_model', None)
+                if self_model is not None and getattr(self_model, 'enabled', False):
+                    self._last_narrative_at = datetime.datetime.now()
+                    try:
+                        text = await self_model.consolidate_narrative()
+                        if text:
+                            preview = text.replace("\n", " ")[:120]
+                            pretty_log(
+                                "Selfhood",
+                                f"narrative regenerated ({len(text)} chars): {preview}…",
+                                icon=Icons.BRAIN_THINK,
+                            )
+                    except Exception as e:
+                        logger.warning(f"Narrative consolidation phase failed: {e}")
+                    finally:
+                        self._last_narrative_at = datetime.datetime.now()
+
         # Phase 3: Synthetic Self-Play (>60 min idle)
         if idle_secs > 3600:
             since_last_selfplay = (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
@@ -1399,7 +1490,7 @@ class GhostAgent:
                             logger.warning(f"Adaptive cooldown lookup failed: {e}")
                             self._current_selfplay_cooldown = self._SELFPLAY_COOLDOWN
 
-    async def process_journal_queue(self):
+    async def process_journal_queue(self, *, respect_idle: bool = True):
         if not hasattr(self.context, 'journal'): return
 
         items = await asyncio.to_thread(self.context.journal.pop_all)
@@ -1409,11 +1500,12 @@ class GhostAgent:
 
         processed = 0
         for i, item in enumerate(items):
-            idle_secs = (datetime.datetime.now() - self.context.last_activity_time).total_seconds()
-            if idle_secs < 30:
-                pretty_log("Hippocampus", f"User returned! Suspending memory processing. ({len(items)-i} items left)", icon=Icons.STOP)
-                await asyncio.to_thread(self.context.journal.push_front, items[i:])
-                break
+            if respect_idle:
+                idle_secs = (datetime.datetime.now() - self.context.last_activity_time).total_seconds()
+                if idle_secs < 30:
+                    pretty_log("Hippocampus", f"User returned! Suspending memory processing. ({len(items)-i} items left)", icon=Icons.STOP)
+                    await asyncio.to_thread(self.context.journal.push_front, items[i:])
+                    break
 
             try:
                 if item["type"] == "smart_memory":
@@ -2086,6 +2178,34 @@ class GhostAgent:
 
 
                 base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_context)
+
+                # Selfhood wake-up prefix (recognition layer, proposal item #4).
+                # Splices the agent's own past — autobiographical
+                # experiences, open questions, mood, the running diary —
+                # into the system prompt as first-person continuity
+                # material. The block is bounded by SELFHOOD:BEGIN /
+                # SELFHOOD:END markers so evaluators can strip it. No-op
+                # when --no-memory / --no-self-model / no prior state.
+                # Non-fatal: a failure here must never break a user turn.
+                #
+                # Strict isinstance check on the SelfModel (NOT just
+                # truthiness) — `ctx` is a MagicMock in many tests and
+                # `getattr(MagicMock(), 'self_model', None)` returns a
+                # fresh MagicMock that is truthy AND whose
+                # `build_wakeup_prefix()` returns yet another truthy
+                # MagicMock. Without the type gate, base_prompt would
+                # become a MagicMock-arithmetic object and downstream
+                # `messages[0]["content"]` would be unverifiable
+                # garbage. Same defensive pattern as the PRM phase.
+                try:
+                    from ..selfhood import SelfModel as _SelfModel
+                    self_model = getattr(self.context, 'self_model', None)
+                    if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
+                        wakeup_prefix = self_model.build_wakeup_prefix(recent_experiences_n=3)
+                        if isinstance(wakeup_prefix, str) and wakeup_prefix:
+                            base_prompt = wakeup_prefix + "\n" + base_prompt
+                except Exception as e:
+                    logger.debug(f"selfhood wake-up prefix skipped: {type(e).__name__}: {e}")
 
                 # Dynamic "Perfect It" Protocol Injection
                 if getattr(self.context.args, 'perfect_it', False):
@@ -3102,7 +3222,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                             if was_complex_task or execution_failure_count > 0:
                                 if not force_stop or "READY TO FINALIZE" in stream_thought.upper():
-                                    if getattr(self.context, 'journal', None):
+                                    # Gated on `--smart-memory > 0.0` to honour
+                                    # the contract in CLAUDE.md ("Memory writes
+                                    # are gated on --smart-memory / --no-memory").
+                                    # Without this, a `--smart-memory 0.0` run
+                                    # still queued post_mortem entries → phase 1
+                                    # consumer → SkillMemory.learn_lesson, leaking
+                                    # auto-extracted lessons into the playbook on
+                                    # every complex/failing turn.
+                                    if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
 
                                         await asyncio.to_thread(self.context.journal.append, 'post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
 
@@ -3468,10 +3596,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     safe_user["content"] = safe_user["content"][:10000] + "\n... [EMERGENCY TRUNCATION] ..."
                                 recovery_msgs.append(safe_user)
 
-                            # If the last thing was a tool output that caused the overflow, keep it but heavily truncated
-                            if tools_run_this_turn:
-                                last_tool = tools_run_this_turn[-1].copy()
-                                last_tool["content"] = last_tool["content"][:1000] + "\n... [EMERGENCY TRUNCATION] ..."
+                            # If the last thing was a tool output that caused the overflow, keep it but heavily truncated.
+                            # Walk back to the last *real* tool entry — a synthetic
+                            # agent-loop error (parse-error nudge, etc.) is not real
+                            # prior tool output and pretending it is leads the recovery
+                            # retry to plan against fabricated evidence. Also strip
+                            # internal-tracking keys (`_synthetic`) before forwarding
+                            # upstream so the LLM payload stays clean OpenAI-shape.
+                            real_tool = _find_substantive_tool_for_verifier(
+                                tools_run_this_turn
+                            )
+                            if real_tool is not None:
+                                last_tool = {
+                                    k: v for k, v in real_tool.items()
+                                    if not k.startswith("_")
+                                }
+                                last_tool["content"] = str(last_tool.get("content", ""))[:1000] + "\n... [EMERGENCY TRUNCATION] ..."
                                 recovery_msgs.append(last_tool)
 
                             recovery_msgs.append({"role": "user", "content": "SYSTEM ALERT: The conversation history was truncated to fit within context limits. Continue task. Assume previous context has been handled."})
@@ -3704,7 +3844,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         args_val[cm.group(1).strip()] = cm.group(2)
 
                                     # Format 1: <parameter name="x">y</parameter> (Handles missing closing tags)
-                                    param_matches = list(re.finditer(r'<parameter(?:\s+name=|=)([^>]+)>(.*?)(?=</parameter>|<parameter(?:\s+name=|=)|</function>|</tool_call>|$)', block_content, re.DOTALL | re.IGNORECASE))
+                                    # The lookahead also breaks on a stray *opening* `<function`
+                                    # or `<tool_call` — when the model emits two tool calls in one
+                                    # turn and uses a non-`</parameter>` close tag (e.g. `</path>`,
+                                    # `</file_path>`) on the first call's last param, the lazy
+                                    # `.*?` would otherwise consume past the first call's
+                                    # `</function>` / `</tool_call>` pair (when block-splitting
+                                    # already missed them) and latch onto the *second* call's
+                                    # `</parameter>`, so a single param ends up holding both
+                                    # tool calls' tag-soup as its value. The opening-tag stops
+                                    # are belt-and-braces against block-split misses.
+                                    param_matches = list(re.finditer(r'<parameter(?:\s+name=|=)([^>]+)>(.*?)(?=</parameter>|<parameter(?:\s+name=|=)|<function\b|</function>|<tool_call\b|</tool_call>|$)', block_content, re.DOTALL | re.IGNORECASE))
                                     for p in param_matches:
                                         p_name = p.group(1).split()[0].strip().strip('"').strip("'") # grab first token to avoid attribute bleed
                                         p_val = p.group(2).strip('\r\n')
@@ -3753,9 +3903,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                             re.IGNORECASE,
                                         )
                                         close_re = re.compile(r'</parameter>', re.IGNORECASE)
-                                        end_func_re = re.compile(r'</function>|</tool_call>', re.IGNORECASE)
+                                        # Mirror Format 1's boundary set: a stray `<function`
+                                        # or `<tool_call` opening (block-split miss) terminates
+                                        # the body just like a closing tag, so we never repair
+                                        # a value past the start of the next tool call.
+                                        end_func_re = re.compile(r'<function\b|</function>|<tool_call\b|</tool_call>', re.IGNORECASE)
                                         openings = list(open_pattern.finditer(block_content))
-                                        end_func = end_func_re.search(block_content)
+                                        # The FIRST `<function>` opening is the legitimate one
+                                        # for this block — searching the boundary regex from
+                                        # position 0 would latch onto it and pin `end_pos = 0`,
+                                        # killing every parameter extraction. Start the search
+                                        # AFTER the first `<function>` opening (if present), so
+                                        # the next `<function>` / `<tool_call>` opening — which
+                                        # only happens when block-split missed a boundary —
+                                        # correctly terminates the function body.
+                                        first_func = re.search(r'<function\b', block_content, re.IGNORECASE)
+                                        search_start = first_func.end() if first_func else 0
+                                        end_func = end_func_re.search(block_content, search_start)
                                         end_pos = end_func.start() if end_func else len(block_content)
                                         for i, op in enumerate(openings):
                                             p_name = op.group(1).strip().strip('"').strip("'")
@@ -4100,7 +4264,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         ui_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', ui_content, flags=re.DOTALL)
 
                         # 3. Task Tree Regurgitation Scrubbers
-                        ui_content = re.sub(r'(?m)^\s*(?: )\s*\[.*?\].*?\n?', '', ui_content)
+                        # Old pattern was `^\s*(?: )\s*\[.*?\].*?\n?` which
+                        # stripped any indented `[label]` prefix — that
+                        # mangled legitimate indented markdown links
+                        # ('  [docs](https://x)' → '(https://x)'). Tightened
+                        # to require a task-shape token inside the
+                        # brackets (a `task_NN` id or one of the status
+                        # keywords) so markdown links survive.
+                        ui_content = re.sub(r'(?m)^\s*\[(?:task_\d+|IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\b[^\]]*\].*?\n?', '', ui_content)
                         ui_content = re.sub(r'(?m)^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*\n?', '', ui_content)
                         ui_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', ui_content)
                         ui_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', ui_content)
@@ -4331,6 +4502,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 await asyncio.to_thread(self.context.journal.append, 'smart_memory', {'text': recent_arc, 'model': model})
                         break
 
+                    # Capture the end-of-prior-iteration boundary so we
+                    # can rollback this iteration's preamble flush if
+                    # every tool_call below ends up synthetic (parse
+                    # error, invalid JSON args, unknown/disabled tool,
+                    # idempotency block, empty-write block). Without the
+                    # rollback, a confused iteration's preamble
+                    # ("Thank you for the kind words!") concatenates to
+                    # the NEXT iteration's real response and the user
+                    # sees a Frankenstein reply.
+                    # Trace: 2026-05-01 dialog log turn 28.
+                    _pre_flush_final_len = len(final_ai_content)
+
                     if ui_content:
                         ui_content = ui_content.replace("\r", "")
                         if final_ai_content and not final_ai_content.endswith("\n\n"):
@@ -4388,7 +4571,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         if hasattr(self, 'disabled_tools') and fname in self.disabled_tools:
                             err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM ERROR: Tool '{fname}' is explicitly disabled in this context."}
                             messages.append(err_msg)
-                            tools_run_this_turn.append(err_msg)
+                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
                             execution_failure_count += 1
                             last_was_failure = True
                             continue
@@ -4468,7 +4651,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 "content": err_msg_content,
                             }
                             messages.append(err_msg)
-                            tools_run_this_turn.append(err_msg)
+                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
                             execution_failure_count += 1
                             last_was_failure = True
                             continue
@@ -4494,7 +4677,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         except Exception as e:
                             err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Invalid JSON arguments - {str(e)}"}
                             messages.append(err_msg)
-                            tools_run_this_turn.append(err_msg)
+                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
                             execution_failure_count += 1
                             last_was_failure = True
                             continue
@@ -4532,7 +4715,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 ),
                             }
                             messages.append(err_msg)
-                            tools_run_this_turn.append(err_msg)
+                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
                             continue
                         if is_idempotent_setter:
                             executed_idempotent.add(a_hash)
@@ -4579,7 +4762,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         )
                                         err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM BLOCK: You invoked file_system operation='write' on path={_p_raw!r} but provided an empty or missing 'content' argument. This is completely useless and causes context bloat. Review your task and provide the ACTUAL FULL CONTENT when writing a file. (If you genuinely meant to create an empty file, only these basenames are allowed empty: __init__.py, py.typed, .gitkeep, .nojekyll, .gitignore, conftest.py.) The operation was aborted before execution."}
                                         messages.append(err_msg)
-                                        tools_run_this_turn.append(err_msg)
+                                        tools_run_this_turn.append({**err_msg, "_synthetic": True})
                                         execution_failure_count += 1
                                         last_was_failure = True
                                         continue
@@ -4621,13 +4804,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 pretty_log("Tool Invocation Error", str(e), level="WARNING", icon=Icons.WARN)
                                 err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error invoking tool '{fname}' (Did you forget a required argument?): {str(e)}"}
                                 messages.append(err_msg)
-                                tools_run_this_turn.append(err_msg)
+                                tools_run_this_turn.append({**err_msg, "_synthetic": True})
                                 last_was_failure = True
                         else:
                             err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Unknown tool '{fname}'"}
                             messages.append(err_msg)
-                            tools_run_this_turn.append(err_msg)
+                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
                             execution_failure_count += 1
+
+                    # If every tool_call this iteration was rejected
+                    # synthetically, the model's preamble text was a
+                    # stale deflection — drop it so it does not bleed
+                    # into the next iteration's real response. We keep
+                    # `messages.append(msg)` and the synthetic tool
+                    # entries intact so the LLM still sees its own
+                    # confused attempt + the corrective system message
+                    # on the next iteration.
+                    if tool_calls and not tool_tasks:
+                        if len(final_ai_content) > _pre_flush_final_len:
+                            final_ai_content = final_ai_content[:_pre_flush_final_len]
 
                     if tool_tasks:
                         # CRITICAL FIX: Run mutating tools (like file writes) BEFORE execution tools to prevent race conditions
@@ -5040,6 +5235,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 final_ai_content = re.sub(r'(?m)^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*\n?', '', final_ai_content)
                 final_ai_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', final_ai_content)
                 final_ai_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', final_ai_content)
+                # Strip leaked Qwen Generative-Reward-Model JSON. These keys
+                # are not produced anywhere in Ghost — verified via grep,
+                # zero hits across the codebase. They are an upstream
+                # training artifact: meta-prompts that ask the model to
+                # rate or score itself pull it into evaluator mode and it
+                # emits the GRM schema instead of an answer. Conservative
+                # match requires both c_relevance_to_query AND
+                # c_correctness_of_content, so a legitimate response that
+                # happens to mention one key in isolation is not clobbered.
+                final_ai_content = re.sub(
+                    r'\{\{?\s*"c_relevance_to_query"\s*:\s*\d+\s*,\s*"c_correctness_of_content"\s*:.*?\}\}?',
+                    '',
+                    final_ai_content,
+                    flags=re.DOTALL,
+                )
                 final_ai_content = final_ai_content.strip()
 
                 # --- THE "PERFECT IT" PROTOCOL INJECTION ---
@@ -5139,19 +5349,29 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             final_ai_content = "Task finished successfully, but optimization generation failed."
 
                 if tools_run_this_turn and not final_ai_content:
-                    last_out = tools_run_this_turn[-1].get('content', '')
+                    # Walk back to the last *real* tool output. Reading
+                    # `tools_run_this_turn[-1]` blindly would wrap a
+                    # synthetic agent-loop error ("SYSTEM ERROR: Your
+                    # <tool_call> did not parse...") in a "Process
+                    # finished successfully" banner — silent error to
+                    # false-success leak.
+                    fallback_tool = _find_substantive_tool_for_verifier(
+                        tools_run_this_turn
+                    )
+                    if fallback_tool is not None:
+                        last_out = str(fallback_tool.get('content', ''))
 
-                    if "![Image]" in last_out:
-                        final_ai_content = last_out.strip()
-                    else:
-                        # Extract just the pure STDOUT so the UI fallback is clean
-                        if "STDOUT/STDERR:" in last_out:
-                            last_out = last_out.split("STDOUT/STDERR:")[1].strip()
-                            if "DIAGNOSTIC HINT" in last_out:
-                                last_out = last_out.split("DIAGNOSTIC HINT")[0].strip().strip("-").strip()
+                        if "![Image]" in last_out:
+                            final_ai_content = last_out.strip()
+                        else:
+                            # Extract just the pure STDOUT so the UI fallback is clean
+                            if "STDOUT/STDERR:" in last_out:
+                                last_out = last_out.split("STDOUT/STDERR:")[1].strip()
+                                if "DIAGNOSTIC HINT" in last_out:
+                                    last_out = last_out.split("DIAGNOSTIC HINT")[0].strip().strip("-").strip()
 
-                        preview = (last_out[:2000] + '\n...[Truncated]') if len(last_out) > 2000 else last_out
-                        final_ai_content = f"Process finished successfully.\n\n### Final Output:\n```text\n{preview}\n```"
+                            preview = (last_out[:2000] + '\n...[Truncated]') if len(last_out) > 2000 else last_out
+                            final_ai_content = f"Process finished successfully.\n\n### Final Output:\n```text\n{preview}\n```"
 
                 if not final_ai_content:
                     final_ai_content = "Task executed successfully."
@@ -5179,12 +5399,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     last_tool = _find_substantive_tool_for_verifier(
                         tools_run_this_turn
                     )
+                    # Use the STRICT trivial-chat check (allowlist of
+                    # actual greetings like "hi", "thanks") rather than
+                    # the loose `is_trivial_greeting` flag. The loose
+                    # flag fires on any 5-word conversational message
+                    # without "remember"/"previous" — including
+                    # correction-shaped prompts ("thanks but wrong",
+                    # "no try again", "ok do it again") which are
+                    # exactly the highest-leverage place to verify.
+                    # The fast-path at the top of handle_chat already
+                    # uses `_is_strict_trivial_chat` to decide whether
+                    # to bypass the full turn loop; mirror that gate
+                    # here so any prompt that DID run the full loop
+                    # (and produced tool output) gets verified.
                     if (
                         verifier is not None
                         and verifier.llm_client is not None
                         and last_tool is not None
                         and final_ai_content
-                        and not is_trivial_greeting
+                        and not self._is_strict_trivial_chat(lc)
                     ):
                         tool_output = str(last_tool.get("content", ""))[:4000]
                         tool_name = str(last_tool.get("name", ""))[:80]
@@ -5282,7 +5515,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     is_valid_success = (not force_stop or "READY TO FINALIZE" in thought_content.upper())
 
                     if is_valid_success or is_complete_failure:
-                        if getattr(self.context, 'journal', None):
+                        # Gated on `--smart-memory > 0.0` to honour the
+                        # contract in CLAUDE.md ("Memory writes are gated
+                        # on --smart-memory / --no-memory"). The streaming
+                        # producer has the same gate; both must agree.
+                        if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
 
                             await asyncio.to_thread(self.context.journal.append, 'post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
 
@@ -5801,6 +6038,33 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as e:
             logger.debug(
                 "trajectory stash for correction lookup skipped: %s: %s",
+                type(e).__name__, e,
+            )
+
+        # Selfhood capture (proposal item #1 + #2): write a first-person
+        # experiential record sharing the trajectory id. Distinct from
+        # the trajectory log (structured tool trace, ML-training shape);
+        # this is the agent's own first-person diary entry, tagged
+        # subject="self" so the recognition layer treats it as "mine".
+        # Non-fatal — selfhood capture is secondary to the user turn.
+        # Same MagicMock-resilient isinstance check as the wake-up
+        # prefix path.
+        try:
+            from ..selfhood import SelfModel as _SelfModel
+            self_model = getattr(self.context, 'self_model', None)
+            if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
+                self_model.capture_turn(
+                    trajectory_id=traj.id,
+                    user_request=traj.user_request,
+                    tool_names=[tc.name for tc in traj.tool_calls],
+                    outcome=traj.outcome,
+                    final_response=traj.final_response,
+                    failure_reason=traj.failure_reason,
+                    cluster=traj.cluster,
+                )
+        except Exception as e:
+            logger.debug(
+                "selfhood capture skipped: %s: %s",
                 type(e).__name__, e,
             )
 

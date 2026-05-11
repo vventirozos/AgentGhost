@@ -355,12 +355,67 @@ class SkillMemory:
             self._save_playbook_unlocked(playbook)
 
     def _load_playbook(self) -> list:
+        """Load the JSON playbook, with safe handling for missing /
+        corrupt files.
+
+        - File doesn't exist: return ``[]`` (first run).
+        - File is empty: return ``[]`` (first run, half-initialised).
+        - File contains a non-list JSON value: return ``[]`` (defensive).
+        - File is corrupt JSON: rename to
+          ``skills_playbook.json.corrupt-<ts>`` and return ``[]``. The
+          rename preserves the bad bytes for human recovery; returning
+          ``[]`` lets the caller proceed with a fresh playbook on the
+          next save. Without the rename, the next ``learn_lesson`` call
+          would silently overwrite the corrupt file with a single-entry
+          playbook — every prior lesson lost without a trace.
+        - OSError (disk full, permission, etc.): re-raise. Callers
+          treat the playbook as canonical; pretending it is empty when
+          the disk is sick lies to the next ``learn_lesson`` call,
+          which then "atomically saves" a 1-entry playbook on top of
+          a perfectly-readable file the OS just refused to read for
+          us — same data loss as the corrupt-file case but harder to
+          spot.
+        """
         try:
             content = self.file_path.read_text()
-            data = json.loads(content) if content else []
-            return data if isinstance(data, list) else []
-        except Exception:
+        except FileNotFoundError:
             return []
+        except OSError:
+            raise
+        # Tolerate a non-string return from `read_text` — pre-existing
+        # tests mock `file_path` with a `MagicMock` and exercise the
+        # "no playbook on disk" branch by relying on the empty fallback.
+        # Returning `[]` for non-str content keeps that contract.
+        if not isinstance(content, str):
+            return []
+        if not content:
+            return []
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            # Preserve the corrupt bytes under a timestamped sidecar
+            # so a human can recover, then fall through to empty.
+            ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+            backup = self.file_path.with_suffix(
+                self.file_path.suffix + f".corrupt-{ts}"
+            )
+            try:
+                os.replace(str(self.file_path), str(backup))
+                logger.warning(
+                    "skills_playbook.json was corrupt; renamed to %s",
+                    backup,
+                )
+            except OSError as rename_err:
+                # If we can't even rename, log loudly — but still
+                # return [] so the agent doesn't crash. The next
+                # save will overwrite the corrupt file (same as
+                # the old behaviour, but at least we logged).
+                logger.error(
+                    "skills_playbook.json corrupt AND rename failed: %s",
+                    rename_err,
+                )
+            return []
+        return data if isinstance(data, list) else []
 
     def _find_duplicate_lesson(self, task: str, mistake: str, solution: str, memory_system=None) -> dict:
         """Check if a semantically similar lesson already exists.
@@ -566,6 +621,7 @@ class SkillMemory:
         if not isinstance(trajectory_id, str) or not trajectory_id:
             return 0
         removed = 0
+        json_failed = False
         try:
             with self._get_lock():
                 playbook = self._load_playbook()
@@ -585,22 +641,32 @@ class SkillMemory:
             logger.warning(
                 "retract_lessons_from_trajectory JSON pass failed: %s", e
             )
-            return 0
+            json_failed = True
 
-        if memory_system is not None and removed > 0:
+        # Run the vector scrub whenever the JSON pass SUCCEEDED, even
+        # when ``removed == 0``. Previously gated on ``removed > 0``,
+        # which meant a stale vector entry whose JSON twin was already
+        # gone (drift from a prior partial state) would never get
+        # cleaned up by a retraction call. The drift entry costs a
+        # retrieval slot until the next REM prune.
+        #
+        # When JSON pass FAILED we deliberately DO NOT run the vector
+        # scrub: the on-disk JSON is unchanged (`_save_playbook_unlocked`
+        # is atomic via os.replace, so a save raise leaves the original
+        # file intact), so JSON still has the lesson. Scrubbing only
+        # the vector side would create the opposite drift.
+        if memory_system is not None and not json_failed:
             try:
                 coll = getattr(memory_system, "collection", None)
                 if coll is not None and hasattr(coll, "delete"):
                     coll.delete(where={"source_trajectory_id": trajectory_id})
             except Exception as e:
                 # Vector scrub is best-effort — the JSON playbook is
-                # the canonical store for retrieval re-ranking, and
-                # a stale vector entry whose JSON twin is gone will
-                # be filtered out by the playbook-snapshot lookup
-                # in get_playbook_context (vector docs without a
-                # JSON match render the raw embedded doc, which
-                # still costs a slot but is recoverable on a later
-                # rebuild).
+                # canonical, and a stale vector entry whose JSON twin
+                # is gone will be filtered out by the playbook-snapshot
+                # lookup in get_playbook_context (vector docs without a
+                # JSON match render the raw embedded doc, which still
+                # costs a slot but is recoverable on a later rebuild).
                 logger.warning(
                     "retract_lessons_from_trajectory vector pass failed: %s", e
                 )

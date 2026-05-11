@@ -195,10 +195,15 @@ def _bounds_aware_extract(block: str) -> dict:
         re.IGNORECASE,
     )
     close_re = re.compile(r'</parameter>', re.IGNORECASE)
-    end_func_re = re.compile(r'</function>|</tool_call>', re.IGNORECASE)
+    end_func_re = re.compile(r'<function\b|</function>|<tool_call\b|</tool_call>', re.IGNORECASE)
     out: dict = {}
     openings = list(open_pattern.finditer(block))
-    end_func = end_func_re.search(block)
+    # Skip past the FIRST <function> opening before searching for the
+    # boundary — otherwise the legit opening at position ~0 would be
+    # treated as end-of-function and kill every parameter extraction.
+    first_func = re.search(r'<function\b', block, re.IGNORECASE)
+    search_start = first_func.end() if first_func else 0
+    end_func = end_func_re.search(block, search_start)
     end_pos = end_func.start() if end_func else len(block)
     for i, op in enumerate(openings):
         p_name = op.group(1).strip().strip('"').strip("'")
@@ -324,9 +329,12 @@ def _full_parser_snapshot(block_content: str) -> dict:
         args_val[cm.group(1).strip()] = cm.group(2)
 
     # Format 1 — <parameter name="x">y</parameter>
+    # Lookahead breaks on opening `<function` / `<tool_call` too, so a
+    # block-split miss between two consecutive tool calls cannot let
+    # one param's value swallow the next tool call's contents.
     param_matches = list(re.finditer(
         r'<parameter(?:\s+name=|=)([^>]+)>(.*?)'
-        r'(?=</parameter>|<parameter(?:\s+name=|=)|</function>|</tool_call>|$)',
+        r'(?=</parameter>|<parameter(?:\s+name=|=)|<function\b|</function>|<tool_call\b|</tool_call>|$)',
         block_content, re.DOTALL | re.IGNORECASE,
     ))
     for p in param_matches:
@@ -349,9 +357,13 @@ def _full_parser_snapshot(block_content: str) -> dict:
         re.IGNORECASE,
     )
     close_re = re.compile(r'</parameter>', re.IGNORECASE)
-    end_func_re = re.compile(r'</function>|</tool_call>', re.IGNORECASE)
+    end_func_re = re.compile(r'<function\b|</function>|<tool_call\b|</tool_call>', re.IGNORECASE)
     openings = list(open_pattern.finditer(block_content))
-    end_func = end_func_re.search(block_content)
+    # Skip past the FIRST <function> opening before searching for the
+    # boundary (mirrors the agent.py fix).
+    first_func = re.search(r'<function\b', block_content, re.IGNORECASE)
+    search_start = first_func.end() if first_func else 0
+    end_func = end_func_re.search(block_content, search_start)
     end_pos = end_func.start() if end_func else len(block_content)
     for i, op in enumerate(openings):
         p_name = op.group(1).strip().strip('"').strip("'")
@@ -497,3 +509,105 @@ def test_agent_source_logs_block_on_system_parse_error():
     src = _agent_source()
     assert "Parser emitted system_parse_error" in src
     assert "block_content[:4096]" in src
+
+
+# ---------------------------------------------------------------------------
+# Multi-tool-call boundary regression — when the model emits TWO tool calls
+# in one turn AND the first call uses a non-`</parameter>` close (e.g.
+# `</path>`) on its last param, the parameter regex used to consume past
+# the first call's `</function>`/`</tool_call>` into the SECOND call's
+# `<parameter=operation>write</parameter>`, ending up with a single param
+# value containing both calls' tag-soup. Production trace 07:20:32 (request
+# `F7`): file_system was called with operation="data.csv</path> </function>
+# </tool_call> <tool_call> <function=file_system> <parameter=operation>
+# write" — the operation lookup naturally failed and the cycle had to
+# retry. The fix adds opening `<function` / `<tool_call` to the regex
+# lookahead so a stray opening of the next tool call terminates the
+# parameter just like a closing tag does.
+# ---------------------------------------------------------------------------
+
+
+def test_param_regex_stops_at_next_function_opening():
+    """Worst-case: a block_content where the block-split missed the
+    boundary between two tool calls (e.g. multi-line `<tool_call\\n>`
+    against the no-DOTALL split, or no `</tool_call>` between them).
+    The single block now contains TWO `<function=...>` openings and
+    the first param value would otherwise run into the second call.
+    """
+    block_content = (
+        "<function=file_system>"
+        "<parameter=operation>read</parameter>"
+        "<parameter=file_path>data.csv</path>"  # stray </path>, not </parameter>
+        # Note: NO </function> / </tool_call> — block split missed the boundary.
+        "<function=file_system>"
+        "<parameter=operation>write</parameter>"
+        "<parameter=file_path>solution.py</parameter>"
+        "</function>"
+    )
+    args = _full_parser_snapshot(block_content)
+    # The first call's file_path must NOT include the second call's tag-soup.
+    fp = args.get("file_path", "")
+    assert "<function" not in fp, (
+        f"file_path leaked across tool-call boundary: {fp!r}"
+    )
+    assert "<tool_call" not in fp, (
+        f"file_path leaked into next <tool_call>: {fp!r}"
+    )
+    # Operation parsed cleanly from the first call (the canonical case the
+    # second call's `<parameter=operation>write</parameter>` would have
+    # overwritten under the broken regex via the bounds-aware repair).
+    assert args.get("operation") == "read"
+
+
+def test_param_regex_stops_at_next_tool_call_opening():
+    """Same idea but the next call's `<tool_call>` opening sits inside
+    the param body (block-split miss because the opening was on its
+    own line and `<tool_call.*?>` is split without DOTALL).
+    """
+    block_content = (
+        "<function=file_system>"
+        "<parameter=operation>read</parameter>"
+        "<parameter=file_path>data.csv</path>"
+        "<tool_call>"
+        "<function=file_system>"
+        "<parameter=operation>write</parameter>"
+        "</function>"
+    )
+    args = _full_parser_snapshot(block_content)
+    fp = args.get("file_path", "")
+    assert "<tool_call" not in fp
+    assert "<function" not in fp
+    # Operation must remain "read" — the second call's "write" must not
+    # overwrite it via the repair pass.
+    assert args.get("operation") == "read"
+
+
+def test_param_regex_clean_two_call_block_split_still_works():
+    """Sanity check: when the block-split correctly partitions the two
+    tool calls (the common case), each block's params parse cleanly.
+    The fix to the lookahead must not regress the happy path.
+    """
+    # Block 1: clean first call.
+    block1 = (
+        "<function=file_system>"
+        "<parameter=operation>read</parameter>"
+        "<parameter=file_path>data.csv</parameter>"
+        "</function>"
+    )
+    args1 = _full_parser_snapshot(block1)
+    assert args1 == {"operation": "read", "file_path": "data.csv"}
+
+    # Block 2: clean second call.
+    block2 = (
+        "<function=file_system>"
+        "<parameter=operation>write</parameter>"
+        "<parameter=file_path>solution.py</parameter>"
+        "<parameter=content>print(1)</parameter>"
+        "</function>"
+    )
+    args2 = _full_parser_snapshot(block2)
+    assert args2 == {
+        "operation": "write",
+        "file_path": "solution.py",
+        "content": "print(1)",
+    }

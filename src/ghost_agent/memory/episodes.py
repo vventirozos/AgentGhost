@@ -300,7 +300,7 @@ class EpisodicMemory:
         """Format episodes for injection into LLM context."""
         if not episodes:
             return ""
-        lines = ["### RELEVANT PAST EPISODES:"]
+        lines = ["### RELEVANT PAST EPISODES (from prior sessions — for reference only, NOT events in the current conversation):"]
         used = 0
         for ep in episodes:
             entry = (

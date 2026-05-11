@@ -282,6 +282,35 @@ def validate_challenge_quality(setup_script: str, validation_script: str) -> tup
     if not validation_script:
         return False, "missing validation_script"
 
+    # Syntax check FIRST. The downstream pre-flight in the sandbox catches
+    # SyntaxError too, but only after the regen loop has already exited —
+    # so a syntax-broken validator (overwhelmingly f-string mistakes:
+    # embedded `[`/`(`, mismatched quotes inside `{...}`, unescaped `}`)
+    # used to terminate the whole self-play cycle with no retry. Catching
+    # it here lets the loop feed the line number and message back as
+    # rejection_feedback and burn one of its 3 attempts on a regen
+    # instead. Production log over a single session showed 35/37 of the
+    # pre-flight failures were SyntaxError — all recoverable in-loop.
+    import ast
+    try:
+        ast.parse(validation_script)
+    except SyntaxError as e:
+        return False, (
+            f"validation_script has SyntaxError at line {e.lineno}: "
+            f"{e.msg}. Common causes: f-string with embedded `[`/`(`/`'`/`\"` "
+            f"inside `{{...}}` braces, unescaped literal `{{` or `}}`, "
+            f"or a multi-line f-string that wasn't closed. Pre-compute "
+            f"complex values into a local variable, then interpolate the "
+            f"plain name (e.g. `v = data[0]; print(f\"got {{v}}\")`)."
+        )
+    if setup_script:
+        try:
+            ast.parse(setup_script)
+        except SyntaxError as e:
+            return False, (
+                f"setup_script has SyntaxError at line {e.lineno}: {e.msg}."
+            )
+
     # Strip comments/docstrings/strings before scanning for marker
     # tokens — otherwise a comment like `# do not use random.seed`
     # falsely rejects the challenge (S7).
@@ -1238,7 +1267,7 @@ Return ONLY a JSON object with:
         system_message = SYNTHETIC_CHALLENGE_PROMPT
 
         # Add strict constraint to prevent token overflow
-        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags: <challenge_prompt>, <setup_script>, and <validation_script>. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements."
+        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags: <challenge_prompt>, <setup_script>, and <validation_script>. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements.\n11. F-STRING SAFETY: Inside f-string `{...}` braces, do NOT embed `[`, `(`, `'`, or `\"`. The Python parser frequently rejects these as 'closing parenthesis }' does not match opening parenthesis '['' or 'unterminated string'. Pre-compute the value into a local variable first and then interpolate the plain name. Example — bad: `print(f\"got {data['key'][0]}\")`; good: `v = data['key'][0]; print(f\"got {v}\")`. To print a literal brace, double it (`{{` / `}}`). This applies to BOTH setup_script and validation_script."
 
         # Curiosity / frontier targeting: survey the FrontierTracker on the
         # real context (not the isolated one — this runs before isolation) to

@@ -94,11 +94,11 @@ class LLMClient:
             try:
                 import urllib.parse
                 import ipaddress
-
+                
                 # Robustly handle URLs missing the http:// scheme
                 if not url.startswith("http://") and not url.startswith("https://"):
                     url = "http://" + url
-
+                    
                 hostname = urllib.parse.urlparse(url).hostname
                 if hostname:
                     if hostname.endswith(".local"):
@@ -125,8 +125,8 @@ class LLMClient:
         self._bg_queue_sem = asyncio.Semaphore(3)  # Allow up to 3 concurrent background tasks
         self._main_node_lock = asyncio.Lock()
         self.http_client = httpx.AsyncClient(
-            base_url=upstream_url,
-            timeout=1200.0,
+            base_url=upstream_url, 
+            timeout=1200.0, 
             limits=limits,
             proxy=proxy_url,
             trust_env=False,
@@ -136,12 +136,12 @@ class LLMClient:
 
         self.swarm_clients = []
         self._swarm_index = 0
-
+        
         if swarm_nodes:
             for node in swarm_nodes:
                 client = httpx.AsyncClient(
-                    base_url=node["url"],
-                    timeout=1200.0,
+                    base_url=node["url"], 
+                    timeout=1200.0, 
                     limits=limits,
                     proxy=get_proxy(node["url"]),
                     trust_env=False,
@@ -156,12 +156,12 @@ class LLMClient:
 
         self.worker_clients = []
         self._worker_index = 0
-
+        
         if worker_nodes:
             for node in worker_nodes:
                 client = httpx.AsyncClient(
-                    base_url=node["url"],
-                    timeout=1200.0,
+                    base_url=node["url"], 
+                    timeout=1200.0, 
                     limits=limits,
                     proxy=get_proxy(node["url"]),
                     trust_env=False,
@@ -176,12 +176,12 @@ class LLMClient:
 
         self.vision_clients = []
         self._vision_index = 0
-
+        
         if visual_nodes:
             for node in visual_nodes:
                 client = httpx.AsyncClient(
-                    base_url=node["url"],
-                    timeout=1200.0,
+                    base_url=node["url"], 
+                    timeout=1200.0, 
                     limits=limits,
                     proxy=get_proxy(node["url"]),
                     trust_env=False,
@@ -199,8 +199,8 @@ class LLMClient:
         if coding_nodes:
             for node in coding_nodes:
                 client = httpx.AsyncClient(
-                    base_url=node["url"],
-                    timeout=1200.0,
+                    base_url=node["url"], 
+                    timeout=1200.0, 
                     limits=limits,
                     proxy=get_proxy(node["url"]),
                     trust_env=False,
@@ -218,8 +218,8 @@ class LLMClient:
         if image_gen_nodes:
             for node in image_gen_nodes:
                 client = httpx.AsyncClient(
-                    base_url=node["url"],
-                    timeout=1200.0,
+                    base_url=node["url"], 
+                    timeout=1200.0, 
                     limits=limits,
                     proxy=get_proxy(node["url"]),
                     trust_env=False,
@@ -301,13 +301,13 @@ class LLMClient:
     def get_swarm_node(self, target_model: Optional[str] = None) -> Optional[Dict[str, Any]]:
         if not getattr(self, 'swarm_clients', []):
             return None
-
+            
         if target_model:
             target_lower = target_model.lower()
             for node in self.swarm_clients:
                 if target_lower in node["model"].lower():
                     return node
-
+                    
         node = self.swarm_clients[self._swarm_index]
         self._swarm_index = (self._swarm_index + 1) % len(self.swarm_clients)
         return node
@@ -413,11 +413,11 @@ class LLMClient:
         image_gen_clients = getattr(self, 'image_gen_clients', [])
         if not image_gen_clients:
             raise Exception("No image generation nodes available")
-
+            
         node = self.get_image_gen_node(payload.get("model"))
         if not node:
             raise Exception("Could not find a valid image generation node")
-
+            
         for attempt in range(3):
             try:
                 pretty_log("Image Compute", f"Routing to Image Node ({node['model']})", level="INFO", icon="🎨")
@@ -426,8 +426,7 @@ class LLMClient:
                 return resp.json()
             except Exception as e:
                 if attempt < 2:
-                    pretty_log("Image Node Retry", f"Attempt {attempt+1} failed: {type(e).__name__}: {e}", level="WARNING", icon=Icons.WARN)
-                    #pretty_log("Image Node Retry", f"Attempt {attempt+1} failed: {type(e).__name__}, retrying...", level="WARNING", icon=Icons.WARN)
+                    pretty_log("Image Node Retry", f"Attempt {attempt+1} failed: {type(e).__name__}, retrying...", level="WARNING", icon=Icons.WARN)
                     await asyncio.sleep(2 ** attempt)
                     # Try to get next node if possible
                     node = self.get_image_gen_node()
@@ -449,18 +448,18 @@ class LLMClient:
             if getattr(self, 'vision_clients', None):
                 target_model = payload.get("model")
                 tried_nodes = []
-
+                
                 node = self.get_vision_node(target_model)
-
+                
                 if node:
                     for _ in range(len(self.vision_clients)):
                         if not node:
                             break
-
+                            
                         if node in tried_nodes:
                             target_model = None
                             node = self.get_vision_node(target_model)
-
+                            
                         loop_breaker = 0
                         while node in tried_nodes and loop_breaker < len(self.vision_clients):
                             node = self.get_vision_node(None)
@@ -473,16 +472,16 @@ class LLMClient:
                             break
 
                         tried_nodes.append(node)
-
+                        
                         pretty_log("Vision Compute", f"Routing request to Vision Node ({node['model']})", level="INFO", icon=Icons.TOOL_DEEP)
                         try:
                             node_payload = payload.copy()
                             node_payload["model"] = node["model"]
-
+                            
                             import json
-
+                            
                             body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('ascii', errors='ignore')
-
+                            
                             kwargs = {}
                             if timeout is not None:
                                 kwargs["timeout"] = timeout
@@ -498,31 +497,31 @@ class LLMClient:
                             continue
 
                 pretty_log("Vision Compute Failed", "All vision nodes failed.", level="ERROR", icon=Icons.WARN)
-
+                
             raise Exception("Vision analysis failed: The dedicated vision node is offline or returned an error, and the main upstream model does not support image inputs.")
 
         if use_worker and getattr(self, 'worker_clients', None):
             target_model = payload.get("model")
             tried_nodes = []
-
+            
             node = self.get_worker_node(target_model)
-
+            
             if node:
                 for _ in range(len(self.worker_clients)):
                     if not node:
                         break
-
+                        
                     if node in tried_nodes:
                         target_model = None
                         node = self.get_worker_node(target_model)
-
+                        
                     loop_breaker = 0
                     while node in tried_nodes and loop_breaker < len(self.worker_clients):
                         node = self.get_worker_node(None)
                         loop_breaker += 1
-
+                        
                     tried_nodes.append(node)
-
+                    
                     pretty_log("Worker Compute", f"Routing background task to Worker Node ({node['model']})", level="INFO", icon="⚙️")
                     try:
                         node_payload = payload.copy()
@@ -545,24 +544,24 @@ class LLMClient:
                         target_model = None
                         node = self.get_worker_node(target_model)
                         continue
-
+                        
                 pretty_log("Worker Compute Failed", "All worker nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
 
         elif use_coding and getattr(self, 'coding_clients', None):
             target_model = payload.get("model")
             tried_nodes = []
-
+            
             node = self.get_coding_node(target_model)
-
+            
             if node:
                 for _ in range(len(self.coding_clients)):
                     if not node:
                         break
-
+                        
                     if node in tried_nodes:
                         target_model = None
                         node = self.get_coding_node(target_model)
-
+                        
                     loop_breaker = 0
                     while node in tried_nodes and loop_breaker < len(self.coding_clients):
                         node = self.get_coding_node(None)
@@ -572,7 +571,7 @@ class LLMClient:
                         break
 
                     tried_nodes.append(node)
-
+                    
                     pretty_log("Coding Compute", f"Routing request to Coding Node ({node['model']})", level="INFO", icon=Icons.TOOL_CODE)
                     try:
                         import copy as _copy, json
@@ -580,7 +579,7 @@ class LLMClient:
                         node_payload["model"] = node["model"]
 
                         body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('utf-8')
-
+                        
                         kwargs = {}
                         if timeout is not None:
                             kwargs["timeout"] = timeout
@@ -594,31 +593,31 @@ class LLMClient:
                         target_model = None
                         node = self.get_coding_node(target_model)
                         continue
-
+                        
                 pretty_log("Coding Compute Failed", "All coding nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
 
         elif use_swarm and self.swarm_clients:
             target_model = payload.get("model")
             tried_nodes = []
-
+            
             node = self.get_swarm_node(target_model)
-
+            
             if node:
                 for _ in range(len(self.swarm_clients)):
                     if not node:
                         break
-
+                        
                     if node in tried_nodes:
                         target_model = None
                         node = self.get_swarm_node(target_model)
-
+                        
                     loop_breaker = 0
                     while node in tried_nodes and loop_breaker < len(self.swarm_clients):
                         node = self.get_swarm_node(None)
                         loop_breaker += 1
-
+                        
                     tried_nodes.append(node)
-
+                    
                     pretty_log("Edge Compute", f"Routing request to Swarm Node ({node['model']})", level="INFO", icon="⚡")
                     try:
                         import copy as _copy, json
@@ -626,7 +625,7 @@ class LLMClient:
                         node_payload["model"] = node["model"]
 
                         body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('utf-8')
-
+                        
                         kwargs = {}
                         if timeout is not None:
                             kwargs["timeout"] = timeout
@@ -640,10 +639,10 @@ class LLMClient:
                         target_model = None
                         node = self.get_swarm_node(target_model)
                         continue
-
+                        
                 pretty_log("Edge Compute Failed", "All swarm nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
 
-        for attempt in range(2):
+        for attempt in range(2): 
             try:
                 kwargs = {}
                 if timeout is not None:
@@ -718,7 +717,7 @@ class LLMClient:
         if not texts:
             return []
         payload = {"input": texts, "model": "default"}
-        for attempt in range(2):
+        for attempt in range(2): 
             try:
                 async with self._main_node_lock:
                     resp = await self.http_client.post("/v1/embeddings", json=payload)
@@ -760,13 +759,13 @@ class LLMClient:
 
         # We wrap in a generic retry similar to the non-streaming one if it fails at the start.
         # But once bytes are yielded, if it fails mid-stream, it breaks.
-        for attempt in range(2):
+        for attempt in range(2): 
             try:
                 # We use stream() to keep the connection open and read chunks
                 req = client_to_use.build_request("POST", "/v1/chat/completions", json=payload)
                 resp = await client_to_use.send(req, stream=True)
                 resp.raise_for_status()
-
+                
                 try:
                     # Per-chunk timeout — without this a stalled upstream
                     # (no bytes for minutes) holds the event-loop slot

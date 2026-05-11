@@ -185,26 +185,42 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         }
         
         async def stream_generator():
+            # Track whether any real content chunk has shipped to the
+            # client. If yes, an additional `delta.content` error chunk
+            # would APPEND to the partial response the user already
+            # sees — "Here is the answ" + "CRITICAL SERVER ERROR:
+            # ConnectionResetError" mashed together. Once content has
+            # started, the `event: error` SSE frame is enough for
+            # programmatic detection; emitting an extra content chunk
+            # corrupts the visible reply.
+            content_started = False
             try:
                 # Yield an SSE comment to send HTTP headers instantly and keep reverse proxies alive
                 yield b": processing request...\n\n"
-                
+
                 content, created_time, req_id = await agent.handle_chat(body, background_tasks, request_id=request_id)
-                
+
                 if hasattr(content, '__aiter__'):
                     async for chunk in content:
+                        content_started = True
                         yield chunk
                 else:
                     async for chunk in agent.context.llm_client.stream_openai(model, content, created_time, req_id):
+                        content_started = True
                         yield chunk
             except Exception as e:
                 logger.error(f"Streaming error in chat_proxy: {type(e).__name__}: {e}", exc_info=True)
-                # Send a proper SSE error event so clients can detect the failure
-                # programmatically, then a content chunk for visual display.
+                # Always emit the SSE `event: error` frame so clients
+                # can detect the failure programmatically.
                 err_msg = f"CRITICAL SERVER ERROR: {str(e)}"
                 error_event = {"error": {"message": err_msg, "type": type(e).__name__}}
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode('utf-8')
-                yield f"data: {json.dumps({'choices': [{'delta': {'content': err_msg}}]})}\n\n".encode('utf-8')
+                # Only emit a content chunk for visual display when
+                # NO content has streamed yet — otherwise it gets
+                # concatenated to the partial reply the client has
+                # already rendered.
+                if not content_started:
+                    yield f"data: {json.dumps({'choices': [{'delta': {'content': err_msg}}]})}\n\n".encode('utf-8')
                 yield b"data: [DONE]\n\n"
                 return
 
