@@ -120,6 +120,16 @@
   <h2>Concurrency</h2>
   <p>Async orchestration; the temp agent loop runs synchronously inside the simulation. Triggered by the lifespan-spawned biological watchdog, by the <code>self_play</code> tool (one-shot), or by <code>self_play_loop</code> (continuous). Validator probe / self-test / solver run on the sandbox via <code>asyncio.to_thread</code>.</p>
 
+  <h2>Frontier-aware cluster selection</h2>
+  <p>Before the source-selection stage, <code>synthetic_self_play</code> chooses which cluster to target. The default path calls <a href="../memory/frontier.html"><code>FrontierTracker.pick_seed</code></a> (brittle-pool weighted). When <code>--frontier-selfplay</code> is on (default) AND <em>both</em> <code>ctx.prm_scorer</code> is a real <code>PRMScorer</code> with <code>has_model=True</code> AND <code>ctx.trajectory_collector</code> is a real <code>TrajectoryCollector</code> (strict <code>isinstance</code> checks — MagicMock-backed test contexts fail closed), the dream loop instead:</p>
+  <ol>
+    <li>Builds the candidate cluster pool as <code>set(challenge_templates.TEMPLATES.keys()) ∪ tracker.clusters</code>.</li>
+    <li>Computes per-cluster signals via <a href="frontier_selection.html"><code>core/frontier_selection.py</code></a>: <code>compute_cluster_uncertainty</code> (PRM boundary-distance) and <code>compute_cluster_rarity</code> (log-decay of <code>Trajectory.cluster</code> counts).</li>
+    <li>Calls <code>frontier_tracker.pick_frontier_seed(uncertainty_by_cluster=…, rarity_by_cluster=…, uniform_sample_prob=args.frontier_uniform_sample_prob)</code>.</li>
+  </ol>
+  <p>Any exception in the frontier-aware block is logged at debug and falls through to <code>pick_seed</code> — frontier weighting must never block a self-play cycle. The selected seed's hint is appended to the challenge-generation prompt under <code>### FRONTIER SEED</code> regardless of which picker produced it. The new path's hint begins with <code>FRONTIER TARGET (PRM-weighted)</code> so logs and tests can attribute the source.</p>
+  <p>Covered by <code>tests/test_dream_frontier_weighted.py</code> (real PRM + collector + tracker, mocked LLM/sandbox) and <code>tests/test_dream_synthetic_curiosity.py</code> (legacy path regression).</p>
+
   <p>End-to-end walkthrough: see <a href="../algorithms/dream_cycle.html">algorithms / dream cycle</a>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>

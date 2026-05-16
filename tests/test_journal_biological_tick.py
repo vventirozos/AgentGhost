@@ -130,9 +130,22 @@ async def test_journal_phase_falls_through_to_phase_2_when_no_items():
     running. (Pre-fix bug check: the `return` must be inside
     `if has_items:`, not at the cooldown level.)"""
     ctx = _make_ctx_with_journal(idle_secs=1200, has_items=False)
-    # Wire phase 2 to fire by giving it candidates.
+    # Wire phase 2 to fire by giving it candidates. Return the FULL
+    # Chroma response shape (ids + documents + metadatas + embeddings)
+    # because phase 2's pre-flight is `len(res['ids']) >= 3`, and if the
+    # 50/50 coin lands on calling `Dreamer.dream()` the second
+    # `collection.get(...include=['documents','metadatas','embeddings'])`
+    # call reuses the same mock — an ids-only stub KeyErrors on
+    # `results['documents']` (dream.py:644), making this test 50/50
+    # flaky. Empty `documents` is enough: dream's `len(documents) < 3`
+    # guard short-circuits early, the assertion below still passes.
     ctx.memory_system.collection.get = MagicMock(
-        return_value={"ids": ["a", "b", "c"]}
+        return_value={
+            "ids": ["a", "b", "c"],
+            "documents": [],
+            "metadatas": [],
+            "embeddings": [],
+        }
     )
     with patch.object(GhostAgent, "process_journal_queue",
                       new_callable=AsyncMock) as proc:

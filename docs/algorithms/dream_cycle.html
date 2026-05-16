@@ -93,8 +93,18 @@
       <line x1="500" y1="460" x2="740" y2="480" stroke="#7aa7ff" marker-end="url(#d1)"/>
       <line x1="500" y1="540" x2="500" y2="560" stroke="#7aa7ff" marker-end="url(#d1)"/>
     </svg>
-    <p class="caption">Figure 11 — Dream cycle with full validation stack, saturation routing, and continuous-loop consolidation.</p>
+    <p class="caption">Figure 11 — Dream cycle with full validation stack, saturation routing, and continuous-loop consolidation. Step [b] runs <code>pick_frontier_seed</code> (PRM-weighted) when the gating conditions hold; otherwise legacy <code>pick_seed</code>.</p>
   </div>
+
+  <h2>Frontier-aware cluster selection (PRM-weighted)</h2>
+  <p>Before the saturation / rotation logic, the dream loop chooses <em>which cluster</em> to target. The default path uses <a href="../memory/frontier.html"><code>FrontierTracker.pick_seed</code></a> — brittle-pool weighted, tracking only outcomes. When <code>--frontier-selfplay</code> is on (default), <strong>and</strong> <code>ctx.prm_scorer</code> is a real <code>PRMScorer</code> with <code>has_model=True</code>, <strong>and</strong> <code>ctx.trajectory_collector</code> is a real <code>TrajectoryCollector</code> (strict <code>isinstance</code> checks — MagicMock-backed test contexts fail closed), the picker swaps to <code>pick_frontier_seed</code> which combines two complementary signals:</p>
+  <ul>
+    <li><strong>PRM uncertainty</strong> via <a href="../core/frontier_selection.html"><code>compute_cluster_uncertainty</code></a> — boundary distance <code>1 − 2·|p − 0.5|</code> against a synthetic representative state per cluster. High when the PRM has no opinion or is genuinely at the boundary.</li>
+    <li><strong>Trajectory rarity</strong> via <code>compute_cluster_rarity</code> — <code>1 / (1 + log1p(count))</code> from <code>Trajectory.cluster</code> groupings. Smooth, bounded, log-decay so well-explored clusters still get weight when uncertainty is high.</li>
+  </ul>
+  <p>Signals are multiplied; saturated clusters get weight 0. Three transparent fallbacks restore the legacy <code>pick_seed</code> behaviour: empty signals (cold boot), a uniform-sample sanity roll (default 20%, exposed as <code>--frontier-uniform-sample-prob</code>), or all-zero combined weights. Any exception in the new path is logged at debug and falls through — frontier weighting must never block a self-play cycle.</p>
+  <p><strong>Why the sanity floor matters</strong>: the PRM is itself learned from trajectories the self-play loop produces. Without the uniform-sample bypass, a cold or systematically-wrong PRM could lock self-play onto a single cluster and starve other clusters of new training signal, which would then keep the PRM wrong about them — a self-reinforcing failure mode. 20% uniform sampling breaks that loop without losing the benefit of frontier targeting on the other 80%.</p>
+  <p>The frontier-weighted seed's hint always begins with <code>FRONTIER TARGET (PRM-weighted)</code> so the self-play log can attribute the source. Covered by <code>tests/test_dream_frontier_weighted.py</code> (4 cases) and <code>tests/test_frontier_pick_frontier_seed.py</code> (9 cases).</p>
 
   <h2>Frontier saturation &amp; rotation</h2>
   <p>A cluster is <strong>saturated</strong> when its last <code>SATURATION_WINDOW = 2</code> runs are all first-try passes with near-zero compression delta (<code>&lt;= 0.001</code>). A saturated cluster is producing no learning signal — continuing to target it burns cycles on material the agent already aces. (Window lowered from 3 → 2 after observing a 13-cycle self-play loop that produced 0 net lessons; at 2 the cluster rotates out one clean cycle after a struggle instead of three.)</p>

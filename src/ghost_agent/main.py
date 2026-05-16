@@ -103,6 +103,17 @@ def parse_args():
     # existing simulation fallback in MCTS stays in effect.
     parser.add_argument("--prm-model", default=None, help="Path to a persisted PRM (Process Reward Model) JSON checkpoint. When set, the PRM is loaded and plugged into the MCTS reasoner as a fast scoring path.")
     parser.add_argument("--prm-train-cooldown", type=int, default=10800, help="Seconds between idle-time PRM retrains. Default 3 hours. Has no effect when --prm-model is unset.")
+    # Frontier-aware self-play. When on, the biological-watchdog phase-3
+    # self-play picker weights candidate clusters by (PRM uncertainty ×
+    # trajectory rarity) instead of only the brittle-pool score. This
+    # surfaces clusters the agent has barely tried (which the brittle-pool
+    # signal misses, because "no recent attempts" looks the same as
+    # "all recent attempts succeeded"). Degrades gracefully when the PRM
+    # is untrained or the trajectory store is empty — falls through to
+    # the existing pick_seed without behavioural drift. See
+    # `core/frontier_selection.py` for the weighting math.
+    parser.add_argument("--frontier-selfplay", action=argparse.BooleanOptionalAction, default=True, help="Enable frontier-aware cluster selection in self-play (PRM uncertainty × trajectory rarity). Use --no-frontier-selfplay to revert to the legacy brittle-pool pick.")
+    parser.add_argument("--frontier-uniform-sample-prob", type=float, default=0.2, help="Probability per self-play tick that frontier-aware selection is bypassed in favour of the legacy pick_seed (uniform-sample sanity floor). Without this, a systematically wrong PRM could lock self-play onto a single cluster. Default 0.2.")
     # Selfhood / unified self. The five-piece module (autobiographical
     # log, self-state thread, recognition layer, narrative summariser,
     # continuity tag) is on by default but suppressed alongside the
@@ -790,6 +801,13 @@ def main():
         print(f"✨ Smart Memory: ENABLED (Selectivity Threshold: {args.smart_memory})")
     else:
         print("✨ Smart Memory: DISABLED")
+    if args.frontier_selfplay:
+        print(
+            f"🎯 Frontier Self-Play: ENABLED "
+            f"(uniform-sample floor {args.frontier_uniform_sample_prob:.2f})"
+        )
+    else:
+        print("🎯 Frontier Self-Play: disabled (--no-frontier-selfplay)")
 
     context = GhostContext(args, sandbox_dir, memory_dir, tor_proxy)
     context.scratchpad = Scratchpad()

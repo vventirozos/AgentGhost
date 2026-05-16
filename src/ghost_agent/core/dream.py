@@ -1279,13 +1279,68 @@ Return ONLY a JSON object with:
         seed = {"mode": "cold_start", "cluster_key": None, "hint": ""}
         if frontier_tracker is not None:
             try:
-                # Raised 0.2 → 0.35 after observing template saturation in
-                # the log eval: even with the brittle-cluster bias, the
-                # loop kept re-picking the same 1-2 shapes because they
-                # were the only ones with any recent activity. A 35%
-                # exploration roll lets the loop breathe when no cluster
-                # is genuinely struggling.
-                picked = frontier_tracker.pick_seed(random_explore_prob=0.35)
+                # Frontier-aware path: when --frontier-selfplay is on AND
+                # both the PRM scorer and trajectory collector are wired,
+                # weight clusters by (PRM uncertainty × trajectory rarity)
+                # rather than just the brittle-pool score. The brittle
+                # signal only sees outcomes; frontier weighting catches
+                # clusters that are quiet because the agent hasn't tried
+                # them, not because they're solved. Falls back transparently
+                # to pick_seed when signals are missing or any step raises.
+                # Strict type checks (mirroring the FrontierTracker
+                # isinstance gate above): MagicMock-backed test contexts
+                # set auto-attributes for any name, so `is None` and
+                # truthiness checks both fire spuriously. Real wiring
+                # passes; everything else falls through to pick_seed.
+                from ..prm import PRMScorer as _PRMScorerCls
+                from ..distill.collector import TrajectoryCollector as _TrajColCls
+                _args = getattr(self.context, 'args', None)
+                _frontier_enabled = bool(getattr(_args, 'frontier_selfplay', True))
+                _raw_uniform = getattr(_args, 'frontier_uniform_sample_prob', 0.2)
+                _uniform_prob = float(_raw_uniform) if isinstance(_raw_uniform, (int, float)) else 0.2
+                _prm_scorer = getattr(self.context, 'prm_scorer', None)
+                _traj_collector = getattr(self.context, 'trajectory_collector', None)
+                picked = None
+                if (
+                    _frontier_enabled
+                    and isinstance(_prm_scorer, _PRMScorerCls)
+                    and _prm_scorer.has_model
+                    and isinstance(_traj_collector, _TrajColCls)
+                ):
+                    try:
+                        from .frontier_selection import (
+                            compute_cluster_rarity,
+                            compute_cluster_uncertainty,
+                            count_trajectories_by_cluster,
+                        )
+                        from .challenge_templates import TEMPLATES as _TEMPLATES
+                        # The candidate cluster pool is the union of
+                        # template clusters AND clusters the tracker has
+                        # already seen — both are valid self-play targets.
+                        _tracker_state = frontier_tracker._load()
+                        _seen_clusters = set(_tracker_state.get("clusters", {}).keys())
+                        _candidate_clusters = sorted(set(_TEMPLATES.keys()) | _seen_clusters)
+                        _counts = count_trajectories_by_cluster(
+                            _traj_collector.iter_trajectories()
+                        )
+                        _unc = compute_cluster_uncertainty(_prm_scorer, _candidate_clusters)
+                        _rar = compute_cluster_rarity(_counts, _candidate_clusters)
+                        picked = frontier_tracker.pick_frontier_seed(
+                            uncertainty_by_cluster=_unc,
+                            rarity_by_cluster=_rar,
+                            uniform_sample_prob=_uniform_prob,
+                            random_explore_prob=0.35,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Frontier-aware pick failed, falling back: {e}")
+                        picked = None
+                if picked is None:
+                    # Legacy path: brittle-pool weighted pick, unchanged.
+                    # Raised 0.2 → 0.35 after observing template saturation
+                    # in the log eval: even with the brittle-cluster bias,
+                    # the loop kept re-picking the same 1-2 shapes because
+                    # they were the only ones with any recent activity.
+                    picked = frontier_tracker.pick_seed(random_explore_prob=0.35)
                 if isinstance(picked, dict):
                     seed = picked
             except Exception as e:

@@ -356,6 +356,97 @@ class FrontierTracker:
             "hint": "\n".join(hint_lines),
         }
 
+    def pick_frontier_seed(
+        self,
+        *,
+        uncertainty_by_cluster: dict = None,
+        rarity_by_cluster: dict = None,
+        uniform_sample_prob: float = 0.2,
+        random_explore_prob: float = 0.35,
+    ) -> dict:
+        """Frontier-aware extension of ``pick_seed``.
+
+        Combines PRM-derived uncertainty + trajectory-rarity (both
+        produced by ``core.frontier_selection``) into a weighted pick,
+        excluding saturated clusters. Falls back to ``pick_seed`` in
+        three cases:
+
+        1. Both input dicts are None or empty — the caller couldn't
+           compute signals (e.g., PRM untrained AND trajectory store
+           empty). Preserves existing behaviour.
+        2. With probability ``uniform_sample_prob`` — sanity sampling
+           so a systematically-wrong PRM can't lock self-play into a
+           single cluster forever. The PRM is itself learned from
+           trajectories the self-play loop produces; without this
+           floor a cold bias becomes self-reinforcing.
+        3. All combined weights are zero (e.g., every non-saturated
+           cluster has one signal at 0). The brittle-pool path is a
+           reasonable secondary signal.
+
+        Returns the same dict shape as ``pick_seed`` so call sites in
+        ``dream.synthetic_self_play`` need no schema branching.
+        Adds a ``mode='frontier_weighted'`` value when the new path
+        wins, so logs can distinguish the source.
+        """
+        # Import here to avoid a top-level cycle (core depends on
+        # memory; we don't want memory pulling core into its load order).
+        from ..core.frontier_selection import combine_weights, pick_weighted
+
+        unc = uncertainty_by_cluster or {}
+        rar = rarity_by_cluster or {}
+
+        # Fallback (1): nothing to weight on → preserve existing behaviour.
+        if not unc and not rar:
+            return self.pick_seed(random_explore_prob=random_explore_prob)
+
+        # Fallback (2): sanity sample.
+        if random.random() < uniform_sample_prob:
+            seed = self.pick_seed(random_explore_prob=random_explore_prob)
+            # Tag the source so logs/tests can distinguish the floor
+            # from a real frontier-weighted pick.
+            if isinstance(seed, dict):
+                seed = dict(seed)
+                seed["frontier_fallback"] = "uniform_sample"
+            return seed
+
+        saturated = self.list_saturated_clusters()
+        weights = combine_weights(unc, rar, exclude=saturated)
+        cluster_key = pick_weighted(weights)
+
+        # Fallback (3): combiner produced no live cluster.
+        if cluster_key is None:
+            seed = self.pick_seed(random_explore_prob=random_explore_prob)
+            if isinstance(seed, dict):
+                seed = dict(seed)
+                seed["frontier_fallback"] = "no_positive_weight"
+            return seed
+
+        # Build the same dict shape as ``pick_seed`` returns. We deliberately
+        # do NOT re-implement the brittleness-derived hint here — the
+        # frontier-weighted pick is justified by uncertainty+rarity, not
+        # by recent failures, so its hint should reflect that.
+        difficulty_hint = self.get_difficulty_hint(cluster_key)
+        tier = self.get_difficulty_tier(cluster_key)
+        u = float(unc.get(cluster_key, 0.0))
+        r = float(rar.get(cluster_key, 0.0))
+        hint_lines = [
+            f"FRONTIER TARGET (PRM-weighted): the '{cluster_key}' cluster combines "
+            f"high model uncertainty ({u:.2f}) with low trajectory coverage ({r:.2f}).",
+            f"DIFFICULTY TIER: {tier.upper()} — {difficulty_hint}",
+            "Generate a challenge that probes a part of this cluster the agent "
+            "hasn't already mastered. Do NOT repeat an identical prior challenge.",
+        ]
+        return {
+            "mode": "frontier_weighted",
+            "cluster_key": cluster_key,
+            "difficulty_tier": tier,
+            "saturated_clusters": saturated,
+            "weight": weights.get(cluster_key, 0.0),
+            "uncertainty": u,
+            "rarity": r,
+            "hint": "\n".join(hint_lines),
+        }
+
     def record_run(
         self,
         cluster_key: str,

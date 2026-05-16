@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.frontier_selection — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="llm.html">llm</a>
+    <a href="planning.html">planning</a>
+    <a href="bus.html">bus</a>
+    <a href="context_manager.html">context_manager</a>
+    <a href="dream.html">dream</a>
+    <a class="current" href="frontier_selection.html">frontier_selection</a>
+    <a href="mcts.html">mcts</a>
+    <a href="hypothesis.html">hypothesis</a>
+    <a href="verifier.html">verifier</a>
+    <a href="self_play_scoring.html">self_play_scoring</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / frontier_selection.py</h1>
+  <p class="subtitle">Pure-function weighting layer that turns PRM uncertainty + trajectory rarity into a frontier-aware cluster pick for self-play.</p>
+
+  <h2>What it solves</h2>
+  <p>The brittle-pool scoring in <a href="../memory/frontier.html"><code>FrontierTracker.pick_seed</code></a> sees <em>outcomes</em> but not <em>coverage</em>. A cluster the agent has barely tried looks identical to a cluster it solves first-try: both look quiet to a signal that only watches recent failures. Frontier weighting splits these by adding two complementary signals:</p>
+  <ul>
+    <li><strong>Uncertainty</strong> — <a href="../algorithms/prm.md"><code>PRMScorer.uncertainty(state, action)</code></a> as boundary distance <code>1 − 2·|p − 0.5|</code>. High when the PRM scores a representative state near the decision boundary (or when the model is untrained, which returns 1.0 by contract — explicitly bias toward exploring clusters the PRM has no opinion on).</li>
+    <li><strong>Rarity</strong> — <code>1 / (1 + log1p(count))</code> over <code>Trajectory.cluster</code> groupings. Smooth, bounded in (0, 1], with log decay so even well-explored clusters keep some weight when their uncertainty is high.</li>
+  </ul>
+  <p>The two are <strong>multiplied</strong>: a cluster needs both "the PRM is unsure" AND "we don't have many examples" to win. Either signal alone collapses the product, which is what we want — mastered clusters (low uncertainty) and well-explored clusters (low rarity) drop out automatically.</p>
+
+  <h2>Design non-negotiables</h2>
+  <ul>
+    <li><strong>Pure functions only.</strong> No I/O, no globals, no logging side effects. The caller (typically <code>FrontierTracker.pick_frontier_seed</code> via <code>Dreamer.synthetic_self_play</code>) does the on-disk reads and wires the result through.</li>
+    <li><strong>Fail-safe.</strong> Every function returns a defined value for empty / NaN / inf / negative inputs. <code>compute_cluster_uncertainty</code> catches per-cluster exceptions and assigns max uncertainty (1.0) so a bad cluster gets explored rather than silently dropped.</li>
+    <li><strong>Deterministic-with-seed sampling.</strong> <code>pick_weighted</code> accepts an injected <code>random.Random</code> so tests pin the picker's behaviour without monkeypatching globals.</li>
+    <li><strong>Synthetic representative state, not real trajectory sampling.</strong> The PRM is queried with a templated request (<code>"solve a {cluster} challenge"</code>) per cluster. We deliberately do NOT sample real trajectories here — that would couple the seed picker to the trajectory store's read latency and re-introduce I/O. Aggregated uncertainty over real trajectories is a future refinement; the templated state is enough for the boundary-distance signal we use.</li>
+  </ul>
+
+  <h2>Public API</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>representative_state(cluster_key) → (PlanState, ActionFeatures)</code></td><td>Synthesise a stand-in (state, action) pair for "a fresh attempt at this cluster".</td></tr>
+      <tr><td><code>compute_cluster_uncertainty(prm_scorer, cluster_keys) → {cluster: float}</code></td><td>PRM boundary distance per cluster. <code>None</code> scorer → 1.0 everywhere. Per-cluster exceptions → 1.0 (max uncertainty, biases toward exploration).</td></tr>
+      <tr><td><code>compute_cluster_rarity(trajectory_counts, cluster_keys) → {cluster: float}</code></td><td>Log-decay rarity in (0, 1]. Missing or negative counts treated as 0 (max rarity).</td></tr>
+      <tr><td><code>combine_weights(uncertainty, rarity, exclude=None) → {cluster: float}</code></td><td>Multiplicative combiner. Excluded clusters (typically saturated) get weight 0 but stay in the dict so callers can log what was filtered. NaN / inf / negative slips become 0.</td></tr>
+      <tr><td><code>pick_weighted(weights, *, rng=None) → Optional[str]</code></td><td>Sample a single cluster_key in proportion to its weight. Returns <code>None</code> when every weight is zero (caller falls back to cold-start).</td></tr>
+      <tr><td><code>count_trajectories_by_cluster(trajectories) → {cluster: int}</code></td><td>Group an iterable of <code>Trajectory</code> by their <code>.cluster</code> attribute. Trajectories with None / empty / missing cluster are skipped.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Composition (as wired in dream.py)</h2>
+  <pre><code>candidate_clusters = sorted(set(TEMPLATES.keys()) | tracker.clusters)
+
+counts = count_trajectories_by_cluster(
+    ctx.trajectory_collector.iter_trajectories()
+)
+
+unc = compute_cluster_uncertainty(ctx.prm_scorer, candidate_clusters)
+rar = compute_cluster_rarity(counts, candidate_clusters)
+
+seed = frontier_tracker.pick_frontier_seed(
+    uncertainty_by_cluster=unc,
+    rarity_by_cluster=rar,
+    uniform_sample_prob=args.frontier_uniform_sample_prob,
+)
+# seed → same dict shape as pick_seed; mode="frontier_weighted" on the new path.</code></pre>
+
+  <h2>Weight math (worked example)</h2>
+  <p>With three clusters where SQL is rare-and-uncertain, BASH is well-explored but uncertain, ALGO is well-explored and confident:</p>
+  <pre><code>scores         uncertainty   trajectory_count   rarity        combined
+sql            0.90          1                  0.594         0.535
+bash           0.90          500                0.139         0.125
+algo           0.05          5                  0.358         0.018</code></pre>
+  <p>SQL wins ~76% of picks, BASH ~22%, ALGO ~3%. The well-explored-but-uncertain BASH still gets meaningful airtime; the well-explored-and-confident ALGO is effectively skipped without being hard-blocked.</p>
+
+  <h2>Sanity floor</h2>
+  <p>The picker in <a href="../memory/frontier.html"><code>FrontierTracker.pick_frontier_seed</code></a> wraps this layer with a <strong>uniform-sample sanity roll</strong> (default 20%, exposed as <code>--frontier-uniform-sample-prob</code>). On the roll, the legacy <code>pick_seed</code> is called regardless of weights. The PRM is itself learned from trajectories the self-play loop produces — without this floor a cold bias could self-reinforce onto a single cluster forever.</p>
+
+  <h2>Tests</h2>
+  <ul>
+    <li><code>tests/test_frontier_selection.py</code> — 32 cases over the six public functions (pure math: uncertainty boundary cases, rarity decay monotonicity, weight combination, weighted sampling distribution, deterministic-with-seed behaviour, end-to-end composition).</li>
+    <li><code>tests/test_frontier_pick_frontier_seed.py</code> — 9 cases over the integration with <code>FrontierTracker</code>: empty-signal fallback, uniform-sample tagging, all-zero-weight fallback, saturated-cluster exclusion, dict-shape contract.</li>
+    <li><code>tests/test_prm_uncertainty.py</code> — 10 cases pinning the <code>PRMScorer.uncertainty</code> contract this module depends on.</li>
+    <li><code>tests/test_dream_frontier_weighted.py</code> — 4 dream-integration cases (real PRM + real <code>TrajectoryCollector</code>, mocked LLM/sandbox): new path engages with real wiring; <code>--no-frontier-selfplay</code> kill switch; untrained PRM falls back; missing collector falls back.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

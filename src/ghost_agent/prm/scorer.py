@@ -132,6 +132,29 @@ class PRMScorer:
         isolation."""
         return [self.score(state, action) for action in actions]
 
+    def uncertainty(self, state: PlanState, action: ActionFeatures) -> float:
+        """Return model uncertainty for (state, action) ∈ [0, 1].
+
+        Defined as ``1 - 2·|p − 0.5|``: scores at the decision boundary
+        (p=0.5) map to 1.0 (maximally uncertain), scores at the rails
+        (0 or 1) map to 0.0 (maximally confident). When no model is
+        loaded the scorer returns its neutral 0.5, which by this metric
+        IS maximum uncertainty — semantically correct: "we have no
+        opinion" and "we are most unsure" are the same posture for an
+        un-trained logistic regression.
+
+        Used by frontier-aware self-play to target clusters the PRM is
+        unsure about. Never raises; on internal error returns 1.0 to
+        bias toward exploration rather than silently dropping the
+        cluster.
+        """
+        try:
+            p = self.score(state, action)
+        except Exception:
+            return 1.0
+        # _clamp_unit already pinned p into [0, 1] and neutralised NaN.
+        return _clamp_unit(1.0 - 2.0 * abs(p - 0.5))
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Helpers

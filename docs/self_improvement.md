@@ -685,6 +685,80 @@ scorer implementation; concurrent `score()` during `set_model()` was
 exercised under 4-reader/1-swapper thread thrash. Full agent suite
 remains green at **3248 passing**.
 
+## Frontier-aware self-play (closes the PRM → self-play loop)
+
+The PRM produces a per-step confidence signal; the trajectory store
+records per-cluster coverage. Frontier-aware self-play (default on,
+`--frontier-selfplay`) combines them to choose which cluster the
+biological-watchdog phase-3 self-play pass should target:
+
+```
+cluster weight  =  PRM_uncertainty(cluster)  ×  trajectory_rarity(cluster)
+                   └─ 1 − 2·|p − 0.5| ─┘     └─ 1/(1 + log1p(count)) ─┘
+```
+
+Saturated clusters (per `FrontierTracker.list_saturated_clusters()`)
+are excluded with weight 0. The math lives in
+`core/frontier_selection.py` as pure functions; the integration is on
+`FrontierTracker.pick_frontier_seed`, which mirrors the dict shape of
+the legacy `pick_seed` so call sites in `core/dream.py` need no
+schema branching.
+
+**Why it matters.** The brittle-pool scoring in `pick_seed` sees
+outcomes but not coverage — a cluster the agent has barely tried
+looks identical to a cluster it solves first-try (both have no recent
+failures). Frontier weighting surfaces the under-explored quiet ones.
+That matters because the PRM is itself trained on the trajectories
+self-play produces: if self-play keeps targeting the same handful of
+well-trodden clusters, the PRM's opinion of the others stays stuck at
+neutral, and the brittle-pool picker never gets a reason to rotate
+to them. Frontier weighting breaks the loop.
+
+**Engagement gate (strict).** `isinstance(ctx.prm_scorer, PRMScorer)
+and ctx.prm_scorer.has_model and isinstance(ctx.trajectory_collector,
+TrajectoryCollector)`. MagicMock-backed test contexts fail closed at
+both checks, so legacy tests continue exercising the old path
+unchanged. Cold-boot agents (no PRM model yet, no trajectories yet)
+also fall through cleanly to `pick_seed`.
+
+**Sanity floor.** `--frontier-uniform-sample-prob` (default 0.2)
+bypasses frontier weighting on a per-tick dice roll and falls back to
+the legacy `pick_seed`. Without this floor, a systematically-wrong
+PRM could self-reinforce onto one cluster and starve the others of
+training signal — keeping the PRM wrong about them in perpetuity.
+20% uniform sampling breaks the feedback loop without losing the
+benefit of frontier targeting on the other 80%.
+
+CLI:
+
+```bash
+# Default — frontier weighting on with 20% sanity floor:
+python -m src.ghost_agent.main --upstream-url "http://127.0.0.1:8080"
+
+# A/B comparison — explicitly revert to legacy brittle-pool pick:
+python -m src.ghost_agent.main \
+    --upstream-url "http://127.0.0.1:8080" \
+    --no-frontier-selfplay
+
+# Aggressive — drop sanity floor to 5% if the PRM is well-trained:
+python -m src.ghost_agent.main \
+    --upstream-url "http://127.0.0.1:8080" \
+    --frontier-uniform-sample-prob 0.05
+```
+
+Coverage: `tests/test_prm_uncertainty.py` (10) +
+`tests/test_frontier_selection.py` (32) +
+`tests/test_frontier_pick_frontier_seed.py` (9) +
+`tests/test_dream_frontier_weighted.py` (4) = 55 new tests, all
+green. Existing `tests/test_dream_synthetic_curiosity.py`,
+`tests/test_frontier_tracker.py`, and all `tests/test_selfplay_*.py`
+continue passing — no regression to the legacy path.
+
+End-to-end walkthrough:
+[`docs/core/frontier_selection.html`](core/frontier_selection.html)
+and the new section in
+[`docs/algorithms/dream_cycle.html`](algorithms/dream_cycle.html).
+
 ## Stage 2 hook (future work)
 
 The trajectory log is the ingredient Stage 2 (local SFT via rejection

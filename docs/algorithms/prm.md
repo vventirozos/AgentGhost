@@ -26,7 +26,8 @@ src/ghost_agent/prm/
     model.py           numpy-only logistic regression
                        (StepValueModel, JSON-persisted, schema-versioned)
     scorer.py          Production-facing wrapper
-                       (PRMScorer.score(state, action) → float ∈ [0, 1])
+                       (PRMScorer.score(state, action) → float ∈ [0, 1];
+                        PRMScorer.uncertainty(state, action) → float ∈ [0, 1])
     trainer.py         Pipeline: trajectories → samples → fit → save
                        (PRMTrainer with bail-on-bad-data semantics)
 ```
@@ -204,6 +205,30 @@ existing callers continue working unchanged. Backwards compatibility
 is verified by `tests/test_mcts.py` (the original 12 tests) and
 `tests/test_deep_reason_wiring.py` (still pass after the integration).
 
+### Frontier-aware self-play (consumer of `uncertainty()`)
+
+`PRMScorer.uncertainty(state, action)` is the boundary-distance proxy
+`1 − 2·|p − 0.5|`. Scores at the rails (0 or 1) map to 0.0
+(maximally confident); scores at p = 0.5 map to 1.0 (maximally
+unsure). When the scorer has no loaded model the underlying `score`
+returns its neutral 0.5, which by this metric IS maximum uncertainty —
+semantically correct: "we have no opinion" and "we are most unsure"
+are the same posture for an untrained logistic regression. Never
+raises; on internal error returns 1.0 to bias toward exploration
+rather than silently dropping the cluster.
+
+The biological-watchdog phase-3 self-play picker
+(`core/dream.py::synthetic_self_play`) consumes this via
+`core/frontier_selection.py::compute_cluster_uncertainty` — see
+`docs/core/frontier_selection.html` for the weighting math and
+`docs/algorithms/dream_cycle.html` for the wire-up. Engagement is
+strict-typed: the scorer must be an actual `PRMScorer` instance with
+`has_model=True` (not a MagicMock test attribute) AND the trajectory
+collector must be an actual `TrajectoryCollector`, otherwise the
+picker falls through to the legacy brittle-pool path. Covered by
+`tests/test_prm_uncertainty.py` (10 cases) plus the frontier and
+dream-integration test files.
+
 ### Biological watchdog phase 2.7
 
 Idle CPU-only retraining pass that runs in the 900–3600 s idle window,
@@ -247,6 +272,7 @@ plugged in (first-ever fit case), the phase bridges them too.
 | `tests/test_prm_biological_phase.py` | 12 cases — phase fires when wired, gating, cooldown anchor, exception advance, user-supplied cooldown, no-swap on bail, MCTS auto-plugin. |
 | `tests/test_prm_corner_cases.py` | 59 cases — all-UNKNOWN / all-PASSED / all-FAILED corpora, malformed tool_args, NaN/inf labels and inputs, NaN discount, wrong-length vectors, corrupted JSON, missing fields, atomic save, scorer edge inputs, MCTS scorer-returns-NaN/out-of-range, trainer repeat-run, concurrent score during set_model swap, 5K-sample stress, 1K-candidate batch scoring, corrections-sidecar overlay changing labels, phase 2.7 with unwritable parent, anchor-advance on trainer mid-iteration crash. |
 | `tests/test_prm_adversarial.py` | 30 cases — randomised fuzz inputs to feature extraction (10 seeds × 200 inputs each), random balanced-corpus fuzz training (5 seeds), 10K-sample fit under 60 s, 5K-candidate batch scoring, tool args with null bytes / control chars / 50-deep nesting / circular references / injection-shaped strings, 1000-iteration set_model thrash, schema migration rejections (legacy v0, partial feature names), feature-tuple immutability, dtype consistency (FeatureVector ≡ ndarray ≡ list ≡ tuple). |
+| `tests/test_prm_uncertainty.py` | 10 cases — `PRMScorer.uncertainty(state, action)` contract: untrained → 1.0; trained at p=0 / p=1 → 0.0; p=0.5 → 1.0; symmetric quarter-points → 0.5; exception isolation; NaN robustness. Consumed by `core/frontier_selection.py`. |
 
 **Total: 195 tests, all green.** Full agent suite (3248 tests) regression-clean.
 
