@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.adversarial_generator — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="dream.html">dream</a>
+    <a href="frontier_selection.html">frontier_selection</a>
+    <a href="self_play_scoring.html">self_play_scoring</a>
+    <a href="solution_novelty.html">solution_novelty</a>
+    <a class="current" href="adversarial_generator.html">adversarial_generator</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / adversarial_generator.py</h1>
+  <p class="subtitle">Per-prompt-fingerprint solver pass-rate tracker. Biases the next challenge-generation prompt toward families that have been stumping the solver.</p>
+
+  <h2>Why</h2>
+  <p>Pre-2026-05 the LLM that generated challenges was the same LLM that solved them, and there was no incentive for the generator to produce <em>hard</em> challenges. Production traces showed its creative range collapsing to a handful of CSV/JSON groupby shapes the solver aced first-try (traces 17:44, 18:46, 19:48). The 8-template bank dominated cold-start.</p>
+
+  <p>This module is the tiny state store for proposal G in the 2026-05-17 redesign. It tracks, per generator-prompt fingerprint, the recent solver pass rate on challenges produced under that prompt. The dreamer reads this score and biases the next generator prompt toward families with <em>low</em> solver pass rates — i.e. toward what's actually stumping the agent.</p>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Function / method</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>fingerprint_prompt(prompt_fragment) → str</code></td><td>Stable 12-char sha1 of the variable part of the generator prompt (typically the frontier hint).</td></tr>
+      <tr><td><code>AdversarialGeneratorTracker(memory_dir)</code></td><td>JSON-backed store at <code>{memory_dir}/adversarial_generator.json</code>.</td></tr>
+      <tr><td><code>.record(fingerprint, *, passed, cluster)</code></td><td>Append one outcome to the fingerprint's ring (cap 10 outcomes per fingerprint).</td></tr>
+      <tr><td><code>.pass_rate(fingerprint) → float | None</code></td><td>Recent solver pass rate in [0, 1], or <code>None</code> when fewer than 2 outcomes recorded.</td></tr>
+      <tr><td><code>.worst_fingerprints(limit=3) → list[(fp, rate, top_cluster)]</code></td><td>The N fingerprints with the lowest pass rates.</td></tr>
+      <tr><td><code>.suggest_bias() → str</code></td><td>A short prose block to inject into the challenge-generator prompt. Empty when no signal yet.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Wiring</h2>
+  <p><code>core/dream.synthetic_self_play</code> calls <code>suggest_bias()</code> at the top of the system prompt and appends the returned block <em>before</em> the saturation override. The challenge-gen LLM sees something like:</p>
+
+  <pre><code>### ADVERSARIAL HINT (generator feedback)
+The solver's recent pass rate on 'concurrency, sql'-shaped
+challenges is only 25%. Prefer producing MORE challenges in that
+family with subtle edge cases (empty inputs, off-by-one
+boundaries, unicode payloads, concurrent writers) rather than
+rotating to a different family the solver already aces.</code></pre>
+
+  <p>After the cycle finishes, <code>record()</code> fires with the cycle's (passed, cluster) outcome against the same fingerprint, so the next bias suggestion reflects the most recent attempt.</p>
+
+  <h2>Why a separate file (not on FrontierTracker)</h2>
+  <ul>
+    <li>The frontier tracker is keyed by <em>cluster</em>; the adversarial signal is keyed by <em>generator-prompt fingerprint</em>. Mixing them would couple two independent rotation policies.</li>
+    <li>Generator fingerprints are short-lived — a few dozen, not thousands. A small standalone JSON keeps the I/O footprint obvious and easy to reset.</li>
+    <li>No advisory-lock machinery — the dream loop is single-writer within one process, and cross-process self-play is not supported.</li>
+  </ul>
+
+  <h2>Coverage</h2>
+  <p><code>tests/test_self_play_meaningful.py::TestAdversarialTracker</code> (5 cases): fingerprint stability, minimum-sample gate on <code>pass_rate</code>, ordering of <code>worst_fingerprints</code>, bias-suggestion content, empty-state behaviour.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

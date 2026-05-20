@@ -77,6 +77,16 @@
   <h2>Composed skills</h2>
   <p>Recurring tool-call sequences are pulled into <a href="../tools/composed_skills.html">ComposedSkill</a> macros. A composed skill defines steps with parameter templates and conditional branches, executed via <code>execute(skill_name, executor_fn, params)</code>. Up to 50 composed skills are kept; the least-used is evicted on overflow.</p>
 
+  <h2>Graduating auto-acquired skills</h2>
+  <p>Biological phase 2.6 used to extract and consolidate recurring tool-sequence candidates, log them, and discard them — pure overhead with no output. Now a new <code>GraduatedSkillStore</code> (<code>src/ghost_agent/skills_auto/store.py</code>) closes the loop.</p>
+  <ul>
+    <li>Phase 2.6 runs each consolidated candidate through <code>verify_candidate</code> with a robustness gate — graduate only when support ≥ 3 and confidence ≥ 0.5.</li>
+    <li>Passers are persisted to <code>auto_skills.json</code> as "graduated skills" — bounded at 60 entries, lowest-confidence dropped on overflow.</li>
+    <li>The turn loop reads the store back and injects skills relevant to the current request as a <code>"PROVEN APPROACHES"</code> block in the system prompt.</li>
+  </ul>
+  <p>The full pipeline is now extract → consolidate → verify → persist → retrieve.</p>
+  <div class="note"><strong>Tests:</strong> covered by <code>tests/test_skills_auto_store.py</code>.</div>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

@@ -105,6 +105,159 @@ def _guess_domains(text: str) -> List[str]:
     return tags or ["python_general"]
 
 
+def _detect_data_shape(text: str) -> dict:
+    """Sniff what kind of input the journal entry referenced.
+
+    Returns a dict describing the synthesised fixture: which file
+    extension to materialise, which generator routine to call, and
+    which validator rubric to apply. Falls back to a generic key-value
+    `input.txt` (the pre-2026-05 default) when nothing matches.
+
+    The 2026-05-17 redesign replaced the universal `input.txt + token-
+    match` validator. Pre-redesign every mined challenge produced the
+    same fixture regardless of whether the original task involved CSV
+    parsing, log analysis, JSON munging, or SQL — so the solver got
+    almost zero transfer credit and the journal-mining branch was
+    decorative.
+    """
+    t = (text or "").lower()
+    # Order matters: SQL gets checked before JSON because a phrase like
+    # "json field in the postgres column" should still route to SQL.
+    if any(k in t for k in (".sql", "sqlite", "postgres", "select ", " join ", " group by ", "database")):
+        return {"kind": "sql", "filename": "input.db"}
+    if any(k in t for k in (".csv", "csv", "spreadsheet", "comma-separated")):
+        return {"kind": "csv", "filename": "input.csv"}
+    if any(k in t for k in (".json", "json", "api response", "rest api")):
+        return {"kind": "json", "filename": "input.json"}
+    if any(k in t for k in (".log", "access log", "nginx", "apache log", "log file", "logs")):
+        return {"kind": "log", "filename": "input.log"}
+    return {"kind": "text", "filename": "input.txt"}
+
+
+def _shape_specific_setup(kind: str) -> str:
+    """Return a stdlib-only setup script for the detected shape.
+
+    Each shape produces a small but well-formed fixture of the right
+    kind so the solver can demonstrate the *category* of operation the
+    original user asked for (parse JSON, query SQL, etc.) rather than
+    being railroaded into "read input.txt and print a token".
+    """
+    if kind == "csv":
+        return (
+            "import csv\n"
+            "with open('input.csv', 'w', newline='') as f:\n"
+            "    w = csv.writer(f)\n"
+            "    w.writerow(['id', 'name', 'value'])\n"
+            "    w.writerow([1, 'alpha', 100])\n"
+            "    w.writerow([2, 'beta', 200])\n"
+            "    w.writerow([3, 'gamma', 300])\n"
+            "    w.writerow([4, 'delta', 400])\n"
+        )
+    if kind == "json":
+        return (
+            "import json\n"
+            "data = [\n"
+            "    {'id': 1, 'name': 'alpha', 'value': 100},\n"
+            "    {'id': 2, 'name': 'beta', 'value': 200},\n"
+            "    {'id': 3, 'name': 'gamma', 'value': 300},\n"
+            "    {'id': 4, 'name': 'delta', 'value': 400},\n"
+            "]\n"
+            "with open('input.json', 'w') as f:\n"
+            "    json.dump(data, f)\n"
+        )
+    if kind == "log":
+        return (
+            "lines = [\n"
+            "    '2024-01-01 00:00:01 INFO startup',\n"
+            "    '2024-01-01 00:00:02 ERROR alpha disk full',\n"
+            "    '2024-01-01 00:00:03 WARN beta slow query',\n"
+            "    '2024-01-01 00:00:04 ERROR gamma connection refused',\n"
+            "    '2024-01-01 00:00:05 INFO delta ok',\n"
+            "]\n"
+            "with open('input.log', 'w') as f:\n"
+            "    f.write('\\n'.join(lines) + '\\n')\n"
+        )
+    if kind == "sql":
+        return (
+            "import sqlite3\n"
+            "conn = sqlite3.connect('input.db')\n"
+            "c = conn.cursor()\n"
+            "c.execute('CREATE TABLE items(id INT, name TEXT, value INT)')\n"
+            "c.executemany('INSERT INTO items VALUES (?,?,?)', [\n"
+            "    (1, 'alpha', 100), (2, 'beta', 200),\n"
+            "    (3, 'gamma', 300), (4, 'delta', 400),\n"
+            "])\n"
+            "conn.commit(); conn.close()\n"
+        )
+    # text fallback (pre-2026-05 behaviour)
+    return (
+        "with open('input.txt', 'w') as f:\n"
+        "    f.write('line 1: alpha 100\\n')\n"
+        "    f.write('line 2: beta 200\\n')\n"
+        "    f.write('line 3: gamma 300\\n')\n"
+        "    f.write('line 4: delta 400\\n')\n"
+    )
+
+
+def _shape_specific_validator(kind: str, filename: str) -> str:
+    """Return a validator that proves the solver actually OPENED the
+    shape-appropriate file (csv via csv module, json via json module,
+    log via line parsing, sql via sqlite3) — not just printed a
+    matching token.
+
+    Still intentionally lenient: we don't grade the user's specific
+    requested operation, only that the solver demonstrated a credible
+    interaction with the materialised fixture. The structured-lesson
+    extractor in dream.py captures the real semantic signal.
+    """
+    base = (
+        "import subprocess, sys\n"
+        f"res = subprocess.run(['python3', 'solution.py'], capture_output=True, text=True, timeout=15)\n"
+        "if res.returncode != 0:\n"
+        "    print('EXIT', res.returncode, 'STDERR', res.stderr[:400])\n"
+        "    sys.exit(1)\n"
+        "out = (res.stdout or '').strip()\n"
+        "if not out:\n"
+        "    print('EMPTY OUTPUT — solution must print something')\n"
+        "    sys.exit(1)\n"
+    )
+    # Each rubric requires evidence in stdout that the solver touched
+    # the shape-appropriate fixture content, not just printed a literal.
+    rubrics = {
+        "csv": (
+            "tokens = {'alpha', 'beta', 'gamma', 'delta', '100', '200', '300', '400'}\n"
+            "if not any(t in out for t in tokens):\n"
+            "    print('solution output did not reference any CSV row data')\n"
+            "    sys.exit(1)\n"
+        ),
+        "json": (
+            "tokens = {'alpha', 'beta', 'gamma', 'delta', '100', '200', '300', '400'}\n"
+            "if not any(t in out for t in tokens):\n"
+            "    print('solution output did not reference any JSON entry')\n"
+            "    sys.exit(1)\n"
+        ),
+        "log": (
+            "tokens = {'INFO', 'ERROR', 'WARN', 'alpha', 'beta', 'gamma', 'delta'}\n"
+            "if not any(t in out for t in tokens):\n"
+            "    print('solution output did not reference any log line')\n"
+            "    sys.exit(1)\n"
+        ),
+        "sql": (
+            "tokens = {'alpha', 'beta', 'gamma', 'delta', '100', '200', '300', '400', 'items'}\n"
+            "if not any(t in out for t in tokens):\n"
+            "    print('solution output did not reference any DB row')\n"
+            "    sys.exit(1)\n"
+        ),
+        "text": (
+            "tokens = {'alpha', 'beta', 'gamma', 'delta', '100', '200', '300', '400', 'line'}\n"
+            "if not any(t in out for t in tokens):\n"
+            "    print('solution output did not reference any token from input.txt')\n"
+            "    sys.exit(1)\n"
+        ),
+    }
+    return base + rubrics.get(kind, rubrics["text"]) + "sys.exit(0)\n"
+
+
 def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
     """Turn one journal `post_mortem` / `failure` entry into a
     self-contained challenge.
@@ -112,16 +265,16 @@ def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
     Strategy:
       * Use the user-message as the task prose (anonymised to remove
         names / paths we can't reproduce).
-      * Generate a deterministic mock text file that captures the SHAPE
-        of whatever the agent was working with (so the solver has SOME
-        data to read). We can't faithfully reproduce production data
-        here, so we build a small, bounded `input.txt` and ask the
-        solver to demonstrate the REQUESTED operation on it.
-      * The validator treats any exit-0 solution that produces non-
-        empty, well-formed output as a pass. This is intentionally
+      * Detect the data SHAPE referenced in the original entry
+        (CSV / JSON / log / SQL / text) and materialise a small
+        fixture of the corresponding kind via stdlib — so a solver
+        asked to "parse a JSON payload" actually gets a JSON file
+        rather than a generic `input.txt`.
+      * The validator checks that the solver's output references the
+        fixture content in a kind-appropriate way. Intentionally
         lenient — we're practising the APPROACH, not grading a
-        specific answer. Frontier scoring + the lesson-extractor still
-        capture the real signal.
+        specific answer. Frontier scoring + the lesson-extractor
+        still capture the real signal.
     """
     data = entry.get("data") or {}
     if not isinstance(data, dict):
@@ -143,45 +296,24 @@ def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
     domains = _guess_domains(cleaned)
     jhash = _hash_task(cleaned)
 
-    # The setup script writes a tiny deterministic input.txt that the
-    # solver is expected to read. Keep this stdlib-only and small —
-    # the self-play sandbox asserts stdlib-only in setup scripts.
-    setup_script = (
-        "with open('input.txt', 'w') as f:\n"
-        "    f.write('line 1: alpha 100\\n')\n"
-        "    f.write('line 2: beta 200\\n')\n"
-        "    f.write('line 3: gamma 300\\n')\n"
-        "    f.write('line 4: delta 400\\n')\n"
-    )
-
-    # A deliberately lenient validator: the solver must produce SOME
-    # stdout, exit 0, and demonstrate that it read input.txt (checked
-    # by matching at least one of the tokens present in the file).
-    # We accept any reasonable interpretation of the task — this is
-    # pretending to be the real problem, not a graded test.
-    validation_script = (
-        "import subprocess, sys\n"
-        "res = subprocess.run(['python3', 'solution.py'], capture_output=True, text=True, timeout=15)\n"
-        "if res.returncode != 0:\n"
-        "    print('EXIT', res.returncode, 'STDERR', res.stderr[:400])\n"
-        "    sys.exit(1)\n"
-        "out = (res.stdout or '').strip()\n"
-        "if not out:\n"
-        "    print('EMPTY OUTPUT — solution must print something')\n"
-        "    sys.exit(1)\n"
-        "tokens = {'alpha', 'beta', 'gamma', 'delta', '100', '200', '300', '400', 'line'}\n"
-        "if not any(t in out for t in tokens):\n"
-        "    print('solution output did not reference any token from input.txt')\n"
-        "    sys.exit(1)\n"
-        "sys.exit(0)\n"
-    )
+    # Sniff what kind of input the journal entry was about and
+    # materialise a SHAPE-APPROPRIATE fixture. Pre-2026-05 every mined
+    # challenge got the same `input.txt` regardless — the solver got
+    # ~zero transfer credit because the fixture was divorced from the
+    # original task. Now a "parse a CSV" journal entry gets a CSV
+    # fixture and a CSV-aware validator.
+    shape = _detect_data_shape(cleaned)
+    setup_script = _shape_specific_setup(shape["kind"])
+    validation_script = _shape_specific_validator(shape["kind"], shape["filename"])
 
     challenge_prompt = (
         "You previously struggled with the request below.\n"
-        "A deterministic `input.txt` file (4 numbered lines, each with a word "
-        "and a number) has already been written in your working directory.\n"
+        f"A deterministic `{shape['filename']}` fixture has been written in "
+        "your working directory — its shape matches what the original "
+        "user task referenced (CSV/JSON/log/SQL/text).\n"
         "Write a `solution.py` that:\n"
-        "  1. Opens `input.txt`, reads the lines.\n"
+        f"  1. Opens `{shape['filename']}` using the appropriate stdlib "
+        f"module ({shape['kind']}).\n"
         "  2. Performs the operation the user asked for, applied to that file.\n"
         "  3. Prints the result to stdout (non-empty) and exits 0.\n\n"
         "### ORIGINAL USER REQUEST (sanitized)\n"

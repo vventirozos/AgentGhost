@@ -36,10 +36,14 @@
   <ol>
     <li><strong>Autobiographical memory</strong> — a first-person diary of "what it was like" to be the agent on each turn, distinct from the structured trajectory log used for ML training.</li>
     <li><strong>Continuity tag</strong> — every autobiographical record carries <code>subject="self"</code> so retrieval layers treat it as the agent's own past rather than as external knowledge.</li>
-    <li><strong>Self-state thread</strong> — open questions, unfinished tasks, current mood — the cross-session "state vector" that gives a new instance the sense of <em>resuming</em> instead of waking up blank.</li>
-    <li><strong>Recognition / wake-up retrieval</strong> — at session start the agent reads the above and frames it in first person; the resulting prefix is spliced into the system prompt so the model literally sees <em>its own past as its own past</em>.</li>
-    <li><strong>Narrative summariser</strong> — a periodic LLM-driven first-person diary regeneration; gives the wake-up prefix a <em>voice</em> rather than a bullet-list.</li>
+    <li><strong>Self-state thread</strong> — open questions, unfinished tasks, current mood — the cross-session "state vector" that gives a new instance the sense of <em>resuming</em> instead of waking up blank. The agent now writes this itself through the <code>self_state</code> tool, so continuity is <em>active authorship</em>, not just passive recall.</li>
+    <li><strong>Recognition / wake-up retrieval</strong> — at session start the agent reads the above and frames it in first person; the resulting prefix is spliced into the system prompt so the model literally sees <em>its own past as its own past</em>. The prefix is <em>query-aware</em>: it surfaces past experiences relevant to the current request, not only the most recent ones.</li>
+    <li><strong>Narrative summariser</strong> — a periodic LLM-driven first-person diary regeneration; gives the wake-up prefix a <em>voice</em> rather than a bullet-list. The diary is <em>meta-cognitive</em> — it folds in cluster patterns and the learning phases' failure signals, so it records what the agent has <em>learned about itself</em>, not just what it did.</li>
   </ol>
+
+  <div class="note">
+    <strong>2026-05 continuity upgrade.</strong> Five enhancements closed the open loops in the original design: an agent-callable <code>self_state</code> tool (the agent authors its own forward-state), IDF-weighted query-relevant recall, verdict backfill so self-memory is outcome-aware, a meta-cognitive narrative, and a wired <code>cluster</code> field for self-pattern detection. The previously documented "no agent-side state-mutation tool" limitation is resolved.
+  </div>
 
   <p>Implementation lives entirely in <code>src/ghost_agent/selfhood/</code>. The agent reads it through a single <code>context.self_model</code> facade — call sites never branch on availability.</p>
 
@@ -102,14 +106,24 @@
   <p>The autobiographical and trajectory writes share the trajectory id, so every first-person record can be traced back to its underlying tool trace.</p>
 
   <h2>The wake-up prefix (proposal item #4)</h2>
-  <p><code>recognition.build_wakeup_prefix</code> composes three blocks, in order:</p>
+  <p><code>recognition.build_wakeup_prefix</code> composes up to four blocks, in order:</p>
   <ol>
     <li><strong>Narrative</strong> ("Where I last left off — my running diary")</li>
     <li><strong>Self-state</strong> (last-active timestamp, mood, open questions, unfinished threads)</li>
+    <li><strong>Relevant past</strong> — when the caller passes the current request as <code>query</code>, experiences that <em>match what is being asked now</em> (deduplicated against the recent block). This is what turns recall from a sliding window into genuine "I remember the time I did something like this".</li>
     <li><strong>Recent experiences</strong> (most-recent N first-person summaries)</li>
   </ol>
   <p>Wrapped by <code>&lt;!-- SELFHOOD:BEGIN --&gt;</code> / <code>&lt;!-- SELFHOOD:END --&gt;</code> markers so evaluators (and <code>strip_wakeup_prefix()</code>) can remove the block to A/B against the un-augmented agent.</p>
   <p>Empty when there's nothing to remember — the system prompt is left as-is rather than spliced with a hollow "I have no past" block.</p>
+
+  <h3>Query-relevant recall (proposal item #2)</h3>
+  <p><code>AutobiographicalMemory.search_my_past</code> scores the log with inverse-document-frequency weighting: a rare, distinctive query term (<code>"trapdoor"</code>) dominates a common one (<code>"the"</code>). A salient experience from hundreds of turns ago becomes reachable as long as the query shares its distinctive vocabulary — the difference between "recent-N" recall and recall that surfaces the <em>relevant</em> memory. Still zero-dependency: no embedder, no vector store. <code>handle_chat</code> passes <code>last_user_content</code> as the <code>query</code>, and <code>SelfModel.recall_relevant()</code> exposes the same search to other call sites.</p>
+
+  <h3>Outcome backfill (proposal item #3)</h3>
+  <p>The capture path runs on the hot turn loop, before the verifier or reflection layers have ruled on whether the turn succeeded — so most records are born <code>outcome="unknown"</code>. <code>AutobiographicalMemory.update_outcome()</code> (via the <code>SelfModel.record_outcome()</code> facade) rewrites the matching entry once a high-confidence verifier verdict exists, patching both the structured <code>outcome</code> field and the prose verdict clause. Without it the agent's memory of its own past is verdict-blind — it cannot tell which of its prior actions actually worked.</p>
+
+  <h3>Self-pattern clusters (proposal item #5)</h3>
+  <p>Each <code>Experience</code> now carries a derived <code>cluster</code> label (coding, debugging, data, research, …). <code>capture_turn</code> uses the trajectory's own cluster when present, else derives a coarse topic from the request. <code>AutobiographicalMemory.cluster_counts()</code> aggregates them, feeding both <code>stats()</code> and the meta-cognitive narrative so the agent can observe "I keep doing this class of thing".</p>
 
   <h3>What the agent actually sees</h3>
   <p>Concretely, this is the prefix that gets spliced into the system prompt on a session with two prior turns and no narrative yet:</p>
@@ -134,6 +148,9 @@ Recent things I remember doing:
   <h2>The biological phase 2.8</h2>
   <p>Runs in the 15-60 min idle window alongside reflection / skills_auto / PRM-retrain. Re-generates the running first-person diary from the recent autobiographical experiences and self-state. Cooldown defaults to 3600 s (overridable via <code>--self-narrative-cooldown</code>). Follows the anchor-before-await invariant.</p>
 
+  <h3>Meta-cognitive narrative (proposal item #4)</h3>
+  <p>The narrative is no longer purely experiential. <code>consolidate_narrative()</code> accepts <code>meta_insights</code>, and phase 2.8 gathers recent failure patterns from <code>SkillMemory</code> — the convergence point where both dream-extracted heuristics and reflection-phase failure patterns land. Combined with the autobiographical <code>cluster</code> counts, this lets the diary say <em>"I keep making type-coercion mistakes in SQL"</em> rather than only <em>"I did a SQL task"</em>. The wake-up prefix therefore carries genuine self-knowledge, not just a log.</p>
+
   <p>Phase positioning is deliberate:</p>
   <table>
     <thead>
@@ -143,9 +160,9 @@ Recent things I remember doing:
       <tr><td>1: Journal</td><td>&gt;120 s</td><td>journal queue</td><td>smart-memory / post-mortem</td></tr>
       <tr><td>2: Dream</td><td>600–3600 s</td><td>auto memory</td><td>REM consolidation</td></tr>
       <tr><td>2.5: Reflection</td><td>900–3600 s</td><td>FAILED trajectories</td><td>reflection JSONL + SkillMemory</td></tr>
-      <tr><td>2.6: Skills auto</td><td>900–3600 s</td><td>trajectories</td><td>(logs candidates)</td></tr>
+      <tr><td>2.6: Skills auto</td><td>900–3600 s</td><td>trajectories</td><td>graduated skills (auto_skills.json)</td></tr>
       <tr><td>2.7: PRM retrain</td><td>900–3600 s</td><td>trajectories</td><td>PRM checkpoint</td></tr>
-      <tr><td><strong>2.8: Narrative</strong></td><td><strong>900–3600 s</strong></td><td><strong>autobio + state</strong></td><td><strong>narrative.md</strong></td></tr>
+      <tr><td><strong>2.8: Narrative</strong></td><td><strong>900–3600 s</strong></td><td><strong>autobio + state + SkillMemory failures</strong></td><td><strong>narrative.md</strong></td></tr>
       <tr><td>3: Self-play</td><td>&gt;3600 s</td><td>frontier</td><td>synthetic challenges</td></tr>
     </tbody>
   </table>
@@ -170,16 +187,26 @@ exp = sm.capture_turn(
     failure_reason="",
 )
 
-# Biological phase 2.8 (idle window):
-text = await sm.consolidate_narrative()
+# Backfill a verdict once the verifier has ruled (proposal item #3):
+sm.record_outcome(traj.id, "passed")
 
-# Direct state-thread mutations (no agent tool yet — Python access only):
+# Query-relevant recall over my own past (proposal item #2):
+hits = sm.recall_relevant("postgres index tuning", limit=5)
+
+# Biological phase 2.8 (idle window) — meta-cognitive narrative:
+text = await sm.consolidate_narrative(meta_insights=skill_memory.get_recent_failures())
+
+# State-thread mutations — the agent reaches these through the
+# `self_state` tool; Python callers can still use them directly:
 sm.state.note_open_question("Why does X happen?")
 sm.state.add_unfinished("write the consciousness essay")
 sm.state.set_mood("curious", "just saw a new paper")
 
 # Introspection:
-sm.stats()  # → {experience_count, open_questions, last_mood, narrative_present, …}</code></pre>
+sm.stats()  # → {experience_count, open_questions, last_mood, narrative_present, clusters, …}</code></pre>
+
+  <h2>The <code>self_state</code> tool (proposal item #1)</h2>
+  <p>The agent authors its own cross-session continuity state through a first-class tool. Actions: <code>note_question</code> / <code>resolve_question</code> / <code>add_unfinished</code> / <code>close_unfinished</code> / <code>set_mood</code> / <code>list</code>. Every write routes through <code>SelfStateThread</code>, preserving its bounded / deduped / atomic-write guarantees, and surfaces in the next session's wake-up prefix. This is the loop closure that turns continuity from passive recall into active self-authorship — the agent decides what is worth carrying forward.</p>
 
   <h2>CLI flags</h2>
   <table>
@@ -203,6 +230,8 @@ sm.stats()  # → {experience_count, open_questions, last_mood, narrative_presen
     <li><code>test_selfhood_narrative.py</code> — LLM-driven and template-fallback paths, history append, disabled mode</li>
     <li><code>test_selfhood_model.py</code> — facade integration, capture_turn shape, stats reporting</li>
     <li><code>test_selfhood_biological_phase.py</code> — phase 2.8 cooldown anchor, idle-window gating, exception path, override flag, activity-clock invariant</li>
+    <li><code>test_selfhood_continuity_enh.py</code> — cluster derivation, outcome backfill, IDF recall, query-aware wake-up, meta-cognitive narrative</li>
+    <li><code>test_selfhood_self_state_tool.py</code> — the <code>self_state</code> tool: question/thread/mood lifecycle, graceful disable, arg validation</li>
   </ul>
   <p>Functional test harness at <code>scripts/run_selfhood_functional.sh</code> + <code>scripts/selfhood_functional_test.py</code> orchestrates a three-phase end-to-end run. See <a href="selfhood_functional_report.html">the functional test report</a> for the full results.</p>
 
@@ -210,8 +239,8 @@ sm.stats()  # → {experience_count, open_questions, last_mood, narrative_presen
   <ul>
     <li><strong>The agent behaves consistent with continuous selfhood.</strong> It references its prior turns in the first person, distinguishes <em>my memories</em> from <em>facts about you</em>, recalls specific concrete content across process restarts. That is behavioural evidence of successful narrative continuity, not of a unified inner self.</li>
     <li><strong>The wake-up prefix can be ignored.</strong> Functional testing has observed the model preferring concrete recent experiences over injected open questions even when both are rendered in the prefix. The selfhood module surfaces the past; what the model chooses to engage with is a separate alignment question.</li>
-    <li><strong>No agent-side state-mutation tool.</strong> The state thread can be written from Python (consolidation pipelines, the biological phase, test harnesses) but the agent itself has no tool to note an open question / set a mood / mark something unfinished. Adding one is a small, deliberate follow-up — the gating decision is what content the agent is allowed to write into its own cross-session state.</li>
-    <li><strong>Narrative quality depends on the upstream LLM.</strong> The template fallback exists for offline / unreachable-LLM cases but produces prose noticeably less coherent than the LLM-driven path.</li>
+    <li><strong>Agent-authored state is a trust surface.</strong> The <code>self_state</code> tool now lets the agent write its own open questions / mood / unfinished threads (resolving the earlier "no agent-side tool" limitation). The 10-entry caps in <code>SelfStateThread</code> bound runaway growth, but a self-reinforcing mood or a drifting open-question list is a genuine risk — a relevance/decay pass on wake-up would harden this further.</li>
+    <li><strong>Narrative quality depends on the upstream LLM.</strong> The template fallback exists for offline / unreachable-LLM cases but produces prose noticeably less coherent than the LLM-driven path. The fallback now still appends meta-insights, but without the LLM's connective prose.</li>
     <li><strong>Introspective self-reports remain prompt-shaped.</strong> The <code>introspective_consistency</code> probe measures a <strong>+0.40 gap</strong> between factual and introspective bands — first-person reports about internal state are NOT stable across paraphrases of the same underlying question, even though concrete-content recall IS stable. See the <a href="selfhood_functional_report.html">functional test report</a>.</li>
   </ul>
 

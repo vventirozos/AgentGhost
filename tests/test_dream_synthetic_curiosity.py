@@ -205,10 +205,26 @@ async def test_frontier_failure_records_negative_delta(
 @patch("ghost_agent.sandbox.docker.DockerSandbox")
 @patch("ghost_agent.core.agent.GhostAgent")
 async def test_repeat_failure_on_known_cluster_suppresses_skill_write(
-    mock_agent_cls, mock_sandbox_cls, tmp_path
+    mock_agent_cls, mock_sandbox_cls, tmp_path, monkeypatch
 ):
     """After a cluster already has a prior failure, a second failure must
     NOT call learn_lesson — the skill gate suppresses duplicates."""
+    # Force the LLM-generated challenge path so the cluster the test
+    # primes (sql) is the cluster actually classified for the new run.
+    # Pre-2026-05 the template fast path was non-deterministic across
+    # test orderings — _LAST_TEMPLATE_KEY pollution from prior tests
+    # could route this to bash, turning the test's primed-sql scenario
+    # into a "first failure on new cluster" case that legitimately
+    # opens the new write gate. Disabling both template entry points
+    # makes the cluster classification deterministic.
+    monkeypatch.setattr(
+        "ghost_agent.core.challenge_templates.try_template",
+        lambda *a, **kw: None,
+    )
+    monkeypatch.setattr(
+        "ghost_agent.core.challenge_templates.pick_random_template",
+        lambda *a, **kw: None,
+    )
     ft = FrontierTracker(tmp_path)
     # Prime the tracker: cluster already known with one failure
     ft.record_run("sql", "prior", 3, False, 0, mistake="prior fail")

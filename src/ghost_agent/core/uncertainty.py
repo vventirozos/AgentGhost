@@ -9,10 +9,13 @@ This lets the agent decide when to ask the user vs. when to proceed,
 and attach a risk summary to final responses for transparency.
 """
 
+import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
@@ -55,12 +58,43 @@ class Assumption:
         }
 
 
-class UncertaintyTracker:
-    """Tracks unknowns and assumptions during an agent reasoning session."""
+# Conservative first-person hedge markers. Used to auto-populate the
+# tracker from the agent's own output, so uncertainty is load-bearing
+# even when the LLM never calls the flag_uncertainty tool explicitly.
+_HEDGE_RE = re.compile(
+    r"\b(i(?:'m| am) (?:assuming|not sure|not certain|unsure)|i assume\b|"
+    r"assuming that|i (?:can(?:no|')?t|could not|couldn't) verify|"
+    r"i don'?t have access to|it'?s unclear|i'?m guessing|"
+    r"without (?:more|further) (?:info|information|context))",
+    re.IGNORECASE,
+)
 
-    def __init__(self):
+
+class UncertaintyTracker:
+    """Tracks unknowns and assumptions during an agent reasoning session.
+
+    The per-turn in-memory lists are cleared by ``reset()`` between
+    turns. When a ``persist_path`` is supplied, every flag is also
+    appended to a durable JSONL log — that is what makes recurring
+    blind-spots (the same unknown flagged turn after turn) visible
+    across sessions via ``recurring_unknowns()``."""
+
+    def __init__(self, persist_path: Optional[Path] = None):
         self.unknowns: List[Unknown] = []
         self.assumptions: List[Assumption] = []
+        self.persist_path: Optional[Path] = Path(persist_path) if persist_path else None
+
+    def _append_persist(self, record: dict) -> None:
+        """Append one flag record to the durable log. Never raises —
+        persistence is secondary to the reasoning turn."""
+        if self.persist_path is None:
+            return
+        try:
+            self.persist_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.persist_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            logger.debug("uncertainty persist failed: %s", e)
 
     def flag_unknown(self, what: str, impact: int = 3,
                      resolution: str = "ask user") -> Unknown:
@@ -69,6 +103,10 @@ class UncertaintyTracker:
         unknown = Unknown(what=what, impact=impact, resolution=resolution)
         self.unknowns.append(unknown)
         logger.debug("Uncertainty: flagged unknown (impact=%d): %s", impact, what[:100])
+        self._append_persist({
+            "ts": time.time(), "kind": "unknown", "text": what,
+            "impact": impact, "resolution": resolution,
+        })
         return unknown
 
     def resolve_unknown(self, index_or_unknown, value: str) -> bool:
@@ -115,6 +153,10 @@ class UncertaintyTracker:
         assumption = Assumption(claim=claim, confidence=confidence, basis=basis)
         self.assumptions.append(assumption)
         logger.debug("Uncertainty: flagged assumption (conf=%.2f): %s", confidence, claim[:100])
+        self._append_persist({
+            "ts": time.time(), "kind": "assumption", "text": claim,
+            "confidence": confidence, "basis": basis,
+        })
         return assumption
 
     def verify_assumption(self, index_or_assumption, was_correct: bool) -> bool:
@@ -195,8 +237,77 @@ class UncertaintyTracker:
 
         return "\n".join(lines)
 
+    def recurring_unknowns(
+        self, *, min_count: int = 2, lookback: int = 400,
+    ) -> List[Tuple[str, int]]:
+        """Unknowns flagged repeatedly across turns — the durable
+        blind-spots. Returns ``[(text, count), ...]`` sorted count-desc.
+
+        Reads the persisted log; empty when persistence is off."""
+        if self.persist_path is None or not self.persist_path.exists():
+            return []
+        counts: Dict[str, int] = {}
+        display: Dict[str, str] = {}
+        try:
+            lines = self.persist_path.read_text(
+                encoding="utf-8").splitlines()[-lookback:]
+        except OSError:
+            return []
+        for ln in lines:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                rec = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("kind") != "unknown":
+                continue
+            text = str(rec.get("text") or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            counts[key] = counts.get(key, 0) + 1
+            display[key] = text
+        out = [(display[k], c) for k, c in counts.items() if c >= min_count]
+        out.sort(key=lambda kv: kv[1], reverse=True)
+        return out
+
+    def persisted_context(self, *, limit: int = 3) -> str:
+        """Prompt block surfacing recurring blind-spots from prior turns,
+        so the agent reasons with its own durable uncertainty in view."""
+        recurring = self.recurring_unknowns()
+        if not recurring:
+            return ""
+        parts = [
+            "### RECURRING UNCERTAINTIES (unresolved across multiple past turns):"
+        ]
+        for text, count in recurring[:limit]:
+            parts.append(
+                f"  - {text} (flagged {count}× — resolve this if it is in scope)"
+            )
+        return "\n".join(parts)
+
+    @staticmethod
+    def scan_text_for_uncertainty(text: str, *, limit: int = 3) -> List[str]:
+        """Best-effort extraction of explicit first-person hedge sentences
+        from agent output. Lets the turn loop auto-populate the tracker
+        without depending on the LLM remembering to flag uncertainty."""
+        if not text:
+            return []
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        hits: List[str] = []
+        for s in sentences:
+            s = s.strip()
+            if s and _HEDGE_RE.search(s):
+                hits.append(s[:200])
+            if len(hits) >= limit:
+                break
+        return hits
+
     def reset(self):
-        """Clear all tracked state for a new reasoning session."""
+        """Clear in-memory turn state for a new reasoning session.
+        The durable persisted log (if any) is untouched."""
         self.unknowns.clear()
         self.assumptions.clear()
 

@@ -100,6 +100,16 @@
   <h2>Concurrency</h2>
   <p>Fully async; <code>asyncio.gather</code> drives parallel simulation calls. Worker pool is preferred (cheaper, different perspective) when available.</p>
 
+  <h2>Invocation in the turn loop</h2>
+  <p><code>MCTSReasoner.select_best_action</code> was constructed under <code>--deep-reason</code> but never actually called in the reasoning loop — dead wiring. It is now invoked.</p>
+  <ul>
+    <li>For requests the complexity router classifies HARD (label <code>"hard"</code> or escalated), and when <code>--deep-reason</code> is on (so <code>context.mcts_reasoner</code> exists), <code>handle_chat</code> calls <code>select_best_action</code> and injects the top-ranked candidate as a <code>"DEEP-REASON LOOKAHEAD"</code> planning hint into the system prompt.</li>
+    <li>Bounded by a 75-second wall-clock timeout so a slow search cannot pin the turn.</li>
+    <li>Non-fatal — any failure is swallowed and the turn proceeds without the hint.</li>
+  </ul>
+  <p>The router verdict is the gate, so the extra LLM round-trips land only where reasoning depth pays off.</p>
+  <div class="note"><strong>Tests:</strong> covered by <code>tests/test_mcts_lookahead.py</code>.</div>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

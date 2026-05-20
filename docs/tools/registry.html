@@ -115,6 +115,14 @@
     <p class="caption">Figure 7 — Tool-call dispatch path through the registry.</p>
   </div>
 
+  <h2>Continuity &amp; metacognition tools</h2>
+  <p>Two new agent-callable tools.</p>
+  <ul>
+    <li><code>self_state</code> — the agent authors its own cross-session continuity state: open questions, unfinished threads, and mood (actions: <code>note_question</code>, <code>resolve_question</code>, <code>add_unfinished</code>, <code>close_unfinished</code>, <code>set_mood</code>, <code>list</code>). Writes route through the selfhood <code>SelfStateThread</code> and surface in the next session's wake-up prefix.</li>
+    <li><code>flag_uncertainty</code> — the agent registers what it does not know (unknowns, with an impact score) or is unverified about (assumptions, with a confidence score) with the metacognitive <a href="../core/uncertainty.html">UncertaintyTracker</a>; a critical unknown triggers a clarification gate before the answer is finalized.</li>
+  </ul>
+  <p>Both tools are registered in <code>TOOL_DEFINITIONS</code> and <code>get_available_tools</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

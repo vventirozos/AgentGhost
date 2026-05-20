@@ -177,9 +177,21 @@
   <h2>Important guards (reference)</h2>
   <ul>
     <li><a href="../core/dream.html">validate_challenge_quality</a> — rejects challenges whose validator depends on randomness, references no setup files, or has SQL schema / column-count mismatches. Returns rejection kind so the regeneration loop can give targeted feedback.</li>
-    <li><a href="../core/self_play_scoring.html">correctness_weighted_score</a> + three-tier <code>count_tool_errors</code> — wrong-but-compressed answers get zero credit; fixture reads aren't mistaken for errors.</li>
-    <li><a href="../memory/frontier.html">FrontierTracker</a> keeps a <code>recent_hashes</code> dedup list per cluster (window 20). Duplicates don't bump mastery counters (<code>runs</code>, <code>total_first_try_wins</code>, <code>best_length</code>) but DO append to <code>recent_outcomes</code> so saturation detection and the decay guard can see pattern changes on deterministic-template re-rolls — an earlier implementation discarded the append and fossilised clusters in the brittle pool forever.</li>
-    <li><a href="../core/challenge_templates.html">pick_random_template</a> maintains a module-level <code>_LAST_TEMPLATE_KEY</code> anchor so the sampler doesn't pick the same template twice in a row.</li>
+    <li><a href="../core/self_play_scoring.html">correctness_weighted_score</a> + three-tier <code>count_tool_errors</code> — multi-signal score combining compression, AST novelty, and attempts efficiency; wrong-but-compressed answers get zero credit; fixture reads aren't mistaken for errors.</li>
+    <li><a href="../core/solution_novelty.html">solution_novelty</a> — AST-canonical Jaccard distance between the new <code>solution.py</code> and the cluster's recent winning shapes. Drives the novelty term of the score AND the new write-gate path (first-try pass with novelty ≥ 0.5 → write lesson).</li>
+    <li><a href="../core/adversarial_generator.html">AdversarialGeneratorTracker</a> — tracks solver pass rate per generator-prompt fingerprint; <code>suggest_bias()</code> injects guidance into the next challenge-gen prompt so the generator gets a quiet incentive to produce challenges in families the solver fails on.</li>
+    <li><a href="../memory/frontier.html">FrontierTracker</a> keeps a <code>recent_hashes</code> dedup list per cluster (window 20) AND a <code>winning_solutions</code> ring (cap 5) for novelty scoring. The new <code>list_saturated_templates()</code> surfaces per-template saturation independently of cluster-level saturation (proposal H, 2026-05-17).</li>
+    <li><a href="../core/challenge_templates.html">pick_random_template</a> maintains a module-level <code>_LAST_TEMPLATE_KEY</code> anchor so the sampler doesn't pick the same template twice in a row. Templates at intermediate+ tiers compose K orthogonal twists (proposal B) drawn deterministically from the seed.</li>
+    <li><a href="../core/journal_challenges.html">journal_challenges</a> now materialises shape-specific fixtures (<code>input.csv</code> / <code>input.json</code> / <code>input.log</code> / <code>input.db</code> / <code>input.txt</code>) with matching validator rubrics, instead of the pre-2026-05 generic <code>input.txt</code> + token-match for every entry.</li>
+    <li><a href="../core/dream.html">PRM in-loop retrain</a> — <code>tools/memory._run_self_play_loop</code> calls <code>_maybe_retrain_prm</code> every 20 cycles so the frontier-weighted picker (which gates on <code>PRMScorer.has_model</code>) actually engages without waiting for the 15-60 min idle window.</li>
+  </ul>
+
+  <h2>Closed inter-phase loops (2026-05)</h2>
+  <p>Three idle phases now feed each other and the live loop instead of writing to dead ends:</p>
+  <ul>
+    <li><strong>Phase 2.6 (skills auto)</strong> verifies and GRADUATES skill candidates into a persistent store (was: logged then discarded).</li>
+    <li><strong>Phase 2.5 (reflection)</strong> records the cluster of each reflected failure into the <a href="../memory/frontier.html">FrontierTracker</a> via <code>note_reflection_failure</code>, so phase 3 self-play can drill the agent's real-world weaknesses.</li>
+    <li><strong>Phase 2.8 (selfhood narrative)</strong> is now meta-cognitive — it folds recent <a href="../memory/skills.html">SkillMemory</a> failure patterns into the regenerated diary.</li>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>

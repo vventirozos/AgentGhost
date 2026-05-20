@@ -354,12 +354,42 @@ async def lifespan(app):
         pretty_log("Verifier Failed", str(e), level="WARNING", icon=Icons.WARN)
 
     # Per-process uncertainty tracker. The agent calls reset() at the
-    # start of each turn — a single shared instance is fine.
+    # start of each turn — a single shared instance is fine. A durable
+    # JSONL log (alongside the trajectory log) makes recurring blind-
+    # spots visible across sessions; disabled with --no-memory.
     try:
-        context.uncertainty_tracker = UncertaintyTracker()
-        pretty_log("Uncertainty Tracker", "Unknown/assumption tracker initialized", icon=Icons.UNCERTAINTY_DIE)
+        _uncertainty_log = None
+        if not getattr(args, "no_memory", False):
+            _md = getattr(context, "memory_dir", None)
+            if _md is not None:
+                _uncertainty_log = Path(_md).parent / "uncertainty_log.jsonl"
+        context.uncertainty_tracker = UncertaintyTracker(persist_path=_uncertainty_log)
+        _u_note = "Unknown/assumption tracker initialized"
+        if _uncertainty_log is not None:
+            _u_note += " (persistent — recurring blind-spots tracked)"
+        pretty_log("Uncertainty Tracker", _u_note, icon=Icons.UNCERTAINTY_DIE)
     except Exception as e:
         pretty_log("Uncertainty Tracker Failed", str(e), level="WARNING", icon=Icons.WARN)
+
+    # Graduated-skill store (proposal item #9). Auto-acquired tool
+    # sequences that clear verification in biological phase 2.6 are
+    # persisted here and surfaced back into the turn prompt as "proven
+    # approaches". Disabled with --no-memory.
+    context.auto_skill_store = None
+    try:
+        if not getattr(args, "no_memory", False):
+            _md_skills = getattr(context, "memory_dir", None)
+            if _md_skills is not None:
+                from .skills_auto import GraduatedSkillStore
+                context.auto_skill_store = GraduatedSkillStore(_md_skills)
+                pretty_log(
+                    "Skills Auto",
+                    f"graduated-skill store ready "
+                    f"({context.auto_skill_store.count()} proven skills on file)",
+                    icon=Icons.BRAIN_PLAN,
+                )
+    except Exception as e:
+        pretty_log("Skills Auto Failed", str(e), level="WARNING", icon=Icons.WARN)
 
     # Deep-reasoning modules. Off by default to keep the worker-pool
     # cost bounded; gated behind ``--deep-reason``. When enabled, callers
@@ -522,6 +552,15 @@ async def lifespan(app):
                 per_call_timeout_s=120.0,
                 max_failures=3,
                 model=args.model,
+                # Proposal F (2026-05-17): also pick up self-play
+                # trajectories that PASSED but with structural novelty
+                # below 0.15 — those are cycles where the agent
+                # re-emitted a known winning shape, producing no new
+                # learning signal under the new score. The reflector
+                # is what asks "why was this boring?" and either
+                # writes a meta-lesson or expands the curriculum.
+                accept_low_novelty_passes=True,
+                novelty_threshold=0.15,
             )
 
             # The Reflector is handed a COMPOSITE sink — it persists every

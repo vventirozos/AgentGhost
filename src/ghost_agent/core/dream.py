@@ -577,6 +577,202 @@ def _summarize_long_transcript(
     return head + middle_block + tail
 
 
+_KNOWN_DOMAINS = (
+    "data_analysis", "regex_parse", "sql", "concurrency",
+    "algo", "bash", "python_general", "web_automation",
+)
+
+
+_EXTRACTOR_SHARED_GUIDELINES = (
+    "Guidelines that improve lesson quality (preference, not gates):\n"
+    "  • prefer a `trigger` that describes the CLASS of task "
+    "(\"parsing CSV with quoted fields containing commas\") rather "
+    "than restating this specific synthetic challenge.\n"
+    "  • prefer a `correct_pattern` that would run on a sibling "
+    "challenge in the same family — avoid literal fixture filenames, "
+    "fixture column names, or fixture-only constants when a generic "
+    "alternative exists.\n"
+    f"  • `domains` should be drawn from {list(_KNOWN_DOMAINS)} when "
+    "applicable; an empty list is acceptable when none clearly fits.\n"
+    "  • include a fenced ```python ... ``` snippet in "
+    "`correct_pattern` when code clarifies the technique.\n"
+)
+
+
+def _build_extractor_prompt(
+    *,
+    outcome: str,
+    cluster_key: str,
+    status_str: str,
+    challenge: str,
+    validation_script: str,
+    transcript: str,
+    attempt: int,
+    solution_novelty,
+) -> str:
+    """Build the outcome-specific lesson-extractor prompt.
+
+    Separated from the LLM call so the wording is unit-testable
+    without needing a stub LLM client. Caller passes everything by
+    keyword — no positional args.
+    """
+    header = (
+        "### SELF-PLAY POST-MORTEM\n"
+        f"Outcome: {outcome}. Cluster: {cluster_key}. Status: {status_str}.\n"
+    )
+    if solution_novelty is not None:
+        header += f"Solution novelty vs. prior wins: {solution_novelty:.2f}\n"
+    header += "\n"
+
+    body_blocks = (
+        "CHALLENGE:\n"
+        f"{challenge}\n\n"
+        "VALIDATOR (Hidden Test):\n"
+        f"{validation_script}\n\n"
+        "TRANSCRIPT:\n"
+        f"{transcript}\n\n"
+    )
+
+    if outcome == "STRUGGLED_THEN_WON":
+        intent = (
+            "The agent FAILED earlier attempts and only solved this on "
+            f"attempt {attempt + 1}. Your job is to extract the SPECIFIC "
+            "DEBUGGING INSIGHT the agent gained between the failing and "
+            "winning attempts. Be concrete: which assumption was wrong, "
+            "and what fix corrected it?\n\n"
+            "This is exactly the kind of lesson that pays off on future "
+            "cycles — produce a non-empty answer unless the transcript "
+            "shows zero learnable signal (e.g. the win was pure luck).\n\n"
+        )
+    elif outcome == "FAILED":
+        intent = (
+            "The agent FAILED to solve this challenge in all attempts. "
+            "Your job is to identify the SPECIFIC ERROR PATTERN that "
+            "killed the run, and the warning sign a future attempt "
+            "should heed to avoid it. Be concrete about the failure "
+            "shape (e.g. \"missed the empty-input edge case\", \"used "
+            "round() instead of f-string format()\").\n\n"
+        )
+    elif outcome == "NOVEL_SHAPE":
+        intent = (
+            "The agent solved this on the first attempt, but produced "
+            "a solution whose AST shape is genuinely different from "
+            "the cluster's prior winning solutions (novelty ≥ 0.5). "
+            "Your job is to capture the ALTERNATIVE APPROACH worth "
+            "noting — what technique did the agent use here that "
+            "future cycles could re-apply on a sibling challenge?\n\n"
+            "A NOVEL_SHAPE lesson is observational, not corrective; "
+            "the `anti_pattern` field can be empty.\n\n"
+        )
+    else:  # FIRST_TRY_SUCCESS — kept as the strict-extraction path
+        intent = (
+            "The agent solved this on the first attempt with a "
+            "solution shape similar to prior wins. Only extract a "
+            "lesson if you can identify a transferable insight that "
+            "isn't already implied by the existing playbook. If not, "
+            "return empty fields — first-try wins on familiar shapes "
+            "are usually not lessons.\n\n"
+        )
+
+    schema = (
+        "Return ONLY a JSON object with this shape:\n"
+        "{\n"
+        '  "trigger": "short phrase — the CLASS of task this applies to",\n'
+        '  "anti_pattern": "the specific wrong approach observed (may be empty)",\n'
+        '  "correct_pattern": "the right approach — fenced ```python``` snippet when applicable",\n'
+        '  "domains": ["data_analysis" | "regex_parse" | "sql" | "concurrency" | "algo" | "bash" | "python_general" | "web_automation"],\n'
+        '  "confidence": 0.0..1.0,\n'
+        '  "task": "<mirror of trigger for back-compat>",\n'
+        '  "mistake": "<mirror of anti_pattern for back-compat>",\n'
+        '  "solution": "<mirror of correct_pattern for back-compat>"\n'
+        "}\n"
+    )
+    return header + body_blocks + intent + _EXTRACTOR_SHARED_GUIDELINES + "\n" + schema
+
+
+def _patch_with_fallback(
+    parsed: dict,
+    *,
+    outcome: str,
+    cluster_key: str,
+    challenge: str,
+    attempt: int,
+    solution_novelty,
+) -> dict:
+    """When the LLM returns a partial / empty response on a cycle that
+    DID carry a signal (struggled, novel-shape, or failure), patch in
+    a templated baseline so we never throw away a learnable cycle.
+
+    Conservative confidence (0.30) ensures real LLM-derived lessons
+    rank above the fallback in playbook retrieval. The fallback is
+    keyed by cluster so subsequent cycles on the same cluster don't
+    each generate a fresh near-duplicate — the skill_memory dedup
+    layer will merge them.
+    """
+    if not isinstance(parsed, dict):
+        parsed = {}
+    trig = (parsed.get("trigger") or parsed.get("task") or "").strip()
+    fix = (parsed.get("correct_pattern") or parsed.get("solution") or "").strip()
+    if trig and fix:
+        return parsed  # already viable; no patching needed
+
+    challenge_head = (challenge or "")[:200].strip().replace("\n", " ")
+    cluster = cluster_key or "general"
+
+    if outcome == "STRUGGLED_THEN_WON":
+        fallback_trig = f"hard cases in the {cluster} cluster requiring retry-on-failure"
+        fallback_pat = (
+            f"On a {cluster} task, when the first attempt fails the "
+            "validator, re-read the validator feedback (expected vs. "
+            "actual diff) and identify the specific mismatch — most "
+            "common shapes are float formatting (`round()` vs. "
+            "f-string), tie-break ordering, off-by-one bounds, and "
+            "edge cases on empty / missing rows."
+        )
+        fallback_anti = (
+            "Re-emitting the same logic with cosmetic tweaks instead "
+            "of reading the expected-vs-actual diff."
+        )
+    elif outcome == "FAILED":
+        fallback_trig = f"{cluster} challenges that exhaust all attempts"
+        fallback_pat = (
+            f"When repeatedly failing a {cluster} task, stop and "
+            "re-read the challenge prompt end-to-end before generating "
+            "another attempt — the bug is usually a constraint the "
+            "agent skimmed past (sort order, output format, edge "
+            "case) rather than the algorithm being wrong."
+        )
+        fallback_anti = (
+            "Mutating the algorithm before verifying the I/O contract."
+        )
+    elif outcome == "NOVEL_SHAPE":
+        nov = f"novelty={solution_novelty:.2f}" if solution_novelty is not None else ""
+        fallback_trig = f"alternative idiom for {cluster} tasks ({nov})"
+        fallback_pat = (
+            f"On a {cluster} task that has a familiar shape, a "
+            "structurally different solution can be valid — the "
+            "agent's prior winners aren't the only way. Worth "
+            "re-examining whether comprehensions, generators, or "
+            "stdlib primitives shorten the next attempt."
+        )
+        fallback_anti = ""
+    else:
+        return parsed  # FIRST_TRY_SUCCESS — don't fabricate.
+
+    out = dict(parsed)
+    if not trig:
+        out["trigger"] = fallback_trig
+    if not fix:
+        out["correct_pattern"] = fallback_pat
+    if not out.get("anti_pattern"):
+        out["anti_pattern"] = fallback_anti
+    out.setdefault("domains", [cluster_key] if cluster_key in _KNOWN_DOMAINS else [])
+    out.setdefault("confidence", 0.30)
+    # Tag the fallback so we can audit later.
+    out["fallback_synthesized"] = True
+    return out
+
+
 class Dreamer:
     """
     Active Memory Consolidation System.
@@ -1053,77 +1249,78 @@ Return ONLY a JSON object with:
         attempt: int,
         passed: bool,
         cluster_key: str,
+        solution_novelty: Optional[float] = None,
     ) -> dict:
-        """Run the meta-cognitive LLM call to produce a structured
-        lesson. Returns the parsed JSON or `{}` on any failure.
+        """Outcome-routed lesson extractor.
 
-        The prompt asks for the new schema explicitly — `trigger`,
-        `anti_pattern`, `correct_pattern` (with code snippet encouraged),
-        `domains`, `confidence`. The older `task`/`mistake`/`solution`
-        keys are still produced for dedup back-compat.
+        Pre-2026-05-17 a SINGLE prompt was used for every cycle outcome
+        and it was framed with HARD RULES that forced ``confidence=0``
+        whenever any of four constraints were violated. In production
+        this caused the LLM to return ``{"trigger":"","correct_pattern":""}``
+        on most cycles — even on legitimate struggled-then-won runs
+        where a real lesson was sitting in the transcript. Result:
+        ~0 lessons saved per 100 cycles.
+
+        The new design picks one of three context-specific prompts:
+
+        * ``STRUGGLED_THEN_WON`` — emphasises the concrete debugging
+          insight (what tripped up attempt N, what fixed it on N+1).
+          Lower bar; we have direct evidence the agent learned something.
+        * ``NOVEL_SHAPE`` (first-try win with novelty ≥ 0.5) — asks for
+          the *alternative approach* the agent used here that's worth
+          recording, even when there's no mistake to learn from.
+        * ``FAILED`` — asks for the specific error pattern that killed
+          the run and the warning sign a future attempt should heed.
+
+        The prompts are softened: "these guidelines improve lesson
+        quality" replaces "violating any of these MUST make you return
+        confidence=0". The overfit guard still runs in
+        ``synthetic_self_play`` so quality isn't sacrificed; the prompt
+        no longer pre-emptively suppresses lessons.
+
+        If the LLM returns a partial response (trigger set but no
+        pattern, or vice versa), we synthesise a templated baseline
+        from the cycle metadata so a genuine-signal cycle never
+        produces nothing. The fallback is conservative — low
+        confidence (0.3) — so the playbook ranks real LLM lessons
+        higher.
         """
         if len(transcript) > 15000:
             transcript = _summarize_long_transcript(transcript)
 
-        outcome = (
-            "FIRST_TRY_SUCCESS" if (attempt == 0 and passed)
-            else "STRUGGLED_THEN_WON" if passed
-            else "FAILED"
+        # Outcome routing — order matters, NOVEL_SHAPE supersedes
+        # FIRST_TRY_SUCCESS when novelty is high enough that the
+        # write gate already opted in.
+        if not passed:
+            outcome = "FAILED"
+        elif attempt > 0:
+            outcome = "STRUGGLED_THEN_WON"
+        elif solution_novelty is not None and solution_novelty >= 0.5:
+            outcome = "NOVEL_SHAPE"
+        else:
+            outcome = "FIRST_TRY_SUCCESS"
+
+        prompt = _build_extractor_prompt(
+            outcome=outcome,
+            cluster_key=cluster_key,
+            status_str=status_str,
+            challenge=challenge,
+            validation_script=validation_script,
+            transcript=transcript,
+            attempt=attempt,
+            solution_novelty=solution_novelty,
         )
-        prompt = (
-            "### SELF-PLAY POST-MORTEM\n"
-            f"Outcome: {outcome}. Cluster: {cluster_key}. Status: {status_str}.\n\n"
-            "CHALLENGE:\n"
-            f"{challenge}\n\n"
-            "VALIDATOR (Hidden Test):\n"
-            f"{validation_script}\n\n"
-            "TRANSCRIPT:\n"
-            f"{transcript}\n\n"
-            "Your job is to distill a SINGLE **reusable, transferable** lesson "
-            "that will help a future run of the agent on a DIFFERENT task in "
-            "the same family. A lesson that only works for THIS challenge is "
-            "useless.\n\n"
-            "HARD RULES for generalization — violating any of these MUST make "
-            "you return confidence=0:\n"
-            "  1. `trigger` must describe the CLASS of task (e.g. "
-            "\"parsing a CSV with quoted fields that contain commas\"), NOT a "
-            "restatement of this specific synthetic challenge. Do NOT mention "
-            "the mock filenames, column names, or literal values from THIS "
-            "challenge in the trigger.\n"
-            "  2. `correct_pattern` must be a general-purpose technique. Do "
-            "NOT copy-paste literal constants, filenames, SQL table names, "
-            "or variable names from the setup or validator into the pattern. "
-            "If the snippet wouldn't run on a sibling challenge in the same "
-            "family, it's overfit — set confidence=0.\n"
-            "  3. `domains` must be non-empty and drawn from "
-            "[\"data_analysis\", \"regex_parse\", \"sql\", \"concurrency\", "
-            "\"algo\", \"bash\", \"python_general\"]. If you can't classify "
-            "the lesson into at least one of these, it isn't concrete enough "
-            "— return confidence=0.\n"
-            "  4. Prefer a runnable Python snippet as the `correct_pattern` "
-            "whenever one exists; a vague one-liner is worse than no lesson.\n\n"
-            "Return ONLY a JSON object with this shape:\n"
-            "{\n"
-            '  "trigger": "short phrase describing the TASK CLASS this applies to",\n'
-            '  "anti_pattern": "the specific wrong approach observed (if any)",\n'
-            '  "correct_pattern": "the general-purpose right approach — include a ```python ...``` block if code is applicable",\n'
-            '  "domains": ["data_analysis" | "regex_parse" | "sql" | "concurrency" | "algo" | "bash" | "python_general"],\n'
-            '  "confidence": 0.0..1.0,\n'
-            '  "task": "<mirror of trigger for back-compat>",\n'
-            '  "mistake": "<mirror of anti_pattern for back-compat>",\n'
-            '  "solution": "<mirror of correct_pattern for back-compat>"\n'
-            "}\n"
-            "If no real generalizable lesson can be extracted, return "
-            '{"trigger":"","anti_pattern":"","correct_pattern":"","domains":[],"confidence":0.0,'
-            '"task":"","mistake":"","solution":""}.'
-        )
+
         payload = {
             "model": model_name,
             "messages": [
-                {"role": "system", "content": "You are a Meta-Cognitive Analyst. Output JSON."},
+                {"role": "system", "content": (
+                    "You are a Meta-Cognitive Analyst extracting a single concrete "
+                    "lesson from one self-play cycle. Output JSON only."
+                )},
                 {"role": "user", "content": prompt},
             ],
-            "temperature": 0.1,
+            "temperature": 0.2,
             "max_tokens": 1024,
             "response_format": {"type": "json_object"},
         }
@@ -1134,16 +1331,34 @@ Return ONLY a JSON object with:
             raw = data["choices"][0]["message"].get("content", "")
             parsed = extract_json_from_text(raw) or {}
             if not isinstance(parsed, dict):
-                return {}
-            # Fill back-compat mirror fields so downstream callers
-            # (dedup, disk-format) keep working without schema changes.
-            parsed.setdefault("task", parsed.get("trigger", ""))
-            parsed.setdefault("mistake", parsed.get("anti_pattern", ""))
-            parsed.setdefault("solution", parsed.get("correct_pattern", ""))
-            return parsed
+                parsed = {}
         except Exception as e:
             logger.error(f"Self-play lesson extraction failed: {e}")
-            return {}
+            parsed = {}
+
+        # Templated fallback: if the LLM produced a partial / empty
+        # response for an outcome where we DO have signal (struggled or
+        # novel-shape or failed-on-new-cluster), synthesise a baseline
+        # lesson from the cycle metadata. Low confidence so genuine
+        # LLM lessons still rank higher in retrieval. We DO NOT
+        # fallback for FIRST_TRY_SUCCESS — those cycles really have
+        # nothing to say.
+        if outcome != "FIRST_TRY_SUCCESS":
+            parsed = _patch_with_fallback(
+                parsed,
+                outcome=outcome,
+                cluster_key=cluster_key,
+                challenge=challenge,
+                attempt=attempt,
+                solution_novelty=solution_novelty,
+            )
+
+        # Fill back-compat mirror fields so downstream callers
+        # (dedup, disk-format) keep working without schema changes.
+        parsed.setdefault("task", parsed.get("trigger", ""))
+        parsed.setdefault("mistake", parsed.get("anti_pattern", ""))
+        parsed.setdefault("solution", parsed.get("correct_pattern", ""))
+        return parsed
 
     async def _verify_lesson_helpful(
         self,
@@ -1359,6 +1574,20 @@ Return ONLY a JSON object with:
         # JSON groupby flavours the agent aces first-try). Bias the
         # prompt toward under-represented families so the LLM actually
         # produces novel shapes the agent might struggle with.
+        # Proposal G: bias the generator toward families the solver has
+        # been failing on. Cheap call — falls back silently when the
+        # tracker hasn't accumulated enough signal yet.
+        try:
+            from .adversarial_generator import AdversarialGeneratorTracker as _ATCls
+            _mem_dir = getattr(self.context, "memory_dir", None)
+            if _mem_dir is not None:
+                _adv = _ATCls(Path(_mem_dir))
+                _adv_bias = _adv.suggest_bias()
+                if _adv_bias:
+                    system_message += _adv_bias
+        except Exception:
+            pass
+
         _saturated_for_prompt = list(seed.get("saturated_clusters") or [])
         if _saturated_for_prompt:
             system_message += (
@@ -2832,6 +3061,41 @@ Return ONLY a JSON object with:
                     _count_tool_invocations(body.get("messages", []))
                     if passed else 0
                 )
+
+                # Read the winning `solution.py` so we can compute
+                # structural novelty against the cluster's prior winners
+                # (proposal A, 2026-05-17). Empty string on failure or
+                # when the file isn't there — the novelty scorer treats
+                # missing source as 0 contribution.
+                solution_source = ""
+                if passed:
+                    try:
+                        sol_path = Path(temp_sandbox) / "solution.py"
+                        if sol_path.exists():
+                            solution_source = sol_path.read_text(errors="replace")
+                    except Exception:
+                        solution_source = ""
+
+                solution_novelty: Optional[float] = None
+                if frontier_tracker is not None and solution_source:
+                    try:
+                        from .solution_novelty import jaccard_novelty
+                        prior = frontier_tracker.recent_winning_solutions(cluster_key)
+                        solution_novelty = jaccard_novelty(solution_source, prior)
+                    except Exception as _ne:
+                        logger.debug(f"Novelty computation failed: {_ne}")
+                        solution_novelty = None
+
+                # Resolve the template key for per-template saturation
+                # tracking (proposal H). When the dreamer routed via a
+                # deterministic template the key is the cluster name
+                # of the template chosen; LLM-generated challenges
+                # report an empty template_key and skip per-template
+                # tracking.
+                template_key = ""
+                if seed.get("cluster_key") and not seed.get("frontier_fallback"):
+                    template_key = seed.get("cluster_key") or ""
+
                 frontier_result = {"compression_delta": 0.0, "is_new_cluster": True, "mastered": False}
                 if frontier_tracker is not None:
                     try:
@@ -2843,6 +3107,9 @@ Return ONLY a JSON object with:
                             passed,
                             description_length,
                             "" if passed else (full_simulation_transcript[-400:] if full_simulation_transcript else ""),
+                            solution_source,
+                            template_key,
+                            solution_novelty,
                         )
                         if isinstance(recorded, dict):
                             frontier_result = recorded
@@ -2892,13 +3159,36 @@ Return ONLY a JSON object with:
                 elif passed and attempt == 0 and (is_new_cluster or compression_delta > 0.05):
                     should_write_skill = True
                     gate_reason = "new cluster or compression improvement"
+                elif passed and attempt == 0 and solution_novelty is not None and solution_novelty >= 0.5:
+                    # Proposal C (2026-05-17): first-try pass with HIGH
+                    # structural novelty against prior winners is itself
+                    # a learning signal — the agent found a different
+                    # shape of solution to a familiar problem. Worth
+                    # extracting the principle even when compression
+                    # delta is flat.
+                    should_write_skill = True
+                    gate_reason = (
+                        f"first-try pass with novel shape "
+                        f"(novelty={solution_novelty:.2f}) → write lesson"
+                    )
                 elif not passed and is_new_cluster:
                     should_write_skill = True
                     gate_reason = "first failure on new cluster → record lesson"
                 elif not passed:
                     gate_reason = "repeat failure on known cluster → suppress to prevent skill bloat"
                 else:
-                    gate_reason = "no new signal (passed first try, no compression gain)"
+                    # Boring first-try pass with low novelty — surface
+                    # it to the reflector via the trajectory's
+                    # `extra.solution_novelty`, but DO NOT write a skill
+                    # directly from here. The reflector (proposal F)
+                    # gets to decide if a meta-lesson is warranted.
+                    if solution_novelty is not None:
+                        gate_reason = (
+                            f"first-try pass with low novelty "
+                            f"({solution_novelty:.2f}) → defer to reflector"
+                        )
+                    else:
+                        gate_reason = "no new signal (passed first try, no compression gain)"
 
                 pretty_log(
                     "Self-Play Frontier",
@@ -2918,6 +3208,8 @@ Return ONLY a JSON object with:
                     passed=bool(passed),
                     compression_delta=compression_delta,
                     tool_errors=tool_errors,
+                    novelty=solution_novelty,
+                    attempts_used=attempt + 1,
                 )
                 pretty_log(
                     "Self-Play Score",
@@ -2929,6 +3221,31 @@ Return ONLY a JSON object with:
                 # into cooldown decisions alongside the delta.
                 self.last_correctness_score = cw_score
                 self.last_tool_errors = tool_errors
+                self.last_solution_novelty = solution_novelty
+
+                # Proposal G: record adversarial-generator feedback. The
+                # fingerprint here is the seed-derived hint, which is
+                # the most variable part of the challenge-gen prompt.
+                # We only record when the dreamer actually invoked the
+                # LLM-generated path (no template fast-path), since
+                # template-only cycles aren't useful generator feedback.
+                try:
+                    from .adversarial_generator import (
+                        AdversarialGeneratorTracker,
+                        fingerprint_prompt,
+                    )
+                    mem_dir = getattr(self.context, "memory_dir", None)
+                    if mem_dir is not None and not _tpl:
+                        adv_tracker = AdversarialGeneratorTracker(Path(mem_dir))
+                        fp = fingerprint_prompt(seed.get("hint", "") or "")
+                        await asyncio.to_thread(
+                            adv_tracker.record,
+                            fp,
+                            passed=bool(passed),
+                            cluster=cluster_key,
+                        )
+                except Exception as _ae:
+                    logger.debug(f"Adversarial tracker record failed: {_ae}")
 
                 # We use the REAL context to save the lesson, jumping out of the isolated simulation
                 report_val = ""
@@ -2944,6 +3261,7 @@ Return ONLY a JSON object with:
                         attempt=attempt,
                         passed=passed,
                         cluster_key=cluster_key,
+                        solution_novelty=solution_novelty,
                     )
 
                     # Validate the lesson before writing:
@@ -2963,6 +3281,17 @@ Return ONLY a JSON object with:
                     except Exception:
                         conf_val = 0.5
                     lesson_is_viable = bool(trig) and bool(fix) and conf_val > 0.0
+                    # Surface the extractor outcome so the log makes it
+                    # clear whether the LLM returned a usable lesson at
+                    # all (pre-2026-05-17 this branch was silent and the
+                    # only signal was "lessons never appeared in the
+                    # playbook" — diagnosable only by inference).
+                    pretty_log(
+                        "Self-Play Lesson Extract",
+                        f"viable={lesson_is_viable} trigger_len={len(trig)} "
+                        f"pattern_len={len(fix)} conf={conf_val:.2f}",
+                        icon=Icons.TOOL_DEEP,
+                    )
                     if lesson_is_viable:
                         guard_ok, guard_reason = self._generalization_guard(
                             learned_lesson,
@@ -2985,7 +3314,19 @@ Return ONLY a JSON object with:
                     # the outcome; otherwise discard. This closes the
                     # "the solution sounds plausible but doesn't help"
                     # gap the old design had no signal for.
-                    if lesson_is_viable and (not passed or attempt > 0):
+                    #
+                    # Skip verification when the lesson is a templated
+                    # fallback (`fallback_synthesized=True`): the
+                    # fallback is a known-generic baseline, not an
+                    # LLM-derived hypothesis worth a costly verify run.
+                    # Verification's purpose is to prove the LLM's
+                    # claim — it adds zero signal for a templated
+                    # lesson and would double the cycle wall-clock.
+                    if (
+                        lesson_is_viable
+                        and (not passed or attempt > 0)
+                        and not learned_lesson.get("fallback_synthesized")
+                    ):
                         try:
                             # Fresh inner temp_agent so verification
                             # starts from a clean chat state.
@@ -3064,6 +3405,12 @@ Return ONLY a JSON object with:
                                 source_challenge_hash=challenge_hash,
                                 verified=verified_flag,
                                 source="self_play",
+                            )
+                            pretty_log(
+                                "Self-Play Lesson Saved",
+                                f"trigger='{trig[:60]}' verified={verified_flag} "
+                                f"conf={final_conf:.2f} domains={domains}",
+                                icon=Icons.OK,
                             )
                             report_val = (
                                 f"Challenge: {challenge[:150]}...\n"

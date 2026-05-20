@@ -989,11 +989,24 @@ async def _consolidate_between_cycles(context):
 
 async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop_event: asyncio.Event):
     """Body of the continuous self-play loop. Runs until `stop_event` is
-    set, `max_cycles` is reached, or the outer task is cancelled."""
+    set, `max_cycles` is reached, or the outer task is cancelled.
+
+    Every ``PRM_TRAIN_EVERY_N_CYCLES`` cycles the loop also kicks off a
+    PRM retrain on the collected trajectories so the frontier-weighted
+    pick path actually engages (proposal E, 2026-05-17). Pre-2026-05
+    PRM training was only triggered from the biological watchdog's
+    15-60 min idle window — but a busy self-play loop never reaches
+    that window, so PRM.has_model stayed False and the uncertainty-
+    weighted seed picker silently fell back to the brittle pool.
+    """
     from ..core.dream import Dreamer
     dreamer = Dreamer(context)
     cycles_done = 0
     lessons_before = _count_playbook(context)
+    # PRM retrain cadence inside the loop. 20 is enough fresh
+    # trajectories that the model picks up new signal but not so often
+    # that training itself dominates the cycle wall-clock.
+    PRM_TRAIN_EVERY_N_CYCLES = 20
     pretty_log(
         "Self-Play Loop",
         f"Starting continuous loop (model={model_name}, max_cycles={max_cycles or 'unbounded'}).",
@@ -1040,6 +1053,21 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
                 break
             await _consolidate_between_cycles(context)
 
+            # Proposal E: retrain the PRM every N cycles so the frontier-
+            # weighted curriculum has fresh signal. Fire-and-forget
+            # inside a thread — the trainer is pure-CPU so it won't
+            # contend with the LLM client; if it fails we just keep
+            # looping with the prior model (or no model).
+            if cycles_done and cycles_done % PRM_TRAIN_EVERY_N_CYCLES == 0:
+                try:
+                    await asyncio.to_thread(_maybe_retrain_prm, context)
+                except Exception as _pe:
+                    pretty_log(
+                        "Self-Play Loop",
+                        f"PRM retrain skipped after cycle {cycles_done}: {_pe}",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+
             # Adaptive cool-off — responsive to curiosity delta, but
             # interruptible the instant a new user message arrives.
             cooloff = _derive_loop_cooloff(context)
@@ -1082,6 +1110,55 @@ def _count_playbook(context) -> int:
         return len(sm._load_playbook())
     except Exception:
         return 0
+
+
+def _maybe_retrain_prm(context) -> None:
+    """In-loop PRM retrain (proposal E, 2026-05-17).
+
+    Runs the trainer on the trajectory collector, hot-swaps the model
+    into the live ``PRMScorer`` on success, and logs the report. Pure
+    CPU; safe to call from a worker thread.
+
+    Skips silently when the trajectory collector or PRM scorer aren't
+    wired (e.g. test harnesses that monkey-patch the context with a
+    MagicMock).
+    """
+    from ..distill.collector import TrajectoryCollector
+    from ..prm.scorer import PRMScorer
+    from ..prm.trainer import PRMTrainer
+    from pathlib import Path
+
+    traj_collector = getattr(context, "trajectory_collector", None)
+    prm_scorer = getattr(context, "prm_scorer", None)
+    if not isinstance(traj_collector, TrajectoryCollector):
+        return
+    if not isinstance(prm_scorer, PRMScorer):
+        return
+
+    save_path = getattr(context, "_prm_checkpoint_path", None)
+    if save_path is None:
+        mem_dir = getattr(context, "memory_dir", None)
+        if mem_dir is not None:
+            save_path = Path(mem_dir).parent / "prm" / "checkpoint.json"
+
+    trainer = PRMTrainer()
+    report = trainer.run(
+        trajectories=traj_collector.iter_trajectories(),
+        save_path=save_path,
+    )
+    if report.fit_succeeded and trainer.model is not None:
+        prm_scorer.set_model(trainer.model)
+        pretty_log(
+            "Self-Play PRM Retrain",
+            f"In-loop value-model refit: {report.summary()}",
+            icon=Icons.BRAIN_PLAN,
+        )
+    else:
+        pretty_log(
+            "Self-Play PRM Retrain",
+            f"Skipped: {report.bail_reason or 'unknown'}",
+            level="DEBUG", icon=Icons.BRAIN_PLAN,
+        )
 
 
 async def tool_self_play_loop(context, max_cycles: int = 0, model: str = ""):

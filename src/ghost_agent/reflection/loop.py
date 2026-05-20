@@ -94,12 +94,23 @@ class Reflector:
         max_failures: int = 3,
         model: str = "",
         session_id_prefix: str = "reflect",
+        accept_low_novelty_passes: bool = False,
+        novelty_threshold: float = 0.15,
     ):
         self.critique_fn = critique_fn
         self.per_call_timeout_s = float(per_call_timeout_s)
         self.max_failures = int(max_failures)
         self.model = model
         self.session_id_prefix = session_id_prefix
+        # Proposal F (2026-05-17): when True, the reflector ALSO picks
+        # up self-play trajectories that PASSED but with novelty below
+        # `novelty_threshold`. These are the cycles where the agent
+        # re-emitted a structurally-identical solution to a prior win —
+        # technically a pass, but with no learning signal under the
+        # new score. Pre-2026-05 these trajectories never reached the
+        # reflector because the filter was strict on FAILED.
+        self.accept_low_novelty_passes = bool(accept_low_novelty_passes)
+        self.novelty_threshold = float(novelty_threshold)
 
     async def run(
         self,
@@ -131,7 +142,7 @@ class Reflector:
 
         candidates: List[Trajectory] = []
         for t in iterable:
-            if t.outcome != Outcome.FAILED.value:
+            if not self._is_reflectable(t):
                 continue
             report.seen_failures += 1
             if t.id in reflected_set:
@@ -199,6 +210,36 @@ class Reflector:
             except Exception as e:
                 logger.warning("reflect_one sink failed: %s", e)
         return out
+
+    def _is_reflectable(self, traj: Trajectory) -> bool:
+        """Decide whether a trajectory belongs in the reflection batch.
+
+        Always accept ``FAILED``. When ``accept_low_novelty_passes`` is
+        on, ALSO accept self-play trajectories that passed but whose
+        recorded novelty score is below the threshold — those cycles
+        produced no learning signal under the new score (proposal F).
+        Everything else is ignored.
+        """
+        if traj.outcome == Outcome.FAILED.value:
+            return True
+        if not self.accept_low_novelty_passes:
+            return False
+        # Self-play passes with very low novelty count as "boring wins"
+        # worth meta-critiquing. Read the novelty signal from the
+        # trajectory's `extra` dict where dream.py stashes it.
+        extra = getattr(traj, "extra", None) or {}
+        if not isinstance(extra, dict):
+            return False
+        if (extra.get("task_kind") or "").lower() != "self_play" and \
+                (getattr(traj, "task_kind", "") or "").lower() != "self_play":
+            return False
+        novelty = extra.get("solution_novelty")
+        if novelty is None:
+            return False
+        try:
+            return float(novelty) < self.novelty_threshold
+        except Exception:
+            return False
 
     async def _reflect_one(self, traj: Trajectory) -> ReflectionOutcome:
         out = ReflectionOutcome(source_trajectory_id=traj.id)

@@ -18,7 +18,11 @@ import logging
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, Optional
 
-from .autobiographical import AutobiographicalMemory, summarise_turn_first_person
+from .autobiographical import (
+    AutobiographicalMemory,
+    _derive_cluster,
+    summarise_turn_first_person,
+)
 from .narrative import NarrativeSummariser
 from .recognition import build_wakeup_prefix
 from .schema import Experience
@@ -69,10 +73,17 @@ class SelfModel:
     # Hot-path APIs (called by handle_chat per turn)
     # -----------------------------------------------------------------
 
-    def build_wakeup_prefix(self, *, recent_experiences_n: int = 3) -> str:
+    def build_wakeup_prefix(
+        self, *, recent_experiences_n: int = 3, query: Optional[str] = None,
+    ) -> str:
         """Compose the first-person wake-up text the prompt assembly
         path splices into the system prompt. Empty string when there's
-        nothing to remember (no prior experiences AND no state)."""
+        nothing to remember (no prior experiences AND no state).
+
+        When ``query`` (the current user request) is supplied, the prefix
+        also surfaces past experiences *relevant* to it — not just the
+        most recent ones — so the agent recalls "the time I did something
+        like this" rather than only "the last thing I did"."""
         if not self.enabled:
             return ""
         narrative_text = self.narrative.latest() if self.narrative is not None else ""
@@ -81,7 +92,20 @@ class SelfModel:
             state=self.state,
             narrative=narrative_text,
             recent_experiences_n=recent_experiences_n,
+            query=query,
         )
+
+    def recall_relevant(self, query: str, *, limit: int = 5):
+        """Relevance-ranked search over my own autobiographical past.
+        Returns a list of Experience records, best match first. Empty
+        list when selfhood is disabled or nothing matches."""
+        if not self.enabled or self.autobio is None or not query:
+            return []
+        try:
+            return self.autobio.search_my_past(query, limit=limit)
+        except Exception as e:
+            logger.debug("recall_relevant skipped: %s", e)
+            return []
 
     def capture_turn(
         self,
@@ -100,22 +124,31 @@ class SelfModel:
         if not self.enabled or self.autobio is None:
             return None
         try:
+            tool_list = [t for t in tool_names if t]
             summary = summarise_turn_first_person(
                 user_request=user_request,
-                tool_names=tool_names,
+                tool_names=tool_list,
                 outcome=outcome,
                 final_response=final_response,
                 failure_reason=failure_reason,
             )
             user_short = (user_request or "").strip().replace("\n", " ")[:80]
+            # Wire the cluster field: prefer the caller-supplied label
+            # (the trajectory's own cluster), else derive a coarse topic
+            # from the request so recall / narrative can generalise.
+            resolved_cluster = (cluster or "").strip() or None
+            if resolved_cluster is None:
+                resolved_cluster = _derive_cluster(
+                    f"{user_request} {summary}"
+                )
             exp = Experience(
                 trajectory_id=str(trajectory_id or ""),
                 summary=summary,
                 user_handle=str(user_handle or "")[:80],
                 user_first_words=user_short,
-                tools_used=[t for t in tool_names if t][:10],
+                tools_used=tool_list[:10],
                 outcome=str(outcome or "unknown"),
-                cluster=cluster,
+                cluster=resolved_cluster,
             )
             self.autobio.append(exp)
             if self.state is not None:
@@ -125,13 +158,37 @@ class SelfModel:
             logger.debug("capture_turn skipped: %s", e)
             return None
 
+    def record_outcome(
+        self, trajectory_id: str, outcome: str, *, failure_reason: str = "",
+    ) -> bool:
+        """Backfill a turn's verdict once the verifier / reflection layer
+        has decided whether it actually succeeded. The capture path runs
+        before that verdict exists, so most records start ``unknown``;
+        this closes the loop so the agent's self-memory is verdict-aware.
+
+        Never raises — backfill is secondary to the user turn."""
+        if not self.enabled or self.autobio is None or not trajectory_id:
+            return False
+        try:
+            return self.autobio.update_outcome(
+                str(trajectory_id), outcome, failure_reason=failure_reason,
+            )
+        except Exception as e:
+            logger.debug("record_outcome skipped: %s", e)
+            return False
+
     # -----------------------------------------------------------------
     # Idle-path APIs (called by biological watchdog phase 2.8)
     # -----------------------------------------------------------------
 
-    async def consolidate_narrative(self) -> str:
+    async def consolidate_narrative(self, *, meta_insights: str = "") -> str:
         """Re-generate the running first-person narrative. Called by
         the biological watchdog phase 2.8 during idle windows.
+
+        ``meta_insights`` lets the caller fold in cross-phase learning —
+        heuristics the dream phase consolidated, failure patterns the
+        reflection phase found — so the diary becomes self-knowledge,
+        not just an experience log.
 
         Returns the new narrative text (or empty string when the
         consolidation was skipped — e.g. no experiences yet)."""
@@ -140,6 +197,7 @@ class SelfModel:
         try:
             return await self.narrative.regenerate(
                 autobio=self.autobio, state=self.state,
+                meta_insights=meta_insights,
             )
         except Exception as e:
             logger.warning("narrative consolidation failed: %s", e)
@@ -164,4 +222,5 @@ class SelfModel:
             "last_mood": (self.state.mood().label if self.state and self.state.mood() else ""),
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
+            "clusters": (self.autobio.cluster_counts() if self.autobio else {}),
         }

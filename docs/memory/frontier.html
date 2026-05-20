@@ -136,6 +136,11 @@
     </tbody>
   </table>
 
+  <h2>Reflection-driven curriculum targeting</h2>
+  <p>New methods <code>note_reflection_failure(cluster_key, diagnosis)</code> and <code>get_reflection_hot_clusters(limit, within_days)</code>. Reflection biological phase 2.5 now records which cluster each reflected interactive-turn failure belongs to (stored under <code>clusters[key].reflection_failures</code>, bounded at 20 per cluster).</p>
+  <p><code>pick_seed</code> gained a <code>reflection_priority_prob</code> parameter (default 0.35): with that probability it drills a reflection-hot cluster instead of a self-play-brittle one. This closes the loop so self-play practices the topics the agent fails at in REAL user turns, not only the topics it fails at in self-play.</p>
+  <div class="note"><strong>Tests:</strong> covered by <code>tests/test_frontier_reflection_targeting.py</code>.</div>
+
   <h2>Tests</h2>
   <p>Frontier-tracker invariants are pinned by <code>tests/test_frontier_tracker.py</code>; the new frontier-weighted picker is covered by <code>tests/test_frontier_pick_frontier_seed.py</code> (fallback ladder + dict-shape contract) and the dream integration by <code>tests/test_dream_frontier_weighted.py</code> (real PRM + real <code>TrajectoryCollector</code>, mocked LLM/sandbox).</p>
 

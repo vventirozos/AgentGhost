@@ -1279,6 +1279,33 @@ class GhostAgent:
                             f"Reflection complete: {report.summary()}",
                             icon=Icons.BRAIN_THINK,
                         )
+                        # Reflection → self-play curriculum (proposal
+                        # item #7): record which clusters the reflected
+                        # failures belong to, so phase-3 self-play can
+                        # drill the topics the agent fails at in REAL
+                        # user turns — not just its self-play weaknesses.
+                        _ft = getattr(ctx, 'frontier_tracker', None)
+                        if _ft is not None:
+                            try:
+                                from ..memory.frontier import classify_cluster
+                                for _o in report.outcomes:
+                                    if not getattr(_o, 'ok', False):
+                                        continue
+                                    _rt = getattr(_o, 'reflected_trajectory', None)
+                                    if _rt is None:
+                                        continue
+                                    _cl = (getattr(_rt, 'cluster', '') or '').strip()
+                                    if not _cl:
+                                        _cl = classify_cluster(
+                                            getattr(_rt, 'user_request', '') or ''
+                                        )
+                                    _ft.note_reflection_failure(
+                                        _cl, diagnosis=getattr(_o, 'diagnosis', ''),
+                                    )
+                            except Exception as _e:
+                                logger.debug(
+                                    "reflection→frontier wiring skipped: %s", _e,
+                                )
                     except Exception as e:
                         logger.warning(f"Reflection phase failed: {e}")
                     finally:
@@ -1298,15 +1325,51 @@ class GhostAgent:
                 if traj_collector is not None:
                     self._last_skills_auto_at = datetime.datetime.now()
                     try:
-                        from ..skills_auto import extract_candidates, consolidate
+                        from ..skills_auto import (
+                            extract_candidates, consolidate, verify_candidate,
+                        )
                         trajs = list(traj_collector.iter_trajectories())
                         if trajs:
                             candidates, report = extract_candidates(trajs, min_support=2)
                             if candidates:
                                 consolidated, _ = consolidate(candidates)
+                                # Graduation (proposal item #9): verify each
+                                # consolidated candidate and persist the ones
+                                # that clear the bar into the durable
+                                # GraduatedSkillStore. Previously this phase
+                                # discarded `consolidated` — pure overhead.
+                                # The verify_fn is a robustness gate: a
+                                # sequence only graduates if it is well-
+                                # supported (>=3 validated runs) and high-
+                                # confidence — so one-off coincidences don't
+                                # become "proven approaches".
+                                _graduated = 0
+                                _store = getattr(ctx, 'auto_skill_store', None)
+                                if _store is not None:
+                                    def _verify_fn(c):
+                                        return (getattr(c, 'support', 0) >= 3
+                                                and getattr(c, 'confidence', 0.0) >= 0.5)
+                                    for _cand in consolidated:
+                                        try:
+                                            _vr = verify_candidate(_cand, _verify_fn)
+                                            if _vr.passed and _vr.action == "keep":
+                                                _store.graduate(
+                                                    _cand,
+                                                    confidence=_vr.updated_confidence,
+                                                )
+                                                _graduated += 1
+                                        except Exception as _ve:
+                                            logger.debug(
+                                                "skill graduation skipped for "
+                                                "%s: %s",
+                                                getattr(_cand, 'name', '?'), _ve,
+                                            )
                                 pretty_log(
                                     "Skills Auto",
-                                    f"extracted {report.n_candidates_emitted} → consolidated {len(consolidated)} candidates from {report.n_trajectories_seen} trajectories",
+                                    f"extracted {report.n_candidates_emitted} → "
+                                    f"consolidated {len(consolidated)} → "
+                                    f"graduated {_graduated} "
+                                    f"(from {report.n_trajectories_seen} trajectories)",
                                     icon=Icons.BRAIN_PLAN,
                                 )
                     except Exception as e:
@@ -1439,8 +1502,27 @@ class GhostAgent:
                 self_model = getattr(ctx, 'self_model', None)
                 if self_model is not None and getattr(self_model, 'enabled', False):
                     self._last_narrative_at = datetime.datetime.now()
+                    # Meta-cognitive narrative (proposal item #4): fold the
+                    # learning phases' output into the diary. Recent
+                    # mistakes from SkillMemory are the convergence point —
+                    # both dream-extracted heuristics and reflection-phase
+                    # failure patterns land there — so the regenerated
+                    # narrative reflects what the agent has LEARNED about
+                    # itself, not merely what it did.
+                    meta_insights = ""
                     try:
-                        text = await self_model.consolidate_narrative()
+                        _sm_narr = getattr(ctx, 'skill_memory', None)
+                        if _sm_narr is not None:
+                            _recent_fail = _sm_narr.get_recent_failures(limit=5)
+                            if _recent_fail and "No recent failures" not in _recent_fail \
+                                    and "Failed to load" not in _recent_fail:
+                                meta_insights = _recent_fail
+                    except Exception as e:
+                        logger.debug(f"meta-insight gather skipped: {e}")
+                    try:
+                        text = await self_model.consolidate_narrative(
+                            meta_insights=meta_insights,
+                        )
                         if text:
                             preview = text.replace("\n", " ")[:120]
                             pretty_log(
@@ -2201,11 +2283,117 @@ class GhostAgent:
                     from ..selfhood import SelfModel as _SelfModel
                     self_model = getattr(self.context, 'self_model', None)
                     if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
-                        wakeup_prefix = self_model.build_wakeup_prefix(recent_experiences_n=3)
+                        # Pass the current request as `query` so the
+                        # wake-up prefix surfaces RELEVANT past experiences
+                        # (recall keyed to what's being asked now), not
+                        # just the most recent N. Proposal item #2.
+                        wakeup_prefix = self_model.build_wakeup_prefix(
+                            recent_experiences_n=3,
+                            query=last_user_content,
+                        )
                         if isinstance(wakeup_prefix, str) and wakeup_prefix:
                             base_prompt = wakeup_prefix + "\n" + base_prompt
                 except Exception as e:
                     logger.debug(f"selfhood wake-up prefix skipped: {type(e).__name__}: {e}")
+
+                # Uncertainty context injection (proposal item #6).
+                # Surface the agent's RECURRING blind-spots — unknowns it
+                # has flagged turn after turn — into the system prompt so
+                # it reasons WITH its own durable uncertainty in view,
+                # instead of the tracker only producing an after-the-fact
+                # footer. Non-fatal: must never break a user turn.
+                try:
+                    _utracker = getattr(self.context, 'uncertainty_tracker', None)
+                    if _utracker is not None:
+                        _uctx = _utracker.persisted_context()
+                        # isinstance(str) guard: under MagicMock test
+                        # contexts `persisted_context()` returns a mock,
+                        # and `base_prompt + mock` would silently corrupt
+                        # the system prompt. Same defensive pattern the
+                        # selfhood wake-up path uses.
+                        if isinstance(_uctx, str) and _uctx:
+                            base_prompt = base_prompt + "\n\n" + _uctx
+                except Exception as e:
+                    logger.debug(f"uncertainty context injection skipped: {e}")
+
+                # Graduated-skill injection (proposal item #9). Surface
+                # auto-acquired, verification-passed tool sequences that
+                # match this request as "proven approaches", so a skill
+                # the agent mined from its own validated runs actually
+                # gets reused instead of sitting unread on disk. Non-fatal.
+                try:
+                    _askstore = getattr(self.context, 'auto_skill_store', None)
+                    if _askstore is not None and last_user_content:
+                        _skblock = _askstore.format_for_prompt(
+                            query=last_user_content, limit=3,
+                        )
+                        # isinstance(str) guard — see the uncertainty
+                        # injection above: a MagicMock context must not
+                        # corrupt base_prompt.
+                        if isinstance(_skblock, str) and _skblock:
+                            base_prompt = base_prompt + "\n\n" + _skblock
+                except Exception as e:
+                    logger.debug(f"graduated-skill injection skipped: {e}")
+
+                # Deep-reason MCTS lookahead (proposal item #8). For
+                # requests the complexity router judges HARD (or had to
+                # escalate), run the MCTS action search and inject its
+                # top-ranked next-action as a planning hint. This is the
+                # wiring that makes `select_best_action` load-bearing —
+                # previously the reasoner was constructed under
+                # --deep-reason but never actually called in the turn
+                # loop. Gated on: mcts_reasoner present (it is None
+                # unless --deep-reason) AND a hard/escalated router
+                # verdict, so the extra LLM round-trips land only where
+                # the depth pays off. Bounded by a wall-clock timeout so
+                # a slow search can never pin the turn. Non-fatal.
+                try:
+                    _mcts = getattr(self.context, 'mcts_reasoner', None)
+                    _rd = body.get("_router_decision") or {}
+                    _is_hard = (_rd.get("label") == "hard") or bool(_rd.get("escalated"))
+                    if _mcts is not None and _is_hard and last_user_content:
+                        from ..tools.registry import TOOL_DEFINITIONS as _MCTS_TD
+                        _tool_names = [
+                            t["function"]["name"] for t in _MCTS_TD
+                            if t.get("function", {}).get("name")
+                        ]
+                        _winner = await asyncio.wait_for(
+                            _mcts.select_best_action(
+                                task=last_user_content,
+                                plan_state="(turn start — no actions taken yet)",
+                                available_tools=_tool_names,
+                                context=working_memory_context or "",
+                            ),
+                            timeout=75.0,
+                        )
+                        _w_desc = getattr(_winner, 'description', '') if _winner else ''
+                        if _winner is not None and isinstance(_w_desc, str) and _w_desc:
+                            _hint = (
+                                "### DEEP-REASON LOOKAHEAD\n"
+                                "An MCTS search over candidate approaches ranked "
+                                "this next step highest:\n"
+                                f"  - {_w_desc}"
+                            )
+                            _w_tool = getattr(_winner, 'tool_name', '')
+                            _w_risk = getattr(_winner, 'risk_notes', '')
+                            if isinstance(_w_tool, str) and _w_tool:
+                                _hint += f" (suggested tool: {_w_tool})"
+                            if isinstance(_w_risk, str) and _w_risk:
+                                _hint += f"\n  Watch out for: {_w_risk}"
+                            _hint += (
+                                "\nTreat this as a strong hint, not a mandate — "
+                                "deviate if the task clearly needs another approach."
+                            )
+                            base_prompt = base_prompt + "\n\n" + _hint
+                            pretty_log(
+                                "Deep Reason",
+                                f"MCTS lookahead → {_w_desc[:80]}",
+                                icon=Icons.MCTS_TREE,
+                            )
+                except asyncio.TimeoutError:
+                    logger.debug("MCTS lookahead timed out; proceeding without hint")
+                except Exception as e:
+                    logger.debug(f"MCTS lookahead skipped: {type(e).__name__}: {e}")
 
                 # Dynamic "Perfect It" Protocol Injection
                 if getattr(self.context.args, 'perfect_it', False):
@@ -2474,6 +2662,26 @@ class GhostAgent:
 
                     # Use System 2 Planner based on context arguments (Mock-safe check)
                     use_plan = getattr(self.context.args, 'use_planning', False) == True
+                    # Router-gated reasoning depth (proposal item #10):
+                    # when the complexity router is CONFIDENT the request
+                    # is easy (and never had to escalate), skip the
+                    # strategic planner. An easy request does not need a
+                    # multi-task decomposition, and the planner LLM
+                    # round-trip is the single most expensive step of the
+                    # turn — this is what makes the router decision
+                    # genuinely load-bearing on cost, not just advisory.
+                    if use_plan:
+                        _rd_plan = body.get("_router_decision") or {}
+                        if (_rd_plan.get("label") == "easy"
+                                and not _rd_plan.get("escalated")
+                                and float(_rd_plan.get("confidence") or 0.0) >= 0.75):
+                            use_plan = False
+                            pretty_log(
+                                "Reasoning Loop",
+                                "Router: confident-easy request — skipping "
+                                "strategic planner",
+                                icon=Icons.BRAIN_ROUTE,
+                            )
                     if use_plan and not turn_is_conversational:
                         pretty_log("Reasoning Loop", f"Turn {turn+1} Strategic Analysis...", icon=Icons.BRAIN_PLAN)
 
@@ -5389,6 +5597,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # reply rather than silently regenerating. This keeps the
                 # user in the loop (they can see what the verifier disagreed
                 # with) without doubling latency by rerunning the whole turn.
+                # Selfhood outcome backfill (proposal item #3): the verifier
+                # verdict computed below is the first reliable signal of
+                # whether this turn actually succeeded. Captured here and
+                # applied AFTER `_record_turn_trajectory` writes the
+                # autobiographical record (which is born `outcome="unknown"`
+                # on the hot path). `(outcome, failure_reason)` or None.
+                verifier_backfill: tuple | None = None
                 try:
                     verifier = getattr(self.context, "verifier", None)
                     # Gate: any tool-using turn is worth verifying. The old
@@ -5460,6 +5675,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 context=(last_user_content or "")[:1000],
                             )
                         from .verifier import VerifyVerdict
+                        # Record the verdict for the selfhood backfill that
+                        # runs after the autobiographical record is written.
+                        if v_result and v_result.confidence >= 0.7:
+                            if v_result.verdict == VerifyVerdict.CONFIRMED:
+                                verifier_backfill = ("passed", "")
+                            elif v_result.verdict == VerifyVerdict.REFUTED:
+                                _vr_reason = (
+                                    "; ".join(v_result.issues[:2])
+                                    if v_result.issues else v_result.reasoning
+                                )
+                                verifier_backfill = ("failed", _vr_reason or "")
                         if v_result and v_result.verdict == VerifyVerdict.REFUTED and v_result.confidence >= 0.7:
                             issues_str = "; ".join(v_result.issues[:3]) if v_result.issues else v_result.reasoning
                             note = f"\n\n---\n**Verifier note:** {issues_str}"
@@ -5509,6 +5735,39 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 except Exception as e:
                     logger.debug(f"Verifier gate skipped: {e}")
 
+                # Plan postcondition gate (proposal item #10). If the
+                # strategic planner produced a plan whose ROOT task
+                # declared postconditions, hold the final response to
+                # them — the plan stops being internal bookkeeping and
+                # becomes a success contract on the answer itself. A
+                # response that misses a declared postcondition gets a
+                # visible note rather than passing silently. Non-fatal.
+                try:
+                    _plan_json = locals().get('current_plan_json')
+                    if _plan_json and final_ai_content:
+                        from .planning import TaskTree as _PlanTree
+                        _ptree = _PlanTree()
+                        _ptree.load_from_json(_plan_json)
+                        _unsat = _ptree.root_postconditions_unsatisfied(
+                            final_ai_content
+                        )
+                        if _unsat:
+                            _pnote = (
+                                "**Plan check:** this response may not yet "
+                                "satisfy: " + "; ".join(_unsat[:3])
+                            )
+                            if _pnote[:48] not in final_ai_content:
+                                final_ai_content = (
+                                    f"{final_ai_content}\n\n---\n{_pnote}"
+                                )
+                            pretty_log(
+                                "Plan Gate",
+                                f"{len(_unsat)} unsatisfied postcondition(s)",
+                                icon=Icons.BRAIN_PLAN,
+                            )
+                except Exception as e:
+                    logger.debug(f"plan postcondition gate skipped: {e}")
+
                 # --- AUTOMATED POST-MORTEM (AUTO-LEARNING) ---
                 if was_complex_task or execution_failure_count > 0:
                     is_complete_failure = (execution_failure_count >= 3)
@@ -5549,11 +5808,42 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 try:
                     tracker = getattr(self.context, 'uncertainty_tracker', None)
                     if tracker is not None:
+                        # Auto-populate from the agent's own output: any
+                        # explicit first-person hedge ("I'm assuming…",
+                        # "I couldn't verify…") becomes a tracked, persisted
+                        # assumption — so the tracker is load-bearing even
+                        # when the LLM never calls flag_uncertainty.
+                        try:
+                            for _hedge in tracker.scan_text_for_uncertainty(
+                                final_ai_content or ""
+                            ):
+                                tracker.flag_assumption(
+                                    _hedge, confidence=0.4,
+                                    basis="auto-detected hedge in response",
+                                )
+                        except Exception:
+                            pass
+                        # Metacognitive gate (proposal item #6): if a
+                        # critical unknown still needs the user, surface
+                        # the clarifying question at the TOP of the reply
+                        # — a real gate on the response, not a footer.
+                        try:
+                            question = tracker.should_ask_user()
+                        except Exception:
+                            question = None
+                        if (question and final_ai_content
+                                and question[:40] not in final_ai_content):
+                            final_ai_content = (
+                                f"**{question}**\n\n"
+                                f"(Answering with my current understanding below "
+                                f"— correct me if that clarification changes "
+                                f"things.)\n\n---\n\n{final_ai_content}"
+                            )
                         risk = tracker.get_risk_summary()
                         if risk and final_ai_content and risk[:60] not in final_ai_content:
                             final_ai_content = f"{final_ai_content}\n\n---\n{risk}"
-                        # Reset for next request — unknowns/assumptions are
-                        # per-turn, not durable.
+                        # Reset in-memory turn state; the durable persisted
+                        # log is untouched so recurring blind-spots survive.
                         tracker.reset()
                 except Exception as e:
                     logger.debug(f"Uncertainty surfacing skipped: {e}")
@@ -5588,6 +5878,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # noisy in production. When diagnosing, bump to
                     # warning temporarily.
                     logger.debug(f"trajectory logging skipped: {type(e).__name__}: {e}")
+
+                # Selfhood outcome backfill (proposal item #3): the
+                # autobiographical record was just written `outcome=
+                # "unknown"` by `_record_turn_trajectory`. If the verifier
+                # produced a high-confidence verdict, propagate it into
+                # the agent's self-memory so its recall of its own past
+                # is verdict-aware. Non-fatal — backfill is secondary.
+                if verifier_backfill is not None and current_trajectory_id:
+                    try:
+                        from ..selfhood import SelfModel as _SelfModelBF
+                        _sm_bf = getattr(self.context, 'self_model', None)
+                        if isinstance(_sm_bf, _SelfModelBF) and getattr(_sm_bf, 'enabled', False):
+                            _bf_outcome, _bf_reason = verifier_backfill
+                            _sm_bf.record_outcome(
+                                current_trajectory_id, _bf_outcome,
+                                failure_reason=_bf_reason,
+                            )
+                    except Exception as e:
+                        logger.debug(
+                            "selfhood outcome backfill skipped: %s: %s",
+                            type(e).__name__, e,
+                        )
 
                 return final_ai_content, created_time, req_id
 

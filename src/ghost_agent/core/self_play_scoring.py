@@ -11,7 +11,7 @@ The score is deliberately cheap to compute and has sane behaviour on
 boundary cases (no prior best, failed run, etc).
 """
 
-from typing import Iterable
+from typing import Iterable, Optional
 
 
 # Tool names whose result content is USER DATA (fixture file contents,
@@ -115,25 +115,69 @@ def correctness_weighted_score(
     tool_errors: int,
     alpha: float = 0.4,
     beta: float = 0.1,
+    novelty: Optional[float] = None,
+    attempts_used: Optional[int] = None,
+    gamma_novelty: float = 0.6,
+    delta_attempts: float = 0.3,
 ) -> float:
-    """`score = passed*(1 + α*compression_delta) − β*tool_errors`.
+    """Multi-signal correctness-weighted score.
 
-    When `passed=False`, the base term is 0 — compression is ignored
-    because a failed run's "efficient plan" wasn't correct. The tool
-    errors penalty still applies so a failed run with many errors is
-    ranked below a failed run with few.
+    Pre-2026-05 the formula was just::
 
-    The score is used for:
-      - curriculum brittleness ranking (alongside the raw pass/fail
-        counts that frontier.py already tracks);
-      - gating skill writes (we only write when score > 0 on a pass,
-        or when the failure was informative — first-on-cluster);
-      - adaptive cooldown (positive score → shorter next interval).
+        score = passed*(1 + α*compression_delta) − β*tool_errors
+
+    On deterministic templates `compression_delta` (the old tool-count
+    proxy) was pinned at 0 because tool counts barely move between
+    consecutive wins. The score collapsed to pass/fail and the frontier
+    tracker saw a flat signal — see the post-mortem dated 2026-05-17.
+
+    The new combined score is::
+
+        if passed:
+            base = 1.0 + α·compression_delta + γ·novelty + δ·attempts_efficiency
+        else:
+            base = 0.0
+        score = base − β·tool_errors
+
+    Where:
+      * `compression_delta` ∈ [-1, +1] — kept for back-compat, but now
+        only one of three positive signals.
+      * `novelty` ∈ [0, 1] — structural diversity of the solution AST
+        relative to prior winning solutions for this cluster. None
+        means "caller didn't supply it" → treated as 0 contribution
+        (preserves pre-existing test expectations).
+      * `attempts_used` — when supplied, contributes via
+        ``attempts_efficiency`` (1-shot=1.0, 2-shot=0.5, 3-shot=0.2);
+        None → no contribution.
+
+    Defaults: with both new signals at None the formula reduces to the
+    historical one, so every existing test continues to assert the
+    same numbers. New call sites should supply both new signals to
+    actually break the score plateau.
     """
     try:
         delta = float(compression_delta)
     except Exception:
         delta = 0.0
-    base = (1.0 + alpha * delta) if passed else 0.0
+    if passed:
+        base = 1.0 + alpha * delta
+        if novelty is not None:
+            try:
+                nv = float(novelty)
+                if nv < 0.0:
+                    nv = 0.0
+                elif nv > 1.0:
+                    nv = 1.0
+                base += gamma_novelty * nv
+            except Exception:
+                pass
+        if attempts_used is not None:
+            try:
+                from .solution_novelty import attempts_efficiency
+                base += delta_attempts * attempts_efficiency(int(attempts_used))
+            except Exception:
+                pass
+    else:
+        base = 0.0
     score = base - beta * max(0, int(tool_errors))
     return round(score, 4)

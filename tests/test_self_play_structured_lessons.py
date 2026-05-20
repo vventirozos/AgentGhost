@@ -366,8 +366,13 @@ class TestJournalChallengeMining:
         assert len(out) == 1
         ast.parse(out[0].setup_script)
         ast.parse(out[0].validation_script)
-        assert "input.txt" in out[0].setup_script
-        assert "input.txt" in out[0].challenge.lower() or "input.txt" in out[0].challenge
+        # Post-2026-05-17: the journal miner now materialises a shape-
+        # specific fixture (log / csv / json / sql / text). An "access
+        # log" entry routes to `input.log`. The prompt should reference
+        # the same filename as the setup script writes.
+        fixture_name = "input.log"
+        assert fixture_name in out[0].setup_script
+        assert fixture_name in out[0].challenge
         assert "regex_parse" in out[0].domains
 
     def test_mine_skips_successful_entries(self):

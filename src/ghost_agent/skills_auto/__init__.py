@@ -42,6 +42,7 @@ from .extractor import (
 )
 from .consolidator import consolidate, ConsolidationReport
 from .verifier import verify_candidate, VerificationResult
+from .store import GraduatedSkillStore
 
 __all__ = [
     "SkillCandidate",
@@ -52,4 +53,5 @@ __all__ = [
     "ConsolidationReport",
     "verify_candidate",
     "VerificationResult",
+    "GraduatedSkillStore",
 ]

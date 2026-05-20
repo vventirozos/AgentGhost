@@ -114,6 +114,14 @@
   <h2>Concurrency</h2>
   <p>Synchronous tree mutation. Persistence happens via the <code>ProjectStore</code> RLock; in-memory <code>TaskTree</code> is per-request only.</p>
 
+  <h2>Load-bearing planning &amp; router gating</h2>
+  <p>Two changes make the plan and the router genuinely steer the turn rather than just advise.</p>
+  <ul>
+    <li><strong>Root postcondition gating.</strong> New method <code>TaskTree.root_postconditions_unsatisfied(response_text)</code> checks the FINAL agent response against the ROOT task's declared postconditions — gating the answer itself, not just internal task bookkeeping. At the verifier site, <code>handle_chat</code> rebuilds a <code>TaskTree</code> from the persisted <code>current_plan_json</code> and appends a visible <em>"Plan check"</em> note when the response misses a declared postcondition.</li>
+    <li><strong>Router-gated reasoning depth.</strong> When the complexity router is confident a request is easy (label <code>"easy"</code>, not escalated, confidence ≥ 0.75) the expensive strategic-planner LLM round-trip is skipped — the single most expensive step of the turn — making the router decision load-bearing on cost.</li>
+  </ul>
+  <div class="note"><strong>Tests:</strong> covered by <code>tests/test_planning_root_postconditions.py</code>.</div>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

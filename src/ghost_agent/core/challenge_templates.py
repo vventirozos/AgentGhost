@@ -71,6 +71,78 @@ def _is_hard_mode(tier: Optional[str]) -> bool:
     return _tier(tier) in ("advanced", "expert")
 
 
+# ----------------------------------------------------------------------
+# Tier twists — qualitative difficulty axes (proposal B, 2026-05-17)
+# ----------------------------------------------------------------------
+# Pre-2026-05 difficulty was just `n_rows × {1, 2, 3, 4}` plus a single
+# boolean "hard_mode" twist. A solver that aced basic CSV-aggregation
+# aced expert CSV-aggregation because the algorithm was identical at
+# scale. Real difficulty is *qualitative*: malformed rows, mixed
+# encodings, schema drift mid-file, duplicate keys — each one breaks
+# a different naive assumption.
+#
+# Each cluster declares a small set of orthogonal twist axes here. The
+# tier-to-twist mapping picks K twists (K = tier index, 0/1/2/3) so the
+# basic tier renders the un-twisted shape, intermediate adds one twist,
+# advanced two, expert three. Twists compose: a solver that handles
+# `na_rows` alone may fail when `na_rows` + `negative_values` collide.
+#
+# Templates that don't yet declare twists fall back to the legacy
+# `_is_hard_mode` boolean, which is the all-or-nothing twist axis the
+# old code used.
+
+# Maps cluster_key → list of twist identifiers (ordered: earlier twists
+# are introduced at lower tiers). Keep these short and disjoint.
+_TWIST_AXES: Dict[str, list] = {
+    "data_analysis": [
+        "na_rows",
+        "negative_values",
+        "duplicate_ids",
+        "schema_drift",
+    ],
+    "regex_parse": [
+        "malformed_lines",
+        "unicode_payload",
+        "extra_whitespace",
+    ],
+    "python_general": [
+        "stopwords",
+        "case_sensitivity",
+        "unicode_punctuation",
+    ],
+}
+
+# tier → number of twists drawn from the axis list. Basic = 0 twists
+# (un-twisted baseline). Each tier adds exactly one more.
+_TIER_TWIST_COUNT: Dict[str, int] = {
+    "basic": 0,
+    "intermediate": 1,
+    "advanced": 2,
+    "expert": 3,
+}
+
+
+def _resolve_twists_for_tier(cluster_key: str, tier: Optional[str], seed: int) -> set:
+    """Deterministically pick which twists apply to this template render.
+
+    Same (cluster, tier, seed) triple → same twist set, so the validator
+    and the setup script agree when they each re-derive the twist set
+    from their shared seed.
+    """
+    axes = _TWIST_AXES.get(cluster_key) or []
+    if not axes:
+        return set()
+    count = _TIER_TWIST_COUNT.get(_tier(tier), 0)
+    if count <= 0:
+        return set()
+    count = min(count, len(axes))
+    # Deterministic shuffle so the picked twists are stable per seed.
+    rng = random.Random(seed)
+    shuffled = list(axes)
+    rng.shuffle(shuffled)
+    return set(shuffled[:count])
+
+
 def _pick_seed() -> int:
     """Unique-per-call seed so repeated template calls produce different
     data, but a single call's setup + validator agree."""
@@ -83,9 +155,11 @@ def _data_analysis_csv_aggregation(tier: Optional[str] = None) -> ChallengeTripl
 
     Tier scaling:
       * size grows 1× → 4× with tier.
-      * advanced+ injects ~15% rows with ``value`` set to the literal
-        string ``"NA"`` that the solver must filter out (the validator
-        does the same, so the expected answer is the sum ignoring NA).
+      * tier-driven twists (proposal B, 2026-05-17): basic = none;
+        intermediate adds one of {na_rows, negative_values,
+        duplicate_ids, schema_drift}; advanced two; expert three.
+        Each twist is orthogonal — handling ``na_rows`` alone won't
+        help a solver that hasn't also dealt with ``negative_values``.
     """
     seed = _pick_seed()
     n_rows = random.randint(_size(40, tier), _size(80, tier))
@@ -93,25 +167,59 @@ def _data_analysis_csv_aggregation(tier: Optional[str] = None) -> ChallengeTripl
         ["alpha", "beta", "gamma", "delta", "epsilon", "zeta"],
         k=random.randint(3, 5),
     )
-    hard = _is_hard_mode(tier)
-    na_fraction = 0.15 if hard else 0.0
+    twists = _resolve_twists_for_tier("data_analysis", tier, seed)
+    # Back-compat: pre-twist tests asserted that the advanced+ tier
+    # injected NA rows. Preserve that by ensuring na_rows is always in
+    # the twist set when the legacy hard-mode flag would have fired.
+    if _is_hard_mode(tier) and "na_rows" not in twists:
+        twists = set(twists)
+        twists.add("na_rows")
+    na_fraction = 0.15 if "na_rows" in twists else 0.0
+    negative_fraction = 0.20 if "negative_values" in twists else 0.0
+    dup_id_fraction = 0.10 if "duplicate_ids" in twists else 0.0
+    schema_drift = "schema_drift" in twists
 
-    noise_clause = ""
-    if hard:
-        noise_clause = (
-            "\n**Important:** some rows have `value` set to the literal "
-            "string `\"NA\"` (indicating missing data). You MUST skip "
-            "those rows entirely — do NOT include them in any sum.\n"
+    noise_lines = []
+    if "na_rows" in twists:
+        noise_lines.append(
+            "  - some rows have `value` set to the literal string `\"NA\"` "
+            "(missing data). You MUST skip those rows entirely.\n"
         )
+    if "negative_values" in twists:
+        noise_lines.append(
+            "  - some rows have a NEGATIVE `value` (data-entry error). "
+            "You MUST skip rows where `value < 0` — do not include them "
+            "in any sum.\n"
+        )
+    if "duplicate_ids" in twists:
+        noise_lines.append(
+            "  - some `id` values appear more than once (duplicate "
+            "rows). For each duplicate `id`, count ONLY THE FIRST "
+            "occurrence; subsequent rows with the same `id` must be "
+            "skipped.\n"
+        )
+    if schema_drift:
+        noise_lines.append(
+            "  - the CSV header may include EXTRA columns beyond the "
+            "schema above. Your script MUST use the header to locate "
+            "the `category`, `value`, and `date` columns by name — "
+            "DO NOT rely on column position.\n"
+        )
+    noise_clause = ("\n**Important — data quirks to handle:**\n" + "".join(noise_lines)) if noise_lines else ""
 
+    schema_drift_clause = (
+        " (the CSV may include extra columns beyond these — use the header to locate columns by name)"
+        if schema_drift
+        else ""
+    )
     challenge_prompt = f"""You are given a CSV file named `data.csv` that already exists in your
 current working directory. Its schema is:
 
-    id,category,value,date
+    id,category,value,date{schema_drift_clause}
 
-- `id` is a unique integer
+- `id` is an integer
 - `category` is one of: {', '.join(sorted(categories))}
-- `value` is a positive float{' (or the literal string "NA" for missing data)' if hard else ''}
+- `value` is a float{' (or the literal string "NA" for missing data)' if 'na_rows' in twists else ''}
 - `date` is in YYYY-MM-DD format
 {noise_clause}
 **Task:**
@@ -130,22 +238,43 @@ Exit with code 0 on success."""
 import random
 random.seed({seed})
 categories = {categories!r}
+na_fraction = {na_fraction}
+negative_fraction = {negative_fraction}
+dup_id_fraction = {dup_id_fraction}
+schema_drift = {schema_drift!r}
+fieldnames = ["id", "category", "value", "date"]
+if schema_drift:
+    # Add two distractor columns the solver MUST locate by name.
+    fieldnames = ["region", "id", "category", "value", "date", "source"]
 rows = []
-for i in range({n_rows}):
+next_id = 0
+for _ in range({n_rows}):
     cat = random.choice(categories)
-    if random.random() < {na_fraction}:
+    if random.random() < na_fraction:
         value = "NA"
+    elif random.random() < negative_fraction:
+        # Negative-value twist: data-entry error rows.
+        value = round(-random.uniform(10.0, 100.0), 2)
     else:
         value = round(random.uniform(10.0, 100.0), 2)
     month = random.choice(["01", "01", "01", "02", "03"])
     day = random.randint(1, 28)
     date = f"2024-{{month}}-{{day:02d}}"
-    rows.append({{"id": i, "category": cat, "value": value, "date": date}})
+    row = {{"id": next_id, "category": cat, "value": value, "date": date}}
+    if schema_drift:
+        row["region"] = random.choice(["us", "eu", "apac"])
+        row["source"] = random.choice(["web", "api", "mobile"])
+    rows.append(row)
+    # Duplicate-id twist: re-emit the same row (same id, same data) so
+    # the solver must de-dupe on `id` before summing.
+    if random.random() < dup_id_fraction:
+        rows.append(dict(row))
+    next_id += 1
 with open("data.csv", "w", newline="") as f:
-    w = csv.DictWriter(f, fieldnames=["id", "category", "value", "date"])
+    w = csv.DictWriter(f, fieldnames=fieldnames)
     w.writeheader()
     w.writerows(rows)
-print(f"SETUP OK: wrote {{len(rows)}} rows")
+print(f"SETUP OK: wrote {{len(rows)}} rows (fieldnames={{fieldnames}})")
 """
 
     validation_script = """import subprocess
@@ -153,16 +282,27 @@ import csv
 from collections import defaultdict
 
 totals = defaultdict(float)
+seen_ids = set()
 with open("data.csv", "r") as f:
     reader = csv.DictReader(f)
     for row in reader:
-        if row["date"].startswith("2024-01"):
-            try:
-                v = float(row["value"])
-            except (TypeError, ValueError):
-                # Tier-agnostic: basic never has NA, hard-mode tiers do.
-                continue
-            totals[row["category"]] += v
+        if not row.get("date", "").startswith("2024-01"):
+            continue
+        rid = row.get("id")
+        if rid in seen_ids:
+            # duplicate_ids twist: count only the FIRST row per id.
+            continue
+        if rid is not None:
+            seen_ids.add(rid)
+        try:
+            v = float(row["value"])
+        except (TypeError, ValueError):
+            # na_rows twist: skip the literal "NA".
+            continue
+        if v < 0:
+            # negative_values twist: skip data-entry errors.
+            continue
+        totals[row["category"]] += v
 
 expected = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
 expected_lines = [f"{cat}: {total:.2f}" for cat, total in expected]

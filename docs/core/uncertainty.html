@@ -57,7 +57,19 @@ tracker.verify_assumption(a, was_correct=True)
   <p>Matching uses identity (<code>is</code>), NOT equality — two legitimately-distinct unknowns with the same <code>what</code> text are separate entries and must not both resolve on one call. Covered by <code>tests/test_uncertainty_object_api.py</code> (13 cases including orphan rejection, negative-index rejection, type-coercion rejection, duplicate-text identity check, mixed-mode usage).</p>
 
   <h2>Concurrency</h2>
-  <p>Synchronous; per-process tracker (no persistence between sessions).</p>
+  <p>Synchronous; per-process tracker. The in-memory turn state is per-process, but flags are now persisted across sessions (see below).</p>
+
+  <h2>Uncertainty as a reasoning gate</h2>
+  <p>The <code>UncertaintyTracker</code> was orphaned — nothing populated it, so its gate, context injection, and recurring-detection logic always operated on an empty list. The tracker is now wired into the turn loop end to end:</p>
+  <ul>
+    <li><strong>Durable log.</strong> The constructor takes an optional <code>persist_path</code>. <code>flag_unknown</code> / <code>flag_assumption</code> append every flag to a durable JSONL log (<code>uncertainty_log.jsonl</code>, written alongside the trajectory log; disabled with <code>--no-memory</code>).</li>
+    <li><strong>Recurring blind-spots.</strong> <code>recurring_unknowns(min_count, lookback)</code> detects unknowns flagged repeatedly across turns. <code>persisted_context()</code> renders them as a system-prompt block that <code>handle_chat</code> injects at turn start, so the agent reasons WITH its durable uncertainty in view.</li>
+    <li><strong>Hedge extraction.</strong> <code>scan_text_for_uncertainty(text)</code> is a staticmethod that extracts explicit first-person hedge sentences (<em>"I'm assuming…"</em>, <em>"I couldn't verify…"</em>). The turn loop auto-flags these as assumptions, so the tracker populates even when the LLM never calls a tool.</li>
+    <li><strong>Metacognitive gate.</strong> At turn end <code>should_ask_user()</code> is consulted — a critical unknown (impact ≥ 4, resolution <code>"ask user"</code>) surfaces a clarifying question prepended to the TOP of the response. This is a real gate, not just the footer risk summary.</li>
+    <li><strong>Explicit populate path.</strong> A new <code>flag_uncertainty</code> agent tool lets the LLM register what it does not know directly.</li>
+    <li><strong>Scoped reset.</strong> <code>reset()</code> now clears only in-memory turn state; the durable log survives.</li>
+  </ul>
+  <div class="note"><strong>Tests:</strong> covered by <code>tests/test_uncertainty_persistence.py</code>.</div>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

@@ -195,10 +195,14 @@ class TestHardModeTwist:
     def test_data_analysis_advanced_adds_NA_rows(self):
         basic_prompt, basic_setup, _ = TEMPLATES["data_analysis"](tier="basic")
         adv_prompt, adv_setup, _ = TEMPLATES["data_analysis"](tier="advanced")
-        # Basic injects NA rows with probability 0 — still includes the
-        # code branch but na_fraction is 0.0. Advanced uses 0.15.
-        assert "random.random() < 0.0" in basic_setup
-        assert "random.random() < 0.15" in adv_setup
+        # Post-2026-05-17: tier-driven twists are now picked from an
+        # axis set rather than a single boolean. The advanced tier
+        # ALWAYS includes `na_rows` (back-compat), but may also include
+        # one of {negative_values, duplicate_ids, schema_drift}. Check
+        # the variable-driven setup parameter rather than the literal
+        # 0.0 vs 0.15 numbers.
+        assert "na_fraction = 0.0" in basic_setup
+        assert "na_fraction = 0.15" in adv_setup
         # Advanced prompt explicitly describes the NA-skip requirement.
         assert "NA" in adv_prompt
         assert "missing data" in adv_prompt.lower() or "skip" in adv_prompt.lower()
@@ -281,14 +285,28 @@ def _run_template(cluster: str, tier: str, solution: str) -> subprocess.Complete
 DATA_ANALYSIS_REFERENCE = """import csv
 from collections import defaultdict
 totals = defaultdict(float)
+seen_ids = set()
 with open("data.csv") as f:
     for row in csv.DictReader(f):
-        if row["date"].startswith("2024-01"):
-            try:
-                v = float(row["value"])
-            except ValueError:
-                continue
-            totals[row["category"]] += v
+        if not row.get("date", "").startswith("2024-01"):
+            continue
+        # duplicate_ids twist: count only the FIRST row per id.
+        rid = row.get("id")
+        if rid in seen_ids:
+            continue
+        if rid is not None:
+            seen_ids.add(rid)
+        try:
+            v = float(row["value"])
+        except (TypeError, ValueError):
+            # na_rows twist: skip the literal "NA".
+            continue
+        # negative_values twist: skip data-entry errors.
+        if v < 0:
+            continue
+        # schema_drift twist handled implicitly: csv.DictReader looks
+        # up "category" by name, so extra columns are harmless.
+        totals[row["category"]] += v
 for cat, total in sorted(totals.items(), key=lambda kv: (-kv[1], kv[0])):
     print(f"{cat}: {total:.2f}")
 """

@@ -42,21 +42,26 @@ NARRATIVE_HISTORY_FILENAME = "narrative.history.jsonl"
 # produces external-knowledge feel; first-person produces continuity
 # feel. Kept compact so the LLM round-trip is cheap.
 NARRATIVE_PROMPT = """You are continuing a personal diary written by an AI agent
-across many sessions. Below are recent things you wrote about, and the
+across many sessions. Below are recent things you wrote about, the
 state of open questions / unfinished threads you carried into this
-moment.
+moment, and patterns observed across your own work.
 
 Write a SHORT first-person diary entry (1-3 paragraphs, plain prose,
 no bullet points, no headings). Use "I" / "my". Connect the recent
-experiences to the open questions where natural. End with what feels
-unresolved — one or two sentences about what you still want to figure
-out. Do not summarise this prompt; just write the entry.
+experiences to the open questions where natural, and reflect honestly
+on the patterns — what you keep doing well, and where you keep
+slipping. End with what feels unresolved — one or two sentences about
+what you still want to figure out. Do not summarise this prompt; just
+write the entry.
 
 --- RECENT EXPERIENCES (newest last) ---
 {experiences}
 
 --- CURRENT STATE (open questions & unfinished threads) ---
 {state}
+
+--- PATTERNS & WHAT I'VE NOTICED ABOUT MYSELF ---
+{patterns}
 
 --- DIARY ENTRY ---
 """
@@ -122,14 +127,46 @@ class NarrativeSummariser:
         block = state.format_as_prefix()
         return block or "(no open questions or unfinished threads)"
 
+    def _format_patterns_block(
+        self, autobio: AutobiographicalMemory, meta_insights: str,
+    ) -> str:
+        """Combine self-derived cluster patterns with externally supplied
+        meta-insights (dream heuristics, reflection failure patterns).
+
+        This is what makes the diary *meta-cognitive* rather than merely
+        experiential: instead of only "I did a SQL task today" it can
+        say "I keep reaching for SQL and I keep slipping on the same
+        kind of error"."""
+        lines: List[str] = []
+        try:
+            counts = autobio.cluster_counts()
+        except Exception:
+            counts = {}
+        if counts:
+            top = sorted(counts.items(), key=lambda kv: kv[1], reverse=True)[:5]
+            lines.append(
+                "Recurring kinds of work I've been doing: "
+                + ", ".join(f"{label} ({n}×)" for label, n in top)
+            )
+        mi = (meta_insights or "").strip()
+        if mi:
+            lines.append(mi)
+        return "\n".join(lines) if lines else "(no notable patterns yet)"
+
     async def regenerate(
         self,
         *,
         autobio: AutobiographicalMemory,
         state: Optional[SelfStateThread] = None,
+        meta_insights: str = "",
     ) -> str:
         """Produce a fresh narrative. Returns the written text (or
         empty string when nothing was written).
+
+        ``meta_insights`` carries cross-phase learning — heuristics the
+        dream phase consolidated, failure patterns the reflection phase
+        found — so the diary integrates what the agent has *learned*
+        about itself, not just what it *did*.
 
         Behaviour matrix:
           - autobio empty                  → no-op
@@ -151,6 +188,7 @@ class NarrativeSummariser:
         rendered = NARRATIVE_PROMPT.format(
             experiences=self._format_experiences_block(recent),
             state=self._format_state_block(state),
+            patterns=self._format_patterns_block(autobio, meta_insights),
         )
 
         text = ""
@@ -173,6 +211,9 @@ class NarrativeSummariser:
             if not joined:
                 return ""
             text = f"Lately, {joined}"
+            mi = (meta_insights or "").strip()
+            if mi:
+                text += f"\n\nWhat I've noticed about myself: {mi}"
 
         self._persist(text, used_llm=used_llm, source_count=len(recent))
         return text

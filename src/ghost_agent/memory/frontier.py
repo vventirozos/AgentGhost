@@ -6,7 +6,8 @@ import re
 import random
 import threading
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
+from typing import Optional
 
 # Cross-process advisory lock for the frontier JSON. Slack + web + CLI can
 # run in parallel and update self_play_frontier.json concurrently; the
@@ -99,6 +100,12 @@ class FrontierTracker:
     # counters if we record it as a fresh data point, so we refuse to
     # record runs whose challenge hash matches one of the last N.
     DEDUP_WINDOW = 20
+    # How many prior winning solution sources to retain per cluster for
+    # AST-novelty comparison. Bigger window catches longer cycles of
+    # rotating identical shapes; smaller window keeps the JSON tight.
+    # 5 captures roughly the last 1-2 self-play sessions per cluster
+    # without bloating the frontier file past a few hundred KB.
+    WINNING_SOLUTIONS_KEEP = 5
 
     def __init__(self, memory_dir: Path):
         self.file_path = Path(memory_dir) / "self_play_frontier.json"
@@ -196,6 +203,33 @@ class FrontierTracker:
             if self._cluster_is_saturated(s)
         ]
 
+    def list_saturated_templates(self) -> list:
+        """Return ``(cluster_key, template_key)`` pairs whose per-template
+        history indicates saturation (proposal H). Independent of cluster-
+        level saturation: a template can be saturated even when its
+        parent cluster still has un-saturated siblings, in which case
+        `pick_random_template` should rotate to a different shape
+        within the same cluster."""
+        with self._lock:
+            state = self._load()
+        out = []
+        for cluster_key, cstats in state.get("clusters", {}).items():
+            for template_key, tstats in (cstats.get("templates") or {}).items():
+                if tstats.get("saturated_at"):
+                    out.append((cluster_key, template_key))
+        return out
+
+    def recent_winning_solutions(self, cluster_key: str) -> list:
+        """Return the small ring of recent winning ``solution.py`` sources
+        for ``cluster_key``. Used by the synthetic-self-play orchestrator
+        to compute a novelty score for the *next* solution against the
+        cluster's prior wins. Empty list when the cluster is cold or
+        every winning hash has been pruned."""
+        with self._lock:
+            state = self._load()
+        cluster = state.get("clusters", {}).get(cluster_key, {})
+        return list(cluster.get("winning_solutions") or [])
+
     def _get_brittle_clusters_scored(self, limit: int = 3) -> list:
         """Return the top `limit` brittle clusters as `(score, key, stats)`
         tuples. Exposed separately so `pick_seed` can do weighted sampling
@@ -289,7 +323,64 @@ class FrontierTracker:
         tier = self.get_difficulty_tier(cluster_key)
         return DIFFICULTY_HINTS.get(tier, DIFFICULTY_HINTS["basic"])
 
-    def pick_seed(self, random_explore_prob: float = 0.2) -> dict:
+    def note_reflection_failure(self, cluster_key: str, *, diagnosis: str = "") -> None:
+        """Record that the reflection phase critiqued a FAILED *interactive*
+        turn belonging to ``cluster_key``.
+
+        This is the bridge that closes proposal item #7's loop: the
+        self-play curriculum can now target the topics the agent fails at
+        in real user work, not only the topics it fails at in self-play.
+        Bounded (keeps the most recent 20 per cluster) and best-effort —
+        never raises."""
+        cluster_key = (cluster_key or "").strip()
+        if not cluster_key:
+            return
+        try:
+            with self._crossproc_lock(), self._lock:
+                state = self._load()
+                clusters = state.setdefault("clusters", {})
+                cluster = clusters.setdefault(cluster_key, {})
+                failures = cluster.setdefault("reflection_failures", [])
+                failures.append({
+                    "ts": datetime.now().isoformat(),
+                    "diagnosis": (diagnosis or "")[:300],
+                })
+                if len(failures) > 20:
+                    del failures[: len(failures) - 20]
+                self._save(state)
+        except Exception as e:
+            logger.debug("note_reflection_failure skipped: %s", e)
+
+    def get_reflection_hot_clusters(
+        self, *, limit: int = 3, within_days: int = 7,
+    ) -> list:
+        """Clusters the reflection phase flagged as failing in recent
+        interactive turns. Returns ``[(cluster_key, count), ...]``
+        sorted by recent-failure count, descending."""
+        cutoff = datetime.now() - timedelta(days=max(1, within_days))
+        with self._lock:
+            state = self._load()
+        scored = []
+        for key, cluster in (state.get("clusters", {}) or {}).items():
+            failures = cluster.get("reflection_failures", []) or []
+            recent = 0
+            for f in failures:
+                ts = f.get("ts", "")
+                try:
+                    if ts and datetime.fromisoformat(ts) >= cutoff:
+                        recent += 1
+                except Exception:
+                    continue
+            if recent > 0:
+                scored.append((key, recent))
+        scored.sort(key=lambda kv: kv[1], reverse=True)
+        return scored[:limit]
+
+    def pick_seed(
+        self,
+        random_explore_prob: float = 0.2,
+        reflection_priority_prob: float = 0.35,
+    ) -> dict:
         """Pick a frontier cluster to target the next challenge at.
 
         Returns a dict: {mode, cluster_key, hint} where mode is 'frontier',
@@ -302,6 +393,31 @@ class FrontierTracker:
         """
         if random.random() < random_explore_prob:
             return {"mode": "exploration", "cluster_key": None, "hint": ""}
+
+        # Reflection-driven targeting (proposal item #7): with a modest
+        # probability, drill a cluster the reflection phase flagged as
+        # failing in recent INTERACTIVE turns — so self-play practices
+        # the agent's real-world weaknesses, not just its self-play ones.
+        if random.random() < reflection_priority_prob:
+            hot = self.get_reflection_hot_clusters(limit=3)
+            if hot:
+                hot_key, hot_count = hot[0]
+                tier = self.get_difficulty_tier(hot_key)
+                return {
+                    "mode": "frontier",
+                    "cluster_key": hot_key,
+                    "difficulty_tier": tier,
+                    "source": "reflection",
+                    "hint": (
+                        f"FRONTIER TARGET (reflection-driven): the agent "
+                        f"recently FAILED real user turns in the '{hot_key}' "
+                        f"cluster ({hot_count} reflected failure(s) in the "
+                        f"last week). Generate a challenge that drills this "
+                        f"exact weakness so it stops recurring.\n"
+                        f"DIFFICULTY TIER: {tier.upper()} — "
+                        f"{self.get_difficulty_hint(hot_key)}"
+                    ),
+                }
 
         scored = self._get_brittle_clusters_scored(limit=3)
         if not scored:
@@ -455,9 +571,20 @@ class FrontierTracker:
         passed: bool,
         description_length: int,
         mistake: str = "",
+        solution_source: str = "",
+        template_key: str = "",
+        novelty: Optional[float] = None,
     ) -> dict:
         """Append a run, update cluster stats, return a result dict with
         compression_delta, is_new_cluster, and mastered flags.
+
+        ``solution_source`` is the contents of the winning ``solution.py``
+        (empty for failures) — used to record AST-canonical hashes so
+        the next run can detect a structurally-identical solution and
+        award zero novelty credit. ``template_key`` enables per-template
+        saturation tracking (proposal H). ``novelty`` is computed by the
+        caller against prior winning solutions for the same cluster and
+        plumbed into the result dict for the scorer to consume.
 
         Cross-process safe via fcntl advisory lock on a sibling file; the
         threading.RLock still guards intra-process concurrency.
@@ -481,9 +608,53 @@ class FrontierTracker:
                         "recent_hashes": [],
                         "total_first_try_wins": 0,
                         "unlocked_tier_index": 0,
+                        # winning_solutions: small ring buffer of recent
+                        # winning solution.py sources for this cluster.
+                        # Used by `recent_winning_solutions` to feed the
+                        # novelty scorer. Capped to avoid unbounded JSON
+                        # growth; 5 prior wins is plenty for Jaccard.
+                        "winning_solutions": [],
+                        "winning_solution_hashes": [],
                     },
                 )
                 is_new_cluster = cluster["runs"] == 0
+
+                # Per-template outcome history (proposal H): rotate out
+                # individual templates that the agent has saturated even
+                # if the parent cluster still has un-saturated siblings.
+                if template_key:
+                    templates = cluster.setdefault("templates", {})
+                    tstats = templates.setdefault(
+                        template_key,
+                        {
+                            "runs": 0,
+                            "recent_outcomes": [],
+                            "saturated_at": None,
+                        },
+                    )
+                    tstats["runs"] += 1
+                    tstats["recent_outcomes"] = (
+                        tstats.get("recent_outcomes", []) + [{
+                            "passed": bool(passed),
+                            "attempts_used": int(attempts_used),
+                            "novelty": float(novelty) if novelty is not None else None,
+                        }]
+                    )[-self.SATURATION_WINDOW * 2:]
+                    # Saturation rule per template: same shape as cluster
+                    # saturation — last N outcomes all first-try passes
+                    # with zero novelty (the agent reproduced the same
+                    # AST shape every time).
+                    recent_t = tstats["recent_outcomes"][-self.SATURATION_WINDOW:]
+                    if len(recent_t) >= self.SATURATION_WINDOW and all(
+                        r.get("passed")
+                        and int(r.get("attempts_used", 1)) == 1
+                        and (r.get("novelty") is None or float(r.get("novelty") or 0.0) <= 0.05)
+                        for r in recent_t
+                    ):
+                        if tstats.get("saturated_at") is None:
+                            tstats["saturated_at"] = datetime.now().isoformat()
+                    else:
+                        tstats["saturated_at"] = None
 
                 # M7 dedup: if we've seen this exact challenge recently,
                 # don't let it inflate mastery counters (runs,
@@ -560,6 +731,33 @@ class FrontierTracker:
                     cluster["recent_hashes"] = (
                         recent_hashes + [challenge_hash]
                     )[-self.DEDUP_WINDOW:]
+
+                # Persist a small ring of winning solution sources so the
+                # next run can compute structural novelty. We dedupe by
+                # canonical AST hash — if the agent re-emits the same
+                # AST shape, no need to store the source twice.
+                if passed and solution_source:
+                    try:
+                        from ..core.solution_novelty import canonical_hash
+                        new_hash = canonical_hash(solution_source)
+                    except Exception:
+                        new_hash = ""
+                    existing_hashes = cluster.get("winning_solution_hashes", [])
+                    if new_hash and new_hash not in existing_hashes:
+                        cluster["winning_solutions"] = (
+                            cluster.get("winning_solutions", []) + [solution_source[:4000]]
+                        )[-self.WINNING_SOLUTIONS_KEEP:]
+                        cluster["winning_solution_hashes"] = (
+                            existing_hashes + [new_hash]
+                        )[-self.WINNING_SOLUTIONS_KEEP:]
+                    # Attach novelty into the outcome we just appended
+                    # so future tick reports can read it back without
+                    # recomputing.
+                    if novelty is not None:
+                        try:
+                            cluster["recent_outcomes"][-1]["novelty"] = float(novelty)
+                        except Exception:
+                            pass
 
                 # C7 mastery: require a longer streak AND require that
                 # the streak shows real compression progress somewhere

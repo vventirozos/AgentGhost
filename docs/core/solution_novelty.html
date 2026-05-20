@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.solution_novelty — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="dream.html">dream</a>
+    <a href="frontier_selection.html">frontier_selection</a>
+    <a href="self_play_scoring.html">self_play_scoring</a>
+    <a class="current" href="solution_novelty.html">solution_novelty</a>
+    <a href="adversarial_generator.html">adversarial_generator</a>
+    <a href="challenge_templates.html">challenge_templates</a>
+    <a href="journal_challenges.html">journal_challenges</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / solution_novelty.py</h1>
+  <p class="subtitle">Structural novelty of a candidate <code>solution.py</code> against prior winning solutions for the same cluster — closes the 2026-05-17 "no learning signal" gap.</p>
+
+  <h2>Why</h2>
+  <p>The pre-2026-05 self-play score used a tool-invocation count as a proxy for "how compressed is the plan". On deterministic templates the tool count is constant from one win to the next, so the compression delta pinned at <code>+0.000</code> and the score collapsed to pure pass/fail. The frontier tracker saw a flat signal — see the post-mortem dated 2026-05-17 (no lessons learned after hundreds of cycles).</p>
+
+  <p>This module gives the scorer a real gradient: when a solver passes the same template a second time, did it find a <em>structurally different</em> solution, or did it just reproduce the prior winning shape verbatim? The former is real generalization; the latter is memorization and should not award learning credit.</p>
+
+  <h2>Functions</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>canonical_hash(source) → str</code></td><td>16-char sha1 of the AST canonical form. Empty string when source doesn't parse.</td></tr>
+      <tr><td><code>jaccard_novelty(source, prior_sources) → float</code></td><td>Novelty in [0, 1] of the new solution vs. a list of prior winning solutions for the same cluster.</td></tr>
+      <tr><td><code>attempts_efficiency(attempts_used, max_attempts=3) → float</code></td><td>Maps attempts-to-pass onto a [0.2, 1.0] efficiency score: <code>{1 → 1.0, 2 → 0.5, 3 → 0.2}</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>What "canonical" means</h2>
+  <p>The AST walker replaces variable names, attribute names, and literal values with placeholders before hashing. Two solutions that differ only in identifier names → same canonical hash → novelty 0.0.</p>
+
+  <pre><code># All three of these canonicalise to the same shape:
+x = 1; print(x)
+foo = 1; print(foo)
+bar = 1; print(bar)</code></pre>
+
+  <p>The Jaccard variant goes further: it computes the Jaccard similarity of <em>bigrams</em> in the canonical part stream and reports the distance. Captures local structural overlap rather than just whole-shape equality — a for-loop-with-accumulator differs from a comprehension-with-sum even though both produce the same answer.</p>
+
+  <h2>Wiring</h2>
+  <p><code>memory/frontier.FrontierTracker.record_run</code> reads <code>solution_source</code> and stores both the source and the canonical hash in a small ring buffer (<code>WINNING_SOLUTIONS_KEEP=5</code>). The next cycle, <code>core/dream.synthetic_self_play</code> calls <code>recent_winning_solutions(cluster)</code> and passes the list into <code>jaccard_novelty</code> before recording the new run. The resulting novelty is plumbed into:</p>
+  <ul>
+    <li><a href="self_play_scoring.html"><code>correctness_weighted_score</code></a> (γ·novelty term),</li>
+    <li>the skill-write gate (a first-try pass with novelty ≥ 0.5 now writes a lesson, even when compression delta is flat),</li>
+    <li>the trajectory's <code>extra.solution_novelty</code> field — the <a href="../algorithms/dream_cycle.html">reflector</a> reads this to decide whether to meta-critique an otherwise boring pass.</li>
+  </ul>
+
+  <h2>Behaviour at the edges</h2>
+  <ul>
+    <li><strong>Cold start</strong> (no prior wins for the cluster): novelty = 1.0.</li>
+    <li><strong>Unparseable source</strong> (e.g. partial write, syntax error): novelty = 0.0 — broken solutions are not a learning signal even if they're textually unique.</li>
+    <li><strong>Variable rename / whitespace change</strong>: novelty = 0.0 — same canonical shape.</li>
+    <li><strong>Different structure</strong> (e.g. for-loop vs. comprehension): novelty &gt; 0.3 typically; depends on local bigram overlap.</li>
+  </ul>
+
+  <h2>Coverage</h2>
+  <p><code>tests/test_self_play_meaningful.py::TestSolutionNovelty</code> (7 cases) + <code>TestMultiSignalScore</code> (5 cases) + the end-to-end frontier tests in the same file (3 cases).</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

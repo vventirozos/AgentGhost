@@ -28,16 +28,49 @@
     <thead><tr><th>Function</th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>count_tool_errors(messages) → int</code></td><td>Count tool-result messages that indicate tool <em>failures</em> (three-tier discrimination, below).</td></tr>
-      <tr><td><code>correctness_weighted_score(passed, compression_delta, tool_errors, alpha=0.4, beta=0.1) → float</code></td><td>Final score used by the frontier tracker and adaptive cooldown.</td></tr>
+      <tr><td><code>correctness_weighted_score(passed, compression_delta, tool_errors, alpha=0.4, beta=0.1, novelty=None, attempts_used=None, gamma_novelty=0.6, delta_attempts=0.3) → float</code></td><td>Multi-signal score consumed by the frontier tracker, the adaptive cooldown, and the skill-write gate.</td></tr>
     </tbody>
   </table>
 
-  <h2>Formula</h2>
-  <pre><code>score = (1.0 + α · compression_delta if passed else 0.0) − β · tool_errors
+  <h2>Formula (post 2026-05-17)</h2>
+  <pre><code>if passed:
+    base = 1.0 + α · compression_delta + γ · novelty + δ · attempts_efficiency
+else:
+    base = 0.0
+score = base − β · tool_errors
 
 α = 0.4   # reward for compressing the description after a successful solve
-β = 0.1   # penalty per tool error</code></pre>
-  <p>When <code>passed=False</code>, the base term is 0 — compression is ignored because a failed run's "efficient plan" wasn't correct. The tool-error penalty still applies so a failed run with many errors is ranked below a failed run with few.</p>
+β = 0.1   # penalty per tool error
+γ = 0.6   # reward for finding a structurally novel solution
+δ = 0.3   # reward for solving on the first attempt (vs 2nd / 3rd)</code></pre>
+
+  <p>When <code>passed=False</code>, the base term is 0 — compression / novelty / attempts are ignored because a failed run's "efficient plan" wasn't correct. The tool-error penalty still applies so a failed run with many errors is ranked below a failed run with few.</p>
+
+  <p><strong>Back-compat:</strong> when both <code>novelty</code> and <code>attempts_used</code> are <code>None</code> the formula reduces to the pre-2026-05 shape so every legacy test still asserts the same numbers.</p>
+
+  <p><strong>novelty</strong> ∈ [0, 1] comes from
+    <a href="solution_novelty.html">solution_novelty.jaccard_novelty</a> —
+    1.0 when the cluster has no prior winning solution, 0.0 when the
+    new <code>solution.py</code> AST-canonicalises to a shape already
+    on file. Variable renames don't move the score.</p>
+
+  <p><strong>attempts_efficiency</strong> is a small lookup table:
+    <code>{1 → 1.0, 2 → 0.5, 3 → 0.2}</code>. First-try wins outrank
+    third-try wins even when both pass with the same novelty.</p>
+
+  <h2>Why the redesign</h2>
+  <p>Pre-2026-05 the score collapsed to pass/fail because
+    <code>compression_delta</code> (tool-call count vs. prior best) was
+    pinned at <code>+0.000</code> on deterministic templates — tool
+    counts barely move between consecutive wins. The flat score
+    starved the frontier tracker of gradient and the skill-write gate
+    of any reason to fire. The 2026-05-17 redesign adds two
+    independent signals (novelty + attempts efficiency) so a first-
+    try win with a structurally new solution outranks one that
+    reproduces a saturated AST shape. See the
+    <a href="../self_improvement.md">self-improvement pipeline doc</a>
+    for the full post-mortem and the matching reflector / write-gate
+    changes.</p>
 
   <h2>Three-tier tool-error discrimination</h2>
   <p>The old heuristic substring-matched error markers anywhere in any tool content — which produced false positives whenever a fixture legitimately contained <code>ERROR:</code> / <code>WARN</code> / <code>Traceback</code> tokens (a log-counting challenge's log files, for example). The new <code>count_tool_errors</code> uses three tiers:</p>

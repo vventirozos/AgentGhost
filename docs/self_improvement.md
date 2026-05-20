@@ -759,6 +759,146 @@ End-to-end walkthrough:
 and the new section in
 [`docs/algorithms/dream_cycle.html`](algorithms/dream_cycle.html).
 
+## Meaningful self-play redesign (2026-05-17)
+
+A post-mortem of the 2026-05-17 self-play log found that hundreds of
+cycles produced **zero** lessons. The agent was solving every cycle
+first-try, so:
+
+* the compression-delta metric (tool-call count vs. prior best) stayed
+  pinned at `+0.000` — no gradient for the scorer;
+* the write gate (`struggled-then-won`, `new_cluster`,
+  `first-failure`) never opened because every cluster had been
+  seen and no cluster struggled;
+* mastery (5-streak first-try wins with `delta > 0.05`) was unreachable
+  because `delta` never moved;
+* the reflector only fired on `outcome == FAILED`, so passing-but-
+  boring cycles never reached it;
+* journal mining wrote a generic `input.txt` and a lenient validator
+  for every entry regardless of what the original user task was;
+* PRM training only ran from the biological watchdog's 15-60 min idle
+  window — but a busy self-play loop never reaches that window, so
+  `PRMScorer.has_model` stayed `False` and the frontier-weighted
+  picker silently fell back to the brittle pool;
+* the LLM challenge generator had no incentive to produce *hard*
+  challenges since it shared weights with the solver.
+
+The redesign closes all eight gaps. Modules:
+
+| File | Change |
+|---|---|
+| `core/solution_novelty.py` | **new** — AST-canonical hash + Jaccard novelty against prior winning solutions for a cluster. |
+| `core/self_play_scoring.py` | multi-signal score: `passed*(1 + α·Δ + γ·novelty + δ·attempts_efficiency) − β·errors`. Defaults preserve back-compat. |
+| `core/challenge_templates.py` | qualitative tier twists (`na_rows`, `negative_values`, `duplicate_ids`, `schema_drift`, …) — tier = K-combination of twists, not just N× rows. |
+| `core/journal_challenges.py` | shape-aware fixtures (`input.csv` / `input.json` / `input.log` / `input.db` / `input.txt`) + shape-specific validator rubrics. |
+| `core/adversarial_generator.py` | **new** — per-prompt-fingerprint solver pass-rate tracker; `suggest_bias()` injects guidance into the next challenge-gen prompt. |
+| `memory/frontier.py` | per-template saturation (proposal H); ring buffer of recent winning `solution.py` sources for novelty scoring; `record_run()` now consumes `solution_source`, `template_key`, `novelty`. |
+| `reflection/loop.py` | opt-in `accept_low_novelty_passes` admits self-play passes with `extra.solution_novelty < threshold` into the reflection batch. |
+| `tools/memory.py` | self-play loop calls `_maybe_retrain_prm()` every 20 cycles → PRM model stays fresh without waiting for idle. |
+| `core/dream.py` | wires all of the above: reads winning `solution.py`, computes novelty, passes it to scorer + tracker + reflector; opens write gate on `novel-shape first-try pass`; appends adversarial bias to generator prompt. |
+
+### The new score
+
+```
+if passed:
+    base = 1.0 + α·compression_delta + γ·novelty + δ·attempts_efficiency
+else:
+    base = 0.0
+score = base − β·tool_errors
+```
+
+Defaults: α=0.4, β=0.1, γ=0.6, δ=0.3. `attempts_efficiency` is
+`{1→1.0, 2→0.5, 3→0.2}`. `novelty ∈ [0, 1]` is the Jaccard distance
+between the new solution's canonical AST shape bigrams and the
+cluster's stored prior winning shapes (cluster cold start → 1.0;
+exact AST duplicate → 0.0).
+
+Concrete swing observed live on a fresh cold-start regex_parse cycle:
+the old score reported `+1.000`; the new one reported `+1.900`
+(1.0 base + 0.6 novelty + 0.3 first-try) — a real gradient that
+discriminates among passes that the old score collapsed onto a single
+binary outcome.
+
+### New write-gate path
+
+Added between `struggled-then-won` and `new-failure`:
+
+> `passed and attempt == 0 and novelty ≥ 0.5` →
+> *first-try pass with novel shape → write lesson*
+
+A boring first-try pass with `novelty < 0.5` no longer suppresses
+silently; it's reported as *"defer to reflector"* and the reflector
+(when constructed with `accept_low_novelty_passes=True`) admits it
+into the batch and asks *why was this boring?* — the meta-lesson
+either grows the curriculum or stays the same.
+
+### Tier twists (qualitative difficulty)
+
+Each cluster declares an axis set in `_TWIST_AXES`. The tier-to-twist
+map is:
+
+| tier | twists picked |
+|---|---|
+| basic | 0 |
+| intermediate | 1 |
+| advanced | 2 |
+| expert | 3 |
+
+Twists are sampled deterministically from the seed so the setup and
+the validator agree. `data_analysis` declares
+`{na_rows, negative_values, duplicate_ids, schema_drift}` — a solver
+that aced the basic shape gets four qualitatively different harder
+versions to learn from, not just a 4× larger one.
+
+### Per-template saturation (proposal H)
+
+In addition to cluster-level saturation, each template within a
+cluster gets its own outcome history. A template that earns two
+consecutive first-try wins with `novelty ≤ 0.05` is marked saturated
+(`saturated_at` timestamp). `list_saturated_templates()` returns
+`(cluster, template)` pairs so the dreamer can rotate to a different
+template within the same cluster instead of rotating the whole
+cluster out.
+
+### PRM scheduler inside the loop (proposal E)
+
+`tools/memory._run_self_play_loop` now calls `_maybe_retrain_prm`
+every 20 cycles. Trainer bails out cleanly (with a logged reason)
+when there aren't enough trajectories yet; on success it hot-swaps
+the new `StepValueModel` into the live `PRMScorer`. The frontier-
+weighted picker (`pick_frontier_seed`) can then engage on the next
+cycle instead of falling back to the brittle pool every time.
+
+### Adversarial generator (proposal G)
+
+`AdversarialGeneratorTracker` is keyed by a hash of the variable part
+of the challenge-gen prompt (the frontier hint). It records solver
+pass/fail per fingerprint, exposes `worst_fingerprints(limit)`, and
+synthesises a short `suggest_bias()` block that the dreamer appends
+to the system prompt for the next LLM challenge generation. Result:
+the generator gets a quiet incentive to produce more challenges in
+families the solver is failing on rather than rotating to easier
+ones.
+
+### Tests
+
+New: `tests/test_self_play_meaningful.py` (44 cases) covers the
+score combiner, AST novelty, twist resolver, journal shape detector,
+reflector opt-in admission, adversarial tracker, write-gate inputs,
+per-template saturation, and PRM scheduler safety.
+
+Pre-existing self-play tests were updated where they pinned the old
+contract:
+
+* `tests/test_self_play_structured_lessons.py` — journal mining now
+  asserts shape-appropriate fixture names instead of `input.txt`.
+* `tests/test_tier_aware_templates.py` — `data_analysis` reference
+  solution updated to handle the new twists; setup-script assertion
+  loosened from literal `random.random() < 0.0` to
+  `na_fraction = 0.0`.
+
+Full suite: **3670 passed, 11 skipped, 0 failed.** No regressions.
+
 ## Stage 2 hook (future work)
 
 The trajectory log is the ingredient Stage 2 (local SFT via rejection

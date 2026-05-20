@@ -32,12 +32,21 @@ PREFIX_OPEN = "<!-- SELFHOOD:BEGIN -->"
 PREFIX_CLOSE = "<!-- SELFHOOD:END -->"
 
 
+def _format_experience_line(exp) -> str:
+    line = f"  - {exp.summary}"
+    if exp.outcome and exp.outcome != "unknown":
+        line += f" [{exp.outcome}]"
+    return line
+
+
 def build_wakeup_prefix(
     *,
     autobio: Optional[AutobiographicalMemory],
     state: Optional[SelfStateThread],
     narrative: Optional[str],
     recent_experiences_n: int = 3,
+    query: Optional[str] = None,
+    relevant_experiences_n: int = 3,
     max_chars: int = 2400,
 ) -> str:
     """Compose the first-person wake-up prefix.
@@ -46,11 +55,14 @@ def build_wakeup_prefix(
       1. Narrative ("the running diary I've been keeping") — sets voice
       2. State thread (open questions, unfinished, mood) — load-bearing
          continuity material
-      3. Recent experiences (most recent N) — episodic flavour
+      3. Relevant past (when ``query`` is given) — experiences that match
+         what the user is asking *now*, not just the most recent ones.
+         This is what turns recall from a sliding window into genuine
+         "I remember the time I did something like this".
+      4. Recent experiences (most recent N) — episodic flavour
 
-    Empty when all three sources are empty; the caller is expected to
-    skip prefix injection in that case rather than splicing a blank
-    block."""
+    Empty when all sources are empty; the caller is expected to skip
+    prefix injection in that case rather than splicing a blank block."""
 
     parts = []
 
@@ -63,15 +75,33 @@ def build_wakeup_prefix(
         if state_block:
             parts.append(state_block)
 
+    # Recent experiences — gather first so the relevant block can dedup
+    # against them (no point showing the same memory twice).
+    recent = []
     if autobio is not None and recent_experiences_n > 0:
         recent = autobio.recent(limit=recent_experiences_n)
-        if recent:
-            parts.append("Recent things I remember doing:")
-            for exp in recent:
-                line = f"  - {exp.summary}"
-                if exp.outcome and exp.outcome != "unknown":
-                    line += f" [{exp.outcome}]"
-                parts.append(line)
+    recent_ids = {e.id for e in recent}
+
+    if (autobio is not None and query and query.strip()
+            and relevant_experiences_n > 0):
+        try:
+            relevant = autobio.search_my_past(
+                query, limit=relevant_experiences_n + len(recent_ids),
+            )
+        except Exception:
+            relevant = []
+        relevant = [e for e in relevant if e.id not in recent_ids]
+        relevant = relevant[:relevant_experiences_n]
+        if relevant:
+            parts.append(
+                "This connects to things I've done before — what I remember:")
+            for exp in relevant:
+                parts.append(_format_experience_line(exp))
+
+    if recent:
+        parts.append("Recent things I remember doing:")
+        for exp in recent:
+            parts.append(_format_experience_line(exp))
 
     if not parts:
         return ""
