@@ -2336,22 +2336,32 @@ class GhostAgent:
                     logger.debug(f"graduated-skill injection skipped: {e}")
 
                 # Deep-reason MCTS lookahead (proposal item #8). For
-                # requests the complexity router judges HARD (or had to
-                # escalate), run the MCTS action search and inject its
-                # top-ranked next-action as a planning hint. This is the
-                # wiring that makes `select_best_action` load-bearing —
-                # previously the reasoner was constructed under
-                # --deep-reason but never actually called in the turn
-                # loop. Gated on: mcts_reasoner present (it is None
-                # unless --deep-reason) AND a hard/escalated router
-                # verdict, so the extra LLM round-trips land only where
-                # the depth pays off. Bounded by a wall-clock timeout so
-                # a slow search can never pin the turn. Non-fatal.
+                # requests the complexity router GENUINELY classified as
+                # hard, run the MCTS action search and inject its top
+                # next-action as a planning hint. This is the wiring that
+                # makes `select_best_action` load-bearing — previously
+                # the reasoner was constructed under --deep-reason but
+                # never called in the turn loop.
+                #
+                # Gating is deliberately strict — the search costs ~4 LLM
+                # round-trips, so it must NEVER fire on a cheap request:
+                #   * mcts_reasoner present (None unless --deep-reason);
+                #   * a high-confidence "hard" verdict — `escalated` is
+                #     excluded on purpose: an untrained / low-confidence
+                #     router escalates EVERY request (label defaults to
+                #     "hard", escalated=True), and treating that as hard
+                #     fired the search on trivial greetings (25 s for a
+                #     "hello"). With no trained router MCTS simply stays
+                #     off — the correct fail-safe;
+                #   * not a trivial-chat turn.
+                # Bounded by a wall-clock timeout; non-fatal.
                 try:
                     _mcts = getattr(self.context, 'mcts_reasoner', None)
                     _rd = body.get("_router_decision") or {}
-                    _is_hard = (_rd.get("label") == "hard") or bool(_rd.get("escalated"))
-                    if _mcts is not None and _is_hard and last_user_content:
+                    _is_hard = (_rd.get("label") == "hard"
+                                and not _rd.get("escalated"))
+                    if (_mcts is not None and _is_hard and last_user_content
+                            and not self._is_strict_trivial_chat(lc)):
                         from ..tools.registry import TOOL_DEFINITIONS as _MCTS_TD
                         _tool_names = [
                             t["function"]["name"] for t in _MCTS_TD
