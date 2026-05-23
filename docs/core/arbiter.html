@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.arbiter — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Metacognition uplift</h3>
+    <a href="entropy.html">entropy</a>
+    <a href="confidence.html">confidence</a>
+    <a href="triggers.html">triggers</a>
+    <a class="current" href="arbiter.html">arbiter</a>
+    <a href="../memory/competence.html">memory/competence</a>
+    <a href="../algorithms/metacognition.html">Overview</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / arbiter.py — DualSolverArbiter</h1>
+  <p class="subtitle">Confidence-gated, two-shot consensus check. Runs two scripted-temperature candidates in parallel and routes the answer based on semantic divergence.</p>
+
+  <h2>Decision tree</h2>
+  <pre>
+both candidates failed       → ask_user
+one survived                 → execute survivor
+both ok, converged (sim ≥ τ) → execute lower-T candidate
+both ok, diverged:
+    no validator             → validate (caller decides)
+    validator passes one     → execute the passing one
+    validator passes both    → ask_user (semantic disagreement)
+    validator rejects both   → ask_user (with combined reason)
+  </pre>
+
+  <h2>SemanticDivergence</h2>
+  <p>Cosine similarity over an injected embedder (production: <code>LLMClient.get_embeddings</code>; tests: deterministic stubs). When no embedder is wired, falls back to token-overlap Jaccard — under-clusters paraphrases, so the arbiter is slightly more cautious in that mode (the right failure direction).</p>
+
+  <h2>Cost discipline</h2>
+  <ul>
+    <li>Two candidates only (not the five-sample default in <code>distill/self_consistency.py</code>).</li>
+    <li>Per-sample timeout (default 10 s); a timeout is treated as a failure, NOT a halt.</li>
+    <li>Empty prompt → <code>skipped</code> action; arbiter never doubles a no-op turn.</li>
+  </ul>
+
+  <h2>Convenience gate</h2>
+  <p><code>confidence_gated(...)</code> returns <code>None</code> when the composite confidence is at or above threshold, so call sites can hot-loop the arbiter call without rewiring the conditional themselves.</p>
+</main>
+</body>
+</html>

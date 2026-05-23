@@ -142,11 +142,19 @@ class MCTSReasoner:
 
     def __init__(self, llm_client: Any = None, max_candidates: int = 3,
                  max_depth: int = 2,
-                 prm_scorer: Optional["PRMScorer"] = None):
+                 prm_scorer: Optional["PRMScorer"] = None,
+                 uncertainty_penalty: float = 0.0):
         self.llm_client = llm_client
         self.max_candidates = max_candidates
         self.max_depth = max_depth
         self.prm_scorer = prm_scorer
+        # PRM uncertainty downweighting (roadmap phase 1.5). When > 0,
+        # each PRM-scored candidate is penalised by
+        # ``uncertainty_penalty * scorer.uncertainty(state, action)`` so
+        # MCTS prefers branches the model is confident about over
+        # equally-rated branches it is unsure about. Default 0.0 = legacy
+        # behaviour, kept so existing callers and tests don't shift.
+        self.uncertainty_penalty = float(max(0.0, uncertainty_penalty))
         # Cache of unexplored alternatives for backtracking
         self._backtrack_stack: List[List[ActionCandidate]] = []
 
@@ -300,9 +308,28 @@ class MCTSReasoner:
                     tool_args=candidate.tool_args or {},
                 )
                 raw = scorer.score(prm_state, action)
-                candidate.score = _clamp_unit_score(raw)
+                raw_score = _clamp_unit_score(raw)
+                # Optional uncertainty downweighting (roadmap phase 1.5).
+                # Pull the scorer's uncertainty if it exposes one — duck
+                # typed because tests inject custom scorers. The penalty
+                # multiplies into the score, so a maximally-uncertain
+                # action loses ``uncertainty_penalty`` of its value.
+                penalty = 0.0
+                if self.uncertainty_penalty > 0.0:
+                    unc_fn = getattr(scorer, "uncertainty", None)
+                    if callable(unc_fn):
+                        try:
+                            u = _clamp_unit_score(unc_fn(prm_state, action))
+                            penalty = self.uncertainty_penalty * u
+                        except Exception as exc:
+                            logger.debug(
+                                "MCTS uncertainty probe failed for '%s': %s",
+                                candidate.description[:40], exc,
+                            )
+                candidate.score = _clamp_unit_score(raw_score - penalty)
                 candidate.simulated_outcome = (
-                    f"PRM: p(success)={candidate.score:.2f}"
+                    f"PRM: p(success)={raw_score:.2f}"
+                    + (f" - u·penalty={penalty:.2f}" if penalty > 0 else "")
                 )
             except Exception as exc:
                 logger.debug(

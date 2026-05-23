@@ -705,6 +705,11 @@ class GhostContext:
         # this field is harmless for internal firing. Empty string when
         # no user turn is in flight (e.g. background tasks).
         self.last_user_content = ""
+        # Metacog uplift bundle. None when ``--enable-metacog`` is off
+        # (the default), keeping legacy behaviour unchanged. main.py's
+        # lifespan populates this just after llm_client is wired so the
+        # arbiter's runner/embedder have a live upstream to talk to.
+        self.metacog = None
 
 class GhostAgent:
     def __init__(self, context: GhostContext):
@@ -2255,6 +2260,17 @@ class GhostAgent:
                 request_state = GhostAgent._RequestState(self)
                 profile_context = await request_state.get_profile_str()
 
+                # Metacog: reset per-request arbitration counter so the
+                # MAX_ARBITRATIONS_PER_REQUEST cap is enforced per user
+                # turn, not per agent lifetime. Safe no-op when bundle
+                # is absent.
+                _mc_reset = getattr(self.context, "metacog", None)
+                if _mc_reset is not None:
+                    try:
+                        _mc_reset.reset_arbitration_counter()
+                    except Exception:
+                        pass
+
                 working_memory_context = ""
 
 
@@ -3162,6 +3178,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                     if is_final_generation and stream_response:
                         payload["stream"] = True
+                        # Metacog logprobs opt-in (roadmap phase 2.1). When
+                        # the bundle is wired and the operator has not opted
+                        # out via --metacog-disable-logprobs, ask upstream
+                        # for token-level top_logprobs so the streaming
+                        # consumer can compute rolling Shannon entropy.
+                        # llama.cpp + vLLM both honour the OpenAI-style
+                        # extension; servers that don't recognise it ignore
+                        # the fields. Default top_k=5 matches the entropy
+                        # tracker's K-normalisation.
+                        _mc = getattr(self.context, "metacog", None)
+                        if (_mc is not None and getattr(_mc, "enabled", False)
+                                and getattr(_mc, "logprobs_enabled", False)):
+                            payload.setdefault("logprobs", True)
+                            payload.setdefault("top_logprobs", 5)
                         # Capture outer variables to prevent NameError when finally block deletes them
                         stream_messages_snapshot = list(messages[-10:])
                         stream_tools_snapshot = list(tools_run_this_turn)
@@ -3241,6 +3271,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             )
                             _scrubbed_emitted_len = len(full_content) if _stream_scrub_active else 0
 
+                            # Metacog entropy tracker (roadmap phase 2.2).
+                            # Allocated once per stream; observes one top-K
+                            # logprob vector per chunk that carries one.
+                            # Reading is stashed on the agent context for
+                            # the post-stream composite-confidence check.
+                            _mc_for_stream = getattr(self.context, "metacog", None)
+                            _entropy_tracker = None
+                            if (_mc_for_stream is not None
+                                    and getattr(_mc_for_stream, "enabled", False)
+                                    and getattr(_mc_for_stream, "logprobs_enabled", False)):
+                                try:
+                                    from .entropy import EntropyTracker
+                                    _entropy_tracker = EntropyTracker(window=32, top_k=5)
+                                except Exception as _etx:
+                                    logger.debug("entropy tracker init failed: %s", _etx)
+
                             async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
                                 if loop_detected: break
                                 self.context.last_activity_time = datetime.datetime.now() # Heartbeat
@@ -3262,6 +3308,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 _is_content_chunk = True
                                                 _new_text = delta["content"]
                                                 full_content += _new_text
+                                            # Metacog: pipe top-logprobs into
+                                            # the entropy tracker. Lives in
+                                            # the same try/except as the
+                                            # content decode so a malformed
+                                            # logprobs payload never breaks
+                                            # the stream — the tracker just
+                                            # skips that chunk.
+                                            if _entropy_tracker is not None:
+                                                try:
+                                                    from .entropy import extract_top_logprobs
+                                                    _top_lps = extract_top_logprobs(chunk_data)
+                                                    if _top_lps:
+                                                        _entropy_tracker.observe(_top_lps)
+                                                except Exception as _etxx:
+                                                    logger.debug(
+                                                        "entropy observe failed: %s",
+                                                        _etxx,
+                                                    )
                                 except Exception as e:
                                     logger.debug(f"Stream chunk decode error: {type(e).__name__}")
 
@@ -3410,6 +3474,103 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # [DONE] is yielded elsewhere.
                             if _held_done_chunk is not None:
                                 yield _held_done_chunk
+
+                            # Metacog: stash the final entropy reading on
+                            # the context so the post-turn confidence /
+                            # arbiter step can fuse it with the per-domain
+                            # competence prior. Only stash when we observed
+                            # at least one token's logprobs.
+                            if _entropy_tracker is not None:
+                                try:
+                                    _reading = _entropy_tracker.reading()
+                                    if _reading.n > 0:
+                                        self.context.last_entropy_reading = _reading
+                                        # Composite confidence (roadmap
+                                        # phase 2.4). Fuse entropy with the
+                                        # per-domain competence prior for
+                                        # the most-recently-dispatched tool.
+                                        # The result is logged and stashed
+                                        # on the context so observability
+                                        # and downstream gating share one
+                                        # source of truth. Tool name comes
+                                        # from `fname` if set this turn,
+                                        # otherwise falls back to a global
+                                        # roll-up via domain="other".
+                                        _mc_conf = getattr(self.context, "metacog", None)
+                                        if (_mc_conf is not None
+                                                and getattr(_mc_conf, "confidence", None) is not None
+                                                and getattr(_mc_conf, "competence", None) is not None):
+                                            try:
+                                                from .metacog import _domain_for_tool
+                                                _dom = _domain_for_tool(fname or "")
+                                                _p = _mc_conf.competence.estimate(_dom, fname or None)
+                                                _n = _mc_conf.competence.observations(_dom, fname or None)
+                                                _cr = _mc_conf.confidence.score(
+                                                    normalised_entropy=_reading.norm,
+                                                    competence_p_success=_p,
+                                                    n_observations=_n,
+                                                )
+                                                self.context.last_confidence = _cr
+                                                # Push the reading into the
+                                                # bundle so the mid-turn
+                                                # arbiter gate (consulted
+                                                # at the next tool dispatch)
+                                                # has authoritative state to
+                                                # decide on. Without this
+                                                # push the gate would never
+                                                # fire — it reads from the
+                                                # bundle, not the context.
+                                                try:
+                                                    _mc_conf.record_confidence(_cr)
+                                                    _mc_conf.count(
+                                                        confidence_total=True,
+                                                        confidence_below=_cr.below_threshold,
+                                                    )
+                                                except Exception as _crx:
+                                                    logger.debug(
+                                                        "metacog record_confidence failed: %s",
+                                                        _crx,
+                                                    )
+                                                # Log noise control: per-turn
+                                                # confidence readings are
+                                                # high-volume. We only want
+                                                # INFO for the actionable
+                                                # case (below threshold —
+                                                # the arbiter is now armed
+                                                # for the next mutating
+                                                # dispatch). Above-threshold
+                                                # readings drop to DEBUG so
+                                                # monitoring greps stay
+                                                # signal-rich.
+                                                from .metacog_log import (
+                                                    emit as _mc_emit,
+                                                    Subsystem as _mc_ss,
+                                                    LEVEL_INFO, LEVEL_DEBUG,
+                                                )
+                                                _mc_emit(
+                                                    _mc_ss.CONF,
+                                                    level=(LEVEL_INFO if _cr.below_threshold
+                                                           else LEVEL_DEBUG),
+                                                    below=_cr.below_threshold,
+                                                    C=_cr.composite,
+                                                    entropy=_cr.entropy_component,
+                                                    competence=_cr.competence_component,
+                                                    n=_n,
+                                                    domain=_dom,
+                                                    tool=fname or None,
+                                                    threshold=_cr.threshold,
+                                                )
+                                            except Exception as _cex:
+                                                logger.debug(
+                                                    "metacog confidence score failed: %s",
+                                                    _cex,
+                                                )
+                                        logger.debug(
+                                            "metacog entropy: norm=%.3f (n=%d)",
+                                            _reading.norm, _reading.n,
+                                        )
+                                except Exception as _erx:
+                                    logger.debug("entropy stash failed: %s", _erx)
 
                             if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure:
                                 micro_msgs = []
@@ -5015,6 +5176,85 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 fname = canonical
 
                         if fname in self.available_tools:
+                            # Metacog mid-turn arbiter gate (roadmap phase 3,
+                            # auto-route). Fires only when:
+                            #   * the bundle is enabled and arbiter wired,
+                            #   * the tool is in a mutating-host domain
+                            #     (shell/sql — the irrecoverable kind),
+                            #   * the last composite confidence reading
+                            #     was below threshold,
+                            #   * the per-request arbitration cap (1) is
+                            #     unspent.
+                            # All five gates live on the bundle; this site
+                            # just awaits the decision and acts on it.
+                            _mc_gate = getattr(self.context, "metacog", None)
+                            _gate_decision = None
+                            if _mc_gate is not None and getattr(_mc_gate, "enabled", False):
+                                try:
+                                    _gate_decision = await _mc_gate.arbitrate_tool_calls(
+                                        messages=messages, tool_name=fname,
+                                    )
+                                except Exception as _gex:
+                                    logger.debug(
+                                        "metacog arbiter gate failed: %s", _gex,
+                                    )
+                            if _gate_decision is not None:
+                                # Severity policy: `ask_user` is an
+                                # operational pause — surface as WARN
+                                # so it doesn't get lost in the INFO
+                                # stream. `execute` / `validate` are
+                                # routine.
+                                from .metacog_log import (
+                                    emit as _mc_emit,
+                                    Subsystem as _mc_ss,
+                                    LEVEL_INFO, LEVEL_WARN,
+                                )
+                                _arb_lvl = (
+                                    LEVEL_WARN
+                                    if _gate_decision.action == "ask_user"
+                                    else LEVEL_INFO
+                                )
+                                _mc_emit(
+                                    _mc_ss.ARBITER,
+                                    level=_arb_lvl,
+                                    tool=fname,
+                                    action=_gate_decision.action,
+                                    sim=_gate_decision.similarity,
+                                    candidates=len(_gate_decision.candidates),
+                                    # Full reason — no 80-char truncation;
+                                    # the helper auto-quotes the spaces.
+                                    reason=_gate_decision.reason,
+                                )
+                                if _gate_decision.action == "ask_user":
+                                    # Hard block: skip the dispatch and
+                                    # replace it with a synthetic tool
+                                    # result that surfaces the divergence
+                                    # to the model. The model's next turn
+                                    # will produce a clarification request
+                                    # to the user instead of charging ahead.
+                                    _diag = (
+                                        f"SYSTEM PAUSE — metacog arbiter detected "
+                                        f"ambiguous intent for a {fname} action. "
+                                        f"Two candidate plans diverged "
+                                        f"(sim={_gate_decision.similarity:.2f}) "
+                                        f"and the rule-based validator could not "
+                                        f"pick a clear winner. Reason: "
+                                        f"{_gate_decision.reason}. Ask the user "
+                                        f"to clarify what they want done before "
+                                        f"re-emitting any {fname} call."
+                                    )
+                                    err_msg = {
+                                        "role": "tool",
+                                        "tool_call_id": tool["id"],
+                                        "name": fname,
+                                        "content": _diag,
+                                    }
+                                    messages.append(err_msg)
+                                    tools_run_this_turn.append(
+                                        {**err_msg, "_synthetic": True},
+                                    )
+                                    last_was_failure = True
+                                    continue
                             try:
                                 tool_tasks.append(self.available_tools[fname](**t_args))
                                 tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating))
@@ -5253,6 +5493,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 pass
                             else:
                                 if is_mutating: seen_tools.clear()
+
+                        # Metacog outcome hook (roadmap phase 2.3). Record
+                        # tool success/failure into the per-domain competence
+                        # profile so cross-domain transfer (Level-1) has data
+                        # to compose. Only fires when the bundle is wired.
+                        # ``fname`` is the most-recently-dispatched tool name
+                        # in this loop iteration — set by the enumerate above.
+                        _mc = getattr(self.context, "metacog", None)
+                        if _mc is not None and getattr(_mc, "enabled", False) and fname:
+                            try:
+                                _mc.record_outcome(fname, success=not turn_has_failure)
+                            except Exception as _mcexc:
+                                logger.debug("metacog outcome hook failed: %s", _mcexc)
 
                         if turn_has_failure:
                             # Classify the failure to route to the right budget

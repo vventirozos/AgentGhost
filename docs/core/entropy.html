@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.entropy — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Metacognition uplift</h3>
+    <a class="current" href="entropy.html">entropy</a>
+    <a href="confidence.html">confidence</a>
+    <a href="triggers.html">triggers</a>
+    <a href="arbiter.html">arbiter</a>
+    <a href="../memory/competence.html">memory/competence</a>
+    <a href="../algorithms/metacognition.html">Overview</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / entropy.py — token-level Shannon entropy</h1>
+  <p class="subtitle">Pure-function entropy math + a streaming-friendly rolling tracker. The objective-calibration half of the composite confidence score.</p>
+
+  <h2>Public API</h2>
+  <table>
+    <thead><tr><th>Symbol</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>compute_token_entropy(top_logprobs) -&gt; float</code></td><td>Shannon entropy (nats) of one token's top-K logprobs. Re-normalises the truncation, ignores non-finite inputs.</td></tr>
+      <tr><td><code>normalise_entropy(h, k=5) -&gt; float</code></td><td>Map raw entropy into [0, 1] by dividing by <code>log(K)</code>. <code>K=1</code> is coerced to 2 to avoid divide-by-zero.</td></tr>
+      <tr><td><code>EntropyTracker(window=32, top_k=5)</code></td><td>Rolling-window accumulator. <code>observe(top_lps)</code> per token; <code>reading()</code> returns an <code>EntropyReading</code> (raw mean, normalised, n).</td></tr>
+      <tr><td><code>extract_top_logprobs(chunk) -&gt; list[float] | None</code></td><td>Pulls top-K logprobs out of an OpenAI-compatible streaming chunk. Recognises both <code>logprobs.content[*].top_logprobs</code> and llama.cpp's flat <code>logprobs.top_logprobs</code>. Lenient on shape; returns None on mismatch.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Invariants</h2>
+  <ul>
+    <li>Reading on an empty window: <code>raw=0, norm=0, n=0</code>. Callers can use <code>n == 0</code> as the "no calibration yet" sentinel.</li>
+    <li>Uniform top-K → <code>norm ≈ 1.0</code>; peaked top-K → <code>norm ≈ 0.0</code>.</li>
+    <li>NaN / inf / non-numeric inputs are skipped, not propagated.</li>
+    <li>Logprobs are clamped to <code>[-50, 0]</code> before <code>exp</code> to prevent overflow.</li>
+  </ul>
+
+  <h2>Why no library?</h2>
+  <p>SciPy's <code>entropy</code> would force a numpy dependency on every chunk parse — too expensive on edge. The pure-Python implementation is sub-microsecond per token and dependency-free.</p>
+</main>
+</body>
+</html>

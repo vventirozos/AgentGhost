@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.confidence — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Metacognition uplift</h3>
+    <a href="entropy.html">entropy</a>
+    <a class="current" href="confidence.html">confidence</a>
+    <a href="triggers.html">triggers</a>
+    <a href="arbiter.html">arbiter</a>
+    <a href="../memory/competence.html">memory/competence</a>
+    <a href="../algorithms/metacognition.html">Overview</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / confidence.py — CompositeConfidence</h1>
+  <p class="subtitle">Fuses token-level entropy (one-shot generation signal) and per-domain competence (long-term capability prior) into one tunable confidence score.</p>
+
+  <h2>Formula</h2>
+  <p>
+    <code>C = w_e · (1 - e) + w_c · p</code>, with <code>w_e + w_c = 1</code> enforced and both clamped to [0, 1].
+    When the competence cell has fewer than five observations, <code>p</code> is shrunk toward the neutral 0.5 by a coefficient <code>n / (n + 5)</code>. A fresh agent never radiates overconfidence in a brand-new domain.
+  </p>
+
+  <h2>API</h2>
+  <pre>
+cc = CompositeConfidence(w_entropy=0.5, w_competence=0.5, threshold=0.55)
+r  = cc.score(
+    normalised_entropy=tracker.reading().norm,
+    competence_p_success=profile.estimate("sql", "select"),
+    n_observations=profile.observations("sql", "select"),
+)
+if r.below_threshold:
+    # gate the dual-solver arbiter
+    ...
+  </pre>
+
+  <h2>ConfidenceReading fields</h2>
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>composite</code></td><td>Final C ∈ [0, 1].</td></tr>
+      <tr><td><code>entropy_component</code></td><td><code>1 - e</code> — high when generation was certain.</td></tr>
+      <tr><td><code>competence_component</code></td><td>Post-shrinkage <code>p</code> — the effective domain prior used in the fuse.</td></tr>
+      <tr><td><code>threshold</code></td><td>Echoed for ergonomics.</td></tr>
+      <tr><td><code>below_threshold</code></td><td>Precomputed decision the caller acts on.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Why additive, not geometric?</h2>
+  <p>The two signals are asymmetric: entropy is per-generation; competence is historical. Weighted additive lets operators tune the balance per deployment — an edge build with a thin model raises <code>w_c</code> because token entropy is noisier there.</p>
+</main>
+</body>
+</html>

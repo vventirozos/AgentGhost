@@ -123,6 +123,29 @@ def parse_args():
     # (privacy-sensitive evals, A/B comparisons, etc.).
     parser.add_argument("--no-self-model", action="store_true", help="Disable the selfhood module (autobiographical memory + self-state + narrative). When --no-memory is set, the selfhood module is also disabled regardless of this flag.")
     parser.add_argument("--self-narrative-cooldown", type=int, default=3600, help="Seconds between idle-time narrative consolidations (biological phase 2.8). Default 60 min.")
+    # Metacognition uplift (roadmap phases 1-3). Off by default so the
+    # legacy pre-uplift turn loop is unchanged for callers that don't
+    # opt in. When enabled, the bundle constructed in lifespan wires
+    # eight modules: pre-execution shell/SQL validators, host telemetry
+    # poller, trigger bus + replan bridge, per-domain competence
+    # profile, token-level entropy tracker, composite confidence,
+    # dual-solver arbiter. See docs/algorithms/metacognition.html.
+    parser.add_argument("--enable-metacog", action="store_true", help="Enable the metacognition uplift (validators, host telemetry, competence profile, entropy tracker, composite confidence, dual-solver arbiter, trigger-driven replan).")
+    parser.add_argument("--metacog-confidence-threshold", type=float, default=0.55, help="Composite confidence threshold below which the dual-solver arbiter is invoked. Default 0.55.")
+    parser.add_argument("--metacog-disable-logprobs", action="store_true", help="Skip adding `logprobs=true, top_logprobs=5` to streaming payloads. Use when the upstream LLM server doesn't honour the OpenAI logprobs extension. Disables token-level entropy calibration.")
+    parser.add_argument("--metacog-disable-arbiter", action="store_true", help="Keep the rest of the uplift but skip dual-solver arbitration on low-confidence turns. Useful for cost-sensitive deployments.")
+    # Host telemetry thresholds — operator-tunable because the right
+    # values are deployment-specific (an edge box vs. a fat dev host
+    # vs. a node where the LLM server itself pins RAM at 95% as steady
+    # state). Defaults below stay conservative for the Jetson Nano Orin
+    # target; bump --metacog-mem-high to 97-99 on hosts where the LLM
+    # server normally sits at 90%+ free-RAM-percent so the bridge isn't
+    # spammed with steady-state warnings.
+    parser.add_argument("--metacog-cpu-high", type=float, default=85.0, help="CPU usage %% above which a HostSignal fires (default 85). Sustained crossings escalate severity to warning.")
+    parser.add_argument("--metacog-mem-high", type=float, default=85.0, help="RAM usage %% above which a HostSignal fires (default 85). Raise to 95-99 on hosts where the LLM server pins memory as steady state.")
+    parser.add_argument("--metacog-mem-floor-mb", type=float, default=800.0, help="Hard floor for free RAM in MB (default 800). Crossing emits a critical-severity signal regardless of mem-high.")
+    parser.add_argument("--metacog-disk-high", type=float, default=90.0, help="Disk usage %% above which a HostSignal fires (default 90).")
+    parser.add_argument("--metacog-host-heartbeat-s", type=float, default=300.0, help="Re-emit a steady-state host signal every N seconds even when (metric, severity) hasn't changed. Default 300 (5 min). Prevents 1Hz log spam while keeping a periodic 'still degraded' trail.")
     args = parser.parse_args()
     
     swarm_nodes_list = []
@@ -726,6 +749,97 @@ async def lifespan(app):
     # the chat handler without needing access to the FastAPI app object.
     context.agent = agent
 
+    # Metacognition uplift bundle (roadmap phases 1-3). Constructed
+    # only when --enable-metacog is set; otherwise context.metacog
+    # stays None and every wire-point inside the agent falls through
+    # to the legacy path. The bundle owns its own background poller
+    # (HostTelemetry) which we start now and stop in the finally below.
+    try:
+        from .core.metacog import MetacogBundle
+        context.metacog = MetacogBundle.from_args(context, args)
+        if context.metacog is not None:
+            # Bridge HostSignals to TriggerBus.resource events so the
+            # ReplanBridge picks them up alongside loop / anomaly
+            # events. Keep the import local — no need to pull it in
+            # when the uplift is disabled.
+            from .core.triggers import resource_event
+
+            async def _host_signal_to_bus(sig):
+                # severity is "info" / "warning" / "critical" — same
+                # set the trigger bus uses, so we forward verbatim.
+                metric = "ram"
+                observed = sig.snapshot.mem_percent
+                threshold = 85.0
+                if "free<" in sig.reason:
+                    metric = "ram_floor"
+                elif "CPU" in sig.reason:
+                    metric = "cpu"
+                    observed = sig.snapshot.cpu_percent
+                elif "disk" in sig.reason:
+                    metric = "disk"
+                    observed = sig.snapshot.disk_percent
+                    threshold = 90.0
+                # Pre-uplift this signal was silent — operators couldn't
+                # tell whether the telemetry poller was even running. Now
+                # every signal lands as a structured log line at the
+                # severity-appropriate level so monitoring greps
+                # immediately surface host pressure.
+                from .core.metacog_log import (
+                    emit as _mc_emit, Subsystem as _mc_ss,
+                    LEVEL_INFO, LEVEL_WARN, LEVEL_ERROR,
+                )
+                _lvl = {
+                    "info": LEVEL_INFO,
+                    "warning": LEVEL_WARN,
+                    "critical": LEVEL_ERROR,
+                }.get(sig.severity, LEVEL_INFO)
+                _mc_emit(
+                    _mc_ss.HOST, level=_lvl,
+                    severity=sig.severity, metric=metric,
+                    observed=observed, threshold=threshold,
+                    cpu=sig.snapshot.cpu_percent,
+                    ram=sig.snapshot.mem_percent,
+                    free_mb=int(sig.snapshot.mem_available_mb) if sig.snapshot.mem_available_mb == sig.snapshot.mem_available_mb else None,
+                    reason=sig.reason,
+                )
+                context.metacog.count(
+                    host_signal=True,
+                    host_critical=(sig.severity == "critical"),
+                )
+                await context.metacog.bus.publish(
+                    resource_event(sig.reason, metric=metric,
+                                   observed=observed, threshold=threshold,
+                                   severity=sig.severity)
+                )
+
+            context.metacog.telemetry.subscribe(_host_signal_to_bus)
+            await context.metacog.telemetry.start()
+            from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss
+            _tel = context.metacog.telemetry
+            _mc_emit(
+                _mc_ss.BOOT,
+                state="enabled",
+                threshold=context.metacog.confidence_threshold,
+                logprobs="on" if context.metacog.logprobs_enabled else "off",
+                arbiter="on" if context.metacog.arbiter_enabled else "off",
+                gated_domains=",".join(sorted(context.metacog.GATED_DOMAINS)),
+                cap_per_request=context.metacog.MAX_ARBITRATIONS_PER_REQUEST,
+                cpu_hi=_tel.cpu_high,
+                ram_hi=_tel.mem_high,
+                ram_floor_mb=int(_tel.mem_floor_mb),
+                disk_hi=_tel.disk_high,
+                poll_hz=round(1.0 / _tel.interval_s, 2),
+            )
+        else:
+            from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss, LEVEL_INFO
+            _mc_emit(_mc_ss.BOOT, level=LEVEL_INFO, state="disabled",
+                     reason="--enable-metacog not set")
+    except Exception as _mexc:
+        from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss, LEVEL_ERROR
+        _mc_emit(_mc_ss.BOOT, level=LEVEL_ERROR, state="init_failed",
+                 error=str(_mexc))
+        context.metacog = None
+
     # Single source of truth: store on context (canonical state object).
     # app.state.biological_task is a thin proxy so the lifespan can cancel it.
     context.biological_task = asyncio.create_task(agent.biological_watchdog())
@@ -737,6 +851,19 @@ async def lifespan(app):
     try:
         yield
     finally:
+        # Metacog teardown — stop the telemetry poller and detach the
+        # replan bridge before everything else, so a late-firing
+        # HostSignal can't be misinterpreted during the rest of
+        # shutdown. The bundle's `shutdown()` is idempotent and never
+        # raises.
+        _mc = getattr(context, "metacog", None)
+        if _mc is not None:
+            try:
+                # `shutdown()` itself emits the lifetime summary line;
+                # no extra log here would be redundant.
+                await _mc.shutdown()
+            except Exception as _msx:
+                logger.debug("metacog shutdown error: %s", _msx)
         # Cancel via the canonical reference on context.
         bio = context.biological_task
         if bio is not None:

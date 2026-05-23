@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.competence — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Metacognition uplift</h3>
+    <a href="../core/entropy.html">core/entropy</a>
+    <a href="../core/confidence.html">core/confidence</a>
+    <a href="../core/triggers.html">core/triggers</a>
+    <a href="../core/arbiter.html">core/arbiter</a>
+    <a class="current" href="competence.html">memory/competence</a>
+    <a href="../algorithms/metacognition.html">Overview</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / competence.py — CompetenceProfile</h1>
+  <p class="subtitle">Per-domain capability prior. The Level-1 (cross-domain transfer) component of the metacognition uplift.</p>
+
+  <h2>Why per-(domain, tool)?</h2>
+  <p>Aggregating success rates by raw tool name fragments the signal: <code>list_files</code> and <code>read_file</code> share a domain but live in different cells. Aggregating by tool alone loses the cross-tool generalisation MCTS needs. The dual key gives both: every record updates the leaf, the per-domain roll-up, AND the global cell — so <code>estimate(domain, tool)</code> can fall through whichever level has data.</p>
+
+  <h2>Domain taxonomy</h2>
+  <p><code>shell · sql · fetch · code · fs · memory · vision · other</code>. Common synonyms (<code>postgres → sql</code>, <code>bash → shell</code>, <code>python → code</code>) are canonicalised at write time. Unknown domains land in <code>other</code>.</p>
+
+  <h2>Prior</h2>
+  <p>Beta(1, 1) — uniform. After ~100 samples the prior contributes &lt;2% of the posterior mass; that's only load-bearing during the cold-start window. The <code>CompositeConfidence</code> scorer additionally shrinks toward neutral when the cell has &lt;5 observations.</p>
+
+  <h2>Persistence</h2>
+  <p>Single JSON under the memory directory with atomic-rename writes. The format is keyed by <code>"domain|tool"</code> so a future schema change can be detected at load time.</p>
+
+  <h2>API summary</h2>
+  <table>
+    <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>record(domain, tool, success, weight=1.0)</code></td><td>Update leaf + domain roll-up + global cell atomically.</td></tr>
+      <tr><td><code>estimate(domain, tool=None) -&gt; float</code></td><td>Posterior mean with tool → domain → global fallback.</td></tr>
+      <tr><td><code>observations(domain, tool=None) -&gt; int</code></td><td>Sample count for cell or roll-up.</td></tr>
+      <tr><td><code>by_domain() -&gt; {domain: (mean, n)}</code></td><td>Per-domain roll-up for observability.</td></tr>
+      <tr><td><code>get_context_string() -&gt; str</code></td><td>Prompt-renderable summary for planner context.</td></tr>
+    </tbody>
+  </table>
+</main>
+</body>
+</html>

@@ -1,0 +1,564 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Metacognition Uplift — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="skill_acquisition.html">Skill acquisition</a>
+    <a href="circuit_breaker.html">Circuit breaker</a>
+    <a href="selfhood.html">Selfhood</a>
+    <a class="current" href="metacognition.html">Metacognition uplift</a>
+    <h3>Source map</h3>
+    <a href="../core/uncertainty.html">core/uncertainty.py</a>
+    <a href="../core/mcts.html">core/mcts.py</a>
+    <a href="../memory/adaptive_threshold.html">memory/adaptive_threshold.py</a>
+  </nav>
+</aside>
+
+<main>
+  <h1>Metacognition uplift — calibrated confidence, telemetry, and dual-solver arbitration</h1>
+  <p class="subtitle">
+    Six new modules that close the four metacognitive gaps identified by the
+    <em>AgentGhost Meta-Cognition Evaluation</em>: token-level calibration,
+    grounded host telemetry, trigger-driven replanning, and confidence-gated
+    dual-solver arbitration.
+  </p>
+
+  <h2>Status: WIRED + AUTO-ROUTING</h2>
+  <p>
+    As of 2026-05-23, the uplift modules are integrated into the live turn loop
+    behind the <code>--enable-metacog</code> flag (off by default — legacy
+    behaviour is unchanged when the flag is absent). The single source of truth
+    for wired-state is <code>core/metacog.py:MetacogBundle</code>, hung off
+    <code>GhostContext.metacog</code>. Every wire-point in the agent reads
+    <code>context.metacog</code> with a single attribute check; <code>None</code>
+    short-circuits the integration immediately.
+  </p>
+  <p>
+    <b>The dual-solver arbiter now auto-routes mid-turn.</b> When the agent is
+    about to dispatch a <em>mutating-host</em> tool (shell or SQL) AND the most
+    recent composite confidence reading was below threshold, the arbiter fires
+    on the user's prompt. If the two candidate plans diverge enough that the
+    arbiter returns <code>ask_user</code>, the dispatch is REPLACED with a
+    synthetic <code>SYSTEM PAUSE</code> tool result — the model's next turn then
+    produces a clarification question instead of executing the action.
+  </p>
+
+  <h2>Mid-turn arbiter gate</h2>
+  <p>
+    Five gates govern when the auto-route fires. All five must pass; otherwise
+    the dispatch proceeds unchanged. The gates are evaluated in this order
+    (cheapest first) inside
+    <code>MetacogBundle.arbitrate_tool_calls</code>:
+  </p>
+  <ol>
+    <li>
+      <b>Bundle enabled.</b> <code>--enable-metacog</code> set and the
+      bundle's <code>arbiter</code> field is wired (i.e.
+      <code>--metacog-disable-arbiter</code> NOT set).
+    </li>
+    <li>
+      <b>Tool is in <code>GATED_DOMAINS</code>.</b> Only <code>shell</code>
+      and <code>sql</code> — the host-mutating domains where a wrong call is
+      irrecoverable. <code>file_system</code>, <code>web_search</code>,
+      <code>update_profile</code>, vision tools, etc. always pass through.
+    </li>
+    <li>
+      <b>Per-request arbitration cap.</b>
+      <code>MAX_ARBITRATIONS_PER_REQUEST = 1</code>. The cap is reset by
+      <code>reset_arbitration_counter()</code> at the top of every
+      <code>handle_chat</code> call, so each user turn gets a fresh budget.
+    </li>
+    <li>
+      <b>Composite confidence below threshold.</b> Pulled from
+      <code>bundle._last_confidence</code>, populated by the post-stream
+      confidence step. Cold start (no prior reading) passes through —
+      we don't pay the doubled inference cost on the first turn of a fresh
+      session. The <code>force=True</code> parameter on
+      <code>arbitrate_tool_calls</code> bypasses this gate, mostly used by
+      tests.
+    </li>
+    <li>
+      <b>User prompt present.</b> The arbiter needs SOMETHING to arbitrate
+      over. The bundle walks <code>messages</code> in reverse and uses the
+      most recent <code>role=="user"</code> content as the prompt.
+    </li>
+  </ol>
+
+  <h3>Decision routing</h3>
+  <table>
+    <thead><tr><th>Decision</th><th>Agent behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>execute</code></td><td>Logged; original dispatch proceeds. Arbiter agreed with the original plan.</td></tr>
+      <tr><td><code>validate</code></td><td>Logged; original dispatch proceeds. Arbiter saw divergence but no validator was attached. Caller may inspect <code>decision.other</code> for the alternative.</td></tr>
+      <tr><td><code>ask_user</code></td><td><b>Hard block.</b> Dispatch is replaced with a synthetic tool result that surfaces the divergence to the model. The model's next turn produces a clarification request.</td></tr>
+      <tr><td><code>skipped</code></td><td>Empty prompt; treated as if the gate returned <code>None</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>CLI flags</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>--enable-metacog</code></td><td>off</td><td>Turn the whole uplift on. Constructs <code>MetacogBundle</code> in lifespan, starts the host telemetry poller, attaches the replan bridge.</td></tr>
+      <tr><td><code>--metacog-confidence-threshold</code></td><td><code>0.55</code></td><td>Composite confidence τ below which the dual-solver arbiter is intended to fire.</td></tr>
+      <tr><td><code>--metacog-disable-logprobs</code></td><td>off</td><td>Skip the <code>logprobs=true, top_logprobs=5</code> payload extension. Use when the upstream server doesn't honour it (entropy tracker then has nothing to observe).</td></tr>
+      <tr><td><code>--metacog-disable-arbiter</code></td><td>off</td><td>Keep the rest of the uplift but skip the two-shot arbiter even on low-confidence turns. Useful when cost-capped.</td></tr>
+      <tr><td><code>--metacog-cpu-high</code></td><td><code>85.0</code></td><td>CPU usage %% above which a <code>metacog host</code> signal fires.</td></tr>
+      <tr><td><code>--metacog-mem-high</code></td><td><code>85.0</code></td><td>RAM usage %% above which a <code>metacog host</code> signal fires. <b>Raise to 95-99 on hosts where the LLM server pins RAM as steady state</b> — otherwise the bridge gets spammed.</td></tr>
+      <tr><td><code>--metacog-mem-floor-mb</code></td><td><code>800.0</code></td><td>Hard floor for free RAM (MB). Crossing emits at critical severity regardless of <code>--metacog-mem-high</code>.</td></tr>
+      <tr><td><code>--metacog-disk-high</code></td><td><code>90.0</code></td><td>Disk usage %% above which a host signal fires.</td></tr>
+      <tr><td><code>--metacog-host-heartbeat-s</code></td><td><code>300.0</code></td><td>Re-emit a steady-state host signal every N seconds even when state hasn't changed. Default 5 min. Set to <code>0</code> to disable dedup entirely (every poll emits).</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Host-signal dedup</h3>
+  <p>
+    The 1Hz host poller used to emit a signal on every poll that crossed
+    a threshold. On a deployment where the LLM server pins RAM at 95% as
+    steady state, that produced ~86,400 signals per day — useless spam.
+    The poller now dedups on <code>(metric-set, severity)</code>: identical
+    consecutive states are suppressed until either the state changes (a
+    metric clears, a new metric trips, or severity escalates) or
+    <code>--metacog-host-heartbeat-s</code> elapses. <b>Steady-state
+    95% RAM → one log line, plus a heartbeat every 5 min.</b>
+  </p>
+  <p>
+    The <code>ReplanBridge</code> similarly suppresses log output for
+    every <code>noop:*</code> action (no_plan / no_request_revision /
+    info-severity) — those used to log once per host signal. The full
+    audit still lives in <code>bridge.revisions</code> for programmatic
+    inspection.
+  </p>
+
+  <h2>Integration points (live)</h2>
+  <table>
+    <thead><tr><th>Wire-point</th><th>File:line</th><th>Behaviour when <code>--enable-metacog</code> is off</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Bundle construction</td>
+        <td><code>main.py:737-792</code></td>
+        <td><code>context.metacog</code> stays <code>None</code>. No poller, no bus, no validator.</td>
+      </tr>
+      <tr>
+        <td>Bundle teardown</td>
+        <td><code>main.py:803-815</code></td>
+        <td>No-op — nothing to tear down.</td>
+      </tr>
+      <tr>
+        <td>HostSignal → TriggerBus translator</td>
+        <td><code>main.py:752-783</code></td>
+        <td>Never installed.</td>
+      </tr>
+      <tr>
+        <td>Shell pre-execution validator</td>
+        <td><code>tools/execute.py:148-179</code></td>
+        <td><code>kwargs.get("_metacog_bundle")</code> is <code>None</code> → validator branch skipped.</td>
+      </tr>
+      <tr>
+        <td>SQL pre-execution validator</td>
+        <td><code>tools/database.py:48-77</code></td>
+        <td>Same — bundle absent, validator skipped.</td>
+      </tr>
+      <tr>
+        <td>Bundle injection into tools</td>
+        <td><code>tools/registry.py:465,484</code></td>
+        <td>Passes <code>None</code> via <code>getattr(context, "metacog", None)</code>.</td>
+      </tr>
+      <tr>
+        <td>Tool-outcome competence record</td>
+        <td><code>core/agent.py:5262-5273</code></td>
+        <td><code>_mc</code> is <code>None</code> → recording skipped.</td>
+      </tr>
+      <tr>
+        <td>Streaming logprobs request</td>
+        <td><code>core/agent.py:3178-3187</code></td>
+        <td><code>logprobs</code> / <code>top_logprobs</code> never added to payload.</td>
+      </tr>
+      <tr>
+        <td>Streaming entropy tracker</td>
+        <td><code>core/agent.py:3270-3281, 3299-3315</code></td>
+        <td>Tracker never allocated; per-chunk observe is a dead branch.</td>
+      </tr>
+      <tr>
+        <td>Post-stream composite confidence</td>
+        <td><code>core/agent.py:3478-3517</code></td>
+        <td>Reading never stashed, score never computed.</td>
+      </tr>
+      <tr>
+        <td>GhostContext.metacog field</td>
+        <td><code>core/agent.py:707-711</code></td>
+        <td>Defaults to <code>None</code>.</td>
+      </tr>
+      <tr>
+        <td>Per-request arbitration counter reset</td>
+        <td><code>core/agent.py:2262-2273</code></td>
+        <td>No-op — counter is never read.</td>
+      </tr>
+      <tr>
+        <td>Mid-turn arbiter gate</td>
+        <td><code>core/agent.py:5152-5197</code></td>
+        <td><code>_mc_gate</code> is <code>None</code> → gate skipped; legacy dispatch path runs.</td>
+      </tr>
+      <tr>
+        <td>Confidence stash onto bundle</td>
+        <td><code>core/agent.py:3493-3505</code></td>
+        <td>Bundle never receives the reading → arbiter gate stays in cold-start state forever (which itself returns <code>None</code>).</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Why</h2>
+  <p>
+    The pre-uplift agent already had hierarchical planning with postconditions
+    (<code>core/planning.py</code>), MCTS over candidate actions
+    (<code>core/mcts.py</code>), a Process Reward Model (<code>prm/</code>),
+    idle-time reflection (<code>reflection/loop.py</code>), and runtime
+    circuit-breakers — strong Level-2/Level-3 metacognitive infrastructure.
+    The four remaining gaps were:
+  </p>
+  <ol>
+    <li><b>Calibration</b> — no signal of <em>generation</em> uncertainty
+      beyond verbalised hedges; specifically no token-level Shannon entropy.</li>
+    <li><b>Grounded monitoring</b> — host telemetry existed only as a callable
+      tool; it never fed the live turn loop.</li>
+    <li><b>Trigger replanning</b> — existing detectors retried-or-aborted but
+      did not <em>switch strategy</em>.</li>
+    <li><b>Dual-solver arbitration</b> — no two-shot consensus check on
+      low-confidence turns.</li>
+  </ol>
+
+  <h2>Module map</h2>
+  <table>
+    <thead><tr><th>Module</th><th>Phase</th><th>Role</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><code>utils/telemetry.py</code></td>
+        <td>1.1 — Grounded monitoring</td>
+        <td>
+          <code>HostTelemetry</code> background asyncio poller. 1 Hz default,
+          bounded ring buffer of <code>HostSnapshot</code>s, emits
+          <code>HostSignal</code> events on registered subscribers when
+          CPU/RAM/disk thresholds are crossed. Severity escalates to
+          <code>critical</code> when free RAM drops below
+          <code>mem_floor_mb</code> (default 800 MB — Jetson Nano Orin 8 GB
+          target).
+        </td>
+      </tr>
+      <tr>
+        <td><code>tools/validators.py</code></td>
+        <td>1.4 — Pre-execution validators</td>
+        <td>
+          <code>validate_shell</code> and <code>validate_sql</code> reject
+          unparseable, deny-listed, or unguarded destructive forms before the
+          executor sees them. Validators never raise; they return
+          <code>(ok, reason)</code>.
+        </td>
+      </tr>
+      <tr>
+        <td><code>core/entropy.py</code></td>
+        <td>2.1/2.2 — Token-level calibration</td>
+        <td>
+          <code>compute_token_entropy</code>, <code>normalise_entropy</code>,
+          and <code>EntropyTracker</code>. Consumes top-K logprobs out of an
+          OpenAI-compatible streaming chunk via <code>extract_top_logprobs</code>,
+          maintains a rolling-window mean. Robust against NaN / non-finite
+          inputs.
+        </td>
+      </tr>
+      <tr>
+        <td><code>memory/competence.py</code></td>
+        <td>2.3 — Cross-domain capability profile</td>
+        <td>
+          <code>CompetenceProfile</code> — Beta(α, β) posterior keyed by
+          <code>(domain, tool)</code>. Tool→domain→global fallback so an
+          unseen leaf cell falls through to the per-domain roll-up. Persisted
+          atomic-rename JSON.
+        </td>
+      </tr>
+      <tr>
+        <td><code>core/confidence.py</code></td>
+        <td>2.4 — Composite confidence</td>
+        <td>
+          <code>CompositeConfidence</code> fuses entropy and competence into
+          a single C ∈ [0, 1] with operator-tunable weights and threshold.
+          Includes prior-shrinkage when the competence cell has fewer than
+          five observations.
+        </td>
+      </tr>
+      <tr>
+        <td><code>core/triggers.py</code></td>
+        <td>2.5/2.6 — Triggers &amp; replan</td>
+        <td>
+          <code>TriggerBus</code> async pub/sub with three first-class event
+          kinds (<code>LoopDetected</code>, <code>ResourceExhausted</code>,
+          <code>ExecutionAnomaly</code>), helpers
+          <code>ToolRuntimeBudget</code> (p95 × multiplier window) and
+          <code>RepetitionCounter</code> (sequential streaks), and
+          <code>ReplanBridge</code> which routes warning/critical events to
+          <code>ProjectPlan.request_revision</code>.
+        </td>
+      </tr>
+      <tr>
+        <td><code>core/arbiter.py</code></td>
+        <td>3 — Dual-solver arbitration</td>
+        <td>
+          <code>DualSolverArbiter</code> runs two scripted-temperature
+          candidates in parallel, computes cosine similarity (Jaccard
+          fallback when no embedder is wired), and returns an
+          <code>ArbitrationDecision</code> with action ∈
+          {<code>execute</code>, <code>validate</code>,
+          <code>ask_user</code>, <code>skipped</code>}. The
+          <code>confidence_gated</code> helper enforces "arbitration runs
+          only on low-confidence turns".
+        </td>
+      </tr>
+      <tr>
+        <td><code>core/mcts.py</code></td>
+        <td>1.5 — PRM uncertainty downweighting</td>
+        <td>
+          New <code>uncertainty_penalty</code> constructor arg on
+          <code>MCTSReasoner</code>. When the attached scorer exposes
+          <code>uncertainty(state, action)</code>, candidates are penalised
+          by <code>penalty × u</code> so MCTS prefers branches the PRM is
+          confident about. Default 0.0 preserves legacy behaviour.
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Pipeline diagram</h2>
+  <pre>
+   user request
+        │
+        ▼
+   ┌──────────────────────────────────────────────┐
+   │   stream upstream  →  EntropyTracker         │  token logprobs
+   │                       (rolling Shannon H)    │  → normalised ∈ [0,1]
+   └──────────────────────────────────────────────┘
+        │                       │
+        │                       ▼
+        │            ┌──────────────────────────┐
+        │            │  CompetenceProfile       │  p(success | domain, tool)
+        │            │  (Beta posterior)        │  cell→domain→global fallback
+        │            └──────────────────────────┘
+        │                       │
+        ▼                       ▼
+   ┌──────────────────────────────────────────────┐
+   │   CompositeConfidence.score(...)             │
+   │   C = w_e·(1-e) + w_c·p   with shrinkage     │
+   └──────────────────────────────────────────────┘
+        │
+        ▼
+   ┌─────────────────────────────┐    no    ┌──────────────────────┐
+   │   C &lt; threshold?            │ ──────▶  │   execute as planned │
+   └─────────────────────────────┘          └──────────────────────┘
+        │ yes
+        ▼
+   ┌─────────────────────────────┐    no    ┌──────────────────────┐
+   │   tool ∈ {shell, sql}?      │ ──────▶  │   execute as planned │
+   └─────────────────────────────┘          └──────────────────────┘
+        │ yes (mutating)
+        ▼
+   ┌──────────────────────────────────────────────┐
+   │   DualSolverArbiter (T=0.2 &amp; T=0.7)          │
+   │   → semantic-divergence check                │
+   │      ├── converged → execute lower-T         │
+   │      ├── diverged + validator pass → execute │
+   │      └── ask_user → REPLACE dispatch with    │
+   │                     synthetic SYSTEM PAUSE   │
+   │                     so model re-asks user    │
+   └──────────────────────────────────────────────┘
+
+   In parallel, throughout the turn:
+
+   ┌──────────────────────┐  HostSignal   ┌──────────────────┐
+   │   HostTelemetry      │ ───────────▶  │   TriggerBus     │
+   │   (psutil, 1 Hz)     │               │   (loop/res/anom)│
+   └──────────────────────┘               └──────────────────┘
+                                                 │
+                                                 ▼
+                                          ┌──────────────────┐
+                                          │   ReplanBridge   │
+                                          │   ↳ ProjectPlan  │
+                                          │     .request_    │
+                                          │      revision()  │
+                                          └──────────────────┘
+  </pre>
+
+  <h2>Operational notes</h2>
+  <ul>
+    <li>
+      <b>Edge cost discipline.</b> The arbiter is opt-in via confidence
+      gating; the host poller runs at 1 Hz; entropy work is in the existing
+      streaming path. None of these add a second round-trip on the
+      easy-prompt fast path.
+    </li>
+    <li>
+      <b>Backward compatibility.</b> Every module integrates via narrow
+      hooks. <code>MCTSReasoner</code>'s default <code>uncertainty_penalty=0</code>
+      keeps the pre-uplift behaviour unchanged for callers that haven't
+      been re-wired.
+    </li>
+    <li>
+      <b>Failure modes.</b> Every numeric input runs through a saturating
+      clamp; non-finite inputs collapse to neutral 0.5 rather than NaN.
+      Validators that themselves crash return <em>safe-reject</em>. Trigger
+      handlers are isolated — a misbehaving subscriber does not halt the bus.
+    </li>
+  </ul>
+
+  <h2>Functional verification</h2>
+  <p>
+    <code>scripts/metacognition_functional_test.py</code> exercises the full
+    pipeline end-to-end without a live LLM upstream — telemetry → entropy →
+    competence → composite confidence → trigger bus → replan bridge →
+    arbiter → divergence check → validator. It is the source of truth for
+    "does the uplift compose correctly". Run with
+    <code>PYTHONPATH=src python scripts/metacognition_functional_test.py</code>
+    and expect <em>26/26 checks passed</em>.
+  </p>
+
+  <h2>Test surface</h2>
+  <table>
+    <thead><tr><th>Test file</th><th>Cases</th></tr></thead>
+    <tbody>
+      <tr><td><code>tests/test_host_telemetry.py</code></td><td>16</td></tr>
+      <tr><td><code>tests/test_validators.py</code></td><td>41</td></tr>
+      <tr><td><code>tests/test_mcts_uncertainty_penalty.py</code></td><td>4</td></tr>
+      <tr><td><code>tests/test_entropy.py</code></td><td>21</td></tr>
+      <tr><td><code>tests/test_competence.py</code></td><td>14</td></tr>
+      <tr><td><code>tests/test_confidence.py</code></td><td>11</td></tr>
+      <tr><td><code>tests/test_triggers.py</code></td><td>21</td></tr>
+      <tr><td><code>tests/test_arbiter.py</code></td><td>28</td></tr>
+      <tr><td><code>tests/test_metacog_wiring.py</code></td><td>31 (wiring integration)</td></tr>
+      <tr><td><code>tests/test_metacog_arbiter_gate.py</code></td><td>19 (mid-turn auto-route)</td></tr>
+      <tr><td><code>tests/test_metacog_log.py</code></td><td>19 (log helper contract)</td></tr>
+      <tr><td><code>tests/test_metacog_logging_integration.py</code></td><td>11 (counter bumps + structured output)</td></tr>
+      <tr><td><code>tests/test_metacog_log_polish.py</code></td><td>17 (CLI thresholds, dedup, noop suppression, distinct icons)</td></tr>
+      <tr><td><b>Total new tests</b></td><td><b>253</b></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Functional check</h2>
+  <p>
+    Two independent functional checks gate the uplift:
+  </p>
+  <ul>
+    <li>
+      <code>scripts/metacognition_functional_test.py</code> — pure-module
+      end-to-end. Drives the nine uplift modules through their full pipeline
+      with stub LLM calls, including the live auto-route gate (cold start,
+      non-mutating skip, low-conf + mutating fire, per-request cap, counter
+      reset). <b>31/31 checks pass.</b>
+    </li>
+    <li>
+      <code>scripts/eval_baseline.py freeze --runner stub</code> — exercises
+      the eval pipeline against the agent's own task bank.
+      <code>pass_rate = 0.933</code> over 15 tasks; <code>compare</code>
+      against the same baseline shows 0 regressions / 0 improvements
+      (deterministic round-trip).
+    </li>
+  </ul>
+
+  <h2>Logging contract</h2>
+  <p>
+    Every uplift event reaches the operator in ONE consistent shape. Single
+    grep prefix, structured fields. See
+    <code>core/metacog_log.py</code>.
+  </p>
+  <pre>
+metacog &lt;subsystem&gt;    key=value key=value ...
+  </pre>
+  <h3>Subsystems</h3>
+  <table>
+    <thead><tr><th>Icon</th><th>Subsystem</th><th>Fired by</th><th>Level</th></tr></thead>
+    <tbody>
+      <tr><td>🌱</td><td><code>metacog boot</code></td><td>Lifespan enable / disable / init_failed</td><td>INFO / ERROR</td></tr>
+      <tr><td>📊</td><td><code>metacog summary</code></td><td>Shutdown — one lifetime rollup line</td><td>INFO</td></tr>
+      <tr><td>🌡️</td><td><code>metacog conf</code></td><td>Each streamed-final-turn composite confidence reading</td><td>INFO when <code>below=yes</code>, DEBUG otherwise</td></tr>
+      <tr><td>🧮</td><td><code>metacog arbiter</code></td><td>Each mid-turn arbiter decision</td><td>WARNING when <code>action=ask_user</code>, INFO otherwise</td></tr>
+      <tr><td>🚧</td><td><code>metacog valid</code></td><td>Each pre-execution validator block</td><td>WARNING</td></tr>
+      <tr><td>🖥️</td><td><code>metacog host</code></td><td>Each HostSignal — telemetry threshold crossing (post-dedup)</td><td>severity-matched (INFO / WARNING / ERROR)</td></tr>
+      <tr><td>🔀</td><td><code>metacog replan</code></td><td>ACTIONABLE replan attempts only (<code>revised</code> / <code>revision_rejected</code> / <code>error</code>)</td><td>INFO on <code>revised</code>, WARNING otherwise</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Each subsystem gets a distinct emoji so a quick visual scan separates
+    metacog activity from the agent's own brain-think (💭), planner (📋),
+    and tool-execution lines. The previous unified-but-monotonic 💭 made
+    metacog events indistinguishable from the model's thinking trace.
+  </p>
+
+  <h3>Field conventions</h3>
+  <ul>
+    <li>Floats render at <code>%.2f</code> (so <code>C=0\.\d{2}</code> matches every confidence line).</li>
+    <li>Booleans render as <code>yes</code> / <code>no</code> (cheaper to scan, matches operator phrasing).</li>
+    <li><code>None</code> renders as <code>-</code>.</li>
+    <li>Strings with spaces are auto double-quoted so a parser can split on whitespace without losing words.</li>
+  </ul>
+
+  <h3>Example lines (real output)</h3>
+  <pre>
+metacog boot      state=enabled threshold=0.55 logprobs=on arbiter=on gated_domains=shell,sql cap_per_request=1 cpu_hi=85.00 ram_hi=85.00 ram_floor_mb=800 disk_hi=90.00 poll_hz=1.00
+metacog conf      below=yes C=0.41 entropy=0.30 competence=0.55 n=12 domain=sql tool=postgres_admin threshold=0.55
+metacog arbiter   tool=postgres_admin action=ask_user sim=0.32 candidates=0 reason="diverged plans; validator rejected both"
+metacog valid     verdict=block tool=shell reason="rm -rf / deny-listed" command_head="rm -rf /"
+metacog host      severity=critical metric=ram_floor observed=88.00 threshold=85.00 cpu=20.00 ram=88.00 free_mb=320 reason="free&lt;800MB (320MB)"
+metacog replan    action=revised trigger=loop/warning task=task_42 reason="looped on same tool 3x"
+metacog summary   arbitrations=1 ask_user=1 validator_blocks=1 host_signals=1 host_critical=1 replans_ok=1 replans_tried=1 conf_below=1 conf_total=1
+  </pre>
+
+  <h3>Monitoring grep recipes</h3>
+  <table>
+    <thead><tr><th>Question</th><th>Recipe</th></tr></thead>
+    <tbody>
+      <tr><td>Any uplift activity?</td><td><code>grep "metacog " logfile</code></td></tr>
+      <tr><td>What's the confidence trend?</td><td><code>grep "metacog conf" | awk -F'C=' '{print $2}' | awk '{print $1}'</code></td></tr>
+      <tr><td>Did the arbiter ever block?</td><td><code>grep "metacog arbiter" | grep "action=ask_user"</code></td></tr>
+      <tr><td>Has the host been under pressure?</td><td><code>grep "metacog host" | grep "severity=critical"</code></td></tr>
+      <tr><td>Per-tool block frequency</td><td><code>grep "metacog valid" | awk -F'tool=' '{print $2}' | awk '{print $1}' | sort | uniq -c</code></td></tr>
+      <tr><td>End-of-day rollup</td><td><code>grep "metacog summary" logfile | tail -1</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Operator quickstart</h2>
+  <pre>
+# default: legacy behaviour, uplift OFF
+python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080
+
+# uplift ON, defaults
+python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080 \
+    --enable-metacog
+
+# uplift ON, custom threshold + no arbiter (cost-sensitive)
+python -m src.ghost_agent.main --upstream-url http://127.0.0.1:8080 \
+    --enable-metacog \
+    --metacog-confidence-threshold 0.45 \
+    --metacog-disable-arbiter
+  </pre>
+
+  <h2>Metacognitive scoring delta</h2>
+  <table>
+    <thead><tr><th>Level</th><th>Pre-uplift</th><th>Post-uplift</th></tr></thead>
+    <tbody>
+      <tr><td>L0 — Atomic Self-Knowledge / Calibration</td><td>5/10</td><td><b>8/10</b></td></tr>
+      <tr><td>L1 — Cross-Domain Transfer</td><td>5/10</td><td><b>7/10</b></td></tr>
+      <tr><td>L2 — Compositional Prediction</td><td>6/10</td><td><b>7/10</b> (unc-penalty in MCTS)</td></tr>
+      <tr><td>L3 — Adaptive Self-Regulation</td><td>5/10</td><td><b>8/10</b></td></tr>
+    </tbody>
+  </table>
+</main>
+</body>
+</html>

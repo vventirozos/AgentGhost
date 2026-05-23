@@ -48,6 +48,42 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
     if query:
         query = extract_code_from_markdown(query)
 
+    # Metacog pre-execution SQL validator (roadmap phase 1.4). Only
+    # active when the bundle is wired (i.e. ``--enable-metacog`` set).
+    # Validator rejects unparseable SQL, unguarded DELETE/UPDATE, and
+    # raw DROP/TRUNCATE before the connection is even opened. We only
+    # validate the `query` and `explain_analyze` actions because
+    # `schema` and `activity` go through hand-crafted SQL on lines
+    # 62-83 that never sees user content.
+    _metacog = kwargs.get("_metacog_bundle")
+    if (_metacog is not None and getattr(_metacog, "enabled", False)
+            and query and action in ("query", "explain_analyze")):
+        try:
+            from .validators import validate_sql
+            from ..core.metacog_log import (
+                emit as _mc_emit, Subsystem as _mc_ss, LEVEL_WARN,
+            )
+            ok, reason = validate_sql(query)
+            if not ok:
+                _mc_emit(
+                    _mc_ss.VALID, level=LEVEL_WARN,
+                    verdict="block", tool="sql",
+                    action=action, reason=reason,
+                    sql_head=query[:60],
+                )
+                try:
+                    _metacog.count(validator_block=True)
+                except Exception:
+                    pass
+                return (
+                    f"SYSTEM BLOCK: SQL statement rejected by pre-execution "
+                    f"validator: {reason}. The query was not run. Re-emit with "
+                    f"a WHERE clause, or set `confirm=true` if you genuinely "
+                    f"need to drop/truncate."
+                )
+        except Exception as _vexc:
+            logger.debug("metacog SQL validator crashed: %s", _vexc)
+
     # Default timeout: 15s, but allow override for complex queries
     effective_timeout = timeout_ms or 15000
 
