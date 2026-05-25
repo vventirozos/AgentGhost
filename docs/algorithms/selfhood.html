@@ -45,6 +45,26 @@
     <strong>2026-05 continuity upgrade.</strong> Five enhancements closed the open loops in the original design: an agent-callable <code>self_state</code> tool (the agent authors its own forward-state), IDF-weighted query-relevant recall, verdict backfill so self-memory is outcome-aware, a meta-cognitive narrative, and a wired <code>cluster</code> field for self-pattern detection. The previously documented "no agent-side state-mutation tool" limitation is resolved.
   </div>
 
+  <div class="note">
+    <strong>2026-05-23 hardening pass.</strong> Fourteen targeted fixes against issues surfaced by reading the live <code>autobiographical.jsonl</code> + <code>narrative.md</code> on disk:
+    <ul>
+      <li><strong>Verdict backfill on user corrections</strong> — the user-correction promotion path now propagates <code>FAILED</code> into the autobio log, not only into the trajectory sidecar. Prior memory was verdict-blind on this branch.</li>
+      <li><strong>Diary sanitiser</strong> — <code>sanitise_meta_insights()</code> strips raw tracebacks, <code>[ATTEMPT_ABORTED_THINKING_LOOP]</code> markers, file paths, and system banners before the LLM diary prompt. Stops "RECENT MISTAKES" from leaking machine noise into the first-person voice.</li>
+      <li><strong>Template-prompt rollup</strong> — repeated banners (<code>### SYNTHETIC TRAINING EXERCISE</code>, <code>SYSTEM JUDGE REJECTION</code>, <code>AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR</code>, self-repeating-loop alerts) collapse into a single counter-bumping record instead of flooding the log with near-duplicates.</li>
+      <li><strong>Deprecated <code>utcnow()</code> replaced</strong> — schema timestamps now use <code>datetime.now(UTC)</code>; the trailing <code>Z</code> is preserved so existing records stay parse-compatible.</li>
+      <li><strong><code>user_handle</code> wired</strong> — pulled from <code>profile_memory.root.name</code> when present, populated on every <code>capture_turn</code> call.</li>
+      <li><strong>Stale open-question gardener</strong> — <code>SelfStateThread.stale_open_questions(max_age_days)</code> and a matching facade so an idle hook can surface questions that have been carrying for too long without engagement.</li>
+      <li><strong><code>meta</code> introspection cluster</strong> — new keyword bin for consciousness / self-aware / attention / phenomenology / mood / identity prompts; previously these landed in <code>cluster=None</code>.</li>
+      <li><strong>Narrative blends recent + relevant past</strong> — when the agent has open questions, the diary regeneration prompt mixes IDF-retrieved older relevant entries with the recent slice. The diary window is no longer trapped inside the 12-entry recency floor.</li>
+      <li><strong>Session-boundary markers</strong> — <code>mark_session_boot()</code> writes a synthetic boot record with <code>outcome="boot"</code> / <code>cluster="meta"</code>; dedupes within the same minute so crash-restart loops don't flood the log.</li>
+      <li><strong>Mood history JSONL</strong> — every <code>set_mood</code> appends to <code>mood.history.jsonl</code>; <code>mood_history()</code> returns the tail. Lets the diary describe arcs ("I shifted from stuck to satisfied") rather than only the latest slot.</li>
+      <li><strong>PII redaction</strong> — emails, phone numbers, API keys, and credit-card numbers are scrubbed at the capture boundary so both <code>user_first_words</code> and the quoted-prompt portion of the summary stay clean.</li>
+      <li><strong>IDF cache</strong> — <code>search_my_past</code> now caches the (mtime, size)-keyed document-frequency table; subsequent queries skip the full-file rescan.</li>
+      <li><strong>Prefix-utility tracker</strong> — <code>detect_referenced_experiences()</code> + per-experience counter in <code>reference_counts.json</code>. The agent's next phase can prefer memories that have actually been engaged with, and the falsification probes get a hard signal for "memory was useful".</li>
+      <li><strong>Probe wrapper script</strong> — <code>scripts/run_selfhood_probes.sh</code> packages the falsification probes into a single cron-friendly invocation that writes dated summaries under <code>$GHOST_HOME/system/selfhood/probes/</code>.</li>
+    </ul>
+  </div>
+
   <p>Implementation lives entirely in <code>src/ghost_agent/selfhood/</code>. The agent reads it through a single <code>context.self_model</code> facade — call sites never branch on availability.</p>
 
   <h2>Module shape</h2>
@@ -74,10 +94,15 @@
 
   <h2>Storage layout</h2>
   <pre><code>$GHOST_HOME/system/selfhood/
-    autobiographical.jsonl    Append-only diary entries (one per turn)
+    autobiographical.jsonl    Append-only diary entries (one per turn,
+                              with template-rollup records and synthetic
+                              boot markers)
     state.json                Single-file self-state (open Qs, mood, …)
     narrative.md              Latest running first-person summary
-    narrative.history.jsonl   Audit trail of every narrative regenerated</code></pre>
+    narrative.history.jsonl   Audit trail of every narrative regenerated
+    mood.history.jsonl        Append-only mood transitions (every set_mood)
+    reference_counts.json     Per-experience prefix-utility counters
+    probes/                   Dated summaries from scripts/run_selfhood_probes.sh</code></pre>
   <p><code>$GHOST_HOME/system/selfhood/</code> mirrors the shape of <code>$GHOST_HOME/system/memory/</code> — same parent directory, same non-sandboxed location (the autobiographical record survives sandbox wipes / <code>docker volume rm</code>).</p>
 
   <h2>The capture path (per turn)</h2>
@@ -196,11 +221,22 @@ hits = sm.recall_relevant("postgres index tuning", limit=5)
 # Biological phase 2.8 (idle window) — meta-cognitive narrative:
 text = await sm.consolidate_narrative(meta_insights=skill_memory.get_recent_failures())
 
+# Session-boundary marker — write once on process boot:
+sm.mark_session_boot()
+
+# Detect & count which past experiences shaped the agent's reply
+# (prefix-utility tracking, 2026-05-23):
+n = sm.note_referenced_experiences(prefix_text=prefix, response_text=reply)
+
+# Idle hook: which open questions have I been carrying too long?
+stale = sm.stale_open_questions(max_age_days=3.0)
+
 # State-thread mutations — the agent reaches these through the
 # `self_state` tool; Python callers can still use them directly:
 sm.state.note_open_question("Why does X happen?")
 sm.state.add_unfinished("write the consciousness essay")
 sm.state.set_mood("curious", "just saw a new paper")
+hist = sm.state.mood_history(limit=10)   # arcs, not just latest
 
 # Introspection:
 sm.stats()  # → {experience_count, open_questions, last_mood, narrative_present, clusters, …}</code></pre>
@@ -232,8 +268,40 @@ sm.stats()  # → {experience_count, open_questions, last_mood, narrative_presen
     <li><code>test_selfhood_biological_phase.py</code> — phase 2.8 cooldown anchor, idle-window gating, exception path, override flag, activity-clock invariant</li>
     <li><code>test_selfhood_continuity_enh.py</code> — cluster derivation, outcome backfill, IDF recall, query-aware wake-up, meta-cognitive narrative</li>
     <li><code>test_selfhood_self_state_tool.py</code> — the <code>self_state</code> tool: question/thread/mood lifecycle, graceful disable, arg validation</li>
+    <li><code>test_selfhood_enhancements.py</code> — 2026-05-23 bundle: verdict backfill, diary sanitiser, template rollup, <code>utcnow</code> shape, <code>user_handle</code> propagation, stale-question gardener, meta cluster, recent+relevant blend, boot markers, mood history, PII redaction, IDF cache, prefix-utility tracker</li>
+    <li><code>test_run_selfhood_probes_script.py</code> — smoke test for <code>scripts/run_selfhood_probes.sh</code> (executable, references both probes, writes a summary file)</li>
   </ul>
   <p>Functional test harness at <code>scripts/run_selfhood_functional.sh</code> + <code>scripts/selfhood_functional_test.py</code> orchestrates a three-phase end-to-end run. See <a href="selfhood_functional_report.html">the functional test report</a> for the full results.</p>
+  <p>Falsification probes (<code>scripts/consciousness_probe.py</code>, <code>scripts/introspective_consistency.py</code>) are bundled by <code>scripts/run_selfhood_probes.sh</code>, which writes dated text summaries under <code>$GHOST_HOME/system/selfhood/probes/</code>. The wrapper is cron-friendly: a fixed cadence makes drift in the selfhood substrate observable rather than anecdotal.</p>
+
+  <h2>Hardening-pass details (2026-05-23)</h2>
+
+  <h3>Diary sanitiser</h3>
+  <p><code>narrative.sanitise_meta_insights()</code> removes raw tracebacks, abort markers (e.g. <code>[ATTEMPT_ABORTED_THINKING_LOOP]</code>), file-and-line locations, and recognised system banners before the <code>meta_insights</code> payload is spliced into the diary prompt. Without it, the LLM faithfully echoed the noise into the agent's first-person voice — a voice-breaking failure mode visible on the live <code>narrative.md</code> at the time of the audit.</p>
+
+  <h3>Template-prompt rollup</h3>
+  <p>Repeating system-generated banners are no longer one autobio record per occurrence. <code>_bump_template_rollup()</code> scans the last five records and, if the tail is already a rollup for the same marker, increments its counter, refreshes the tool union, and rewrites the summary as "I worked on N of my recurring &lt;label&gt; in a row." This stops the 53% template-prompt floor observed on the live log from drowning the narrative regeneration in near-duplicates.</p>
+
+  <h3>Verdict backfill on user corrections</h3>
+  <p>The user-correction promotion path in <code>core/agent.py</code> already updated the trajectory log via <code>collector.update_outcome</code>. It now also calls <code>self_model.record_outcome</code>, so the autobio entry is rewritten from <code>unknown</code> to <code>failed</code> and the prose verdict clause is swapped in place.</p>
+
+  <h3>Session-boundary marker</h3>
+  <p><code>SelfModel.mark_session_boot()</code> writes a synthetic <code>Experience(outcome="boot", cluster="meta", summary="Session resumed (last active …).")</code>. The same-minute dedup short-circuit prevents crash-restart loops from flooding the log with boot events.</p>
+
+  <h3>Mood history</h3>
+  <p><code>SelfStateThread.set_mood()</code> appends a JSONL line to <code>mood.history.jsonl</code> on top of the latest-slot write to <code>state.json</code>. <code>mood_history(limit=N)</code> returns the tail. The narrative phase can use this to describe arcs ("I shifted from stuck to satisfied after the third attempt") rather than only the latest mood label.</p>
+
+  <h3>PII redaction</h3>
+  <p><code>autobiographical.redact_pii()</code> is applied at the capture boundary in <code>SelfModel.capture_turn</code>. Both the stored <code>user_first_words</code> prefix AND the verbatim quote of the user request inside the summary template route through the same scrubber, so emails / phone numbers / API keys / credit-card numbers never reach the on-disk diary.</p>
+
+  <h3>IDF cache</h3>
+  <p><code>AutobiographicalMemory._search_index()</code> caches the (experiences, haystacks, df-table) tuple keyed on the file's (mtime, size). A fresh append on disk auto-invalidates the cache. Cuts the per-query full-file rescan that <code>search_my_past</code> previously paid on every call.</p>
+
+  <h3>Prefix-utility tracker</h3>
+  <p>The detector <code>detect_referenced_experiences(prefix_text, response_text, experiences)</code> is a pure function: it returns the ids of experiences whose summary shares a non-stopword trigram with the agent's response. Bumping the per-id counter through <code>SelfModel.note_referenced_experiences()</code> persists into <code>reference_counts.json</code>, giving downstream consumers a concrete signal for "this memory shaped the reply" — useful both as a relevance prior for future retrieval and as a falsification anchor for the consciousness probes.</p>
+
+  <h3>Probe wrapper</h3>
+  <p><code>scripts/run_selfhood_probes.sh</code> is the cron-friendly entry point: it locates the falsification probes via <code>$SELFHOOD_REPO</code> (defaults to the agent repo), tees both stdout streams into <code>$GHOST_HOME/system/selfhood/probes/probes-YYYYMMDD-HHMMSS.txt</code>, and exits 0 unless a probe is missing. Failing probes are findings, not wrapper errors.</p>
 
   <h2>Honest limitations</h2>
   <ul>

@@ -31,7 +31,7 @@ import threading
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional
 
-from .schema import Experience
+from .schema import Experience, _utcnow_iso
 
 logger = logging.getLogger("GhostSelfhood")
 
@@ -59,7 +59,92 @@ _CLUSTER_KEYWORDS = {
     "self_play": ("synthetic training", "self-play", "self play", "challenge",
                   "exercise"),
     "math": ("calculate", "compute", "equation", "arithmetic", "number"),
+    # Introspection / philosophy bin. Previously a turn like "are you
+    # self-aware?" would land in cluster=None because no engineering
+    # keyword matched. The selfhood module's own subject matter
+    # deserves its own bin so the narrative can say "I keep returning
+    # to questions about my own attention" instead of treating each
+    # such turn as unique.
+    "meta": ("consciousness", "self-aware", "self aware", "attention",
+             "phenomenology", "introspect", "introspection", "identity",
+             "subjective", "qualia", "mood", "feel", "experience",
+             "what it's like", "first-person", "self-model", "selfhood"),
 }
+
+
+# Templates whose user prompt is system-generated and effectively
+# identical across many turns. Capturing each one as its own
+# autobiographical record floods the diary with near-duplicates and
+# starves the narrative regeneration of variety. We roll them up
+# instead: only the first occurrence inside a short window writes a
+# full record; subsequent ones bump a counter on the rollup.
+_TEMPLATE_PROMPT_MARKERS = (
+    "### SYNTHETIC TRAINING EXERCISE",
+    "SYSTEM JUDGE REJECTION",
+    "AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR",
+    "SYSTEM ALERT: Your previous turn entered a self-repeating",
+)
+
+
+def _template_marker_for(text: str) -> Optional[str]:
+    """Return the marker that matches the start of ``text``, or None.
+
+    Match is on the leading prefix because system templates always
+    place their banner at the head of the user message."""
+    if not text:
+        return None
+    head = text.lstrip()[:120]
+    for marker in _TEMPLATE_PROMPT_MARKERS:
+        if head.startswith(marker):
+            return marker
+    return None
+
+
+# PII redaction. We only run this against ``user_first_words`` (the
+# short prompt prefix stored on every record) because the rest of the
+# Experience is agent-generated prose. Patterns are deliberately
+# conservative — false positives in the diary cost more than a missed
+# leak does.
+_EMAIL_RE = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+)
+_PHONE_RE = re.compile(
+    r"(?<!\d)(?:\+?\d{1,3}[ -]?)?(?:\(?\d{2,4}\)?[ -]?)?\d{3}[ -]?\d{4}(?!\d)"
+)
+_API_KEY_RE = re.compile(
+    r"\b(?:sk|pk|ghp|github_pat|AKIA|AIza|xoxb|xoxp|api[_-]?key)[A-Za-z0-9_-]{8,}\b",
+    re.IGNORECASE,
+)
+_CREDIT_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+
+
+_ROLLUP_PHRASES = {
+    "### SYNTHETIC TRAINING EXERCISE": "synthetic training exercises",
+    "SYSTEM JUDGE REJECTION": "judge-rejected attempts",
+    "AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR": "auto-diagnostic error fixups",
+    "SYSTEM ALERT: Your previous turn entered a self-repeating":
+        "self-repeating-thinking-loop alerts",
+}
+
+
+def _rollup_summary(marker: str, count: int) -> str:
+    label = _ROLLUP_PHRASES.get(marker, "system-template turns")
+    if count <= 1:
+        return f"I worked on one of my recurring {label}."
+    return f"I worked on {count} of my recurring {label} in a row."
+
+
+def redact_pii(text: str) -> str:
+    """Best-effort PII scrub: emails, phone numbers, API keys, credit
+    cards. Returns the input unchanged when nothing matches. Designed
+    to be cheap enough to call on every turn's user_first_words."""
+    if not text:
+        return text
+    out = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
+    out = _API_KEY_RE.sub("[REDACTED_KEY]", out)
+    out = _CREDIT_CARD_RE.sub("[REDACTED_CC]", out)
+    out = _PHONE_RE.sub("[REDACTED_PHONE]", out)
+    return out
 
 
 def _tokenize(text: str) -> List[str]:
@@ -104,8 +189,16 @@ class AutobiographicalMemory:
     def __init__(self, root: Path, *, enabled: bool = True):
         self.root = Path(root)
         self.path = self.root / AUTOBIO_FILENAME
+        self.refcount_path = self.root / "reference_counts.json"
         self.enabled = bool(enabled)
         self._lock = threading.Lock()
+        # IDF / search cache. (mtime, size) → (experiences, haystacks,
+        # idf_table). Lazily populated on first search; invalidated when
+        # the file changes on disk between calls.
+        self._search_cache: Dict[tuple, tuple] = {}
+        # In-memory reference-count overlay so the hot path doesn't
+        # round-trip through disk on every prefix-utility increment.
+        self._ref_counts: Optional[Dict[str, int]] = None
 
     def append(self, exp: Experience) -> Optional[Path]:
         """Write ``exp`` to the log. Returns the path on success,
@@ -120,6 +213,16 @@ class AutobiographicalMemory:
             # Refuse silently — callers that have no summary to write
             # should not write at all.
             return None
+        # Template-prompt rollup: SYNTHETIC TRAINING / JUDGE REJECTION /
+        # AUTO-DIAGNOSTIC turns share a banner and recur dozens of times
+        # in a row. Bumping a counter on a single rollup record beats
+        # writing 100 near-identical entries — the narrative phase can
+        # still say "I did 100 synthetic exercises this week" without
+        # the diary being drowned in template noise.
+        marker = _template_marker_for(exp.user_first_words)
+        if marker is not None:
+            if self._bump_template_rollup(marker, exp):
+                return self.path
         try:
             with self._lock:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +233,133 @@ class AutobiographicalMemory:
             return self.path
         except Exception as e:
             logger.warning("autobiographical append failed: %s", e)
+            return None
+
+    # ------------------------------------------------------------------
+    # Template rollup helpers
+    # ------------------------------------------------------------------
+
+    def _bump_template_rollup(self, marker: str, fresh: Experience) -> bool:
+        """If the tail of the log is a rollup record for ``marker``,
+        bump its count + update its tail timestamp in place. Returns
+        True when an existing rollup was extended (and the caller
+        should NOT also append the fresh record).
+
+        We restrict the scan to the last few lines: a rollup window
+        spanning hours and arbitrary other turns would defeat the
+        point. The natural caller is the agent's hot loop, where these
+        templates fire in dense bursts."""
+        # Skip the tail scan entirely on a missing file — we'll fall
+        # straight through to opening a fresh rollup record below.
+        if not self.path.exists():
+            lines: List[str] = []
+        else:
+            try:
+                with self._lock:
+                    lines = self.path.read_text(encoding="utf-8").splitlines()
+            except OSError as e:
+                logger.warning("autobiographical rollup read failed: %s", e)
+                lines = []
+        try:
+            # Walk back through the last 5 lines looking for a rollup
+            # we already opened for this marker. Skip plain whitespace;
+            # bail on the first non-rollup, non-matching entry so
+            # unrelated turns can't accidentally extend the window.
+            for i in range(len(lines) - 1, max(-1, len(lines) - 6), -1):
+                s = lines[i].strip()
+                if not s:
+                    continue
+                try:
+                    d = json.loads(s)
+                except json.JSONDecodeError:
+                    break
+                if d.get("template_marker") == marker:
+                    d["template_count"] = int(d.get("template_count") or 1) + 1
+                    d["timestamp"] = fresh.timestamp
+                    # Refresh tools_used to the union — the rollup
+                    # should reflect what got reached for across the
+                    # burst, not just the first turn's tools.
+                    existing_tools = list(d.get("tools_used") or [])
+                    for t in fresh.tools_used:
+                        if t not in existing_tools:
+                            existing_tools.append(t)
+                    d["tools_used"] = existing_tools[:10]
+                    # Re-render the summary with the new count.
+                    d["summary"] = _rollup_summary(marker, d["template_count"])
+                    lines[i] = json.dumps(d, ensure_ascii=False)
+                    tmp = self.path.with_suffix(".jsonl.tmp")
+                    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                    tmp.replace(self.path)
+                    return True
+                break
+        except Exception as e:
+            logger.warning("autobiographical rollup bump failed: %s", e)
+        # No matching tail entry — open a fresh rollup with count=1.
+        fresh_dict = fresh.to_dict()
+        fresh_dict["template_marker"] = marker
+        fresh_dict["template_count"] = 1
+        fresh_dict["summary"] = _rollup_summary(marker, 1)
+        try:
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(fresh_dict, ensure_ascii=False))
+                    f.write("\n")
+                    f.flush()
+        except Exception as e:
+            logger.warning("autobiographical rollup open failed: %s", e)
+            return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Session-boundary marker (#9)
+    # ------------------------------------------------------------------
+
+    def mark_session_boot(self, *, prior_session_at: str = "") -> Optional[Path]:
+        """Write a synthetic boot-event record so the narrative can say
+        "after a few hours off, I started a new session and…" instead of
+        having to infer session boundaries from timestamps.
+
+        No-ops when the most recent record is already a boot marker
+        with a timestamp within the same minute — protects against
+        crash-restart loops emitting a flurry of boot events."""
+        if not self.enabled:
+            return None
+        try:
+            recent_list = self.recent(limit=1)
+            if recent_list and getattr(recent_list[0], "outcome", "") == "boot":
+                last_ts = recent_list[0].timestamp or ""
+                # Drop the seconds slice — same-minute restarts are noise.
+                if last_ts[:16] == _utcnow_iso()[:16]:
+                    return None
+        except Exception:
+            pass
+        ago = ""
+        if prior_session_at:
+            ago = f" (last active {prior_session_at})"
+        exp = Experience(
+            summary=f"Session resumed{ago}.",
+            outcome="boot",
+            cluster="meta",
+            user_first_words="(session boot)",
+        )
+        return self._raw_append(exp)
+
+    def _raw_append(self, exp: Experience) -> Optional[Path]:
+        """Bypass the template-rollup / empty-summary checks. Internal
+        helper used by boot markers, which legitimately have a fixed
+        synthetic summary and must not be conflated with the template
+        rollup."""
+        try:
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as f:
+                    f.write(exp.to_jsonl())
+                    f.write("\n")
+                    f.flush()
+            return self.path
+        except Exception as e:
+            logger.warning("autobiographical raw append failed: %s", e)
             return None
 
     def iter_experiences(self) -> Iterator[Experience]:
@@ -191,23 +421,19 @@ class AutobiographicalMemory:
         if not q_tokens:
             return []
 
-        experiences = list(self.iter_experiences())
+        experiences, haystacks, doc_freq = self._search_index()
         if not experiences:
             return []
 
-        # Document frequency of each query token across the whole log.
-        haystacks: List[str] = []
-        df: Dict[str, int] = {t: 0 for t in q_tokens}
-        for exp in experiences:
-            hs = (exp.summary + " " + exp.user_first_words + " "
-                  + (exp.cluster or "")).lower()
-            haystacks.append(hs)
-            for t in q_tokens:
-                if t in hs:
-                    df[t] += 1
-
         n = len(experiences)
-        idf = {t: math.log((n + 1) / (df[t] + 1)) + 1.0 for t in q_tokens}
+        # Build idf from cached document frequencies — most callers
+        # share the same vocabulary, so the cache cost is amortised
+        # across many queries. Tokens not in cached df are scored 0,
+        # which is the correct answer (no document contains them).
+        idf = {
+            t: math.log((n + 1) / (doc_freq.get(t, 0) + 1)) + 1.0
+            for t in q_tokens
+        }
 
         scored: List[tuple] = []
         for exp, hs in zip(experiences, haystacks):
@@ -216,6 +442,40 @@ class AutobiographicalMemory:
                 scored.append((score, exp))
         scored.sort(key=lambda s: (s[0], s[1].timestamp), reverse=True)
         return [exp for _, exp in scored[:limit]]
+
+    def _search_index(self):
+        """Return cached (experiences, haystacks, df_table). The table
+        maps every token observed in the log to its document
+        frequency; queries grab their token's df from here instead of
+        rescanning the file. Cache key is the file's (mtime, size) so
+        a fresh append on disk auto-invalidates the cache."""
+        if not self.path.exists():
+            return [], [], {}
+        try:
+            st = self.path.stat()
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return [], [], {}
+        cached = self._search_cache.get(key)
+        if cached is not None:
+            return cached
+        experiences = list(self.iter_experiences())
+        haystacks: List[str] = []
+        df: Dict[str, int] = {}
+        for exp in experiences:
+            hs = (exp.summary + " " + exp.user_first_words + " "
+                  + (exp.cluster or "")).lower()
+            haystacks.append(hs)
+            # Every distinct token in this document contributes +1 to
+            # its df. Use a set so duplicate occurrences in the same
+            # haystack don't over-count.
+            for t in set(_tokenize(hs)):
+                if len(t) > 2:
+                    df[t] = df.get(t, 0) + 1
+        # Bound the cache so a long-running agent doesn't hold every
+        # historical (mtime, size) snapshot — only the latest is useful.
+        self._search_cache = {key: (experiences, haystacks, df)}
+        return experiences, haystacks, df
 
     def update_outcome(
         self, trajectory_id: str, outcome: str, *, failure_reason: str = "",
@@ -281,6 +541,63 @@ class AutobiographicalMemory:
                 counts[c] = counts.get(c, 0) + 1
         return counts
 
+    # ------------------------------------------------------------------
+    # Reference-count tracker (#13)
+    # ------------------------------------------------------------------
+
+    def _load_ref_counts(self) -> Dict[str, int]:
+        if self._ref_counts is not None:
+            return self._ref_counts
+        if not self.refcount_path.exists():
+            self._ref_counts = {}
+            return self._ref_counts
+        try:
+            d = json.loads(self.refcount_path.read_text(encoding="utf-8"))
+            self._ref_counts = {str(k): int(v) for k, v in d.items()
+                                if isinstance(v, (int, float))}
+        except Exception:
+            self._ref_counts = {}
+        return self._ref_counts
+
+    def _persist_ref_counts(self) -> None:
+        if self._ref_counts is None:
+            return
+        try:
+            self.refcount_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.refcount_path.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(self._ref_counts, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(self.refcount_path)
+        except Exception as e:
+            logger.warning("ref-count persist failed: %s", e)
+
+    def record_reference(self, experience_id: str) -> int:
+        """Bump the reference counter for ``experience_id``. Returns
+        the new count (0 when disabled / empty id). Persistence is
+        write-through so the count survives a process restart even if
+        no further turns happen."""
+        if not self.enabled or not experience_id:
+            return 0
+        counts = self._load_ref_counts()
+        counts[experience_id] = counts.get(experience_id, 0) + 1
+        self._persist_ref_counts()
+        return counts[experience_id]
+
+    def reference_count(self, experience_id: str) -> int:
+        if not self.enabled or not experience_id:
+            return 0
+        return self._load_ref_counts().get(experience_id, 0)
+
+    def ref_count_summary(self) -> Dict[str, int]:
+        """Snapshot of the full reference-count table. Used by stats()
+        and by the falsification probes to see which memories the
+        agent has actually reached for."""
+        if not self.enabled:
+            return {}
+        return dict(self._load_ref_counts())
+
     def count(self) -> int:
         if not self.path.exists():
             return 0
@@ -293,6 +610,49 @@ class AutobiographicalMemory:
         except OSError:
             return 0
         return n
+
+
+_STOPWORDS = frozenset({
+    "the", "and", "for", "with", "from", "that", "this", "you", "your",
+    "into", "have", "been", "are", "was", "were", "but", "not", "any",
+    "all", "out", "its", "they", "them", "their", "what", "when", "where",
+    "who", "how", "why", "did", "does", "doing", "i", "me", "my",
+    "of", "to", "a", "an", "in", "is", "on", "it",
+})
+
+
+def _trigrams(text: str):
+    toks = [t for t in _tokenize(text) if t not in _STOPWORDS and len(t) > 2]
+    return [tuple(toks[i:i + 3]) for i in range(len(toks) - 2)]
+
+
+def detect_referenced_experiences(
+    *,
+    prefix_text: str,
+    response_text: str,
+    experiences,
+) -> List[str]:
+    """Return ids of experiences whose summary shares a non-trivial
+    trigram with ``response_text``. Trigrams are computed after
+    stopword filtering so generic three-word sequences ("I worked on")
+    don't trigger false matches.
+
+    Pure function — no state mutation. The caller decides whether to
+    feed the result to ``AutobiographicalMemory.record_reference``."""
+    if not response_text or not experiences:
+        return []
+    response_trigrams = set(_trigrams(response_text))
+    if not response_trigrams:
+        return []
+    matched: List[str] = []
+    for exp in experiences:
+        exp_text = (getattr(exp, "summary", "") or "") + " " + (
+            getattr(exp, "user_first_words", "") or "")
+        for tg in _trigrams(exp_text):
+            if tg in response_trigrams:
+                matched.append(exp.id)
+                break
+    return matched
 
 
 def summarise_turn_first_person(

@@ -19,6 +19,7 @@ property here is "small, dense, immediately relevant on wake-up".
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import threading
@@ -31,6 +32,7 @@ logger = logging.getLogger("GhostSelfhood")
 
 
 STATE_FILENAME = "state.json"
+MOOD_HISTORY_FILENAME = "mood.history.jsonl"
 
 # Bounded so the wake-up prefix stays compact. The numbers are
 # deliberate floors, not tuned: ten of each is enough for a multi-day
@@ -49,6 +51,7 @@ class SelfStateThread:
     def __init__(self, root: Path, *, enabled: bool = True):
         self.root = Path(root)
         self.path = self.root / STATE_FILENAME
+        self.mood_history_path = self.root / MOOD_HISTORY_FILENAME
         self.enabled = bool(enabled)
         self._lock = threading.RLock()
         self._state: SelfState = self._read_or_empty()
@@ -168,9 +171,79 @@ class SelfStateThread:
         if not label:
             return None
         with self._lock:
-            self._state.mood = Mood(label=label, evidence=(evidence or "").strip())
+            mood = Mood(label=label, evidence=(evidence or "").strip())
+            self._state.mood = mood
             self._flush()
-            return self._state.mood
+            # Mood history — append-only audit trail so the narrative
+            # can describe arcs ("I shifted from stuck to satisfied")
+            # rather than just the latest slot. Failures are swallowed
+            # — the latest mood is already persisted in state.json.
+            try:
+                self.mood_history_path.parent.mkdir(parents=True, exist_ok=True)
+                rec = {
+                    "label": mood.label,
+                    "evidence": mood.evidence,
+                    "set_at": mood.set_at,
+                }
+                with self.mood_history_path.open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False))
+                    f.write("\n")
+            except Exception as e:
+                logger.warning("mood history append failed: %s", e)
+            return mood
+
+    def mood_history(self, *, limit: int = 20) -> List[Mood]:
+        """Tail of the mood history, oldest first within the returned
+        window. Returns empty list when the file is missing or limit
+        <= 0."""
+        if limit <= 0 or not self.mood_history_path.exists():
+            return []
+        try:
+            lines = self.mood_history_path.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            logger.warning("mood history read failed: %s", e)
+            return []
+        out: List[Mood] = []
+        for line in lines[-limit:]:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                d = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            out.append(Mood(
+                label=str(d.get("label") or ""),
+                evidence=str(d.get("evidence") or ""),
+                set_at=str(d.get("set_at") or ""),
+            ))
+        return out
+
+    def stale_open_questions(self, *, max_age_days: float = 3.0) -> List[OpenQuestion]:
+        """Return open questions whose ``opened_at`` is older than
+        ``max_age_days``. Used by an idle gardener hook so the
+        open-question list stays alive — a question that sits for a
+        week with no engagement should either be re-engaged or
+        resolved, not silently accumulated."""
+        threshold = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+            days=max(0.0, float(max_age_days))
+        )
+        out: List[OpenQuestion] = []
+        with self._lock:
+            for q in self._state.open_questions:
+                if q.resolved_at:
+                    continue
+                try:
+                    # Tolerate either "...Z" or full-iso timestamps.
+                    raw = (q.opened_at or "").rstrip("Z")
+                    opened = datetime.datetime.fromisoformat(raw).replace(
+                        tzinfo=datetime.timezone.utc
+                    )
+                except Exception:
+                    continue
+                if opened < threshold:
+                    out.append(q)
+        return out
 
     def touch_session(self) -> None:
         with self._lock:

@@ -80,6 +80,14 @@
   <h2>Static assets</h2>
   <p><code>interface/static/</code> holds <code>index.html</code> (three.js, marked, dompurify, mermaid, papaparse, chart.js via CDN), <code>app.js</code> (auth wrapper that injects <code>X-Ghost-Key</code> on every <code>/api/</code> fetch, voice queue management, monologue display, renderer iframe), <code>style.css</code> (cyan/magenta cyber theme), <code>matrix_graph.js</code> (three.js particle system), <code>image_face.js</code>, <code>cyber_face.png</code>, and <code>sw.js</code> (service worker).</p>
 
+  <h2>Inline media handling for <code>/api/download/…</code></h2>
+  <p>A <code>MutationObserver</code> in <code>app.js</code> watches <code>#chat-log</code> for tool-emitted artefact links. Two cases:</p>
+  <ul>
+    <li><strong>Images</strong> (<code>&lt;img src="/api/download/gen_*.png"&gt;</code>): the unauthed <code>&lt;img&gt;</code> load 401s because browsers don't attach custom headers to plain image loads. <code>_handleChatImage</code> fetches through the authed wrapper, caches a blob URL in an LRU (cap 100), and swaps <code>img.src</code> to the blob. Failed fetches surface a "broken image" badge.</li>
+    <li><strong>PDF reports</strong> (<code>&lt;a href="/api/download/report_*.pdf"&gt;</code>): <code>_handleChatPdfLink</code> decorates the anchor with the <code>.pdf-link</code> card style, intercepts the click, fetches the bytes through the same authed wrapper / blob cache, opens the blob in the right-rail visualizer iframe (browsers render <code>application/pdf</code> blobs natively), and simultaneously triggers a real download via a hidden <code>&lt;a download&gt;</code>.</li>
+  </ul>
+  <p>Both code paths share <code>_toAuthedBlobUrl</code> and the same blob cache, so an artefact opened once doesn't refetch.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

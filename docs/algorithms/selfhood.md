@@ -245,6 +245,28 @@ The user-authored probe scripts `scripts/consciousness_probe.py` and
 `scripts/introspective_consistency.py` give complementary
 falsification-style measurements against the live selfhood state.
 
+## Hardening pass (2026-05-23)
+
+Fourteen targeted changes against issues surfaced by reading the live
+on-disk `autobiographical.jsonl` and `narrative.md`. Each is covered
+by a unit test in `tests/test_selfhood_enhancements.py` and (for the
+probe wrapper) `tests/test_run_selfhood_probes_script.py`.
+
+* **Verdict backfill on user corrections** — `core/agent.py` user-correction path now calls `self_model.record_outcome` alongside `collector.update_outcome`. Prior memory was verdict-blind on this branch even though the trajectory log already knew the user pushed back.
+* **Diary sanitiser** — `narrative.sanitise_meta_insights()` strips tracebacks, abort markers (`[ATTEMPT_ABORTED_THINKING_LOOP]`), file paths, and system banners before the LLM diary prompt sees them. Stops the LLM from echoing raw machine noise into the first-person diary.
+* **Template-prompt rollup** — `### SYNTHETIC TRAINING EXERCISE`, `SYSTEM JUDGE REJECTION`, `AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR`, and self-repeating-loop alerts now collapse into a single counter-bumping record. 5 turns → 1 record with `template_count: 5`.
+* **`utcnow()` replaced** — `_utcnow_iso` now uses `datetime.now(UTC)`; the trailing `Z` is preserved so existing records stay parse-compatible.
+* **`user_handle` wired** — pulled from `profile_memory.root.name` at capture time. Previously a schema field that nothing ever populated.
+* **Stale open-question gardener** — `SelfStateThread.stale_open_questions(max_age_days)` + `SelfModel.stale_open_questions()` facade. An idle hook can now surface questions that have been carrying for too long with no engagement, so the list doesn't become write-only.
+* **`meta` introspection cluster** — new keyword bin for consciousness / self-aware / attention / phenomenology / mood / identity / subjective / experience. Previously these prompts landed in `cluster=None`.
+* **Narrative blends recent + relevant past** — when state carries open questions, `NarrativeSummariser.regenerate` mixes IDF-retrieved older relevant entries with the recent slice. The diary window is no longer trapped inside the 12-entry recency floor.
+* **Session-boundary markers** — `SelfModel.mark_session_boot()` writes a synthetic `Experience(outcome="boot", cluster="meta")`. Same-minute dedup prevents crash-restart loops from flooding the log.
+* **Mood history JSONL** — every `set_mood` appends to `mood.history.jsonl`; `mood_history()` returns the tail. Lets the narrative describe arcs instead of only the latest mood.
+* **PII redaction** — `redact_pii()` (emails, phone numbers, API keys, credit cards) applied at the capture boundary so both `user_first_words` AND the quoted-prompt portion of the summary stay clean.
+* **IDF cache** — `search_my_past` no longer re-streams the whole log on every query. The cache is keyed on `(mtime, size)` so a fresh append auto-invalidates.
+* **Prefix-utility tracker** — `detect_referenced_experiences()` + per-experience counter in `reference_counts.json`. A concrete signal for "this memory shaped the reply" that the next selfhood phase can use as a relevance prior.
+* **Probe wrapper script** — `scripts/run_selfhood_probes.sh` is the cron-friendly entry point. Writes dated summaries under `$GHOST_HOME/system/selfhood/probes/`.
+
 ## Honest limitations
 
 * **The agent behaves consistent with continuous selfhood.** It

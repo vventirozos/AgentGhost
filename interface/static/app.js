@@ -1898,6 +1898,88 @@ async function _handleChatImage(img) {
     img._ghostPlaceholderBtn = placeholder;
 }
 
+// PDF report support (mirrors the image flow).
+//
+// The agent's `report_pdf` tool returns markdown of the form
+//   [📄 Title (PDF)](/api/download/report_xxx.pdf)
+// which marked renders as a plain <a href="/api/download/...">. Clicking
+// that link navigates the browser straight at the proxy URL, which 401s
+// because plain navigations don't carry the X-Ghost-Key header. We
+// intercept the click, fetch via the authed wrapper, and:
+//   1. open the resulting blob URL in the right-rail visualizer iframe
+//      (browsers render application/pdf blobs natively), and
+//   2. ALSO offer it as a true download via a hidden anchor.
+function _writePdfIntoIframe(iframe, pdfBlobUrl) {
+    if (!iframe) return;
+    iframe.contentDocument.open();
+    iframe.contentDocument.write(
+        '<!DOCTYPE html><html><head><style>'
+        + 'html,body{margin:0;height:100%;background:#0f0505;}'
+        + 'iframe{border:0;width:100%;height:100%;}'
+        + '</style></head><body></body></html>'
+    );
+    iframe.contentDocument.close();
+    const inner = iframe.contentDocument.createElement('iframe');
+    inner.setAttribute('src', pdfBlobUrl);
+    iframe.contentDocument.body.appendChild(inner);
+}
+
+async function _handleChatPdfLink(link) {
+    // Decorate the anchor with a clear PDF affordance so users know it's
+    // a document deliverable, not a generic link. The label is built once
+    // on first sight; reopens reuse the same DOM.
+    const labelText = link.textContent && link.textContent.trim()
+        ? link.textContent.trim()
+        : 'Open PDF';
+    if (!link.dataset.pdfDecorated) {
+        link.dataset.pdfDecorated = '1';
+        link.classList.add('pdf-link');
+        link.title = 'Open PDF in visualizer (and download)';
+    }
+
+    link.addEventListener('click', async (ev) => {
+        ev.preventDefault();
+        try {
+            const blobUrl = await _toAuthedBlobUrl(link.getAttribute('href') || link.href);
+
+            // 1) Inline preview in the right-rail iframe.
+            const renderWindow = document.getElementById('render-window');
+            const renderIframe = document.getElementById('render-iframe');
+            const mermaidContainer = document.getElementById('mermaid-container');
+            const chartContainer = document.getElementById('chart-container');
+            if (mermaidContainer) mermaidContainer.style.display = 'none';
+            if (chartContainer) chartContainer.style.display = 'none';
+            if (renderIframe) {
+                renderIframe.style.display = 'block';
+                _writePdfIntoIframe(renderIframe, blobUrl);
+            }
+            if (renderWindow) renderWindow.classList.remove('hidden');
+            currentRenderState = { type: 'pdf', src: blobUrl };
+
+            // 2) Trigger a real download alongside the preview so the
+            //    user gets a file they can keep, not just a viewer tab.
+            const a = document.createElement('a');
+            a.href = blobUrl;
+            const rawHref = link.getAttribute('href') || '';
+            const filename = rawHref.split('/').pop().split('?')[0] || 'report.pdf';
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+        } catch (e) {
+            console.warn('PDF fetch failed', e);
+            addMessage('system', `Could not load PDF: ${e.message || e}`);
+        }
+    });
+
+    // If the link was rendered without visible text (rare — agent style
+    // is `[📄 Title (PDF)](...)`, which always has text), set a sensible
+    // label so it's still clickable.
+    if (!link.textContent || !link.textContent.trim()) {
+        link.textContent = `📄 ${labelText}`;
+    }
+}
+
 const chatObserver = new MutationObserver(() => {
     document.querySelectorAll('#chat-log img').forEach(img => {
         if (img.classList.contains('placeholder-added')) return;
@@ -1907,6 +1989,18 @@ const chatObserver = new MutationObserver(() => {
         // so the expected 401 on the initial unauthed load doesn't
         // spuriously trigger the broken-image badge.
         _handleChatImage(img);
+    });
+
+    // Capture PDF download links emitted by tools/report_pdf.py.
+    // Matches `/api/download/*.pdf` (case-insensitive) anywhere in the
+    // href so we still hit nested or proxied URLs. Other file types
+    // continue to use the browser's default <a> behaviour.
+    document.querySelectorAll('#chat-log a[href*="/api/download/"]').forEach(link => {
+        if (link.dataset.pdfHandled) return;
+        const href = link.getAttribute('href') || '';
+        if (!/\.pdf(\?|$)/i.test(href)) return;
+        link.dataset.pdfHandled = '1';
+        _handleChatPdfLink(link);
     });
 });
 const chatLogElement = document.getElementById('chat-log');

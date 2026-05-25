@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.report_pdf — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a class="current" href="report_pdf.html">report_pdf</a>
+    <a href="../interfaces/web_server.html">web server</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / report_pdf.py</h1>
+  <p class="subtitle">Native PDF report generator. Produces a multi-page A4 document from markdown sections and writes it into the sandbox so it can be downloaded through <code>/api/download/&lt;file&gt;</code>.</p>
+
+  <h2>Tool: <code>report_pdf</code></h2>
+  <p>Always advertised — there is no remote-service gate (unlike <code>image_generation</code>, which depends on the GPU swarm). Rendering happens locally and offline. The tool slots into the same artefact lifecycle as image generation: write a binary file into <code>sandbox_dir</code>, return a markdown link the LLM is told to emit verbatim so the user can open it.</p>
+
+  <h3>Why a native tool instead of <code>execute</code></h3>
+  <ul>
+    <li>One LLM turn instead of three (no Python-authoring detour).</li>
+    <li>A structured <code>sections=[{heading, body}]</code> schema forces report-shaped output rather than a wall of prose on a single page.</li>
+    <li>The web client and Slack bot already understand the <code>/api/download/&lt;file&gt;</code> markdown convention; PDFs slot into the same auth-fetch + visualizer pipeline as images for free.</li>
+  </ul>
+
+  <h3>Engine</h3>
+  <p>PyMuPDF (<code>fitz</code>) + the pure-Python <code>markdown</code> library:</p>
+  <ul>
+    <li><code>markdown.markdown(body, extensions=["extra","sane_lists","tables","nl2br"])</code> renders each section body into HTML.</li>
+    <li>A small inline CSS block styles headings, code, tables, lists, blockquotes.</li>
+    <li><code>fitz.Story(html=...)</code> + <code>fitz.DocumentWriter</code> flow the assembled HTML across as many A4 pages as needed (hard-capped at 200 pages to guard against runaway outputs).</li>
+  </ul>
+  <p>PyMuPDF is already a hard dependency (it backs <code>vision_analysis</code> and <code>file_system</code>'s <code>read_chunked</code> path), so this adds no new system-level libraries — unlike WeasyPrint, which would pull in Pango and Cairo.</p>
+
+  <h3>Parameters</h3>
+  <ul>
+    <li><code>title</code> — H1 on page 1. <strong>REQUIRED.</strong></li>
+    <li><code>sections</code> — list of <code>{heading, body}</code>. <code>body</code> is markdown. May also be a single markdown string; the healer wraps it in one section. <strong>REQUIRED.</strong></li>
+    <li><code>subtitle</code> — optional tagline under the title.</li>
+    <li><code>author</code> — optional byline.</li>
+  </ul>
+
+  <h3>Parameter healing</h3>
+  <p>Mirrors the kwarg-aliasing in <code>tool_generate_image</code>. Self-play logs show the LLM regularly hallucinates parameter names (<code>body</code>, <code>content</code>, <code>text</code>, <code>report_title</code>, <code>name</code>). The tool accepts all of them rather than failing hard. HTML-escapes <code>title</code>, <code>subtitle</code>, and <code>author</code> so a stray <code>&lt;</code> can't break the document.</p>
+
+  <h3>Return value</h3>
+  <pre>SUCCESS: PDF report generated (N page(s), KB.K KB). DO NOT CALL THIS TOOL
+AGAIN with the same title. Respond DIRECTLY to the user by including this
+exact markdown so the file is offered for download:
+
+[📄 &lt;title&gt; (PDF)](/api/download/report_XXXXXXXX.pdf)</pre>
+  <p>Failure modes return <code>SYSTEM ERROR: ...</code> strings (missing title, missing sections, bodies over 200 000 chars, render exceptions). On render failure the partial file is unlinked so the returned link never points at a corrupt artefact.</p>
+
+  <h3>Example prompt</h3>
+  <pre>&gt;&gt;&gt; Look up the top 5 upcoming tech trends for next year, compile a
+    market analysis report, and save it as a PDF.</pre>
+  <p>The agent fans out research via <code>deep_research</code> / <code>delegate_to_swarm</code>, assembles findings in the scratchpad, then makes one <code>report_pdf</code> call with section-shaped <code>{heading, body}</code> entries. The reply ends with the markdown download link, which the <a href="../interfaces/web_server.html">web client</a> auto-promotes into a clickable card with inline PDF preview.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

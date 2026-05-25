@@ -23,7 +23,15 @@ SCHEMA_VERSION = "v1"
 
 
 def _utcnow_iso() -> str:
-    return datetime.datetime.utcnow().isoformat() + "Z"
+    # datetime.utcnow() is deprecated in 3.12 and slated for removal.
+    # We keep the trailing "Z" so existing on-disk records stay
+    # parse-compatible with the new ones.
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .replace(tzinfo=None)
+        .isoformat()
+        + "Z"
+    )
 
 
 @dataclass

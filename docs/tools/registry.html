@@ -22,6 +22,7 @@
     <a href="system.html">system</a>
     <a href="vision.html">vision</a>
     <a href="image_gen.html">image_gen</a>
+    <a href="report_pdf.html">report_pdf</a>
     <a href="swarm.html">swarm</a>
     <a href="tasks.html">tasks (scheduler)</a>
     <a href="projects.html">projects</a>
@@ -66,6 +67,7 @@
       <tr><td><code>manage_skills</code></td><td>acquired_skills</td><td>List / delete the agent's acquired SKILLS (custom Python tools created via <code>create_skill</code>). This is the routing target for "show me your skills", "list your skills", "what skills do you have". Distinct from <code>list_lessons</code>: a SKILL is a tool, a LESSON is a mistake-and-fix.</td></tr>
       <tr><td><code>vision_analysis</code></td><td><a href="vision.html">vision</a></td><td>Image / PDF analysis (auto-registered when vision-capable LLM available).</td></tr>
       <tr><td><code>image_generation</code></td><td><a href="image_gen.html">image_gen</a></td><td>SDXL gen (auto-registered when <code>image_gen_clients</code> configured).</td></tr>
+      <tr><td><code>report_pdf</code></td><td><a href="report_pdf.html">report_pdf</a></td><td>Native multi-page PDF report from markdown sections (PyMuPDF + markdown; no remote service required).</td></tr>
     </tbody>
   </table>
   <p>Plus dynamic tools added at runtime: every active <a href="acquired_skills.html">acquired skill</a> and every registered <a href="composed_skills.html">composed skill</a> appears as its own LLM-facing tool definition.</p>

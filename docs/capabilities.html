@@ -41,6 +41,7 @@
     <a class="card" href="#code"><h3>Code &amp; data analysis</h3><p>Run Python / shell inside a Docker sandbox on files you upload.</p></a>
     <a class="card" href="#projects"><h3>Multi-step projects</h3><p>Scaffold, implement, test, and iterate on deliverables over many turns.</p></a>
     <a class="card" href="#image"><h3>Image generation</h3><p>SDXL-backed visuals through a dedicated GPU swarm pool.</p></a>
+    <a class="card" href="#pdf"><h3>PDF reports</h3><p>Compile research into a styled, multi-page PDF deliverable rendered locally.</p></a>
     <a class="card" href="#vision"><h3>Vision &amp; OCR</h3><p>Describe screenshots, extract tables from PDFs, caption photos.</p></a>
     <a class="card" href="#memory"><h3>Long-term memory</h3><p>Remembers preferences, facts, and hard-won procedures across sessions.</p></a>
     <a class="card" href="#schedule"><h3>Scheduling &amp; autonomy</h3><p>Cron-style recurring tasks that run the agent against a stored prompt.</p></a>
@@ -77,6 +78,13 @@
   bottom-heavy.</code></pre>
   <p><strong>Under the hood:</strong> <a href="tools/image_gen.html"><code>image_gen</code></a> → SDXL server → <code>file_system.read</code> → <a href="tools/vision.html"><code>vision</code></a> critique → optional second generation pass.</p>
   <p><strong>Tools:</strong> <a href="tools/image_gen.html"><code>image_gen</code></a>, <a href="tools/vision.html"><code>vision</code></a>, <a href="tools/swarm.html"><code>swarm</code></a>.</p>
+
+  <h2 id="pdf">PDF reports</h2>
+  <p>Ask for any "report", "whitepaper", "market analysis", or "PDF deliverable" and the agent calls <a href="tools/report_pdf.html"><code>report_pdf</code></a>. The tool renders markdown-shaped sections into a styled multi-page A4 document via PyMuPDF + the pure-Python markdown library — no network, no GPU, and no new system dependencies (PyMuPDF was already on the dep list for vision and PDF reading). Output lands in the sandbox and is offered through <code>/api/download/&lt;file&gt;.pdf</code>; the <a href="interfaces/web_server.html">web client</a> auto-promotes the link into a clickable card with inline PDF preview, and the Slack bot delivers it as a file attachment.</p>
+  <pre><code>&gt; Look up the top 5 upcoming tech trends for next year, compile a
+  market analysis report, and save it as a PDF.</code></pre>
+  <p><strong>Under the hood:</strong> <a href="tools/search.html"><code>deep_research</code></a> or <a href="tools/swarm.html"><code>delegate_to_swarm</code></a> fan out the research → results land in the <a href="memory/scratchpad.html">scratchpad</a> → one <a href="tools/report_pdf.html"><code>report_pdf</code></a> call assembles them into <code>{heading, body}</code> sections → reply includes the markdown download link verbatim.</p>
+  <p><strong>Tools:</strong> <a href="tools/report_pdf.html"><code>report_pdf</code></a>, <a href="tools/search.html"><code>deep_research</code></a>, <a href="tools/swarm.html"><code>swarm</code></a>.</p>
 
   <h2 id="vision">Vision &amp; OCR</h2>
   <p>Drop a screenshot, a PDF page, or a photo into the conversation and the agent routes it through the visual pool for description, table extraction, or debugging help.</p>

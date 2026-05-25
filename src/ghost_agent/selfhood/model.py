@@ -21,6 +21,8 @@ from typing import Awaitable, Callable, Iterable, Optional
 from .autobiographical import (
     AutobiographicalMemory,
     _derive_cluster,
+    detect_referenced_experiences,
+    redact_pii,
     summarise_turn_first_person,
 )
 from .narrative import NarrativeSummariser
@@ -125,14 +127,21 @@ class SelfModel:
             return None
         try:
             tool_list = [t for t in tool_names if t]
+            # Redact PII at the boundary so both the summary template
+            # (which quotes the user_request) AND the stored prefix
+            # share the scrubbed text. We do not redact the agent's
+            # own final_response — that's the agent's own prose and
+            # is far less likely to contain raw user data, and the
+            # summary builder doesn't quote it verbatim.
+            safe_request = redact_pii(user_request or "")
             summary = summarise_turn_first_person(
-                user_request=user_request,
+                user_request=safe_request,
                 tool_names=tool_list,
                 outcome=outcome,
                 final_response=final_response,
                 failure_reason=failure_reason,
             )
-            user_short = (user_request or "").strip().replace("\n", " ")[:80]
+            user_short = safe_request.strip().replace("\n", " ")[:80]
             # Wire the cluster field: prefer the caller-supplied label
             # (the trajectory's own cluster), else derive a coarse topic
             # from the request so recall / narrative can generalise.
@@ -157,6 +166,70 @@ class SelfModel:
         except Exception as e:
             logger.debug("capture_turn skipped: %s", e)
             return None
+
+    def mark_session_boot(self) -> None:
+        """Record a session-boundary event. Idempotent within the same
+        minute so a crash-restart loop doesn't flood the log."""
+        if not self.enabled or self.autobio is None:
+            return
+        prior = ""
+        if self.state is not None:
+            prior = self.state.state.last_session_at
+        try:
+            self.autobio.mark_session_boot(prior_session_at=prior)
+            if self.state is not None:
+                self.state.touch_session()
+        except Exception as e:
+            logger.debug("mark_session_boot skipped: %s", e)
+
+    def note_referenced_experiences(
+        self, *, prefix_text: str, response_text: str,
+    ) -> int:
+        """Detect which experiences from the wake-up prefix were
+        actually echoed in the agent's response, and bump their
+        reference counters. Returns the number of experiences whose
+        counter was incremented (0 when disabled / no match).
+
+        The detector is a pure function — see
+        ``autobiographical.detect_referenced_experiences``. Reference
+        counts get persisted to ``reference_counts.json`` so the
+        signal survives process restarts."""
+        if not self.enabled or self.autobio is None:
+            return 0
+        if not prefix_text or not response_text:
+            return 0
+        try:
+            recent_pool = self.autobio.recent(limit=50)
+        except Exception:
+            recent_pool = []
+        try:
+            ids = detect_referenced_experiences(
+                prefix_text=prefix_text,
+                response_text=response_text,
+                experiences=recent_pool,
+            )
+        except Exception as e:
+            logger.debug("ref-detection failed: %s", e)
+            return 0
+        for eid in ids:
+            try:
+                self.autobio.record_reference(eid)
+            except Exception:
+                continue
+        return len(ids)
+
+    def stale_open_questions(self, *, max_age_days: float = 3.0):
+        """Surface open questions that have been carrying for more than
+        ``max_age_days``. Used by an idle hook to prompt the agent to
+        revisit, refile, or resolve them so the open-questions list
+        doesn't become write-only."""
+        if not self.enabled or self.state is None:
+            return []
+        try:
+            return self.state.stale_open_questions(max_age_days=max_age_days)
+        except Exception as e:
+            logger.debug("stale_open_questions skipped: %s", e)
+            return []
 
     def record_outcome(
         self, trajectory_id: str, outcome: str, *, failure_reason: str = "",

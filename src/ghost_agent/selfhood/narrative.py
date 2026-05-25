@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import re
 import threading
 from pathlib import Path
 from typing import Awaitable, Callable, List, Optional
@@ -34,6 +35,46 @@ logger = logging.getLogger("GhostSelfhood")
 
 NARRATIVE_FILENAME = "narrative.md"
 NARRATIVE_HISTORY_FILENAME = "narrative.history.jsonl"
+
+
+# Patterns we strip from meta_insights before feeding it to the LLM
+# diary prompt. The LLM faithfully echoes whatever it's shown, so
+# pasting in a raw Python traceback or a runtime-abort marker results
+# in the marker literally appearing in the agent's first-person diary.
+# Voice-breaking.
+_TRACEBACK_RE = re.compile(
+    r"Traceback \(most recent call last\):.*?(?=\n\n|\Z)",
+    re.DOTALL,
+)
+_ABORT_MARKER_RE = re.compile(r"\[ATTEMPT_ABORTED[^\]]*\]")
+_SYSTEM_BANNER_RE = re.compile(
+    r"(?:SYSTEM ALERT|SYSTEM JUDGE REJECTION|### SYNTHETIC TRAINING EXERCISE|"
+    r"AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR)[^\n]*",
+)
+# Long file-path-y blobs from sandbox tracebacks.
+_FILE_PATH_RE = re.compile(r'File "[^"]+", line \d+[^\n]*')
+
+
+def sanitise_meta_insights(text: str, *, max_chars: int = 600) -> str:
+    """Strip raw tracebacks, abort markers, and system banners from
+    ``meta_insights`` before they're spliced into the diary prompt.
+    Returns a compact, voice-safe summary.
+
+    Why aggressive: the narrative is the agent's first-person diary;
+    a paragraph that quotes raw traceback noise reads as broken
+    selfhood. We'd rather lose detail than leak system noise into the
+    agent's voice."""
+    if not text:
+        return ""
+    out = _TRACEBACK_RE.sub("(a traceback I won't reproduce here)", text)
+    out = _ABORT_MARKER_RE.sub("(an abort marker)", out)
+    out = _SYSTEM_BANNER_RE.sub("(a system banner)", out)
+    out = _FILE_PATH_RE.sub("(a source location)", out)
+    # Collapse runs of whitespace introduced by the substitutions.
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    if len(out) > max_chars:
+        out = out[: max_chars - 1].rstrip() + "…"
+    return out
 
 
 # Critique-style prompt: the model is asked to write a first-person
@@ -112,14 +153,48 @@ class NarrativeSummariser:
     # Write path
     # -----------------------------------------------------------------
 
-    def _format_experiences_block(self, experiences: List[Experience]) -> str:
+    def _format_experiences_block(
+        self,
+        experiences: List[Experience],
+        *,
+        relevant: Optional[List[Experience]] = None,
+    ) -> str:
         if not experiences:
             return "(no recent experiences)"
         lines = []
         for exp in experiences:
             tag = f"[{exp.outcome}]" if exp.outcome and exp.outcome != "unknown" else ""
             lines.append(f"- {exp.timestamp} {tag} {exp.summary}".strip())
+        if relevant:
+            lines.append("")
+            lines.append(
+                "(older entries that connect to my current open questions:)"
+            )
+            for exp in relevant:
+                tag = f"[{exp.outcome}]" if exp.outcome and exp.outcome != "unknown" else ""
+                lines.append(f"- {exp.timestamp} {tag} {exp.summary}".strip())
         return "\n".join(lines)
+
+    def _derive_recall_query(self, state: Optional[SelfStateThread]) -> str:
+        """Build a recall query from the agent's current open questions
+        + mood. Empty string when state is empty — the regenerate path
+        treats that as "no blend, recent-only", which matches the
+        pre-blend behaviour."""
+        if state is None:
+            return ""
+        parts: List[str] = []
+        try:
+            for q in state.open_questions()[-3:]:
+                if q.text:
+                    parts.append(q.text)
+            mood = state.mood()
+            if mood and mood.label:
+                parts.append(mood.label)
+                if mood.evidence:
+                    parts.append(mood.evidence)
+        except Exception:
+            return ""
+        return " ".join(parts).strip()
 
     def _format_state_block(self, state: Optional[SelfStateThread]) -> str:
         if state is None:
@@ -148,7 +223,7 @@ class NarrativeSummariser:
                 "Recurring kinds of work I've been doing: "
                 + ", ".join(f"{label} ({n}×)" for label, n in top)
             )
-        mi = (meta_insights or "").strip()
+        mi = sanitise_meta_insights(meta_insights or "")
         if mi:
             lines.append(mi)
         return "\n".join(lines) if lines else "(no notable patterns yet)"
@@ -185,8 +260,27 @@ class NarrativeSummariser:
         if not recent:
             return ""
 
+        # Blend recent + relevant: with hundreds of entries on disk,
+        # the most-recent-N window is < 3% of the agent's actual past.
+        # We expand the diary's input by IDF-retrieving older entries
+        # related to the agent's current open questions / mood, then
+        # interleave them with the recent slice. This is what lets the
+        # narrative say "this connects to something I worked on weeks
+        # ago" instead of being stuck inside the recency window.
+        recent_ids = {e.id for e in recent}
+        relevant: List[Experience] = []
+        try:
+            query = self._derive_recall_query(state)
+            if query:
+                relevant = [
+                    e for e in autobio.search_my_past(query, limit=8)
+                    if e.id not in recent_ids
+                ][:4]
+        except Exception:
+            relevant = []
+
         rendered = NARRATIVE_PROMPT.format(
-            experiences=self._format_experiences_block(recent),
+            experiences=self._format_experiences_block(recent, relevant=relevant),
             state=self._format_state_block(state),
             patterns=self._format_patterns_block(autobio, meta_insights),
         )
@@ -211,7 +305,7 @@ class NarrativeSummariser:
             if not joined:
                 return ""
             text = f"Lately, {joined}"
-            mi = (meta_insights or "").strip()
+            mi = sanitise_meta_insights(meta_insights or "")
             if mi:
                 text += f"\n\nWhat I've noticed about myself: {mi}"
 

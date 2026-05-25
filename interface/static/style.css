@@ -644,6 +644,29 @@ body.zen-mode #activity-container {
     text-shadow: 0 0 8px var(--accent-color);
 }
 
+/* PDF download cards emitted by the `report_pdf` tool. The agent renders
+   the link as [📄 Title (PDF)](/api/download/...) — the JS decorator
+   adds .pdf-link so we can promote it from a dashed-underline anchor
+   into something that visually reads as a downloadable artefact, on
+   the same tier as image thumbnails. */
+.message a.pdf-link {
+    display: inline-block;
+    padding: 8px 14px;
+    margin: 6px 0;
+    border: 1px solid var(--accent-color);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.03);
+    text-decoration: none;
+    font-weight: 600;
+    transition: background 0.15s ease, box-shadow 0.15s ease;
+}
+
+.message a.pdf-link:hover {
+    background: rgba(255, 255, 255, 0.06);
+    box-shadow: 0 0 12px rgba(255, 255, 255, 0.15);
+    text-shadow: 0 0 8px var(--accent-color);
+}
+
 .message blockquote {
     border-left: 3px solid var(--secondary-color);
     margin: 10px 0;

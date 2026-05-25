@@ -2,13 +2,25 @@
 
 An autonomous FastAPI-based AI agent service with multi-tier memory, Docker-isolated tool execution, swarm inference, and biological-rhythm self-play.
 
-> **Runtime stance.** Ghost Agent is designed and tuned around an **uncensored Qwen 3.6 35B-A3** upstream model, and every outbound network request the agent issues is mandated through **Tor**. The agent fails closed if `TOR_PROXY` is unset or the Tor daemon is unreachable — a silently-cleartext agent is worse than a stalled one.
+## What it is
+
+Ghost Agent is a self-contained reasoning runtime that wraps an upstream LLM with:
+
+- **Six-tier memory** — vector, graph, profile, skill, journal, and episodic stores, fused per turn via reciprocal rank fusion.
+- **Docker-isolated tool execution** — every tool call runs in a managed container with mounts and resource limits.
+- **Swarm inference & MCTS planning** — multi-sample reasoning with a hand-crafted complexity classifier deciding when to escalate.
+- **Dream / self-play loop** — idle-time consolidation, reflection, and passive skill mining from validator-passing trajectories.
+- **Local-only self-improvement** — DSPy/GEPA prompt optimisation, redacted trajectory distillation, and reflection-driven skill writes. No external teacher, no weight updates.
+
+### Runtime stance
+
+Ghost is designed and tuned around an **uncensored Qwen 3.6 35B-A3** upstream model. Every outbound network request the agent issues is mandated through **Tor**: the agent fails closed if `TOR_PROXY` is unset or the Tor daemon is unreachable. A silently-cleartext agent is worse than a stalled one.
 
 ## Documentation
 
-Full reference is published on GitHub Pages: **<https://vventirozos.github.io/AgentGhost/>**
+**The authoritative reference is published at <https://vventirozos.github.io/AgentGhost/>.**
 
-Every module in `src/ghost_agent/` and `interface/` has a dedicated page. The HTML sources live in [`docs/`](docs/) on the default branch.
+Every module in `src/ghost_agent/` and `interface/` has a dedicated page. HTML sources live in [`docs/`](docs/) on the default branch — treat this `README.md` and `CLAUDE.md` as orienting documents; the published site is the source of truth.
 
 | Entry point | What's there |
 | --- | --- |
@@ -23,15 +35,13 @@ Every module in `src/ghost_agent/` and `interface/` has a dedicated page. The HT
 | [Dream / self-play](https://vventirozos.github.io/AgentGhost/algorithms/dream_cycle.html) | Idle-time consolidation and skill extraction |
 | [Docker sandbox](https://vventirozos.github.io/AgentGhost/sandbox/docker.html) | Container lifecycle, mounts, resource limits |
 
-Treat this `README.md` and `CLAUDE.md` as orienting documents. The published site (sourced from `docs/`) is the authoritative reference.
-
 ## Quick start
 
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# Required environment (see https://vventirozos.github.io/AgentGhost/installation.html for the full list)
+# Required environment (full list in the Install & Run docs)
 export GHOST_API_KEY="..."
 export GHOST_HOME="$HOME/ghost"
 export GHOST_MODEL="qwen-3.6-35b-a3"
@@ -44,7 +54,7 @@ python -m src.ghost_agent.main \
     --host 0.0.0.0 --port 8000 --verbose
 ```
 
-Companion processes (web UI, Slack bot, voice, image-gen) are documented in [Install & Run](https://vventirozos.github.io/AgentGhost/installation.html#process-commands).
+Companion processes (web UI, Slack bot, voice, image-gen) are documented under [Install & Run → process commands](https://vventirozos.github.io/AgentGhost/installation.html#process-commands).
 
 ## Repository layout
 
@@ -68,12 +78,12 @@ Companion processes (web UI, Slack bot, voice, image-gen) are documented in [Ins
 | `tests/` | Behaviour-organised pytest suite (`asyncio_mode=auto`) |
 | `scripts/` | Eval / GEPA / sandbox-image / token-load helper scripts |
 
-The `eval / distill / router / optim / skills_auto / reflection` modules together form Ghost's local-only stage-1 self-improvement substrate. Reflections close the loop by writing into `SkillMemory` so a fresh user turn retrieves the corrected plan via the existing memory bus — no external teacher, no weight update.
+The `eval / distill / router / optim / skills_auto / reflection` modules together form Ghost's local-only stage-1 self-improvement substrate. Reflections close the loop by writing into `SkillMemory` so a fresh user turn retrieves the corrected plan via the existing memory bus.
 
 ## Tests & lint
 
 ```bash
-GHOST_API_KEY=test-key pytest                                   # full suite (key is required at collection time — interface/server.py raises on missing key)
+GHOST_API_KEY=test-key pytest                                   # full suite (key required at collection time — interface/server.py raises on missing key)
 GHOST_API_KEY=test-key pytest tests/test_agent_planning.py      # single file
 GHOST_API_KEY=test-key pytest -k "memory and not slack"         # filter
 black src interface tests

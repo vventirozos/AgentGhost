@@ -242,6 +242,57 @@ TOOL_DEFINITIONS = [
     }
 ]
 
+TOOL_DEFINITIONS.append({
+    "type": "function",
+    "function": {
+        "name": "report_pdf",
+        "description": (
+            "Generate a styled multi-page PDF report and save it to the sandbox. "
+            "Use this whenever the user asks for a 'report', 'whitepaper', "
+            "'market analysis', 'PDF', or any document deliverable. The PDF is "
+            "rendered locally (no network) and exposed via /api/download/<file>. "
+            "After this tool succeeds, include the returned markdown download "
+            "link verbatim in your reply so the user can open the file."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Report title shown as the H1 on page 1. REQUIRED.",
+                },
+                "subtitle": {
+                    "type": "string",
+                    "description": "Optional subtitle / tagline rendered under the title.",
+                },
+                "author": {
+                    "type": "string",
+                    "description": "Optional author/byline (e.g. 'Ghost Agent').",
+                },
+                "sections": {
+                    "type": "array",
+                    "description": (
+                        "Ordered list of report sections. Each section is "
+                        "{heading, body} where body is markdown (paragraphs, "
+                        "lists, tables, code, bold/italic). If you only have "
+                        "one section you may pass a single markdown string and "
+                        "the tool will wrap it for you."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "heading": {"type": "string", "description": "Section heading (H2). May be empty for an unheaded prelude."},
+                            "body":    {"type": "string", "description": "Section body, written in markdown."},
+                        },
+                        "required": ["body"],
+                    },
+                },
+            },
+            "required": ["title", "sections"],
+        },
+    },
+})
+
 _NON_CODING_DROP_TOOLS = frozenset({"postgres_admin"})
 _NON_VISION_DROP_TOOLS = frozenset({"vision_analysis"})
 
@@ -489,6 +540,9 @@ def get_available_tools(context):
     
     from .vision import tool_vision_analysis
     tools["vision_analysis"] = lambda **kwargs: tool_vision_analysis(llm_client=context.llm_client, sandbox_dir=context.sandbox_dir, tor_proxy=context.tor_proxy, **kwargs)
+
+    from .report_pdf import tool_generate_pdf
+    tools["report_pdf"] = lambda **kwargs: tool_generate_pdf(sandbox_dir=context.sandbox_dir, **kwargs)
 
     if getattr(context.llm_client, 'image_gen_clients', None):
         from .image_gen import tool_generate_image

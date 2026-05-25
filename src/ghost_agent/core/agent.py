@@ -6337,6 +6337,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     "user-correction sidecar write failed: %s: %s",
                     type(e).__name__, e,
                 )
+            # Propagate the same FAILED verdict into the autobio log.
+            # Without this, the first-person diary stays stuck at
+            # "without a verdict either way" while the trajectory log
+            # already knows the user pushed back.
+            try:
+                from ..selfhood import SelfModel as _SelfModel
+                self_model = getattr(ctx, 'self_model', None)
+                if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
+                    self_model.record_outcome(
+                        traj.id,
+                        Outcome.FAILED.value,
+                        failure_reason=verdict.reason or "user-correction",
+                    )
+            except Exception as e:
+                logger.debug(
+                    "selfhood verdict backfill skipped: %s: %s",
+                    type(e).__name__, e,
+                )
             try:
                 pretty_log(
                     "Trajectory Promoted",
@@ -6628,6 +6646,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             from ..selfhood import SelfModel as _SelfModel
             self_model = getattr(self.context, 'self_model', None)
             if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
+                # Best-effort user handle: pull "root.name" from the
+                # profile memory. Anonymous installations or missing
+                # profile-memory leave it blank; the autobio writer
+                # treats empty as "unknown user" and just omits it
+                # from the rendered summary.
+                user_handle = ""
+                try:
+                    pm = getattr(self.context, "profile_memory", None)
+                    if pm is not None and hasattr(pm, "load"):
+                        prof = pm.load() or {}
+                        root = prof.get("root") if isinstance(prof, dict) else None
+                        if isinstance(root, dict):
+                            user_handle = str(root.get("name") or "")
+                except Exception:
+                    user_handle = ""
                 self_model.capture_turn(
                     trajectory_id=traj.id,
                     user_request=traj.user_request,
@@ -6636,6 +6669,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     final_response=traj.final_response,
                     failure_reason=traj.failure_reason,
                     cluster=traj.cluster,
+                    user_handle=user_handle,
                 )
         except Exception as e:
             logger.debug(

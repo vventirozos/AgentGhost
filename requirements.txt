@@ -11,6 +11,11 @@ chromadb>=1.5.0
 networkx>=3.0
 PyMuPDF>=1.23.0
 pypdf>=3.17.0
+# Pure-Python markdown → HTML renderer used by tools/report_pdf.py to feed
+# fitz.Story / fitz.DocumentWriter. No system deps. The tool degrades
+# gracefully (wraps bodies in <pre>) if this is missing, but the output is
+# much nicer with it present, so it's a hard requirement.
+markdown>=3.5
 beautifulsoup4>=4.12.0
 duckduckgo-search>=6.0.0
 ddgs>=9.0.0
