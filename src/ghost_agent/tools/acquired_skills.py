@@ -579,7 +579,22 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     # don't re-run the sanitizer.
     mgr.save_skill(name, description, schema_dict, normalized_code)
 
-    return f"Success: Skill '{name}' acquired and tested successfully."
+    # Pair with `_RequestState.invalidate_tool_defs()` — the agent loop
+    # drops its cached schema list immediately after this tool returns,
+    # so the next iteration's LLM call sees `<name>` in the function
+    # catalogue. The message below tells the model it's safe to call
+    # `<name>` directly and warns against the pre-fix workaround of
+    # `python3 acquired_skills/<name>.py` via `execute`, which fails
+    # because the canonical file lives outside the sandbox.
+    return (
+        f"Success: Skill '{name}' acquired and tested successfully. "
+        f"It is now LIVE in your tool list — invoke it directly via a "
+        f"`<tool_call>` block with name=\"{name}\" (just like any "
+        f"built-in tool). DO NOT run `python3 acquired_skills/{name}.py` "
+        f"or `import {name}` via `execute`; the source file lives in "
+        f"$GHOST_HOME/system/memory/acquired_skills/ (outside the "
+        f"sandbox) so those paths will not resolve."
+    )
 
 async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, action: str = None, skill_name: str = None):
     if not action:

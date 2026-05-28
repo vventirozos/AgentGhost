@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Workspace Continuity — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="selfhood.html">Selfhood (unified self)</a>
+    <a class="current" href="workspace.html">Workspace continuity</a>
+    <a href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="metacognition.html">Metacognition</a>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+  </nav>
+</aside>
+<main>
+  <h1>Workspace Continuity</h1>
+  <p class="subtitle">The world-model counterpart to selfhood. Selfhood tracks "who I am"; workspace continuity tracks "what I'm looking at."</p>
+
+  <h2>Why this exists</h2>
+  <p>Selfhood was added to give a fresh session of the agent a sense of <em>resuming</em> rather than <em>waking blank</em> — autobiographical diary, open questions, mood, recognition prefix. That closed the asymmetry on the <em>self</em> side. But the <em>world</em> side was still snapshot-only: every session the agent saw an unannotated current file listing, no record of what its scheduled tasks did overnight, no memory of which URLs it had already pulled, no diff against the user's last engagement. The agent's self-model had become richer than its world-model.</p>
+  <p>Workspace continuity is the symmetric module that fixes this. Same shape as selfhood:</p>
+  <ul>
+    <li>An <strong>activity log</strong> (append-only JSONL) mirrors the autobiographical log.</li>
+    <li>A <strong>state thread</strong> (single JSON file) mirrors the self-state thread.</li>
+    <li>A <strong>recognition layer</strong> renders a wake-up prefix spliced into every system prompt, right after the selfhood prefix.</li>
+    <li>A <strong>narrative summariser</strong> regenerates a "running summary of the workspace" in the idle phase 2.9, immediately after the selfhood narrative phase 2.8.</li>
+    <li>A <strong>WorkspaceModel facade</strong> on <code>context.workspace_model</code> is the only object the rest of the agent talks to.</li>
+  </ul>
+
+  <h2>What it tracks</h2>
+  <table>
+    <thead><tr><th>Kind</th><th>What gets recorded</th><th>How</th></tr></thead>
+    <tbody>
+      <tr><td><code>file_changed</code></td><td>One entry per tracked file whose stat changed since the last scan (newly tracked / modified / appeared / deleted).</td><td>On every <code>build_wakeup_prefix()</code> call: <code>scan_tracked()</code> stats every <code>TrackedFile</code> against its cached <code>FileSnapshot</code>. The diff is what the wake-up prefix surfaces.</td></tr>
+      <tr><td><code>task_outcome</code></td><td>One entry per scheduled-task firing: <code>job_id</code>, name, <code>passed</code>/<code>failed</code>, duration, summary, error.</td><td>The APScheduler callback <code>_run_proactive_task</code> in <code>main.py</code> sinks success/failure into <code>WorkspaceModel.record_task_outcome</code> in a try/except so a failing sink can't kill the scheduler.</td></tr>
+      <tr><td><code>research</code></td><td>One entry per unique URL pulled by <code>deep_research</code>; second-and-later occurrences silently dedup against the seen-URL set.</td><td><code>tool_deep_research</code> receives <code>workspace_model</code> via the registry lambda and calls <code>record_research_artifact</code> on every discovered URL.</td></tr>
+      <tr><td><code>command</code></td><td>Significant <code>execute</code>-tool outcomes (long-running, failed, mutating). Caller decides what's significant.</td><td><code>WorkspaceModel.record_command_outcome</code>. Wiring into <code>tool_execute</code> is the next phase.</td></tr>
+      <tr><td><code>note</code></td><td>Free-form workspace events authored by the agent via the <code>workspace_track</code> tool.</td><td><code>WorkspaceModel.note</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Module layout</h2>
+  <table>
+    <thead><tr><th>File</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><code>src/ghost_agent/workspace/schema.py</code></td><td>Dataclasses: <code>FileSnapshot</code>, <code>TrackedFile</code>, <code>TaskOutcome</code>, <code>ResearchArtifact</code>, <code>CommandOutcome</code>, <code>WorkspaceEvent</code>, <code>WorkspaceState</code>.</td></tr>
+      <tr><td><code>src/ghost_agent/workspace/activity.py</code></td><td>Append-only JSONL log of <code>WorkspaceEvent</code>. Same discipline as <code>selfhood.autobiographical</code>: sink failures swallowed, lazy iteration, mid-file corruption tolerated.</td></tr>
+      <tr><td><code>src/ghost_agent/workspace/state.py</code></td><td><code>WorkspaceStateThread</code> — persistent JSON state (tracked files, seen-URL set, last session timestamp). Atomic temp+rename flush. Bounded slots: <code>MAX_TRACKED_FILES=200</code>, <code>MAX_SEEN_URLS=5000</code>. File-watcher lives here: <code>scan_tracked()</code> diffs current stat against cached snapshot.</td></tr>
+      <tr><td><code>src/ghost_agent/workspace/recognition.py</code></td><td><code>build_workspace_prefix()</code> — pure read function that composes activity + state + narrative + file-diffs into the prefix the agent splices into the system prompt. Markers <code>&lt;!-- WORKSPACE:BEGIN --&gt;</code> / <code>END</code> for evaluator strip.</td></tr>
+      <tr><td><code>src/ghost_agent/workspace/narrative.py</code></td><td><code>WorkspaceNarrative</code> — periodic LLM-rewritten "running summary of the workspace". Template fallback when no critique function is supplied, same pattern as <code>selfhood.narrative</code>.</td></tr>
+      <tr><td><code>src/ghost_agent/workspace/model.py</code></td><td><code>WorkspaceModel</code> — single facade. Capture hooks (<code>record_task_outcome</code>, <code>record_research_artifact</code>, <code>record_command_outcome</code>, <code>note</code>), file watcher (<code>track_file</code>, <code>untrack_file</code>, <code>scan_tracked</code>), prefix builder (<code>build_wakeup_prefix</code>), idle consolidator (<code>consolidate_narrative</code>), introspection (<code>stats</code>).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Wiring into the agent</h2>
+  <ol>
+    <li><strong>Lifespan construction</strong> (<code>main.py</code>): <code>context.workspace_model = WorkspaceModel(root=$GHOST_HOME/system/workspace/, …)</code> — same place where <code>context.self_model</code> is built. <code>mark_session_boot()</code> stamps the session.</li>
+    <li><strong>Prompt assembly</strong> (<code>core/agent.py</code>): right after the selfhood prefix splices in, <code>workspace_model.build_wakeup_prefix()</code> is invoked under a strict <code>isinstance</code> gate (defends against MagicMock test contexts) and the resulting block is prepended to <code>base_prompt</code>. Empty when disabled or no state.</li>
+    <li><strong>Scheduled-task ledger</strong> (<code>main.py::_run_proactive_task</code>): around the existing <code>handle_chat</code> dispatch we record <code>outcome="passed"</code> on success and <code>outcome="failed"</code> with the exception class+message on failure. Both branches are wrapped in try/except so a sink failure can't take down a cron job.</li>
+    <li><strong>Research dedup</strong> (<code>tools/search.py::tool_deep_research</code>): after URL discovery and before page fetching, we record every URL into the workspace. The <code>seen_urls</code> set is what makes the next research call dedup.</li>
+    <li><strong>Idle narrative</strong> (<code>core/agent.py::_biological_tick</code> phase 2.9): a new phase added immediately after the selfhood narrative phase 2.8. Same idle window (15-60 min) and cooldown discipline (<code>_WORKSPACE_NARRATIVE_COOLDOWN=3600</code>, overridable via <code>--workspace-narrative-cooldown</code>).</li>
+  </ol>
+
+  <h2>CLI flags</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Default</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-workspace-model</code></td><td>off</td><td>Disable the workspace continuity module entirely. Facade is still attached as a no-op so call sites don't branch on availability.</td></tr>
+      <tr><td><code>--no-memory</code></td><td>off</td><td>Disables persistent stores (including this one) regardless of the flag above.</td></tr>
+      <tr><td><code>--workspace-narrative-cooldown N</code></td><td>3600</td><td>Seconds between biological-phase-2.9 workspace-narrative regenerations.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Agent-callable tools</h2>
+  <ul>
+    <li><a href="../tools/workspace.html"><code>workspace</code></a> — read-only. Actions: <code>summary</code> (default), <code>stats</code>, <code>files</code>, <code>changes</code>, <code>tasks</code>, <code>research</code>, <code>commands</code>, <code>narrative</code>, <code>recent</code>. Answers "what changed since yesterday?", "what did my scheduled task do?", "did I already pull this URL?".</li>
+    <li><a href="../tools/workspace_track.html"><code>workspace_track</code></a> — write. Actions: <code>track</code>, <code>untrack</code>, <code>note</code>, <code>mark_seen</code>. The agent authors the watchlist and records free-form workspace observations.</li>
+  </ul>
+
+  <h2>On-disk layout</h2>
+  <pre><code>$GHOST_HOME/system/workspace/
+  ├── activity.jsonl       # heterogeneous append-only event log
+  ├── state.json           # tracked files + seen-URL set + last session
+  ├── narrative.txt        # latest consolidated running summary
+  └── narrative.txt.tmp    # transient (atomic write tempfile)
+</code></pre>
+
+  <h2>Testing</h2>
+  <p>Per-module unit tests:</p>
+  <ul>
+    <li><code>tests/test_workspace_schema.py</code> — dataclass roundtrip, version constant, partial-dict tolerance</li>
+    <li><code>tests/test_workspace_state_thread.py</code> — track/untrack, URL dedup with normalisation, FIFO cap, scan_tracked detecting modification + deletion, corrupt-JSON recovery, persistence across reconstruction, prefix rendering</li>
+    <li><code>tests/test_workspace_activity.py</code> — append/iter/recent/filter-by-kind, kind tally, disabled-mode no-op, corrupt-line tolerance, empty-kind refusal</li>
+    <li><code>tests/test_workspace_recognition.py</code> — prefix composition, marker presence, file-change surfacing, narrative header order, char cap, strip-block</li>
+    <li><code>tests/test_workspace_continuity_model.py</code> — facade hooks (task / research dedup / command / track / note), narrative template + LLM critique paths, stats shape, disabled-mode</li>
+    <li><code>tests/test_workspace_tool.py</code> — every action of both tools, registry wiring, disabled / None workspace_model graceful, dispatch lambda binds context</li>
+    <li><code>tests/test_workspace_wiring.py</code> — GhostContext default, deep_research artifact sink + repeat-dedup with DDGS patched, wake-up prefix non-empty when state present</li>
+  </ul>
+
+  <h2>Diagram</h2>
+  <div class="diagram">
+    <svg viewBox="0 0 920 360" xmlns="http://www.w3.org/2000/svg" font-size="12">
+      <rect width="920" height="360" fill="#131822"/>
+      <defs><marker id="ws1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,1.5 L9,5 L0,8.5 Z" fill="rgba(122,167,255,0.9)"/></marker></defs>
+
+      <rect x="20" y="20" width="200" height="42" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="120" y="46" text-anchor="middle" fill="#e6e9ef">deep_research → URLs</text>
+
+      <rect x="240" y="20" width="200" height="42" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="340" y="46" text-anchor="middle" fill="#e6e9ef">scheduler → task outcome</text>
+
+      <rect x="460" y="20" width="200" height="42" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="560" y="46" text-anchor="middle" fill="#e6e9ef">tracked file diff</text>
+
+      <rect x="680" y="20" width="220" height="42" fill="#1a2030" stroke="#7aa7ff" rx="6"/>
+      <text x="790" y="46" text-anchor="middle" fill="#e6e9ef">workspace_track tool</text>
+
+      <rect x="280" y="110" width="360" height="46" fill="#1a2030" stroke="#b894ff" rx="6"/>
+      <text x="460" y="138" text-anchor="middle" fill="#e6e9ef">WorkspaceModel facade</text>
+
+      <rect x="40" y="200" width="200" height="42" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="140" y="226" text-anchor="middle" fill="#e6e9ef">activity.jsonl</text>
+      <rect x="280" y="200" width="200" height="42" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="380" y="226" text-anchor="middle" fill="#e6e9ef">state.json</text>
+      <rect x="520" y="200" width="200" height="42" fill="#1a2030" stroke="#5dd39e" rx="6"/>
+      <text x="620" y="226" text-anchor="middle" fill="#e6e9ef">narrative.txt</text>
+
+      <rect x="180" y="290" width="560" height="46" fill="#1a2030" stroke="#ffb454" rx="6"/>
+      <text x="460" y="318" text-anchor="middle" fill="#e6e9ef">build_wakeup_prefix() → spliced into system prompt</text>
+
+      <line x1="120" y1="62" x2="380" y2="110" stroke="#7aa7ff" marker-end="url(#ws1)"/>
+      <line x1="340" y1="62" x2="430" y2="110" stroke="#7aa7ff" marker-end="url(#ws1)"/>
+      <line x1="560" y1="62" x2="490" y2="110" stroke="#7aa7ff" marker-end="url(#ws1)"/>
+      <line x1="790" y1="62" x2="540" y2="110" stroke="#7aa7ff" marker-end="url(#ws1)"/>
+
+      <line x1="380" y1="156" x2="140" y2="200" stroke="#b894ff" marker-end="url(#ws1)"/>
+      <line x1="460" y1="156" x2="380" y2="200" stroke="#b894ff" marker-end="url(#ws1)"/>
+      <line x1="540" y1="156" x2="620" y2="200" stroke="#b894ff" marker-end="url(#ws1)"/>
+
+      <line x1="140" y1="242" x2="370" y2="290" stroke="#5dd39e" marker-end="url(#ws1)"/>
+      <line x1="380" y1="242" x2="460" y2="290" stroke="#5dd39e" marker-end="url(#ws1)"/>
+      <line x1="620" y1="242" x2="540" y2="290" stroke="#5dd39e" marker-end="url(#ws1)"/>
+    </svg>
+    <p class="caption">Figure — Capture sources fan into <code>WorkspaceModel</code>, which writes through three substrates (activity log, state thread, narrative) and reads back out via <code>build_wakeup_prefix()</code> on every chat turn.</p>
+  </div>
+
+  <h2>Relation to selfhood</h2>
+  <p>The two modules are designed to coexist. <a href="selfhood.html">Selfhood</a> answers "tell me about yourself" with the agent's autobiographical past and ongoing internal state. Workspace continuity answers "what's happening in my workspace?" with the user's external state. Both wake-up prefixes are spliced into the same system prompt, with selfhood first (who I am) and workspace second (what I'm looking at). The clean separation is intentional: an evaluator can strip one block without disturbing the other.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

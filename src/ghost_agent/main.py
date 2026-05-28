@@ -57,6 +57,7 @@ from .reflection import Reflector
 from .router import ComplexityClassifier, ComplexityDispatcher
 from .prm import PRMScorer, PRMTrainer
 from .selfhood import SelfModel
+from .workspace import WorkspaceModel
 
 print(" - All modules imported successfully!", flush=True)
 
@@ -123,6 +124,8 @@ def parse_args():
     # (privacy-sensitive evals, A/B comparisons, etc.).
     parser.add_argument("--no-self-model", action="store_true", help="Disable the selfhood module (autobiographical memory + self-state + narrative). When --no-memory is set, the selfhood module is also disabled regardless of this flag.")
     parser.add_argument("--self-narrative-cooldown", type=int, default=3600, help="Seconds between idle-time narrative consolidations (biological phase 2.8). Default 60 min.")
+    parser.add_argument("--no-workspace-model", action="store_true", help="Disable the workspace continuity module (file watcher, scheduled-task ledger, research dedup, command outcomes). When --no-memory is set, this module is also disabled regardless of this flag.")
+    parser.add_argument("--workspace-narrative-cooldown", type=int, default=3600, help="Seconds between idle-time workspace narrative consolidations (biological phase 2.9). Default 60 min.")
     # Metacognition uplift (roadmap phases 1-3). Off by default so the
     # legacy pre-uplift turn loop is unchanged for callers that don't
     # opt in. When enabled, the bundle constructed in lifespan wires
@@ -311,7 +314,20 @@ async def lifespan(app):
             """Dispatch a scheduled prompt back through the agent's chat
             handler. Any exception here is logged but not re-raised — a
             single failing scheduled job must not kill the scheduler
-            thread and take down every other job with it."""
+            thread and take down every other job with it.
+
+            Outcomes (success or failure) are also sunk into the
+            workspace activity log so the user can query
+            ``workspace(action='tasks')`` later and see what their cron
+            jobs actually did."""
+            import time as _time
+            started = _time.time()
+            task_name = ""
+            try:
+                _job = _sched.get_job(job_id) if _sched else None
+                task_name = getattr(_job, "name", "") or job_id
+            except Exception:  # noqa: BLE001
+                task_name = job_id
             try:
                 pretty_log(
                     "Scheduled Task Fire",
@@ -330,12 +346,36 @@ async def lifespan(app):
                 from fastapi import BackgroundTasks
                 bg = BackgroundTasks()
                 await context.agent.handle_chat(body, bg, request_id=f"sched-{job_id}")
+                # Sink the success into workspace continuity.
+                try:
+                    _ws = getattr(context, "workspace_model", None)
+                    if _ws is not None and getattr(_ws, "enabled", False):
+                        _ws.record_task_outcome(
+                            job_id=job_id, task_name=task_name,
+                            outcome="passed",
+                            duration_seconds=_time.time() - started,
+                            summary=(prompt or "")[:200],
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
             except Exception as e:
                 pretty_log(
                     "Scheduled Task Failed",
                     f"{job_id}: {type(e).__name__}: {e}",
                     level="WARNING", icon=Icons.WARN,
                 )
+                try:
+                    _ws = getattr(context, "workspace_model", None)
+                    if _ws is not None and getattr(_ws, "enabled", False):
+                        _ws.record_task_outcome(
+                            job_id=job_id, task_name=task_name,
+                            outcome="failed",
+                            duration_seconds=_time.time() - started,
+                            summary=(prompt or "")[:200],
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
 
         # Bind the runner function into the tasks module so
         # `tool_schedule_task` can pass it to `scheduler.add_job`.
@@ -741,6 +781,63 @@ async def lifespan(app):
     except Exception as e:
         pretty_log("Selfhood Failed", str(e), level="WARNING", icon=Icons.WARN)
         context.self_model = SelfModel(root=self_root, enabled=False)
+
+    # Workspace continuity — the world-model counterpart to selfhood.
+    # Tracks files the user wants watched, scheduled-task outcomes,
+    # research artifacts pulled, and significant command outcomes.
+    # Persists under $GHOST_HOME/system/workspace/. Disabled when
+    # --no-memory (persistent module) or --no-workspace-model.
+    workspace_root = Path(str(context.memory_dir)).parent / "workspace"
+    workspace_enabled = not args.no_memory and not getattr(args, "no_workspace_model", False)
+    try:
+        async def _workspace_critique_fn(prompt: str) -> str:
+            """LLM critique closure for the workspace narrative. Same
+            shape as the selfhood narrative critique — low temperature,
+            modest max_tokens for a 3-5 sentence paragraph."""
+            payload = {
+                "model": args.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.4,
+                "max_tokens": 512,
+                "stream": False,
+            }
+            res = await context.llm_client.chat_completion(payload)
+            return (
+                (res or {})
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+
+        context.workspace_model = WorkspaceModel(
+            root=workspace_root,
+            enabled=workspace_enabled,
+            narrative_critique_fn=(
+                _workspace_critique_fn if workspace_enabled else None
+            ),
+        )
+        if workspace_enabled:
+            ws_stats = context.workspace_model.stats()
+            pretty_log(
+                "Workspace",
+                f"continuity initialised at {workspace_root}: "
+                f"{ws_stats['tracked_files']} tracked file(s), "
+                f"{ws_stats['event_count']} prior event(s)",
+                icon=Icons.BRAIN_THINK,
+            )
+            try:
+                context.workspace_model.mark_session_boot()
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            pretty_log(
+                "Workspace",
+                "disabled (--no-memory or --no-workspace-model)",
+                icon=Icons.WARN,
+            )
+    except Exception as e:
+        pretty_log("Workspace Failed", str(e), level="WARNING", icon=Icons.WARN)
+        context.workspace_model = WorkspaceModel(root=workspace_root, enabled=False)
 
     agent = GhostAgent(context)
     app.state.agent = agent

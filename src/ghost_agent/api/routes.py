@@ -90,6 +90,22 @@ async def api_pull(request: Request):
 
 @router.delete("/api/delete")
 async def api_delete(request: Request):
+    # Ollama-compatible: DELETE /api/delete removes a pulled model. We
+    # serve a single canonical model and never let the user actually
+    # delete it, but returning 200/success for ANY name was misleading —
+    # clients couldn't distinguish "deleted my model" from "no such
+    # model." Validate against the configured model name.
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    name = (body or {}).get("model") or (body or {}).get("name")
+    configured = request.app.state.args.model
+    if name and name != configured:
+        return JSONResponse(
+            {"error": {"message": f"model '{name}' not found", "type": "NotFound"}},
+            status_code=404,
+        )
     return {"status": "success"}
 
 @router.post("/api/generate", dependencies=[Security(verify_api_key)])
@@ -171,7 +187,68 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             },
             status_code=400,
         )
-    model = body.get("model", agent.context.args.model)
+
+    # ---- request validation (HTTP boundary) ---------------------------
+    # Stops three classes of garbage from reaching `agent.handle_chat`:
+    #   1. `messages: []` (or missing) — used to silently produce
+    #      fabricated content from injected system state.
+    #   2. `messages: "not a list"` / each-message-not-a-dict — used to
+    #      crash `handle_chat` with `'str' object has no attribute 'get'`
+    #      leaking Python internals as a 500.
+    #   3. Unknown role values — passed through to the upstream LLM and
+    #      surfaced as an "upstream error 400 template parser failed"
+    #      string masquerading as an assistant reply.
+    # Errors here are 422 with OpenAI-style `{error:{message,type}}`.
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return JSONResponse(
+            {"error": {
+                "message": "`messages` must be a non-empty list of message objects",
+                "type": "InvalidRequestShape",
+            }},
+            status_code=422,
+        )
+    allowed_roles = {"system", "user", "assistant", "tool", "function"}
+    for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            return JSONResponse(
+                {"error": {
+                    "message": f"messages[{i}] must be an object, got {type(m).__name__}",
+                    "type": "InvalidRequestShape",
+                }},
+                status_code=422,
+            )
+        role = m.get("role")
+        if role not in allowed_roles:
+            return JSONResponse(
+                {"error": {
+                    "message": (
+                        f"messages[{i}].role={role!r} is not one of "
+                        f"{sorted(allowed_roles)}"
+                    ),
+                    "type": "InvalidRequestShape",
+                }},
+                status_code=422,
+            )
+
+    # `model` is optional in many clients (Ollama leaves it implicit).
+    # If supplied AND it doesn't match the configured model, return 404
+    # rather than silently rerouting to the upstream. We don't 404 a
+    # missing key — that preserves Ollama compatibility.
+    requested_model = body.get("model")
+    configured_model = agent.context.args.model
+    if requested_model and requested_model != configured_model:
+        return JSONResponse(
+            {"error": {
+                "message": (
+                    f"model {requested_model!r} not found; configured "
+                    f"model is {configured_model!r}"
+                ),
+                "type": "ModelNotFound",
+            }},
+            status_code=404,
+        )
+    model = requested_model or configured_model
     stream = body.get("stream", False)
     
     # Extract Request ID if provided (for Slack Bot correlation)
@@ -234,12 +311,24 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     try:
         content, created_time, req_id = await agent.handle_chat(body, background_tasks, request_id=request_id)
     except Exception as e:
-        logger.error(f"Non-streaming error in chat_proxy: {type(e).__name__}: {e}", exc_info=True)
+        # The detailed stack lives in the log. The wire response gets a
+        # generic message + an opaque exception type so a malformed-body
+        # repro doesn't reveal Python internals (e.g. "'str' object has
+        # no attribute 'get'"). The error-id lets you correlate to logs.
+        err_id = uuid.uuid4().hex[:8]
+        logger.error(
+            f"[err_id={err_id}] Non-streaming error in chat_proxy: "
+            f"{type(e).__name__}: {e}",
+            exc_info=True,
+        )
         return JSONResponse(
             {
                 "error": {
-                    "message": f"CRITICAL SERVER ERROR: {e}",
-                    "type": type(e).__name__,
+                    "message": (
+                        "internal error while handling chat request "
+                        f"(error_id={err_id})"
+                    ),
+                    "type": "InternalError",
                 }
             },
             status_code=500,
@@ -256,7 +345,28 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
 async def save_workspace(request: Request):
     """Packages the current chat history, scratchpad, and sandbox into a downloadable zip."""
     agent = get_agent(request)
-    body = await request.json()
+    # Empty / malformed body used to surface as a bare 500
+    # `Internal Server Error` with no JSON envelope. Accept "no body"
+    # as "save with empty chat history" and reject malformed bodies
+    # with a structured 400.
+    raw = await request.body()
+    if not raw:
+        body = {}
+    else:
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+            return JSONResponse(
+                {"error": {"message": f"Invalid JSON in request body: {e}",
+                           "type": type(e).__name__}},
+                status_code=400,
+            )
+        if not isinstance(body, dict):
+            return JSONResponse(
+                {"error": {"message": f"Request body must be a JSON object, got {type(body).__name__}",
+                           "type": "InvalidRequestShape"}},
+                status_code=400,
+            )
     chat_history = body.get("chat_history", [])
 
     # The previous version used `iter([zip_buffer.getvalue()])` which held

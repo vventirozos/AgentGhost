@@ -13,6 +13,8 @@ from .composed_skills import register_composed_skills
 from .projects import tool_manage_projects, MANAGE_PROJECTS_TOOL_DEF
 from .self_state import tool_self_state
 from .introspect import tool_introspect
+from .workspace import tool_workspace
+from .workspace_track import tool_workspace_track
 from .uncertainty_tool import tool_flag_uncertainty
 
 import logging
@@ -141,6 +143,8 @@ TOOL_DEFINITIONS = [
     },
     {"type": "function", "function": {"name": "learn_skill", "description": "MANDATORY when you solve a complex bug or task after initial failure. Save the lesson so you don't repeat the mistake.", "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "mistake": {"type": "string"}, "solution": {"type": "string"}}, "required": ["task", "mistake", "solution"]}}},
     {"type": "function", "function": {"name": "flag_uncertainty", "description": "Register what you DON'T know or are unsure about with your metacognitive tracker. Call action='unknown' when you need a fact you don't have (set impact 1-5 — 4+ means it materially affects correctness; resolution tells how to get it: 'ask user', 'search web', 'read file'). Call action='assumption' when you are proceeding on a belief you have NOT verified (set confidence 0.0-1.0). action='list' shows what is currently flagged plus recurring blind-spots from past turns. A critical unknown (impact>=4, resolution='ask user') triggers a clarification prompt before your answer is finalized — so flag honestly rather than guessing. Everything flagged persists, so questions you keep hitting become visible as recurring blind-spots.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["unknown", "assumption", "list"]}, "text": {"type": "string", "description": "For action='unknown': what you don't know. For action='assumption': the unverified belief."}, "impact": {"type": "integer", "minimum": 1, "maximum": 5, "description": "For action='unknown': how much not knowing this affects correctness (1 minor, 5 critical)."}, "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "For action='assumption': how confident you are in the belief (0.0-1.0)."}, "resolution": {"type": "string", "description": "For action='unknown': how to resolve it — 'ask user', 'search web', 'read file', etc."}, "basis": {"type": "string", "description": "For action='assumption': why you believe it."}}, "required": ["action"]}}},
+    {"type": "function", "function": {"name": "workspace", "description": "READ-ONLY view of the user's WORKSPACE state — what's outside of you (files, scheduled-task outcomes, research artifacts you've pulled, commands you ran). This is the world-model counterpart to introspect (which reads your selfhood). Use this when the user asks 'what changed since yesterday?', 'what did my scheduled task do?', 'have I already pulled this URL?', 'show me what you've been doing in my project'. Distinct from: introspect (your own selfhood), file_system (one-shot reads of the filesystem), recall (vector search over ingested docs). Actions: 'summary' (default; stats + narrative + recent changes + recent tasks/research); 'stats' (counts); 'files' (the watchlist); 'changes' (diff tracked files against last-seen snapshot); 'tasks' (recent scheduled-task outcomes); 'research' (URLs you've already pulled); 'commands' (significant command outcomes); 'narrative' (the running workspace summary); 'recent' (the activity log, mixed kinds).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "files", "changes", "tasks", "research", "commands", "narrative", "recent"], "description": "Default 'summary' if omitted."}, "limit": {"type": "integer", "description": "For tasks/research/commands/recent: how many entries to return. Defaults to 10; capped at 50."}}, "required": []}}},
+    {"type": "function", "function": {"name": "workspace_track", "description": "WRITE path into the WORKSPACE state — author the watchlist of files to track, free-form workspace notes, and manual research dedup markers. Counterpart to the read-only workspace tool. Actions: 'track' (add a file path to the watchlist; optional 'label' for a human descriptor); 'untrack' (remove a path); 'note' (record a free-form workspace observation); 'mark_seen' (record a URL as already-pulled so future research dedups against it). Tracked files get a stat-cache diff on every wake-up, so 'track' is how you get 'what changed in this file since last session' to surface automatically.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["track", "untrack", "note", "mark_seen"]}, "path": {"type": "string", "description": "For track/untrack: the file path to add/remove from the watchlist."}, "label": {"type": "string", "description": "Optional for track: a short human descriptor (e.g. 'main config', 'experiment log')."}, "text": {"type": "string", "description": "Required for note: the free-form observation."}, "url": {"type": "string", "description": "Required for mark_seen: the URL to record as already-pulled."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "introspect", "description": "READ-ONLY introspection over your OWN selfhood — your running first-person diary, recent experiences, topic clusters, and counts. Use this when the user asks you to describe yourself, what you've been working on, what you remember, or what you've done before. Distinct from: self_state (which AUTHORS open questions / threads / mood for the next session), knowledge_base (facts about the world), update_profile (facts about the USER). Actions: 'summary' (default; renders stats + running diary + recent experiences in one block — the natural answer to 'tell me about yourself'); 'stats' (counts and the topic cluster mix); 'narrative' (just the running diary); 'recent' (the last N first-person experiences); 'recall' (relevance-ranked search over your past, IDF-weighted, no embeddings — pass 'query'). All reads route through your SelfModel; nothing here writes.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "narrative", "recent", "recall"], "description": "Default 'summary' if omitted."}, "query": {"type": "string", "description": "Required for action='recall': what to search your past for (e.g. 'postgres migrations', 'the trapdoor question')."}, "limit": {"type": "integer", "description": "For action='recent' or 'recall': how many results to return. Defaults to 5; capped at 25."}}, "required": []}}},
     {"type": "function", "function": {"name": "self_state", "description": "Author your OWN cross-session continuity state — the open questions, unfinished threads, and mood you carry from this session into the next. This is YOUR forward-looking self, not facts about the world. Use it when you finish a turn but something is left unresolved that the next session of you should pick up. Distinct from: knowledge_base (facts/documents), update_profile (facts about the USER), scratchpad (notes for THIS conversation only). action='note_question' records something you are still trying to figure out; 'resolve_question' marks one answered; 'add_unfinished' notes a task left mid-flight; 'close_unfinished' completes one; 'set_mood' records your current functional state (e.g. 'curious', 'stuck', 'satisfied'); 'list' shows what is currently on file. Whatever you record here is shown to you at the start of your next session.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["note_question", "resolve_question", "add_unfinished", "close_unfinished", "set_mood", "list"]}, "text": {"type": "string", "description": "For note_question/add_unfinished: the question or thread text. For resolve_question/close_unfinished: the id (or id-prefix, or a text substring) of the item to close."}, "mood": {"type": "string", "description": "Required for set_mood: a short functional-state label (e.g. 'curious', 'stuck', 'satisfied')."}, "evidence": {"type": "string", "description": "Optional for set_mood: one sentence on why."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "web_search", "description": "Search the internet (Anonymous via Tor). ALWAYS use this FIRST for simple factual questions and general web searches. CRITICAL: Keep your queries concise and keyword-focused (e.g., 'PostgreSQL 16 release notes'). DO NOT use long conversational sentences. Use advanced search operators like 'site:wikipedia.org', 'site:github.com', or 'site:.org' to force the search engine to return official documentation instead of SEO spam.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
@@ -289,6 +293,16 @@ TOOL_DEFINITIONS.append({
                         "required": ["body"],
                     },
                 },
+                "filename": {
+                    "type": "string",
+                    "description": (
+                        "OPTIONAL output filename for the PDF, e.g. "
+                        "'q4_report.pdf'. Must start with an alphanumeric "
+                        "and contain only letters, digits, '.', '_' or '-'. "
+                        "No path separators. If omitted, a unique name like "
+                        "'report_<8hex>.pdf' is generated."
+                    ),
+                },
             },
             "required": ["title", "sections"],
         },
@@ -369,7 +383,23 @@ def get_active_tool_definitions(context, query: str = None):
                             "minimum": 4,
                             "maximum": 8,
                             "description": "Number of inference steps (default 6. Keep it between 4 and 8 for Lightning models)."
-                        }
+                        },
+                        "width": {
+                            "type": "integer",
+                            "description": (
+                                "Requested width in pixels (optional, default 1024). "
+                                "Will be snapped to the nearest SDXL training "
+                                "bucket: 640, 768, 832, 896, 1024, 1152, 1216, "
+                                "1344, or 1536. Aspect ratio is honored."
+                            ),
+                        },
+                        "height": {
+                            "type": "integer",
+                            "description": (
+                                "Requested height in pixels (optional, default 1024). "
+                                "Snapped to the same SDXL bucket set as `width`."
+                            ),
+                        },
                     },
                     "required": ["prompt"]
                 }
@@ -515,15 +545,17 @@ def get_available_tools(context):
         "file_system": lambda **kwargs: tool_file_system(sandbox_dir=context.sandbox_dir, tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, **kwargs),
         "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=context.sandbox_dir, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "recall": lambda **kwargs: tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs),
-        "execute": lambda **kwargs: tool_execute(sandbox_dir=context.sandbox_dir, sandbox_manager=context.sandbox_manager, memory_dir=context.memory_dir, _metacog_bundle=getattr(context, "metacog", None), **kwargs),
-        "browser": lambda **kwargs: tool_browser(sandbox_dir=context.sandbox_dir, sandbox_manager=context.sandbox_manager, tor_proxy=context.tor_proxy, **kwargs),
+        "execute": lambda **kwargs: tool_execute(sandbox_dir=context.sandbox_dir, sandbox_manager=context.sandbox_manager, memory_dir=context.memory_dir, _metacog_bundle=getattr(context, "metacog", None), workspace_model=getattr(context, "workspace_model", None), **kwargs),
+        "browser": lambda **kwargs: tool_browser(sandbox_dir=context.sandbox_dir, sandbox_manager=context.sandbox_manager, tor_proxy=context.tor_proxy, workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "learn_skill": lambda **kwargs: tool_learn_skill(skill_memory=context.skill_memory, memory_system=context.memory_system, memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "self_state": lambda **kwargs: tool_self_state(self_model=getattr(context, "self_model", None), **kwargs),
         "introspect": lambda **kwargs: tool_introspect(self_model=getattr(context, "self_model", None), **kwargs),
+        "workspace": lambda **kwargs: tool_workspace(workspace_model=getattr(context, "workspace_model", None), **kwargs),
+        "workspace_track": lambda **kwargs: tool_workspace_track(workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "flag_uncertainty": lambda **kwargs: tool_flag_uncertainty(uncertainty_tracker=getattr(context, "uncertainty_tracker", None), **kwargs),
         "web_search": lambda **kwargs: tool_search(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, **kwargs),
-        "deep_research": lambda **kwargs: tool_deep_research(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, **kwargs),
-        "fact_check": lambda **kwargs: tool_fact_check(llm_client=context.llm_client, model_name=getattr(context.args, 'model', "qwen-3.6-35b-a3"), tool_definitions=get_active_tool_definitions(context), deep_research_callable=lambda q: tool_deep_research(query=q, anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context), **kwargs),
+        "deep_research": lambda **kwargs: tool_deep_research(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None), **kwargs),
+        "fact_check": lambda **kwargs: tool_fact_check(llm_client=context.llm_client, model_name=getattr(context.args, 'model', "qwen-3.6-35b-a3"), tool_definitions=get_active_tool_definitions(context), deep_research_callable=lambda q: tool_deep_research(query=q, anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None)), **kwargs),
         "update_profile": lambda **kwargs: tool_update_profile(profile_memory=context.profile_memory, memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "scratchpad": lambda **kwargs: tool_scratchpad(scratchpad=context.scratchpad, **kwargs),
         "manage_tasks": lambda **kwargs: tool_manage_tasks(scheduler=context.scheduler, memory_system=context.memory_system, **kwargs),

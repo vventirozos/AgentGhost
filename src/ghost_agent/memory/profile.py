@@ -59,6 +59,24 @@ class ProfileMemory:
             if cat not in data or not isinstance(data[cat], dict):
                 data[cat] = {}
 
+            # Singleton keys: identity-style facts where the user has
+            # exactly one value. Merging here produced absurd results
+            # like `name: ["User", "Vasilis"]` (the seeded default kept
+            # alongside the user-supplied name). For these keys we
+            # always REPLACE; for everything else the merge behavior
+            # below applies.
+            _SINGLETON_KEYS = {
+                "name", "role", "email", "timezone", "age",
+                "birthday", "pronouns", "title", "location",
+            }
+            if target_key in _SINGLETON_KEYS:
+                data[cat][target_key] = v
+                self.save(data)
+                if (cat, target_key) != (original_cat, original_key):
+                    return (f"Synchronized: {cat}.{target_key} = {v}  "
+                            f"[normalised from {original_cat}.{original_key}]")
+                return f"Synchronized: {cat}.{target_key} = {v}"
+
             # MERGE semantics (was overwrite). Profile facts often coexist
             # ("python" AND "rust" are both interests; the user owns BOTH a
             # car and a bike). Overwriting silently dropped prior facts. We

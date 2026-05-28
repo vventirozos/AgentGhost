@@ -806,6 +806,7 @@ async def tool_browser(
     sandbox_dir: Path = None,
     sandbox_manager=None,
     tor_proxy: Optional[str] = None,
+    workspace_model=None,
     **kwargs,
 ):
     """Run a single browser operation inside the sandbox.
@@ -966,6 +967,24 @@ async def tool_browser(
                 "once first, or pass `url=...` on this call."
             ),
         )
+
+    # Workspace research dedup: record the URL we actually loaded so
+    # a later research turn can ask "did I already pull this?" via the
+    # workspace tool. Operations that meaningfully fetch a page
+    # (navigate / extract_text / click / interact / screenshot) carry
+    # a `parsed['url']` (or `final_url`). Non-fatal — must never break
+    # a successful browser turn.
+    if workspace_model is not None and getattr(workspace_model, "enabled", False):
+        try:
+            _hit_url = parsed.get("url") or parsed.get("final_url")
+            if _hit_url:
+                workspace_model.record_research_artifact(
+                    url=_hit_url, source="browser",
+                    title=parsed.get("title") or parsed.get("final_title") or "",
+                    note=operation,
+                )
+        except Exception:  # noqa: BLE001
+            pass
 
     # Pretty-print the success result for the LLM. Keep each op's
     # return shape deterministic so downstream prompts can rely on it.

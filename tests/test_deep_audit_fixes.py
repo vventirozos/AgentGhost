@@ -362,8 +362,14 @@ async def test_api_chat_non_streaming_returns_json_error_on_exception():
     )
     assert resp.status_code == 500
     body = resp.json()
-    assert body.get("error", {}).get("type") == "RuntimeError"
-    assert "boom" in body["error"]["message"]
+    # Error envelope is intentionally generic — the exception type
+    # name and its repr must NOT leak to the wire (info-disclosure
+    # hardening). The error_id lets operators correlate to the log
+    # entry where the full stack lives.
+    assert body.get("error", {}).get("type") == "InternalError"
+    assert "RuntimeError" not in body["error"]["message"]
+    assert "boom" not in body["error"]["message"]
+    assert "error_id=" in body["error"]["message"]
 
 
 # --------------------------------------------------------------------------- #

@@ -69,6 +69,8 @@
       <tr><td><code>image_generation</code></td><td><a href="image_gen.html">image_gen</a></td><td>SDXL gen (auto-registered when <code>image_gen_clients</code> configured).</td></tr>
       <tr><td><code>report_pdf</code></td><td><a href="report_pdf.html">report_pdf</a></td><td>Native multi-page PDF report from markdown sections (PyMuPDF + markdown; no remote service required).</td></tr>
       <tr><td><code>introspect</code></td><td><a href="introspect.html">introspect</a></td><td>Read-only selfhood snapshot — running diary, recent experiences, stats, IDF-weighted past-recall. The deterministic answer to "tell me about yourself".</td></tr>
+      <tr><td><code>workspace</code></td><td><a href="workspace.html">workspace</a></td><td>Read-only world-model snapshot — tracked-file diffs, scheduled-task outcomes, research artifacts, command outcomes, running workspace narrative.</td></tr>
+      <tr><td><code>workspace_track</code></td><td><a href="workspace_track.html">workspace_track</a></td><td>Write path into workspace continuity — author the file watchlist, free-form notes, manual research dedup markers.</td></tr>
     </tbody>
   </table>
   <p>Plus dynamic tools added at runtime: every active <a href="acquired_skills.html">acquired skill</a> and every registered <a href="composed_skills.html">composed skill</a> appears as its own LLM-facing tool definition.</p>
@@ -123,6 +125,7 @@
   <ul>
     <li><code>self_state</code> — the agent authors its own cross-session continuity state: open questions, unfinished threads, and mood (actions: <code>note_question</code>, <code>resolve_question</code>, <code>add_unfinished</code>, <code>close_unfinished</code>, <code>set_mood</code>, <code>list</code>). Writes route through the selfhood <code>SelfStateThread</code> and surface in the next session's wake-up prefix.</li>
     <li><a href="introspect.html"><code>introspect</code></a> — read-only counterpart to <code>self_state</code>: snapshots the agent's own selfhood for introspective queries like "tell me about yourself" or "what do you remember about X?". Actions: <code>summary</code> (default), <code>stats</code>, <code>narrative</code>, <code>recent</code>, <code>recall</code>. All reads route through the <code>SelfModel</code> facade — stats, the running diary, recent experiences, and IDF-weighted past-recall.</li>
+    <li><a href="workspace.html"><code>workspace</code></a> / <a href="workspace_track.html"><code>workspace_track</code></a> — world-model counterparts to the selfhood pair. Read tool surfaces file diffs, scheduled-task outcomes, research artifacts, command outcomes, and the running workspace narrative; write tool authors the file watchlist, free-form notes, and manual research dedup markers. Both route through the <code>WorkspaceModel</code> facade (see <a href="../algorithms/workspace.html">workspace continuity</a>).</li>
     <li><code>flag_uncertainty</code> — the agent registers what it does not know (unknowns, with an impact score) or is unverified about (assumptions, with a confidence score) with the metacognitive <a href="../core/uncertainty.html">UncertaintyTracker</a>; a critical unknown triggers a clarification gate before the answer is finalized.</li>
   </ul>
   <p>All three are registered in <code>TOOL_DEFINITIONS</code> and <code>get_available_tools</code>.</p>

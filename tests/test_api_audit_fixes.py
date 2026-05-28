@@ -164,11 +164,16 @@ async def test_chat_stream_yields_keepalive_before_handle_chat_completes():
     agent.handle_chat = fake_handle_chat
     agent.context.args.model = "test-model"
 
-    req = _make_request(method="POST", json_body={"stream": True, "messages": []})
+    # `messages: []` is now rejected by request validation BEFORE the
+    # stream generator runs. Supply a valid messages list so the test
+    # actually exercises the keepalive-before-handler-await invariant.
+    valid_body = {"stream": True,
+                  "messages": [{"role": "user", "content": "hi"}]}
+    req = _make_request(method="POST", json_body=valid_body)
     req.app = MagicMock()
     req.app.state.agent = agent
     # `chat_proxy` calls `await request.json()` directly.
-    req.json = AsyncMock(return_value={"stream": True, "messages": []})
+    req.json = AsyncMock(return_value=valid_body)
 
     bg_tasks = MagicMock()
 

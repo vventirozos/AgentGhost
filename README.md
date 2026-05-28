@@ -93,3 +93,4 @@ pylint src/ghost_agent
 ## Telemetry
 
 Telemetry from PostHog, ChromaDB, and Hugging Face Hub is disabled at import time. Don't reintroduce libraries that re-enable it without matching opt-outs.
+

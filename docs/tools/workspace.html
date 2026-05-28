@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.workspace — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="browser.html">browser</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="introspect.html">introspect</a>
+    <a class="current" href="workspace.html">workspace</a>
+    <a href="workspace_track.html">workspace_track</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="report_pdf.html">report_pdf</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks (scheduler)</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / workspace.py</h1>
+  <p class="subtitle">Read-only view of the user's workspace state — file watchlist, scheduled-task outcomes, research artifacts, command outcomes, running narrative.</p>
+
+  <h2>Why this tool exists</h2>
+  <p>The <a href="../algorithms/workspace.html">workspace continuity</a> module's wake-up prefix is already spliced into every system prompt, so casual workspace questions ("what's been going on?") are grounded by default. This tool is the explicit handle for deterministic snapshots and ad-hoc queries the wake-up prefix doesn't cover.</p>
+  <p>It is the world-model counterpart to <a href="introspect.html"><code>introspect</code></a> (which reads the agent's selfhood). The writable counterpart is <a href="workspace_track.html"><code>workspace_track</code></a>.</p>
+
+  <h2>Tool: <code>workspace</code></h2>
+  <table>
+    <thead><tr><th>Action</th><th>Returns</th><th>Backed by</th></tr></thead>
+    <tbody>
+      <tr><td><code>summary</code> (default)</td><td>Stats + running narrative + recent file changes + recent task outcomes + recent research — the natural "tell me what's been happening" snapshot.</td><td><code>WorkspaceModel.stats()</code>, <code>WorkspaceNarrative.latest()</code>, <code>scan_tracked()</code>, <code>activity.recent()</code></td></tr>
+      <tr><td><code>stats</code></td><td>Counts (tracked files, events on file, URLs already pulled), last session timestamp, narrative-present flag, top-6 event-kind mix.</td><td><code>WorkspaceModel.stats()</code></td></tr>
+      <tr><td><code>files</code></td><td>The current watchlist with last-seen timestamps and "missing on disk" flags.</td><td><code>WorkspaceStateThread.tracked_files()</code></td></tr>
+      <tr><td><code>changes</code></td><td>Stat every tracked file against its cached snapshot; emit a one-line description of every change since the last scan.</td><td><code>WorkspaceModel.scan_tracked()</code></td></tr>
+      <tr><td><code>tasks</code></td><td>Recent scheduled-task outcomes (<code>passed</code>/<code>failed</code>, duration, error).</td><td><code>activity.recent(kind="task_outcome")</code></td></tr>
+      <tr><td><code>research</code></td><td>Recent research artifacts (URLs already pulled, source tool).</td><td><code>activity.recent(kind="research")</code></td></tr>
+      <tr><td><code>commands</code></td><td>Recent significant command outcomes.</td><td><code>activity.recent(kind="command")</code></td></tr>
+      <tr><td><code>narrative</code></td><td>The most recent consolidated workspace narrative.</td><td><code>WorkspaceNarrative.latest()</code></td></tr>
+      <tr><td><code>recent</code></td><td>The full activity log, mixed kinds, newest last.</td><td><code>activity.recent()</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Parameters</h2>
+  <table>
+    <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>action</code></td><td>enum</td><td>One of <code>summary</code>, <code>stats</code>, <code>files</code>, <code>changes</code>, <code>tasks</code>, <code>research</code>, <code>commands</code>, <code>narrative</code>, <code>recent</code>. Defaults to <code>summary</code>.</td></tr>
+      <tr><td><code>limit</code></td><td>int</td><td>For <code>tasks</code> / <code>research</code> / <code>commands</code> / <code>recent</code>: how many entries to return. Defaults to 10; clamped to <code>[1, 50]</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Failure semantics</h2>
+  <ul>
+    <li><strong>Workspace disabled</strong> (<code>--no-workspace-model</code> / <code>--no-memory</code>): returns a single human-readable "unavailable" sentence.</li>
+    <li><strong>Unknown action</strong>: returns <code>"SYSTEM ERROR: 'action' must be one of …"</code>.</li>
+    <li><strong>Internal exception</strong>: caught at the tool boundary and returned as a short failure string. Introspection never breaks a user turn.</li>
+  </ul>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_workspace_tool.py</code> covers every action including the empty / no-tracked-files / disabled / None / invalid-action paths, plus registry wiring.</p>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="../algorithms/workspace.html">Workspace continuity</a> — module overview and on-disk layout.</li>
+    <li><a href="workspace_track.html"><code>workspace_track</code></a> — write path.</li>
+    <li><a href="introspect.html"><code>introspect</code></a> — the selfhood read counterpart.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

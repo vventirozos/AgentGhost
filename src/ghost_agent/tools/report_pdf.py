@@ -33,9 +33,10 @@ tool.
 
 import asyncio
 import html
+import re
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from ..utils.logging import Icons, pretty_log
 
@@ -165,11 +166,40 @@ def _render_to_pdf(full_html: str, out_path: Path) -> int:
     return pages
 
 
+_SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+
+def _sanitize_filename(raw: Optional[str]) -> Optional[str]:
+    """Return a safe, sandbox-relative filename or None if invalid.
+
+    Rules:
+      * Strip whitespace; reject empty.
+      * Strip any leading ``./`` and `path.basename` to defeat traversal
+        like ``../etc/passwd`` or ``/tmp/x.pdf``.
+      * Must match `_SAFE_FILENAME_RE`: starts alphanumeric, body
+        alphanumeric / dot / underscore / dash, length ≤ 128.
+      * If no `.pdf` suffix, append one (the tool only writes PDFs).
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # Defeat traversal regardless of separator.
+    s = s.replace("\\", "/").split("/")[-1]
+    if not s.lower().endswith(".pdf"):
+        s = f"{s}.pdf"
+    if not _SAFE_FILENAME_RE.match(s):
+        return None
+    return s
+
+
 async def tool_generate_pdf(
     title: str = "",
     sections: Any = None,
     subtitle: str = "",
     author: str = "",
+    filename: str = "",
     sandbox_dir: Path = None,
     **kwargs,
 ) -> str:
@@ -217,8 +247,25 @@ async def tool_generate_pdf(
     sandbox_dir = Path(sandbox_dir)
     sandbox_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = f"report_{uuid.uuid4().hex[:8]}.pdf"
-    out_path = sandbox_dir / filename
+    # Caller may supply a `filename` (or hallucinate it as `name`/
+    # `output`/`path`). Sanitize it through `_sanitize_filename` to
+    # block traversal and bad shapes; if nothing usable is supplied,
+    # fall back to a generated `report_<8hex>.pdf`.
+    requested_name = (
+        filename
+        or kwargs.get("output")
+        or kwargs.get("path")
+        or kwargs.get("file")
+    )
+    safe_name = _sanitize_filename(requested_name)
+    if requested_name and not safe_name:
+        return (
+            "SYSTEM ERROR: requested filename "
+            f"{requested_name!r} is not safe — must start with "
+            "alphanumeric and contain only letters/digits/./_/-"
+        )
+    final_name = safe_name or f"report_{uuid.uuid4().hex[:8]}.pdf"
+    out_path = sandbox_dir / final_name
 
     pretty_log("PDF Report", f"Title: {title[:60]} | sections={len(secs)}", icon="📄")
 
@@ -246,5 +293,5 @@ async def tool_generate_pdf(
         "DO NOT CALL THIS TOOL AGAIN with the same title. Respond DIRECTLY "
         "to the user by including this exact markdown so the file is "
         f"offered for download:\n\n"
-        f"[📄 {title} (PDF)](/api/download/{filename})"
+        f"[📄 {title} (PDF)](/api/download/{final_name})"
     )

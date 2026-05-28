@@ -399,7 +399,54 @@ class ProjectStore:
         if updated and row:
             self.log_event(row["project_id"], task_id, "task_updated",
                            {"fields": list(fields.keys())})
+            # Auto-roll-up: when a task status changes, the project as a
+            # whole may have finished. If every task is in a terminal
+            # state, transition the project. (DONE if all DONE; FAILED
+            # if any task ended in FAILED.) Skip if the project is
+            # already in a terminal state — never auto-undo a manual
+            # ARCHIVE.
+            if "status" in fields:
+                self._maybe_rollup_project_status(row["project_id"])
         return updated
+
+    def _maybe_rollup_project_status(self, project_id: str) -> None:
+        """Transition `project_id` to a terminal status if all its tasks
+        have reached one. No-op if any task is still open or if the
+        project is already terminal.
+
+        Rules:
+          * any task FAILED → project FAILED (mapped to DONE-with-fail-
+            note since ProjectStatus has no FAILED member; we leave
+            status DONE but emit an event so the rollup is observable).
+          * all tasks DONE → project DONE.
+          * otherwise → no-op.
+        """
+        proj = self.get_project(project_id)
+        if not proj:
+            return
+        current = (proj.get("status") or "").upper()
+        if current in {ProjectStatus.DONE.value, ProjectStatus.ARCHIVED.value}:
+            return
+        tasks = self.list_tasks(project_id)
+        if not tasks:
+            return
+        terminal = {"DONE", "FAILED", "CANCELLED"}
+        statuses = [str(t.get("status", "")).upper() for t in tasks]
+        if not all(s in terminal for s in statuses):
+            return
+        # All terminal. Roll the project up.
+        new_status = ProjectStatus.DONE.value
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
+                (new_status, _now(), project_id),
+            )
+            conn.commit()
+        self.log_event(
+            project_id, None, "project_auto_rollup",
+            {"new_status": new_status,
+             "had_failures": any(s == "FAILED" for s in statuses)},
+        )
 
     def delete_task(self, task_id: str) -> bool:
         """Delete a task and its descendants (via FK cascade on parent_id=NULL

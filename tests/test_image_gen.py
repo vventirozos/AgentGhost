@@ -33,10 +33,14 @@ async def test_tool_generate_image_success(mock_sandbox, mock_llm_client):
     # Run the tool
     result = await tool_generate_image(prompt, mock_llm_client, mock_sandbox)
 
-    # Verify generate_image was called correctly with default 50 steps (clipped to 50)
+    # The tool now snaps requested size to the nearest SDXL bucket and
+    # forwards it on the payload. With no width/height passed, the
+    # default 1024x1024 (which IS a bucket) is used unchanged.
     mock_llm_client.generate_image.assert_awaited_once_with({
         "prompt": prompt,
-        "steps": 6
+        "steps": 6,
+        "width": 1024,
+        "height": 1024,
     })
 
     # Verify result string format
@@ -82,7 +86,9 @@ async def test_tool_generate_image_steps_clipping(mock_sandbox, mock_llm_client,
 
     mock_llm_client.generate_image.assert_awaited_once_with({
         "prompt": "prompt",
-        "steps": expected_steps
+        "steps": expected_steps,
+        "width": 1024,
+        "height": 1024,
     })
 
 @pytest.mark.asyncio

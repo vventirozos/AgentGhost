@@ -131,14 +131,26 @@ class TestChatErrorShape:
             r = c.post(
                 "/api/chat",
                 headers={"X-Ghost-Key": "test-key"},
-                json={"messages": [], "stream": False},
+                # Must supply a VALID messages list so the request
+                # passes input validation and actually reaches the
+                # handler (where `boom` raises). `messages: []` would
+                # now be rejected with 422 by the request-validation
+                # layer before the handler is invoked.
+                json={"messages": [{"role": "user", "content": "hi"}],
+                      "stream": False},
             )
             assert r.status_code == 500
             data = r.json()
             assert "error" in data, f"500 missing error field: {data}"
             assert "message" in data["error"]
             assert "type" in data["error"]
-            assert "RuntimeError" in data["error"]["type"]
+            # The error type is now the generic "InternalError" — the
+            # Python exception class name MUST NOT leak to the wire
+            # (security/info-disclosure hardening). An error_id is
+            # included for log correlation.
+            assert data["error"]["type"] == "InternalError"
+            assert "RuntimeError" not in data["error"]["message"]
+            assert "error_id=" in data["error"]["message"]
 
     def test_handler_exception_in_streaming_writes_error_event(self):
         async def boom(body, bg, request_id=None):
@@ -149,7 +161,8 @@ class TestChatErrorShape:
             r = c.post(
                 "/api/chat",
                 headers={"X-Ghost-Key": "test-key"},
-                json={"messages": [], "stream": True},
+                json={"messages": [{"role": "user", "content": "hi"}],
+                      "stream": True},
             )
             # SSE stream returns 200 + event-stream content
             assert r.status_code == 200

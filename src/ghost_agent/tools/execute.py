@@ -14,7 +14,7 @@ from ..utils.logging import Icons, pretty_log
 from ..utils.sanitizer import sanitize_code
 from .file_system import _get_safe_path
 
-async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, **kwargs):
+async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, workspace_model=None, **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     command = command or kwargs.get("cmd")
     filename = filename or kwargs.get("file") or kwargs.get("script") or kwargs.get("name")
@@ -189,12 +189,30 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 logger.debug("metacog shell validator crashed: %s", _vexc)
 
         # Execute the command securely using the sandbox manager's built-in execute wrapper
+        import time as _time
+        _t0 = _time.time()
         cmd_str = f"bash -c {shlex.quote(command)}"
         output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=300)
-        
+        _dt = _time.time() - _t0
+
+        # Workspace command-outcome capture: record significant runs so
+        # the user can later ask "what commands did I run yesterday?" or
+        # "did that pipeline ever finish?". Significance gate: failed
+        # commands always, or successful runs that took >5s. Skip noise.
+        if workspace_model is not None and getattr(workspace_model, "enabled", False):
+            try:
+                if exit_code != 0 or _dt >= 5.0:
+                    workspace_model.record_command_outcome(
+                        command=command, exit_code=int(exit_code),
+                        duration_seconds=float(_dt),
+                        note=("failed" if exit_code != 0 else "long-running"),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
         if exit_code != 0:
             return _format_error(output or f"Process failed (Exit {exit_code}) with no output.")
-            
+
         return f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\nSTDOUT/STDERR:\n{output}"
 
     is_ephemeral = False
@@ -570,9 +588,24 @@ if has_error:
             else:
                 output = "(Process executed successfully, but no output was printed to stdout. If you expected output, ensure you use print() statements.)"
 
+        # Workspace command-outcome capture for the script-execution
+        # branch. Significance gate is the same as the bash branch:
+        # failures always, successes only when they took noticeable
+        # wall time. Non-fatal — never block a real return.
+        if workspace_model is not None and getattr(workspace_model, "enabled", False):
+            try:
+                workspace_model.record_command_outcome(
+                    command=f"{runner} {filename}" if runner else str(filename),
+                    exit_code=int(exit_code),
+                    duration_seconds=0.0,
+                    note=("failed" if exit_code != 0 else "ran"),
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
         if exit_code != 0:
              return _format_error(output, hint=diagnostic_info)
-        
+
         return f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\nSTDOUT/STDERR:\n{output}"
     except Exception as e:
         return _format_error(f"Error: {e}")

@@ -17,6 +17,11 @@ def create_app():
         allow_methods=["*"],
         allow_headers=["*"],
     )
-    app.include_router(router)
+    # Order matters: `projects_router` must be included BEFORE `router`,
+    # because `router` ends with a catch-all `/{path:path}` proxy that
+    # would otherwise match every `/api/projects*` request before
+    # reaching the dedicated routes. (Previously every project endpoint
+    # silently 404'd because of this — see test_router_order_projects.)
     app.include_router(projects_router)
+    app.include_router(router)
     return app

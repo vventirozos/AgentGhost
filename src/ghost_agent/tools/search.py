@@ -165,7 +165,7 @@ async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_
     # Tavily support removed. Always using DDGS.
     return await tool_search_ddgs(query, tor_proxy)
 
-async def tool_deep_research(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, **kwargs):
+async def tool_deep_research(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
     # Ensure proxy is in correct format for ddgs/httpx
@@ -274,6 +274,17 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     page_contents = await asyncio.gather(*tasks, return_exceptions=True)
     valid_contents = [c for c in page_contents if isinstance(c, str)]
     full_report = "\n\n".join(valid_contents)
+    # Workspace research dedup: record every URL we pulled so a later
+    # research turn can ask "did I already see this?" via the workspace
+    # tool. Non-fatal — must never break a successful research turn.
+    if workspace_model is not None and getattr(workspace_model, "enabled", False):
+        try:
+            for u in urls:
+                workspace_model.record_research_artifact(
+                    url=u, source="deep_research", note=(query or "")[:120],
+                )
+        except Exception:  # noqa: BLE001
+            pass
     return f"--- DEEP RESEARCH RESULT ---\n{full_report}\n\nSYSTEM INSTRUCTION: Analyze the text above."
 
 async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] = None, llm_client=None, tool_definitions=None, deep_research_callable: Optional[Callable] = None, model_name: str = "qwen-3.6-35b-a3", max_context: int = 8192, **kwargs: Any):

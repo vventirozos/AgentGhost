@@ -696,6 +696,11 @@ class GhostContext:
         self.trajectory_collector = None
         self.reflector = None
         self.complexity_dispatcher = None
+        # Workspace continuity facade — world-model counterpart to
+        # selfhood. Populated by main.py during lifespan; left as None
+        # otherwise so callers that touch ``context.workspace_model``
+        # before initialisation see a clean None rather than AttributeError.
+        self.workspace_model = None
         # Most-recent user message for the current turn. Stashed by
         # handle_chat right after it extracts it from the request body so
         # tools can inspect user intent without re-parsing the message
@@ -1125,6 +1130,7 @@ class GhostAgent:
     _SKILLS_AUTO_COOLDOWN = 7200  # 2 hours between skill auto-extractions
     _PRM_TRAIN_COOLDOWN = 10800   # 3 hours between PRM retrain passes
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
+    _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
     # already prevents same-batch refire, but a journal write that
@@ -1157,6 +1163,8 @@ class GhostAgent:
             self._last_prm_train_at = datetime.datetime.min
         if not hasattr(self, '_last_narrative_at'):
             self._last_narrative_at = datetime.datetime.min
+        if not hasattr(self, '_last_workspace_narrative_at'):
+            self._last_workspace_narrative_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
         # Adaptive self-play cooldown (curiosity-driven). Starts at the
@@ -1540,6 +1548,43 @@ class GhostAgent:
                     finally:
                         self._last_narrative_at = datetime.datetime.now()
 
+        # Phase 2.9: Workspace Narrative Consolidation (15-60 min idle).
+        # Mirrors phase 2.8 but for the world-model. Re-renders the
+        # "running summary of the workspace" so the next session's
+        # wake-up prefix can splice it in without a re-run. Same idle
+        # window + cooldown discipline as the selfhood narrative.
+        if 900 < idle_secs <= 3600:
+            ws_cooldown_override = getattr(
+                getattr(ctx, 'args', None), 'workspace_narrative_cooldown', None,
+            )
+            if not isinstance(ws_cooldown_override, (int, float)):
+                ws_cooldown_override = None
+            ws_cooldown = (
+                float(ws_cooldown_override) if ws_cooldown_override
+                else float(self._WORKSPACE_NARRATIVE_COOLDOWN)
+            )
+            since_last_ws = (
+                datetime.datetime.now() - self._last_workspace_narrative_at
+            ).total_seconds()
+            if since_last_ws >= ws_cooldown:
+                try:
+                    from ..workspace import WorkspaceModel as _WorkspaceModel
+                    ws = getattr(ctx, 'workspace_model', None)
+                    if isinstance(ws, _WorkspaceModel) and getattr(ws, 'enabled', False):
+                        self._last_workspace_narrative_at = datetime.datetime.now()
+                        text = await ws.consolidate_narrative()
+                        if text:
+                            preview = text.replace("\n", " ")[:120]
+                            pretty_log(
+                                "Workspace",
+                                f"narrative regenerated ({len(text)} chars): {preview}…",
+                                icon=Icons.BRAIN_THINK,
+                            )
+                except Exception as e:
+                    logger.warning(f"Workspace narrative phase failed: {e}")
+                finally:
+                    self._last_workspace_narrative_at = datetime.datetime.now()
+
         # Phase 3: Synthetic Self-Play (>60 min idle)
         if idle_secs > 3600:
             since_last_selfplay = (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
@@ -1893,6 +1938,16 @@ class GhostAgent:
 
         def invalidate_skill_playbook(self):
             self._skill_playbook_cache.clear()
+
+        def invalidate_tool_defs(self):
+            """Drop the cached tool schema list so the next LLM call
+            re-enumerates acquired skills from disk. Called after a
+            tool that mutates the skill registry (create_skill,
+            manage_skills(action=delete)) runs, so the freshly-created
+            skill appears in the very next turn-iteration's tool list
+            rather than being stranded until the next user message."""
+            self._active_tool_defs_cache.clear()
+            self._xml_schema_cache.clear()
 
     # Allowlist of phrases that the trivial fast path is safe to intercept.
     # Anything not on this list (even a 1-word "test") falls through to the
@@ -2311,6 +2366,22 @@ class GhostAgent:
                             base_prompt = wakeup_prefix + "\n" + base_prompt
                 except Exception as e:
                     logger.debug(f"selfhood wake-up prefix skipped: {type(e).__name__}: {e}")
+
+                # Workspace continuity prefix (world-model counterpart
+                # to the selfhood prefix just spliced in above). Reads
+                # workspace state, recent activity, file diffs since
+                # last scan. Same defensive isinstance gate against
+                # MagicMock contexts. Non-fatal: a failure must never
+                # break a user turn.
+                try:
+                    from ..workspace import WorkspaceModel as _WorkspaceModel
+                    workspace_model = getattr(self.context, 'workspace_model', None)
+                    if isinstance(workspace_model, _WorkspaceModel) and getattr(workspace_model, 'enabled', False):
+                        ws_prefix = workspace_model.build_wakeup_prefix()
+                        if isinstance(ws_prefix, str) and ws_prefix:
+                            base_prompt = ws_prefix + "\n" + base_prompt
+                except Exception as e:
+                    logger.debug(f"workspace wake-up prefix skipped: {type(e).__name__}: {e}")
 
                 # Uncertainty context injection (proposal item #6).
                 # Surface the agent's RECURRING blind-spots — unknowns it
@@ -5051,6 +5122,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # Skill writes invalidate the playbook cache too.
                             if fname == "learn_skill":
                                 request_state.invalidate_skill_playbook()
+                            # Acquired-skill registry mutations
+                            # (create_skill / manage_skills delete) change
+                            # the schema list the LLM sees. Without this
+                            # the new skill is unreachable until the next
+                            # user message — observed loop where the model
+                            # spent 11 min narrating "now invoking X" but
+                            # never emitting a real tool_call because the
+                            # cached schema didn't contain X yet.
+                            if fname == "create_skill" or (
+                                fname == "manage_skills"
+                                and (t_args.get("action") or "").lower() == "delete"
+                            ):
+                                request_state.invalidate_tool_defs()
 
                             a_hash = f"{fname}:{json.dumps(t_args, sort_keys=True)}"
                         except Exception as e:
@@ -5722,6 +5806,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     flags=re.DOTALL,
                 )
                 final_ai_content = final_ai_content.strip()
+
+                # Collapse consecutive duplicate paragraphs. When the
+                # model emits its final answer as a preamble alongside
+                # a tool_call AND then again after the tool returns, the
+                # accumulator stores the same paragraph twice in a row
+                # ("Your name is X.\n\nYour name is X."). Users see a
+                # stutter. Cheap fix: split on blank-line boundaries and
+                # drop a paragraph that exactly matches its predecessor
+                # after whitespace normalisation. Non-adjacent repeats
+                # are left alone — they're usually intentional (e.g.
+                # quoting the user's question and then answering it).
+                if "\n\n" in final_ai_content:
+                    parts = final_ai_content.split("\n\n")
+                    deduped: list[str] = []
+                    prev_key = None
+                    for p in parts:
+                        key = re.sub(r"\s+", " ", p).strip()
+                        if key and key == prev_key:
+                            continue
+                        deduped.append(p)
+                        prev_key = key
+                    final_ai_content = "\n\n".join(deduped)
 
                 # --- THE "PERFECT IT" PROTOCOL INJECTION ---
                 # Only trigger proactive optimization for heavy engineering/research tasks
