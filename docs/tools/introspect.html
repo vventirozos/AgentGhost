@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.introspect — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="browser.html">browser</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a class="current" href="introspect.html">introspect</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="report_pdf.html">report_pdf</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks (scheduler)</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / introspect.py</h1>
+  <p class="subtitle">Read-only handle the agent reaches for when asked to describe itself, recall what it has been working on, or surface specific past turns.</p>
+
+  <h2>Why this tool exists</h2>
+  <p>The selfhood wake-up prefix is already spliced into every system prompt (see <a href="../algorithms/selfhood.html">Selfhood</a>), so a casual <em>"tell me about yourself"</em> is already grounded in the running diary. <code>introspect</code> is the explicit handle for cases where the agent wants a <strong>deterministic snapshot</strong> rather than relying on whatever the prefix happened to surface — answering specific recall questions, producing a structured self-report, or letting evaluation scripts pull a known shape.</p>
+  <p>Counterpart to <code>self_state</code>: <em>introspect</em> reads, <em>self_state</em> writes. The two are deliberately split so a single tool description does not conflate "introspect myself" with "author my forward-looking continuity slot".</p>
+
+  <h2>Tool: <code>introspect</code></h2>
+  <table>
+    <thead><tr><th>Action</th><th>Returns</th><th>Backed by</th></tr></thead>
+    <tbody>
+      <tr><td><code>summary</code> (default)</td><td><code>stats()</code> + the running first-person diary + the most recent 5 experiences, rendered as one first-person block — the natural answer to "tell me about yourself".</td><td><code>SelfModel.stats()</code>, <code>NarrativeSummariser.latest()</code>, <code>AutobiographicalMemory.recent()</code></td></tr>
+      <tr><td><code>stats</code></td><td>Counts (experiences, open questions, unfinished threads), last noted mood, last-active timestamp, narrative-present flag, top-5 topic cluster mix.</td><td><code>SelfModel.stats()</code></td></tr>
+      <tr><td><code>narrative</code></td><td>The most recently consolidated first-person diary, or "No narrative on file yet."</td><td><code>NarrativeSummariser.latest()</code></td></tr>
+      <tr><td><code>recent</code></td><td>The last N first-person experiences (newest last), with outcome flags when known. <code>limit</code> defaults to 5; capped at 25.</td><td><code>AutobiographicalMemory.recent()</code></td></tr>
+      <tr><td><code>recall</code></td><td>IDF-weighted, dependency-free search over the autobiographical log; returns best-match-first. Requires <code>query</code>.</td><td><code>SelfModel.recall_relevant()</code> → <code>AutobiographicalMemory.search_my_past()</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Parameters</h2>
+  <table>
+    <thead><tr><th>Field</th><th>Type</th><th>Notes</th></tr></thead>
+    <tbody>
+      <tr><td><code>action</code></td><td>enum</td><td>One of <code>summary</code>, <code>stats</code>, <code>narrative</code>, <code>recent</code>, <code>recall</code>. Defaults to <code>summary</code>.</td></tr>
+      <tr><td><code>query</code></td><td>string</td><td>Required for <code>action="recall"</code>. The phrase to search the autobiographical log for.</td></tr>
+      <tr><td><code>limit</code></td><td>int</td><td>Optional for <code>recent</code> / <code>recall</code>. Defaults to 5; clamped to <code>[1, 25]</code>.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Failure semantics</h2>
+  <ul>
+    <li><strong>Selfhood disabled</strong> (<code>--no-self-model</code> / <code>--no-memory</code>): the tool returns a single human-readable "unavailable" sentence. It does <em>not</em> raise.</li>
+    <li><strong>Unknown action</strong>: returns <code>"SYSTEM ERROR: 'action' must be one of …"</code>.</li>
+    <li><strong>Missing <code>query</code> on <code>recall</code></strong>: returns <code>"SYSTEM ERROR: 'query' is required for recall."</code>.</li>
+    <li><strong>Internal exception</strong> in the SelfModel read path: caught at the tool boundary, logged at WARNING, returned as a short failure string. Introspection must never break a user turn.</li>
+  </ul>
+
+  <h2>Wiring</h2>
+  <p>Declared in <a href="registry.html"><code>tools/registry.py</code></a>:</p>
+  <ul>
+    <li><code>TOOL_DEFINITIONS</code> entry adjacent to <code>self_state</code>, with the read-only intent emphasised in the description so the model picks the right tool when asked introspective questions.</li>
+    <li><code>get_available_tools(context)</code> dispatch lambda binds <code>context.self_model</code> into <code>tool_introspect</code> — the same pattern <code>self_state</code> uses.</li>
+  </ul>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_selfhood_introspect_tool.py</code> covers:</p>
+  <ul>
+    <li>Default action renders the summary block (stats, recent experiences, first-person framing).</li>
+    <li>Explicit <code>action="summary"</code> matches the default exactly.</li>
+    <li><code>stats</code> reports correct counts, current mood, and at least one topic cluster.</li>
+    <li><code>narrative</code> reports "No narrative" when empty; returns persisted diary text when present.</li>
+    <li><code>recent</code> returns the last-N experiences, gracefully handles the empty-log case, and clamps absurd limits.</li>
+    <li><code>recall</code> requires a query, surfaces relevant past turns, and rejects unrelated ones via IDF scoring; the no-match case is explained quietly.</li>
+    <li>Disabled / <code>None</code> SelfModel returns the "unavailable" message rather than crashing.</li>
+    <li>Invalid action returns the system-error string.</li>
+    <li>An exception in the underlying recall path is swallowed — the tool never re-raises.</li>
+    <li>Registry wiring: <code>introspect</code> appears in <code>TOOL_DEFINITIONS</code> with the expected enum, and the dispatch lambda binds <code>context.self_model</code>.</li>
+  </ul>
+
+  <h2>Related</h2>
+  <ul>
+    <li><a href="../algorithms/selfhood.html">Selfhood algorithm</a> — the four substrates (autobiographical memory, self-state thread, recognition layer, narrative summariser).</li>
+    <li><code>tools/self_state.py</code> — the writable counterpart.</li>
+    <li><code>scripts/consciousness_probe.py</code> and <code>scripts/introspective_consistency.py</code> — pre-existing probes that hit a running agent with introspective questions.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

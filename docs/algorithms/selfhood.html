@@ -244,6 +244,17 @@ sm.stats()  # → {experience_count, open_questions, last_mood, narrative_presen
   <h2>The <code>self_state</code> tool (proposal item #1)</h2>
   <p>The agent authors its own cross-session continuity state through a first-class tool. Actions: <code>note_question</code> / <code>resolve_question</code> / <code>add_unfinished</code> / <code>close_unfinished</code> / <code>set_mood</code> / <code>list</code>. Every write routes through <code>SelfStateThread</code>, preserving its bounded / deduped / atomic-write guarantees, and surfaces in the next session's wake-up prefix. This is the loop closure that turns continuity from passive recall into active self-authorship — the agent decides what is worth carrying forward.</p>
 
+  <h2>The <code>introspect</code> tool (read path)</h2>
+  <p>Counterpart to <code>self_state</code>: a read-only handle the agent reaches for when the user asks it to describe itself, recall what it has been working on, or surface specific past turns. The wake-up prefix already grounds casual self-questions, but a deterministic snapshot is sometimes wanted instead. Actions:</p>
+  <ul>
+    <li><code>summary</code> (default) — renders <code>stats()</code> + the running first-person diary + the most recent N experiences in one block. This is the natural answer to "tell me about yourself".</li>
+    <li><code>stats</code> — counts (experiences, open questions, unfinished threads), last mood, last-active timestamp, narrative-present flag, and the topic-cluster mix.</li>
+    <li><code>narrative</code> — just the most recently consolidated diary entry.</li>
+    <li><code>recent</code> — the last N first-person experiences (<code>limit</code> capped at 25).</li>
+    <li><code>recall</code> — IDF-weighted, dependency-free search over the autobiographical log (<code>query</code> required).</li>
+  </ul>
+  <p>Reads go through <code>SelfModel.stats()</code>, <code>SelfModel.recall_relevant()</code>, <code>autobio.recent()</code>, and <code>narrative.latest()</code>; nothing is mutated. Disabled selfhood returns a clear "unavailable" message rather than crashing the turn. Source: <a href="../tools/introspect.html"><code>tools/introspect.py</code></a>.</p>
+
   <h2>CLI flags</h2>
   <table>
     <thead>
@@ -268,6 +279,7 @@ sm.stats()  # → {experience_count, open_questions, last_mood, narrative_presen
     <li><code>test_selfhood_biological_phase.py</code> — phase 2.8 cooldown anchor, idle-window gating, exception path, override flag, activity-clock invariant</li>
     <li><code>test_selfhood_continuity_enh.py</code> — cluster derivation, outcome backfill, IDF recall, query-aware wake-up, meta-cognitive narrative</li>
     <li><code>test_selfhood_self_state_tool.py</code> — the <code>self_state</code> tool: question/thread/mood lifecycle, graceful disable, arg validation</li>
+    <li><code>test_selfhood_introspect_tool.py</code> — the <code>introspect</code> tool: default summary, stats, narrative, recent, IDF recall, disabled-mode fallback, registry wiring</li>
     <li><code>test_selfhood_enhancements.py</code> — 2026-05-23 bundle: verdict backfill, diary sanitiser, template rollup, <code>utcnow</code> shape, <code>user_handle</code> propagation, stale-question gardener, meta cluster, recent+relevant blend, boot markers, mood history, PII redaction, IDF cache, prefix-utility tracker</li>
     <li><code>test_run_selfhood_probes_script.py</code> — smoke test for <code>scripts/run_selfhood_probes.sh</code> (executable, references both probes, writes a summary file)</li>
   </ul>
