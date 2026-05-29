@@ -37,7 +37,7 @@ both ok, diverged:
   </pre>
 
   <h2>SemanticDivergence</h2>
-  <p>Cosine similarity over an injected embedder (production: <code>LLMClient.get_embeddings</code>; tests: deterministic stubs). When no embedder is wired, falls back to token-overlap Jaccard — under-clusters paraphrases, so the arbiter is slightly more cautious in that mode (the right failure direction).</p>
+  <p>Cosine similarity over an injected embedder. Production prefers the <em>local</em> vector-memory embedder (<code>memory_system.embedding_fn</code>, the <code>all-MiniLM-L6-v2</code> SentenceTransformer) so the signal needs no model-server round-trip and works while the server runs in MTP/speculative mode — where <code>--embedding</code> is unavailable. It falls back to the remote <code>LLMClient.get_embeddings</code> endpoint, then (when neither is wired, e.g. tests with deterministic stubs) to token-overlap Jaccard — which under-clusters paraphrases, so the arbiter is slightly more cautious in that mode (the right failure direction).</p>
 
   <h2>Cost discipline</h2>
   <ul>

@@ -27,6 +27,7 @@ modules) in one obvious place.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -464,22 +465,51 @@ def _make_arbiter_runner(context: Any) -> Callable[..., Awaitable[Any]]:
 
 def _make_arbiter_embedder(context: Any):
     """Build the embedder the arbiter uses for semantic-divergence
-    cosine similarity. Re-uses the LLM client's embedding endpoint.
-    Returns ``None`` when no client is wired — the arbiter falls back
-    to Jaccard.
+    cosine similarity.
+
+    Prefers the *local* SentenceTransformer embedder already loaded by
+    the vector memory (``context.memory_system.embedding_fn``). This
+    keeps true semantic similarity without depending on the model
+    server's ``/v1/embeddings`` endpoint — which is disabled whenever
+    the server runs in MTP/speculative mode (``--embedding`` and
+    speculative decoding are mutually exclusive).
+
+    Falls back to the LLM client's remote embeddings (legacy path), then
+    to ``None`` (arbiter uses Jaccard) when neither is wired.
     """
+    # 1. Local embedder (preferred): no network, works alongside MTP.
+    mem = getattr(context, "memory_system", None)
+    local_fn = getattr(mem, "embedding_fn", None)
+    if callable(local_fn):
+        async def embed_local(texts):
+            try:
+                # SentenceTransformer inference is blocking CPU/GPU work;
+                # run it off the event loop. ChromaDB embedders return
+                # numpy arrays, but the arbiter's _cosine needs plain
+                # float lists — numpy truthiness is ambiguous and would
+                # otherwise force a silent Jaccard fallback.
+                raw = await asyncio.to_thread(local_fn, list(texts))
+                return [[float(x) for x in vec] for vec in raw]
+            except Exception as exc:
+                logger.debug("Arbiter local embed failed: %s", exc)
+                return []
+
+        return embed_local
+
+    # 2. Remote embeddings via the LLM client (legacy / server-side).
     client = getattr(context, "llm_client", None)
-    if client is None or not hasattr(client, "get_embeddings"):
-        return None
+    if client is not None and hasattr(client, "get_embeddings"):
+        async def embed(texts):
+            try:
+                return await client.get_embeddings(list(texts))
+            except Exception as exc:
+                logger.debug("Arbiter embed failed: %s", exc)
+                return []
 
-    async def embed(texts):
-        try:
-            return await client.get_embeddings(list(texts))
-        except Exception as exc:
-            logger.debug("Arbiter embed failed: %s", exc)
-            return []
+        return embed
 
-    return embed
+    # 3. Nothing wired — arbiter falls back to Jaccard.
+    return None
 
 
 __all__ = ["MetacogBundle"]

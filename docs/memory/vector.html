@@ -33,7 +33,7 @@
   <ul>
     <li>ChromaDB <code>PersistentClient</code> at <code>memory_dir/</code> with collection <code>"agent_memory"</code>.</li>
     <li>Library index JSON at <code>memory_dir/library_index.json</code> (atomic temp + <code>os.replace</code>).</li>
-    <li>Embedding via <code>SentenceTransformerEmbeddingFunction</code> or a custom HTTP embedding endpoint (<code>GhostEmbeddingFunction</code>) with retry + Tor proxy support.</li>
+    <li>Embedding via a local <code>SentenceTransformerEmbeddingFunction</code> (<code>all-MiniLM-L6-v2</code>).</li>
   </ul>
 
   <h2>Record schema</h2>

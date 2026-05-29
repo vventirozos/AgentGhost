@@ -197,20 +197,67 @@ async def test_arbiter_runner_returns_empty_on_failure(fake_context):
     assert out == ""
 
 
-def test_embedder_none_when_client_lacks_method(fake_context):
+def test_embedder_none_when_nothing_wired(fake_context):
+    # No local embedder and no client method -> None (arbiter uses Jaccard).
+    fake_context.memory_system = None
     # Default fixture removed get_embeddings
     assert _make_arbiter_embedder(fake_context) is None
 
 
 @pytest.mark.asyncio
-async def test_embedder_routes_to_client(fake_context):
+async def test_embedder_routes_to_client_without_local(fake_context):
+    # With no local embedder, the legacy remote path is used.
+    fake_context.memory_system = None
     fake_context.llm_client.get_embeddings = AsyncMock(
         return_value=[[1.0, 0.0], [0.0, 1.0]]
     )
     emb = _make_arbiter_embedder(fake_context)
     assert emb is not None
+    assert emb.__name__ == "embed"
     out = await emb(["a", "b"])
     assert out == [[1.0, 0.0], [0.0, 1.0]]
+
+
+@pytest.mark.asyncio
+async def test_embedder_prefers_local_over_client(fake_context):
+    # The local vector-memory embedder is preferred over the remote
+    # client (which is disabled when the server runs in MTP mode). Local
+    # embedders (ChromaDB style) may return numpy-like arrays; the
+    # wrapper must coerce them to plain float lists.
+    import numpy as np
+
+    fake_context.memory_system = MagicMock()
+    fake_context.memory_system.embedding_fn = lambda input: [
+        np.asarray([0.1, 0.2], dtype=np.float32) for _ in input
+    ]
+    # Remote path is present but must NOT be chosen.
+    fake_context.llm_client.get_embeddings = AsyncMock(
+        return_value=[[9.0, 9.0]]
+    )
+    emb = _make_arbiter_embedder(fake_context)
+    assert emb is not None
+    assert emb.__name__ == "embed_local"
+    out = await emb(["a", "b"])
+    fake_context.llm_client.get_embeddings.assert_not_called()
+    assert len(out) == 2
+    assert [v for vec in out for v in vec] == pytest.approx(
+        [0.1, 0.2, 0.1, 0.2], rel=1e-6
+    )
+    assert isinstance(out[0][0], float)  # coerced from numpy float32
+
+
+@pytest.mark.asyncio
+async def test_embedder_local_failure_returns_empty(fake_context):
+    # A blowup in the local embedder degrades gracefully to [] so the
+    # arbiter falls back to Jaccard rather than crashing the turn.
+    def boom(_input):
+        raise RuntimeError("model unavailable")
+
+    fake_context.memory_system = MagicMock()
+    fake_context.memory_system.embedding_fn = boom
+    emb = _make_arbiter_embedder(fake_context)
+    assert emb is not None
+    assert await emb(["a"]) == []
 
 
 # ──────────────────────────────────────────────────────────────────────

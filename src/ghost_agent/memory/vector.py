@@ -13,8 +13,6 @@ from chromadb.config import Settings
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import get_utc_timestamp
 
-from chromadb.api.types import EmbeddingFunction, Documents, Embeddings
-
 logger = logging.getLogger("GhostAgent")
 
 
@@ -83,38 +81,6 @@ def _cross_encoder_rerank(query: str, candidates: list, top_k: int = 12) -> list
 
     candidates.sort(key=lambda x: x.get('rerank_score', x.get('combined_score', 0)))
     return candidates[:top_k]
-
-class GhostEmbeddingFunction(EmbeddingFunction):
-    """
-    Custom robust embedding function that uses the upstream LLM.
-    Handles proxy bypass and retries.
-    """
-    def __init__(self, upstream_url: str, tor_proxy: str = None):
-        import httpx
-        self.url = f"{upstream_url}/v1/embeddings"
-        
-        # Determine proxy usage
-        proxy_url = None
-        if "127.0.0.1" not in upstream_url and "localhost" not in upstream_url and tor_proxy:
-             proxy_url = tor_proxy.replace("socks5://", "socks5h://")
-
-        self.client = httpx.Client(timeout=60.0, proxy=proxy_url, http2=False)
-
-    def __call__(self, input: Documents) -> Embeddings:
-        # ChromaDB expects a List of Embeddings
-        import time
-        for attempt in range(3):
-            try:
-                resp = self.client.post(self.url, json={"input": input, "model": "default"})
-                resp.raise_for_status()
-                data = resp.json()
-                return [item["embedding"] for item in data["data"]]
-            except Exception as e:
-                if attempt < 2:
-                    time.sleep(2 ** attempt)
-                else:
-                    logger.error(f"Embedding failed after 3 attempts: {e}")
-                    raise
 
 class VectorMemory:
     def __init__(self, memory_dir: Path, upstream_url: str, tor_proxy: str = None):

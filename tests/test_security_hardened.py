@@ -10,7 +10,7 @@ import sys
 # We need to make sure src is in path or we run with PYTHONPATH=src
 # valid imports
 from ghost_agent.core.llm import LLMClient
-from ghost_agent.memory.vector import VectorMemory, GhostEmbeddingFunction
+from ghost_agent.memory.vector import VectorMemory
 from ghost_agent.sandbox.docker import DockerSandbox
 from ghost_agent.tools.system import tool_check_health
 from ghost_agent.tools.search import tool_search_ddgs
@@ -63,17 +63,6 @@ def test_vector_memory_does_not_inject_env_vars(mock_embed, mock_client, mock_to
         # Assert Environment Variables NOT set for HuggingFace
         assert os.environ.get("HTTP_PROXY") is None
         assert os.environ.get("HTTPS_PROXY") is None
-
-@patch("httpx.Client")
-def test_ghost_embedding_function_uses_proxy(mock_httpx_client, mock_tor_proxy, mock_tor_proxy_h):
-    # Patching global httpx.Client because it is imported as 'import httpx' inside __init__
-    # and then used as httpx.Client. 
-    # Since we can't easily patch 'ghost_agent.memory.vector.httpx' (it doesn't exist at module level),
-    # we rely on the fact that 'import httpx' returns the global module.
-    
-    ef = GhostEmbeddingFunction(upstream_url="https://external-api.com", tor_proxy=mock_tor_proxy)
-    _, kwargs = mock_httpx_client.call_args
-    assert kwargs.get("proxy") == mock_tor_proxy_h
 
 # --- 3. Docker Sandbox Tests ---
 @patch("docker.from_env")
