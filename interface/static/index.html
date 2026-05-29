@@ -27,7 +27,7 @@
     <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=2.5">
+    <link rel="stylesheet" href="/static/style.css?v=2.6">
 </head>
 
 <body>
@@ -49,7 +49,15 @@
                 </div>
             </div>
             <div id="render-content-wrapper">
+                <!-- Same-origin iframe: ONLY used to display our own blob
+                     previews (images / PDFs), which need parent access to
+                     write into contentDocument. Never receives agent code. -->
                 <iframe id="render-iframe" sandbox="allow-scripts allow-same-origin"></iframe>
+                <!-- Sandboxed iframe: renders untrusted agent-authored
+                     HTML/CSS/JS via srcdoc. NO allow-same-origin, so it gets
+                     an opaque origin and cannot reach window.parent (and thus
+                     cannot read the injected GHOST_API_KEY). -->
+                <iframe id="render-iframe-sandboxed" sandbox="allow-scripts"></iframe>
                 <div id="mermaid-container"></div>
                 <div id="chart-container"><canvas id="render-chart"></canvas></div>
             </div>
@@ -139,7 +147,7 @@
         </footer>
     </div>
 
-    <script type="module" src="/static/app.js?v=2.5"></script>
+    <script type="module" src="/static/app.js?v=2.6"></script>
 </body>
 
 </html>

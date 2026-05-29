@@ -80,25 +80,6 @@ body.is-reading #background-layer {
 }
 
 /* Header */
-#face-title {
-    position: absolute;
-    top: 50%;
-    right: 32px;
-    transform: translateY(-50%);
-    font-family: var(--font-mono);
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: var(--accent-color);
-    text-transform: uppercase;
-    letter-spacing: 8px;
-    text-shadow: 0 0 10px rgba(0, 243, 255, 0.5), 0 0 20px rgba(0, 243, 255, 0.3);
-    opacity: 0.6;
-    pointer-events: none;
-    z-index: 5;
-    writing-mode: vertical-rl;
-    text-orientation: mixed;
-}
-
 header {
     display: flex;
     justify-content: space-between;
@@ -442,6 +423,13 @@ footer#input-area-wrapper {
 }
 
 /* Custom Scrollbar & Animations */
+/* Firefox: the ::-webkit-scrollbar rules below don't apply, so set the
+   standard properties too (thin track in the same dark-red theme). */
+html {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(139, 0, 0, 0.6) rgba(255, 255, 255, 0.05);
+}
+
 ::-webkit-scrollbar {
     width: 10px;
 }
@@ -477,8 +465,7 @@ footer#input-area-wrapper {
 
 body.zen-mode #ui-layer #chat-container,
 body.zen-mode #ui-layer #input-area,
-body.zen-mode #status-indicator,
-body.zen-mode #face-title {
+body.zen-mode #status-indicator {
     opacity: 0;
     pointer-events: none;
     transition: opacity 0.5s ease;
@@ -768,6 +755,7 @@ body.zen-mode #activity-container {
 }
 
 #render-iframe,
+#render-iframe-sandboxed,
 #mermaid-container,
 #chart-container {
     position: absolute;
@@ -779,8 +767,15 @@ body.zen-mode #activity-container {
     transition: transform 0.2s ease;
 }
 
-#render-iframe {
+#render-iframe,
+#render-iframe-sandboxed {
     background: #fff;
+}
+
+/* The sandboxed (code-render) iframe is hidden until renderHTMLContent
+   shows it; the same-origin iframe is the default visible one. */
+#render-iframe-sandboxed {
+    display: none;
 }
 
 #mermaid-container {
@@ -1136,5 +1131,143 @@ pre:hover .render-code-btn {
     .icon-btn, #mic-btn, #send-btn {
         width: 36px;
         height: 36px;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   Visual enhancements — motion & depth polish
+   Layered on top of the existing cyber theme; nothing above changes
+   structurally. All heavy motion is disabled under
+   prefers-reduced-motion at the bottom of this block.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Directional message entrances: user bubbles drift in from the right,
+   agent bubbles from the left, so the two sides read as a dialogue.
+   These override only the animation-NAME from the base `.message` rule
+   (higher specificity), and are never toggled at runtime — so streaming
+   state changes can't replay the entrance. */
+@keyframes slideInLeft {
+    from { opacity: 0; transform: translateX(-22px) scale(0.98); }
+    to   { opacity: 1; transform: none; }
+}
+@keyframes slideInRight {
+    from { opacity: 0; transform: translateX(22px) scale(0.98); }
+    to   { opacity: 1; transform: none; }
+}
+.message.agent { animation-name: slideInLeft; }
+.message.user  { animation-name: slideInRight; }
+
+/* Live agent reply: a pulsing accent edge runs down the left border while
+   tokens stream. Implemented as a ::before overlay (not an `animation` on
+   the bubble itself) so toggling `.streaming` never disturbs the one-shot
+   entrance animation. Pairs with the existing ::after cursor glyph. */
+.message.agent.streaming::before {
+    content: '';
+    position: absolute;
+    left: -1px;
+    top: 8px;
+    bottom: 8px;
+    width: 2px;
+    border-radius: 4px;
+    background: var(--accent-color);
+    box-shadow: 0 0 12px var(--accent-color), 0 0 4px var(--accent-color);
+    animation: edgePulse 1.6s ease-in-out infinite;
+}
+@keyframes edgePulse {
+    0%, 100% { opacity: 0.35; box-shadow: 0 0 6px var(--accent-color); }
+    50%      { opacity: 1;    box-shadow: 0 0 16px var(--accent-color), 0 0 6px var(--accent-color); }
+}
+
+/* Hover lift on finished bubbles — subtle depth cue. */
+.message.agent, .message.user {
+    transition: box-shadow 0.3s ease, transform 0.3s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.3s ease;
+}
+.message.agent:hover {
+    transform: translateY(-1px);
+    border-color: rgba(0, 243, 255, 0.35);
+    box-shadow: 0 10px 36px rgba(0, 0, 0, 0.25), 0 0 18px rgba(0, 243, 255, 0.08);
+}
+.message.user:hover {
+    transform: translateY(-1px);
+    border-color: rgba(139, 0, 0, 0.7);
+    box-shadow: 0 10px 36px rgba(0, 0, 0, 0.25), 0 0 18px rgba(139, 0, 0, 0.18);
+}
+
+/* Breathing glow on the input while focused — a slow, low-amplitude pulse
+   layered over the static focus shadow. Only box-shadow is keyframed, so
+   the focus-within translateY lift is preserved. */
+#input-area:focus-within {
+    animation: inputGlow 3.2s ease-in-out infinite;
+}
+@keyframes inputGlow {
+    0%, 100% { box-shadow: 0 15px 50px rgba(0, 0, 0, 0.7), 0 0 16px rgba(139, 0, 0, 0.30); }
+    50%      { box-shadow: 0 15px 50px rgba(0, 0, 0, 0.7), 0 0 26px rgba(139, 0, 0, 0.55); }
+}
+
+/* Send button gets a faint accent ring at rest so it reads as the
+   primary affordance without shouting. */
+#send-btn:not(.send-btn-cancel) {
+    box-shadow: 0 0 0 1px rgba(0, 243, 255, 0.08), inset 0 0 12px rgba(0, 243, 255, 0.04);
+}
+
+/* Empty-state hero: animated gradient wordmark + staggered chip reveal. */
+.empty-hero-title {
+    background: linear-gradient(100deg,
+        var(--accent-color) 0%, #7fd7ff 25%, var(--secondary-color) 50%,
+        #7fd7ff 75%, var(--accent-color) 100%);
+    background-size: 220% auto;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
+    color: transparent;
+    text-shadow: none;
+    filter: drop-shadow(0 0 18px rgba(0, 243, 255, 0.30));
+    animation: heroSweep 7s linear infinite;
+}
+@keyframes heroSweep {
+    to { background-position: 220% center; }
+}
+.empty-hero-chip {
+    opacity: 0;
+    animation: chipIn 0.5s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+.empty-hero-chip:nth-child(1) { animation-delay: 0.15s; }
+.empty-hero-chip:nth-child(2) { animation-delay: 0.28s; }
+.empty-hero-chip:nth-child(3) { animation-delay: 0.41s; }
+@keyframes chipIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* Decorated code blocks: a thin accent rule along the header bottom and a
+   left accent stripe give code a clearer, more designed frame. */
+.message pre.decorated-code {
+    border-left: 2px solid rgba(0, 243, 255, 0.35);
+}
+.message pre.decorated-code .code-header {
+    background: linear-gradient(90deg, rgba(0, 243, 255, 0.06), rgba(0, 0, 0, 0.45) 60%);
+    border-bottom: 1px solid rgba(0, 243, 255, 0.18);
+}
+
+/* Status pill: a faint sheen so the header chip feels less flat. */
+#status-indicator {
+    background: linear-gradient(135deg, rgba(0, 0, 0, 0.5), rgba(20, 10, 14, 0.5));
+}
+
+/* Respect reduced-motion: kill the continuous/entrance animations and
+   long transitions for users who ask for it. (matrix_graph.js applies a
+   matching damping to the 3D sphere.) */
+@media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+        animation-duration: 0.001ms !important;
+        animation-iteration-count: 1 !important;
+        transition-duration: 0.001ms !important;
+        scroll-behavior: auto !important;
+    }
+    .message { animation: none !important; }
+    .empty-hero-chip { opacity: 1 !important; }
+    .empty-hero-title {
+        animation: none !important;
+        background-position: 0 center !important;
     }
 }

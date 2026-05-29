@@ -212,6 +212,62 @@ async def test_trivial_fast_path_falls_through_on_no_llm():
     assert res is None
 
 
+@pytest.mark.asyncio
+async def test_trivial_fast_path_disables_thinking():
+    """The trivial path must suppress chain-of-thought on a reasoning model.
+
+    Regression test for the bug where greetings produced empty `content`
+    (the model spent its whole budget on a `<think>` block) and every
+    greeting fell through to the slow turn loop. We assert BOTH switches
+    the model honours are wired: the `enable_thinking` chat-template flag
+    and the portable `/no_think` soft-switch on the user message."""
+    agent = _make_agent(llm_response="hello back")
+    res = await agent._handle_trivial_chat(
+        last_user_content="hi", messages=[{"role": "user", "content": "hi"}],
+        model="x", stream_response=False, req_id="r"
+    )
+    assert res is not None
+    payload = agent.context.llm_client.chat_completion.await_args.args[0]
+    assert payload.get("chat_template_kwargs", {}).get("enable_thinking") is False
+    assert payload["messages"][-1]["content"].rstrip().endswith("/no_think")
+
+
+@pytest.mark.asyncio
+async def test_trivial_fast_path_recovers_reasoning_content_field():
+    """Reasoning models return chain-of-thought in a separate
+    `reasoning_content` field. When `content` is empty but the visible
+    answer trails the reasoning, the fast path must still recover a reply
+    rather than declining. This is the core fix for the empty-content bug."""
+    agent = _make_agent()
+    agent.context.llm_client.chat_completion = AsyncMock(return_value={
+        "choices": [{"message": {
+            "content": "Hey there, good to see you!",
+            "reasoning_content": "The user greeted me; reply warmly.",
+        }}]
+    })
+    res = await agent._handle_trivial_chat(
+        last_user_content="hi", messages=[],
+        model="x", stream_response=False, req_id="r"
+    )
+    assert res is not None
+    content, _, _ = res
+    assert content == "Hey there, good to see you!"
+    assert "reason" not in content.lower()
+
+
+@pytest.mark.asyncio
+async def test_trivial_fast_path_strips_unclosed_think_block():
+    """A model cut off mid-thought emits `<think>` with no closing tag.
+    Everything inside it is reasoning, so the visible reply is empty and
+    the path must decline (fall through) rather than leak the monologue."""
+    agent = _make_agent(llm_response="<think>still deciding how to greet")
+    res = await agent._handle_trivial_chat(
+        last_user_content="hi", messages=[],
+        model="x", stream_response=False, req_id="r"
+    )
+    assert res is None
+
+
 # =====================================================================
 # #4 — RequestState cache
 # =====================================================================

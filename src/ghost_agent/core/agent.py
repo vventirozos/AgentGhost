@@ -2145,13 +2145,26 @@ class GhostAgent:
         if not req_messages or req_messages[-1].get("role") != "user":
             req_messages.append({"role": "user", "content": last_user_content})
 
+        # Disable thinking for the trivial path. This is a Qwen-style
+        # reasoning model: left to its own devices it spends the whole
+        # `max_tokens` budget on a `<think>` block and returns an EMPTY
+        # `content` field — exactly the bug that made every greeting fall
+        # through to the full turn loop. Chain-of-thought cannot improve a
+        # "hi"/"thanks" reply, so we suppress it via BOTH switches the model
+        # honours: the `enable_thinking` chat-template flag AND the portable
+        # `/no_think` soft-switch appended to the user message (see the
+        # NON_THINKING_* notes at the top of this module).
+        last_msg = req_messages[-1]
+        if not str(last_msg.get("content", "")).rstrip().endswith("/no_think"):
+            last_msg["content"] = f"{last_msg.get('content', '')} /no_think".strip()
+
         payload = {
             "model": model,
             "messages": req_messages,
-            "temperature": 0.7,
-            "top_p": 0.9,
             "max_tokens": 256,
             "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+            **NON_THINKING_GENERAL_PARAMS,
         }
 
         pretty_log(
@@ -2171,20 +2184,33 @@ class GhostAgent:
             return None  # fall through to full path
 
         try:
-            content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+            msg = (data.get("choices") or [{}])[0].get("message", {}) or {}
+            content = msg.get("content") or ""
+            # Reasoning models return their chain-of-thought in a separate
+            # `reasoning_content` field. Even with thinking disabled, a model
+            # can occasionally route the whole reply there and leave `content`
+            # empty. Mirror the full path (agent.py ~4106): fold reasoning in
+            # so the <think>-stripper below can recover any text after it.
+            reasoning = msg.get("reasoning_content")
+            if reasoning:
+                content = f"<think>\n{reasoning}\n</think>\n{content}"
         except Exception as e:
             logger.error(f"Trivial fast path response parse failed: {e}")
             return None
 
-        # If the model returned absolutely nothing, fall through so the
-        # full path can take a second crack at it.
-        if not content.strip():
+        # Strip <think>...</think> preamble (closed or not) so the user sees
+        # only the visible reply. The unclosed variant matters: if the model
+        # was cut off mid-thought, everything after the last </think> — or
+        # nothing — is the real answer.
+        content = re.sub(
+            r"<think>.*?(?:</think>|$)", "", content, flags=re.DOTALL | re.IGNORECASE
+        ).strip()
+
+        # If, after stripping, the model gave us nothing usable, fall through
+        # so the full path can take a second crack at it.
+        if not content:
             logger.warning("Trivial fast path returned empty content; falling through to full path")
             return None
-
-        # Some models leak <think>...</think> blocks even on small prompts —
-        # strip them so the user sees only the visible reply.
-        content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL).strip()
 
         self.context.last_activity_time = datetime.datetime.now()
         pretty_log("Trivial Fast Path", f"Resolved in {len(content)} chars", icon=Icons.OK)

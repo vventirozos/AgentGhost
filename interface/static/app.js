@@ -181,6 +181,19 @@ const IDLE_ICONS = new Set(Object.keys(ICON_CLASS).filter(i =>
 ));
 
 let isProcessingRequest = false;
+// True only while we're rebuilding the chat log from saved/loaded history.
+// Auto-opening the visualizer (for renderable code blocks and images) is
+// desirable for a fresh live reply, but jarring when restoring history —
+// it would pop the floating window open on every page load. The image
+// auto-open runs from an async MutationObserver microtask, so a plain
+// flag cleared on a macrotask (setTimeout 0) reliably stays set through
+// the observer pass that processes the restored nodes.
+let _restoringHistory = false;
+function _withHistoryRestore(fn) {
+    _restoringHistory = true;
+    try { fn(); }
+    finally { setTimeout(() => { _restoringHistory = false; }, 0); }
+}
 let currentChatController = null;
 let currentTaskId = null;
 let currentChunkIndex = 0;
@@ -483,6 +496,16 @@ function flashActivityIcon() {
     }
 }
 
+// Languages that get a "Visualize" button instead of inline display.
+// Declared here (not next to attachRenderButtons further down) because
+// decorateCodeBlocks references it, and loadChatState() — which calls
+// decorateCodeBlocks — runs at module top-level *before* the render
+// section below would otherwise initialize this const (TDZ).
+const RENDERABLE_LANGS = new Set([
+    'language-html', 'language-css', 'language-javascript', 'language-js',
+    'language-mermaid', 'language-csv'
+]);
+
 // Decorate <pre><code> blocks inside a rendered message with a small
 // language pill + copy button. Runs on each marked.parse() reassignment;
 // the `data-decorated` marker makes it idempotent so repeated streaming
@@ -497,11 +520,16 @@ function decorateCodeBlocks(root) {
         // Skip renderable blocks — `attachRenderButtons` owns those; we
         // don't want two buttons stacking in the same corner.
         if (pre.classList.contains('renderable-hidden')) return;
+        // During streaming a renderable block (html/css/js/mermaid/csv)
+        // isn't `.renderable-hidden` yet, so also skip by language. Else
+        // we'd decorate it with a lang badge + Copy header that ends up
+        // orphaned above the hidden code once the Visualize button lands.
+        const langClass = [...code.classList].find(c => c.startsWith('language-'));
+        if (langClass && RENDERABLE_LANGS.has(langClass)) return;
 
         pre.dataset.decorated = '1';
         pre.classList.add('decorated-code');
 
-        const langClass = [...code.classList].find(c => c.startsWith('language-'));
         const lang = langClass ? langClass.replace('language-', '') : 'text';
 
         const header = document.createElement('div');
@@ -608,6 +636,20 @@ function renderMarkdown(text) {
     return escaped;
 }
 
+// Strip the agent's internal-only markup before display: <tool_call>
+// blocks AND <think> reasoning blocks (including an unclosed trailing
+// one mid-stream). This keeps the visible transcript consistent with
+// what the TTS engine speaks — previously the display stripped only
+// <tool_call>, so raw reasoning leaked into the chat bubble while being
+// suppressed in audio.
+function _stripInternalTags(text) {
+    return String(text ?? "")
+        .replace(/<think>[\s\S]*?<\/think>/gi, '')   // closed reasoning
+        .replace(/<think>[\s\S]*$/i, '')             // unclosed (still streaming)
+        .replace(/<tool_call[\s\S]*?(?:<\/tool_call>|$)/gi, '')
+        .trim();
+}
+
 function addMessage(role, text) {
     dismissEmptyStateHero();
     const div = document.createElement('div');
@@ -643,6 +685,41 @@ function scrollToBottomDuringStream() {
     });
 }
 
+// Re-render the in-flight agent message from the accumulated content.
+// Re-parsing the full markdown + re-sanitizing on every network read is
+// O(n²) over a long reply; coalescing renders to one-per-animation-frame
+// (scheduleStreamRender) keeps it smooth. _renderStreamingContent does
+// the actual work and is also called once synchronously after the stream
+// ends to flush the final tokens.
+function _renderStreamingContent() {
+    if (!currentAgentMessageDiv || currentAccumulatedContent === "") return;
+    const displayContent = _stripInternalTags(currentAccumulatedContent);
+    currentAgentMessageDiv.innerHTML = renderMarkdown(displayContent);
+    // Streaming-cursor glyph; removed in sendMessage's finally.
+    currentAgentMessageDiv.classList.add('streaming');
+    const isAtBottom = Math.abs(chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight) <= 50;
+    if (isAtBottom) scrollToBottomDuringStream();
+    decorateCodeBlocks(currentAgentMessageDiv);
+}
+let _streamRenderRafId = null;
+function scheduleStreamRender() {
+    if (_streamRenderRafId !== null) return;
+    _streamRenderRafId = requestAnimationFrame(() => {
+        _streamRenderRafId = null;
+        _renderStreamingContent();
+    });
+}
+// Cancel a pending throttled render. Without this, a frame scheduled
+// during streaming can fire AFTER sendMessage's finally removed the
+// `streaming` class and re-add it — leaving the blinking cursor glyph
+// stuck on a completed reply.
+function _cancelScheduledStreamRender() {
+    if (_streamRenderRafId !== null) {
+        cancelAnimationFrame(_streamRenderRafId);
+        _streamRenderRafId = null;
+    }
+}
+
 // Is-reading dim: when the user has scrolled up to review earlier
 // history, fade the background sphere back so the text takes focus.
 // When they return to the bottom, the sphere returns. Debounced via
@@ -675,31 +752,33 @@ function loadChatState() {
     if (saved) {
         try {
             chatHistory = JSON.parse(saved);
-            for (const msg of chatHistory) {
-                const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
-                let displayContent = msg.content;
-                
-                if (Array.isArray(displayContent)) {
-                    const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
-                    displayContent = texts.join(" ") + " \n*[Image Attached]*";
-                }
-                if (typeof displayContent === 'string') {
-                    let cleanContent = displayContent.replace(/<tool_call[\s\S]*?(?:<\/tool_call>|$)/gi, '').trim();
-                    if (cleanContent) {
-                        const div = document.createElement('div');
-                        div.className = `message ${roleClass}`;
-                        if (roleClass === 'system') {
-                            div.textContent = cleanContent;
-                        } else {
-                            div.innerHTML = renderMarkdown(cleanContent);
-                            if (roleClass === 'agent') decorateCodeBlocks(div);
+            _withHistoryRestore(() => {
+                for (const msg of chatHistory) {
+                    const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
+                    let displayContent = msg.content;
+
+                    if (Array.isArray(displayContent)) {
+                        const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
+                        displayContent = texts.join(" ") + " \n*[Image Attached]*";
+                    }
+                    if (typeof displayContent === 'string') {
+                        let cleanContent = _stripInternalTags(displayContent);
+                        if (cleanContent) {
+                            const div = document.createElement('div');
+                            div.className = `message ${roleClass}`;
+                            if (roleClass === 'system') {
+                                div.textContent = cleanContent;
+                            } else {
+                                div.innerHTML = renderMarkdown(cleanContent);
+                                if (roleClass === 'agent') decorateCodeBlocks(div);
+                            }
+                            chatLog.appendChild(div);
                         }
-                        chatLog.appendChild(div);
                     }
                 }
-            }
-            scrollToBottom();
-            if (typeof attachRenderButtons === 'function') attachRenderButtons();
+                scrollToBottom();
+                if (typeof attachRenderButtons === 'function') attachRenderButtons();
+            });
         } catch (e) {
             console.error("Failed to load chat history", e);
         }
@@ -805,7 +884,14 @@ async function sendMessage(isResume = false) {
     }
 
     try {
-        const payload = { model: "qwen-3.5-27b", messages: chatHistory, stream: true };
+        // Deliberately omit `model`: the agent validates a supplied model
+        // name against its single configured model and returns 404
+        // ModelNotFound on any mismatch (see api/routes.py). Pinning a
+        // name here means every model rename on the agent silently breaks
+        // chat with a 404. With no `model`, the agent uses its configured
+        // model (`requested_model or configured_model`), so the client
+        // always tracks whatever the agent is running.
+        const payload = { messages: chatHistory, stream: true };
         currentChatController = new AbortController();
 
         let response;
@@ -883,8 +969,6 @@ async function sendMessage(isResume = false) {
                             currentAgentMessageDiv.textContent = "";
                         }
 
-                        const isAtBottom = Math.abs(chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight) <= 50;
-
                         currentAccumulatedContent += chunkContent;
 
                         // --- Voice Intercept Logic ---
@@ -920,30 +1004,24 @@ async function sendMessage(isResume = false) {
                 }
             }
 
+            // Coalesce re-renders to one per animation frame (see
+            // _renderStreamingContent) instead of re-parsing the whole
+            // markdown on every network read.
             if (currentAccumulatedContent !== "" && currentAgentMessageDiv) {
-                let displayContent = currentAccumulatedContent.replace(/<tool_call[\s\S]*?(?:<\/tool_call>|$)/gi, '').trim();
-                currentAgentMessageDiv.innerHTML = renderMarkdown(displayContent);
-                // Keep a streaming-cursor glyph on the active message so
-                // the user sees the model is still producing tokens. It's
-                // removed in the finally block when the stream ends.
-                currentAgentMessageDiv.classList.add('streaming');
-                const isAtBottom = Math.abs(chatLog.scrollHeight - chatLog.scrollTop - chatLog.clientHeight) <= 50;
-                if (isAtBottom) scrollToBottomDuringStream();
-                // Post-process: language badges + copy buttons on any new
-                // <pre><code> blocks that just appeared.
-                decorateCodeBlocks(currentAgentMessageDiv);
+                scheduleStreamRender();
             }
         }
 
-        // Push the final concatenated message to chat history
-        if (currentAccumulatedContent && !resuming) {
+        // Flush a final synchronous render so the last tokens are shown
+        // even if an rAF was still pending when the stream ended.
+        _renderStreamingContent();
+
+        // Push the final concatenated message to chat history. On the
+        // resume path the partial assistant turn was never pushed when it
+        // dropped, so a plain push is correct in both cases.
+        if (currentAccumulatedContent) {
             chatHistory.push({ role: "assistant", content: currentAccumulatedContent });
-        } else if (currentAccumulatedContent && resuming) {
-            // Overwrite the last assistant message since it might have been partially pushed? 
-            // Wait, we didn't push it when it dropped! So we just push it normally.
-            chatHistory.push({ role: "assistant", content: currentAccumulatedContent });
-        }
-        if (!currentAccumulatedContent) {
+        } else {
             currentAgentMessageDiv.textContent = "No response";
             chatHistory.push({ role: "assistant", content: "No response" });
         }
@@ -990,6 +1068,9 @@ async function sendMessage(isResume = false) {
         }
     } finally {
         if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
+        // Cancel any throttled render still queued for a future frame —
+        // otherwise it fires after this point and re-adds `streaming`.
+        _cancelScheduledStreamRender();
         // Drop the streaming cursor glyph and any stale "thinking" class
         // so the message renders as a completed reply.
         if (currentAgentMessageDiv) {
@@ -1146,35 +1227,37 @@ if (workspaceBtn && workspaceUploadInput) {
             
             chatHistory = result.chat_history || [];
             chatLog.innerHTML = '';
-            
-            for (const msg of chatHistory) {
-                const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
-                let displayContent = msg.content;
-                
-                if (Array.isArray(displayContent)) {
-                    const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
-                    displayContent = texts.join(" ") + " \n*[Image Attached]*";
-                }
-                if (typeof displayContent === 'string') {
-                    let cleanContent = displayContent.replace(/<tool_call[\s\S]*?(?:<\/tool_call>|$)/gi, '').trim();
-                    if (cleanContent) {
-                        const div = document.createElement('div');
-                        div.className = `message ${roleClass}`;
-                        if (roleClass === 'system') {
-                            div.textContent = cleanContent;
-                        } else {
-                            div.innerHTML = renderMarkdown(cleanContent);
-                            if (roleClass === 'agent') decorateCodeBlocks(div);
+
+            _withHistoryRestore(() => {
+                for (const msg of chatHistory) {
+                    const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
+                    let displayContent = msg.content;
+
+                    if (Array.isArray(displayContent)) {
+                        const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
+                        displayContent = texts.join(" ") + " \n*[Image Attached]*";
+                    }
+                    if (typeof displayContent === 'string') {
+                        let cleanContent = _stripInternalTags(displayContent);
+                        if (cleanContent) {
+                            const div = document.createElement('div');
+                            div.className = `message ${roleClass}`;
+                            if (roleClass === 'system') {
+                                div.textContent = cleanContent;
+                            } else {
+                                div.innerHTML = renderMarkdown(cleanContent);
+                                if (roleClass === 'agent') decorateCodeBlocks(div);
+                            }
+                            chatLog.appendChild(div);
                         }
-                        chatLog.appendChild(div);
                     }
                 }
-            }
+                if (typeof attachRenderButtons === 'function') attachRenderButtons();
+            });
 
             addMessage('system', 'Workspace loaded successfully.');
             updateWorkspaceBtnState();
-            if (typeof attachRenderButtons === 'function') attachRenderButtons();
-            
+
         } catch (error) {
             addMessage('system', `Workspace Load Error: ${error.message}`);
             activeFace.triggerSpike();
@@ -1249,8 +1332,15 @@ if (downloadBtn) {
             addMessage('system', `Starting download for ${filename}...`);
             // Trigger download by creating a hidden anchor tag
             const url = `/api/download/${encodeURIComponent(filename.trim())}`;
+            // Must go through fetch (not a plain <a> navigation) so the
+            // authed wrapper attaches X-Ghost-Key. A plain-anchor fallback
+            // can't carry the header, so it would just 401 — and skipping
+            // the res.ok check would "download" the error JSON as the file.
             fetch(url)
-                .then(res => res.blob())
+                .then(res => {
+                    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                    return res.blob();
+                })
                 .then(blob => {
                     const objectUrl = URL.createObjectURL(blob);
                     const a = document.createElement('a');
@@ -1262,13 +1352,8 @@ if (downloadBtn) {
                     setTimeout(() => URL.revokeObjectURL(objectUrl), 100);
                 })
                 .catch(err => {
-                    console.error("Download fallback", err);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename.trim();
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
+                    addMessage('system', `Download failed for ${filename.trim()}: ${err.message}`);
+                    activeFace.triggerSpike();
                 });
         }
     });
@@ -1310,25 +1395,33 @@ if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
 // If the chat log is empty after loading history, show an onboarding hero.
 if (!chatHistory || chatHistory.length === 0) renderEmptyStateHero();
 
-document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'visible') {
-        if (ws && (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING)) {
-            connectWebSocket();
-        }
-    }
-});
+// (Reconnect-on-visible is handled by the single visibilitychange
+// listener defined earlier — see connectWebSocket wiring above.)
 
 // ═══════════════════════════════════════════════════════════════
 //  Render Window – Visualizer Logic
 // ═══════════════════════════════════════════════════════════════
 
 // --- Mermaid init ---
-mermaid.initialize({ startOnLoad: false, theme: 'dark' });
+// Guarded: if the mermaid CDN failed to load, `mermaid` is undefined.
+// This runs at module top-level *before* the render-window element refs
+// and listeners below, so an unguarded throw here would leave those
+// consts in the TDZ and make `attachRenderButtons()` (called from
+// sendMessage's finally) throw on every completed message. Mirrors the
+// defensive marked/DOMPurify handling.
+if (window.mermaid) {
+    try { mermaid.initialize({ startOnLoad: false, theme: 'dark' }); }
+    catch (e) { console.warn('mermaid.initialize failed', e); }
+} else {
+    console.warn('[Ghost] mermaid CDN did not load — diagram rendering disabled.');
+}
 
 // --- Element references ---
 const renderWindow = document.getElementById('render-window');
 const renderHeader = document.getElementById('render-header');
 const renderIframe = document.getElementById('render-iframe');
+// Opaque-origin iframe for untrusted agent HTML/JS (see index.html).
+const renderIframeSandboxed = document.getElementById('render-iframe-sandboxed');
 const mermaidContainer = document.getElementById('mermaid-container');
 const chartContainer = document.getElementById('chart-container');
 const renderChart = document.getElementById('render-chart');
@@ -1345,6 +1438,9 @@ let currentRenderState = null;
 renderCloseBtn.addEventListener('click', () => {
     renderWindow.classList.add('hidden');
     renderIframe.src = 'about:blank';
+    // Tear down any agent code so it stops running while hidden.
+    renderIframeSandboxed.removeAttribute('srcdoc');
+    renderIframeSandboxed.style.display = 'none';
     mermaidContainer.innerHTML = '';
     if (currentChart) {
         currentChart.destroy();
@@ -1445,9 +1541,11 @@ if (renderDownloadBtn) {
 function applyZoom() {
     const t = `scale(${currentZoom})`;
     renderIframe.style.transform = t;
+    renderIframeSandboxed.style.transform = t;
     mermaidContainer.style.transform = t;
     chartContainer.style.transform = t;
     renderIframe.style.transformOrigin = 'center center';
+    renderIframeSandboxed.style.transformOrigin = 'center center';
     mermaidContainer.style.transformOrigin = 'center center';
     chartContainer.style.transformOrigin = 'center center';
 }
@@ -1484,8 +1582,10 @@ renderZoomOut.addEventListener('click', () => {
         origLeft = renderWindow.offsetLeft;
         origTop = renderWindow.offsetTop;
         renderHeader.style.cursor = 'grabbing';
-        renderIframe.style.pointerEvents = 'none'; // Prevent iframe event swallowing
-        
+        // Prevent either iframe from swallowing the drag's pointer events.
+        renderIframe.style.pointerEvents = 'none';
+        renderIframeSandboxed.style.pointerEvents = 'none';
+
         if (e.cancelable) e.preventDefault();
 
         document.addEventListener('mousemove', onMouseMove);
@@ -1510,6 +1610,7 @@ renderZoomOut.addEventListener('click', () => {
             isDragging = false;
             renderHeader.style.cursor = 'grab';
             renderIframe.style.pointerEvents = 'auto'; // Restore iframe interactions
+            renderIframeSandboxed.style.pointerEvents = 'auto';
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', onMouseUp);
             document.removeEventListener('touchmove', onMouseMove);
@@ -1549,7 +1650,8 @@ renderZoomOut.addEventListener('click', () => {
         startW = parseInt(style.width, 10);
         startH = parseInt(style.height, 10);
         renderIframe.style.pointerEvents = 'none'; // Prevent iframe event swallowing
-        
+        renderIframeSandboxed.style.pointerEvents = 'none';
+
         if (e.cancelable) e.preventDefault();
         e.stopPropagation();
 
@@ -1574,6 +1676,7 @@ renderZoomOut.addEventListener('click', () => {
         if (isResizing) {
             isResizing = false;
             renderIframe.style.pointerEvents = 'auto'; // Restore iframe interactions
+            renderIframeSandboxed.style.pointerEvents = 'auto';
             document.removeEventListener('mousemove', onResizeMove);
             document.removeEventListener('mouseup', onResizeUp);
             document.removeEventListener('touchmove', onResizeMove);
@@ -1585,11 +1688,6 @@ renderZoomOut.addEventListener('click', () => {
 // ═══════════════════════════════════════════════════════════════
 //  Render Buttons – "Visualize" on code blocks
 // ═══════════════════════════════════════════════════════════════
-
-const RENDERABLE_LANGS = new Set([
-    'language-html', 'language-css', 'language-javascript', 'language-js',
-    'language-mermaid', 'language-csv'
-]);
 
 function attachRenderButtons() {
     const pres = chatLog.querySelectorAll('pre');
@@ -1630,8 +1728,10 @@ function attachRenderButtons() {
             }
         });
 
-        // Auto-open
-        btn.click();
+        // Auto-open the visualizer for freshly-arrived blocks, but not
+        // when we're rebuilding the log from history (that would spring
+        // the window open on every page/workspace load).
+        if (!_restoringHistory) btn.click();
     });
 }
 
@@ -1639,9 +1739,14 @@ function attachRenderButtons() {
 function renderMermaid(codeText) {
     currentRenderState = { type: 'mermaid' };
     renderIframe.style.display = 'none';
+    renderIframeSandboxed.style.display = 'none';
     chartContainer.style.display = 'none';
     mermaidContainer.style.display = 'flex';
 
+    if (!window.mermaid) {
+        mermaidContainer.innerHTML = `<pre style="color:#ff4444;">Diagram rendering unavailable (mermaid failed to load).</pre>`;
+        return;
+    }
     mermaid.render('mermaid-graph-' + Date.now(), codeText).then(result => {
         mermaidContainer.innerHTML = result.svg;
     }).catch(err => {
@@ -1654,7 +1759,9 @@ function renderHTMLContent(codeText, lang) {
     currentRenderState = { type: 'html', content: codeText, lang: lang };
     mermaidContainer.style.display = 'none';
     chartContainer.style.display = 'none';
-    renderIframe.style.display = 'block';
+    // Hide the same-origin iframe; agent code goes into the sandboxed one.
+    renderIframe.style.display = 'none';
+    renderIframeSandboxed.style.display = 'block';
 
     let html = codeText;
     if (lang === 'language-css') {
@@ -1663,9 +1770,12 @@ function renderHTMLContent(codeText, lang) {
         html = `<!DOCTYPE html><html><head></head><body><script>${codeText}<\/script></body></html>`;
     }
 
-    renderIframe.contentDocument.open();
-    renderIframe.contentDocument.write(html);
-    renderIframe.contentDocument.close();
+    // srcdoc + sandbox="allow-scripts" (no allow-same-origin) runs the
+    // agent code in an opaque origin: it can't reach window.parent, so it
+    // can't read the injected GHOST_API_KEY or drive our /api/* calls.
+    // Using srcdoc (not contentDocument.write) is what lets us drop
+    // allow-same-origin — the parent never needs to touch the doc.
+    renderIframeSandboxed.srcdoc = html;
 }
 
 // --- CSV / Chart renderer ---
@@ -1673,6 +1783,7 @@ function renderCSV(codeText) {
     currentRenderState = { type: 'chart' };
     mermaidContainer.style.display = 'none';
     renderIframe.style.display = 'none';
+    renderIframeSandboxed.style.display = 'none';
     chartContainer.style.display = 'block';
 
     if (currentChart) {
@@ -1735,6 +1846,9 @@ function renderCSV(codeText) {
 // on any embedded quote — `" onload="alert(1)` was the intended vector.
 function writeImageIntoIframe(iframe, imgSrc) {
     if (!iframe) return;
+    // The sandboxed code iframe may still be visible from a prior
+    // "Visualize" — hide it so the image preview isn't covered.
+    if (renderIframeSandboxed) renderIframeSandboxed.style.display = 'none';
     iframe.contentDocument.open();
     iframe.contentDocument.write(
         '<!DOCTYPE html><html><head><style>'
@@ -1813,6 +1927,11 @@ async function _toAuthedBlobUrl(rawSrc) {
 }
 
 async function _handleChatImage(img) {
+    // Capture the restore state synchronously, BEFORE any await. The
+    // auto-open decision below happens after an async blob fetch, by
+    // which point _restoringHistory's macrotask reset may already have
+    // fired — so we can't read the live flag there.
+    const restoringAtStart = _restoringHistory;
     let swappedToBlob = false;
     try {
         const rawSrc = img.getAttribute('src') || '';
@@ -1857,15 +1976,20 @@ async function _handleChatImage(img) {
     const mermaidContainer = document.getElementById('mermaid-container');
     const chartContainer = document.getElementById('chart-container');
 
-    if (mermaidContainer) mermaidContainer.style.display = 'none';
-    if (chartContainer) chartContainer.style.display = 'none';
-    if (renderIframe) renderIframe.style.display = 'block';
+    // Only auto-open the visualizer for live images. When restoring
+    // history we still swap to the blob URL and add the reopen button
+    // below, but we don't pop the floating window open on page load.
+    if (!restoringAtStart) {
+        if (mermaidContainer) mermaidContainer.style.display = 'none';
+        if (chartContainer) chartContainer.style.display = 'none';
+        if (renderIframe) renderIframe.style.display = 'block';
 
-    if (typeof currentZoom !== 'undefined') { currentZoom = 1.0; applyZoom(); }
-    currentRenderState = { type: 'image', src: img.src };
+        if (typeof currentZoom !== 'undefined') { currentZoom = 1.0; applyZoom(); }
+        currentRenderState = { type: 'image', src: img.src };
 
-    writeImageIntoIframe(renderIframe, img.src);
-    if (renderWindow) renderWindow.classList.remove('hidden');
+        writeImageIntoIframe(renderIframe, img.src);
+        if (renderWindow) renderWindow.classList.remove('hidden');
+    }
 
     const placeholder = document.createElement('button');
     placeholder.className = 'icon-btn';
@@ -1911,6 +2035,7 @@ async function _handleChatImage(img) {
 //   2. ALSO offer it as a true download via a hidden anchor.
 function _writePdfIntoIframe(iframe, pdfBlobUrl) {
     if (!iframe) return;
+    if (renderIframeSandboxed) renderIframeSandboxed.style.display = 'none';
     iframe.contentDocument.open();
     iframe.contentDocument.write(
         '<!DOCTYPE html><html><head><style>'
@@ -1980,7 +2105,7 @@ async function _handleChatPdfLink(link) {
     }
 }
 
-const chatObserver = new MutationObserver(() => {
+function _processChatLogArtifacts() {
     document.querySelectorAll('#chat-log img').forEach(img => {
         if (img.classList.contains('placeholder-added')) return;
         img.classList.add('placeholder-added');
@@ -2002,9 +2127,21 @@ const chatObserver = new MutationObserver(() => {
         link.dataset.pdfHandled = '1';
         _handleChatPdfLink(link);
     });
-});
+}
+
+const chatObserver = new MutationObserver(_processChatLogArtifacts);
 const chatLogElement = document.getElementById('chat-log');
-if (chatLogElement) chatObserver.observe(chatLogElement, { childList: true, subtree: true });
+if (chatLogElement) {
+    chatObserver.observe(chatLogElement, { childList: true, subtree: true });
+    // A MutationObserver only reports FUTURE mutations, so chat history
+    // restored by loadChatState() (which ran earlier, before this point)
+    // was never processed — its images would 401 and show broken. Do one
+    // initial pass over the already-present nodes. _restoringHistory is
+    // still true here (its reset is a macrotask that runs after this
+    // synchronous script), so restored images get the authed-blob swap
+    // without auto-opening the visualizer.
+    _processChatLogArtifacts();
+}
 
 function _showBrokenImagePlaceholder(img) {
     // Replace a failed <img> with a visible badge so users aren't staring

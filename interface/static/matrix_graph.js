@@ -32,6 +32,9 @@ export const COLORS = {
 // store pixels, not CSS pixels.
 const _mqMobile = window.matchMedia('(max-width: 768px), (max-height: 600px)');
 const IS_MOBILE = _mqMobile.matches;
+// Users who ask for reduced motion get a calmer sphere: no orbit and a
+// much slower morph. Mirrors the CSS prefers-reduced-motion block.
+const PREFERS_REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 const NODE_COUNT = IS_MOBILE ? 120 : 250;
 const MAX_LINES = IS_MOBILE ? 2500 : 10000;
 const BLOOM_SCALE = IS_MOBILE ? 0.6 : 1.0;
@@ -42,6 +45,7 @@ let instancedMesh, linesMesh;
 let lineGeometry, nodeMaterial, lineMaterial;
 let time = 0;
 let shapeTime = 0;
+let sceneSpin = 0;  // accumulated slow-orbit angle (radians)
 let currentShapeSpeed = SPEEDS.idle;
 let animationFrameId;
 
@@ -110,6 +114,7 @@ uniform float uAccentStrength;
 
 varying vec3 vColor;
 varying vec2 vUv;
+varying float vDepthFade;
 
 void main() {
     vUv = uv;
@@ -129,9 +134,18 @@ void main() {
 
     gl_Position = projectionMatrix * mvPosition;
 
+    // Depth fade: 0 near the camera .. 1 far. Lets the fragment dim
+    // distant nodes so the cloud reads as a 3D volume, not a flat sheet.
+    vDepthFade = clamp((-mvPosition.z - 2.5) / 7.0, 0.0, 1.0);
+
+    // Active color drifts electric-blue <-> cyan across the body so the
+    // network isn't one flat hue.
+    float hueShift = sin(instancePos.y * 1.5 + instancePos.z * 1.5) * 0.5 + 0.5;
+    vec3 activeCol = mix(uActiveColor, vec3(0.0, 0.95, 1.0), hueShift);
+
     // Smoothly shift between shades based on position/time to give it life
     float colorMix = sin(instancePos.x * 2.0 + instancePos.y * 2.0 + uWorkingState) * 0.5 + 0.5;
-    vec3 mixCol = mix(uBaseColor, uActiveColor, colorMix);
+    vec3 mixCol = mix(uBaseColor, activeCol, colorMix);
 
     vec3 col = mix(mixCol, uErrorColor, uErrorState);
     // Per-node falloff for the accent tint: nodes nearer the world
@@ -151,6 +165,7 @@ void main() {
 const nodeFragmentShader = `
 varying vec3 vColor;
 varying vec2 vUv;
+varying float vDepthFade;
 void main() {
     float d = distance(vUv, vec2(0.5)) * 2.0; // scaled 0 to 1
     if (d > 1.0) discard;
@@ -161,17 +176,22 @@ void main() {
     float core = pow(1.0 - d, 8.0) * 1.5;
 
     float alpha = intensity + core;
-    gl_FragColor = vec4(vColor * alpha, alpha);
+    // Distance dimming: far nodes glow less and fade out, near nodes pop.
+    float depthDim = mix(1.0, 0.35, vDepthFade);
+    gl_FragColor = vec4(vColor * alpha * depthDim, alpha * mix(1.0, 0.7, vDepthFade));
 }
 `;
 
 const lineVertexShader = `
 attribute float aLightPass;
 varying float vLightPass;
+varying float vLineDepth;
 
 void main() {
     vLightPass = aLightPass;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    vLineDepth = clamp((-mvPosition.z - 2.5) / 7.0, 0.0, 1.0);
+    gl_Position = projectionMatrix * mvPosition;
 }
 `;
 
@@ -187,6 +207,7 @@ uniform vec3 uAccentColor;
 uniform float uAccentStrength;
 
 varying float vLightPass;
+varying float vLineDepth;
 
 void main() {
     float gradient = fract(vLightPass * 1.5 - uTime * 2.0);
@@ -212,7 +233,9 @@ void main() {
 
     float alpha = mix(0.4 + uWorkingState * 0.2, 1.0, pulse);
     alpha = max(alpha, burst * uPulseT);
-    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3), alpha);
+    // Distance dimming so far links recede behind near ones.
+    float depthDim = mix(1.0, 0.4, vLineDepth);
+    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim, alpha * mix(1.0, 0.55, vLineDepth));
 }
 `;
 
@@ -241,9 +264,11 @@ export function init() {
 
     composer = new EffectComposer(renderer, renderTarget);
     const renderScene = new RenderPass(scene, camera);
+    // strength, radius, threshold. Wider radius + lower threshold gives a
+    // softer, dreamier halo than the previous tight bloom.
     bloomPass = new UnrealBloomPass(
         new THREE.Vector2(container.clientWidth, container.clientHeight),
-        1.5 * BLOOM_SCALE, 0.3, 0.1
+        1.3 * BLOOM_SCALE, 0.55, 0.05
     );
 
     composer.addPass(renderScene);
@@ -494,6 +519,15 @@ function animate() {
     const baseScale = 0.9 * breathe;
     scene.scale.set(baseScale, baseScale, baseScale);
 
+    // Slow continuous orbit (faster while working) plus a gentle tilt
+    // gives the network real depth and life at idle. Skipped entirely
+    // under reduced-motion.
+    if (!PREFERS_REDUCED_MOTION) {
+        sceneSpin += 0.0006 + workingState * 0.0010;
+        scene.rotation.y = sceneSpin;
+        scene.rotation.x = 0.12 * Math.sin(time * 0.25);
+    }
+
     // Parallax: ease camera toward target offset. Never changes z, so
     // depth-of-field / chat clipping don't flicker.
     camera.position.x += (parallaxTargetX - camera.position.x) * 0.04;
@@ -510,7 +544,7 @@ function animate() {
     }
 
     // Multiply by 0.0025 instead of 0.005 to halve the speed for both idle and busy
-    shapeTime += 0.0025 * currentShapeSpeed;
+    shapeTime += 0.0025 * currentShapeSpeed * (PREFERS_REDUCED_MOTION ? 0.3 : 1.0);
 
     // Audio reactivity: inflate the morph amplitude subtly during TTS
     // so the sphere visibly resonates with speech. Capped at +30% so it
@@ -602,9 +636,10 @@ function animate() {
     lUniforms.uPulseT.value = pulseT;
     lUniforms.uAccentStrength.value = accentStrength;
 
-    // Bloom now tracks work, not just errors. Mobile scale keeps the
-    // composite pass cheap on A-series GPUs.
-    bloomPass.strength = (1.3 + workingState * 0.4 + errorState * 2.5) * BLOOM_SCALE;
+    // Bloom tracks work + errors, and kicks briefly on each pulse so the
+    // heartbeat reads as a glow swell. Mobile scale keeps the composite
+    // pass cheap on A-series GPUs.
+    bloomPass.strength = (1.15 + workingState * 0.45 + errorState * 2.2 + pulseT * 0.5) * BLOOM_SCALE;
 
     composer.render();
 }
