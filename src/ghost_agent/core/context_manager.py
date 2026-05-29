@@ -13,6 +13,7 @@ Compression levels:
 """
 
 import logging
+from ..utils.logging import pretty_log, Icons
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("GhostAgent")
@@ -67,6 +68,7 @@ class ContextManager:
 
         # Determine compression level based on usage ratio
         ratio = usage / self.max_tokens if self.max_tokens > 0 else 0
+        prev_level = self._compression_level
         if ratio < 0.60:
             self._compression_level = 0
             return messages
@@ -78,6 +80,17 @@ class ContextManager:
             self._compression_level = 3
         else:
             self._compression_level = 4
+
+        # Surface compaction on the monitored stream when it ESCALATES — the
+        # operator otherwise can't see when answers begin degrading from
+        # dropped context (this was logger.debug only, invisible live).
+        if self._compression_level > prev_level:
+            pretty_log(
+                "Context Compaction",
+                f"L{self._compression_level} ratio={ratio:.0%} ≈{usage}/{self.max_tokens} tok",
+                icon=Icons.CUT,
+                level=("WARNING" if self._compression_level >= 3 else "INFO"),
+            )
 
         logger.debug(
             "ContextManager: ratio=%.2f level=%d tokens≈%d/%d",

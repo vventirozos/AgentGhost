@@ -169,7 +169,7 @@ class TestSwarmAwaitResults:
 
         async def fake_worker(instruction, input_data, output_key, llm_client,
                               fallback_model_name, scratchpad, worker_persona=None,
-                              target_model=None):
+                              target_model=None, preselected_node=None):
             await asyncio.sleep(0.01)
             scratchpad.set(output_key, f"OK::{output_key}")
             completed[output_key] = True

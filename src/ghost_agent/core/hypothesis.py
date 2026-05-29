@@ -147,15 +147,19 @@ class HypothesisTester:
             try:
                 result = await executor(h.test_tool or "execute", h.test_action)
                 h.result = str(result)[:4000]
-                # Simple heuristic: if test ran without error, hypothesis is consistent
+                # Simple heuristic: a clean (error-free) run is consistent.
                 result_lower = h.result.lower()
                 has_error = any(kw in result_lower for kw in (
                     "error", "exception", "traceback", "not found",
                     "permission denied", "no such file",
                 ))
-                # If the test was designed to trigger an error on the hypothesis,
-                # we can't auto-classify — leave it for evaluation
-                h.consistent = not has_error
+                # When error keywords ARE present we cannot auto-classify:
+                # a minimal test designed to SURFACE an error is exactly the
+                # one that CONFIRMS its hypothesis, so forcing consistent=False
+                # here silently eliminated the real root cause (get_surviving
+                # keeps only `is True`). Leave it untested (None) and defer to
+                # evaluate_results / the LLM rather than pre-judging.
+                h.consistent = None if has_error else True
             except Exception as exc:
                 h.result = f"Test failed: {exc}"
                 h.consistent = False

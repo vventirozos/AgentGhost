@@ -196,8 +196,21 @@ def _build_state_for_step(
         user_request=traj.user_request or "",
         steps_so_far=int(step_index),
         failures_so_far=len(failed),
-        pending_count=max(0, len(calls) - step_index - 1),
-        plan_depth=int(traj.n_steps or 0),
+        # pending_count and plan_depth are deliberately NOT derived from
+        # the trajectory. `len(calls) - step_index - 1` (steps AFTER this
+        # one) and `traj.n_steps` (total executed steps) are FUTURE
+        # knowledge relative to the moment the agent chose step
+        # `step_index` — exactly what this prefix-state must exclude. The
+        # MC-discounted label V = γ^(N-i-1)·terminal is monotone in that
+        # remaining-step count, so feeding it as a feature let the PRM
+        # learn the label almost directly (high train accuracy, useless
+        # deployed scores — at inference the remaining count is unknown).
+        # We pin them to the same neutral constants the live inference
+        # path uses (frontier_selection._seed_state_action: 1/1), so the
+        # features carry neither label leakage nor train/serve skew. NOTE:
+        # models trained before this change must be retrained.
+        pending_count=1,
+        plan_depth=1,
         tools_used_this_turn=used,
         tools_failed_this_turn=failed,
     )

@@ -61,6 +61,14 @@ A single `(state, action)` tuple where:
   tools that errored so far). Reconstructed at training time so the
   PRM only sees what the agent actually knew at decision time —
   leaking later steps would let it post-hoc infer the answer.
+
+  > **Retrain note (May 2026).** A label-leakage bug was fixed: the
+  > prefix-state's `pending_count`/`plan_depth` were being derived from
+  > the *completed* trajectory (i.e. the future), which the MC label is
+  > monotone in — so the PRM could learn the label almost directly. They
+  > are now pinned to neutral inference constants. **PRM checkpoints
+  > trained before this fix must be retrained.** See
+  > [Audit &amp; hardening](../audit_fixes.html).
 * **action** = a candidate's `(description, tool_name, tool_args)`
   tuple. Mirrors `core.mcts.ActionCandidate` so MCTS can adapt one
   to the other without translation logic in the hot path.

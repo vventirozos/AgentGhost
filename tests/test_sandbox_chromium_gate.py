@@ -101,7 +101,11 @@ def test_v2_marker_gate_name_pinned():
     sandbox/Dockerfile. Pin it here so renaming in one place without
     the other is a loud test failure."""
     import inspect
-    src = inspect.getsource(DockerSandbox.ensure_running)
+    # ensure_running is now a thin locking wrapper; the provisioning body
+    # lives in _ensure_running_impl. Inspect both so the gate assertions
+    # hold regardless of which method carries the logic.
+    src = inspect.getsource(DockerSandbox.ensure_running) + inspect.getsource(
+        DockerSandbox._ensure_running_impl)
     assert "/root/.supercharged.v2" in src, (
         "marker path drifted from /root/.supercharged.v2 — update "
         "sandbox/Dockerfile in lockstep"
@@ -172,7 +176,11 @@ def test_post_install_verification_refuses_to_mark_on_missing_binary():
     /root/.supercharged.v2. A hypothetical install that exited 0 but
     produced no binary must NOT leave a v2-marked image around."""
     import inspect
-    src = inspect.getsource(DockerSandbox.ensure_running)
+    # ensure_running is now a thin locking wrapper; the provisioning body
+    # lives in _ensure_running_impl. Inspect both so the gate assertions
+    # hold regardless of which method carries the logic.
+    src = inspect.getsource(DockerSandbox.ensure_running) + inspect.getsource(
+        DockerSandbox._ensure_running_impl)
     assert "_chromium_binary_present" in src
     # Grep the source for the refuse-to-mark guard. The assertion
     # here is purposely loose — we just want to make sure the check

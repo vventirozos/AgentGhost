@@ -184,4 +184,6 @@ class TestDeepReasonEvals:
             return "cat: /nope: No such file or directory"
 
         out = await tester.test_hypotheses_parallel([h], executor)
-        assert out[0].consistent is False  # error output → refuted
+        # Error output is now ambiguous (None), deferred to evaluate_results,
+        # not auto-refuted — see HypothesisTester.test_hypotheses_parallel.
+        assert out[0].consistent is None

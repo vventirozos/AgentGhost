@@ -84,7 +84,14 @@ class TestHypothesisTester:
         result = await tester.test_hypotheses_parallel(hypotheses, mock_executor)
         assert len(result) == 2
         assert result[0].consistent is True
-        assert result[1].consistent is False
+        # An error-keyword RESULT (not a raised exception) is now left
+        # ambiguous (None) and deferred to evaluate_results rather than
+        # force-marked False — a test designed to SURFACE an error may be
+        # the one that CONFIRMS its hypothesis. get_surviving still keeps
+        # only the clean (True) one.
+        assert result[1].consistent is None
+        surviving = tester.get_surviving(result)
+        assert result[0] in surviving and result[1] not in surviving
 
     async def test_test_hypotheses_executor_exception(self, tester):
         hypotheses = [

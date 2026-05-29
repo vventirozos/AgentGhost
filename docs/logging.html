@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost Agent — Logging &amp; Monitoring</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Overview</h3>
+    <a href="index.html">Home</a>
+    <a href="capabilities.html">Capabilities</a>
+    <a href="architecture.html">System Architecture</a>
+    <a href="installation.html">Install &amp; Run</a>
+    <a href="cli_reference.html">CLI Reference</a>
+    <a href="audit_fixes.html">Audit &amp; hardening</a>
+    <a class="current" href="logging.html">Logging &amp; monitoring</a>
+
+    <h3>Core</h3>
+    <a href="core/agent.html">agent</a>
+    <a href="core/llm.html">llm</a>
+    <a href="core/bus.html">bus (memory)</a>
+    <a href="core/context_manager.html">context_manager</a>
+
+    <h3>Sandbox &amp; API</h3>
+    <a href="sandbox/docker.html">Docker sandbox</a>
+    <a href="api/routes.html">HTTP routes</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <div class="eyebrow">Operations</div>
+    <h1>Logging &amp; monitoring</h1>
+    <p class="subtitle">The agent is monitored by watching its live log stream. Every operationally-important event — and every failure — appears there in one aligned, per-request, icon-tagged format. This page is how to read it, and what the May-2026 overhaul changed.</p>
+    <div class="hero-meta">
+      <span class="badge">pretty_log</span>
+      <span class="badge">per-request tags</span>
+      <span class="badge good">failures visible</span>
+      <span class="badge">distinct icons</span>
+    </div>
+  </section>
+
+  <div class="note">
+    <strong>The model.</strong> <code>pretty_log(title, content, icon, level)</code> in
+    <code>utils/logging.py</code> writes the monitored console stream. Standard library
+    <code>logger.warning/error</code> calls are now <em>routed through the same renderer</em>,
+    so a failure never appears as a bare, easily-missed plain line interleaved with the
+    pretty output. The on-disk file (<code>system/ghost-agent.log</code>) keeps a plain,
+    grep-friendly format (now stamped with the logger name).
+  </div>
+
+  <h2>Reading a line</h2>
+  <p>Each line has a fixed anatomy — once your eye learns the columns, a busy multi-request stream is scannable:</p>
+  <pre><code>│  A7  💭  +0.42s  thinking            128 tokens · 0.9s
+^   ^   ^    ^        ^                    ^
+│   │   │    │        │                    └── content (one line; ERROR/WARNING get a larger budget)
+│   │   │    │        └── title (lower-cased, bold, level-coloured)
+│   │   │    └── elapsed since the request began
+│   │   └── icon — picks itself per event type
+│   └── 2-char request tag (deterministic colour; groups concurrent requests)
+└── left frame edge</code></pre>
+  <p>Requests are framed by <code>┌─ … request started</code> / <code>└─ … request finished +12.3s</code> markers, and the boot and shutdown sequences are framed by <code>🌅 System Boot</code> … <code>🚀 System Ready</code> … <code>💤 System Shutdown</code>.</p>
+
+  <h2>Icon catalog</h2>
+  <p>Icons are defined once in the <code>Icons</code> class and reused, so a glyph means the same thing everywhere. A selection:</p>
+  <table>
+    <thead><tr><th>Group</th><th>Icons</th></tr></thead>
+    <tbody>
+      <tr><td>Lifecycle</td><td>🌅 boot · 🚀 ready · 💤 shutdown · 🫀 watchdog</td></tr>
+      <tr><td>Request flow</td><td>🎬 start · 🏁 done · ⏳ wait</td></tr>
+      <tr><td>Reasoning</td><td>💭 thinking · 🧠 summary · 📋 plan · 🧩 context · 🧭 route · 🎯 frontier · 🌳 MCTS · 🧪 verifier</td></tr>
+      <tr><td>Tools</td><td>🌐 search · 🔬 deep/vision · 🐍 code · 🐚 shell · 🌎 browser · 🐘 postgres · 🎨 image · 📄 PDF</td></tr>
+      <tr><td>Inference nodes</td><td>⚙️ worker · 🛰️ swarm edge</td></tr>
+      <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 🧹 wipe · 👤 profile · 🪞 self-state · 🎓 skill graduate · ⚖️ belief</td></tr>
+      <tr><td>Status</td><td>✅ ok · ❌ fail · ⚠️ warn · 🛑 stop · 🔄 retry · 💡 idea · 🛡️ shield (security/guard) · ✂️ cut</td></tr>
+    </tbody>
+  </table>
+
+  <h2>May 2026 overhaul</h2>
+  <p>An audit of all ~700 log sites surfaced three problem classes; all are fixed (with unit tests). See the <a href="audit_fixes.html">audit page</a> for the companion bug-fix work.</p>
+
+  <h3>1 — Orphaned loggers (logs going nowhere)</h3>
+  <p>Five first-party loggers — <code>GhostSelfhood</code>, <code>GhostWorkspace</code>, <code>GhostOptim</code>, <code>GhostDistill</code>, <code>GhostReflect</code> — were never given handlers; <code>setup_logging</code> only configured <code>GhostAgent</code>. Their <code>debug/info</code> was discarded and <code>warning/error</code> leaked to bare stderr — never the file, never the stream. <code>setup_logging</code> now configures all of them.</p>
+
+  <h3>2 — Failures off the monitored stream</h3>
+  <p>~150 <code>logger.warning/error</code> calls printed as un-iconed plain lines (or, for the orphaned loggers, nowhere). A new <code>_PrettyLogHandler</code> renders every <code>WARNING+</code> record through <code>pretty_log</code> (⚠️/❌, with the request tag), so failures land in the channel you're already watching. Where an event had <em>no log at all</em> it was added with a semantic icon: API <strong>auth rejections</strong> (🛡️), <strong>proxy</strong> failures (❌), <strong>browser</strong> / <strong>sandbox-exec</strong> / <strong>Postgres</strong> failures, <strong>context compaction</strong> escalation (✂️, so you can see when answers start degrading from dropped context), a <strong>shutdown frame</strong> (💤), and <strong>profile-corruption</strong> resets (👤, which previously reverted the user's identity silently).</p>
+
+  <h3>3 — Readability</h3>
+  <ul>
+    <li><strong>Failure content survives.</strong> WARNING/ERROR lines get a larger content budget, so the exception text (the <em>why</em>) isn't truncated off the live stream.</li>
+    <li><strong>Distinct icons.</strong> De-collided glyphs that were double-bound (📚/📓, ✂️ vs split, ⚡ boot vs edge-node) and gave the browser/image/PDF/worker/edge events their own icons instead of borrowing 🐚/literals.</li>
+    <li><strong>Distinct titles.</strong> The 8-way overloaded <code>Sandbox</code> boot title was split into <code>Sandbox Provision / Image / Chromium / Tor / Cache / Ready</code>; node-failover messages that were crammed into the 18-char <em>title</em> (losing the error) are now a short title + full content; a failed verifier no longer renders a green ✅.</li>
+  </ul>
+
+  <div class="note">
+    <strong>Verbosity knobs.</strong> <code>--verbose</code> lifts the content truncation entirely
+    (full payloads on the stream); <code>--debug</code> drops the file/console threshold to DEBUG
+    and mirrors every <code>pretty_log</code> into the file. <code>--daemon</code> suppresses the
+    console handler (file only). <code>NO_COLOR</code> / a non-TTY sink disables ANSI so piped logs
+    stay clean.
+  </div>
+</main>
+</body>
+</html>

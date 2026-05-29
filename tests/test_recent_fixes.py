@@ -59,9 +59,11 @@ async def test_database_statement_timeout():
         # Action 'query'
         res = await tool_postgres_admin("query", "uri", "SELECT 1")
         
-        # Verify execute was called with SET statement_timeout
+        # Verify execute was called with SET statement_timeout — now
+        # PARAMETERIZED (int-clamped) instead of f-string-interpolated.
         calls = mock_cur.execute.call_args_list
-        assert calls[0][0][0] == "SET statement_timeout = 15000;"
+        assert calls[0][0][0] == "SET statement_timeout = %s"
+        assert calls[0][0][1] == (15000,)
         assert "SELECT 1" in calls[1][0][0]
 
 @pytest.mark.asyncio

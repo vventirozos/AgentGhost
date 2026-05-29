@@ -186,3 +186,94 @@ def test_redact_trajectory_handles_none_planning_output():
     t = Trajectory(planning_output=None)
     r = redact_trajectory(t)
     assert r.planning_output is None
+
+
+# -----------------------------------------------------------------
+# redact_trajectory — nested arg values + metadata dicts
+# (regression: secrets nested inside list/dict arg values, and in the
+#  `extra` / `validator_signal` dicts, were previously written verbatim)
+# -----------------------------------------------------------------
+
+def test_redact_trajectory_nested_dict_arg_value():
+    t = Trajectory(tool_calls=[ToolCall(
+        name="http",
+        arguments={"headers": {"Authorization": "Bearer ghost-secret-tok-abc123",
+                                "X-Count": 3}},
+    )])
+    r = redact_trajectory(t)
+    headers = r.tool_calls[0].arguments["headers"]
+    assert "ghost-secret-tok-abc123" not in headers["Authorization"]
+    assert headers["X-Count"] == 3  # non-string scalar preserved
+
+
+def test_redact_trajectory_nested_list_arg_value():
+    t = Trajectory(tool_calls=[ToolCall(
+        name="execute",
+        arguments={"env": ["PATH=/usr/bin", "OPENAI_API_KEY=sk-liveABCDEFGHIJKLMN1234"]},
+    )])
+    r = redact_trajectory(t)
+    env = r.tool_calls[0].arguments["env"]
+    assert "PATH=/usr/bin" in env
+    assert not any("sk-liveABCDEFGH" in e for e in env)
+
+
+def test_redact_trajectory_deeply_nested_arg_value():
+    t = Trajectory(tool_calls=[ToolCall(
+        name="x",
+        arguments={"a": {"b": [{"c": "leak sk-liveDEEPLYnestedKEY123456"}]}},
+    )])
+    r = redact_trajectory(t)
+    leaked = r.tool_calls[0].arguments["a"]["b"][0]["c"]
+    assert "sk-liveDEEPLY" not in leaked
+
+
+def test_redact_trajectory_redacts_extra_dict():
+    t = Trajectory(extra={"raw_cmd": "curl -H 'Authorization: Bearer ghost-extra-secret-9'",
+                          "n": 7})
+    r = redact_trajectory(t)
+    assert "ghost-extra-secret-9" not in r.extra["raw_cmd"]
+    assert r.extra["n"] == 7
+
+
+def test_redact_trajectory_redacts_validator_signal_dict():
+    t = Trajectory(validator_signal={"detail": "saw key sk-liveVALIDATORsignalKEY12345",
+                                     "passed": False})
+    r = redact_trajectory(t)
+    assert "sk-liveVALIDATOR" not in r.validator_signal["detail"]
+    assert r.validator_signal["passed"] is False
+
+
+def test_redact_trajectory_does_not_mutate_nested_input():
+    secret = "sk-liveNESTEDmutationCHECK12345"
+    original_args = {"headers": {"Authorization": f"Bearer {secret}"}}
+    t = Trajectory(tool_calls=[ToolCall(name="http", arguments=original_args)],
+                   extra={"x": secret})
+    redact_trajectory(t)
+    # Original nested structures must be untouched.
+    assert t.tool_calls[0].arguments["headers"]["Authorization"] == f"Bearer {secret}"
+    assert t.extra["x"] == secret
+
+
+def test_redact_trajectory_sensitive_key_redacts_opaque_value():
+    """A secret with no self-identifying shape (just `hunter2`) is caught
+    because it sits under a sensitive key name."""
+    t = Trajectory(tool_calls=[ToolCall(
+        name="login",
+        arguments={"password": "hunter2", "username": "alice", "retries": 2},
+    )])
+    r = redact_trajectory(t)
+    args = r.tool_calls[0].arguments
+    assert args["password"] == "<REDACTED>"
+    assert args["username"] == "alice"   # non-sensitive key preserved
+    assert args["retries"] == 2          # non-string preserved
+
+
+def test_redact_trajectory_jsonl_has_no_secret_in_extra():
+    """End-to-end: the on-disk JSONL line must not contain the secret."""
+    t = Trajectory(
+        extra={"cmd": "export AWS_SECRET_ACCESS_KEY=AKIAIOSFODNN7EXAMPLE"},
+        validator_signal={"note": "token xoxb-1234567890-deadbeefcafe"},
+    )
+    line = redact_trajectory(t).to_jsonl()
+    assert "AKIAIOSFODNN7EXAMPLE" not in line
+    assert "xoxb-1234567890-deadbeefcafe" not in line

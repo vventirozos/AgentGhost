@@ -245,6 +245,7 @@ async def op_extract_text(op):
             # collapsed text the user would see — a much cleaner target
             # than raw HTML for LLM consumption.
             text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        full_len = len(text)  # capture BEFORE truncating
         truncated = False
         if len(text) > max_chars:
             text = text[:max_chars]
@@ -256,7 +257,10 @@ async def op_extract_text(op):
             "title": await page.title(),
             "text": text,
             "truncated": truncated,
-            "length": len(text),
+            # Report the TRUE page length, not the capped length — else
+            # `length` always equals max_chars on truncation, hiding how
+            # much was dropped from any downstream "got the whole page?" check.
+            "length": full_len,
             "used_last_url": used_fallback,
         }
 
@@ -550,6 +554,7 @@ async def op_interact(op):
                         text = await page.evaluate(
                             "() => document.body ? document.body.innerText : ''"
                         )
+                    full_len = len(text)  # capture BEFORE truncating
                     truncated = False
                     if len(text) > max_chars:
                         text = text[:max_chars]
@@ -557,7 +562,8 @@ async def op_interact(op):
                     results.append({
                         "index": idx, "action": "extract_text", "ok": True,
                         "selector": sel, "text": text,
-                        "length": len(text), "truncated": truncated,
+                        # True length, not the capped length (see extract_text above).
+                        "length": full_len, "truncated": truncated,
                     })
                 elif name == "fill":
                     sel = step.get("selector")
@@ -936,7 +942,7 @@ async def tool_browser(
             int(timeout_ms) * max(1, len(sanitised_actions or [])),
         )
 
-    pretty_log("Browser", f"{operation} {url or selector or ''}".strip(), icon=Icons.TOOL_SHELL)
+    pretty_log("Browser", f"{operation} {url or selector or ''}".strip(), icon=Icons.TOOL_BROWSER)
 
     cmd = (
         f"python3 -u {_BROWSER_RUNNER_FILENAME} "
@@ -951,10 +957,14 @@ async def tool_browser(
             sandbox_manager.execute, cmd, timeout=subprocess_timeout
         )
     except Exception as e:
+        pretty_log("Browser Failed", f"{operation}: {type(e).__name__}: {e}",
+                   icon=Icons.TOOL_BROWSER, level="ERROR")
         return _err(f"sandbox execute failed: {e}")
 
     ok, parsed = _parse_runner_output(output or "")
     if not ok:
+        pretty_log("Browser Failed", f"{operation}: runner exit {exit_code}",
+                   icon=Icons.TOOL_BROWSER, level="WARNING")
         return _err(
             f"Runner failed (exit {exit_code}): {parsed}",
             hint=(

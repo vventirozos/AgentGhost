@@ -18,7 +18,27 @@ from .workspace_track import tool_workspace_track
 from .uncertainty_tool import tool_flag_uncertainty
 
 import logging
+import re
 from ..utils.logging import pretty_log, Icons
+
+
+def _acquired_skill_result_ok(result) -> bool:
+    """Classify an acquired-skill execution result as success/failure.
+
+    `tool_execute` RETURNS error strings (non-zero EXIT CODE, tracebacks,
+    [SYSTEM ERROR]) rather than raising, so an unconditional success=True
+    telemetry write recorded broken skills as wins — resetting
+    failure_count and defeating degraded-skill retirement.
+    """
+    s = str(result)
+    if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
+        return False
+    m = re.search(r"EXIT CODE:\s*(\d+)", s)
+    if m:
+        return m.group(1) == "0"
+    # No exit-code banner (non-execute-shaped result): success unless it
+    # clearly starts with an error marker.
+    return not s.lstrip().startswith(("Error", "ERROR", "SYSTEM ERROR", "Traceback"))
 
 logger = logging.getLogger("GhostAgent")
 
@@ -644,9 +664,17 @@ def get_available_tools(context):
                                     content=skill_src,
                                     args=[args_str]
                                 )
-                                # Telemetry: Log success
-                                manager.log_telemetry(name, success=True)
-                                logger.info(f"Acquired Skill '{name}' executed successfully.")
+                                # Telemetry: tool_execute returns error
+                                # strings rather than raising, so classify
+                                # the RESULT. Logging success=True
+                                # unconditionally let broken skills reset
+                                # their failure_count and dodge retirement.
+                                ok = _acquired_skill_result_ok(result)
+                                manager.log_telemetry(name, success=ok)
+                                if ok:
+                                    logger.info(f"Acquired Skill '{name}' executed successfully.")
+                                else:
+                                    logger.warning(f"Acquired Skill '{name}' returned a failure result.")
                                 return result
                             except Exception as e:
                                 # Telemetry: Log failure

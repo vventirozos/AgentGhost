@@ -171,17 +171,24 @@ class Icons:
     TOOL_FILE_S  = "🔍"
     TOOL_FILE_I  = "👀"
     TOOL_DOWN    = "⬇️"
+    TOOL_BROWSER = "🌎"   # headless browser automation (distinct from shell 🐚)
+    IMAGE_GEN    = "🎨"
+    REPORT_PDF   = "📄"
+    NODE_WORKER  = "⚙️"   # background / edge worker-node compute
+    NODE_EDGE    = "🛰️"   # swarm edge-node compute (NOT ⚡ — that's SYSTEM_BOOT)
 
     # --- Memory & Identity ---
     MEM_SAVE     = "📝"
     MEM_READ     = "🔎"
     MEM_MATCH    = "📍"
     MEM_INGEST   = "📚"
-    MEM_SPLIT    = "✂️"
+    MEM_SPLIT    = "📑"   # chunk split (distinct from CUT ✂️)
     MEM_EMBED    = "🧬"
     MEM_WIPE     = "🧹"
     MEM_SCRATCH  = "🗒️"
     USER_ID      = "👤"
+    SELF_STATE   = "🪞"   # selfhood state / mood transition
+    SKILL_GRADUATE = "🎓" # a lesson graduates into a reusable skill
 
     # --- Status ---
     OK           = "✅"
@@ -209,7 +216,7 @@ class Icons:
     GRAPH_WEB        = "🕸️"   # triplet / knowledge-graph store
     VECTOR_EMBED     = "🧬"   # vector DB + sentence embeddings
     MEM_INDEX        = "🗃️"   # memory system fully loaded with items
-    MEM_LIBRARY      = "📚"   # indexed fragments ready for recall
+    MEM_LIBRARY      = "📓"   # indexed fragments ready for recall (distinct from MEM_INGEST 📚)
     BELIEF_SCALES    = "⚖️"   # contradiction log / belief versioning
     THRESHOLD_TUNE   = "🎚️"   # adaptive recall threshold
     EPISODE_REEL     = "🎞️"   # episodic memory (sessions = frames)
@@ -223,37 +230,80 @@ class Icons:
 logger = logging.getLogger("GhostAgent")
 
 
+# Every first-party logger in the codebase. Only "GhostAgent" used to be
+# configured; the others (selfhood/workspace/optim/distill/reflection) had
+# NO handlers, so their debug/info was dropped and their warning/error
+# leaked to bare stderr — never the log file, never the monitored stream.
+_GHOST_LOGGERS = (
+    "GhostAgent", "GhostSelfhood", "GhostWorkspace",
+    "GhostOptim", "GhostDistill", "GhostReflect",
+)
+
+
+class _PrettyLogHandler(logging.Handler):
+    """Render stdlib WARNING+ records into the pretty_log console stream so
+    failures show up in the SAME aligned/iconed channel the operator watches
+    — instead of as bare, unframed plain lines interleaved with it.
+    WARNING → ⚠️, ERROR/CRITICAL → ❌. INFO/DEBUG are NOT rendered here (they
+    still reach the file handler); skipping them also prevents recursion with
+    pretty_log's own DEBUG mirror.
+    """
+    def emit(self, record):
+        if record.levelno < logging.WARNING:
+            return
+        try:
+            name = record.name
+            # "GhostSelfhood" → "Selfhood", "GhostAgent" → "Agent".
+            subsystem = name[5:] if name.startswith("Ghost") else name
+            icon = Icons.FAIL if record.levelno >= logging.ERROR else Icons.WARN
+            pretty_log(subsystem or "log", record.getMessage(),
+                       icon=icon, level=record.levelname)
+        except Exception:
+            self.handleError(record)
+
+
 def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verbose: bool = False):
     global DEBUG_MODE, LOG_TRUNCATE_LIMIT, VERBOSE_MODE
     DEBUG_MODE = debug
     VERBOSE_MODE = verbose
     if verbose:
         LOG_TRUNCATE_LIMIT = 1000000
-    logger.setLevel(logging.DEBUG if debug else logging.INFO)
-    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S')
-
-    # Drop any previously-installed handlers before adding new ones. Without
-    # this, repeat calls (hot reload, daemon restart, test fixtures) double
-    # up handlers and every log line gets written N times — and each call
-    # leaks a file descriptor.
-    for old in list(logger.handlers):
-        try:
-            old.close()
-        except Exception:
-            pass
-        logger.removeHandler(old)
+    level = logging.DEBUG if debug else logging.INFO
+    # File log keeps a plain, grep-friendly format — now WITH the logger name
+    # so subsystem lines (GhostSelfhood vs GhostAgent) are distinguishable.
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'
+    )
 
     os.makedirs(os.path.dirname(log_file), exist_ok=True)
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)
-    logger.addHandler(fh)
 
-    if not daemon:
-        sh = logging.StreamHandler()
-        sh.setFormatter(formatter)
-        sh.setLevel(logging.DEBUG if debug else logging.INFO)
-        logger.addHandler(sh)
+    # Console handler: route WARNING+ through pretty_log (only when not daemon).
+    pretty_handler = _PrettyLogHandler()
+    pretty_handler.setLevel(logging.WARNING)
+
+    # Configure GhostAgent AND every subsystem logger with the SAME handlers.
+    # Clearing first keeps repeat calls (hot reload, restart, test fixtures)
+    # from accumulating handlers / leaking file descriptors.
+    for name in _GHOST_LOGGERS:
+        lg = logging.getLogger(name)
+        for old in list(lg.handlers):
+            try:
+                old.close()
+            except Exception:
+                pass
+            lg.removeHandler(old)
+        lg.setLevel(level)
+        # NB: leave propagate=True (the default). Now that every Ghost*
+        # logger HAS handlers, Python's `lastResort` stderr fallback never
+        # fires (it only triggers when zero handlers are found in the
+        # chain), so there's no double-emit — and propagation keeps pytest's
+        # caplog (a root-level handler) working.
+        lg.addHandler(fh)
+        if not daemon:
+            lg.addHandler(pretty_handler)
 
     for lib in ["httpx", "uvicorn", "docker", "chromadb", "urllib3", "pypdf"]:
         logging.getLogger(lib).setLevel(logging.WARNING)
@@ -333,7 +383,7 @@ def _wrap_content(content_str: str) -> str:
     return ("\n" + _CONTINUATION_INDENT).join(lines)
 
 
-def pretty_log(title: str, content: Any = None, icon: str = "📝", level: str = "INFO", special_marker: str = None):
+def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None):
     req_id = request_id_context.get()
     tag = _req_tag(req_id)
     rcol = _req_color(req_id)
@@ -401,7 +451,13 @@ def pretty_log(title: str, content: Any = None, icon: str = "📝", level: str =
     else:
         content_str = str(content)
 
-    content_str = _truncate(content_str, LOG_TRUNCATE_LIMIT).replace("\n", " ").replace("\r", "")
+    # Failures get a larger content budget so the *why* (exception text, the
+    # cause) survives on the monitored stream — not just in --verbose / the
+    # file. INFO/DEBUG stay tight (60) to keep the stream scannable.
+    _limit = LOG_TRUNCATE_LIMIT
+    if level.upper() in ("WARNING", "WARN", "ERROR", "CRITICAL"):
+        _limit = max(LOG_TRUNCATE_LIMIT, 240)
+    content_str = _truncate(content_str, _limit).replace("\n", " ").replace("\r", "")
     content_str = _wrap_content(content_str)
 
     lvl_col = _LEVEL_COLOR.get(level.upper(), "")

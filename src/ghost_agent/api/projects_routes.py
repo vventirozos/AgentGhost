@@ -24,7 +24,7 @@ Endpoints:
 import logging
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Security
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, Security
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -141,7 +141,10 @@ async def delete_project(pid: str, request: Request, hard: bool = False):
     ctx = _context(request)
     if getattr(ctx, "current_project_id", None) == pid:
         ctx.current_project_id = None
-    return JSONResponse(status_code=204, content=None)
+    # 204 No Content MUST have an empty body (RFC 9110). JSONResponse(204,
+    # content=None) serialized a 4-byte `null`, which strict HTTP/2 clients
+    # and proxies reject.
+    return Response(status_code=204)
 
 
 @projects_router.post("/{pid}/switch")
@@ -260,4 +263,7 @@ async def delete_task(pid: str, tid: str, request: Request):
     if not existing or existing["project_id"] != pid:
         raise HTTPException(404, "task not found in this project")
     store.delete_task(tid)
-    return JSONResponse(status_code=204, content=None)
+    # 204 No Content MUST have an empty body (RFC 9110). JSONResponse(204,
+    # content=None) serialized a 4-byte `null`, which strict HTTP/2 clients
+    # and proxies reject.
+    return Response(status_code=204)

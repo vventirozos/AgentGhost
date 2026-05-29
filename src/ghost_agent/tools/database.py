@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import threading
 from typing import Optional
 from ..utils.logging import Icons, pretty_log
 from ..utils.sanitizer import extract_code_from_markdown
@@ -8,13 +9,44 @@ logger = logging.getLogger("GhostAgent")
 
 # Simple connection pool: cache one connection per URI to avoid
 # opening/closing on every call during multi-step SQL workflows.
+#
+# A psycopg2 connection is NOT safe for concurrent use by multiple
+# threads, yet tool calls are dispatched concurrently via
+# `asyncio.to_thread` (see core/agent.py's parallel tool gather). Two
+# `postgres_admin` calls against the same URI would otherwise share one
+# connection across two worker threads and corrupt the protocol stream
+# ("lost synchronization with server"). We therefore serialize all use
+# of a given URI's connection behind a per-URI lock.
 _connection_pool: dict = {}
+_conn_locks: dict = {}
+_pool_lock = threading.Lock()  # guards the two module dicts above
+
+
+def _get_uri_lock(connection_string: str) -> threading.Lock:
+    """Return the per-URI lock serializing use of that URI's connection."""
+    with _pool_lock:
+        lk = _conn_locks.get(connection_string)
+        if lk is None:
+            lk = threading.Lock()
+            _conn_locks[connection_string] = lk
+        return lk
+
+
+def _evict_connection(connection_string: str):
+    """Drop the cached connection for a URI (after a connection error)."""
+    with _pool_lock:
+        _connection_pool.pop(connection_string, None)
 
 
 def _get_connection(connection_string: str):
-    """Get or create a cached connection for the given URI."""
+    """Get or create a cached connection for the given URI.
+
+    The caller MUST hold the per-URI lock from `_get_uri_lock` — this
+    function reads/writes the shared connection for the URI.
+    """
     import psycopg2
-    conn = _connection_pool.get(connection_string)
+    with _pool_lock:
+        conn = _connection_pool.get(connection_string)
     if conn is not None:
         try:
             # Check if connection is still alive
@@ -26,7 +58,8 @@ def _get_connection(connection_string: str):
     if conn is None:
         conn = psycopg2.connect(connection_string)
         conn.autocommit = True
-        _connection_pool[connection_string] = conn
+        with _pool_lock:
+            _connection_pool[connection_string] = conn
     return conn
 
 
@@ -84,91 +117,131 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
         except Exception as _vexc:
             logger.debug("metacog SQL validator crashed: %s", _vexc)
 
-    # Default timeout: 15s, but allow override for complex queries
-    effective_timeout = timeout_ms or 15000
+    # Default timeout: 15s, but allow override for complex queries.
+    # `timeout_ms` arrives from LLM tool-args (frequently as a string)
+    # and used to be interpolated straight into a SET statement — both a
+    # crash risk and a SQL-injection sink (e.g. "0; DROP TABLE x--" on an
+    # autocommit connection, where multi-statement batches execute). We
+    # coerce to int and clamp to a sane band so it can only ever be a
+    # bare integer; the SET is parameterized too as defense in depth.
+    try:
+        effective_timeout = int(timeout_ms) if timeout_ms else 15000
+    except (TypeError, ValueError):
+        effective_timeout = 15000
+    effective_timeout = max(100, min(effective_timeout, 600000))
+
+    def _run_action(cur):
+        if action == "schema":
+            # Parameterized — table_name comes from an LLM and could
+            # otherwise carry an injection payload ("'; DROP TABLE--").
+            sql = "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'"
+            if table_name:
+                sql += " AND table_name = %s"
+                cur.execute(sql, (table_name,))
+            else:
+                cur.execute(sql)
+            rows = cur.fetchall()
+            if not rows: return "No schema found."
+            return tabulate(rows, headers="keys", tablefmt="pipe")
+
+        elif action == "activity":
+            # Bounded row count + ordering so the model sees the
+            # longest-running queries first. Previously this was
+            # unbounded and would flood the prompt context with
+            # hundreds of `pg_stat_activity` rows on a busy DB.
+            cur.execute(
+                "SELECT pid, state, query, extract(epoch from now() - query_start) as duration_sec "
+                "FROM pg_stat_activity "
+                "WHERE state != 'idle' "
+                "ORDER BY duration_sec DESC NULLS LAST "
+                "LIMIT 50;"
+            )
+            rows = cur.fetchall()
+            if not rows: return "No active queries."
+            output = tabulate(rows, headers="keys", tablefmt="pipe")
+            if len(rows) == 50:
+                output += "\n\n[... showing 50 longest-running rows; LIMIT 50 applied. Use a direct `query` with your own filter for more detail. ...]"
+            return output
+
+        elif action in ["query", "explain_analyze"]:
+            if not query: return "Error: query parameter required."
+            sql = query
+            if action == "explain_analyze" and not sql.upper().strip().startswith("EXPLAIN"):
+                sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {sql}"
+
+            # Parameterized + already int-clamped (defense in depth).
+            cur.execute("SET statement_timeout = %s", (effective_timeout,))
+            cur.execute(sql)
+            if cur.description:
+                # We fetch one extra row beyond our display cap so we
+                # can detect "there are more than 300 rows" without
+                # paying the cost of materialising the full result
+                # set just to call `len()` on it.
+                rows = cur.fetchmany(301)
+                if not rows: return "Query executed successfully. No rows returned."
+                truncated = len(rows) > 300
+                output = tabulate(rows[:300], headers="keys", tablefmt="pipe")
+                if truncated:
+                    # We can't cheaply get the true total without
+                    # `SELECT COUNT(*)` reissue against an arbitrary
+                    # query (subquery wrapping is fragile), so we
+                    # surface the cap honestly — the model now knows
+                    # the result was clamped and how to dig deeper.
+                    output += (
+                        "\n\n[Returned 300 rows (max display limit). "
+                        "The full result set may contain MORE rows. "
+                        "Re-run with `LIMIT N OFFSET M` or wrap the query in "
+                        "`SELECT count(*) FROM (...) sub` to know the true total.]"
+                    )
+                else:
+                    output += f"\n\n[Returned {len(rows)} of {len(rows)} rows.]"
+                return output
+            return "Query executed successfully. No rows returned."
+        else:
+            return f"Unknown action: {action}"
+
+    # psycopg2's connection-level exception types. Resolved defensively:
+    # under test doubles these attributes may not be real exception
+    # classes, so we filter to genuine BaseException subclasses and match
+    # with isinstance (never `except <non-class>`, which raises TypeError).
+    _conn_err_types = tuple(
+        t for t in (getattr(psycopg2, "OperationalError", None),
+                    getattr(psycopg2, "InterfaceError", None))
+        if isinstance(t, type) and issubclass(t, BaseException)
+    )
 
     def execute_db():
-        conn = None
-        try:
-            conn = _get_connection(connection_string)
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                if action == "schema":
-                    # Parameterized — table_name comes from an LLM and could
-                    # otherwise carry an injection payload ("'; DROP TABLE--").
-                    sql = "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'"
-                    if table_name:
-                        sql += " AND table_name = %s"
-                        cur.execute(sql, (table_name,))
-                    else:
-                        cur.execute(sql)
-                    rows = cur.fetchall()
-                    if not rows: return "No schema found."
-                    return tabulate(rows, headers="keys", tablefmt="pipe")
-                
-                elif action == "activity":
-                    # Bounded row count + ordering so the model sees the
-                    # longest-running queries first. Previously this was
-                    # unbounded and would flood the prompt context with
-                    # hundreds of `pg_stat_activity` rows on a busy DB.
-                    cur.execute(
-                        "SELECT pid, state, query, extract(epoch from now() - query_start) as duration_sec "
-                        "FROM pg_stat_activity "
-                        "WHERE state != 'idle' "
-                        "ORDER BY duration_sec DESC NULLS LAST "
-                        "LIMIT 50;"
-                    )
-                    rows = cur.fetchall()
-                    if not rows: return "No active queries."
-                    output = tabulate(rows, headers="keys", tablefmt="pipe")
-                    if len(rows) == 50:
-                        output += "\n\n[... showing 50 longest-running rows; LIMIT 50 applied. Use a direct `query` with your own filter for more detail. ...]"
-                    return output
-                
-                elif action in ["query", "explain_analyze"]:
-                    if not query: return "Error: query parameter required."
-                    sql = query
-                    if action == "explain_analyze" and not sql.upper().strip().startswith("EXPLAIN"):
-                        sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {sql}"
-                    
-                    cur.execute(f"SET statement_timeout = {effective_timeout};")
-                    cur.execute(sql)
-                    if cur.description:
-                        # We fetch one extra row beyond our display cap so we
-                        # can detect "there are more than 300 rows" without
-                        # paying the cost of materialising the full result
-                        # set just to call `len()` on it.
-                        rows = cur.fetchmany(301)
-                        if not rows: return "Query executed successfully. No rows returned."
-                        truncated = len(rows) > 300
-                        output = tabulate(rows[:300], headers="keys", tablefmt="pipe")
-                        if truncated:
-                            # We can't cheaply get the true total without
-                            # `SELECT COUNT(*)` reissue against an arbitrary
-                            # query (subquery wrapping is fragile), so we
-                            # surface the cap honestly — the model now knows
-                            # the result was clamped and how to dig deeper.
-                            output += (
-                                "\n\n[Returned 300 rows (max display limit). "
-                                "The full result set may contain MORE rows. "
-                                "Re-run with `LIMIT N OFFSET M` or wrap the query in "
-                                "`SELECT count(*) FROM (...) sub` to know the true total.]"
-                            )
-                        else:
-                            output += f"\n\n[Returned {len(rows)} of {len(rows)} rows.]"
-                        return output
-                    return "Query executed successfully. No rows returned."
-                else:
-                    return f"Unknown action: {action}"
-        except Exception as e:
-            # On error, close and discard the pooled connection to avoid
-            # reusing a broken connection on the next call.
-            if conn:
+        # Serialize all use of this URI's shared connection — psycopg2
+        # connections are not thread-safe and tool dispatch is concurrent.
+        with _get_uri_lock(connection_string):
+            last_err = None
+            for attempt in range(2):  # one retry on a stale/broken connection
+                conn = None
                 try:
-                    conn.close()
-                except Exception:
-                    pass
-                _connection_pool.pop(connection_string, None)
-            return f"Error: Postgres execution failed - {str(e)}"
+                    conn = _get_connection(connection_string)
+                    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                        return _run_action(cur)
+                except Exception as e:
+                    # Always discard the (possibly broken) connection.
+                    last_err = e
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    _evict_connection(connection_string)
+                    # A connection-level failure (server dropped an idle
+                    # conn, network blip) is retried once with a fresh
+                    # connection. Query-level errors (bad SQL) are not —
+                    # the statement itself is the problem.
+                    is_conn_err = bool(_conn_err_types) and isinstance(e, _conn_err_types)
+                    if is_conn_err and attempt == 0:
+                        logger.debug("DB connection-level error, retrying with a fresh connection: %s", e)
+                        continue
+                    pretty_log("Postgres Error", f"{type(e).__name__}: {str(e)[:160]}",
+                               icon=Icons.FAIL, level="ERROR")
+                    return f"Error: Postgres execution failed - {str(e)}"
+            return f"Error: Postgres execution failed - {last_err}"
 
     result = await asyncio.to_thread(execute_db)
     if result.startswith("Error:"):

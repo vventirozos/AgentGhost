@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost Agent — Audit &amp; Hardening (2026-05)</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Overview</h3>
+    <a href="index.html">Home</a>
+    <a href="capabilities.html">Capabilities</a>
+    <a href="architecture.html">System Architecture</a>
+    <a href="installation.html">Install &amp; Run</a>
+    <a href="cli_reference.html">CLI Reference</a>
+    <a class="current" href="audit_fixes.html">Audit &amp; hardening</a>
+
+    <h3>Core</h3>
+    <a href="core/agent.html">agent</a>
+    <a href="core/mcts.html">mcts</a>
+    <a href="core/hypothesis.html">hypothesis</a>
+    <a href="core/dream.html">dream</a>
+    <a href="core/planning.html">planning</a>
+    <a href="core/project_advancer.html">project_advancer</a>
+    <a href="core/bus.html">bus (memory)</a>
+    <a href="core/arbiter.html">arbiter (uplift)</a>
+    <a href="core/confidence.html">confidence (uplift)</a>
+
+    <h3>Memory</h3>
+    <a href="memory/graph.html">graph</a>
+    <a href="memory/vector.html">vector</a>
+    <a href="memory/frontier.html">frontier</a>
+    <a href="memory/episodes.html">episodes</a>
+
+    <h3>Tools</h3>
+    <a href="tools/database.html">database</a>
+    <a href="tools/memory_tools.html">memory tools</a>
+    <a href="tools/browser.html">browser</a>
+    <a href="tools/projects.html">projects</a>
+    <a href="tools/swarm.html">swarm</a>
+    <a href="tools/search.html">search</a>
+    <a href="tools/acquired_skills.html">acquired_skills</a>
+    <a href="tools/registry.html">registry</a>
+
+    <h3>Sandbox &amp; API</h3>
+    <a href="sandbox/docker.html">Docker sandbox</a>
+    <a href="api/routes.html">HTTP routes</a>
+    <a href="api/projects_routes.html">Projects routes</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <div class="eyebrow">Maintenance</div>
+    <h1>Audit &amp; hardening — May 2026</h1>
+    <p class="subtitle">A deep correctness/security pass across the codebase. Every fix below ships with unit tests under <code>tests/</code>; the full suite (4300+ tests) is green and the live API was smoke-tested end-to-end on port 8000.</p>
+    <div class="hero-meta">
+      <span class="badge good">28+ fixes</span>
+      <span class="badge">11 new test files</span>
+      <span class="badge">full suite green</span>
+      <span class="badge">live-verified</span>
+    </div>
+  </section>
+
+  <div class="note">
+    <strong>Scope.</strong> These are correctness and security fixes — no feature changes.
+    Two items change an observable contract and are called out inline:
+    project <code>DELETE</code> now returns a <em>truly empty</em> <code>204</code> body, and the
+    <strong>PRM must be retrained</strong> (its training-time feature state changed to remove
+    label leakage). Everything else preserves documented behaviour while fixing a latent bug.
+  </div>
+
+  <h2>Critical — security &amp; data integrity</h2>
+  <table>
+    <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
+    <tbody>
+      <tr><td>Trajectory redaction</td><td>Only top-level string tool-args were redacted; secrets nested in list/dict args and the <code>extra</code>/<code>validator_signal</code> metadata reached the on-disk SFT corpus verbatim. Now recurses through nested containers, redacts both metadata dicts, and scrubs values under sensitive key names (<code>password</code>, <code>authorization</code>, …).</td><td><code>distill/redact.py</code></td></tr>
+      <tr><td>SQL injection</td><td><code>timeout_ms</code> (an LLM-supplied arg) was f-string-interpolated into <code>SET statement_timeout</code> on an autocommit connection — a crash + injection sink. Now int-coerced, clamped, and parameterized.</td><td><a href="tools/database.html">tools/database</a></td></tr>
+      <tr><td>ReDoS / scrubber leaks</td><td>The markdown code-fence extractor had a catastrophic-backtracking regex (a ~3&nbsp;KB unterminated fence hung a worker). De-ambiguated + length-capped. Also: the fully-wrapped CDATA strip used <code>rfind</code> (leaked an embedded <code>]]&gt;</code>); and <code>.strip('`')</code> corrupted valid non-Python code with edge backticks.</td><td><code>utils/sanitizer.py</code></td></tr>
+      <tr><td>Sandbox escape</td><td>The <code>forget</code> tool's containment check used <code>str.startswith</code>, so a sibling dir like <code>…/sandbox_evil</code> looked "inside" <code>…/sandbox</code> — and a symlink could delete out-of-sandbox files. Now path-component containment (<code>is_relative_to</code>) and refuses to delete through symlinks.</td><td><a href="tools/memory_tools.html">tools/memory</a></td></tr>
+      <tr><td>DB connection safety</td><td>One shared psycopg2 connection per URI used concurrently across <code>to_thread</code> workers (protocol corruption). Now serialized behind a per-URI lock, with a one-shot reconnect on a dropped idle connection.</td><td><a href="tools/database.html">tools/database</a></td></tr>
+    </tbody>
+  </table>
+
+  <h2>High — a defect that silently defeated a whole subsystem</h2>
+  <table>
+    <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
+    <tbody>
+      <tr><td>MCTS simulation</td><td><code>route()</code> returns a content <em>string</em>, but the simulator called <code>.get()</code> on it → <code>AttributeError</code> swallowed → every candidate collapsed to the 0.3 default, defeating ranking whenever worker nodes were configured. Added the <code>isinstance(result, str)</code> guard the verifier already had.</td><td><a href="core/mcts.html">core/mcts</a></td></tr>
+      <tr><td>Self-play learning</td><td><code>web_automation</code> was missing from the lesson-domain allow-list, so 100% of web-automation self-play lessons were discarded by the generalization guard. Added it.</td><td><a href="core/dream.html">core/dream</a></td></tr>
+      <tr><td>Knowledge graph</td><td>Re-asserting a previously-expired functional fact bumped its weight but never cleared <code>valid_until</code>, so the (now true) fact stayed invisible on the next restart. The upsert now resets <code>valid_until = NULL</code>.</td><td><a href="memory/graph.html">memory/graph</a></td></tr>
+      <tr><td>PRM label leakage <span class="badge">retrain</span></td><td>Prefix-state <code>pending_count</code>/<code>plan_depth</code> were derived from the <em>completed</em> trajectory (future knowledge), letting the PRM learn the label directly. Pinned to neutral inference constants. <strong>Existing PRM checkpoints must be retrained.</strong></td><td><code>prm/labels.py</code> · <a href="algorithms/prm.md">prm</a></td></tr>
+      <tr><td>Autobiographical recall</td><td>Search scored on substring containment ("art" matched "smart") while IDF was token-based. Now token-set membership. Also closed two lock gaps (template-rollup rewrite, reference-count RMW) that lost updates under the watchdog.</td><td><code>selfhood/autobiographical.py</code></td></tr>
+      <tr><td>Eval integrity</td><td>The post-learning "discover-first" validator matched <code>ls</code> as a bare substring (fired inside "ca<strong>ls</strong>"/"fa<strong>ls</strong>e"), corrupting the pre/post-learning delta. Now word-boundary matching.</td><td><code>eval/tasks.py</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Concurrency — races on shared state</h2>
+  <table>
+    <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
+    <tbody>
+      <tr><td>Docker sandbox</td><td><code>ensure_running()</code> had no lock; concurrent tool calls raced container creation (409 name conflict, double ~2-min provisioning). Now lock-guarded, and a 409 is treated as "another process won" → adopt the existing container.</td><td><a href="sandbox/docker.html">sandbox/docker</a></td></tr>
+      <tr><td>Project advancer</td><td>Two ticks read the same READY leaf and marked it IN_PROGRESS only <em>after</em> an <code>await</code> — double-running a step. The leaf is now claimed atomically before any await, under a per-project lock.</td><td><a href="core/project_advancer.html">core/project_advancer</a></td></tr>
+      <tr><td>Reflection loop</td><td><code>run()</code> added a trajectory to the shared dedup set only after awaiting, so a concurrent <code>reflect_one()</code> double-reflected it. Now claimed before the await.</td><td><code>reflection/loop.py</code></td></tr>
+      <tr><td>Agent loop</td><td>Per-domain metacog competence was recorded once post-loop with the last tool's name + the turn-wide failure flag (mis-attributed on multi-tool turns) → now recorded per result. Plus: the Context-Shield summarizer no longer clobbers the loop-level <code>payload</code> (which truncated the Perfect-It generation), and the episode-archive write is tracked + drained on shutdown.</td><td><a href="core/agent.html">core/agent</a></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Medium &amp; lower-confidence</h2>
+  <table>
+    <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>
+    <tbody>
+      <tr><td>Text chunking</td><td><code>recursive_split_text</code> stepped by <code>chunk_size − chunk_overlap</code>; when overlap ≥ size the step went ≤ 0 and silently dropped all content. Step clamped to ≥ 1.</td><td><code>utils/helpers.py</code></td></tr>
+      <tr><td>Web search</td><td>The reformulation fallback referenced a function-local <code>junk</code> list defined only after a successful primary call — so it raised <code>UnboundLocalError</code> on exactly the failure (Tor down) it exists to handle. Hoisted to module scope.</td><td><a href="tools/search.html">tools/search</a></td></tr>
+      <tr><td>Eval network guard</td><td>Only <code>connect</code> was blocked; UDP <code>sendto</code>/<code>sendmsg</code> escaped the "no bytes leave" guarantee. Now guarded too.</td><td><code>eval/network_guard.py</code></td></tr>
+      <tr><td>Frontier state</td><td>Corrupt JSON was swallowed and the next save wiped all cluster/tier/mastery history. Corrupt files are now preserved as a timestamped sidecar.</td><td><a href="memory/frontier.html">memory/frontier</a></td></tr>
+      <tr><td>Plan completion</td><td><code>all([])</code> vacuously marked a parent DONE/BLOCKED when its child IDs were all dangling. Guarded with a non-empty check.</td><td><a href="core/planning.html">core/planning</a></td></tr>
+      <tr><td>Acquired-skill telemetry</td><td><code>tool_execute</code> returns error strings rather than raising, so a broken skill was logged <code>success=True</code> and never retired. The result is now classified (EXIT CODE / error markers).</td><td><a href="tools/registry.html">tools/registry</a> · <a href="tools/acquired_skills.html">acquired_skills</a></td></tr>
+      <tr><td>Browser extract_text</td><td>Reported the <em>capped</em> length on truncation, hiding how much was dropped. Now reports the true page length.</td><td><a href="tools/browser.html">tools/browser</a></td></tr>
+      <tr><td>GEPA adapter</td><td>From inside a running event loop the dspy LM adapter fell through to <code>asyncio.run()</code> and raised. Now runs the coroutine on a worker thread.</td><td><code>optim/run_gepa.py</code></td></tr>
+      <tr><td>Hypothesis testing</td><td>An error <em>result</em> was force-marked inconsistent and dropped — but a test designed to surface an error can be the one that <em>confirms</em> its hypothesis. Error results are now left ambiguous and deferred to evaluation.</td><td><a href="core/hypothesis.html">core/hypothesis</a></td></tr>
+      <tr><td>Project decompose</td><td><code>zip(ids, subtasks)</code> mis-aligned knowledge-graph links when a blank subtask was dropped from <code>ids</code>. Pairs are now built as tasks are created.</td><td><a href="tools/projects.html">tools/projects</a></td></tr>
+      <tr><td>Swarm routing</td><td><code>get_swarm_node</code> was called twice per task (dispatch + worker), double-advancing the round-robin index. The validated node is now passed to the worker.</td><td><a href="tools/swarm.html">tools/swarm</a></td></tr>
+      <tr><td>Episodic recall</td><td>Referenced a <code>search_raw</code> method that never existed (permanently dead). Now calls the real <code>search_advanced</code>.</td><td><a href="memory/episodes.html">memory/episodes</a></td></tr>
+      <tr><td>Vector store</td><td>A recoverable embedding-provider conflict called <code>sys.exit(1)</code> despite logging "Resetting collection". Now actually drops + recreates the collection.</td><td><a href="memory/vector.html">memory/vector</a></td></tr>
+      <tr><td>Projects API <span class="badge">contract</span></td><td><code>DELETE</code> returned a 4-byte <code>null</code> body on a <code>204</code> (RFC violation). Now an empty <code>Response</code>.</td><td><a href="api/projects_routes.html">api/projects_routes</a></td></tr>
+      <tr><td>Confidence calibration</td><td>The competence-prior shrinkage had a discontinuous jump at <code>n=5</code> (the documented "halfway" point was unreachable). Now the continuous <code>n/(n+5)</code> curve for all n.</td><td><a href="core/confidence.html">core/confidence</a></td></tr>
+      <tr><td>Memory-bus intent</td><td>The two-word keyword <code>"best practice"</code> could never match the single-token set intersection (dead). Replaced with <code>"practice"</code>.</td><td><a href="core/bus.html">core/bus</a></td></tr>
+      <tr><td>API auth</td><td>The API key was compared with <code>!=</code> (timing side-channel). Now <code>secrets.compare_digest</code>, plus a startup warning when the default key is used on a non-loopback bind.</td><td><a href="api/routes.html">api/routes</a></td></tr>
+      <tr><td>Arbiter convergence</td><td>Two whitespace-only candidates tokenised to empty sets and scored "fully converged" (1.0). <code>similarity()</code> now strips first, scoring 0.</td><td><a href="core/arbiter.html">core/arbiter</a></td></tr>
+    </tbody>
+  </table>
+
+  <h2>Verification</h2>
+  <ul>
+    <li><strong>Unit tests</strong> — each fix has targeted tests under <code>tests/</code> (11 new files plus extensions to existing suites). Regression tests reproduce the original defect (e.g. a ReDoS timing guard, a sandbox-escape symlink, a double-advance counter).</li>
+    <li><strong>Full suite</strong> — <code>pytest tests/</code> passes (4300+ tests, 0 failures).</li>
+    <li><strong>Live smoke test</strong> — the agent was restarted on port 8000 and exercised end-to-end: health/version/models endpoints, the projects CRUD + empty-204 path, a conversational turn, and a tool-using (<code>execute</code>) turn — all green.</li>
+  </ul>
+</main>
+</body>
+</html>

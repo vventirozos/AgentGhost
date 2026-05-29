@@ -85,7 +85,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         pretty_log("Image Gen",
                    f"Prompt: {prompt[:30]}... | size={final_w}x{final_h}"
                    + (f" (snapped from {raw_w}x{raw_h})" if snapped else ""),
-                   icon="🎨")
+                   icon=Icons.IMAGE_GEN)
 
         if not getattr(llm_client, 'image_gen_clients', None):
             return "ERROR: Image generation node is offline or not configured."

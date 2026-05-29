@@ -3,7 +3,7 @@ import threading
 import os
 from pathlib import Path
 from typing import Any, Dict
-from ..utils.logging import pretty_log
+from ..utils.logging import pretty_log, Icons
 
 class ProfileMemory:
     def __init__(self, path: Path):
@@ -13,11 +13,20 @@ class ProfileMemory:
             self.save({"root": {"name": "User"}, "relationships": {}, "interests": {}, "assets": {}})
 
     def load(self) -> Dict[str, Any]:
+        _default = {"root": {"name": "User"}, "relationships": {}, "interests": {}, "assets": {}}
         with self._lock:
-            try: 
+            try:
                 return json.loads(self.file_path.read_text())
-            except: 
-                return {"root": {"name": "User"}, "relationships": {}, "interests": {}, "assets": {}}
+            except FileNotFoundError:
+                return dict(_default)
+            except Exception as e:
+                # A corrupt profile would otherwise silently revert the
+                # user's identity to the default — and the next save() would
+                # overwrite the real file. Surface it on the monitored stream.
+                pretty_log("Profile Corrupt",
+                           f"{type(e).__name__}: {e}; reverting to default identity",
+                           icon=Icons.USER_ID, level="WARNING")
+                return dict(_default)
 
     def save(self, data: Dict[str, Any]):
         with self._lock:

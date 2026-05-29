@@ -249,67 +249,71 @@ class AutobiographicalMemory:
         spanning hours and arbitrary other turns would defeat the
         point. The natural caller is the agent's hot loop, where these
         templates fire in dense bursts."""
-        # Skip the tail scan entirely on a missing file — we'll fall
-        # straight through to opening a fresh rollup record below.
-        if not self.path.exists():
-            lines: List[str] = []
-        else:
-            try:
-                with self._lock:
-                    lines = self.path.read_text(encoding="utf-8").splitlines()
-            except OSError as e:
-                logger.warning("autobiographical rollup read failed: %s", e)
-                lines = []
-        try:
-            # Walk back through the last 5 lines looking for a rollup
-            # we already opened for this marker. Skip plain whitespace;
-            # bail on the first non-rollup, non-matching entry so
-            # unrelated turns can't accidentally extend the window.
-            for i in range(len(lines) - 1, max(-1, len(lines) - 6), -1):
-                s = lines[i].strip()
-                if not s:
-                    continue
+        # Hold the lock across the ENTIRE read → walk → write → replace
+        # (and the fresh-append fallback). Previously the read was locked
+        # but released before tmp.replace, so a concurrent append (hot
+        # loop) or watchdog write landing between our read and our replace
+        # was silently clobbered by the stale snapshot.
+        with self._lock:
+            # Skip the tail scan entirely on a missing file — we'll fall
+            # straight through to opening a fresh rollup record below.
+            if not self.path.exists():
+                lines: List[str] = []
+            else:
                 try:
-                    d = json.loads(s)
-                except json.JSONDecodeError:
+                    lines = self.path.read_text(encoding="utf-8").splitlines()
+                except OSError as e:
+                    logger.warning("autobiographical rollup read failed: %s", e)
+                    lines = []
+            try:
+                # Walk back through the last 5 lines looking for a rollup
+                # we already opened for this marker. Skip plain whitespace;
+                # bail on the first non-rollup, non-matching entry so
+                # unrelated turns can't accidentally extend the window.
+                for i in range(len(lines) - 1, max(-1, len(lines) - 6), -1):
+                    s = lines[i].strip()
+                    if not s:
+                        continue
+                    try:
+                        d = json.loads(s)
+                    except json.JSONDecodeError:
+                        break
+                    if d.get("template_marker") == marker:
+                        d["template_count"] = int(d.get("template_count") or 1) + 1
+                        d["timestamp"] = fresh.timestamp
+                        # Refresh tools_used to the union — the rollup
+                        # should reflect what got reached for across the
+                        # burst, not just the first turn's tools.
+                        existing_tools = list(d.get("tools_used") or [])
+                        for t in fresh.tools_used:
+                            if t not in existing_tools:
+                                existing_tools.append(t)
+                        d["tools_used"] = existing_tools[:10]
+                        # Re-render the summary with the new count.
+                        d["summary"] = _rollup_summary(marker, d["template_count"])
+                        lines[i] = json.dumps(d, ensure_ascii=False)
+                        tmp = self.path.with_suffix(".jsonl.tmp")
+                        tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                        tmp.replace(self.path)
+                        return True
                     break
-                if d.get("template_marker") == marker:
-                    d["template_count"] = int(d.get("template_count") or 1) + 1
-                    d["timestamp"] = fresh.timestamp
-                    # Refresh tools_used to the union — the rollup
-                    # should reflect what got reached for across the
-                    # burst, not just the first turn's tools.
-                    existing_tools = list(d.get("tools_used") or [])
-                    for t in fresh.tools_used:
-                        if t not in existing_tools:
-                            existing_tools.append(t)
-                    d["tools_used"] = existing_tools[:10]
-                    # Re-render the summary with the new count.
-                    d["summary"] = _rollup_summary(marker, d["template_count"])
-                    lines[i] = json.dumps(d, ensure_ascii=False)
-                    tmp = self.path.with_suffix(".jsonl.tmp")
-                    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
-                    tmp.replace(self.path)
-                    return True
-                break
-        except Exception as e:
-            logger.warning("autobiographical rollup bump failed: %s", e)
-        # No matching tail entry — open a fresh rollup with count=1.
-        fresh_dict = fresh.to_dict()
-        fresh_dict["template_marker"] = marker
-        fresh_dict["template_count"] = 1
-        fresh_dict["summary"] = _rollup_summary(marker, 1)
-        try:
-            with self._lock:
+            except Exception as e:
+                logger.warning("autobiographical rollup bump failed: %s", e)
+            # No matching tail entry — open a fresh rollup with count=1.
+            fresh_dict = fresh.to_dict()
+            fresh_dict["template_marker"] = marker
+            fresh_dict["template_count"] = 1
+            fresh_dict["summary"] = _rollup_summary(marker, 1)
+            try:
                 self.path.parent.mkdir(parents=True, exist_ok=True)
                 with self.path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(fresh_dict, ensure_ascii=False))
                     f.write("\n")
                     f.flush()
-        except Exception as e:
-            logger.warning("autobiographical rollup open failed: %s", e)
-            return False
-        return True
+            except Exception as e:
+                logger.warning("autobiographical rollup open failed: %s", e)
+                return False
+            return True
 
     # ------------------------------------------------------------------
     # Session-boundary marker (#9)
@@ -436,8 +440,8 @@ class AutobiographicalMemory:
         }
 
         scored: List[tuple] = []
-        for exp, hs in zip(experiences, haystacks):
-            score = sum(idf[t] for t in q_tokens if t in hs)
+        for exp, hs_tokens in zip(experiences, haystacks):
+            score = sum(idf[t] for t in q_tokens if t in hs_tokens)
             if score > 0:
                 scored.append((score, exp))
         scored.sort(key=lambda s: (s[0], s[1].timestamp), reverse=True)
@@ -460,18 +464,22 @@ class AutobiographicalMemory:
         if cached is not None:
             return cached
         experiences = list(self.iter_experiences())
-        haystacks: List[str] = []
+        haystacks: List[set] = []
         df: Dict[str, int] = {}
         for exp in experiences:
             hs = (exp.summary + " " + exp.user_first_words + " "
                   + (exp.cluster or "")).lower()
-            haystacks.append(hs)
-            # Every distinct token in this document contributes +1 to
-            # its df. Use a set so duplicate occurrences in the same
-            # haystack don't over-count.
-            for t in set(_tokenize(hs)):
-                if len(t) > 2:
-                    df[t] = df.get(t, 0) + 1
+            # Store the TOKEN SET (not the raw string). Scoring tests
+            # membership token-wise to match how df is built — a query
+            # token must EQUAL a document token, not merely appear as a
+            # substring of one. The old `t in hs` substring test ranked
+            # "art" into "smart"/"part" and, worse, gave an unseen query
+            # token max idf whenever it happened to be a substring.
+            toks = {t for t in _tokenize(hs) if len(t) > 2}
+            haystacks.append(toks)
+            # Every distinct token contributes +1 to its df.
+            for t in toks:
+                df[t] = df.get(t, 0) + 1
         # Bound the cache so a long-running agent doesn't hold every
         # historical (mtime, size) snapshot — only the latest is useful.
         self._search_cache = {key: (experiences, haystacks, df)}
@@ -580,15 +588,22 @@ class AutobiographicalMemory:
         no further turns happen."""
         if not self.enabled or not experience_id:
             return 0
-        counts = self._load_ref_counts()
-        counts[experience_id] = counts.get(experience_id, 0) + 1
-        self._persist_ref_counts()
-        return counts[experience_id]
+        # Hold the lock across load → bump → persist so concurrent callers
+        # (post-turn hot path + biological watchdog) can't lose an
+        # increment, and so _persist_ref_counts never json.dumps a dict
+        # another thread is mutating ("dict changed size during iteration").
+        with self._lock:
+            counts = self._load_ref_counts()
+            counts[experience_id] = counts.get(experience_id, 0) + 1
+            new_count = counts[experience_id]
+            self._persist_ref_counts()
+        return new_count
 
     def reference_count(self, experience_id: str) -> int:
         if not self.enabled or not experience_id:
             return 0
-        return self._load_ref_counts().get(experience_id, 0)
+        with self._lock:
+            return self._load_ref_counts().get(experience_id, 0)
 
     def ref_count_summary(self) -> Dict[str, int]:
         """Snapshot of the full reference-count table. Used by stats()
@@ -596,7 +611,8 @@ class AutobiographicalMemory:
         agent has actually reached for."""
         if not self.enabled:
             return {}
-        return dict(self._load_ref_counts())
+        with self._lock:
+            return dict(self._load_ref_counts())
 
     def count(self) -> int:
         if not self.path.exists():

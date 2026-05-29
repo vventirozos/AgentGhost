@@ -1,6 +1,7 @@
 """Regression tests for sandbox & dream fixes derived from a self-play log
 where every Docker exec spammed 'Environment Ready.' and the synthetic
 self-play context inherited a MemoryBus pointing at production stores."""
+import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -30,6 +31,7 @@ def _make_already_ready_sandbox():
     sb.client = MagicMock()
     sb.docker_lib = MagicMock()
     sb.NotFound = type("NotFound", (Exception,), {})
+    sb._lock = threading.Lock()  # ensure_running's locking wrapper acquires this
 
     container = MagicMock()
     def _exec_run(cmd, *args, **kwargs):
@@ -75,7 +77,9 @@ def test_ensure_running_logs_when_initialising():
         sb.ensure_running()
 
     titles = [c.args[0] for c in plog.call_args_list]
-    assert "Sandbox" in titles
+    # Boot phases now carry distinct titles (Sandbox Provision / Image /
+    # Chromium / Ready / …) instead of a single overloaded "Sandbox".
+    assert any(t.startswith("Sandbox") for t in titles)
     messages = [c.args[1] for c in plog.call_args_list if len(c.args) > 1]
     assert any("Initializing" in m for m in messages)
     assert any("Environment Ready" in m for m in messages)
@@ -126,7 +130,7 @@ def test_ensure_running_logs_when_supercharged_marker_missing():
     with patch("ghost_agent.sandbox.docker.pretty_log") as plog:
         sb.ensure_running()
     msgs = [c.args[1] for c in plog.call_args_list if len(c.args) > 1]
-    assert any("Installing Deep Learning Stack" in m for m in msgs)
+    assert any("deep-learning stack" in m for m in msgs)
     assert any("Environment Ready" in m for m in msgs)
 
 

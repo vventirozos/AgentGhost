@@ -1168,7 +1168,7 @@ Return ONLY a JSON object with:
     _GENERALIZATION_MIN_NGRAM = 6  # min consecutive-token overlap that counts as "copy-paste"
     _VALID_LESSON_DOMAINS = frozenset({
         "data_analysis", "regex_parse", "sql", "concurrency",
-        "algo", "bash", "python_general",
+        "algo", "bash", "python_general", "web_automation",
     })
 
     @classmethod

@@ -988,11 +988,23 @@ class GhostAgent:
             from ..utils.helpers import get_utc_timestamp
             if self.context.memory_system and "Summarization unavailable" not in summary:
                 episode_text = f"EPISODIC ARCHIVE (Past Conversation Summary):\n{summary}"
-                asyncio.create_task(asyncio.to_thread(
+                # Hold a reference to this fire-and-forget archive write:
+                # asyncio keeps only a weak ref to bare tasks, so an
+                # un-stored create_task can be GC'd mid-flight (the write
+                # silently never lands). Tracking it in a context-level set
+                # also lets the lifespan shutdown drain it instead of
+                # destroying it mid-await.
+                _bg = getattr(self.context, "_pending_background_tasks", None)
+                if _bg is None:
+                    _bg = set()
+                    self.context._pending_background_tasks = _bg
+                _arch_task = asyncio.create_task(asyncio.to_thread(
                     self.context.memory_system.add,
                     episode_text,
                     {"type": "episode", "timestamp": get_utc_timestamp()}
                 ))
+                _bg.add(_arch_task)
+                _arch_task.add_done_callback(_bg.discard)
         except Exception as e:
             logger.warning(f"Context summarization failed: {e}")
             summary += f"(Summarization unavailable due to error, dropping old turns: {e})"
@@ -5406,9 +5418,34 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             fname, tool_id, a_hash, is_mutating = tool_call_metadata[i]
                             str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
 
+                            # Metacog per-tool outcome (roadmap phase 2.3):
+                            # record THIS result's tool keyed on its OWN
+                            # success — not (as before) a single post-loop call
+                            # using the last tool's name + the turn-wide failure
+                            # flag, which mis-attributed competence whenever a
+                            # turn dispatched multiple tools in parallel.
+                            _mc = getattr(self.context, "metacog", None)
+                            if _mc is not None and getattr(_mc, "enabled", False) and fname:
+                                _lstr = str_res.lstrip()
+                                _tool_failed = isinstance(result, Exception) or (
+                                    _lstr.startswith(("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
+                                    or "Traceback" in str_res
+                                    or "EXIT CODE: 1" in str_res
+                                    or "EXIT CODE: 2" in str_res
+                                )
+                                try:
+                                    _mc.record_outcome(fname, success=not _tool_failed)
+                                except Exception as _mcexc:
+                                    logger.debug("metacog outcome hook failed: %s", _mcexc)
+
                             shield_limit = max(16000, int(char_budget * 0.1))
                             if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base", "postgres_admin"]:
-                                payload = {
+                                # Use a DISTINCT variable, not `payload`: the
+                                # outer `payload` is reused later (e.g. the
+                                # Perfect-It optimization call), and rebinding
+                                # it here to this 300-token summarizer silently
+                                # capped that later generation's max_tokens.
+                                shield_payload = {
                                     "model": model,
                                     "messages": [{"role": "user", "content": f"The user asked: '{last_user_content}'. Summarize this tool output. If it contains facts relevant to the user, extract them. If it is a script error, state the root cause. Output: {str_res[:15000]}"}],
                                     "temperature": 0.0,
@@ -5416,7 +5453,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 }
                                 try:
                                     pretty_log("Context Shield", f"Offloading {len(str_res)} chars from {fname} to Edge Worker...", icon=Icons.SHIELD)
-                                    summary_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
+                                    summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=True)
                                     summary_content = summary_data["choices"][0]["message"].get("content", "").strip()
                                     if summary_content:
                                         str_res = f"[EDGE CONDENSED]: {summary_content}"
@@ -5578,18 +5615,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             else:
                                 if is_mutating: seen_tools.clear()
 
-                        # Metacog outcome hook (roadmap phase 2.3). Record
-                        # tool success/failure into the per-domain competence
-                        # profile so cross-domain transfer (Level-1) has data
-                        # to compose. Only fires when the bundle is wired.
-                        # ``fname`` is the most-recently-dispatched tool name
-                        # in this loop iteration — set by the enumerate above.
-                        _mc = getattr(self.context, "metacog", None)
-                        if _mc is not None and getattr(_mc, "enabled", False) and fname:
-                            try:
-                                _mc.record_outcome(fname, success=not turn_has_failure)
-                            except Exception as _mcexc:
-                                logger.debug("metacog outcome hook failed: %s", _mcexc)
+                        # (Metacog per-tool outcomes are now recorded inside
+                        # the enumerate(results) loop above, keyed per result.)
 
                         if turn_has_failure:
                             # Classify the failure to route to the right budget
@@ -6096,11 +6123,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     type(_e).__name__, _e,
                                 )
                         else:
-                            pretty_log(
-                                "Verifier",
-                                f"{v_result.verdict.value} ({v_result.confidence:.0%})" if v_result else "skipped",
-                                icon=Icons.OK,
-                            )
+                            if v_result:
+                                pretty_log(
+                                    "Verifier",
+                                    f"{v_result.verdict.value} ({v_result.confidence:.0%})",
+                                    icon=Icons.VERIFIER_LAB,
+                                )
+                            else:
+                                # v_result is None → the verifier pipeline FAILED
+                                # (e.g. LLM error); it did NOT pass. Don't show ✅.
+                                pretty_log(
+                                    "Verifier", "unavailable — gate skipped",
+                                    icon=Icons.WARN, level="WARNING",
+                                )
                 except Exception as e:
                     logger.debug(f"Verifier gate skipped: {e}")
 

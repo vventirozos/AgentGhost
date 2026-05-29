@@ -948,6 +948,8 @@ async def lifespan(app):
     try:
         yield
     finally:
+        pretty_log("System Shutdown", "draining background work…",
+                   icon=Icons.SYSTEM_SHUT, level="INFO")
         # Metacog teardown — stop the telemetry poller and detach the
         # replan bridge before everything else, so a late-firing
         # HostSignal can't be misinterpreted during the rest of
@@ -997,6 +999,23 @@ async def lifespan(app):
                     )
             except Exception as e:
                 logger.warning(f"Pending reflection drain error: {e}")
+
+        # Drain fire-and-forget background writes (e.g. the episodic-archive
+        # memory.add). These are short disk writes wrapped in to_thread, so
+        # we WAIT for them (not cancel) — a shutdown mid-write could leave a
+        # half-applied store entry — bounded so a stuck write can't pin
+        # shutdown indefinitely.
+        pending_bg = getattr(context, "_pending_background_tasks", None)
+        if pending_bg:
+            try:
+                _done, still_bg = await asyncio.wait(list(pending_bg), timeout=5.0)
+                if still_bg:
+                    logger.warning(
+                        "Background-task drain: %d task(s) unfinished after 5s; abandoning",
+                        len(still_bg),
+                    )
+            except Exception as e:
+                logger.warning(f"Background-task drain error: {e}")
         # Cancel any in-flight continuous self-play loop so the
         # process can exit cleanly. The loop is NOT persisted across
         # restarts by design — a fresh session starts with no loop.
@@ -1035,6 +1054,10 @@ async def lifespan(app):
             except Exception as e:
                 logger.warning(f"Sandbox shutdown error: {e}")
 
+        pretty_log("Shutdown Complete", "all subsystems stopped",
+                   icon=Icons.SYSTEM_SHUT, level="INFO")
+
+
 def main():
     args = parse_args()
     base_dir = Path(os.getenv("GHOST_HOME", Path.home() / "ghost_llamacpp"))
@@ -1052,6 +1075,14 @@ def main():
     memory_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"👻 Ghost Agent (Ollama Compatible) running on {args.host}:{args.port}")
+    # Security: warn loudly if the publicly-known default API key is in use
+    # on a non-loopback bind — that combination authenticates trivially.
+    if args.api_key == "ghost-secret-123" and args.host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            "⚠️  SECURITY WARNING: default API key ('ghost-secret-123') in use while "
+            f"binding to {args.host} (non-loopback). Set GHOST_API_KEY / --api-key to "
+            "a secret, or bind to 127.0.0.1."
+        )
     print(f"🔗 Connected to Upstream LLM at: {args.upstream_url}")
     print(f"📏 Max Context: {args.max_context} tokens")
 

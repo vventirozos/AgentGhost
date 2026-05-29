@@ -198,8 +198,12 @@ class TaskTree:
         ]
 
         if parent.dependency_type == DependencyType.ALL:
-            # All children must be DONE
-            if all(s == TaskStatus.DONE for s in child_statuses):
+            # All children must be DONE. `child_statuses` can be EMPTY
+            # even when parent.children is non-empty (child IDs dangling /
+            # not yet hydrated); guard that case so `all([])`'s vacuous
+            # True can't mark a parent DONE with zero real children
+            # completed (which then cascades up to the root).
+            if child_statuses and all(s == TaskStatus.DONE for s in child_statuses):
                 parent.status = TaskStatus.DONE
                 self._check_parent_completion(parent.parent_id, visited)
 
@@ -219,7 +223,7 @@ class TaskTree:
         elif parent.dependency_type == DependencyType.BEST:
             # All children must be terminal (DONE or FAILED), then pick best
             terminal = {TaskStatus.DONE, TaskStatus.FAILED}
-            if all(s in terminal for s in child_statuses):
+            if child_statuses and all(s in terminal for s in child_statuses):
                 done_children = [
                     self.nodes[cid] for cid in parent.children
                     if cid in self.nodes and self.nodes[cid].status == TaskStatus.DONE
@@ -269,8 +273,10 @@ class TaskTree:
                 self._check_parent_failure(parent.parent_id, visited)
 
         elif parent.dependency_type == DependencyType.ANY:
-            # Only block if ALL children have failed
-            if all(s in failed_statuses for s in child_statuses):
+            # Only block if ALL children have failed. Guard empty: all([])
+            # is vacuously True and would BLOCK a parent whose child IDs
+            # are all dangling.
+            if child_statuses and all(s in failed_statuses for s in child_statuses):
                 parent.status = TaskStatus.BLOCKED
                 parent.failure_reason = "All ANY-dependency children failed"
                 self._check_parent_failure(parent.parent_id, visited)
@@ -279,7 +285,7 @@ class TaskTree:
         elif parent.dependency_type == DependencyType.BEST:
             # Don't block until all children are terminal
             terminal = {TaskStatus.DONE, TaskStatus.FAILED}
-            if all(s in terminal for s in child_statuses):
+            if child_statuses and all(s in terminal for s in child_statuses):
                 # If all failed, parent fails
                 if all(s == TaskStatus.FAILED for s in child_statuses):
                     parent.status = TaskStatus.FAILED

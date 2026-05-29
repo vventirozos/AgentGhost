@@ -267,7 +267,7 @@ async def tool_generate_pdf(
     final_name = safe_name or f"report_{uuid.uuid4().hex[:8]}.pdf"
     out_path = sandbox_dir / final_name
 
-    pretty_log("PDF Report", f"Title: {title[:60]} | sections={len(secs)}", icon="📄")
+    pretty_log("PDF Report", f"Title: {title[:60]} | sections={len(secs)}", icon=Icons.REPORT_PDF)
 
     full_html = _build_html(title, subtitle, author, secs)
     try:

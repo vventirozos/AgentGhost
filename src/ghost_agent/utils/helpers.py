@@ -192,6 +192,14 @@ def parse_utc_timestamp(s: str) -> datetime.datetime:
 
 def recursive_split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 70) -> List[str]:
     if not text: return []
+    # The range() loops below step by `chunk_size - chunk_overlap`. When
+    # chunk_overlap >= chunk_size that step is <= 0, so range() yields
+    # NOTHING and the text is silently DROPPED (a 0 step raises
+    # ValueError). Clamp so the step is always >= 1. Reachable from
+    # semantic_split_text when a long header shrinks the effective
+    # chunk_size below the overlap.
+    chunk_size = max(1, int(chunk_size))
+    chunk_overlap = max(0, min(int(chunk_overlap), chunk_size - 1))
     if len(text) <= chunk_size: return [text]
 
     separators = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]

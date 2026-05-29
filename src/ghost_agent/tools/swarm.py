@@ -19,7 +19,7 @@ def _register_task(task_id: str, task: asyncio.Task):
 
     task.add_done_callback(_cleanup)
 
-async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_client, fallback_model_name: str, scratchpad, worker_persona: str = None, target_model: str = None):
+async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_client, fallback_model_name: str, scratchpad, worker_persona: str = None, target_model: str = None, preselected_node=None):
     """Background worker that executes on the fast edge node with retry logic."""
     MAX_RETRIES = 2
 
@@ -36,7 +36,16 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
 
     last_error = None
     for attempt in range(MAX_RETRIES + 1):
-        node = llm_client.get_swarm_node(target_model)
+        # On the first attempt reuse the node the dispatcher already
+        # resolved + validated for this task. Re-resolving here advanced
+        # the round-robin index a SECOND time per task — skewing node
+        # assignment and (for an unset target_model) sending the worker to
+        # a different node than the one validated. Retries DO re-resolve so
+        # a transient failure can route elsewhere.
+        if attempt == 0 and preselected_node is not None:
+            node = preselected_node
+        else:
+            node = llm_client.get_swarm_node(target_model)
         if not node:
             scratchpad.set(output_key, "SYSTEM ALERT: Swarm execution failed. No cluster nodes available.")
             return
@@ -159,7 +168,7 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
                 pass
             continue
 
-        task = asyncio.create_task(_swarm_worker(t_instruction, t_input_data, t_output_key, llm_client, model_name, scratchpad, worker_persona=t_worker_persona, target_model=t_target_model))
+        task = asyncio.create_task(_swarm_worker(t_instruction, t_input_data, t_output_key, llm_client, model_name, scratchpad, worker_persona=t_worker_persona, target_model=t_target_model, preselected_node=node))
         _swarm_tasks.add(task)
         task.add_done_callback(_swarm_tasks.discard)
 

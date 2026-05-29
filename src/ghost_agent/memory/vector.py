@@ -140,12 +140,29 @@ class VectorMemory:
             
         except Exception as e:
             if "already exists" in str(e) or "Embedding function conflict" in str(e):
+                # An embedding-provider mismatch on an existing collection is
+                # RECOVERABLE: drop + recreate it with the current embedding
+                # function. The previous `sys.exit(1)` here contradicted the
+                # "Resetting collection" log right above it and hard-killed the
+                # whole process on a fixable mismatch.
                 pretty_log("Memory Conflict", "Embedding provider mismatch. Resetting collection for new provider...", level="WARNING", icon="⚠️")
-                # Fallback: if 'v2' also conflicts (unlikely), we'd need to reset. 
-                # For now, renaming to v2 is the safest non-destructive path.
-                sys.exit(1)
-            logger.error(f"CRITICAL DB ERROR: {e}")
-            self.collection = None
+                try:
+                    collection_name = "agent_memory"
+                    try:
+                        self.client.delete_collection(name=collection_name)
+                    except Exception:
+                        pass
+                    self.collection = self.client.get_or_create_collection(
+                        name=collection_name,
+                        embedding_function=self.embedding_fn,
+                    )
+                    pretty_log("Memory System", f"Reset [{collection_name}] after provider mismatch", icon=Icons.MEM_INDEX)
+                except Exception as reset_exc:
+                    logger.error(f"Collection reset failed after provider mismatch: {reset_exc}")
+                    self.collection = None
+            else:
+                logger.error(f"CRITICAL DB ERROR: {e}")
+                self.collection = None
 
     def _get_lock(self):
         """Return the instance lock, lazily creating one if `__init__` was

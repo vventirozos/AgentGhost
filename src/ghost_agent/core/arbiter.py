@@ -119,7 +119,11 @@ class SemanticDivergence:
         """Return cosine similarity in [-1, 1] (typically [0, 1] for
         normalised embeddings). On failure, falls back to Jaccard.
         Empty input → similarity 0."""
-        if not a or not b:
+        # Strip first: a whitespace-only candidate is empty in substance,
+        # so it scores 0 (per the docstring) and must NOT slip through to
+        # _jaccard, where two blank outputs tokenise to empty sets and
+        # score 1.0 — a spurious "converged" the arbiter would act on.
+        if not (a or "").strip() or not (b or "").strip():
             return 0.0
         if self.embedder is None:
             return _jaccard(a, b)

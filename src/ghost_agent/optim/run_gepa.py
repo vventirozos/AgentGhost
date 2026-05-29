@@ -113,14 +113,25 @@ class _GhostLMAdapter:
     def __call__(self, prompt: str, **kwargs) -> List[str]:
         import asyncio
         try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Called from an async context — schedule and wait
-                return asyncio.get_event_loop().run_until_complete(
-                    self._acall(prompt, **kwargs)
-                )
+            asyncio.get_running_loop()
+            running = True
         except RuntimeError:
-            pass
+            running = False
+
+        if running:
+            # We're inside a running event loop (GEPA driven from the
+            # agent's async runtime). The old code tried run_until_complete
+            # (raises "loop already running") and then fell through to
+            # asyncio.run (raises "cannot be called from a running event
+            # loop") — uncaught, so GEPA died. We can't block the running
+            # loop from within it, so run the coroutine to completion on a
+            # SEPARATE thread with its own loop and block on the result.
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                fut = ex.submit(lambda: asyncio.run(self._acall(prompt, **kwargs)))
+                return fut.result()
+        # No running loop on this thread (e.g. driven via asyncio.to_thread)
+        # — safe to spin up one directly.
         return asyncio.run(self._acall(prompt, **kwargs))
 
 

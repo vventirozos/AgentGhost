@@ -11,6 +11,23 @@ from ..memory.scratchpad import Scratchpad
 logger = logging.getLogger("GhostAgent")
 
 
+def _is_within_root(path: Path, root: Path) -> bool:
+    """True iff `path` is inside `root`, compared path-component-wise.
+
+    NOT `str(path).startswith(str(root))`: that treats a *sibling*
+    directory whose name merely shares the prefix (e.g. ``/x/sandbox_evil``
+    vs root ``/x/sandbox``) as "inside", which let a resolved symlink
+    escape the sandbox-deletion guard.
+    """
+    if hasattr(path, "is_relative_to"):  # Python 3.9+
+        return path.is_relative_to(root)
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
 class _NullCM:
     """No-op context manager used as a fallback when a lock helper is
     missing (e.g. tests with a MagicMock memory_system). Lets shared
@@ -420,9 +437,17 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
             chosen: list[Path] = exact_hits or stem_hits or substr_hits
             for victim in chosen:
                 try:
+                    # Never delete THROUGH a symlink: victim.resolve()
+                    # follows it, so unlinking the resolved path would
+                    # remove the (possibly out-of-sandbox) target file.
+                    if victim.is_symlink():
+                        report.append(f"⚠️ Disk: Refused symlink '{victim}' (won't delete through links)")
+                        continue
                     resolved = victim.resolve()
-                    # Hard sandbox containment check before unlink.
-                    if not str(resolved).startswith(str(sandbox_root)):
+                    # Hard sandbox containment check before unlink —
+                    # path-component-wise, NOT str.startswith (which would
+                    # accept a sibling like '…/sandbox_evil').
+                    if not _is_within_root(resolved, sandbox_root):
                         report.append(f"⚠️ Disk: Refused unsafe path '{victim}' (outside sandbox)")
                         continue
                     if resolved.is_file():

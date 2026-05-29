@@ -726,17 +726,26 @@ async def tool_manage_projects(
                 return _err(f"unknown task: {target_id}")
 
             ids: List[str] = []
+            pairs: List[tuple] = []  # (task_id, description) for graph linking
             try:
                 if target_id:
                     ids = plan.decompose(target_id, subtasks)
+                    # decompose drops blank descriptions, so the non-blank
+                    # (stripped) subtasks align 1:1 with the returned ids.
+                    # zip-ing against the RAW subtasks shifted the pairing
+                    # whenever a blank was dropped → wrong graph descriptions.
+                    non_blank = [d.strip() for d in subtasks if d and d.strip()]
+                    pairs = list(zip(ids, non_blank))
                 else:
                     for desc in subtasks:
                         if not desc or not desc.strip():
                             continue
-                        ids.append(plan.add_task(desc.strip()))
+                        tid = plan.add_task(desc.strip())
+                        ids.append(tid)
+                        pairs.append((tid, desc.strip()))
             except ValueError as e:
                 return _err(str(e))
-            for tid, desc in zip(ids, subtasks):
+            for tid, desc in pairs:
                 _link_task_in_graph(context, project_id, tid, desc)
             return _ok({"created": ids,
                         "parent_id": target_id})
@@ -833,7 +842,10 @@ async def tool_manage_projects(
             _link_task_in_graph(context, pid, root, root_desc)
             if subtasks:
                 ids = plan.decompose(root, subtasks)
-                for tid, desc in zip(ids, subtasks):
+                # Pair against the non-blank (stripped) subtasks — decompose
+                # drops blanks, so zip-ing the raw list would misalign.
+                non_blank = [d.strip() for d in subtasks if d and d.strip()]
+                for tid, desc in zip(ids, non_blank):
                     _link_task_in_graph(context, pid, tid, desc)
             if context_summary:
                 store.log_event(pid, root, "context_snapshot",

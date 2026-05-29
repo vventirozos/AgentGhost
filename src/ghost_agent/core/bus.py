@@ -100,7 +100,10 @@ class MemoryBus:
     }
     _PROCEDURAL_KEYWORDS = {
         "how", "fix", "solve", "debug", "error", "mistake", "lesson",
-        "avoid", "pattern", "best practice", "should", "must", "never",
+        # "practice" (single token), NOT "best practice": intent is matched
+        # by token-set intersection below, where a two-word phrase can never
+        # appear as a single token — so "best practice" was dead.
+        "avoid", "pattern", "practice", "should", "must", "never",
         "always", "steps", "procedure", "workflow",
     }
 

@@ -39,14 +39,16 @@ class TestSearchSimilarWithVector:
             success=True,
         )
         mock_vector = MagicMock()
-        mock_vector.search_raw = MagicMock(return_value=[
-            {"metadata": {"episode_id": 1}, "distance": 0.3},
+        # search_advanced is the real raw-hits API (the old `search_raw`
+        # existed nowhere). Hits need type=="episode" + episode_id metadata.
+        mock_vector.search_advanced = MagicMock(return_value=[
+            {"metadata": {"type": "episode", "episode_id": 1}, "score": 0.3},
         ])
         results = ep_mem.search_similar(
             "styling issue with HTML page",
             vector_memory=mock_vector,
         )
-        mock_vector.search_raw.assert_called_once()
+        mock_vector.search_advanced.assert_called_once()
 
     def test_falls_back_when_vector_fails(self, ep_mem):
         ep_mem.record_episode(
@@ -55,7 +57,7 @@ class TestSearchSimilarWithVector:
             success=True,
         )
         mock_vector = MagicMock()
-        mock_vector.search_raw = MagicMock(side_effect=Exception("vector down"))
+        mock_vector.search_advanced = MagicMock(side_effect=Exception("vector down"))
         results = ep_mem.search_similar(
             "database timeout",
             vector_memory=mock_vector,
@@ -70,7 +72,7 @@ class TestSearchSimilarWithVector:
             success=True,
         )
         mock_vector = MagicMock()
-        mock_vector.search_raw = MagicMock(return_value=[])
+        mock_vector.search_advanced = MagicMock(return_value=[])
         results = ep_mem.search_similar(
             "memory leak",
             vector_memory=mock_vector,
@@ -131,15 +133,15 @@ class TestSearchRecoveries:
             lesson="Use exponential backoff for rate limits",
         )
         mock_vector = MagicMock()
-        mock_vector.search_raw = MagicMock(return_value=[
-            {"metadata": {"episode_id": 1}, "distance": 0.2},
+        mock_vector.search_advanced = MagicMock(return_value=[
+            {"metadata": {"type": "episode", "episode_id": 1}, "score": 0.2},
         ])
         recoveries = ep_mem.search_recoveries(
             "rate limiting error",
             vector_memory=mock_vector,
         )
         # Should have used vector search
-        mock_vector.search_raw.assert_called()
+        mock_vector.search_advanced.assert_called()
 
 
 class TestExistingFunctionality:

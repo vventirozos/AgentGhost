@@ -4,6 +4,14 @@ import io
 import ast
 from typing import Optional, Tuple, List
 
+# Upper bound on input size for the *looser* fence scans. The strict
+# primary pattern is newline-anchored and safe at any size; the tolerant
+# fallbacks are only needed for short, malformed model output, so on very
+# large inputs we skip them entirely (defense-in-depth against pathological
+# inputs in addition to the de-ambiguated regexes below).
+_MAX_FENCE_SCAN = 200_000
+
+
 def extract_code_from_markdown(text: str, filename: str = "") -> str:
     """
     Extracts code from markdown blocks if present.
@@ -40,11 +48,22 @@ def extract_code_from_markdown(text: str, filename: str = "") -> str:
     # trailing spaces, missing language tag, or content on the same line as
     # the opening fence). Combine candidates from both passes; the LONGEST
     # match wins, regardless of which pattern produced it.
+    #
+    # The opening-fence prefix is written as three DISJOINT runs —
+    # `[ \t]*` (spaces) / `[a-zA-Z0-9_.+-]*` (language tag) / `[ \t\n]?`
+    # (one optional separator) — rather than the old
+    # `[ \t]*(?:[ \t]*\n|[ \t]+)?` alternation. That alternation made the
+    # prefix ambiguous over a run of spaces and, when the input had NO
+    # closing fence, drove catastrophic backtracking: a ~3KB crafted block
+    # hung the worker for tens of seconds (a DoS reachable from any code
+    # the model was asked to write or execute). Disjoint runs cannot
+    # backtrack against each other, so matching is linear.
     secondary_pattern = re.compile(
-        r'```[ \t]*(?:[a-zA-Z]+)?(?:[ \t]*\n|[ \t]+)?(.*?)```',
+        r'```[ \t]*[a-zA-Z0-9_.+-]*[ \t\n]?(.*?)```',
         re.DOTALL | re.IGNORECASE,
     )
-    matches.extend(secondary_pattern.findall(text))
+    if len(text) <= _MAX_FENCE_SCAN:
+        matches.extend(secondary_pattern.findall(text))
 
     if matches:
         # Guard against mangling raw-code files that contain fenced
@@ -75,19 +94,26 @@ def extract_code_from_markdown(text: str, filename: str = "") -> str:
             except SyntaxError:
                 pass
         best = max(matches, key=len)
-        return best.strip().strip('`')
+        # NB: do NOT `.strip('`')` here. The regex already excludes the
+        # fence delimiters from the capture group, so any backtick in
+        # `best` is part of the payload (e.g. shell command substitution
+        # `echo \`date\``). Stripping them corrupted valid non-Python code.
+        return best.strip()
 
     # Truncated block with no closing ticks (model output got cut off
-    # mid-stream). Match the opening fence + the rest. We strip stray
-    # trailing backticks here — they're leftover fence characters from a
-    # malformed close (`...`` instead of ````), not legitimate code.
+    # mid-stream). Match the opening fence + the rest. We `.rstrip('`')`
+    # (TRAILING only) here — a malformed close (`...`` instead of ````)
+    # leaves dangling fence backticks at the end; leading backticks, by
+    # contrast, are legitimate payload (the opening fence was already
+    # consumed by the prefix). Same de-ambiguated prefix as above.
     truncated_pattern = re.compile(
-        r'```[ \t]*(?:[a-zA-Z]+)?(?:[ \t]*\n|[ \t]+)?(.*)',
+        r'```[ \t]*[a-zA-Z0-9_.+-]*[ \t\n]?(.*)',
         re.DOTALL | re.IGNORECASE,
     )
-    match = truncated_pattern.search(text)
-    if match:
-        return match.group(1).strip().strip('`')
+    if len(text) <= _MAX_FENCE_SCAN:
+        match = truncated_pattern.search(text)
+        if match:
+            return match.group(1).strip().rstrip('`')
 
     # No fence at all — return the whole input as-is (whitespace-stripped).
     # We deliberately do NOT `.strip('`')` here: an unfenced input may
@@ -319,9 +345,13 @@ def _strip_cdata_envelope(content: str) -> str:
         return content
     stripped = content.lstrip()
 
-    # Case 1 — fully wrapped.
+    # Case 1 — fully wrapped. A CDATA section ends at the FIRST `]]>`
+    # (XML semantics), so use `find`, not `rfind`. With `rfind`, a body
+    # that itself contains `]]>` would leak everything up to the LAST
+    # one — e.g. `<![CDATA[print('a')]]>\nprint('b')]]>` would let the
+    # stray `]]>` through into the written file.
     if stripped.startswith("<![CDATA[") and "]]>" in stripped:
-        end = stripped.rfind("]]>")
+        end = stripped.find("]]>")
         if end > len("<![CDATA["):
             return stripped[len("<![CDATA["):end]
 

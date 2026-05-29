@@ -169,12 +169,24 @@ class EpisodicMemory:
                        vector_memory) -> List[Dict]:
         """Semantic search using the vector memory's embedding model."""
         # Search for episode-type memories in the vector store
-        search_fn = getattr(vector_memory, "search_raw", None)
-        if not search_fn:
+        # Use search_advanced (the real raw-hits API). The previous
+        # `search_raw` attribute existed NOWHERE, so this path was always a
+        # no-op and recall silently fell back to substring matching. NOTE:
+        # activating true semantic recall also needs episodes ingested into
+        # the vector store with {"type":"episode","episode_id":...} metadata
+        # (a separate ingestion gap); until that's wired this still falls
+        # back — but it now calls a method that actually exists.
+        search_fn = getattr(vector_memory, "search_advanced", None)
+        if not callable(search_fn):
             return []
-        hits = search_fn(trigger, n_results=limit * 2, type_filter="episode")
+        try:
+            hits = search_fn(trigger, limit=limit * 2)
+        except Exception:
+            return []
         if not hits:
             return []
+        # search_advanced doesn't filter by type — keep episode hits only.
+        hits = [h for h in hits if (h.get("metadata") or {}).get("type") == "episode"]
         # Map vector hits back to episode records
         episode_ids = []
         for hit in hits:

@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import json
+import secrets
 import shutil
 import uuid
 import httpx
@@ -34,8 +35,16 @@ def get_agent(request: Request):
 
 async def verify_api_key(request: Request, api_key: str = Security(api_key_header)):
     agent = get_agent(request)
-    if agent.context.args.api_key and (not api_key or api_key != agent.context.args.api_key):
-        raise HTTPException(status_code=403, detail="Invalid API Key")
+    configured = agent.context.args.api_key
+    if configured:
+        # Constant-time comparison to avoid a timing side-channel that
+        # could let an attacker recover the key byte-by-byte.
+        if not api_key or not secrets.compare_digest(str(api_key), str(configured)):
+            # Surface auth failures on the monitored stream (brute-force /
+            # misconfigured client). Never log the key bytes.
+            pretty_log("Auth Rejected", f"path={request.url.path}",
+                       icon=Icons.SHIELD, level="WARNING")
+            raise HTTPException(status_code=403, detail="Invalid API Key")
     return api_key
 
 @router.get("/")
@@ -600,4 +609,6 @@ async def catch_all(request: Request, path: str):
             headers=response_headers,
         )
     except Exception as e:
+        pretty_log("Proxy Failed", f"{request.method} /{path}: {type(e).__name__}: {e}",
+                   icon=Icons.FAIL, level="ERROR")
         return JSONResponse({"error": f"Proxy Error: {e}"}, 502)

@@ -69,7 +69,11 @@ class TestHypothesisTesterContract:
             return "No such file or directory" if "foo" in action else "bar found"
 
         tested = await t.test_hypotheses_parallel([h1, h2], executor)
-        assert tested[0].consistent is False  # error → inconsistent
+        # An error RESULT is now ambiguous (None), deferred to evaluation —
+        # a test designed to surface an error ("missing file" → "No such
+        # file") may be the one that CONFIRMS its hypothesis, so it must not
+        # be auto-marked inconsistent and dropped.
+        assert tested[0].consistent is None  # error → ambiguous (deferred)
         assert tested[1].consistent is True
 
 

@@ -70,6 +70,8 @@ def no_external_network(extra_allow: Iterable[str] = ()):
     allow: Set[str] = set(_DEFAULT_ALLOW_HOSTS) | set(extra_allow)
     original_connect = socket.socket.connect
     original_connect_ex = socket.socket.connect_ex
+    original_sendto = socket.socket.sendto
+    original_sendmsg = socket.socket.sendmsg
 
     def guarded_connect(self, addr):
         host = _host_from_addr(addr)
@@ -89,10 +91,40 @@ def no_external_network(extra_allow: Iterable[str] = ()):
             )
         return original_connect_ex(self, addr)
 
+    def guarded_sendto(self, data, *args):
+        # sendto(data, address) or sendto(data, flags, address): the
+        # destination is always the LAST positional arg. Connectionless
+        # egress (UDP, DNS-tunnel, QUIC) never calls connect(), so without
+        # guarding sendto/sendmsg the "no bytes leave the machine"
+        # guarantee had a hole.
+        if args:
+            host = _host_from_addr(args[-1])
+            if not _is_loopback_host(host, allow):
+                raise NetworkEgressError(
+                    f"eval guard blocked outbound sendto to {args[-1]!r}; "
+                    "Ghost eval is strictly offline"
+                )
+        return original_sendto(self, data, *args)
+
+    def guarded_sendmsg(self, buffers, ancdata=(), flags=0, address=None):
+        if address is not None:
+            host = _host_from_addr(address)
+            if not _is_loopback_host(host, allow):
+                raise NetworkEgressError(
+                    f"eval guard blocked outbound sendmsg to {address!r}; "
+                    "Ghost eval is strictly offline"
+                )
+            return original_sendmsg(self, buffers, ancdata, flags, address)
+        return original_sendmsg(self, buffers, ancdata, flags)
+
     socket.socket.connect = guarded_connect         # type: ignore[assignment]
     socket.socket.connect_ex = guarded_connect_ex   # type: ignore[assignment]
+    socket.socket.sendto = guarded_sendto           # type: ignore[assignment]
+    socket.socket.sendmsg = guarded_sendmsg         # type: ignore[assignment]
     try:
         yield
     finally:
         socket.socket.connect = original_connect           # type: ignore[assignment]
         socket.socket.connect_ex = original_connect_ex     # type: ignore[assignment]
+        socket.socket.sendto = original_sendto             # type: ignore[assignment]
+        socket.socket.sendmsg = original_sendmsg           # type: ignore[assignment]

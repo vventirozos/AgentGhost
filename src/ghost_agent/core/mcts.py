@@ -371,11 +371,20 @@ class MCTSReasoner:
                         "stream": False,
                     })
 
-                text = (
-                    result.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                )
+                # route() returns the content STRING on success (see
+                # LLMClient.route) — only the chat_completion fallback
+                # above returns a dict. Without this guard, a worker-node
+                # result (a str) hit str.get(), raised AttributeError,
+                # got swallowed below, and collapsed EVERY candidate to
+                # the 0.3 neutral default — silently defeating ranking.
+                if isinstance(result, str):
+                    text = result
+                else:
+                    text = (
+                        result.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
                 data = self._parse_json(text)
                 progress = float(data.get("progress", 0.5))
                 cost = float(data.get("cost", 0.5))

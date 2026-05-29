@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from ..utils.logging import Icons, pretty_log
@@ -50,6 +51,13 @@ class DockerSandbox:
         self.tor_proxy = tor_proxy
         self.container = None
         self.image = "python:3.11-slim-bookworm"
+        # Serializes ensure_running across threads. execute() is run via
+        # asyncio.to_thread, so concurrent tool calls hit ensure_running
+        # on different threads; without this they race container
+        # creation/provisioning (409 name conflict, double apt/pip/
+        # playwright install, racing image commit). docker-py client
+        # models are not thread-safe either.
+        self._lock = threading.Lock()
 
         pretty_log("Sandbox Init", f"Mounting {self.host_workspace} -> {CONTAINER_WORKDIR}", icon=Icons.SANDBOX_BOX)
 
@@ -106,6 +114,14 @@ class DockerSandbox:
             return False
 
     def ensure_running(self):
+        # Hold the lock for the WHOLE check+provision. The actual command
+        # exec in execute() runs AFTER this returns (lock released), so
+        # commands still run in parallel — only the readiness/provision
+        # step is serialized, which is exactly what must not race.
+        with self._lock:
+            return self._ensure_running_impl()
+
+    def _ensure_running_impl(self):
         # Track whether this call did any actual work. Most invocations are
         # no-ops (the container is already up and provisioned) and must stay
         # silent — `execute()` calls `ensure_running` before every shell
@@ -119,7 +135,7 @@ class DockerSandbox:
 
         if not (self.container and self._is_container_ready()):
             did_work = True
-            pretty_log("Sandbox", "Initializing High-Performance Environment...", icon="⚙️")
+            pretty_log("Sandbox Provision", "Initializing high-performance environment…", icon=Icons.SANDBOX_BOX)
             try:
                 try:
                     old = self.client.containers.get(self.container_name)
@@ -171,7 +187,7 @@ class DockerSandbox:
                 try:
                     self.client.images.get(self.image)
                 except self.docker_lib.errors.ImageNotFound:
-                    pretty_log("Sandbox", f"Pulling required Docker image: {self.image}", icon="📥")
+                    pretty_log("Sandbox Image", f"Pulling required Docker image: {self.image}", icon=Icons.TOOL_DOWN)
                     try:
                         self.client.images.pull(self.image)
                     except Exception as pull_err:
@@ -197,14 +213,25 @@ class DockerSandbox:
                 run_kwargs["cpu_period"] = 100000
                 run_kwargs["cpu_quota"] = cpu_quota
 
-                self.container = self.client.containers.run(**run_kwargs)
+                try:
+                    self.container = self.client.containers.run(**run_kwargs)
+                except self.APIError as run_err:
+                    # Another process (sharing this docker daemon and the
+                    # workspace-derived container name) won the race
+                    # between our remove and run — a 409 "name already in
+                    # use". Adopt the existing container instead of dying.
+                    msg = str(run_err).lower()
+                    if getattr(run_err, "status_code", None) == 409 or "already in use" in msg:
+                        self.container = self.client.containers.get(self.container_name)
+                    else:
+                        raise
                 
                 for _ in range(10):
                     if self._is_container_ready(): break
                     time.sleep(1)
                 
             except Exception as e:
-                pretty_log("Sandbox Error", f"Failed to start: {e}", level="ERROR")
+                pretty_log("Sandbox Error", f"Failed to start: {e}", level="ERROR", icon=Icons.FAIL)
                 raise e
 
         env_vars = {}
@@ -239,12 +266,12 @@ class DockerSandbox:
                 # silent-failure mode v2 exists to catch. Flag loudly;
                 # the full install flow below will fix it.
                 pretty_log(
-                    "Sandbox",
-                    "Provision marker present but Chromium binary missing. Reinstalling...",
+                    "Sandbox Chromium",
+                    "Provision marker present but Chromium binary missing. Reinstalling…",
                     level="WARNING",
-                    icon="⚠️",
+                    icon=Icons.WARN,
                 )
-            pretty_log("Sandbox", "Installing Deep Learning Stack (Wait ~60s)...", icon="📦")
+            pretty_log("Sandbox Provision", "Installing deep-learning stack (~60s)…", icon=Icons.SANDBOX_BOX)
             
             apt_cmd = "sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3'"
             code, out = self.container.exec_run(apt_cmd, environment=env_vars)
@@ -290,7 +317,7 @@ class DockerSandbox:
             # If Chromium is somehow already present (e.g. the user
             # manually deleted the supercharged marker without wiping
             # the cache), `playwright install` short-circuits in ~1 s.
-            pretty_log("Sandbox", "Installing Headless Chromium (Wait ~2m)...", icon=Icons.TOOL_DOWN)
+            pretty_log("Sandbox Chromium", "Installing headless Chromium (~2m)…", icon=Icons.TOOL_DOWN)
             pw_code, pw_out = self.container.exec_run(
                 "python3 -m playwright install chromium --with-deps",
                 environment=env_vars,
@@ -326,7 +353,7 @@ class DockerSandbox:
             # Cache the fully installed environment for instant future startups
             if self.image != "ghost-agent-base:latest":
                 try:
-                    pretty_log("Sandbox", "Committing fast-boot image cache...", icon=Icons.MEM_SAVE)
+                    pretty_log("Sandbox Cache", "Committing fast-boot image cache…", icon=Icons.SANDBOX_BOX)
                     self.container.commit(repository="ghost-agent-base", tag="latest")
                 except Exception as e:
                     logger.warning(f"Failed to commit sandbox image cache: {e}")
@@ -336,7 +363,7 @@ class DockerSandbox:
             exit_code, _ = self.container.exec_run("test -f /usr/bin/tor")
             if exit_code != 0:
                 did_work = True
-                pretty_log("Sandbox", "Installing isolated Tor daemon...", icon=Icons.TOOL_DOWN)
+                pretty_log("Sandbox Tor", "Installing isolated Tor daemon…", icon=Icons.TOOL_DOWN)
                 self.container.exec_run("sh -c 'apt-get update && apt-get install -y tor'", user="root")
 
             code, _ = self.container.exec_run("pgrep -x tor")
@@ -347,7 +374,7 @@ class DockerSandbox:
         # Only announce readiness when this call actually had to bring the
         # environment up. Silent on the steady-state common path.
         if did_work:
-            pretty_log("Sandbox", "Environment Ready.", icon="✅")
+            pretty_log("Sandbox Ready", "Environment Ready.", icon=Icons.OK)
 
     def _chromium_binary_present(self) -> bool:
         """Check that Playwright's Chromium `headless_shell` is actually
@@ -386,6 +413,8 @@ class DockerSandbox:
         try:
             self.ensure_running()
             if not self._is_container_ready():
+                pretty_log("Sandbox Not Ready", "container refused to start",
+                           icon=Icons.STOP, level="ERROR")
                 return "Error: Container refused to start.", 1
  
  
@@ -445,6 +474,8 @@ class DockerSandbox:
             return output, exit_code
 
         except Exception as e:
+            pretty_log("Sandbox Exec Failed", f"{type(e).__name__}: {e}",
+                       icon=Icons.FAIL, level="ERROR")
             return f"Container Execution Error: {str(e)}", 1
 
     def close(self, remove: bool = False):

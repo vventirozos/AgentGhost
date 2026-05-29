@@ -25,6 +25,7 @@ verify both paths.
 
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -33,6 +34,28 @@ logger = logging.getLogger("GhostAgent")
 
 
 DEFAULT_STEPS_CAP = 50
+
+
+# Per-project lock serializing the leaf-claim step of advance_once.
+# advance_once is reachable concurrently from the autoadvance tool, the
+# HTTP /advance route, and the scheduler; without serializing the
+# read-leaf → mark-IN_PROGRESS step, two ticks would claim the SAME leaf
+# and then double-run its tool, double-write artifacts, and double-charge
+# budget. A threading.Lock (not asyncio) so it is correct whether ticks
+# share one event loop or run on different threads; the claim span is
+# fully synchronous (no await), so the lock is never held across a
+# suspension point.
+_project_locks: Dict[str, "threading.Lock"] = {}
+_project_locks_guard = threading.Lock()
+
+
+def _get_project_lock(project_id: str) -> "threading.Lock":
+    with _project_locks_guard:
+        lk = _project_locks.get(project_id)
+        if lk is None:
+            lk = threading.Lock()
+            _project_locks[project_id] = lk
+        return lk
 
 
 # Keyword buckets used by the lightweight classifier. The lists are
@@ -175,10 +198,20 @@ async def advance_once(
     # graph into every scheduler tick which is wasteful.
     from .planning import ProjectPlan, TaskStatus
 
-    plan = ProjectPlan(store, project_id)
-    nxt = plan.next_ready_leaf()
-    if not nxt:
-        return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
+    # Atomically claim the next leaf. The original code marked IN_PROGRESS
+    # only AFTER `await llm_classifier(...)`, so on a single event loop
+    # that await was a preemption point where a concurrent tick grabbed
+    # the SAME leaf (and across threads it raced outright). Claim the leaf
+    # — read it and mark IN_PROGRESS — while holding the per-project lock
+    # and BEFORE any await, so the claim is atomic. Classification and the
+    # tool run then happen OUTSIDE the lock, so different leaves still
+    # advance in parallel.
+    with _get_project_lock(project_id):
+        plan = ProjectPlan(store, project_id)
+        nxt = plan.next_ready_leaf()
+        if not nxt:
+            return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
+        plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
 
     if llm_classifier is None:
         classification = classify_task(nxt.description)
@@ -188,9 +221,6 @@ async def advance_once(
         except Exception:
             classification = classify_task(nxt.description)
     classification = (classification or "research").lower()
-
-    # Mark IN_PROGRESS up front so concurrent ticks don't pick the same leaf.
-    plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
 
     if classification == "needs_user":
         plan.update_status(nxt.id, TaskStatus.NEEDS_USER,

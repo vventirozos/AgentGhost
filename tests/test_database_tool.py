@@ -133,3 +133,123 @@ async def test_postgres_admin_schema_no_table_name():
             mock_cursor.execute.assert_called_with(
                 "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'"
             )
+
+
+# -----------------------------------------------------------------
+# timeout_ms: int-coercion / clamping / parameterization
+# (regression: timeout_ms was f-string-interpolated raw into a SET
+#  statement → crash on non-int + SQL-injection sink on autocommit)
+# -----------------------------------------------------------------
+
+def _find_set_timeout_call(mock_cursor):
+    """Return the (args, params) of the SET statement_timeout execute call."""
+    for call in mock_cursor.execute.call_args_list:
+        if call.args and isinstance(call.args[0], str) and "statement_timeout" in call.args[0]:
+            return call.args
+    return None
+
+
+async def _run_query_with_timeout(timeout_ms):
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.__enter__.return_value = mock_conn
+    mock_conn.cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.description = True
+    mock_cursor.fetchmany.return_value = [{"x": 1}]
+    with patch("psycopg2.connect", return_value=mock_conn):
+        with patch("tabulate.tabulate", return_value="| x |"):
+            result = await tool_postgres_admin(
+                "query", "postgres://uri-timeout", "SELECT 1", timeout_ms=timeout_ms
+            )
+    return result, mock_cursor
+
+
+@pytest.mark.asyncio
+async def test_timeout_ms_string_does_not_crash_and_defaults():
+    """A non-numeric timeout_ms (LLM often passes strings) must not crash;
+    it falls back to the 15000ms default."""
+    result, cur = await _run_query_with_timeout("not-a-number")
+    assert not result.startswith("Error:")
+    set_call = _find_set_timeout_call(cur)
+    assert set_call == ("SET statement_timeout = %s", (15000,))
+
+
+@pytest.mark.asyncio
+async def test_timeout_ms_injection_payload_neutralized():
+    """An injection payload in timeout_ms can never reach the SQL text."""
+    result, cur = await _run_query_with_timeout("0; DROP TABLE users--")
+    # int() fails → default; parameterized → payload is gone entirely.
+    set_call = _find_set_timeout_call(cur)
+    assert set_call == ("SET statement_timeout = %s", (15000,))
+    # No execute call's SQL string contains the injection.
+    for call in cur.execute.call_args_list:
+        if call.args and isinstance(call.args[0], str):
+            assert "DROP TABLE" not in call.args[0]
+
+
+@pytest.mark.asyncio
+async def test_timeout_ms_parameterized_and_clamped():
+    """Valid ints are used; out-of-band values are clamped to [100, 600000]."""
+    _, cur = await _run_query_with_timeout(5000)
+    assert _find_set_timeout_call(cur) == ("SET statement_timeout = %s", (5000,))
+
+    _, cur = await _run_query_with_timeout(99999999)
+    assert _find_set_timeout_call(cur) == ("SET statement_timeout = %s", (600000,))
+
+    _, cur = await _run_query_with_timeout(1)
+    assert _find_set_timeout_call(cur) == ("SET statement_timeout = %s", (100,))
+
+
+# -----------------------------------------------------------------
+# per-URI connection lock + stale-connection retry
+# -----------------------------------------------------------------
+
+def test_uri_lock_is_per_uri_and_reused():
+    import threading
+    from ghost_agent.tools.database import _get_uri_lock
+    a1 = _get_uri_lock("postgres://A")
+    a2 = _get_uri_lock("postgres://A")
+    b = _get_uri_lock("postgres://B")
+    assert a1 is a2          # same URI → same lock (serializes that connection)
+    assert a1 is not b       # different URI → different lock
+    assert isinstance(a1, type(threading.Lock()))
+
+
+@pytest.mark.asyncio
+async def test_connection_retry_on_operational_error(monkeypatch):
+    """A connection-level error (server dropped an idle conn) is retried
+    once with a fresh connection instead of surfacing an error."""
+    import ghost_agent.tools.database as db
+
+    class _OpErr(Exception):
+        pass
+
+    class _IfErr(Exception):
+        pass
+
+    fake = MagicMock()
+    fake.OperationalError = _OpErr
+    fake.InterfaceError = _IfErr
+    fake.extras = MagicMock()
+    monkeypatch.setitem(sys.modules, "psycopg2", fake)
+    monkeypatch.setitem(sys.modules, "psycopg2.extras", fake.extras)
+
+    # Ensure a clean pool for this URI.
+    uri = "postgres://retry-uri"
+    db._evict_connection(uri)
+
+    # First connection's cursor context raises OperationalError; second works.
+    conn_bad = MagicMock()
+    conn_bad.cursor.return_value.__enter__.side_effect = _OpErr("server closed the connection")
+    conn_good = MagicMock()
+    good_cursor = MagicMock()
+    conn_good.cursor.return_value.__enter__.return_value = good_cursor
+    good_cursor.fetchall.return_value = [{"table_name": "users"}]
+    fake.connect.side_effect = [conn_bad, conn_good]
+
+    with patch("tabulate.tabulate", return_value="| ok |"):
+        result = await tool_postgres_admin("schema", uri)
+
+    assert "POSTGRES RESULT" in result          # retry succeeded
+    assert fake.connect.call_count == 2          # reconnected after eviction
+    db._evict_connection(uri)

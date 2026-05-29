@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -309,15 +310,22 @@ def _load_post_learning_tasks() -> List[CuratedRequestTask]:
     between a pre-learning baseline and a post-learning run.
     """
     DISCOVER_KEYWORDS = [
-        "list", "listing", "ls ", "ls$", "find ", "search",
+        "list", "listing", "ls", "find", "search",
         "locate", "directory", "workspace", "verify", "check",
         "first step",
     ]
+    # Word-boundary match, NOT bare substring. The old `"ls" in low` test
+    # fired inside "ca`ls`", "fa`ls`e", "too`ls`", "a`ls`o" — so responses
+    # that ignored the discover-first lesson scored as if they'd applied
+    # it, corrupting the exact pre/post-learning delta this suite measures.
+    # (`"ls$"` was also dead: a literal `$` never appears in plain text.)
+    _discover_re = re.compile(
+        r"\b(?:" + "|".join(re.escape(k) for k in DISCOVER_KEYWORDS) + r")\b",
+        re.IGNORECASE,
+    )
 
     def _discover_first(out: str, _ctx) -> Tuple[bool, str]:
-        low = (out or "").lower()
-        hits = [kw for kw in DISCOVER_KEYWORDS if kw.strip() in low]
-        if hits:
+        if _discover_re.search(out or ""):
             return True, ""
         # Also catch the failure mode: model fabricates contents without
         # any discovery step. An explicit fabrication signal (model

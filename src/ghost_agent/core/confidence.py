@@ -81,12 +81,15 @@ class CompositeConfidence:
         """
         e = _clamp_unit(normalised_entropy)
         p = _clamp_unit(competence_p_success)
-        if n_observations < 5:
-            # Shrinkage toward the neutral prior; coefficient is
-            # n/(n+5) so 0 obs → fully neutral, 5 obs → halfway.
-            n = max(0, int(n_observations))
-            shrink = n / (n + 5.0) if (n + 5.0) > 0 else 0.0
-            p = shrink * p + (1.0 - shrink) * 0.5
+        # Shrink the competence component toward the neutral prior (0.5)
+        # so it can't dominate before the prior has earned its weight.
+        # Coefficient is n/(n+5): 0 obs → fully neutral, 5 obs → halfway,
+        # → 1.0 as n grows. Applied for ALL n (no `< 5` cutoff): that cutoff
+        # made the coefficient jump discontinuously from 4/9≈0.44 at n=4 to
+        # 1.0 at n=5 — right at the calibration threshold the design cares about.
+        n = max(0, int(n_observations))
+        shrink = n / (n + 5.0)
+        p = shrink * p + (1.0 - shrink) * 0.5
         entropy_component = 1.0 - e
         composite = self.w_entropy * entropy_component + self.w_competence * p
         composite = _clamp_unit(composite)

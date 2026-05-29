@@ -7,6 +7,21 @@ from typing import List, Dict, Any, Callable, Optional
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import helper_fetch_url_content
 
+# Low-value / bot-walled domains filtered out of search results. Module-level
+# (NOT function-local) so web_search's query-reformulation fallback can
+# reference it even when the primary attempt raised before any local
+# assignment — previously a function-local `junk` left that fallback raising
+# UnboundLocalError on exactly the failure (Tor/DDGS down) it exists to handle.
+_JUNK_DOMAINS = [
+    "duckduckgo.com", "whatsapp.com", "twitter.com", "facebook.com",
+    "tiktok.com", "instagram.com", "zhihu.com", "baike.baidu.com",
+    "dict.cn", "pinterest.com", "aliexpress.com", "zhidao.baidu.com",
+    "yahoo.com", "forbes.com", "bloomberg.com", "scmp.com", "quora.com",
+    "medium.com", "msn.com", "cnn.com", "foxnews.com", "wsj.com",
+    "csdn.net", "sohu.com", "sina.com", "forums.att.com",
+]
+
+
 def truncate_query(query: str, limit: int = 35) -> str:
     return (query[:limit] + "..") if len(query) > limit else query  # type: ignore
 
@@ -105,11 +120,10 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
                 return []
             raw_results = await asyncio.to_thread(run)
 
-            junk = ["duckduckgo.com", "whatsapp.com", "twitter.com", "facebook.com", "tiktok.com", "instagram.com", "zhihu.com", "baike.baidu.com", "dict.cn", "pinterest.com", "aliexpress.com", "zhidao.baidu.com", "yahoo.com", "forbes.com", "bloomberg.com", "scmp.com", "quora.com", "medium.com", "msn.com", "cnn.com", "foxnews.com", "wsj.com", "csdn.net", "sohu.com", "sina.com"]
             valid_results = []
             for r in raw_results:
                 url = r.get('href', r.get('url', '')).lower()
-                if not url or url.startswith("/") or any(j in url for j in junk):
+                if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
                     continue
                 valid_results.append(r)
 
@@ -147,7 +161,7 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
             valid_results = []
             for r in raw_results:
                 url = r.get('href', r.get('url', '')).lower()
-                if not url or url.startswith("/") or any(j in url for j in junk):
+                if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
                     continue
                 valid_results.append(r)
             if valid_results:
@@ -195,13 +209,11 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
             results = await asyncio.to_thread(run)
             if not results:
                 raise ValueError("DuckDuckGo returned empty list (Likely Tor Block). Force IP cycling.")
-            
-            junk = ["forums.att.com", "quora.com", "facebook.com", "twitter.com", "whatsapp.com", "duckduckgo.com", "zhihu.com", "scmp.com", "pinterest.com", "tiktok.com", "instagram.com", "yahoo.com", "msn.com", "forbes.com", "bloomberg.com", "csdn.net", "sohu.com", "sina.com", "baike.baidu.com", "dict.cn", "aliexpress.com", "zhidao.baidu.com", "medium.com", "cnn.com", "foxnews.com", "wsj.com"]
-            
+
             valid_urls = []
             for r in results:
                 url = r.get('href', r.get('url', '')).lower()
-                if not url or url.startswith("/") or any(j in url for j in junk):
+                if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
                     continue
                 valid_urls.append(r.get('href', r.get('url', '')))
             if not valid_urls:
@@ -290,7 +302,7 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
 async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] = None, llm_client=None, tool_definitions=None, deep_research_callable: Optional[Callable] = None, model_name: str = "qwen-3.6-35b-a3", max_context: int = 8192, **kwargs: Any):
     query_text = query or statement or kwargs.get("query") or kwargs.get("statement", "")
     from ..core.agent import extract_json_from_text
-    pretty_log("Fact Check", query_text[:50] + "..", icon=Icons.STOP)  # type: ignore
+    pretty_log("Fact Check", query_text[:50] + "..", icon=Icons.TOOL_DEEP)  # type: ignore
     
     allowed_names = ["deep_research"]
     restricted_tools = [t for t in tool_definitions if t["function"]["name"] in allowed_names]

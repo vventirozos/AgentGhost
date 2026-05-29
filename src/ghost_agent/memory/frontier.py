@@ -151,8 +151,30 @@ class FrontierTracker:
     def _load(self) -> dict:
         try:
             return json.loads(self.file_path.read_text())
-        except Exception:
+        except FileNotFoundError:
             return {"runs": [], "clusters": {}}
+        except json.JSONDecodeError as e:
+            # Corrupt JSON (partial write from a crash, manual edit). Do
+            # NOT silently return empty — the next _save would overwrite
+            # the file and WIPE all accumulated cluster mastery / tier /
+            # outcome history. Preserve the bad file as a timestamped
+            # sidecar (mirrors SkillMemory._load_playbook) so the loss is
+            # recoverable and auditable, then start fresh.
+            try:
+                import time as _time
+                sidecar = self.file_path.with_suffix(f".corrupt-{int(_time.time())}.json")
+                os.replace(self.file_path, sidecar)
+                logger.warning(
+                    "frontier state corrupt (%s); preserved as %s, starting fresh",
+                    e, sidecar.name,
+                )
+            except Exception as _mvexc:
+                logger.warning("frontier corrupt-file preserve failed: %s", _mvexc)
+            return {"runs": [], "clusters": {}}
+        # NOTE: OSError (unreadable-but-present file, e.g. a transient
+        # permission/IO error) is deliberately NOT caught here — it
+        # propagates rather than masquerading as an empty state that the
+        # next _save would commit over real history.
 
     def _save(self, state: dict):
         tmp = self.file_path.with_suffix(".tmp")

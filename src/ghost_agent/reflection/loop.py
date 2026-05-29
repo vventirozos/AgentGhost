@@ -153,9 +153,14 @@ class Reflector:
                 break
 
         for traj in candidates:
+            # Mark BEFORE awaiting (mirrors reflect_one at line ~204).
+            # During this await window a concurrent reflect_one(traj) —
+            # e.g. a user-correction scheduled via create_task — must see
+            # the id already claimed, or the same trajectory gets
+            # reflected twice (duplicate/contradictory SFT data).
+            reflected_set.add(traj.id)
             outcome = await self._reflect_one(traj)
             report.outcomes.append(outcome)
-            reflected_set.add(traj.id)
             if outcome.ok:
                 report.reflected_ok += 1
                 if sink is not None and outcome.reflected_trajectory is not None:

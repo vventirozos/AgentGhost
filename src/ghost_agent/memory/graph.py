@@ -155,7 +155,7 @@ class GraphMemory:
                             '''INSERT INTO triplets (subject, predicate, object, weight, timestamp, valid_from)
                                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP, ?)
                                ON CONFLICT(subject, predicate, object)
-                               DO UPDATE SET weight = weight + 1, timestamp = CURRENT_TIMESTAMP''',
+                               DO UPDATE SET weight = weight + 1, timestamp = CURRENT_TIMESTAMP, valid_until = NULL''',
                             (sn, pn, on, now)
                         )
                         if cursor.rowcount > 0:

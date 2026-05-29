@@ -420,7 +420,7 @@ class LLMClient:
 
         for attempt in range(3):
             try:
-                pretty_log("Image Compute", f"Routing to Image Node ({node['model']})", level="INFO", icon="🎨")
+                pretty_log("Image Compute", f"Routing to Image Node ({node['model']})", level="INFO", icon=Icons.IMAGE_GEN)
                 resp = await node["client"].post("/v1/images/generations", json=payload)
                 resp.raise_for_status()
                 return resp.json()
@@ -492,12 +492,12 @@ class LLMClient:
                             return resp.json()
                         except Exception as e:
                             self.circuit_breaker.record_failure(node["url"])
-                            pretty_log(f"Vision node ({node['model']}) failed: {type(e).__name__}, trying next...", level="WARNING", icon=Icons.WARN)
+                            pretty_log("Vision Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                             target_model = None
                             node = self.get_vision_node(target_model)
                             continue
 
-                pretty_log("Vision Compute Failed", "All vision nodes failed.", level="ERROR", icon=Icons.WARN)
+                pretty_log("Vision Compute Failed", "All vision nodes failed.", level="ERROR", icon=Icons.FAIL)
 
             raise Exception("Vision analysis failed: The dedicated vision node is offline or returned an error, and the main upstream model does not support image inputs.")
 
@@ -523,7 +523,7 @@ class LLMClient:
 
                     tried_nodes.append(node)
 
-                    pretty_log("Worker Compute", f"Routing background task to Worker Node ({node['model']})", level="INFO", icon="⚙️")
+                    pretty_log("Worker Compute", f"Routing background task to Worker Node ({node['model']})", level="INFO", icon=Icons.NODE_WORKER)
                     try:
                         node_payload = payload.copy()
                         node_payload["model"] = node["model"]
@@ -541,7 +541,7 @@ class LLMClient:
                         return resp.json()
                     except Exception as e:
                         self.circuit_breaker.record_failure(node["url"])
-                        pretty_log(f"Worker node ({node['model']}) failed: {type(e).__name__}, trying next...", level="WARNING", icon=Icons.WARN)
+                        pretty_log("Worker Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_worker_node(target_model)
                         continue
@@ -590,7 +590,7 @@ class LLMClient:
                         return resp.json()
                     except Exception as e:
                         self.circuit_breaker.record_failure(node["url"])
-                        pretty_log(f"Coding node ({node['model']}) failed: {type(e).__name__}, trying next...", level="WARNING", icon=Icons.WARN)
+                        pretty_log("Coding Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_coding_node(target_model)
                         continue
@@ -619,7 +619,7 @@ class LLMClient:
 
                     tried_nodes.append(node)
 
-                    pretty_log("Edge Compute", f"Routing request to Swarm Node ({node['model']})", level="INFO", icon="⚡")
+                    pretty_log("Edge Compute", f"Routing request to Swarm Node ({node['model']})", level="INFO", icon=Icons.NODE_EDGE)
                     try:
                         import copy as _copy, json
                         node_payload = _copy.deepcopy(payload)
@@ -636,7 +636,7 @@ class LLMClient:
                         return resp.json()
                     except Exception as e:
                         self.circuit_breaker.record_failure(node["url"])
-                        pretty_log(f"Swarm node ({node['model']}) failed: {type(e).__name__}, trying next...", level="WARNING", icon=Icons.WARN)
+                        pretty_log("Swarm Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_swarm_node(target_model)
                         continue

@@ -78,7 +78,11 @@ class TestCompositeConfidence:
                      n_observations=100)
         assert 0.0 <= r.composite <= 1.0
         assert r.entropy_component == pytest.approx(1.0)  # 1 - 0
-        assert r.competence_component == pytest.approx(1.0)  # 1 capped
+        # competence 5.0 is clamped to 1.0, then shrunk by the n/(n+5)
+        # prior coefficient (now applied for all n, no <5 cutoff):
+        # 100/105 → ~0.976. Still clamped within [0, 1].
+        assert 0.95 <= r.competence_component <= 1.0
+        assert r.competence_component == pytest.approx(0.976, abs=0.01)
 
     def test_threshold_clamped(self):
         cc = CompositeConfidence(threshold=-99.0)

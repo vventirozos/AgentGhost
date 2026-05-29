@@ -227,7 +227,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     # 0. VALIDATION: Ensure we are only executing scripts
     ext = str(filename).split('.')[-1].lower()
     if ext not in ["py", "sh", "js"]:
-        pretty_log("Execution Blocked", f"Invalid extension: .{ext}", level="WARNING", icon=Icons.STOP)
+        pretty_log("Execution Blocked", f"Invalid extension: .{ext}", level="WARNING", icon=Icons.SHIELD)
         tip = "To save data files or web pages (HTML/CSS/JS), use 'file_system(operation=\"write\", ...)' instead."
         return _format_error(f"SYSTEM ERROR: The 'execute' tool is ONLY for running scripts (.py, .sh, .js).\nSYSTEM TIP: {tip}")
 
