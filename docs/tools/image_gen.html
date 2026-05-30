@@ -29,7 +29,8 @@
     <li>Clamps <code>steps</code> to <code>[4, 8]</code> (Lightning models hate longer schedules).</li>
     <li>Calls <code>llm_client.generate_image({"prompt", "steps"})</code>.</li>
     <li>Decodes base64 PNG, writes to sandbox as <code>gen_UUID.png</code>.</li>
-    <li>Returns markdown embed: <code>![prompt](/api/download/gen_UUID.png)</code></li>
+    <li>Returns a markdown embed with a <strong>short</strong> alt text (<code>![generated image](/api/download/gen_UUID.png)</code>) — the giant raw prompt is deliberately kept out of the alt text.</li>
+    <li>Instructs the model to follow the embed with one or two short sentences describing what it generated, in its own words, so the user always gets a human-readable caption instead of a bare link.</li>
   </ul>
 
   <p>Backend topology and SDXL model config: <a href="../interfaces/image_gen_server.html">image-gen server</a>.</p>

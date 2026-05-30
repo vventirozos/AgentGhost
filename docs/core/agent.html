@@ -76,8 +76,13 @@
     <dt>MAX_THINKING_CHARS</dt><dd>32 000 (line 242)</dd>
     <dt>MAX_THINKING_CHARS_EXTENDED</dt><dd>64 000 (line 243)</dd>
     <dt>DEFAULT_TOOL_TURN_MAX_TOKENS</dt><dd>16 384 (line 262)</dd>
+    <dt>MAX_TRUNCATION_CONTINUATIONS</dt><dd>3 — max auto-continuation round-trips for a length-truncated text answer.</dd>
     <dt>_BOOKKEEPING_TOOL_NAMES</dt><dd><code>{"manage_projects","scratchpad",…}</code> excluded from the verifier evidence search.</dd>
   </div>
+
+  <h2 id="truncated-answer-continuation">Truncated-answer auto-continuation</h2>
+  <p>The streaming consume loop records the last non-null <code>finish_reason</code> seen on the upstream stream. When a <em>text</em> turn (no <code>&lt;tool_call&gt;</code> / <code>&lt;function&gt;</code> in flight) ends with <code>finish_reason == "length"</code>, the answer was cut off at the model's token cap — shipping it would hand the user a mid-sentence reply, which the <a href="verifier.html">Verifier</a> correctly REFUTES (truncated output, and any explicit question left unanswered).</p>
+  <p>Instead of surfacing the fragment, <code>handle_chat</code> transparently continues the generation: it replays the request with the partial answer as a prior <code>assistant</code> turn plus a "your reply was cut off — continue from exactly where it stopped, don't repeat anything" instruction, and appends the result to <code>full_content</code>. This repeats until the upstream returns a non-<code>length</code> finish or <code>MAX_TRUNCATION_CONTINUATIONS</code> (3) round-trips are spent — the bound prevents a model that mis-reports <code>length</code> on every reply from looping forever. The continuation payload drops <code>tools</code>/<code>tool_choice</code> so it can only produce prose, and strips any <code>&lt;think&gt;</code> prelude the continuation emits before appending. Turns that produced a tool call are unaffected — those go through the parse/retry path, not this user-facing-prose path.</p>
 
   <h2>Turn flow</h2>
   <div class="diagram">

@@ -326,6 +326,16 @@ MAX_THINKING_CHARS_EXTENDED = 64000 # extended cap when model is making progress
 # reached by healthy verbose generations.
 DEFAULT_TOOL_TURN_MAX_TOKENS = 16384
 
+# When the upstream stops a *text* answer at its token cap
+# (`finish_reason == "length"`), the partial reply is shipped mid-sentence
+# and the verifier correctly REFUTES it (truncated output / explicit
+# question left unanswered). Rather than surface a cut-off final answer, we
+# transparently continue the generation from where it stopped, up to this
+# many times, then accept whatever we have. Bounded so a model that emits
+# "length" on every continuation (mis-reported finish_reason, runaway) can't
+# loop forever — each continuation is a full upstream round-trip.
+MAX_TRUNCATION_CONTINUATIONS = 3
+
 
 def _distill_terminal_tool_summary(tool_name: str, raw: str) -> str:
     """Turn a terminal tool's return string into a short user-facing
@@ -3878,6 +3888,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         payload["stream"] = True
                         full_content = ""
                         reasoning_content = ""
+                        # Last non-null `finish_reason` seen on the stream.
+                        # "length" means the upstream hit its token cap and
+                        # the answer is truncated — handled after the loop.
+                        stream_finish_reason = None
 
                         # Thinking metrics: surfaced as a single summary line
                         # after the stream completes. We no longer print empty
@@ -3961,6 +3975,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     chunk_data = json.loads(chunk_str[6:])
                                     if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
                                         delta = chunk_data["choices"][0].get("delta", {})
+                                        _fr = chunk_data["choices"][0].get("finish_reason")
+                                        if _fr:
+                                            stream_finish_reason = _fr
 
                                         if "reasoning_content" in delta and delta["reasoning_content"] is not None:
                                             r_token = delta["reasoning_content"]
@@ -4094,6 +4111,82 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 f"| {thinking_duration:.1f}s",
                                 icon=Icons.BRAIN_SUM,
                             )
+
+                        # --- TRUNCATED-ANSWER AUTO-CONTINUATION ---
+                        # If the upstream stopped a *text* answer at its
+                        # token cap (`finish_reason == "length"`), the partial
+                        # reply would be shipped mid-sentence and the verifier
+                        # correctly REFUTES it. Continue the generation from
+                        # where it stopped — bounded by
+                        # MAX_TRUNCATION_CONTINUATIONS — so the model can
+                        # finish the thought and answer any explicit question.
+                        # Skip when a tool call is in flight (those turns are
+                        # handled by the parse/retry path, not user-facing
+                        # prose) or when the model emitted no visible content.
+                        _truncated_text_turn = (
+                            stream_finish_reason == "length"
+                            and bool(full_content.strip())
+                            and not msg.get("tool_calls")
+                            and "<tool_call" not in full_content.lower()
+                            and "<function" not in full_content.lower()
+                        )
+                        _continue_tries = 0
+                        while (
+                            _truncated_text_turn
+                            and _continue_tries < MAX_TRUNCATION_CONTINUATIONS
+                        ):
+                            _continue_tries += 1
+                            pretty_log(
+                                "Truncated Output",
+                                "Upstream stopped at token cap mid-answer; "
+                                f"continuing ({_continue_tries}/{MAX_TRUNCATION_CONTINUATIONS}).",
+                                level="WARNING", icon=Icons.WARN,
+                            )
+                            cont_messages = list(req_messages) + [
+                                {"role": "assistant", "content": full_content},
+                                {"role": "user", "content": (
+                                    "Your previous reply was cut off by a length "
+                                    "limit. Continue it from exactly where it "
+                                    "stopped — do NOT repeat anything you already "
+                                    "wrote, do NOT restate the question, just emit "
+                                    "the next characters and finish the answer."
+                                )},
+                            ]
+                            cont_payload = {
+                                **payload,
+                                "messages": cont_messages,
+                                "stream": False,
+                            }
+                            # Plain-text continuation: never invite a tool call.
+                            cont_payload.pop("tools", None)
+                            cont_payload.pop("tool_choice", None)
+                            cont_payload.pop("parallel_tool_calls", None)
+                            stream_finish_reason = None
+                            try:
+                                cont_result = await self.context.llm_client.chat_completion(cont_payload)
+                                cont_choice = (cont_result or {}).get("choices", [{}])[0]
+                                cont_text = (cont_choice.get("message", {}) or {}).get("content", "") or ""
+                                stream_finish_reason = cont_choice.get("finish_reason")
+                                # A continuation may re-open its own <think>
+                                # prelude; strip it so only answer prose is
+                                # appended to the user-facing content.
+                                cont_text = re.sub(
+                                    r'<think>.*?(?:</think>|$)', '',
+                                    cont_text, flags=re.DOTALL | re.IGNORECASE,
+                                )
+                                if not cont_text.strip():
+                                    break
+                                # Bridge with a space only when the seam would
+                                # otherwise weld two words together; mid-token
+                                # cuts are continued without a gap.
+                                if full_content and not full_content[-1].isspace() and not cont_text[:1].isspace():
+                                    full_content += cont_text if cont_text[:1] in ",.;:!?)]}\"'" else " " + cont_text
+                                else:
+                                    full_content += cont_text
+                            except Exception as exc:
+                                logger.warning("Truncation continuation failed: %s", exc)
+                                break
+                            _truncated_text_turn = stream_finish_reason == "length"
 
                         merged_content = full_content
                         if reasoning_content:

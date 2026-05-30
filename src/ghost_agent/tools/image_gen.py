@@ -101,6 +101,16 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         file_path = sandbox_dir / filename
         await asyncio.to_thread(file_path.write_bytes, image_bytes)
 
-        return f"SUCCESS: Image generated and saved to sandbox. DO NOT CALL THIS TOOL AGAIN with the same prompt. Respond DIRECTLY to the user by including this exact markdown to display the image and its description:\n\n![{prompt}](/api/download/{filename})\n\n**Description:** {prompt}"
+        return (
+            "SUCCESS: Image generated and saved to sandbox. "
+            "DO NOT CALL THIS TOOL AGAIN with the same prompt.\n\n"
+            "Respond DIRECTLY to the user. First, display the image using EXACTLY "
+            "this markdown line (keep the short alt text — do NOT paste the full "
+            "prompt into it):\n\n"
+            f"![generated image](/api/download/{filename})\n\n"
+            "Then, on the next line, write ONE or TWO short sentences in your own "
+            "words telling the user what you generated and the mood/style you went "
+            "for. Do NOT paste the raw prompt verbatim."
+        )
     except Exception as e:
         return f"ERROR generating image: {str(e)}"

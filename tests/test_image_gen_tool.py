@@ -27,8 +27,13 @@ async def test_tool_generate_image_success(tmp_path):
     result = await tool_generate_image(prompt="draw a cat", steps=4, llm_client=mock_llm_client, sandbox_dir=tmp_path)
     
     assert "SUCCESS" in result
-    assert "![draw a cat](/api/download/gen_" in result
-    
+    # Alt text is kept short — the giant raw prompt must NOT be dumped into it.
+    assert "![generated image](/api/download/gen_" in result
+    assert "![draw a cat]" not in result
+    # The model is explicitly instructed to author a short human description.
+    assert "short sentences" in result
+    assert "Do NOT paste the raw prompt verbatim." in result
+
     # Check if file was written
     files = list(tmp_path.glob("gen_*.png"))
     assert len(files) == 1
