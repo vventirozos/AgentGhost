@@ -23,13 +23,6 @@ router = APIRouter()
 API_KEY_NAME = "X-Ghost-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
-def clear_global_history():
-    """
-    Placeholder for stateful history clearing. 
-    Current implementation is stateless (OpenAI-compatible).
-    """
-    return True
-
 def get_agent(request: Request):
     return request.app.state.agent
 
@@ -97,7 +90,7 @@ async def list_openai_models(request: Request):
 async def api_pull(request: Request):
     return {"status": "success"}
 
-@router.delete("/api/delete")
+@router.delete("/api/delete", dependencies=[Security(verify_api_key)])
 async def api_delete(request: Request):
     # Ollama-compatible: DELETE /api/delete removes a pulled model. We
     # serve a single canonical model and never let the user actually
@@ -429,6 +422,20 @@ async def save_workspace(request: Request):
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB hard ceiling on inbound uploads
 
 
+def _is_within(base: Path, candidate: Path) -> bool:
+    """True iff resolved ``candidate`` is ``base`` or strictly inside it.
+
+    Robust against the prefix-``startswith`` sibling-directory bypass (e.g.
+    ``/data/sandbox`` matching ``/data/sandbox_evil``) that a bare
+    ``str(p).startswith(str(base))`` check allows.
+    """
+    try:
+        candidate.resolve().relative_to(base.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
 async def _read_capped(upload: UploadFile) -> bytes:
     """Read an UploadFile body with a hard size cap. Without this, a
     multi-GB upload exhausts memory and disk.
@@ -502,7 +509,8 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
                         continue
                     extracted_path = (sandbox_dir / rel_path).resolve()
                     # Security constraint: Prevent zip-slip traversal attacks
-                    if not str(extracted_path).startswith(str(sandbox_dir)):
+                    # (relative_to-based; rejects sibling-dir prefix escapes).
+                    if not _is_within(sandbox_dir, extracted_path):
                         continue
                     
                     if zip_info.is_dir():
@@ -525,7 +533,7 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     if not file.filename or ".." in file.filename or file.filename.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid filename")
     file_path = (sandbox_dir / file.filename).resolve()
-    if not str(file_path).startswith(str(sandbox_dir.resolve())):
+    if not _is_within(sandbox_dir, file_path):
         raise HTTPException(status_code=400, detail="Invalid filename")
 
     # Read with size cap before writing — same DoS guard as workspace/load.
@@ -541,8 +549,11 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 async def download_file(request: Request, filename: str):
     agent = get_agent(request)
     sandbox_dir = agent.context.sandbox_dir
+    # Reject traversal explicitly (parity with /api/upload) then containment-check.
+    if ".." in filename or filename.startswith("/"):
+        raise HTTPException(status_code=404, detail="File not found")
     file_path = (sandbox_dir / filename).resolve()
-    if not str(file_path).startswith(str(sandbox_dir.resolve())) or not file_path.exists():
+    if not _is_within(sandbox_dir, file_path) or not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=str(file_path), filename=file_path.name)
 

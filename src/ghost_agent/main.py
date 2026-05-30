@@ -66,7 +66,7 @@ logger = logging.getLogger("GhostAgent")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Ghost Agent: Autonomous AI Service")
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0 — reachable over the network, e.g. a Tailscale host). Use 127.0.0.1 to restrict to loopback. A non-loopback bind with the default API key prints a security warning.")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--upstream-url", default="http://127.0.0.1:8080")
     parser.add_argument("--swarm-nodes", default=None, help="Comma-separated list of url|model nodes")
@@ -104,6 +104,7 @@ def parse_args():
     # existing simulation fallback in MCTS stays in effect.
     parser.add_argument("--prm-model", default=None, help="Path to a persisted PRM (Process Reward Model) JSON checkpoint. When set, the PRM is loaded and plugged into the MCTS reasoner as a fast scoring path.")
     parser.add_argument("--prm-train-cooldown", type=int, default=10800, help="Seconds between idle-time PRM retrains. Default 3 hours. Has no effect when --prm-model is unset.")
+    parser.add_argument("--router-train-cooldown", type=int, default=10800, help="Seconds between idle-time router-classifier retrains. Default 3 hours.")
     # Frontier-aware self-play. When on, the biological-watchdog phase-3
     # self-play picker weights candidate clusters by (PRM uncertainty ×
     # trajectory rarity) instead of only the brittle-pool score. This
@@ -715,12 +716,20 @@ async def lifespan(app):
         if clf is None:
             pretty_log(
                 "Complexity Router",
-                "No model loaded — dispatcher is a pass-through (always escalates to full swarm)",
+                "No model loaded — dispatcher pass-through (escalates to full swarm) until the idle retrain produces one",
                 icon=Icons.BRAIN_PLAN,
             )
+        # Where the idle-time router retrain writes/reads the classifier.
+        # Mirrors context._prm_checkpoint_path. When --router-model is unset we
+        # still train and persist here so the router self-improves from logs.
+        if args.router_model:
+            context._router_checkpoint_path = Path(args.router_model)
+        else:
+            context._router_checkpoint_path = (context.memory_dir.parent / "router" / "checkpoint.json")
     except Exception as e:
         pretty_log("Complexity Router Failed", str(e), level="WARNING", icon=Icons.WARN)
         context.complexity_dispatcher = None
+        context._router_checkpoint_path = None
 
     # Selfhood module: the five-component "unified self" — first-person
     # autobiographical log, self-state thread (open questions / mood /
@@ -765,6 +774,14 @@ async def lifespan(app):
             narrative_critique_fn=_selfhood_critique_fn if self_enabled else None,
         )
         if self_enabled:
+            # Emit the "Session resumed…" boot marker (symmetric to the
+            # workspace_model.mark_session_boot() call below). Previously
+            # never called, so the autobiographical narrative could never
+            # mark session boundaries explicitly.
+            try:
+                context.self_model.mark_session_boot()
+            except Exception:
+                pass
             stats = context.self_model.stats()
             pretty_log(
                 "Selfhood",
@@ -1075,13 +1092,16 @@ def main():
     memory_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"👻 Ghost Agent (Ollama Compatible) running on {args.host}:{args.port}")
-    # Security: warn loudly if the publicly-known default API key is in use
-    # on a non-loopback bind — that combination authenticates trivially.
+    # Security: warn loudly (do NOT block startup) if the publicly-known
+    # default API key is in use on a non-loopback bind. Blocking startup here
+    # silently broke existing network deployments (e.g. a CLI client reaching
+    # the agent over Tailscale), so this is advisory — operators on a private
+    # mesh with the default key are making an informed choice.
     if args.api_key == "ghost-secret-123" and args.host not in ("127.0.0.1", "localhost", "::1"):
         print(
             "⚠️  SECURITY WARNING: default API key ('ghost-secret-123') in use while "
-            f"binding to {args.host} (non-loopback). Set GHOST_API_KEY / --api-key to "
-            "a secret, or bind to 127.0.0.1."
+            f"binding to {args.host} (non-loopback). On an UNTRUSTED network, set "
+            "GHOST_API_KEY / --api-key to a real secret or bind to 127.0.0.1."
         )
     print(f"🔗 Connected to Upstream LLM at: {args.upstream_url}")
     print(f"📏 Max Context: {args.max_context} tokens")

@@ -762,12 +762,22 @@ class LLMClient:
         # But once bytes are yielded, if it fails mid-stream, it breaks.
         for attempt in range(2):
             try:
-                # We use stream() to keep the connection open and read chunks
+                # We use stream() to keep the connection open and read chunks.
                 req = client_to_use.build_request("POST", "/v1/chat/completions", json=payload)
                 resp = await client_to_use.send(req, stream=True)
-                resp.raise_for_status()
-
+                # The aclose() MUST cover raise_for_status() too — otherwise a
+                # 4xx/5xx leaks the streamed connection (the `except` handlers
+                # never closed it), and repeated upstream errors exhaust the
+                # httpx pool (max_connections=15).
                 try:
+                    _sc = getattr(resp, "status_code", None)
+                    if isinstance(_sc, int) and _sc >= 400:
+                        # Read the error body NOW (stream still open) so the
+                        # HTTPStatusError handler's heuristic has content; httpx
+                        # caches it, so the handler's aread() returns it again.
+                        await resp.aread()
+                    resp.raise_for_status()
+
                     # Per-chunk timeout — without this a stalled upstream
                     # (no bytes for minutes) holds the event-loop slot
                     # forever and keeps `foreground_tasks > 0`, which in

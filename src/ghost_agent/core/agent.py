@@ -663,6 +663,25 @@ def extract_json_from_text(text: str) -> dict:
         logger.warning(f"extract_json_from_text raised {type(e).__name__}: {e}")
         return {}
 
+
+async def _timed_tool_coro(coro, sink: list, idx: int):
+    """Await `coro`, writing its wall-clock duration into ``sink[idx]``.
+
+    Lets the parallel tool-dispatch path capture a per-tool duration (feeding
+    the metacog runtime-budget anomaly window) without changing how results
+    are gathered. Never lets the timing bookkeeping affect the result.
+    """
+    import time as _t
+    _t0 = _t.monotonic()
+    try:
+        return await coro
+    finally:
+        try:
+            sink[idx] = _t.monotonic() - _t0
+        except Exception:
+            pass
+
+
 class GhostContext:
     def __init__(self, args, sandbox_dir, memory_dir, tor_proxy):
         self.args = args
@@ -1143,6 +1162,8 @@ class GhostAgent:
     _PRM_TRAIN_COOLDOWN = 10800   # 3 hours between PRM retrain passes
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
+    _STALE_QUESTIONS_COOLDOWN = 7200  # 2 h between stale open-question surfacings (phase 2.8b)
+    _ROUTER_TRAIN_COOLDOWN = 10800   # 3 h between router-classifier retrains (phase 2.7b)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
     # already prevents same-batch refire, but a journal write that
@@ -1177,6 +1198,10 @@ class GhostAgent:
             self._last_narrative_at = datetime.datetime.min
         if not hasattr(self, '_last_workspace_narrative_at'):
             self._last_workspace_narrative_at = datetime.datetime.min
+        if not hasattr(self, '_last_stale_questions_at'):
+            self._last_stale_questions_at = datetime.datetime.min
+        if not hasattr(self, '_last_router_train_at'):
+            self._last_router_train_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
         # Adaptive self-play cooldown (curiosity-driven). Starts at the
@@ -1193,8 +1218,11 @@ class GhostAgent:
             if since_last_journal >= self._JOURNAL_COOLDOWN:
                 has_items = False
                 try:
-                    with ctx.journal._lock:
-                        has_items = len(json.loads(ctx.journal.file_path.read_text())) > 0
+                    # Route through the guarded load() (not a raw read_text +
+                    # json.loads): on a corrupt journal, load() sidecars the
+                    # bytes and returns [] rather than letting `except: pass`
+                    # silently skip consolidation forever.
+                    has_items = len(ctx.journal.load()) > 0
                 except Exception:
                     pass
                 if has_items:
@@ -1495,6 +1523,56 @@ class GhostAgent:
                     finally:
                         self._last_prm_train_at = datetime.datetime.now()
 
+        # Phase 2.7b: Router classifier retrain on accumulated trajectories.
+        # Mirrors the PRM phase. The router ships UNTRAINED (escalates every
+        # request); this trains the ComplexityClassifier from the trajectory log
+        # and hot-swaps it into the live dispatcher so cheap turns stop waking
+        # the full swarm. CPU-only, same idle window + cooldown discipline.
+        if 900 < idle_secs <= 3600:
+            _rt_cd_override = getattr(getattr(ctx, 'args', None), 'router_train_cooldown', None)
+            if not isinstance(_rt_cd_override, (int, float)):
+                _rt_cd_override = None
+            _rt_cooldown = float(_rt_cd_override) if _rt_cd_override else float(self._ROUTER_TRAIN_COOLDOWN)
+            since_last_router = (datetime.datetime.now() - self._last_router_train_at).total_seconds()
+            if since_last_router >= _rt_cooldown:
+                traj_collector = getattr(ctx, 'trajectory_collector', None)
+                from ..distill.collector import TrajectoryCollector as _TrajColCls
+                from ..router import ComplexityDispatcher as _ComplexityDispatcher
+                dispatcher = getattr(ctx, 'complexity_dispatcher', None)
+                if (isinstance(traj_collector, _TrajColCls)
+                        and isinstance(dispatcher, _ComplexityDispatcher)):
+                    self._last_router_train_at = datetime.datetime.now()
+                    try:
+                        from ..router import RouterTrainer
+                        save_path = getattr(ctx, '_router_checkpoint_path', None)
+                        if save_path is None:
+                            base_mem = getattr(ctx, 'memory_dir', None)
+                            if base_mem is not None:
+                                save_path = base_mem.parent / "router" / "checkpoint.json"
+                        trainer = RouterTrainer()
+                        report = trainer.run(
+                            trajectories=traj_collector.iter_trajectories(),
+                            save_path=save_path,
+                        )
+                        if report.fit_succeeded and trainer.classifier is not None:
+                            # Hot-swap: the dispatcher re-reads .classifier /
+                            # .disabled on every route() call, so this takes
+                            # effect immediately (no restart).
+                            dispatcher.classifier = trainer.classifier
+                            dispatcher.disabled = False
+                            pretty_log(
+                                "Router Retrain",
+                                f"classifier refit on idle: {report.summary()} · "
+                                f"router now routing (was escalate-all)",
+                                icon=Icons.BRAIN_PLAN,
+                            )
+                        else:
+                            logger.debug("Router idle retrain skipped: %s", report.bail_reason or "unknown")
+                    except Exception as e:
+                        logger.warning(f"Router retrain phase failed: {e}")
+                    finally:
+                        self._last_router_train_at = datetime.datetime.now()
+
         # Phase 2.8: Selfhood narrative consolidation (15-60 min idle).
         # Re-generates the agent's first-person running diary from the
         # recent autobiographical experiences + self-state thread. The
@@ -1559,6 +1637,30 @@ class GhostAgent:
                         logger.warning(f"Narrative consolidation phase failed: {e}")
                     finally:
                         self._last_narrative_at = datetime.datetime.now()
+
+        # Phase 2.8b: Surface STALE open questions (previously unwired). Every
+        # few hours, pull self-questions the agent has carried unresolved past
+        # `max_age_days` and log them so they can be re-engaged instead of
+        # silently accreting. Same idle window + cooldown discipline.
+        if 900 < idle_secs <= 3600:
+            since_last_sq = (datetime.datetime.now() - self._last_stale_questions_at).total_seconds()
+            if since_last_sq >= self._STALE_QUESTIONS_COOLDOWN:
+                _sm = getattr(ctx, 'self_model', None)
+                if _sm is not None and getattr(_sm, 'enabled', False):
+                    self._last_stale_questions_at = datetime.datetime.now()
+                    try:
+                        stale = _sm.stale_open_questions(max_age_days=3.0)
+                        if stale:
+                            preview = "; ".join(getattr(q, "text", str(q))[:60] for q in stale[:3])
+                            pretty_log(
+                                "Selfhood",
+                                f"{len(stale)} stale open question(s) carried >3d — re-engage: {preview}",
+                                icon=Icons.SELF_STATE,
+                            )
+                    except Exception as e:
+                        logger.debug(f"stale-question surfacing failed: {e}")
+                    finally:
+                        self._last_stale_questions_at = datetime.datetime.now()
 
         # Phase 2.9: Workspace Narrative Consolidation (15-60 min idle).
         # Mirrors phase 2.8 but for the world-model. Re-renders the
@@ -2635,7 +2737,15 @@ class GhostAgent:
                     bus = self._get_memory_bus()
                     if bus is not None:
                         try:
-                            fetched_context = await bus.hydrate_context(search_query)
+                            # Pass llm_client + a char budget so RAG-Fusion's
+                            # query-decomposition actually runs (it was always
+                            # None → heuristic-only) and complex queries can
+                            # scale past the 6k default (cap 12k chars).
+                            fetched_context = await bus.hydrate_context(
+                                search_query,
+                                llm_client=getattr(self.context, "llm_client", None),
+                                context_budget=12000,
+                            )
                             if fetched_context:
                                 fetched_context = fetched_context.replace("\r", "")
                                 pretty_log("Memory Bus", f"Hydrated context for: {search_query}", icon=Icons.BRAIN_CTX)
@@ -2878,8 +2988,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 ### CURRENT PLAN (JSON)
 {json.dumps(current_plan_json, indent=2) if current_plan_json else "No plan yet."}
 """
+                        # Apply a GEPA-optimized planning instruction when one
+                        # has been produced offline (run_gepa → system/optim/
+                        # planning.decompose.json). Prepend it as an authoritative
+                        # directive rather than replacing the structured prompt —
+                        # the tuned text is a short instruction, the baseline is a
+                        # full multi-section system prompt. Falls back to baseline
+                        # when no tuned file exists. (Was write-only before.)
+                        from ..optim.loader import tuned_instruction as _tuned_instruction
+                        _tuned_plan = _tuned_instruction("planning.decompose", "")
+                        _planner_system = (
+                            f"{_tuned_plan}\n\n{PLANNING_SYSTEM_PROMPT}"
+                            if _tuned_plan else PLANNING_SYSTEM_PROMPT
+                        )
                         planner_messages = [
-                            {"role": "system", "content": PLANNING_SYSTEM_PROMPT},
+                            {"role": "system", "content": _planner_system},
                             {"role": "user", "content": f"### RECENT CONVERSATION:\n{recent_transcript}\n\n{planner_transient.strip()}"}
                         ]
 
@@ -3721,6 +3844,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
 
                                         await asyncio.to_thread(self.context.journal.append, 'post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
+                                    await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
 
                             # Retrieval feedback loop: credit lessons that
                             # were surfaced during this turn whenever the
@@ -5029,6 +5153,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             except: pass
 
                     tool_tasks, tool_call_metadata = [], []
+                    tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
                     for _tc_idx, tool in enumerate(tool_calls):
                         # Strike cap inside the per-tool loop. The outer cap
                         # at the top of the turn loop only runs at turn
@@ -5171,6 +5296,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             if fname == "create_skill" or (
                                 fname == "manage_skills"
                                 and (t_args.get("action") or "").lower() == "delete"
+                            ) or (
+                                fname == "manage_composed_skills"
+                                and (t_args.get("action") or "").lower() in ("define", "delete", "approve")
                             ):
                                 request_state.invalidate_tool_defs()
 
@@ -5218,8 +5346,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             messages.append(err_msg)
                             tools_run_this_turn.append({**err_msg, "_synthetic": True})
                             continue
-                        if is_idempotent_setter:
-                            executed_idempotent.add(a_hash)
+                        # NB: `executed_idempotent.add(a_hash)` is deliberately
+                        # deferred until AFTER the tool is actually dispatched
+                        # (see the dispatch site) — recording it here marked the
+                        # call "done" even when a downstream gate (metacog
+                        # ask_user) aborted the dispatch, which then blocked the
+                        # user's legitimate re-issue as a false duplicate.
 
                         seen_tools.add(a_hash)
 
@@ -5378,8 +5510,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     last_was_failure = True
                                     continue
                             try:
-                                tool_tasks.append(self.available_tools[fname](**t_args))
+                                # Wrap in a timing shim so each tool's wall-clock
+                                # duration lands in tool_durations[idx] (parallel to
+                                # results/metadata) — feeds the metacog runtime-budget
+                                # anomaly window.
+                                _coro = self.available_tools[fname](**t_args)
+                                tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
+                                tool_durations.append(None)
                                 tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating))
+                                # Record the idempotency hash only now that the
+                                # call has actually been dispatched (not at the
+                                # guard above) so an aborted gate doesn't block a
+                                # later legitimate re-issue.
+                                if is_idempotent_setter:
+                                    executed_idempotent.add(a_hash)
                             except Exception as e:
                                 pretty_log("Tool Invocation Error", str(e), level="WARNING", icon=Icons.WARN)
                                 err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error invoking tool '{fname}' (Did you forget a required argument?): {str(e)}"}
@@ -5459,8 +5603,41 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     or "EXIT CODE: 1" in str_res
                                     or "EXIT CODE: 2" in str_res
                                 )
+                                _dur = tool_durations[i] if i < len(tool_durations) else None
+                                _bus = getattr(_mc, "bus", None)
+                                # Trigger publishes are best-effort and MUST NOT
+                                # block the competence/budget record below — hence a
+                                # separate try. is_anomalous runs BEFORE record_outcome
+                                # so the current sample isn't compared against itself.
                                 try:
-                                    _mc.record_outcome(fname, success=not _tool_failed)
+                                    # LoopDetected: observe the tool key; on a
+                                    # repeat-streak trip publish a loop event (the
+                                    # ReplanBridge can revise the active task), reset.
+                                    _rep = getattr(_mc, "repetition", None)
+                                    if _rep is not None and _bus is not None and hasattr(_rep, "observe"):
+                                        _streak = _rep.observe(fname)
+                                        if _rep.tripped():
+                                            from .triggers import loop_event as _loop_event
+                                            await _bus.publish(_loop_event(
+                                                f"tool '{fname}' repeated {_streak}x in a row",
+                                                key=fname, count=_streak,
+                                            ))
+                                            _rep.reset()
+                                    # ExecutionAnomaly: this duration vs the learned p95×budget.
+                                    _rb = getattr(_mc, "runtime_budget", None)
+                                    if (_rb is not None and _bus is not None and _dur is not None
+                                            and hasattr(_rb, "is_anomalous") and _rb.is_anomalous(fname, _dur)):
+                                        from .triggers import anomaly_event as _anom_event
+                                        await _bus.publish(_anom_event(
+                                            f"tool '{fname}' ran {_dur:.1f}s (>budget)",
+                                            tool_name=fname, duration_s=_dur,
+                                            budget_s=(_rb.budget(fname) or 0.0),
+                                        ))
+                                except Exception as _trexc:
+                                    logger.debug("metacog trigger publish failed: %s", _trexc)
+                                try:
+                                    # Feed the budget window + competence profile.
+                                    _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
                                 except Exception as _mcexc:
                                     logger.debug("metacog outcome hook failed: %s", _mcexc)
 
@@ -5484,7 +5661,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     if summary_content:
                                         str_res = f"[EDGE CONDENSED]: {summary_content}"
                                 except Exception as e:
-                                    logger.debug(f"Final generation XML parse failure: {type(e).__name__}")
+                                    logger.debug(f"Context-Shield edge summarisation failed: {type(e).__name__}: {e}")
 
                             trunc_limit = max(80000, int(char_budget * 0.4))
                             half = trunc_limit // 2
@@ -6211,6 +6388,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
 
                             await asyncio.to_thread(self.context.journal.append, 'post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
+                            await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)
 
                 # Retrieval feedback: a clean, non-failing turn credits
                 # any lesson surfaced in the last ~5min. Hoisted out of
@@ -6253,6 +6431,43 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 )
                         except Exception:
                             pass
+                        # Resolve unknowns the agent answered for ITSELF this
+                        # turn: when an info-gathering tool ran successfully and
+                        # an unknown's resolution pointed at that path, mark it
+                        # resolved so it drops out of the clarifying-question gate
+                        # and the risk footer below. (The resolve-side of the
+                        # uncertainty lifecycle was previously never called, so
+                        # self-answered unknowns kept re-surfacing to the user.)
+                        try:
+                            _info_tools = {"web_search", "deep_research", "recall",
+                                           "fact_check", "browser", "file_system", "knowledge_base"}
+                            _ran_info = any(
+                                isinstance(t, dict) and t.get("name") in _info_tools
+                                and not str(t.get("content", "")).lstrip().startswith(("Error", "ERROR", "SYSTEM ERROR"))
+                                for t in (tools_run_this_turn or [])
+                            )
+                            if _ran_info:
+                                for _u in list(tracker.unknowns):
+                                    if getattr(_u, "resolved", False):
+                                        continue
+                                    _resn = (getattr(_u, "resolution", "") or "").lower()
+                                    if any(k in _resn for k in ("search", "web", "read", "file", "look", "fetch", "recall", "research")):
+                                        tracker.resolve_unknown(_u, "resolved via tool output this turn")
+                        except Exception:
+                            pass
+                        # Verify-side of the lifecycle (previously unwired): if the
+                        # turn completed cleanly (a response, no error/failure
+                        # markers), treat the assumptions the agent proceeded on as
+                        # borne out (was_correct=True). Conservative — only confirms
+                        # on a clean turn, never marks them wrong.
+                        try:
+                            _turn_clean = bool(final_ai_content) and "error" not in final_ai_content[:80].lower()
+                            if _turn_clean:
+                                for _a in list(tracker.assumptions):
+                                    if not getattr(_a, "verified", False):
+                                        tracker.verify_assumption(_a, True)
+                        except Exception:
+                            pass
                         # Metacognitive gate (proposal item #6): if a
                         # critical unknown still needs the user, surface
                         # the clarifying question at the TOP of the reply
@@ -6277,6 +6492,56 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         tracker.reset()
                 except Exception as e:
                     logger.debug(f"Uncertainty surfacing skipped: {e}")
+
+                # Chat→project promotion suggestion (advisory; previously unwired).
+                # When a free-chat session accumulates enough turns / sandbox
+                # work, gently suggest promoting it to a tracked project — ONCE
+                # (suppressed via a scratchpad flag so we don't nag). Only the
+                # explicit manage_projects(promote_from_context) tool actually
+                # creates a project; this is just a one-line footer offer.
+                try:
+                    if getattr(self.context, "current_project_id", None) is None and final_ai_content:
+                        _sp = getattr(self.context, "scratchpad", None)
+                        _already = False
+                        try:
+                            _already = bool(_sp and _sp.get("_promotion_suggested"))
+                        except Exception:
+                            _already = False
+                        if not _already:
+                            from .project_safety import should_suggest_promotion as _ssp
+                            _uturns = [
+                                m.get("content") for m in messages
+                                if isinstance(m, dict) and m.get("role") == "user"
+                                and isinstance(m.get("content"), str)
+                            ]
+                            _aturns = [
+                                m.get("content") for m in messages
+                                if isinstance(m, dict) and m.get("role") == "assistant"
+                                and isinstance(m.get("content"), str)
+                            ]
+                            _writes = sum(
+                                1 for t in (tools_run_this_turn or [])
+                                if isinstance(t, dict) and t.get("name") == "file_system"
+                            )
+                            _sugg = _ssp(
+                                user_turns=_uturns, assistant_turns=_aturns,
+                                sandbox_writes=_writes, plan_node_count=0,
+                                already_in_project=False,
+                            )
+                            if getattr(_sugg, "should_suggest", False):
+                                final_ai_content = (
+                                    f"{final_ai_content}\n\n---\n"
+                                    f"💡 This looks like ongoing work ({_sugg.reason}). "
+                                    f"Want me to promote it to a tracked project "
+                                    f"(“{_sugg.suggested_title}”)? Just say the word."
+                                )
+                                try:
+                                    if _sp:
+                                        _sp.set("_promotion_suggested", "1")
+                                except Exception:
+                                    pass
+                except Exception as _pexc:
+                    logger.debug(f"promotion suggestion skipped: {_pexc}")
 
                 # Sync the locally-evolved `messages` list back to the caller's
                 # `body`. `messages` was rebound (by `process_rolling_window`,
@@ -6308,6 +6573,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # noisy in production. When diagnosing, bump to
                     # warning temporarily.
                     logger.debug(f"trajectory logging skipped: {type(e).__name__}: {e}")
+
+                # Selfhood reference-count (rest of H12): bump the reference
+                # counter for the prior experiences the agent actually echoed
+                # this turn (wake-up prefix it was shown vs. the response it
+                # produced). Previously note_referenced_experiences had no
+                # caller, so the "which memories did I reach for" signal was
+                # always empty. Non-fatal.
+                try:
+                    _sm = getattr(self.context, "self_model", None)
+                    if _sm is not None and getattr(_sm, "enabled", False):
+                        _wp = locals().get("wakeup_prefix", "") or ""
+                        if _wp and final_ai_content:
+                            await asyncio.to_thread(
+                                _sm.note_referenced_experiences,
+                                prefix_text=_wp, response_text=final_ai_content,
+                            )
+                except Exception as _refexc:
+                    logger.debug(f"selfhood reference-count skipped: {_refexc}")
 
                 # Selfhood outcome backfill (proposal item #3): the
                 # autobiographical record was just written `outcome=
@@ -6652,6 +6935,44 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 pass
 
         task.add_done_callback(_log_post_turn_reflection_result)
+
+    async def _record_episode_safe(self, user_text, tools, ai_text) -> None:
+        """Best-effort episodic-memory write for a completed significant turn.
+
+        EpisodicMemory.record_episode previously had no caller, so the store
+        was always empty and the MemoryBus's episodic RAG tier returned
+        nothing. This populates it from the turn's tool sequence + outcome.
+        Never raises — episodic logging is secondary to the turn.
+        """
+        em = getattr(self.context, "episodic_memory", None)
+        if em is None:
+            return
+        try:
+            actions = []
+            for t in (tools or []):
+                if not isinstance(t, dict):
+                    continue
+                content = str(t.get("content", ""))
+                actions.append({
+                    "tool": t.get("name", "unknown"),
+                    "args": {},  # post_mortem entries keep result, not args
+                    "result": content,
+                    "success": not content.lstrip().startswith(
+                        ("Error", "ERROR", "SYSTEM ERROR", "[SYSTEM ERROR]", "Traceback")
+                    ),
+                })
+            ai_head = str(ai_text or "")[:80].lower()
+            success = bool(ai_text) and "error" not in ai_head and "failed" not in ai_head
+            await asyncio.to_thread(
+                em.record_episode,
+                trigger=str(user_text or "")[:500],
+                context="",
+                actions=actions,
+                outcome=str(ai_text or "")[:1000],
+                success=success,
+            )
+        except Exception:
+            pass
 
     def _record_turn_trajectory(
         self,

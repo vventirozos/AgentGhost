@@ -38,10 +38,17 @@ logger = logging.getLogger("GhostAgent")
 # delete-the-whole-disk variants. Anchored at word boundaries so a
 # benign substring ("description") doesn't trip the deny-list.
 _SHELL_DENY: tuple = (
-    # rm -rf / and friends
-    re.compile(r"\brm\b\s+(?:-[A-Za-z]*r[A-Za-z]*f|-[A-Za-z]*f[A-Za-z]*r)\b\s+/(?:\s|$)"),
-    re.compile(r"\brm\b\s+-rf\s+/(?:\s|$)"),
-    re.compile(r"\brm\b\s+(?:-[A-Za-z]*r[A-Za-z]*f|-[A-Za-z]*f[A-Za-z]*r)\b\s+~(?:\s|$)"),
+    # rm with BOTH -r and -f flags (any order/spelling, combined or split)
+    # targeting a DANGEROUS path: absolute (/...), root glob (/*), home (~ /
+    # $HOME), or a quoted form of those. Relative deletes (rm -rf ./build)
+    # are intentionally NOT blocked. The two lookaheads require an `r` flag
+    # and an `f` flag in the rm invocation before the target.
+    re.compile(
+        r"\brm\b(?=[^|;&]*\s-\w*r)(?=[^|;&]*\s-\w*f)[^|;&]*\s+"
+        r"(?:/(?:\s|$|\*|\w[^\s'\"]*)|~(?:\s|$|/)|\$\{?HOME\}?"
+        r"|['\"]\s*(?:/[^'\"]*|~[^'\"]*|\$\{?HOME\}?)['\"])",
+        re.IGNORECASE,
+    ),
     # dd to a raw device
     re.compile(r"\bdd\b[^|;&]*of=/dev/(?:sd|nvme|hd)"),
     # mkfs / fdisk / shred against a device
@@ -51,9 +58,14 @@ _SHELL_DENY: tuple = (
     re.compile(r":\(\)\s*\{\s*:\|\s*:&\s*\}\s*;\s*:"),
     # Chmod 777 on root / system dirs
     re.compile(r"\bchmod\b\s+(?:-R\s+)?(?:0?777|a\+rwx)\b\s+/(?:bin|etc|usr|sys|root)\b"),
-    # Curl|sh pattern — common malware delivery shape
-    re.compile(r"\bcurl\b[^|]+\|\s*(?:sh|bash|zsh)\b"),
-    re.compile(r"\bwget\b[^|]+\|\s*(?:sh|bash|zsh)\b"),
+    # Download piped straight into an interpreter — common malware shape.
+    # Covers curl/wget/fetch | (sudo) sh/bash/zsh/dash/python/perl/ruby/node/php,
+    # including `| bash -s`.
+    re.compile(
+        r"\b(?:curl|wget|fetch)\b[^|]+\|\s*(?:sudo\s+)?"
+        r"(?:sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|php)\b",
+        re.IGNORECASE,
+    ),
 )
 
 
@@ -100,12 +112,16 @@ _SQL_TRUNCATE = re.compile(r"^\s*truncate\b", re.IGNORECASE)
 _SQL_SINGLE_QUOTE = "'"
 
 
-def validate_sql(stmt: str) -> Tuple[bool, str]:
+def validate_sql(stmt: str, confirm: bool = False) -> Tuple[bool, str]:
     """Validate a SQL statement. Returns ``(ok, reason)``.
 
     Tries to use ``sqlparse`` for tokenisation when available; falls
     back to regex shape checks. Either path rejects unguarded
     DELETE/UPDATE, raw DROP/TRUNCATE, and unbalanced quotes/parens.
+
+    ``confirm=True`` skips the DROP/TRUNCATE block — the caller has
+    explicitly acknowledged a destructive DDL (see ``postgres_admin``'s
+    ``confirm`` parameter).
     """
     if not stmt or not stmt.strip():
         return False, "empty statement"
@@ -127,10 +143,11 @@ def validate_sql(stmt: str) -> Tuple[bool, str]:
         # Only block when there is no WHERE anywhere in the statement.
         if not re.search(r"\bwhere\b", s, re.IGNORECASE):
             return False, "UPDATE without WHERE clause"
-    if _SQL_DROP.match(s):
-        return False, "DROP statement requires explicit confirmation"
-    if _SQL_TRUNCATE.match(s):
-        return False, "TRUNCATE statement requires explicit confirmation"
+    if not confirm:
+        if _SQL_DROP.match(s):
+            return False, "DROP statement requires confirm=true"
+        if _SQL_TRUNCATE.match(s):
+            return False, "TRUNCATE statement requires confirm=true"
 
     # Try sqlparse for a deeper parse if installed.
     try:
@@ -146,7 +163,7 @@ def validate_sql(stmt: str) -> Tuple[bool, str]:
             # Multi-statement is okay only if each individual statement
             # already passes the same guards.
             for p in non_empty:
-                ok, reason = validate_sql(str(p))
+                ok, reason = validate_sql(str(p), confirm=confirm)
                 if not ok:
                     return False, f"multi-stmt: {reason}"
     except ImportError:

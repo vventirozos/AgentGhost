@@ -25,10 +25,15 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
     
     try:
         if is_url:
+            # SSRF guard (shared): block internal/metadata hosts before fetch.
+            from ..utils.helpers import url_ssrf_reason as _url_ssrf_reason
+            _ssrf = _url_ssrf_reason(target)
+            if _ssrf:
+                return f"Error: {_ssrf}"
             proxy_url = tor_proxy
             if proxy_url and proxy_url.startswith("socks5://"):
                 proxy_url = proxy_url.replace("socks5://", "socks5h://")
-            
+
             async with httpx.AsyncClient(proxy=proxy_url, follow_redirects=True, timeout=60.0) as client:
                 resp = await client.get(target)
                 resp.raise_for_status()

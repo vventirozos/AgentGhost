@@ -798,6 +798,24 @@ def _parse_runner_output(stdout: str) -> tuple[bool, object]:
 _VALID_OPS = {"navigate", "extract_text", "click", "screenshot", "close", "interact"}
 
 
+def _browser_blocked_url(u: Optional[str]) -> Optional[str]:
+    """SSRF guard for the browser: block http(s) navigation to internal /
+    loopback / link-local / metadata hosts (which the host-network sandbox
+    can otherwise reach), while ALLOWING file:// (self-play fixtures render
+    as file:// pages) and about:/data:. Returns a refusal reason or None."""
+    if not u:
+        return None
+    from urllib.parse import urlparse
+    try:
+        scheme = (urlparse(str(u)).scheme or "").lower()
+    except Exception:
+        return None
+    if scheme in ("http", "https"):
+        from ..utils.helpers import url_ssrf_reason
+        return url_ssrf_reason(u)
+    return None
+
+
 async def tool_browser(
     operation: str = None,
     url: Optional[str] = None,
@@ -853,6 +871,17 @@ async def tool_browser(
         return _err(f"Unknown operation {operation!r}. Valid: {valid_list}.")
     if not sandbox_dir or not sandbox_manager:
         return _err("Sandbox is not initialised — cannot run browser.")
+
+    # SSRF guard: refuse http(s) navigation to internal/metadata hosts.
+    # (file:// fixtures and about:/data: are allowed.)
+    _b = _browser_blocked_url(url)
+    if _b:
+        return _err(f"Refused navigation: {_b}")
+    for _a in (actions or []):
+        if isinstance(_a, dict) and _a.get("action") == "goto":
+            _b = _browser_blocked_url(_a.get("url"))
+            if _b:
+                return _err(f"Refused goto: {_b}")
 
     # Write the runner once per call. Cheap (~10 KB) and avoids stale-
     # runner bugs if the file is edited mid-session.

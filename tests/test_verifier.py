@@ -96,22 +96,6 @@ class TestVerifier:
         )
         assert result.passed()
 
-    async def test_adversarial_probe(self, verifier, mock_llm_client):
-        mock_llm_client.chat_completion.return_value = {
-            "choices": [{"message": {"content": json.dumps({
-                "edge_cases": [
-                    {"case": "Empty input", "risk": "Division by zero"},
-                    {"case": "Unicode characters", "risk": "Encoding error"},
-                ],
-            })}}],
-        }
-        cases = await verifier.adversarial_probe(
-            problem="Calculate average of numbers",
-            solution="return sum(nums) / len(nums)",
-        )
-        assert len(cases) == 2
-        assert cases[0]["case"] == "Empty input"
-
     async def test_verify_with_no_llm(self):
         # Verifier with no LLM client cannot produce a real verdict.
         # Must return None so callers can log "skipped" instead of

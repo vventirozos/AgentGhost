@@ -40,6 +40,11 @@ def _make_ctx_with_journal(*, idle_secs: float, has_items: bool = True):
     journal.file_path.read_text = MagicMock(
         return_value='[{"type":"smart_memory","data":{}}]' if has_items else '[]'
     )
+    # The watchdog now calls the guarded journal.load() (corrupt → sidecar)
+    # instead of reading file_path directly.
+    journal.load = MagicMock(
+        return_value=[{"type": "smart_memory", "data": {}}] if has_items else []
+    )
     ctx.journal = journal
 
     # Phase 2 will see no candidates, so it short-circuits cleanly.

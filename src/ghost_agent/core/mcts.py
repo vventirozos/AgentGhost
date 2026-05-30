@@ -207,29 +207,6 @@ class MCTSReasoner:
         )
         return winner
 
-    async def backtrack(self) -> Optional[ActionCandidate]:
-        """Pop the next-best alternative from the backtrack stack.
-
-        Called when the selected action fails, to try the next candidate
-        without re-generating.
-        """
-        while self._backtrack_stack:
-            alternatives = self._backtrack_stack[-1]
-            if alternatives:
-                candidate = alternatives.pop(0)
-                candidate.selected = True
-                logger.info(
-                    "MCTS: backtracking to '%s' (score=%.2f)",
-                    candidate.description[:60], candidate.score,
-                )
-                return candidate
-            self._backtrack_stack.pop()
-        return None
-
-    def has_alternatives(self) -> bool:
-        """Check if there are cached alternatives to backtrack to."""
-        return any(alts for alts in self._backtrack_stack)
-
     def clear(self):
         """Reset the search tree."""
         self._backtrack_stack.clear()

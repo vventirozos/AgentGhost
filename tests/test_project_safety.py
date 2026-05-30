@@ -14,7 +14,7 @@ from ghost_agent.core.project_advancer import advance_once
 from ghost_agent.core.project_safety import (
     BudgetDecision, PromotionSuggestion,
     check_budget, record_runtime,
-    has_human_gate, enforce_human_gate, HUMAN_GATE_PREFIX,
+    enforce_human_gate, HUMAN_GATE_PREFIX,
     detect_contradiction, route_contradiction,
     should_suggest_promotion,
     MIN_TURNS_FOR_SUGGESTION, MIN_PLAN_NODES_FOR_SUGGESTION,
@@ -114,17 +114,6 @@ async def test_advance_records_runtime_and_tool_calls(context, store):
 
 
 # --------------------------------------------------------------------- human gates
-
-def test_has_human_gate_detects_prefix():
-    assert has_human_gate([f"{HUMAN_GATE_PREFIX} approve migration"])
-    assert has_human_gate(["regular", f"{HUMAN_GATE_PREFIX}ship"])
-
-
-def test_has_human_gate_returns_false_for_empty():
-    assert has_human_gate([]) is False
-    assert has_human_gate(None) is False
-    assert has_human_gate(["plain postcondition"]) is False
-
 
 def test_enforce_human_gate_returns_reason():
     task = {"postconditions": [f"{HUMAN_GATE_PREFIX} needs CTO sign-off"]}

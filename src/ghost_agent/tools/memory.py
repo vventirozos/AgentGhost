@@ -1092,6 +1092,15 @@ async def _run_self_play_loop(context, *, model_name: str, max_cycles: int, stop
                         f"PRM retrain skipped after cycle {cycles_done}: {_pe}",
                         level="WARNING", icon=Icons.WARN,
                     )
+                # Router classifier retrain rides the same cadence as PRM.
+                try:
+                    await asyncio.to_thread(_maybe_retrain_router, context)
+                except Exception as _re:
+                    pretty_log(
+                        "Self-Play Loop",
+                        f"Router retrain skipped after cycle {cycles_done}: {_re}",
+                        level="WARNING", icon=Icons.WARN,
+                    )
 
             # Adaptive cool-off — responsive to curiosity delta, but
             # interruptible the instant a new user message arrives.
@@ -1181,6 +1190,52 @@ def _maybe_retrain_prm(context) -> None:
     else:
         pretty_log(
             "Self-Play PRM Retrain",
+            f"Skipped: {report.bail_reason or 'unknown'}",
+            level="DEBUG", icon=Icons.BRAIN_PLAN,
+        )
+
+
+def _maybe_retrain_router(context) -> None:
+    """In-loop router-classifier retrain (mirrors _maybe_retrain_prm).
+
+    Trains the ComplexityClassifier on the trajectory log and hot-swaps it
+    into the live dispatcher on success, so the router stops escalating every
+    request. Pure CPU; safe from a worker thread. Skips silently when the
+    collector or dispatcher aren't wired.
+    """
+    from ..distill.collector import TrajectoryCollector
+    from ..router import ComplexityDispatcher, RouterTrainer
+    from pathlib import Path
+
+    traj_collector = getattr(context, "trajectory_collector", None)
+    dispatcher = getattr(context, "complexity_dispatcher", None)
+    if not isinstance(traj_collector, TrajectoryCollector):
+        return
+    if not isinstance(dispatcher, ComplexityDispatcher):
+        return
+
+    save_path = getattr(context, "_router_checkpoint_path", None)
+    if save_path is None:
+        mem_dir = getattr(context, "memory_dir", None)
+        if mem_dir is not None:
+            save_path = Path(mem_dir).parent / "router" / "checkpoint.json"
+
+    trainer = RouterTrainer()
+    report = trainer.run(
+        trajectories=traj_collector.iter_trajectories(),
+        save_path=save_path,
+    )
+    if report.fit_succeeded and trainer.classifier is not None:
+        dispatcher.classifier = trainer.classifier
+        dispatcher.disabled = False
+        pretty_log(
+            "Self-Play Router Retrain",
+            f"In-loop classifier refit: {report.summary()} · router now routing",
+            icon=Icons.BRAIN_PLAN,
+        )
+    else:
+        pretty_log(
+            "Self-Play Router Retrain",
             f"Skipped: {report.bail_reason or 'unknown'}",
             level="DEBUG", icon=Icons.BRAIN_PLAN,
         )

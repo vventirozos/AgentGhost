@@ -174,6 +174,10 @@ async def test_tool_find_files(sandbox):
     
     args, kwargs = sandbox_manager.execute.call_args
     cmd = args[0]
+    # The pipeline is now wrapped in `sh -c '...'` so the `| head` pipe is
+    # interpreted by a shell (the sandbox exec has no shell otherwise).
+    assert cmd.startswith("sh -c ")
     assert "find " in cmd
-    assert "'-name' '*.py'" in cmd or "-name '*.py'" in cmd
+    assert "*.py" in cmd
     assert "-not -path" in cmd
+    assert "| head -n 100" in cmd

@@ -39,6 +39,26 @@ MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB
 # version had no cap upstream of the agent.
 MAX_CHAT_MESSAGES = 500
 
+# Wall-clock ceiling for a single chat request proxied to the agent
+# backend. A long agent turn (deep browser automation, many sequential
+# tool calls) can legitimately run for many minutes without flushing any
+# SSE bytes to the HTTP response. With the old flat `timeout=600.0`,
+# httpx's *read* timeout (the max gap between received bytes) fired at
+# 600s, aborted the stream, and the UI rendered a bare "No response"
+# because no assistant tokens had arrived yet. Raise the default and make
+# it tunable via env. A separate, short connect timeout still fails fast
+# when the backend is actually down rather than merely slow.
+CHAT_TIMEOUT_S = float(os.environ.get("GHOST_CHAT_TIMEOUT", "1800"))  # 30 min
+CHAT_CONNECT_TIMEOUT_S = float(os.environ.get("GHOST_CHAT_CONNECT_TIMEOUT", "10"))
+
+
+def _chat_timeout() -> "httpx.Timeout":
+    """httpx Timeout for chat proxying: fail fast on connect, but allow a
+    long read/write/pool window so a slow-but-alive agent turn isn't cut
+    mid-flight. Passing the positional default sets read/write/pool to
+    CHAT_TIMEOUT_S while `connect` is overridden explicitly."""
+    return httpx.Timeout(CHAT_TIMEOUT_S, connect=CHAT_CONNECT_TIMEOUT_S)
+
 
 async def verify_interface_key(x_ghost_key: str | None = Header(default=None)) -> None:
     """Auth dependency for state-mutating interface proxies. Mirrors the
@@ -76,7 +96,7 @@ SHARED_HTTP_CLIENT: "httpx.AsyncClient | None" = None
 def _get_http_client() -> httpx.AsyncClient:
     global SHARED_HTTP_CLIENT
     if SHARED_HTTP_CLIENT is None or SHARED_HTTP_CLIENT.is_closed:
-        SHARED_HTTP_CLIENT = httpx.AsyncClient(timeout=600.0)
+        SHARED_HTTP_CLIENT = httpx.AsyncClient(timeout=_chat_timeout())
     return SHARED_HTTP_CLIENT
 
 # Mount static files
@@ -190,7 +210,18 @@ async def get(key: str | None = None):
         f'<script>window.GHOST_API_KEY={json.dumps(GHOST_API_KEY)};</script>\n'
     )
     html = html.replace("</head>", f"{injected}</head>", 1)
-    return HTMLResponse(content=html, status_code=200)
+    # `no-cache` forces the browser to revalidate the document with the
+    # server on every load instead of serving a stale copy from disk
+    # cache. Without this, an edit that bumps an asset cache-buster (e.g.
+    # `style.css?v=2.7`) never takes effect until the user manually hard-
+    # refreshes, because the cached HTML still references the old `?v=`.
+    # The document itself carries the injected API key, so we also mark it
+    # `private` to keep shared proxies from caching it.
+    return HTMLResponse(
+        content=html,
+        status_code=200,
+        headers={"Cache-Control": "no-cache, must-revalidate, private"},
+    )
 
 @app.get("/sw.js")
 async def get_sw():
@@ -278,7 +309,7 @@ async def chat_proxy(request: Request):
                 import time as _time
                 client = _get_http_client()  # reuse pooled client
                 try:
-                    async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers={"X-Ghost-Key": GHOST_API_KEY}, timeout=600.0) as response:
+                    async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers={"X-Ghost-Key": GHOST_API_KEY}, timeout=_chat_timeout()) as response:
                         response.raise_for_status()
                         async for chunk in response.aiter_bytes(chunk_size=None):
                             t = active_chat_tasks[t_id]
@@ -357,7 +388,7 @@ async def chat_proxy(request: Request):
                 "http://localhost:8000/api/chat",
                 json=body,
                 headers={"X-Ghost-Key": GHOST_API_KEY},
-                timeout=600.0,
+                timeout=_chat_timeout(),
             )
             return response.json()
                 

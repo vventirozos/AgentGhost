@@ -13,6 +13,7 @@ Compression levels:
 """
 
 import logging
+from collections import OrderedDict
 from ..utils.logging import pretty_log, Icons
 from typing import Any, Dict, List, Optional
 
@@ -30,7 +31,11 @@ class ContextManager:
         self.max_tokens = max_tokens
         self._estimate_tokens = token_estimator or self._default_estimate
         self._compression_level = 0
-        self._summaries_cache: Dict[str, str] = {}
+        # Bounded LRU-ish cache (insertion-ordered dict) so a long-lived
+        # session with many distinct large tool outputs can't grow it without
+        # bound. Oldest entries are evicted past the cap.
+        self._summaries_cache: "OrderedDict[str, str]" = OrderedDict()
+        self._summaries_cache_max = 256
 
     @staticmethod
     def _default_estimate(messages: List[dict]) -> int:
@@ -171,6 +176,7 @@ class ContextManager:
         # Check cache
         cache_key = f"{tool_name}:{hash(content)}"
         if cache_key in self._summaries_cache:
+            self._summaries_cache.move_to_end(cache_key)  # LRU bump
             return {**msg, "content": self._summaries_cache[cache_key]}
 
         # Heuristic compression: keep first and last lines, error lines
@@ -194,6 +200,9 @@ class ContextManager:
         # Only use compression if it actually saves space
         if len(summary) < len(content) * 0.8:
             self._summaries_cache[cache_key] = summary
+            self._summaries_cache.move_to_end(cache_key)
+            while len(self._summaries_cache) > self._summaries_cache_max:
+                self._summaries_cache.popitem(last=False)  # evict oldest
             return {**msg, "content": summary}
         return msg
 

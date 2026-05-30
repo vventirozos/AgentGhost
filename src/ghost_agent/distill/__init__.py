@@ -9,11 +9,13 @@ tuples. Two uses:
      pipeline builds a dataset without ever having run a data-collection
      campaign.
 
-  2. Active: `self_consistency.sample()` runs the same prompt N times
-     at varied temperatures, uses the validator (when available) to
+  2. Offline-only: `self_consistency.sample()` runs the same prompt N
+     times at varied temperatures, uses the validator (when available) to
      label each sample pass/fail, and writes the labeled batch to the
      trajectory store. That's the rejection-sampling corpus: (failed
-     attempt, successful attempt) pairs from the same model.
+     attempt, successful attempt) pairs from the same model. NOTE: this is
+     invoked by the offline GEPA/training tooling, NOT by the live agent
+     loop (the arbiter reimplements the dual-sample pattern separately).
 
 Redaction runs on every write. No trajectory leaves this machine.
 """

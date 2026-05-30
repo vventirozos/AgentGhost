@@ -1750,7 +1750,13 @@ function renderMermaid(codeText) {
     mermaid.render('mermaid-graph-' + Date.now(), codeText).then(result => {
         mermaidContainer.innerHTML = result.svg;
     }).catch(err => {
-        mermaidContainer.innerHTML = `<pre style="color:#ff4444;">${err}</pre>`;
+        // textContent (not innerHTML) — the error string can echo fragments
+        // of untrusted agent-authored diagram source (reflected XSS sink).
+        mermaidContainer.replaceChildren();
+        const pre = document.createElement('pre');
+        pre.style.color = '#ff4444';
+        pre.textContent = String(err);
+        mermaidContainer.appendChild(pre);
     });
 }
 

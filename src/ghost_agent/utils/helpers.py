@@ -4,9 +4,75 @@ import asyncio
 import httpx
 import subprocess
 import platform
-from typing import List
+import ipaddress
+from typing import List, Optional
 
 import socket
+
+# Hostnames that always resolve to the local machine, regardless of DNS.
+_BLOCKED_HOSTNAMES = {"localhost", "ip6-localhost", "ip6-loopback"}
+
+
+def _ip_is_internal(ip_str: str) -> bool:
+    """True if `ip_str` is a loopback / private / link-local / reserved /
+    multicast / unspecified address — i.e. an SSRF-relevant internal target
+    (covers 127.0.0.0/8, 10/8, 172.16/12, 192.168/16, 169.254/16 incl. the
+    169.254.169.254 cloud-metadata endpoint, ::1, fc00::/7, etc.)."""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return (
+        ip.is_private or ip.is_loopback or ip.is_link_local
+        or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+    )
+
+
+def url_ssrf_reason(url: str, *, resolve: bool = True) -> Optional[str]:
+    """Return None if `url` is a safe EXTERNAL http(s) target, else a short
+    human-readable refusal reason.
+
+    The single SSRF guard shared by every tool that fetches an
+    LLM-supplied URL (web fetch, file download, vision, browser). It blocks:
+      * non-http(s) schemes — file://, gopher://, dict://, … (local-file read)
+      * hosts that ARE, or (best-effort) DNS-RESOLVE TO, a loopback /
+        private / link-local / reserved address — the SSRF + cloud-metadata
+        (169.254.169.254) + internal-service class.
+    DNS resolution failures are treated as "allow" so a transient resolver
+    problem can't block a legitimate public fetch.
+    """
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(str(url))
+    except Exception:
+        return f"invalid URL: {url!r}"
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        return (
+            f"refused non-http(s) URL (scheme={scheme!r}); only http/https are "
+            f"allowed (blocks file://, gopher://, dict://, …)."
+        )
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return f"refused URL with no host: {url!r}"
+    if host in _BLOCKED_HOSTNAMES:
+        return f"refused local host {host!r} (SSRF guard)."
+    if _ip_is_internal(host):
+        return f"refused internal/loopback/link-local host {host!r} (SSRF guard)."
+    if resolve:
+        try:
+            port = parsed.port or (443 if scheme == "https" else 80)
+            infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        except Exception:
+            infos = []
+        for info in infos:
+            ip = info[4][0]
+            if _ip_is_internal(ip):
+                return (
+                    f"refused host {host!r} resolving to internal address {ip} "
+                    f"(SSRF guard)."
+                )
+    return None
 
 def request_new_tor_identity(control_port=9051, password=""):
     try:
@@ -43,20 +109,13 @@ def request_new_tor_identity(control_port=9051, password=""):
             return False, f"Tor control port error: {e}. Fallback restart also failed: {fallback_e}"
 
 async def helper_fetch_url_content(url: str) -> str:
-    # --- URL VALIDATION ---
-    # Reject anything that isn't an http(s) URL. Without this, an LLM
-    # tool call could fetch `file:///etc/passwd`, hit internal endpoints
-    # via the Tor proxy, or trigger SSRF against host services.
-    try:
-        from urllib.parse import urlparse
-        parsed = urlparse(str(url))
-    except Exception:
-        return f"Error: invalid URL: {url}"
-    if parsed.scheme not in ("http", "https"):
-        return f"Error: refused fetch of non-http URL ({parsed.scheme!r}). Only http and https are allowed."
-    host = (parsed.hostname or "").lower()
-    if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1") or host.startswith("169.254."):
-        return f"Error: refused fetch of local/link-local host {host!r} (SSRF guard)."
+    # --- URL VALIDATION (shared SSRF guard) ---
+    # Reject non-http(s) schemes and any host that is/resolves to an
+    # internal address, so an LLM tool call can't fetch `file:///etc/passwd`,
+    # hit cloud-metadata (169.254.169.254), or reach internal services.
+    _ssrf = url_ssrf_reason(url)
+    if _ssrf:
+        return f"Error: {_ssrf}"
 
     # 1. Setup Tor Proxy
     proxy_url = os.getenv("TOR_PROXY", "socks5://127.0.0.1:9050")

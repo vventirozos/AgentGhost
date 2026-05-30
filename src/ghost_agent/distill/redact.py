@@ -29,38 +29,66 @@ from .schema import Trajectory
 _BuiltinRule = Tuple[str, Pattern[str], str]
 
 _BUILTIN_RULES: List[_BuiltinRule] = [
-    # Bearer / Authorization headers. The optional quotes around the
-    # field name and around the value cover both HTTP header form
-    # (`Authorization: Bearer xxx`) and JSON form (`"Authorization":
-    # "Bearer xxx"`).
+    # PEM private-key blocks (multi-line) — most specific, run first so the
+    # whole block collapses before any sub-pattern nibbles at it.
+    ("pem_private_key", re.compile(
+        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
+        r"[\s\S]+?-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
+    ), "<REDACTED_PRIVATE_KEY>"),
+
+    # Bearer / Authorization headers (HTTP header form + JSON form).
     ("auth_header", re.compile(
         r"(?i)(authorization\"?\s*:\s*\"?)(bearer\s+[^\s\"',]+)"
     ), r"\1<REDACTED_BEARER>"),
 
-    # OpenAI / Anthropic / generic sk- prefixed keys
-    ("openai_key", re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "<REDACTED_API_KEY>"),
-    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "<REDACTED_API_KEY>"),
+    # JWTs (header.payload.signature, all base64url).
+    ("jwt", re.compile(
+        r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"
+    ), "<REDACTED_JWT>"),
 
-    # Slack tokens
+    # Anthropic keys FIRST (more specific) so they get their own label
+    # before the generic openai `sk-` rule would swallow them.
+    ("anthropic_key", re.compile(r"sk-ant-[A-Za-z0-9_\-]{16,}"), "<REDACTED_API_KEY>"),
+    # OpenAI / generic `sk-` (hyphen) prefixed keys.
+    ("openai_key", re.compile(r"sk-[A-Za-z0-9_\-]{16,}"), "<REDACTED_API_KEY>"),
+    # Stripe secret/restricted keys (underscore form — NOT caught by sk-).
+    ("stripe_key", re.compile(r"\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}\b"), "<REDACTED_API_KEY>"),
+    # Google API keys.
+    ("google_api_key", re.compile(r"\bAIza[0-9A-Za-z_\-]{20,}\b"), "<REDACTED_API_KEY>"),
+
+    # Slack tokens (bot/app/user/legacy).
     ("slack_bot_token", re.compile(r"xoxb-[0-9A-Za-z\-]{10,}"), "<REDACTED_SLACK_TOKEN>"),
     ("slack_app_token", re.compile(r"xapp-[0-9A-Za-z\-]{10,}"), "<REDACTED_SLACK_TOKEN>"),
-    ("slack_user_token", re.compile(r"xoxp-[0-9A-Za-z\-]{10,}"), "<REDACTED_SLACK_TOKEN>"),
+    ("slack_user_token", re.compile(r"xox[pasr]-[0-9A-Za-z\-]{10,}"), "<REDACTED_SLACK_TOKEN>"),
 
-    # GitHub personal access tokens
-    ("github_pat", re.compile(r"ghp_[A-Za-z0-9]{20,}"), "<REDACTED_GITHUB_PAT>"),
-    ("github_oauth", re.compile(r"gho_[A-Za-z0-9]{20,}"), "<REDACTED_GITHUB_TOKEN>"),
+    # GitHub tokens: classic ghp_/gho_/ghu_/ghs_ AND fine-grained github_pat_.
+    ("github_finegrained_pat", re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), "<REDACTED_GITHUB_PAT>"),
+    ("github_pat", re.compile(r"gh[posu]_[A-Za-z0-9]{20,}"), "<REDACTED_GITHUB_TOKEN>"),
 
-    # AWS access key IDs (distinctive prefix + length)
-    ("aws_access_key", re.compile(r"AKIA[0-9A-Z]{16}"), "<REDACTED_AWS_KEY>"),
+    # AWS access key IDs.
+    ("aws_access_key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"), "<REDACTED_AWS_KEY>"),
 
-    # Generic hex-looking tokens in env-var assignments
+    # Credentials embedded in a DB / broker connection URI: redact only the
+    # password between `user:` and `@host` (host/scheme are topology, not secret).
+    ("conn_uri_password", re.compile(
+        r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql)://[^\s:\"'/]+:)"
+        r"([^\s:\"'@/]+)(@)"
+    ), r"\1<REDACTED>\3"),
+
+    # Named secret env-var assignments (NAME=value or "NAME": "value").
     ("env_assignment_secret", re.compile(
-        r"((?:GHOST_API_KEY|SLACK_BOT_TOKEN|SLACK_APP_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_SECRET_ACCESS_KEY)\s*[=:]\s*)[^\s\"',]+",
+        r"((?:GHOST_API_KEY|SLACK_BOT_TOKEN|SLACK_APP_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|GH_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY)\s*[=:]\s*\"?)[^\s\"',]+",
     ), r"\1<REDACTED>"),
+
+    # Generic ALL-CAPS secret-shaped env assignment (…KEY/TOKEN/SECRET/
+    # PASSWORD/PASSWD/CREDENTIAL = value). Prefers false positives.
+    ("generic_secret_assignment", re.compile(
+        r"\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)S?)(\s*[=:]\s*\"?)([^\s\"',]+)"
+    ), r"\1\2<REDACTED>"),
 
     # JSON-style "api_key": "..." / "token": "..."
     ("json_secret_field", re.compile(
-        r'("(?:api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|password|passwd)"\s*:\s*")[^"]+(")',
+        r'("(?:api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|password|passwd|client[_-]?secret|refresh[_-]?token)"\s*:\s*")[^"]+(")',
         re.IGNORECASE,
     ), r"\1<REDACTED>\2"),
 
@@ -78,15 +106,22 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
         r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,24}"
     ), "<REDACTED_EMAIL>"),
 
-    # IPv4 addresses outside loopback + private ranges. We redact ALL
-    # v4 addresses because a leaked address even from a private range
-    # reveals local topology, and we can always un-redact in analysis.
-    # Loopback is kept readable for debugging.
+    # IPv4 addresses outside loopback. Loopback is kept readable for debugging.
     ("ipv4", re.compile(
         r"\b(?!127\.)(?!0\.0\.0\.0\b)"
         r"((?:25[0-5]|2[0-4]\d|[01]?\d\d?)"
         r"(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d\d?)){3})\b"
     ), "<REDACTED_IP>"),
+
+    # IPv6 addresses (>=4 hextet groups so `::1` loopback stays readable).
+    ("ipv6", re.compile(r"\b(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}\b"), "<REDACTED_IP>"),
+
+    # Phone numbers and credit-card numbers (ported from the selfhood diary
+    # redactor so the higher-stakes corpus is at least as strict as the diary).
+    ("credit_card", re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"), "<REDACTED_CC>"),
+    ("phone", re.compile(
+        r"(?<!\d)(?:\+?\d{1,3}[ -]?)?(?:\(?\d{2,4}\)?[ -]?)?\d{3}[ -]?\d{4}(?!\d)"
+    ), "<REDACTED_PHONE>"),
 ]
 
 
@@ -140,6 +175,27 @@ def _is_sensitive_key(key) -> bool:
     return str(key).strip().lower().replace("-", "_").replace(" ", "_") in _SENSITIVE_KEYS
 
 
+def _redact_subtree(value):
+    """Replace EVERY string leaf under `value` with ``<REDACTED>``.
+
+    Used when a key is sensitive (see ``_SENSITIVE_KEYS``) but its value is
+    a container — e.g. ``{"credentials": ["alice", "hunter2"]}`` or
+    ``{"authorization": {"value": "tok"}}`` — where the opaque secret has
+    nothing in its own shape to match on. Without this, only direct string
+    values under a sensitive key were redacted and the container-valued
+    case leaked.
+    """
+    if isinstance(value, str):
+        return "<REDACTED>"
+    if isinstance(value, dict):
+        return {k: _redact_subtree(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_subtree(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_subtree(v) for v in value)
+    return value
+
+
 def _redact_value(value, _r):
     """Recursively redact every string *leaf* inside a nested container.
 
@@ -157,8 +213,9 @@ def _redact_value(value, _r):
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if isinstance(v, str) and _is_sensitive_key(k):
-                out[k] = "<REDACTED>"
+            if _is_sensitive_key(k):
+                # Sensitive key → redact the WHOLE value (string or container).
+                out[k] = "<REDACTED>" if isinstance(v, str) else _redact_subtree(v)
             else:
                 out[k] = _redact_value(v, _r)
         return out

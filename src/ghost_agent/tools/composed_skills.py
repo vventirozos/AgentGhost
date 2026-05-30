@@ -7,15 +7,39 @@ repeated use. Unlike single acquired skills, composed skills are
 procedures the agent can execute as a single macro.
 """
 
+import asyncio
 import json
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+from ..utils.logging import pretty_log, Icons
+
 logger = logging.getLogger("GhostAgent")
+
+# A composed-skill name is advertised to the LLM as a top-level tool name
+# (see `to_tool_definitions`), so it must be a bare identifier — no spaces,
+# dots, slashes, or punctuation that would break the function catalogue or
+# let a macro masquerade as a path. Same shape-guard rationale as the
+# acquired-skill name check in acquired_skills.py.
+_SAFE_COMPOSED_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
+def _validate_composed_name(name: str) -> str:
+    """Return `name` if it is a safe identifier; raise ValueError otherwise."""
+    if not isinstance(name, str) or not name:
+        raise ValueError(f"composed-skill name must be a non-empty string, got {name!r}")
+    if not _SAFE_COMPOSED_NAME_RE.match(name):
+        raise ValueError(
+            f"composed-skill name {name!r} rejected: must match "
+            f"[A-Za-z_][A-Za-z0-9_]{{0,63}} (it becomes an LLM tool name, so no "
+            f"spaces, dots, slashes, or punctuation)."
+        )
+    return name
 
 
 @dataclass
@@ -50,6 +74,16 @@ class ComposedSkill:
     trigger_description: str  # For semantic matching
     steps: List[SkillStep] = field(default_factory=list)
     branches: Dict[str, List[SkillStep]] = field(default_factory=dict)
+    # "sequential" (default) runs steps in order with branching support;
+    # "parallel" fans every step out concurrently and returns all results
+    # — the right mode for an independent read-only bundle like a briefing.
+    execution_mode: str = "sequential"
+    # "active" macros are advertised to the LLM and dispatchable; "proposed"
+    # macros are auto-discovered drafts (mined from the trajectory log by the
+    # dream cycle) awaiting user approval — they are stored and listable but
+    # deliberately NOT advertised or executable until approved via
+    # manage_composed_skills(action="approve").
+    status: str = "active"
     usage_count: int = 0
     success_count: int = 0
     last_used: float = 0.0
@@ -65,6 +99,8 @@ class ComposedSkill:
             "trigger_description": self.trigger_description,
             "steps": [s.to_dict() for s in self.steps],
             "branches": {k: [s.to_dict() for s in v] for k, v in self.branches.items()},
+            "execution_mode": self.execution_mode,
+            "status": self.status,
             "usage_count": self.usage_count,
             "success_count": self.success_count,
             "success_rate": self.success_rate,
@@ -111,6 +147,8 @@ class ComposedSkillRegistry:
                     trigger_description=skill_data.get("trigger_description", ""),
                     steps=steps,
                     branches=branches,
+                    execution_mode=skill_data.get("execution_mode", "sequential"),
+                    status=skill_data.get("status", "active"),
                     usage_count=skill_data.get("usage_count", 0),
                     success_count=skill_data.get("success_count", 0),
                     last_used=skill_data.get("last_used", 0),
@@ -135,10 +173,18 @@ class ComposedSkillRegistry:
     def register(self, skill: ComposedSkill) -> bool:
         """Register a new composed skill."""
         if len(self.skills) >= self.MAX_SKILLS:
-            # Evict the least-used skill
-            worst = min(self.skills.values(), key=lambda s: s.usage_count)
+            # Evict proposed (unapproved) drafts before any active macro,
+            # then by lowest usage — so a flood of auto-proposals can never
+            # push out a macro the user actually approved or uses.
+            worst = min(
+                self.skills.values(),
+                key=lambda s: (s.status == "active", s.usage_count),
+            )
             del self.skills[worst.name]
-            logger.info("Evicted composed skill '%s' (usage=%d)", worst.name, worst.usage_count)
+            logger.info(
+                "Evicted composed skill '%s' (status=%s, usage=%d)",
+                worst.name, worst.status, worst.usage_count,
+            )
 
         self.skills[skill.name] = skill
         self.save()
@@ -170,23 +216,32 @@ class ComposedSkillRegistry:
             self.save()
 
     def compile_from_pattern(self, pattern_name: str,
-                             tool_sequence: List[Dict[str, str]],
-                             description: str) -> ComposedSkill:
+                             tool_sequence: List[Dict[str, Any]],
+                             description: str,
+                             *,
+                             status: str = "proposed",
+                             execution_mode: str = "sequential") -> ComposedSkill:
         """Compile a detected tool-call pattern into a ComposedSkill.
 
-        Called by the dream cycle when it detects a recurring sequence.
+        Called by the dream cycle when it mines a recurring tool-call
+        sequence from the trajectory log. Defaults to ``status="proposed"``
+        — an auto-discovered draft that is stored and listable but NOT
+        advertised to the LLM or dispatchable until the user approves it via
+        ``manage_composed_skills(action="approve")``.
         """
         steps = []
         for i, entry in enumerate(tool_sequence):
             steps.append(SkillStep(
                 tool_name=entry.get("tool", "unknown"),
                 description=entry.get("description", f"Step {i+1}"),
-                param_template=entry.get("params", {}),
+                param_template=entry.get("params", {}) or {},
             ))
         skill = ComposedSkill(
             name=pattern_name,
             trigger_description=description,
             steps=steps,
+            execution_mode=execution_mode,
+            status=status,
         )
         self.register(skill)
         return skill
@@ -200,6 +255,10 @@ class ComposedSkillRegistry:
         """
         defs: List[dict] = []
         for name, skill in self.skills.items():
+            # Proposed (auto-discovered, unapproved) macros are NOT shown to
+            # the LLM — they await user approval first.
+            if skill.status != "active":
+                continue
             param_keys: set = set()
             for step in skill.steps:
                 if isinstance(step.param_template, dict):
@@ -229,10 +288,26 @@ class ComposedSkillRegistry:
             })
         return defs
 
+    @staticmethod
+    def _resolve_args(step: "SkillStep", params: Dict[str, Any]) -> Dict[str, Any]:
+        """Resolve a step's `$variable` param templates against runtime params."""
+        resolved_args = {}
+        for k, v in step.param_template.items():
+            if isinstance(v, str) and v.startswith("$"):
+                resolved_args[k] = params.get(v[1:], v)
+            else:
+                resolved_args[k] = v
+        return resolved_args
+
     async def execute(self, skill_name: str,
                       executor: Callable,
                       params: Dict[str, Any] = None) -> Dict[str, Any]:
         """Execute a composed skill using the provided tool executor.
+
+        Dispatches on the skill's ``execution_mode``: ``"parallel"`` fans
+        all steps out concurrently (ideal for an independent read-only
+        bundle like a morning briefing), ``"sequential"`` (default) runs
+        them in order with conditional branching.
 
         Parameters
         ----------
@@ -242,13 +317,22 @@ class ComposedSkillRegistry:
 
         Returns
         -------
-        Dict with 'success', 'results', and 'steps_completed' keys.
+        Dict with 'success', 'results', 'steps_completed', 'total_steps'
+        and 'mode' keys.
         """
         if skill_name not in self.skills:
             return {"success": False, "error": f"Skill '{skill_name}' not found"}
 
         skill = self.skills[skill_name]
         params = params or {}
+        if skill.execution_mode == "parallel":
+            return await self._execute_parallel(skill, executor, params)
+        return await self._execute_sequential(skill, executor, params)
+
+    async def _execute_sequential(self, skill: "ComposedSkill",
+                                  executor: Callable,
+                                  params: Dict[str, Any]) -> Dict[str, Any]:
+        """Run steps in order, honouring conditional branches and optional steps."""
         results = []
         success = True
 
@@ -257,13 +341,7 @@ class ComposedSkillRegistry:
 
         while step_idx < len(active_steps):
             step = active_steps[step_idx]
-            # Resolve parameter templates
-            resolved_args = {}
-            for k, v in step.param_template.items():
-                if isinstance(v, str) and v.startswith("$"):
-                    resolved_args[k] = params.get(v[1:], v)
-                else:
-                    resolved_args[k] = v
+            resolved_args = self._resolve_args(step, params)
 
             try:
                 result = await executor(step.tool_name, resolved_args)
@@ -295,12 +373,56 @@ class ComposedSkillRegistry:
 
             step_idx += 1
 
-        self.record_usage(skill_name, success)
+        self.record_usage(skill.name, success)
         return {
             "success": success,
             "results": results,
             "steps_completed": len(results),
             "total_steps": len(skill.steps),
+            "mode": "sequential",
+        }
+
+    async def _execute_parallel(self, skill: "ComposedSkill",
+                                executor: Callable,
+                                params: Dict[str, Any]) -> Dict[str, Any]:
+        """Fan every step out concurrently, then collect all results.
+
+        Branching does NOT apply in parallel mode — there is no ordered
+        result to test a `branch_condition` against, so branches are
+        ignored. Every step runs even if a sibling fails; a non-optional
+        step failing marks the whole macro failed but never aborts the
+        fan-out (we want the briefing's other panels regardless).
+        """
+        async def _run_step(step: "SkillStep") -> Dict[str, Any]:
+            resolved_args = self._resolve_args(step, params)
+            try:
+                result = await executor(step.tool_name, resolved_args)
+                return {
+                    "step": step.description,
+                    "tool": step.tool_name,
+                    "result": str(result)[:1000],
+                    "success": True,
+                }
+            except Exception as exc:
+                return {
+                    "step": step.description,
+                    "tool": step.tool_name,
+                    "error": str(exc),
+                    "success": False,
+                    "optional": step.optional,
+                }
+
+        results = list(await asyncio.gather(*[_run_step(s) for s in skill.steps]))
+        # A step is "tolerated" if it succeeded or was declared optional.
+        success = all(r["success"] or r.get("optional") for r in results)
+
+        self.record_usage(skill.name, success)
+        return {
+            "success": success,
+            "results": results,
+            "steps_completed": len(results),
+            "total_steps": len(skill.steps),
+            "mode": "parallel",
         }
 
 
@@ -318,11 +440,14 @@ def _registry_from_context(context) -> Optional[ComposedSkillRegistry]:
     cached = getattr(context, "_composed_skill_registry", None)
     if isinstance(cached, ComposedSkillRegistry):
         return cached
-    sandbox_dir = getattr(context, "sandbox_dir", None)
-    if sandbox_dir is None:
+    # Prefer memory_dir so macros persist across sandbox wipes (same
+    # rationale as acquired skills); fall back to sandbox_dir for
+    # early-init contexts that haven't wired memory_dir yet.
+    base = getattr(context, "memory_dir", None) or getattr(context, "sandbox_dir", None)
+    if base is None:
         return None
     try:
-        storage_dir = Path(sandbox_dir) / "composed_skills"
+        storage_dir = Path(base) / "composed_skills"
     except Exception:
         return None
     reg = ComposedSkillRegistry(storage_dir=storage_dir)
@@ -371,3 +496,263 @@ def register_composed_skills(tool_definitions: list, context) -> int:
     if added:
         logger.info("Registered %d composed skill(s) into tool definitions.", added)
     return added
+
+
+def _format_execution_result(skill_name: str, result: Dict[str, Any]) -> str:
+    """Render an `execute()` result dict as a compact, LLM-readable string.
+
+    This is what the agent's dispatch loop hands back as the tool result;
+    the model then synthesises the briefing/answer from the per-step
+    blocks. Each step's body is already bounded to 1000 chars by
+    `execute()`, so a chatty step can't blow the context budget.
+    """
+    # Guard-style failures (unknown skill) carry an 'error' and no 'results'.
+    if not result.get("success") and "error" in result and "results" not in result:
+        return f"[composed skill '{skill_name}' error] {result.get('error')}"
+
+    mode = result.get("mode", "sequential")
+    header = (
+        f"COMPOSED SKILL '{skill_name}' — "
+        f"{result.get('steps_completed', 0)}/{result.get('total_steps', 0)} steps "
+        f"({mode}), overall {'OK' if result.get('success') else 'PARTIAL/FAIL'}."
+    )
+    blocks = [header]
+    for i, r in enumerate(result.get("results", []), 1):
+        head = f"[{i}] {r.get('tool')} — {r.get('step')}"
+        if r.get("success"):
+            blocks.append(f"{head}:\n{r.get('result', '')}")
+        else:
+            opt = " (optional)" if r.get("optional") else ""
+            blocks.append(f"{head}: FAILED{opt} — {r.get('error', 'unknown error')}")
+    return "\n\n".join(blocks)
+
+
+def build_step_executor(tools_ref: Dict[str, Callable], composed_names) -> Callable:
+    """Return an async ``(tool_name, args) -> result_str`` dispatcher that
+    runs a single composed-skill STEP against the agent's live tool dict.
+
+    ``tools_ref`` is the same dict ``get_available_tools`` builds — captured
+    by reference, so it is fully populated by the time a step actually runs.
+    ``composed_names`` is the set of composed-skill names; steps are
+    FORBIDDEN from invoking another composed skill, which is what stops a
+    macro from recursing into itself (or a cycle of macros) and blowing the
+    stack.
+    """
+    composed = set(composed_names or ())
+
+    async def _exec_step(tool_name: str, tool_args: Dict[str, Any]):
+        if tool_name in composed:
+            return (
+                f"[blocked] '{tool_name}' is itself a composed skill; "
+                f"composed skills cannot be nested as steps."
+            )
+        fn = tools_ref.get(tool_name)
+        if fn is None:
+            return f"[error] step tool '{tool_name}' is not available."
+        return await fn(**(tool_args or {}))
+
+    return _exec_step
+
+
+def make_composed_skill_runner(skill_name: str, registry: "ComposedSkillRegistry",
+                               tools_ref: Dict[str, Callable], composed_names) -> Callable:
+    """Build the top-level tool runner for one composed skill.
+
+    The returned coroutine is what ``get_available_tools`` registers under
+    the macro's name. Calling it fans the macro's steps out through
+    ``build_step_executor`` and returns a formatted, LLM-readable summary.
+    """
+    async def _run(**kwargs):
+        skill = registry.skills.get(skill_name)
+        nsteps = len(skill.steps) if skill else "?"
+        mode = skill.execution_mode if skill else "?"
+        pretty_log(
+            "Composed Skill",
+            f"Running macro '{skill_name}' ({nsteps} steps, {mode}).",
+            icon=Icons.BRAIN_PLAN,
+        )
+        executor = build_step_executor(tools_ref, composed_names)
+        result = await registry.execute(skill_name, executor, params=kwargs)
+        return _format_execution_result(skill_name, result)
+
+    return _run
+
+
+def register_composed_skill_runners(tools: Dict[str, Callable], context) -> int:
+    """Mutate the ``tools`` executor dict in-place to add a runner for each
+    registered composed skill. Counterpart to ``register_composed_skills``
+    (which adds the LLM-facing DEFINITIONS) — together they make a macro
+    both visible to the model AND dispatchable.
+
+    A macro name is skipped if it would shadow a built-in / acquired-skill
+    runner already in ``tools`` (same shadow policy as the definition side),
+    which keeps a macro from hijacking a real tool name.
+    """
+    if not isinstance(tools, dict):
+        return 0
+    reg = _registry_from_context(context)
+    if reg is None or not reg.skills:
+        return 0
+    composed_names = set(reg.skills.keys())
+    added = 0
+    for name, skill in reg.skills.items():
+        # Proposed (auto-discovered, unapproved) drafts are not dispatchable
+        # until the user approves them.
+        if skill.status != "active":
+            continue
+        if name in tools:
+            logger.warning(
+                "Composed skill '%s' shadows an existing tool runner — skipping.",
+                name,
+            )
+            continue
+        tools[name] = make_composed_skill_runner(name, reg, tools, composed_names)
+        added += 1
+    if added:
+        logger.info("Wired %d composed-skill runner(s) into the tool dispatch.", added)
+    return added
+
+
+async def tool_manage_composed_skills(context=None, action: str = None,
+                                      name: str = None, description: str = None,
+                                      steps=None, mode: str = "parallel",
+                                      known_tools=None, **_extra):
+    """Define / list / delete composed skills — named macros that bundle
+    several tool calls into ONE invocation.
+
+    Actions
+    -------
+    define : register a new macro. ``steps`` is a list of
+        ``{tool, description, params, optional}`` objects. ``mode`` is
+        ``"parallel"`` (default — fan out independent steps) or
+        ``"sequential"`` (ordered). The macro becomes a top-level tool the
+        agent invokes by ``name``.
+    list   : show all registered macros.
+    delete : remove one by ``name``.
+    """
+    if not action:
+        return "SYSTEM ERROR: 'action' is MANDATORY (define | list | delete)."
+    reg = _registry_from_context(context)
+    if reg is None:
+        return ("SYSTEM ERROR: composed-skill storage is unavailable "
+                "(no sandbox/memory dir on the active context).")
+    action = action.strip().lower()
+
+    if action == "list":
+        if not reg.skills:
+            return "No composed skills defined yet."
+        active = [(n, sk) for n, sk in reg.skills.items() if sk.status == "active"]
+        proposed = [(n, sk) for n, sk in reg.skills.items() if sk.status != "active"]
+        out = ["Composed skills (macros):"]
+        for n, sk in active:
+            out.append(
+                f"- {n} [{sk.execution_mode}] — {sk.trigger_description} "
+                f"({len(sk.steps)} steps; used {sk.usage_count}x, "
+                f"{sk.success_rate:.0%} ok)"
+            )
+        if not active:
+            out.append("(none active)")
+        if proposed:
+            out.append("")
+            out.append("Proposed (auto-discovered from your tool-use history — approve to activate):")
+            for n, sk in proposed:
+                seq = " → ".join(s.tool_name for s in sk.steps)
+                out.append(f"- {n} [proposed, {sk.execution_mode}] — {sk.trigger_description} (steps: {seq})")
+            out.append("")
+            out.append(
+                "Approve with manage_composed_skills(action='approve', name='<name>'); "
+                "reject with action='delete'."
+            )
+        return "\n".join(out)
+
+    if action == "approve":
+        if not name:
+            return "Error: 'name' is required for approve."
+        if name not in reg.skills:
+            return f"Error: composed skill '{name}' not found."
+        sk = reg.skills[name]
+        if sk.status == "active":
+            return f"Composed skill '{name}' is already active."
+        sk.status = "active"
+        reg.save()
+        pretty_log("Macro Approved", f"Activated proposed macro: {name}", icon=Icons.OK)
+        return (
+            f"Success: composed skill '{name}' approved and activated. It is now "
+            f"a top-level tool — invoke it by name. (Its step parameters were "
+            f"mined from past calls; delete + redefine if you want to adjust them.)"
+        )
+
+    if action == "delete":
+        if not name:
+            return "Error: 'name' is required for delete."
+        if name not in reg.skills:
+            return f"Error: composed skill '{name}' not found."
+        del reg.skills[name]
+        reg.save()
+        pretty_log("Macro Forgotten", f"Deleted composed skill: {name}", icon=Icons.MEM_WIPE)
+        return f"Success: composed skill '{name}' deleted."
+
+    if action == "define":
+        if not name or not description or not steps:
+            return ("SYSTEM ERROR: 'name', 'description', and 'steps' are "
+                    "MANDATORY for define.")
+        try:
+            name = _validate_composed_name(name)
+        except ValueError as ve:
+            return f"Error: {ve}"
+        if not isinstance(steps, list) or not steps:
+            return "Error: 'steps' must be a non-empty list of step objects."
+        mode = (mode or "parallel").strip().lower()
+        if mode not in ("parallel", "sequential"):
+            return "Error: 'mode' must be 'parallel' or 'sequential'."
+
+        skill_steps: List[SkillStep] = []
+        unknown_tools: List[str] = []
+        for i, raw in enumerate(steps):
+            if not isinstance(raw, dict):
+                return f"Error: step {i + 1} must be an object, got {type(raw).__name__}."
+            tool = (raw.get("tool") or raw.get("tool_name") or "").strip()
+            if not tool:
+                return f"Error: step {i + 1} is missing 'tool'."
+            if tool == name:
+                return (f"Error: step {i + 1} references the macro itself "
+                        f"('{name}') — composed skills cannot recurse.")
+            if known_tools and tool not in known_tools:
+                unknown_tools.append(tool)
+            params = raw.get("params") or raw.get("param_template") or {}
+            if not isinstance(params, dict):
+                return f"Error: step {i + 1} 'params' must be an object."
+            skill_steps.append(SkillStep(
+                tool_name=tool,
+                description=(raw.get("description") or f"Step {i + 1}"),
+                param_template=params,
+                optional=bool(raw.get("optional", False)),
+            ))
+
+        skill = ComposedSkill(
+            name=name,
+            trigger_description=description,
+            steps=skill_steps,
+            execution_mode=mode,
+        )
+        reg.register(skill)
+        pretty_log(
+            "Macro Defined",
+            f"Composed skill '{name}' ({len(skill_steps)} steps, {mode}).",
+            icon=Icons.MEM_SAVE,
+        )
+        msg = (
+            f"Success: composed skill '{name}' defined with {len(skill_steps)} "
+            f"steps ({mode} mode). It is now a TOP-LEVEL TOOL — invoke it by "
+            f"name like any built-in; its steps run and the combined results "
+            f"come back for you to synthesise."
+        )
+        if unknown_tools:
+            msg += (
+                f"\nWARNING: these step tools aren't recognised built-ins and "
+                f"will error at run time unless they are acquired skills: "
+                f"{', '.join(sorted(set(unknown_tools)))}."
+            )
+        return msg
+
+    return f"Error: unknown action '{action}' (use define | list | approve | delete)."

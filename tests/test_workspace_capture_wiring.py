@@ -103,8 +103,12 @@ async def test_tool_execute_records_failed_command(tmp_path: Path):
     fake_sandbox = MagicMock()
     fake_sandbox.execute = MagicMock(return_value=("permission denied", 1))
 
+    # A non-destructive command that fails (exit 1). NB: a destructive form
+    # like `rm -rf /protected` is now (correctly) blocked by the unconditional
+    # pre-execution validator before it reaches the sandbox, so it would never
+    # be recorded — use a plain failing command to exercise the outcome sink.
     out = await execute_mod.tool_execute(
-        command="rm -rf /protected",
+        command="cat /protected/secret.txt",
         sandbox_dir=tmp_path,
         sandbox_manager=fake_sandbox,
         workspace_model=wm,
@@ -113,7 +117,7 @@ async def test_tool_execute_records_failed_command(tmp_path: Path):
     cmds = wm.activity.recent(limit=5, kind="command")
     assert cmds
     assert cmds[0].payload.get("exit_code") == 1
-    assert "rm" in cmds[0].payload.get("command", "")
+    assert "cat" in cmds[0].payload.get("command", "")
 
 
 async def test_tool_execute_skips_fast_successful_commands(tmp_path: Path):

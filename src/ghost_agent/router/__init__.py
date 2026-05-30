@@ -31,6 +31,7 @@ from .features import extract_features, FeatureVector, FEATURE_NAMES
 from .labels import derive_label, label_trajectories, LabelSpec
 from .model import ComplexityClassifier, TrainingReport
 from .dispatch import ComplexityDispatcher, RoutingDecision
+from .trainer import RouterTrainer, RouterTrainerReport
 
 __all__ = [
     "extract_features",
@@ -43,4 +44,6 @@ __all__ = [
     "TrainingReport",
     "ComplexityDispatcher",
     "RoutingDecision",
+    "RouterTrainer",
+    "RouterTrainerReport",
 ]

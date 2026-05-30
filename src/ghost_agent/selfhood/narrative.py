@@ -199,8 +199,19 @@ class NarrativeSummariser:
     def _format_state_block(self, state: Optional[SelfStateThread]) -> str:
         if state is None:
             return "(no persisted state)"
-        block = state.format_as_prefix()
-        return block or "(no open questions or unfinished threads)"
+        block = state.format_as_prefix() or "(no open questions or unfinished threads)"
+        # Mood arc: surface how my functional state has SHIFTED recently so the
+        # narrative can describe an arc ("stuck → satisfied") rather than only
+        # the latest slot. Wires the previously-unread mood_history reader.
+        try:
+            hist = state.mood_history(limit=8)
+            labels = [getattr(m, "label", "") for m in (hist or []) if getattr(m, "label", "")]
+            arc = [l for i, l in enumerate(labels) if i == 0 or l != labels[i - 1]]  # collapse repeats
+            if len(arc) >= 2:
+                block = f"{block}\nMood arc lately: {' → '.join(arc)}."
+        except Exception:
+            pass
+        return block
 
     def _format_patterns_block(
         self, autobio: AutobiographicalMemory, meta_insights: str,

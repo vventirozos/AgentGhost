@@ -482,7 +482,9 @@ def detect_tool_patterns(skill_memory) -> list:
         solution = (lesson.get("solution") or "").lower()
         task = (lesson.get("task") or "").lower()
         combined = f"{task} {solution}"
-        # Extract ordered tool mentions
+        # Extract the SET of tools mentioned (unordered co-occurrence — the
+        # key is sorted below, so this is NOT a sequence; for true ordered
+        # sequence mining see mine_recurring_tool_sequences).
         found_tools = []
         for tool in tool_keywords:
             if tool in combined:
@@ -508,6 +510,144 @@ def detect_tool_patterns(skill_memory) -> list:
                 "frequency": data["count"],
             })
     return results
+
+
+# Tools that should never anchor an auto-proposed macro: meta / control-flow
+# tools, or one-off side-effecting tools that aren't reusable as a bundled
+# step. A mined window made up entirely of these is dropped.
+_MACRO_IGNORE_TOOLS = frozenset({
+    "replan", "abort_attempt", "flag_uncertainty", "manage_composed_skills",
+    "create_skill", "manage_skills", "self_play", "self_play_loop",
+    "stop_self_play", "dream_mode", "self_state", "introspect",
+})
+
+# A composed-skill name must be a bare identifier (it becomes an LLM tool
+# name on approval). Mirror the validator in composed_skills without importing.
+_MACRO_NAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_]")
+
+
+def _safe_macro_name(tools_seq) -> str:
+    """Build a valid-identifier macro name from a tool-name sequence."""
+    raw = "auto_" + "_".join(tools_seq)
+    cleaned = _MACRO_NAME_UNSAFE_RE.sub("_", raw)[:64]
+    return cleaned or "auto_macro"
+
+
+def mine_recurring_tool_sequences(
+    trajectories,
+    *,
+    min_len: int = 2,
+    max_len: int = 4,
+    min_support: int = 3,
+    max_proposals: int = 3,
+    ignore_tools=_MACRO_IGNORE_TOOLS,
+) -> list:
+    """Mine recurring CONTIGUOUS tool-call sequences from trajectories.
+
+    ``trajectories`` is any iterable of objects exposing ``.tool_calls``
+    (each item has ``.name`` and ``.arguments``), ``.id``, and ``.outcome``
+    — i.e. the distill ``Trajectory`` shape, but duck-typed so tests can
+    pass lightweight fakes.
+
+    Returns up to ``max_proposals`` proposal dicts of the shape::
+
+        {"name", "description",
+         "steps": [{"tool", "description", "params"}],
+         "support", "signature"}
+
+    where ``support`` is the number of DISTINCT trajectories the sequence
+    appears in (and is >= ``min_support``), and each step's ``params`` is
+    the MOST COMMON argument set observed at that position across all
+    occurrences — so an approved macro replays realistic arguments, not an
+    empty skeleton. Trajectories whose outcome is ``"failed"`` are skipped:
+    we don't want to immortalise failure patterns as macros.
+    """
+    from collections import Counter
+
+    sig_traj_ids: Dict[tuple, set] = {}       # signature -> set of distinct traj ids
+    sig_arg_samples: Dict[tuple, list] = {}   # signature -> [ [json-args, ...] per position ]
+
+    for traj in trajectories:
+        if (getattr(traj, "outcome", "") or "") == "failed":
+            continue
+        calls = getattr(traj, "tool_calls", None) or []
+        names = [getattr(c, "name", "") or "" for c in calls]
+        args = [getattr(c, "arguments", {}) or {} for c in calls]
+        tid = getattr(traj, "id", None) or id(traj)
+        n = len(names)
+        for L in range(min_len, min(max_len, n) + 1):
+            for i in range(n - L + 1):
+                window = tuple(names[i:i + L])
+                if not all(window):
+                    continue
+                # Drop windows that are entirely meta tools, or a single
+                # tool repeated (low value as a reusable macro).
+                if all(t in ignore_tools for t in window):
+                    continue
+                if len(set(window)) == 1:
+                    continue
+                sig_traj_ids.setdefault(window, set()).add(tid)
+                samples = sig_arg_samples.setdefault(window, [[] for _ in range(L)])
+                for j in range(L):
+                    try:
+                        samples[j].append(json.dumps(args[i + j], sort_keys=True, default=str))
+                    except Exception:
+                        samples[j].append("{}")
+
+    # Candidates meeting the distinct-trajectory support threshold.
+    candidates = [
+        (sig, len(tids)) for sig, tids in sig_traj_ids.items()
+        if len(tids) >= min_support
+    ]
+    # Prefer higher support, then longer sequences.
+    candidates.sort(key=lambda x: (x[1], len(x[0])), reverse=True)
+
+    def _is_subwindow(short, long_) -> bool:
+        ls, ll = len(short), len(long_)
+        if ls >= ll:
+            return False
+        return any(long_[k:k + ls] == short for k in range(ll - ls + 1))
+
+    # Drop a candidate that is a contiguous sub-window of an already-accepted
+    # longer candidate with >= the support (the longer one subsumes it).
+    accepted = []
+    for sig, support in candidates:
+        if any(_is_subwindow(sig, asig) and support <= asup for asig, asup in accepted):
+            continue
+        accepted.append((sig, support))
+        if len(accepted) >= max_proposals:
+            break
+
+    proposals = []
+    for sig, support in accepted:
+        samples = sig_arg_samples.get(sig, [])
+        steps = []
+        for pos, tool in enumerate(sig):
+            params: Dict[str, Any] = {}
+            if pos < len(samples) and samples[pos]:
+                common_json, _ = Counter(samples[pos]).most_common(1)[0]
+                try:
+                    decoded = json.loads(common_json)
+                    if isinstance(decoded, dict):
+                        params = decoded
+                except Exception:
+                    params = {}
+            steps.append({
+                "tool": tool,
+                "description": f"{tool} (step {pos + 1})",
+                "params": params,
+            })
+        proposals.append({
+            "name": _safe_macro_name(sig),
+            "description": (
+                f"Auto-discovered recurring sequence ({' → '.join(sig)}) "
+                f"seen in {support} past turns."
+            ),
+            "steps": steps,
+            "support": support,
+            "signature": sig,
+        })
+    return proposals
 
 
 # Regex used by `_summarize_long_transcript` to mine the middle of a
@@ -981,6 +1121,29 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             except Exception as pe:
                 logger.debug(f"Pattern detection in dream failed: {pe}")
 
+            # --- AUTO-MACRO PROPOSALS ---------------------------------
+            # Mine the trajectory log for recurring tool-call SEQUENCES and
+            # register the strongest as PROPOSED composed-skill macros for
+            # the user to approve. Distinct from detect_tool_patterns above
+            # (which saves advisory lessons): this produces executable macro
+            # drafts via compile_from_pattern. Non-fatal.
+            macros_proposed = 0
+            try:
+                _macro_res = await asyncio.to_thread(self._propose_macros_sync)
+                macros_proposed = int(_macro_res.get("proposed", 0) or 0)
+            except Exception as me:
+                logger.debug(f"Macro proposal step failed: {me}")
+
+            # --- SKILL GRADUATION ---
+            # Promote frequently-referenced, code-bearing lessons into
+            # TDD-verified acquired skills. Gated on freq>=5 un-graduated
+            # lessons, so most cycles short-circuit cheaply with no LLM call.
+            # (Previously graduate_lessons had no caller at all.)
+            try:
+                await self.graduate_lessons(model_name=model_name)
+            except Exception as ge:
+                logger.debug(f"Skill graduation step failed: {ge}")
+
             # --- RETRIEVAL-UTILITY PRUNING ----------------------------
             # REM is the natural place to garbage-collect lessons that
             # have been retrieved enough times to be judged and didn't
@@ -999,7 +1162,9 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                     if callable(prune_fn) and not isinstance(
                         type(sm).__name__, type(None)
                     ) and type(sm).__module__.startswith("ghost_agent"):
-                        raw_count = await asyncio.to_thread(prune_fn)
+                        # Pass memory_system so pruned lessons' vector twins are
+                        # deleted too (no orphan vectors drifting from the JSON).
+                        raw_count = await asyncio.to_thread(prune_fn, 5, 0.25, self.memory)
                         try:
                             pruned_count = int(raw_count) if raw_count else 0
                         except Exception:
@@ -1013,6 +1178,8 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 metrics_note = f" ({skipped_low_compression} low-compression consolidations skipped)"
             if patterns_found > 0:
                 metrics_note += f" ({patterns_found} tool-call patterns detected)"
+            if macros_proposed > 0:
+                metrics_note += f" ({macros_proposed} macros proposed)"
             if pruned_count > 0:
                 metrics_note += f" ({pruned_count} low-utility lessons pruned)"
             # Record the fragment set we just processed so the next REM
@@ -1029,6 +1196,101 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             msg = f"Dream error: {e}"
             pretty_log("Dream Mode", msg, level="ERROR", icon="❌")
             return msg
+
+    def _fallback_trajectory_collector(self):
+        """Best-effort READ-ONLY collector at the canonical on-disk trajectory
+        root, for dream runs whose context lacks a live ``trajectory_collector``
+        (headless / cron, or a context built outside main.py's lifespan).
+
+        Mirrors main.py's wiring (``<memory_dir>/../trajectories``) so it reads
+        the SAME corpus the live collector writes; falls back to the
+        collector's own default root ($GHOST_HOME/trajectories or
+        ~/.ghost/trajectories) when ``memory_dir`` isn't available. Returns
+        ``None`` when trajectory logging is disabled via ``--no-trajectories``
+        or the collector can't be constructed. ``enabled=False`` because this
+        instance is only ever read from — it never appends.
+        """
+        try:
+            from ..distill.collector import TrajectoryCollector
+            if getattr(getattr(self.context, "args", None), "no_trajectories", False):
+                return None  # respect the kill switch
+            mem_dir = getattr(self.context, "memory_dir", None)
+            if mem_dir is not None:
+                from pathlib import Path
+                return TrajectoryCollector(
+                    root=Path(mem_dir).parent / "trajectories", enabled=False,
+                )
+            return TrajectoryCollector(enabled=False)
+        except Exception:
+            return None
+
+    def _propose_macros_sync(self, *, max_trajectories: int = 500) -> dict:
+        """Mine the trajectory log for recurring tool sequences and register
+        the strongest as PROPOSED composed-skill macros (awaiting approval).
+
+        Synchronous (disk reads + registry writes) so the caller runs it via
+        ``asyncio.to_thread``. Returns ``{"proposed": int, "names": [...]}``.
+        Never raises — a mining failure must not break the dream cycle.
+        """
+        result = {"proposed": 0, "names": []}
+        try:
+            from collections import deque
+            from ..distill.collector import TrajectoryCollector
+            from ..tools.composed_skills import _registry_from_context
+
+            collector = getattr(self.context, "trajectory_collector", None)
+            if not isinstance(collector, TrajectoryCollector):
+                # No live recording collector on this context (a headless /
+                # cron dream run, a context built outside main.py's lifespan,
+                # or a failed collector init). Fall back to a READ-ONLY
+                # collector at the canonical on-disk trajectory root so we can
+                # still mine past turns — respecting the --no-trajectories
+                # kill switch.
+                collector = self._fallback_trajectory_collector()
+                if collector is None:
+                    return result
+            reg = _registry_from_context(self.context)
+            if reg is None:
+                return result
+
+            # Bound the walk so a huge log can't dominate the REM cycle.
+            trajs = list(deque(collector.iter_trajectories(), maxlen=max_trajectories))
+            if len(trajs) < 3:
+                return result
+
+            proposals = mine_recurring_tool_sequences(trajs)
+            if not proposals:
+                return result
+
+            # Signatures already on file (active OR proposed) so we never
+            # re-propose the same sequence on every REM cycle.
+            existing_sigs = {
+                tuple(s.tool_name for s in sk.steps) for sk in reg.skills.values()
+            }
+            active_count = sum(1 for sk in reg.skills.values() if sk.status == "active")
+
+            for p in proposals:
+                if active_count >= reg.MAX_SKILLS:
+                    break  # never let proposals crowd out active macros
+                if p["signature"] in existing_sigs or p["name"] in reg.skills:
+                    continue
+                reg.compile_from_pattern(
+                    p["name"], p["steps"], p["description"],
+                    status="proposed", execution_mode="sequential",
+                )
+                existing_sigs.add(p["signature"])
+                result["names"].append(p["name"])
+                result["proposed"] += 1
+                pretty_log(
+                    "Macro Proposed",
+                    f"Auto-discovered macro '{p['name']}' from {p['support']} turns: "
+                    f"{' → '.join(p['signature'])}. Review with "
+                    f"manage_composed_skills(action='list').",
+                    icon=Icons.IDEA,
+                )
+        except Exception as e:
+            logger.debug(f"Macro proposal mining failed: {e}")
+        return result
 
     async def graduate_lessons(self, model_name: str = "qwen-3.6-35b-a3") -> str:
         """Skill graduation pipeline: promote frequently-referenced playbook
@@ -1111,20 +1373,55 @@ Return ONLY a JSON object with:
                 result = extract_json_from_text(data["choices"][0]["message"]["content"])
 
                 if all(k in result for k in ["name", "description", "python_code", "test_payload"]):
-                    # Mark as graduated in playbook
-                    playbook[idx]["graduated"] = True
-                    skill_memory.save_playbook(playbook)
-                    graduated += 1
-                    pretty_log(
-                        "Skill Graduated",
-                        f"Lesson '{lesson['task'][:40]}' promoted to acquired skill candidate: {result['name']}",
-                        icon="🎓"
+                    # ACTUALLY create the skill via the TDD-gated path
+                    # (tool_create_skill runs the test_payload in the sandbox
+                    # and only registers the skill if it passes). The previous
+                    # code discarded python_code/test_payload entirely and just
+                    # set graduated=True — so no tool was ever created AND the
+                    # lesson was burned (excluded from future graduation
+                    # forever). Only mark graduated when creation SUCCEEDS.
+                    from ..tools.acquired_skills import tool_create_skill
+                    import json as _json
+                    _schema = result.get("parameters_schema", {"type": "object", "properties": {}})
+                    if not isinstance(_schema, str):
+                        _schema = _json.dumps(_schema)
+                    _test_payload = result["test_payload"]
+                    if not isinstance(_test_payload, str):
+                        _test_payload = _json.dumps(_test_payload)
+
+                    create_result = await tool_create_skill(
+                        sandbox_dir=getattr(self.context, "sandbox_dir", None),
+                        memory_dir=getattr(self.context, "memory_dir", None),
+                        memory_system=self.memory,
+                        sandbox_manager=getattr(self.context, "sandbox_manager", None),
+                        name=result["name"],
+                        description=result["description"],
+                        parameters_schema=_schema,
+                        python_code=result["python_code"],
+                        test_payload=_test_payload,
                     )
+                    if isinstance(create_result, str) and create_result.strip().lower().startswith("success"):
+                        playbook[idx]["graduated"] = True
+                        skill_memory.save_playbook(playbook)
+                        graduated += 1
+                        pretty_log(
+                            "Skill Graduated",
+                            f"Lesson '{lesson['task'][:40]}' graduated into acquired skill: {result['name']}",
+                            icon="🎓"
+                        )
+                    else:
+                        # TDD/creation failed — leave the lesson un-graduated so
+                        # it can be retried, and surface why.
+                        logger.info(
+                            "Graduation candidate '%s' failed creation; lesson left "
+                            "un-graduated. Detail: %s",
+                            result.get("name"), str(create_result)[:200],
+                        )
 
             except Exception as e:
                 logger.debug(f"Graduation failed for lesson {idx}: {e}")
 
-        return f"Graduation complete: {graduated} lessons promoted to skill candidates."
+        return f"Graduation complete: {graduated} lessons graduated into acquired skills."
 
     # ------------------------------------------------------------------
     # Self-play helpers: challenge sourcing, verification-grounded
@@ -2119,12 +2416,11 @@ Return ONLY a JSON object with:
                         repair_text,
                         flags=re.DOTALL | re.IGNORECASE,
                     )
-                    # Use the same extractor helpers — they already handle
-                    # the whitespace / missing-close-tag variants.
-                    repaired = _extract_with_fallback("validation_script")
-                    # The closure above reads from scrubbed/raw content_text —
-                    # but we want to run the extractor against the repair
-                    # response, not the original response. Do it inline:
+                    # Extract from the REPAIR response (not the original).
+                    # (The previous `_extract_with_fallback("validation_script")`
+                    # call here was dead — it read the original content_text and
+                    # its result was immediately overwritten by the inline regex
+                    # below.)
                     _r = re.search(
                         r'<validation_script[^>]*>(.*)</validation_script\s*>',
                         repair_text, re.DOTALL | re.IGNORECASE,
@@ -3217,11 +3513,11 @@ Return ONLY a JSON object with:
                     f"(passed={passed}, Δ={compression_delta:+.3f}, tool_errors={tool_errors})",
                     icon=Icons.BRAIN_AIM,
                 )
-                # Expose on the Dreamer so the watchdog can factor it
-                # into cooldown decisions alongside the delta.
-                self.last_correctness_score = cw_score
-                self.last_tool_errors = tool_errors
-                self.last_solution_novelty = solution_novelty
+                # (The correctness-weighted score is surfaced via the log
+                # line above; the watchdog cooldown reads last_compression_delta
+                # — set at the frontier-record step — not these. Earlier dead
+                # writes of last_correctness_score/last_tool_errors/
+                # last_solution_novelty were removed: nothing consumed them.)
 
                 # Proposal G: record adversarial-generator feedback. The
                 # fingerprint here is the seed-derived hint, which is

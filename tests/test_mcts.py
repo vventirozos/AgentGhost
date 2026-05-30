@@ -88,33 +88,10 @@ class TestMCTSReasoner:
         result = await mcts.select_best_action("task", "state", ["tools"])
         assert result is None
 
-    async def test_backtrack(self, mcts, mock_llm_client):
-        # Manually populate backtrack stack
-        alt1 = ActionCandidate(description="Alternative 1", score=0.6)
-        alt2 = ActionCandidate(description="Alternative 2", score=0.4)
-        mcts._backtrack_stack.append([alt1, alt2])
-
-        result = await mcts.backtrack()
-        assert result is not None
-        assert result.description == "Alternative 1"
-        assert result.selected is True
-
-        result2 = await mcts.backtrack()
-        assert result2.description == "Alternative 2"
-
-    async def test_backtrack_empty(self, mcts):
-        result = await mcts.backtrack()
-        assert result is None
-
-    def test_has_alternatives(self, mcts):
-        assert mcts.has_alternatives() is False
-        mcts._backtrack_stack.append([ActionCandidate(description="alt")])
-        assert mcts.has_alternatives() is True
-
     def test_clear(self, mcts):
         mcts._backtrack_stack.append([ActionCandidate(description="alt")])
         mcts.clear()
-        assert not mcts.has_alternatives()
+        assert not mcts._backtrack_stack
 
     async def test_expand_handles_exception(self, mcts, mock_llm_client):
         mock_llm_client.chat_completion.side_effect = Exception("boom")

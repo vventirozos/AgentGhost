@@ -43,10 +43,12 @@ def _make_agent(idle_seconds: int = 0,
         ctx.journal._lock = MagicMock()
         ctx.journal._lock.__enter__ = MagicMock(return_value=None)
         ctx.journal._lock.__exit__ = MagicMock(return_value=False)
+        _items = [{"type": "smart_memory", "data": {"text": "x", "model": "m"}}] * journal_items
         ctx.journal.file_path = MagicMock()
-        ctx.journal.file_path.read_text.return_value = json.dumps(
-            [{"type": "smart_memory", "data": {"text": "x", "model": "m"}}] * journal_items
-        )
+        ctx.journal.file_path.read_text.return_value = json.dumps(_items)
+        # The watchdog now routes through the guarded journal.load() (so a
+        # corrupt journal sidecars instead of silently skipping consolidation).
+        ctx.journal.load.return_value = _items
     else:
         ctx.journal = None
 

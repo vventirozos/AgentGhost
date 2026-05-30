@@ -63,7 +63,7 @@ def _get_connection(connection_string: str):
     return conn
 
 
-async def tool_postgres_admin(action: str = None, connection_string: Optional[str] = None, query: Optional[str] = None, table_name: Optional[str] = None, default_uri: Optional[str] = None, timeout_ms: Optional[int] = None, **kwargs):
+async def tool_postgres_admin(action: str = None, connection_string: Optional[str] = None, query: Optional[str] = None, table_name: Optional[str] = None, default_uri: Optional[str] = None, timeout_ms: Optional[int] = None, confirm: bool = False, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
     pretty_log("Postgres Admin", f"Action: {action}", icon=Icons.POSTGRES)
@@ -74,48 +74,68 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
     except ImportError:
         return "Error: psycopg2 or tabulate library is missing."
 
+    _supplied_conn = connection_string  # what the LLM actually passed (may be None)
     connection_string = connection_string or default_uri
     if not connection_string:
         return "Error: connection_string is required and no default is configured. Ask the user for the DB URI."
 
+    # Host restriction (SSRF / internal-DB-probe guard): when a default URI
+    # is configured, the LLM may NOT redirect the connection to a DIFFERENT
+    # host. Only honor an LLM-supplied connection_string whose host matches
+    # the configured default. (With no default configured the operator has
+    # explicitly opted into arbitrary URIs.)
+    if default_uri and _supplied_conn and _supplied_conn != default_uri:
+        try:
+            from urllib.parse import urlparse
+            _sup_host = (urlparse(_supplied_conn).hostname or "").lower()
+            _def_host = (urlparse(default_uri).hostname or "").lower()
+        except Exception:
+            return "Error: could not parse the supplied connection_string."
+        if _sup_host != _def_host:
+            return (
+                f"Error: refused connection to host {_sup_host!r}; only the "
+                f"configured database host {_def_host!r} is allowed. Omit "
+                f"connection_string to use the default."
+            )
+
     if query:
         query = extract_code_from_markdown(query)
 
-    # Metacog pre-execution SQL validator (roadmap phase 1.4). Only
-    # active when the bundle is wired (i.e. ``--enable-metacog`` set).
-    # Validator rejects unparseable SQL, unguarded DELETE/UPDATE, and
-    # raw DROP/TRUNCATE before the connection is even opened. We only
-    # validate the `query` and `explain_analyze` actions because
-    # `schema` and `activity` go through hand-crafted SQL on lines
-    # 62-83 that never sees user content.
+    # Pre-execution SQL validator (roadmap phase 1.4). Runs UNCONDITIONALLY
+    # — the destructive-statement guard (unguarded DELETE/UPDATE, raw
+    # DROP/TRUNCATE, multi-statement, unbalanced quotes) is a safety boundary
+    # that must not depend on the optional ``--enable-metacog`` uplift. Extra
+    # metacog telemetry is emitted only when the bundle is wired. We validate
+    # only `query`/`explain_analyze`; `schema`/`activity` use hand-crafted SQL
+    # that never sees user content. `confirm=true` allows DROP/TRUNCATE.
     _metacog = kwargs.get("_metacog_bundle")
-    if (_metacog is not None and getattr(_metacog, "enabled", False)
-            and query and action in ("query", "explain_analyze")):
+    if query and action in ("query", "explain_analyze"):
         try:
             from .validators import validate_sql
-            from ..core.metacog_log import (
-                emit as _mc_emit, Subsystem as _mc_ss, LEVEL_WARN,
-            )
-            ok, reason = validate_sql(query)
-            if not ok:
-                _mc_emit(
-                    _mc_ss.VALID, level=LEVEL_WARN,
-                    verdict="block", tool="sql",
-                    action=action, reason=reason,
-                    sql_head=query[:60],
-                )
+            ok, reason = validate_sql(query, confirm=bool(confirm))
+        except Exception as _vexc:
+            logger.debug("SQL validator crashed: %s", _vexc)
+            ok, reason = True, ""
+        if not ok:
+            if _metacog is not None and getattr(_metacog, "enabled", False):
                 try:
+                    from ..core.metacog_log import (
+                        emit as _mc_emit, Subsystem as _mc_ss, LEVEL_WARN,
+                    )
+                    _mc_emit(
+                        _mc_ss.VALID, level=LEVEL_WARN,
+                        verdict="block", tool="sql",
+                        action=action, reason=reason, sql_head=query[:60],
+                    )
                     _metacog.count(validator_block=True)
                 except Exception:
                     pass
-                return (
-                    f"SYSTEM BLOCK: SQL statement rejected by pre-execution "
-                    f"validator: {reason}. The query was not run. Re-emit with "
-                    f"a WHERE clause, or set `confirm=true` if you genuinely "
-                    f"need to drop/truncate."
-                )
-        except Exception as _vexc:
-            logger.debug("metacog SQL validator crashed: %s", _vexc)
+            return (
+                f"SYSTEM BLOCK: SQL statement rejected by pre-execution "
+                f"validator: {reason}. The query was not run. Re-emit with a "
+                f"WHERE clause, or pass confirm=true if you genuinely need to "
+                f"DROP/TRUNCATE."
+            )
 
     # Default timeout: 15s, but allow override for complex queries.
     # `timeout_ms` arrives from LLM tool-args (frequently as a string)

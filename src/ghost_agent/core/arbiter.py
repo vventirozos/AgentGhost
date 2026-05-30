@@ -20,9 +20,6 @@ This module wires four pieces:
      ``LLMClient.get_embeddings``; tests pass a deterministic stub.
   3. ``ArbitrationDecision`` — the structured result the caller acts
      on: ``execute`` / ``validate`` / ``ask_user``.
-  4. ``confidence_gated`` — convenience helper that bridges
-     ``CompositeConfidence`` to the arbiter so callers don't have to
-     hand-thread the threshold check.
 
 Cost discipline:
   * Max one arbitration round per turn (configurable).
@@ -325,25 +322,6 @@ class DualSolverArbiter:
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Confidence-gated convenience
-# ──────────────────────────────────────────────────────────────────────
-
-async def confidence_gated(
-    *,
-    confidence_below_threshold: bool,
-    arbiter: DualSolverArbiter,
-    prompt: str,
-    validator: Optional[Callable[[str], Tuple[bool, str]]] = None,
-) -> Optional[ArbitrationDecision]:
-    """Convenience: only invoke the arbiter when composite confidence
-    flagged the turn as low. Returns ``None`` when the gate is open
-    (caller should execute the original plan unchanged)."""
-    if not confidence_below_threshold:
-        return None
-    return await arbiter.arbitrate(prompt, validator=validator)
-
-
-# ──────────────────────────────────────────────────────────────────────
 # Vector helpers
 # ──────────────────────────────────────────────────────────────────────
 
@@ -394,5 +372,4 @@ __all__ = [
     "SemanticDivergence",
     "ArbitrationDecision",
     "Candidate",
-    "confidence_gated",
 ]

@@ -37,7 +37,7 @@ import time
 from pathlib import Path
 
 # ── Bring in the new modules ────────────────────────────────────────
-from ghost_agent.core.arbiter import DualSolverArbiter, confidence_gated
+from ghost_agent.core.arbiter import DualSolverArbiter
 from ghost_agent.core.confidence import CompositeConfidence
 from ghost_agent.core.entropy import EntropyTracker, normalise_entropy
 from ghost_agent.core.triggers import (
@@ -280,19 +280,6 @@ async def run_phase_3() -> None:
     check("arbiter: divergent + validator → execute safe",
           d2.action == "execute" and "DELETE" in d2.chosen.output,
           f"action={d2.action}, chosen={d2.chosen.output[:40] if d2.chosen else 'n/a'}")
-
-    # --- gating: above-threshold returns None (no arbitration)
-    skipped = await confidence_gated(
-        confidence_below_threshold=False, arbiter=arbiter, prompt="x",
-    )
-    check("arbiter: confidence gate above threshold skips", skipped is None)
-
-    # --- gating: below-threshold triggers arbitration
-    used = await confidence_gated(
-        confidence_below_threshold=True, arbiter=arbiter, prompt="x",
-    )
-    check("arbiter: confidence gate below threshold fires",
-          used is not None and used.action == "execute")
 
 
 # ──────────────────────────────────────────────────────────────────────

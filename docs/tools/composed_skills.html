@@ -26,7 +26,7 @@
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
       <tr><td><code>SkillStep</code></td><td>tool_name · description · param_template · branch_condition · branch_target · optional</td></tr>
-      <tr><td><code>ComposedSkill</code></td><td>name · trigger_description · steps · branches · usage_count · success_count · last_used · created_at</td></tr>
+      <tr><td><code>ComposedSkill</code></td><td>name · trigger_description · steps · branches · <strong>execution_mode</strong> · <strong>status</strong> · usage_count · success_count · last_used · created_at</td></tr>
     </tbody>
   </table>
 
@@ -36,14 +36,62 @@
   <h2>Registry</h2>
   <ul>
     <li>Up to 50 skills in memory; persisted to <code>composed_skills.json</code>.</li>
-    <li>Least-used skill evicted on overflow.</li>
-    <li><code>compile_from_pattern(pattern_name, tool_sequence, description)</code> creates a macro from a detected sequence.</li>
-    <li><code>execute(skill_name, executor_fn, params)</code> runs steps sequentially; evaluates <code>branch_condition</code> against each result; <code>optional=true</code> steps don't abort on failure.</li>
+    <li>On overflow the least-used skill is evicted — but <strong>proposed drafts are evicted before any active macro</strong>, so a flood of auto-proposals can never push out a macro the user approved or uses.</li>
+    <li><code>compile_from_pattern(pattern_name, tool_sequence, description, *, status="proposed", execution_mode="sequential")</code> creates a macro from a mined sequence. It defaults to <strong>proposed</strong> status (see <a href="#auto">auto-proposals</a>).</li>
+    <li><code>execute(skill_name, executor_fn, params)</code> dispatches on <code>execution_mode</code> (see below) and returns a result dict with <code>success · results · steps_completed · total_steps · mode</code>.</li>
     <li><code>record_usage(skill_name, success)</code> updates counters.</li>
   </ul>
 
-  <h2>LLM exposure</h2>
-  <p><code>to_tool_definitions()</code> renders each composed skill as an OpenAI-style tool definition so the LLM sees it like any other tool.</p>
+  <h2>Status: active vs. proposed</h2>
+  <p>The <code>status</code> field gates visibility:</p>
+  <ul>
+    <li><strong>active</strong> (default for user-defined macros) — advertised to the LLM via <code>to_tool_definitions()</code> and dispatchable via <code>register_composed_skill_runners()</code>.</li>
+    <li><strong>proposed</strong> — an auto-discovered draft. Stored and listable, but <em>deliberately hidden</em> from the tool catalogue and <em>not dispatchable</em> until the user approves it with <code>manage_composed_skills(action="approve")</code>. This keeps possibly-stale mined macros out of the live tool list until a human signs off.</li>
+  </ul>
+
+  <h2>Execution modes</h2>
+  <p><code>execution_mode</code> selects how <code>execute()</code> runs the steps:</p>
+  <ul>
+    <li><strong>sequential</strong> (default) — steps run in order; <code>branch_condition</code> is evaluated against each result to optionally jump into a named branch; an <code>optional=true</code> step that fails does not abort the macro. Best for pipelines where a later step consumes an earlier step's output.</li>
+    <li><strong>parallel</strong> — every step is fanned out concurrently via <code>asyncio.gather</code> and all results are collected. Branching is ignored (there is no ordered result to test). A non-optional step failing marks the macro <em>partial/failed</em> but never aborts the fan-out. Best for an independent, read-only bundle like a morning briefing.</li>
+  </ul>
+
+  <h2>Defining a macro: <code>manage_composed_skills</code></h2>
+  <p>The <code>manage_composed_skills</code> tool lets the agent (or user) declare a named bundle on demand — <code>action</code> ∈ <code>define · list · approve · delete</code>. A defined (or approved) macro becomes a <strong>top-level tool</strong> the agent invokes by name; its steps run and the combined results return for the model to synthesise. <code>list</code> shows active macros and, separately, any auto-discovered <em>proposed</em> ones; <code>approve</code> activates a proposed macro; <code>delete</code> removes (or rejects) one. Macro names must be bare identifiers (they become tool names), and a step may only call a built-in tool or an acquired skill — <em>not</em> another composed skill (no nesting / recursion).</p>
+  <p>Example — a parallel <code>morning_briefing</code>:</p>
+  <pre><code>manage_composed_skills(
+  action="define",
+  name="morning_briefing",
+  description="daily briefing: weather, headlines, diagnostics, lessons",
+  mode="parallel",
+  steps=[
+    {"tool": "system_utility", "description": "Weather",     "params": {"action": "check_weather"}},
+    {"tool": "web_search",     "description": "Headlines",   "params": {"query": "latest news headlines"}},
+    {"tool": "system_utility", "description": "Diagnostics", "params": {"action": "check_health"}},
+    {"tool": "list_lessons",   "description": "Lessons",     "params": {"scope": "today"}},
+  ],
+)
+# → 'morning_briefing' is now a tool. Calling it fans the four steps out
+#   concurrently and returns all four panels for synthesis.</code></pre>
+  <p>A step's <code>params</code> value of <code>"$varname"</code> is substituted from the macro's own runtime arguments at call time, so a macro can take parameters too.</p>
+
+  <h2 id="auto">Auto-discovered macro proposals</h2>
+  <p>The <a href="../core/dream.html">dream cycle</a> mines the agent's own <strong>trajectory log</strong> (<code>distill/</code> — ordered tool calls <em>with arguments</em>, across sessions) for recurring tool-call sequences and registers the strongest as <strong>proposed</strong> macros. The user reviews them with <code>manage_composed_skills(action="list")</code> and activates the good ones with <code>action="approve"</code>.</p>
+  <ul>
+    <li><code>mine_recurring_tool_sequences(trajectories, …)</code> (in <code>core/dream.py</code>) finds contiguous tool-name windows (length 2–4) that appear in ≥ <code>min_support</code> <em>distinct</em> trajectories. Failed trajectories are skipped, single-tool repeats and all-meta windows are dropped, and a sub-window subsumed by a same-support longer window is discarded.</li>
+    <li>Each step's <code>params</code> is the <strong>most common argument set</strong> observed at that position — so an approved macro replays realistic arguments, not an empty skeleton.</li>
+    <li><code>Dreamer._propose_macros_sync()</code> walks the collector, mines, and calls <code>compile_from_pattern(..., status="proposed")</code> for the top few — skipping any signature already on file so the same sequence isn't re-proposed every REM cycle. Each proposal is surfaced via a <code>pretty_log</code> line and counted in the dream summary ("N macros proposed").</li>
+  </ul>
+  <p><strong>Collector source.</strong> The live recording collector is wired onto the context by <code>main.py</code> during lifespan (<code>context.trajectory_collector = TrajectoryCollector(...)</code>, under <code>$GHOST_HOME/trajectories</code>, disabled by <code>--no-trajectories</code>). When the dream cycle runs on a context that lacks the live collector (headless / cron, or a context built outside lifespan), <code>_propose_macros_sync</code> falls back to a <em>read-only</em> collector at the same canonical on-disk root, so mining still runs over the recorded corpus — unless <code>--no-trajectories</code> is set, which it honours.</p>
+
+  <h2>LLM exposure &amp; dispatch wiring</h2>
+  <ul>
+    <li><code>to_tool_definitions()</code> renders each <strong>active</strong> composed skill as an OpenAI-style tool definition (proposed drafts are skipped).</li>
+    <li><code>register_composed_skills(tool_defs, context)</code> appends those definitions into the active tool list (called from <code>registry.get_active_tool_definitions</code>) — this is what makes the LLM <em>see</em> the macro.</li>
+    <li><code>register_composed_skill_runners(tools, context)</code> wires a callable runner per <strong>active</strong> macro into the dispatch dict (called from <code>registry.get_available_tools</code>) — this is what makes the macro <em>executable</em>. Each runner dispatches steps through <code>build_step_executor</code>, which blocks nested composed-skill calls.</li>
+    <li>After a <code>define</code> / <code>approve</code> / <code>delete</code>, the agent loop calls <code>invalidate_tool_defs()</code> so the macro appears (or disappears) in the very next turn-iteration rather than waiting for the next user message.</li>
+  </ul>
+  <p>Macros persist to <code>composed_skills.json</code> under <code>memory_dir</code>, so they survive sandbox wipes (same rationale as acquired skills).</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

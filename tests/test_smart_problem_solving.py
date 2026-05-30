@@ -230,12 +230,6 @@ class TestFallbackChains:
         assert hint is not None
         assert "recall" in hint.lower() or "memory" in hint.lower()
 
-    def test_get_fallback_tool_name(self):
-        from ghost_agent.tools.fallback_chains import get_fallback_tool_name
-        assert get_fallback_tool_name("deep_research") == "web_search"
-        assert get_fallback_tool_name("execute") == "file_system"
-        assert get_fallback_tool_name("nonexistent") is None
-
 
 # ============================================================
 # #8: Checkpoint & Resume

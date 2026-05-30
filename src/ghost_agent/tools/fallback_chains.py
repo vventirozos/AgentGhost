@@ -62,11 +62,3 @@ def get_fallback_hint(failed_tool: str, error_text: str = "") -> Optional[str]:
         return f"FALLBACK SUGGESTION: {hint}"
 
     return None
-
-
-def get_fallback_tool_name(failed_tool: str) -> Optional[str]:
-    """Get the first fallback tool name for a failed tool."""
-    chain = FALLBACK_CHAINS.get(failed_tool)
-    if chain:
-        return chain[0][0]
-    return None

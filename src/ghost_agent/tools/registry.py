@@ -9,7 +9,11 @@ from .execute import tool_execute
 from .browser import tool_browser
 from .swarm import tool_delegate_to_swarm
 from .acquired_skills import tool_create_skill, tool_manage_skills, AcquiredSkillManager
-from .composed_skills import register_composed_skills
+from .composed_skills import (
+    register_composed_skills,
+    register_composed_skill_runners,
+    tool_manage_composed_skills,
+)
 from .projects import tool_manage_projects, MANAGE_PROJECTS_TOOL_DEF
 from .self_state import tool_self_state
 from .introspect import tool_introspect
@@ -220,6 +224,10 @@ TOOL_DEFINITIONS = [
                     "table_name": {
                         "type": "string",
                         "description": "Optional table name to filter the 'schema' action."
+                    },
+                    "confirm": {
+                        "type": "boolean",
+                        "description": "Set true to authorise a destructive DROP/TRUNCATE statement (the pre-execution validator blocks these unless confirmed). Default false."
                     }
                 },
                 "required": ["action"]
@@ -325,6 +333,105 @@ TOOL_DEFINITIONS.append({
                 },
             },
             "required": ["title", "sections"],
+        },
+    },
+})
+
+TOOL_DEFINITIONS.append({
+    "type": "function",
+    "function": {
+        "name": "manage_composed_skills",
+        "description": (
+            "Group several tool calls into ONE reusable named macro (a 'composed "
+            "skill') — e.g. a 'morning_briefing' that bundles weather + news "
+            "headlines + system diagnostics + today's lessons into a single call. "
+            "Use action='define' to create one from a list of steps, 'list' to see "
+            "existing macros (including auto-discovered PROPOSED ones), 'approve' to "
+            "activate a proposed macro, 'delete' to remove one. Once active, the macro "
+            "is a TOP-LEVEL TOOL you invoke by its name like any built-in — its steps "
+            "run and the combined results come back for you to synthesise. Default "
+            "mode='parallel' fans the steps out concurrently (ideal for independent "
+            "read-only steps); use mode='sequential' only when a later step depends "
+            "on an earlier one. NOTE: a macro's steps may only call built-in tools "
+            "or acquired skills — NOT other composed skills (no nesting). The dream "
+            "cycle auto-proposes macros from recurring tool sequences in your history; "
+            "they stay inert until you 'approve' them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["define", "list", "approve", "delete"],
+                    "description": "What to do.",
+                },
+                "name": {
+                    "type": "string",
+                    "description": (
+                        "Macro name (required for define/delete). Becomes the tool "
+                        "name, so use a bare identifier like 'morning_briefing' — "
+                        "letters, digits and underscores only."
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "For define: a short natural-language description of when "
+                        "to use this macro (shown in the tool list and used for "
+                        "matching)."
+                    ),
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["parallel", "sequential"],
+                    "description": (
+                        "For define: 'parallel' (default) runs every step "
+                        "concurrently; 'sequential' runs them in order."
+                    ),
+                },
+                "steps": {
+                    "type": "array",
+                    "description": (
+                        "For define: the list of tool calls this macro bundles. "
+                        "Each item is an object describing one step."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {
+                                "type": "string",
+                                "description": (
+                                    "Exact name of the tool to call in this step "
+                                    "(e.g. 'system_utility', 'web_search', "
+                                    "'list_lessons')."
+                                ),
+                            },
+                            "description": {
+                                "type": "string",
+                                "description": "Short human label for this step (e.g. 'Local weather').",
+                            },
+                            "params": {
+                                "type": "object",
+                                "description": (
+                                    "Arguments to pass to that tool (e.g. "
+                                    "{\"action\": \"check_weather\"}). Use a value "
+                                    "of \"$varname\" to pull from the macro's own "
+                                    "runtime parameters at call time."
+                                ),
+                            },
+                            "optional": {
+                                "type": "boolean",
+                                "description": (
+                                    "If true, this step failing does NOT fail the "
+                                    "whole macro. Default false."
+                                ),
+                            },
+                        },
+                        "required": ["tool"],
+                    },
+                },
+            },
+            "required": ["action"],
         },
     },
 })
@@ -590,7 +697,16 @@ def get_available_tools(context):
         "postgres_admin": lambda **kwargs: tool_postgres_admin(default_uri=getattr(context.args, 'default_db', 'postgresql://ghost@127.0.0.1:5432/agent'), _metacog_bundle=getattr(context, "metacog", None), **kwargs),
         "delegate_to_swarm": lambda **kwargs: tool_delegate_to_swarm(llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), scratchpad=context.scratchpad, **kwargs),
         "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
-        "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs)
+        "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs),
+        "manage_composed_skills": lambda **kwargs: tool_manage_composed_skills(
+            context=context,
+            # Include the dynamically-appended tools (vision_analysis,
+            # image_generation) so a composed-skill step that uses them
+            # doesn't get a false "not a recognised built-in" warning.
+            known_tools=({t.get("function", {}).get("name") for t in TOOL_DEFINITIONS}
+                         | {"vision_analysis", "image_generation"}),
+            **kwargs,
+        ),
     }
     
     from .vision import tool_vision_analysis
@@ -687,5 +803,14 @@ def get_available_tools(context):
                     tools[skill_name] = make_skill_runner(skill_name)
         except Exception as e:
             logger.debug(f"Acquired skill handler loading failed: {type(e).__name__}: {e}")
+
+    # Wire a runner for every registered composed skill (macro) so the names
+    # advertised by register_composed_skills in get_active_tool_definitions
+    # are actually dispatchable here. Mirrors the acquired-skill loop above;
+    # non-fatal — a failure just means macros aren't callable this build.
+    try:
+        register_composed_skill_runners(tools, context)
+    except Exception as e:
+        logger.debug(f"Composed skill runner wiring failed: {type(e).__name__}: {e}")
 
     return tools

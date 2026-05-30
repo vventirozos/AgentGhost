@@ -12,7 +12,6 @@ from ghost_agent.core.arbiter import (
     SemanticDivergence,
     _cosine,
     _jaccard,
-    confidence_gated,
 )
 
 
@@ -253,27 +252,3 @@ async def test_jaccard_fallback_when_no_embedder():
     decision = await arbiter.arbitrate("question")
     assert decision.action == "execute"
     assert decision.similarity == 1.0
-
-
-# ──────────────────────────────────────────────────────────────────────
-# confidence_gated convenience
-# ──────────────────────────────────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_confidence_gated_returns_none_when_above_threshold():
-    arbiter = DualSolverArbiter(runner=make_runner({}))
-    result = await confidence_gated(
-        confidence_below_threshold=False, arbiter=arbiter, prompt="x",
-    )
-    assert result is None
-
-
-@pytest.mark.asyncio
-async def test_confidence_gated_runs_arbiter_when_below():
-    runner = make_runner({0.2: "ans", 0.7: "ans"})
-    arbiter = DualSolverArbiter(runner=runner)
-    result = await confidence_gated(
-        confidence_below_threshold=True, arbiter=arbiter, prompt="x",
-    )
-    assert result is not None
-    assert result.action == "execute"

@@ -161,8 +161,38 @@ class DockerSandbox:
                     "volumes": {str(self.host_workspace): {'bind': CONTAINER_WORKDIR, 'mode': 'rw'}},
                     "mem_limit": mem_limit,
                 }
-                
-                if is_linux:
+
+                # Fork-bomb / runaway-process defense — always on. Tunable but
+                # never unbounded by default. (Set GHOST_SANDBOX_PIDS=0 to
+                # disable, e.g. for highly-parallel workloads.)
+                try:
+                    _pids = int(_os.environ.get("GHOST_SANDBOX_PIDS", "1024"))
+                    if _pids > 0:
+                        run_kwargs["pids_limit"] = _pids
+                except (TypeError, ValueError):
+                    run_kwargs["pids_limit"] = 1024
+
+                # Optional capability hardening — OFF by default because the
+                # sandbox provisions passwordless sudo (setuid) for in-container
+                # apt installs, which `no-new-privileges` / `cap_drop=ALL` would
+                # break. Operators who don't need in-sandbox package installs can
+                # opt in with GHOST_SANDBOX_DROP_CAPS=1.
+                if _os.environ.get("GHOST_SANDBOX_DROP_CAPS", "").lower() in ("1", "true", "yes"):
+                    run_kwargs["cap_drop"] = ["ALL"]
+                    run_kwargs["security_opt"] = ["no-new-privileges"]
+
+                # Network mode. On Linux the default is `host` because the
+                # in-sandbox browser must reach the host's Tor proxy at
+                # 127.0.0.1:9050 (bridge would break Tor-routed browsing). This
+                # also means sandboxed code shares the host's loopback — set
+                # GHOST_SANDBOX_NETWORK=bridge (or none) to ISOLATE when you
+                # don't rely on host-loopback services from the sandbox.
+                _net = _os.environ.get("GHOST_SANDBOX_NETWORK", "").strip().lower()
+                if _net in ("host", "bridge", "none"):
+                    run_kwargs["network_mode"] = _net
+                    if _net == "bridge" and not is_mac:
+                        run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
+                elif is_linux:
                     run_kwargs["network_mode"] = "host"
                 else:
                     run_kwargs["network_mode"] = "bridge"

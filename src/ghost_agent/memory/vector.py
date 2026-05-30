@@ -382,7 +382,10 @@ class VectorMemory:
                     if not results['documents'] or len(results['documents']) <= batch_idx:
                         return
 
-                    for doc, meta, dist in zip(
+                    _ids_batch = (results.get('ids') or [])
+                    _ids_batch = _ids_batch[batch_idx] if len(_ids_batch) > batch_idx else [None] * len(results['documents'][batch_idx])
+                    for _cid, doc, meta, dist in zip(
+                        _ids_batch,
                         results['documents'][batch_idx],
                         results['metadatas'][batch_idx],
                         results['distances'][batch_idx]
@@ -429,6 +432,7 @@ class VectorMemory:
                             elif m_type == 'manual': priority_score = 0
 
                             candidates.append({
+                                "id": _cid,  # real Chroma id — needed for retrieval-stat bumps
                                 "doc": doc,
                                 "meta": meta,
                                 "dist": dist,
@@ -489,7 +493,12 @@ class VectorMemory:
                 # so they decay slower on future searches (spaced-repetition).
                 bump_ids = []
                 for item in final_selection:
-                    mem_id = item['meta'].get('id') or item.get('id')
+                    # Prefer the REAL Chroma id captured from the query result.
+                    # The old code only had meta['id'] (rarely set) and fell
+                    # back to md5(doc) — which only matches `add()` entries, not
+                    # ingest_document chunks (id=md5(filename|i|chunk) ≠
+                    # md5(enriched_doc)), so doc-chunk stats never bumped.
+                    mem_id = item.get('id') or item['meta'].get('id')
                     if not mem_id:
                         import hashlib as _hl
                         mem_id = _hl.md5(item['doc'].encode("utf-8")).hexdigest()

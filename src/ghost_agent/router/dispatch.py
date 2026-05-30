@@ -39,9 +39,13 @@ POOL_SWARM = "swarm"
 class RoutingDecision:
     """Returned by ComplexityDispatcher.route.
 
-    `allowed_pools` is the whitelist the caller should respect.
-    `label` and `confidence` are observability: the dispatcher records
-    them on the trajectory so we can A/B test the router's effect.
+    `allowed_pools` is the whitelist a caller COULD respect — but note: no
+    production code currently gates swarm pools on it (the swarm dispatch
+    never reads `_router_decision.allowed_pools`). Today the router's only
+    consumed effect is `label`/`confidence`/`escalated`, which gate the MCTS
+    lookahead and the strategic planner (agent.py). Pool-whitelisting is not
+    yet wired. `label` and `confidence` are also recorded on the trajectory
+    for A/B-testing the router's effect.
     """
 
     allowed_pools: List[str]

@@ -104,10 +104,10 @@ class EpisodicMemory:
                              1 if action.get("success", True) else 0)
                         )
 
-                # Enforce max capacity
+                # Enforce max capacity.
                 count = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
                 if count > self.MAX_EPISODES:
-                    # Delete oldest non-lesson episodes first
+                    # Prefer deleting oldest non-lesson, unconsolidated episodes.
                     conn.execute(
                         '''DELETE FROM episodes WHERE id IN (
                             SELECT id FROM episodes
@@ -116,6 +116,26 @@ class EpisodicMemory:
                             LIMIT ?
                         )''',
                         (count - self.MAX_EPISODES,)
+                    )
+                    # Fallback: if lesson-bearing / consolidated rows STILL keep
+                    # the table over the cap, delete the oldest of any kind so
+                    # the cap is actually enforced. (The old code only deleted
+                    # lesson-empty/unconsolidated rows, so once those filled the
+                    # table the cap silently stopped enforcing — unbounded growth.)
+                    still = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+                    if still > self.MAX_EPISODES:
+                        conn.execute(
+                            '''DELETE FROM episodes WHERE id IN (
+                                SELECT id FROM episodes ORDER BY timestamp ASC LIMIT ?
+                            )''',
+                            (still - self.MAX_EPISODES,)
+                        )
+                    # Reap action rows orphaned by the deletes above — the FK is
+                    # declared but not enforced (no PRAGMA / cascade), so without
+                    # this episode_actions grows unboundedly with orphans.
+                    conn.execute(
+                        "DELETE FROM episode_actions WHERE episode_id NOT IN "
+                        "(SELECT id FROM episodes)"
                     )
 
                 conn.commit()

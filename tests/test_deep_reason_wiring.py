@@ -44,12 +44,11 @@ class TestMCTSReasonerContract:
             ActionCandidate(description="alt1", score=0.6),
             ActionCandidate(description="alt2", score=0.4),
         ]]
-        assert r.has_alternatives()
-        first = await r.backtrack()
-        assert first.description == "alt1"
-        second = await r.backtrack()
-        assert second.description == "alt2"
-        assert await r.backtrack() is None
+        # select_best_action populates _backtrack_stack with runners-up;
+        # here we assert the stack faithfully preserves the cached
+        # alternatives in score order for any future consumer.
+        assert [c.description for c in r._backtrack_stack[0]] == ["alt1", "alt2"]
+        assert r._backtrack_stack[0][0].score == 0.6
 
 
 class TestHypothesisTesterContract:

@@ -5,10 +5,9 @@ Provides a Verifier that challenges the agent's own conclusions using
 a separate LLM call (ideally on a worker node or at a different temperature)
 before returning results to the user.
 
-Three capabilities:
+Two capabilities:
 1. verify_claim     — Check whether a stated conclusion is supported by evidence.
 2. verify_code_output — Check whether code output actually answers the user's question.
-3. adversarial_probe — Generate edge cases / counterexamples for stress-testing.
 """
 
 import asyncio
@@ -292,13 +291,3 @@ class Verifier:
         )
         data = await self._call_llm(prompt, temperature=0.1)
         return self._build_verify_result(data)
-
-    async def adversarial_probe(self, problem: str,
-                                solution: str) -> List[Dict[str, str]]:
-        """Generate edge cases that could break *solution*."""
-        prompt = _ADVERSARIAL_PROBE_PROMPT.format(
-            problem=problem[:2000],
-            solution=solution[:4000],
-        )
-        data = await self._call_llm(prompt, temperature=0.4)
-        return data.get("edge_cases", [])

@@ -620,10 +620,19 @@ async def tool_list_files(sandbox_dir: Path, memory_system=None):
     except Exception as e: return f"Error scanning sandbox: {e}"
 
 async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filename: str = None):
+    # --- SSRF guard (shared) ---
+    # Block file:// and internal/metadata hosts BEFORE any fetch, so the
+    # LLM can't make the host read local files or reach 169.254.169.254 /
+    # loopback services. file:// is reachable regardless of the proxy.
+    from ..utils.helpers import url_ssrf_reason as _url_ssrf_reason
+    _ssrf = _url_ssrf_reason(url)
+    if _ssrf:
+        return f"Error: {_ssrf}"
+
     # 1. Clean Proxy URL
     proxy_url = tor_proxy
     mode = "TOR" if proxy_url and "127.0.0.1" in proxy_url else "WEB"
-    
+
     pretty_log(f"Download [{mode}]", f"{url[:35]}..", icon=Icons.TOOL_DOWN)
     
     if proxy_url and proxy_url.startswith("socks5://"): 
@@ -639,7 +648,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                     target_path = _get_safe_path(sandbox_dir, filename)
                 except ValueError as ve: return str(ve)
                 
-                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=60.0, verify=False) as client:
+                async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=60.0) as client:
                     resp = await client.get(url, stream=True)
                     if resp.status_code != 200:
                         if resp.status_code in [401, 403, 503] and mode == "TOR":
@@ -653,19 +662,30 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                         return f"Error: File is too large ({int(clength)/1000000:.1f}MB). Download limit is 50MB."
                     
                     target_path.parent.mkdir(parents=True, exist_ok=True)
+                    _MAX_DL = 50_000_000
+                    _total = 0
+                    _overflow = False
                     with open(target_path, "wb") as f:
                         buffer = bytearray()
                         async for chunk in resp.aiter_content():
                             if chunk:
                                 buffer.extend(chunk)
+                                _total += len(chunk)
+                                if _total > _MAX_DL:
+                                    _overflow = True
+                                    break
                                 if len(buffer) >= 1024 * 1024:
                                     await asyncio.to_thread(f.write, buffer)
                                     buffer.clear()
-                        if buffer:
+                        if buffer and not _overflow:
                             await asyncio.to_thread(f.write, buffer)
+                    if _overflow:
+                        try: target_path.unlink()
+                        except Exception: pass
+                        return "Error: download exceeded the 50MB cap (server omitted or exceeded Content-Length)."
                     return f"SUCCESS: Downloaded '{url}' to '{filename}'."
             else:
-                async with httpx.AsyncClient(proxy=proxy_url, headers=headers, follow_redirects=True, timeout=60.0, verify=False) as client:
+                async with httpx.AsyncClient(proxy=proxy_url, headers=headers, follow_redirects=True, timeout=60.0) as client:
                     async with client.stream("GET", url) as resp:
                         if resp.status_code != 200:
                             if resp.status_code in [401, 403, 503] and mode == "TOR":
@@ -683,17 +703,28 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                         except ValueError as ve: return str(ve)
 
                         target_path.parent.mkdir(parents=True, exist_ok=True)
-                        
+
+                        _MAX_DL = 50_000_000
+                        _total = 0
+                        _overflow = False
                         with open(target_path, "wb") as f:
                             buffer = bytearray()
                             async for chunk in resp.aiter_bytes():
                                 buffer.extend(chunk)
+                                _total += len(chunk)
+                                if _total > _MAX_DL:
+                                    _overflow = True
+                                    break
                                 if len(buffer) >= 1024 * 1024:
                                     await asyncio.to_thread(f.write, buffer)
                                     buffer.clear()
-                            if buffer:
+                            if buffer and not _overflow:
                                 await asyncio.to_thread(f.write, buffer)
-                                
+                        if _overflow:
+                            try: target_path.unlink()
+                            except Exception: pass
+                            return "Error: download exceeded the 50MB cap (server omitted or exceeded Content-Length)."
+
                     return f"SUCCESS: Downloaded '{url}' to '{filename}'."
         except Exception as e:
             last_error = e
@@ -787,7 +818,12 @@ async def tool_find_files(pattern: str, sandbox_manager, path: str = ".", sandbo
                 # Outside-sandbox traversal — surface clearly rather than
                 # silently searching the wrong tree.
                 return f"Error: path '{path}' resolves outside the sandbox."
-        cmd = f"find {shlex.quote(search_path)} -type f -name {shlex.quote(pattern)} -not -path '*/\.*' -not -path '*/node_modules/*' -not -path '*/__pycache__/*' | head -n 100"
+        # The sandbox runs commands WITHOUT a shell (docker exec splits the
+        # string into argv), so a bare `| head` would be passed as literal
+        # args to `find`. Wrap the whole pipeline in `sh -c` so the pipe is
+        # interpreted (mirrors the `bash -c` pattern in execute.py).
+        _inner = f"find {shlex.quote(search_path)} -type f -name {shlex.quote(pattern)} -not -path '*/\\.*' -not -path '*/node_modules/*' -not -path '*/__pycache__/*' | head -n 100"
+        cmd = f"sh -c {shlex.quote(_inner)}"
         output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, timeout=15)
         return output if output.strip() else "Report: No files found matching that pattern."
     except Exception as e: return f"Error: {e}"

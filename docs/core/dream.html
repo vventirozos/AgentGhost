@@ -34,7 +34,7 @@
   <ul>
     <li>Mine failed tasks from the journal into standalone, self-contained challenges via <a href="journal_challenges.html">journal_challenges</a>.</li>
     <li>Validate LLM-generated challenges before running them — quality gate, preflight, and validator self-test gate.</li>
-    <li>Detect cross-episode tool patterns that should become composed skills.</li>
+    <li>Detect cross-episode tool patterns (advisory lessons) and mine recurring tool-call <em>sequences</em> from the trajectory log into <strong>proposed</strong> <a href="../tools/composed_skills.html">composed-skill</a> macros for the user to approve.</li>
     <li>Orchestrate the self-play simulation loop: spawn an isolated temp agent, run the challenge, score with <a href="self_play_scoring.html">correctness_weighted_score</a>, verify and persist any new lesson via <a href="../memory/skills.html">SkillMemory</a>.</li>
   </ul>
 
@@ -109,7 +109,10 @@
       <tr><td><code>_instrument_validator_for_self_test(src) → Optional[str]</code></td><td>AST probe injector (module-level, testable).</td></tr>
       <tr><td><code>_extract_selftest_dump(stdout) → Optional[str]</code></td><td>Pull dumped expected-output from sentinel markers.</td></tr>
       <tr><td><code>_looks_like_validator_crash(text) → bool</code></td><td>Tail-of-traceback check for <code>.validator.py</code> frame.</td></tr>
-      <tr><td><code>detect_tool_patterns(skill_memory) → list</code></td><td>Cross-episode tool-call sequence detection.</td></tr>
+      <tr><td><code>detect_tool_patterns(skill_memory) → list</code></td><td>Cross-episode tool-name co-occurrence detection over the lesson playbook → advisory lessons.</td></tr>
+      <tr><td><code>mine_recurring_tool_sequences(trajectories, …) → list</code></td><td>Mine recurring contiguous tool-call sequences (with most-common args) from the trajectory log → macro proposals. Skips failed trajectories, single-tool repeats, all-meta windows; dedups subsumed sub-windows.</td></tr>
+      <tr><td><code>Dreamer._propose_macros_sync(max_trajectories) → {proposed, names}</code></td><td>Walk the trajectory collector (the live one wired by main.py, or a read-only fallback at the canonical on-disk root when absent), mine sequences, register the top ones as <strong>proposed</strong> composed-skill macros via <code>compile_from_pattern</code> (awaiting <code>manage_composed_skills(action="approve")</code>). Honours <code>--no-trajectories</code>.</td></tr>
+      <tr><td><code>Dreamer._fallback_trajectory_collector() → TrajectoryCollector | None</code></td><td>Best-effort read-only collector at <code>&lt;memory_dir&gt;/../trajectories</code> for dream runs whose context lacks a live collector. None when logging is disabled.</td></tr>
       <tr><td><code>Dreamer.synthetic_self_play(model_name, is_background)</code></td><td>Full pipeline: seed → source select → gates → run → score → extract → verify → persist.</td></tr>
       <tr><td><code>Dreamer._try_journal_challenge(probability)</code></td><td>Probabilistic journal mining; probability bumped to 0.75 under saturation.</td></tr>
       <tr><td><code>Dreamer._generalization_guard(lesson, …) → (bool, reason)</code></td><td>Overfit-lesson rejection.</td></tr>

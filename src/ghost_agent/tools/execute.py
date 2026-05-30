@@ -147,46 +147,40 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
 
         pretty_log("Shell Command", command, icon=Icons.TOOL_SHELL)
 
-        # Metacog pre-execution validator (roadmap phase 1.4). Gated by
-        # the bundle being live on context, so the legacy path is
-        # untouched when ``--enable-metacog`` is off. The validator
-        # rejects unparseable / deny-listed forms (e.g. `rm -rf /`,
-        # `curl | sh`) BEFORE the sandbox sees them, returning the
-        # rejection as a structured tool error so the LLM can read it
-        # back and re-emit. Validator failures are non-fatal — a
-        # validator that itself crashes is wrapped in try/except so a
-        # bug here never breaks a turn.
+        # Pre-execution shell validator (roadmap phase 1.4). Runs
+        # UNCONDITIONALLY — the destructive-command deny-list (`rm -rf /`,
+        # `curl | sh`, fork bombs, etc.) is a safety boundary that must not
+        # depend on the optional ``--enable-metacog`` uplift. Extra metacog
+        # telemetry is emitted only when the bundle is wired. Validator
+        # failures are non-fatal: a crashing validator must never break a
+        # turn, so we fall through to running the command.
         _metacog = kwargs.get("_metacog_bundle")
-        if _metacog is not None and getattr(_metacog, "enabled", False):
-            try:
-                from .validators import validate_shell
-                from ..core.metacog_log import (
-                    emit as _mc_emit, Subsystem as _mc_ss, LEVEL_WARN,
-                )
-                ok, reason = validate_shell(command)
-                if not ok:
+        try:
+            from .validators import validate_shell
+            _shell_ok, _shell_reason = validate_shell(command)
+        except Exception as _vexc:
+            logging.getLogger("GhostAgent").debug("shell validator crashed: %s", _vexc)
+            _shell_ok, _shell_reason = True, ""
+        if not _shell_ok:
+            if _metacog is not None and getattr(_metacog, "enabled", False):
+                try:
+                    from ..core.metacog_log import (
+                        emit as _mc_emit, Subsystem as _mc_ss, LEVEL_WARN,
+                    )
                     _mc_emit(
                         _mc_ss.VALID, level=LEVEL_WARN,
                         verdict="block", tool="shell",
-                        reason=reason,
-                        # Truncate the command to a fingerprint — full
-                        # command bodies in logs are noisy and the
-                        # validator's reason field already cites the
-                        # specific pattern that matched.
-                        command_head=command[:60],
+                        reason=_shell_reason, command_head=command[:60],
                     )
-                    try:
-                        _metacog.count(validator_block=True)
-                    except Exception:
-                        pass
-                    return _format_error(
-                        f"SYSTEM BLOCK: shell command rejected by pre-execution "
-                        f"validator: {reason}. The command was not run. Re-emit a "
-                        f"safer form, or use file_system + execute if you need to "
-                        f"run a script."
-                    )
-            except Exception as _vexc:
-                logger.debug("metacog shell validator crashed: %s", _vexc)
+                    _metacog.count(validator_block=True)
+                except Exception:
+                    pass
+            return _format_error(
+                f"SYSTEM BLOCK: shell command rejected by pre-execution "
+                f"validator: {_shell_reason}. The command was not run. Re-emit a "
+                f"safer form, or use file_system + execute if you need to "
+                f"run a script."
+            )
 
         # Execute the command securely using the sandbox manager's built-in execute wrapper
         import time as _time

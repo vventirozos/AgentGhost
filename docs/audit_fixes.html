@@ -134,11 +134,74 @@
     </tbody>
   </table>
 
+  <h2>Round 2 — full-codebase gap sweep (2026-05-30)</h2>
+  <p>A 14-agent parallel audit of the whole codebase surfaced a further set of gaps; all were fixed in this round. The dominant theme was <em>built-but-unwired features</em> (advertised/tested but never reached at runtime) and <em>SSRF / isolation</em> sinks where one guard existed but sibling sinks were missed.</p>
+
+  <h3>Security &amp; isolation</h3>
+  <table>
+    <thead><tr><th>Area</th><th>Fix</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td>SSRF (shared guard) <span class="badge">critical</span></td><td>New <code>utils.helpers.url_ssrf_reason()</code> blocks non-http(s) schemes (<code>file://</code>, <code>gopher://</code>…) and any host that is/resolves to loopback / private / link-local / <code>169.254.169.254</code>. Wired into <code>file_system</code> download (also removed <code>verify=False</code>), <code>vision</code>, <code>browser</code> (http(s) only; <code>file://</code> fixtures preserved), and <code>helper_fetch_url_content</code>.</td><td>utils/helpers, file_system, vision, browser</td></tr>
+      <tr><td>DB host pinning</td><td><code>postgres_admin</code> refuses an LLM-supplied <code>connection_string</code> whose host differs from the configured default.</td><td><a href="tools/database.html">tools/database</a></td></tr>
+      <tr><td>Validators always-on</td><td>Shell + SQL pre-execution validators ran only under <code>--enable-metacog</code> (off by default); now run <strong>unconditionally</strong> (metacog telemetry stays opt-in). The <code>rm -rf</code> deny-list was widened (any absolute/glob/<code>$HOME</code> target; <code>curl|…|bash/python/…</code>); <code>postgres_admin</code> gained a real <code>confirm</code> for DROP/TRUNCATE.</td><td>database, execute, validators</td></tr>
+      <tr><td>Bind / default key</td><td>A non-loopback bind with the default API key prints a loud <strong>security warning</strong> (advisory, not blocking — an earlier hard-refusal + <code>127.0.0.1</code> default was reverted because it silently broke legitimate network deployments, e.g. a CLI client reaching the agent over Tailscale). Default bind stays <code>0.0.0.0</code>. The Slack bot requires <code>GHOST_API_KEY</code> (no default).</td><td>main, slack_bot</td></tr>
+      <tr><td>API auth + traversal</td><td><code>DELETE /api/delete</code> gained <code>verify_api_key</code>; zip-slip / upload / download now use <code>relative_to</code>-based containment (the prefix-<code>startswith</code> check let sibling-dir escapes through).</td><td><a href="api/routes.html">api/routes</a></td></tr>
+      <tr><td>Sandbox hardening</td><td>Always-on <code>pids_limit</code> (fork-bomb defense); opt-in network isolation (<code>GHOST_SANDBOX_NETWORK</code>) and capability drop (<code>GHOST_SANDBOX_DROP_CAPS</code>) — opt-in because host-net is load-bearing for the in-sandbox Tor proxy.</td><td><a href="sandbox/docker.html">sandbox/docker</a></td></tr>
+      <tr><td>Front-end XSS</td><td>The sanitizer chain (<code>marked</code> + <code>DOMPurify</code>) and <code>mermaid</code>/<code>chart.js</code> are now <strong>vendored locally</strong> (no unpinned CDN / SRI gap); the mermaid error path uses <code>textContent</code>.</td><td>interface/static</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Secret redaction (trajectory corpus + journal)</h3>
+  <p>The distill redactor missed high-value formats it is the last line of defense for. Added rules for <code>github_pat_*</code>, Google <code>AIza…</code>, Stripe <code>sk_live/test_…</code>, JWTs, PEM private-key blocks, DB-URI passwords, and a generic <code>*_KEY/TOKEN/SECRET/PASSWORD</code> env rule; ported phone / credit-card / IPv6 from the diary; fixed the nested-sensitive-key leak (a secret under a sensitive key whose value was a list/dict). The <strong>journal</strong> now redacts tool-output on write and sidecar-preserves a corrupt file instead of silently discarding queued consolidation work.</p>
+
+  <h3>Built-but-unwired features</h3>
+  <table>
+    <thead><tr><th>Feature</th><th>Resolution</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td>Skill graduation</td><td><code>graduate_lessons</code> discarded the generated tool and marked lessons graduated forever (a landmine) — and had no caller. Now it creates the skill via the TDD-gated path, only marks graduated on success, and is wired into the dream cycle.</td><td><a href="core/dream.html">core/dream</a></td></tr>
+      <tr><td>Episodic memory</td><td><code>record_episode</code> had no caller, so episodic recall was always empty. Now written each significant turn; also fixed unbounded growth + orphaned action rows.</td><td><a href="memory/episodes.html">memory/episodes</a></td></tr>
+      <tr><td>Metacog replan</td><td><code>set_active_task</code> was never called, so the ReplanBridge always dropped events as <code>noop:no_plan</code>. Now set/cleared around node execution in the project advancer.</td><td><a href="core/project_advancer.html">project_advancer</a></td></tr>
+      <tr><td>RAG-Fusion</td><td>The bus query-decomposition path never received an <code>llm_client</code>. Now passed, with a 12k char budget for complex queries.</td><td><a href="core/bus.html">core/bus</a></td></tr>
+      <tr><td>Selfhood boot</td><td><code>mark_session_boot</code> was wired for workspace but not selfhood; now symmetric.</td><td>main / selfhood</td></tr>
+      <tr><td>Dead duplicate</td><td>Deleted <code>core/workspace_model.py</code> — a ~250-line shadow of the live <code>workspace/</code> package.</td><td>core</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Correctness &amp; leaks</h3>
+  <ul>
+    <li><strong>Vector retrieval reinforcement</strong> bumped the wrong ids (hashed doc text instead of the Chroma id), so spaced-repetition decay was dead for ingested-document chunks — now captures + uses the real id.</li>
+    <li><strong>Streaming connection leak</strong> in <code>llm.py</code>: a 4xx/5xx leaked the streamed response (<code>aclose()</code> didn't cover <code>raise_for_status()</code>), exhausting the httpx pool under repeated errors — now an outer <code>try/finally</code>.</li>
+    <li><strong>Idempotency guard</strong> recorded the call hash before the metacog gate could abort dispatch, blocking a later legitimate re-issue — now recorded only after dispatch.</li>
+    <li><strong><code>find … | head</code></strong> was passed as literal args (the sandbox has no shell) — now wrapped in <code>sh -c</code>.</li>
+    <li>Plus: <code>execute</code> validator <code>NameError</code> (undefined <code>logger</code>), an LRU-bounded context-summary cache, dead writes/vars removed, and misleading docstrings corrected (router pool-gating, self-consistency offline-only).</li>
+  </ul>
+
   <h2>Verification</h2>
   <ul>
-    <li><strong>Unit tests</strong> — each fix has targeted tests under <code>tests/</code> (11 new files plus extensions to existing suites). Regression tests reproduce the original defect (e.g. a ReDoS timing guard, a sandbox-escape symlink, a double-advance counter).</li>
-    <li><strong>Full suite</strong> — <code>pytest tests/</code> passes (4300+ tests, 0 failures).</li>
+    <li><strong>Unit tests</strong> — each round has targeted tests under <code>tests/</code>. Round 2 adds <code>test_ssrf_and_validators.py</code> and <code>test_redact_hardening_journal.py</code> plus extensions, with negative-case regressions (SSRF bypass, <code>rm -rf</code> bypass, journal corruption, failed-graduation must-not-burn-lesson).</li>
+    <li><strong>Full suite</strong> — <code>pytest tests/</code> passes (4400+ tests, 0 failures after both rounds).</li>
     <li><strong>Live smoke test</strong> — the agent was restarted on port 8000 and exercised end-to-end: health/version/models endpoints, the projects CRUD + empty-204 path, a conversational turn, and a tool-using (<code>execute</code>) turn — all green.</li>
+  </ul>
+
+  <h2>Round 3 — residuals completed (2026-05-30)</h2>
+  <p>The deferred residuals from Round 2 were subsequently wired (or, for pure-dead code, removed). Each was mapped first, then implemented with tests.</p>
+  <table>
+    <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td>Skill-vector orphans (M18)</td><td><code>_delete_lesson_twin</code> deletes a lesson's embedded vector twin (keyed by <code>{type:skill, trigger[:200]}</code>, source-id fallback) whenever a lesson is trimmed (in <code>learn_lesson</code>), pruned (<code>prune_low_utility</code>), or removed (<code>remove_by_trigger</code>). The dream prune caller threads <code>memory_system</code> through.</td><td><a href="memory/skills.html">memory/skills</a>, core/dream</td></tr>
+      <tr><td>GEPA prompt loader (M7)</td><td>New <code>optim/loader.py</code> reads <code>$GHOST_HOME/system/optim/&lt;sig&gt;.json</code> (<code>optimized_instruction</code>) and the planner prepends it to <code>PLANNING_SYSTEM_PROMPT</code> when present — the optimization was previously write-only.</td><td>optim/loader, core/agent</td></tr>
+      <tr><td>Router training (H9)</td><td>New <code>router/trainer.py</code> (<code>RouterTrainer</code>, mirroring <code>PRMTrainer</code> with class-balance + min-count bail floors). An idle watchdog phase (2.7b) and a self-play-loop hook label trajectories → fit <code>ComplexityClassifier</code> → save → hot-swap the live dispatcher, so the router stops escalating every request. Checkpoint at <code>&lt;memory_dir&gt;/../router/checkpoint.json</code>; cadence via <code>--router-train-cooldown</code>.</td><td>router/trainer, core/agent, tools/memory, main</td></tr>
+      <tr><td>Metacog loop/anomaly triggers (rest of H7)</td><td>A per-tool timing shim feeds the runtime-budget window; the dispatch loop now calls <code>repetition.observe</code> + <code>runtime_budget.is_anomalous</code> and publishes <code>loop_event</code>/<code>anomaly_event</code> to the bus (gated on <code>--enable-metacog</code>; trigger publishes are isolated from the competence record).</td><td>core/agent, core/triggers</td></tr>
+      <tr><td>Chat→project promotion (M12)</td><td><code>should_suggest_promotion</code> is called at end-of-turn (free-chat only) and surfaces a one-line offer, suppressed after the first via a scratchpad flag.</td><td>core/agent, core/project_safety</td></tr>
+      <tr><td>Selfhood (rest of H12)</td><td><code>note_referenced_experiences</code> bumps reference counts post-turn (wake-up prefix vs. response); a new idle phase surfaces <code>stale_open_questions</code>; the narrative now reads <code>mood_history</code> to describe a mood arc.</td><td>core/agent, selfhood/narrative</td></tr>
+      <tr><td>Uncertainty lifecycle</td><td>The resolve-side is now wired: unknowns the agent answered for itself via an info tool this turn are <code>resolve_unknown</code>'d (so they drop from the clarifying-question gate and risk footer); clean turns <code>verify_assumption</code> the turn's auto-flagged assumptions.</td><td>core/agent, core/uncertainty</td></tr>
+      <tr><td>Dead public methods</td><td>Deleted (pure-dead / duplicates): <code>arbiter.confidence_gated</code>, <code>project_safety.has_human_gate</code>, <code>fallback_chains.get_fallback_tool_name</code>, <code>mcts.backtrack</code>/<code>has_alternatives</code>, <code>verifier.adversarial_probe</code> — with their tests trimmed.</td><td>core/{arbiter,mcts,verifier}, project_safety, fallback_chains</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Remaining by design</h2>
+  <ul>
+    <li><strong>Sandbox host-networking</strong> — remains the Linux default (the in-sandbox Tor proxy needs host loopback); isolation is opt-in via <code>GHOST_SANDBOX_NETWORK</code>. Not a bug; left as a deliberate, documented trade-off.</li>
   </ul>
 </main>
 </body>

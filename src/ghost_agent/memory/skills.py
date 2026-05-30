@@ -328,6 +328,33 @@ def _trim_playbook_by_utility(playbook: list, max_entries: int) -> list:
     return kept
 
 
+def _delete_lesson_twin(memory_system, lesson) -> None:
+    """Best-effort delete of a lesson's embedded vector twin.
+
+    When a lesson is trimmed/pruned/removed from the JSON playbook, its
+    ChromaDB twin was previously orphaned — accumulating stale docs that
+    `get_playbook_context` would still surface. Keyed by the exact metadata
+    written at add() time (skills.py learn_lesson): trigger[:200]+type (the
+    precise per-lesson key), falling back to source_trajectory_id. Never
+    raises — the JSON playbook is canonical; the vector scrub is advisory.
+    """
+    if memory_system is None or not isinstance(lesson, dict):
+        return
+    try:
+        coll = getattr(memory_system, "collection", None)
+        if coll is None or not hasattr(coll, "delete"):
+            return
+        trig = (lesson.get("trigger") or lesson.get("task") or "")[:200]
+        if trig:
+            coll.delete(where={"type": "skill", "trigger": trig})
+            return
+        src = lesson.get("source_trajectory_id")
+        if isinstance(src, str) and src:
+            coll.delete(where={"source_trajectory_id": src})
+    except Exception as e:
+        logger.warning("skill twin delete failed: %s", e)
+
+
 class SkillMemory:
     def __init__(self, memory_dir: Path):
         self.file_path = memory_dir / "skills_playbook.json"
@@ -542,11 +569,18 @@ class SkillMemory:
             )
 
             with self._get_lock():
-                playbook = self._load_playbook()
-                playbook = _trim_playbook_by_utility(
-                    [new_lesson] + playbook, PLAYBOOK_MAX
-                )
+                before = [new_lesson] + self._load_playbook()
+                playbook = _trim_playbook_by_utility(before, PLAYBOOK_MAX)
                 self._save_playbook_unlocked(playbook)
+
+            # Delete the vector twins of any lessons the trim dropped, so the
+            # capped JSON playbook and the vector store don't drift apart
+            # (orphans waste retrieval slots). Identity-keyed against `before`.
+            if memory_system:
+                kept_ids = {id(l) for l in playbook}
+                for dropped in before:
+                    if id(dropped) not in kept_ids and dropped is not new_lesson:
+                        _delete_lesson_twin(memory_system, dropped)
 
             if memory_system:
                 text = lesson_embedding_text(new_lesson)
@@ -779,15 +813,20 @@ class SkillMemory:
                 self._save_playbook_unlocked(playbook)
         return credited
 
-    def prune_low_utility(self, min_retrievals: int = 5, max_drop_fraction: float = 0.25) -> int:
+    def prune_low_utility(self, min_retrievals: int = 5, max_drop_fraction: float = 0.25,
+                          memory_system=None) -> int:
         """Drop lessons whose utility score is in the bottom quartile
         **and** that have been retrieved at least `min_retrievals` times
         (we need real data before punishing a lesson).
 
         Verified lessons are always retained regardless of score. Never
         drops more than `max_drop_fraction` of the playbook in one pass.
+
+        When `memory_system` is given, each pruned lesson's embedded vector
+        twin is also deleted so the stores don't drift (orphan vectors).
         """
         removed = 0
+        _pruned_lessons = []
         with self._get_lock():
             playbook = self._load_playbook()
             if len(playbook) < 10:
@@ -822,6 +861,11 @@ class SkillMemory:
             )
             self._save_playbook_unlocked(survivors)
             removed = len(pruned)
+            _pruned_lessons = list(pruned)
+        # Vector-twin scrub AFTER a successful save (canonical store first).
+        if removed and memory_system is not None:
+            for lesson in _pruned_lessons:
+                _delete_lesson_twin(memory_system, lesson)
         if removed:
             pretty_log(
                 "SKILL PRUNE",
@@ -1060,21 +1104,28 @@ class SkillMemory:
 
         return self._update_lesson_fields(_match, _mut)
 
-    def remove_by_trigger(self, trigger: str) -> bool:
+    def remove_by_trigger(self, trigger: str, memory_system=None) -> bool:
         """Delete the first lesson with a matching trigger. Returns True
         if one was removed. Used when verification proves a lesson
-        unhelpful / actively harmful."""
+        unhelpful / actively harmful. When `memory_system` is given, the
+        lesson's embedded vector twin is deleted too (no orphan)."""
         if not trigger:
             return False
         target = trigger.strip().lower()
+        removed_lesson = None
         with self._get_lock():
             playbook = self._load_playbook()
             for idx, raw in enumerate(playbook):
                 t = (raw.get("trigger") or raw.get("task") or "").strip().lower()
                 if t == target:
+                    removed_lesson = playbook[idx]
                     del playbook[idx]
                     self._save_playbook_unlocked(playbook)
-                    return True
+                    break
+        if removed_lesson is not None:
+            if memory_system is not None:
+                _delete_lesson_twin(memory_system, removed_lesson)
+            return True
         return False
 
 

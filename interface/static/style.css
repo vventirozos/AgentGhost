@@ -82,6 +82,11 @@ body.is-reading #background-layer {
 /* Header */
 header {
     display: flex;
+    /* Own stacking layer above main#chat-container (which is positioned,
+       so it would otherwise paint over the static header where they meet
+       and steal taps from the buttons). */
+    position: relative;
+    z-index: 20;
     justify-content: space-between;
     align-items: flex-start;
     padding: 16px 32px;
@@ -148,7 +153,13 @@ header {
 
 #header-controls {
     display: flex;
-    flex-direction: column;
+    /* Horizontal row, not a vertical stack. As a column the 5 icon
+       buttons made the (flex-shrink:0) header ~300px tall, reserving the
+       top third of the screen above the chat — which read as "chats are
+       hidden at the top". A row keeps the header one button tall. */
+    flex-direction: row;
+    flex-wrap: wrap;
+    justify-content: flex-end;
     gap: 12px;
     align-items: center;
 }
@@ -178,22 +189,20 @@ header {
 
 /* Chat Area */
 main#chat-container {
-    flex-grow: 1;
+    /* flex:1 1 0 + min-height:0 is the robust fill pattern: the chat grows
+       to fill the space between the (compact) header and the input and
+       never overflows its siblings. Earlier this used margin-top:auto to
+       bottom-anchor a max-height-capped block, but on iOS Safari that
+       auto-margin + flex-grow combo let the container overlap the header,
+       so its buttons couldn't be tapped on mobile. No cap, no auto margin,
+       no top mask fade (which had hidden the top 15% until hover). */
+    flex: 1 1 0;
+    min-height: 0;
     position: relative;
     overflow: hidden;
-    mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 100%);
-    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 15%, black 100%);
     display: flex;
     flex-direction: column;
     margin-bottom: 10px;
-    max-height: 55vh;
-    margin-top: auto;
-    transition: mask-image 0.3s ease, -webkit-mask-image 0.3s ease;
-}
-
-main#chat-container:hover {
-    mask-image: linear-gradient(to bottom, transparent 0%, black 0%, black 100%);
-    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, black 0%, black 100%);
 }
 
 #chat-log {
@@ -1104,7 +1113,13 @@ pre:hover .render-code-btn {
 @media (max-width: 1280px) and (max-height: 720px) {
     header {
         padding: 8px 15px;
-        height: 50px;
+        /* min-height, NOT a fixed height. On a portrait phone this query
+           also matches (height <= 720) while the <=480 rule makes the
+           header a 2-row column (status + buttons); a fixed 50px clipped
+           that, so the buttons overflowed below the header into the chat.
+           min-height keeps the uConsole's single-row bar compact while
+           letting the phone header grow to contain its buttons. */
+        min-height: 50px;
     }
     #chat-log {
         font-size: 0.9rem; /* Slightly smaller text for readability */
@@ -1118,7 +1133,10 @@ pre:hover .render-code-btn {
         padding: 10px;
     }
     #chat-input {
-        font-size: 0.95rem;
+        /* font-size intentionally NOT set < 16px here: on phones (which
+           also match this query) iOS Safari auto-zooms the page when an
+           input under 16px is focused. The 0.95rem shrink is uConsole-only
+           (see the min-width:1000px block below). */
         padding: 10px;
     }
     /* Scale down the Render Window for the small screen */
@@ -1128,9 +1146,23 @@ pre:hover .render-code-btn {
         left: 7.5vw !important;
         top: 10vh !important;
     }
+}
+
+/* 36px buttons are a uConsole-only optimisation. The query above also
+   matches phones (any viewport <=720px tall — portrait SE, landscape),
+   where 36px is below the 44px touch-target guideline. Gate the shrink on
+   a wide viewport (min-width:1000px) so only the uConsole's 1280px-wide
+   screen gets it; phones keep the base 44px .icon-btn/#send-btn/#mic-btn.
+   Largest phones top out ~932px wide in landscape, well under 1000px. */
+@media (min-width: 1000px) and (max-height: 720px) {
     .icon-btn, #mic-btn, #send-btn {
         width: 36px;
         height: 36px;
+    }
+    /* uConsole-only: safe here because it's not a touch phone, so iOS
+       focus-zoom doesn't apply. */
+    #chat-input {
+        font-size: 0.95rem;
     }
 }
 

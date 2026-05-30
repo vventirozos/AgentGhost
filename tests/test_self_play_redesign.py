@@ -927,9 +927,21 @@ class TestChallengeGenDisablesThinking:
         copies the non-thinking switches into the main agent path
         would silently degrade the agent's reasoning quality."""
         src = AGENT_SRC.read_text()
-        # The tool-turn payload in handle_chat must NOT contain the
-        # disable-thinking hard-switch.
-        assert '"chat_template_kwargs": {"enable_thinking": False}' not in src
+        # The disable-thinking hard-switch is legitimately present EXACTLY
+        # once — in the trivial fast-path (greeting) payload, which SHOULD
+        # suppress <think> for "hi"/"thanks". The guard is that it never gets
+        # copied into the main tool-turn loop. Asserting a single occurrence
+        # catches that regression while allowing the (correct) trivial path.
+        occurrences = src.count('"chat_template_kwargs": {"enable_thinking": False}')
+        assert occurrences <= 1, (
+            f"disable-thinking switch appears {occurrences}x — it must stay "
+            "confined to the trivial fast-path, never the main tool turn."
+        )
+        # And the single occurrence must sit in the trivial-path block.
+        idx = src.find('"chat_template_kwargs": {"enable_thinking": False}')
+        if idx != -1:
+            preceding = src[max(0, idx - 1200):idx]
+            assert "trivial" in preceding.lower() or "/no_think" in preceding
 
     @pytest.mark.asyncio
     async def test_challenge_gen_payload_end_to_end(self, monkeypatch, tmp_path):

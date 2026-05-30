@@ -19,7 +19,11 @@ app = AsyncApp(token=os.environ.get("SLACK_BOT_TOKEN"))
 
 # Constants
 GHOST_API_URL = os.environ.get("GHOST_API_URL", "http://localhost:8000/api/chat")
-GHOST_API_KEY = os.environ.get("GHOST_API_KEY", "ghost-secret-123")
+# Never ship a default secret — require the key to be set explicitly so the
+# bot can't silently authenticate with the publicly-known default.
+GHOST_API_KEY = os.environ.get("GHOST_API_KEY")
+if not GHOST_API_KEY:
+    raise SystemExit("GHOST_API_KEY environment variable is required (no default).")
 LOG_FILE_PATH = "/Users/vasilis/AI/Logs/ghost-slack-bot-main.err"
 GHOST_SANDBOX_DIR = os.environ.get("GHOST_SANDBOX_DIR", "/tmp/sandbox")
 

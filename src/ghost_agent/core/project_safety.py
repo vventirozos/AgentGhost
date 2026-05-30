@@ -22,7 +22,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 logger = logging.getLogger("GhostAgent")
 
@@ -98,17 +98,6 @@ def record_runtime(
 # ------------------------------------------------------------------ human gates
 
 HUMAN_GATE_PREFIX = "HUMAN_GATE:"
-
-
-def has_human_gate(postconditions: Optional[Iterable[str]]) -> bool:
-    if not postconditions:
-        return False
-    for pc in postconditions:
-        if not pc:
-            continue
-        if str(pc).strip().upper().startswith(HUMAN_GATE_PREFIX):
-            return True
-    return False
 
 
 def enforce_human_gate(task: Dict[str, Any]) -> Optional[str]:

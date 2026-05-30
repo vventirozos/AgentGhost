@@ -146,6 +146,18 @@ def _increment_budget(store, project_id: str) -> None:
     store.update_project(project_id, metadata=new_meta)
 
 
+def _metacog_set_task(context, task_id) -> None:
+    """Best-effort: stash the executing task id on the metacog bundle so the
+    ReplanBridge can attribute a triggered replan. No-op when metacog is off
+    or absent. Never raises."""
+    try:
+        mc = getattr(context, "metacog", None)
+        if mc is not None and getattr(mc, "enabled", False):
+            mc.set_active_task(task_id)
+    except Exception:
+        pass
+
+
 async def advance_once(
     context,
     project_id: str,
@@ -210,8 +222,17 @@ async def advance_once(
         plan = ProjectPlan(store, project_id)
         nxt = plan.next_ready_leaf()
         if not nxt:
+            _metacog_set_task(context, None)  # nothing executing → clear
             return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
         plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
+
+    # Tell the metacog ReplanBridge which task is now executing, so a
+    # trigger (host-resource pressure, etc.) can attribute a replan to THIS
+    # node instead of being dropped as `noop:no_plan`. Cleared at the start
+    # of the next advance and after this node completes. No-op unless
+    # --enable-metacog is set. (Previously set_active_task had no caller, so
+    # the entire trigger→replan pipeline was inert.)
+    _metacog_set_task(context, nxt.id)
 
     if llm_classifier is None:
         classification = classify_task(nxt.description)
@@ -310,6 +331,7 @@ async def advance_once(
 
     plan.update_status(nxt.id, TaskStatus.DONE,
                        result=result_summary, actual_tool=tool_name)
+    _metacog_set_task(context, None)  # node finished → don't replan a done task
     _increment_budget(store, project_id)
     from .project_safety import record_runtime as _record
     _record(store, project_id,
