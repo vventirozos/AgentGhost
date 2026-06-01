@@ -110,6 +110,19 @@ def _new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
+def _canon_id(value: Optional[str]) -> str:
+    """Canonical form of a project / task id.
+
+    IDs are generated as lowercase hex (``uuid4().hex[:12]``), but an LLM
+    that echoes one back in a tool call routinely mangles the case of an
+    opaque hex token — e.g. ``9b5bd5cd812b`` → ``9B5Bd5Cd812B`` — which
+    made the case-sensitive ``WHERE id = ?`` lookups miss with
+    "project not found". Normalising every id the store accepts (strip +
+    lowercase) makes generation and resolution always agree, regardless
+    of how the id was transmitted. Idempotent on already-canonical ids."""
+    return (value or "").strip().lower()
+
+
 def _now() -> float:
     return time.time()
 
@@ -191,6 +204,7 @@ class ProjectStore:
             return [self._row_to_project(r) for r in rows]
 
     def get_project(self, project_id: str) -> Optional[Dict[str, Any]]:
+        project_id = _canon_id(project_id)
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM projects WHERE id = ?", (project_id,)
@@ -198,6 +212,7 @@ class ProjectStore:
             return self._row_to_project(row) if row else None
 
     def update_project(self, project_id: str, **fields) -> bool:
+        project_id = _canon_id(project_id)
         if not fields:
             return False
         allowed = {"title", "kind", "goal", "status", "workspace_dir", "metadata"}
@@ -238,6 +253,7 @@ class ProjectStore:
         project remains resumable. Hard delete removes the rows (and
         cascades to tasks/artifacts/events via FK).
         """
+        project_id = _canon_id(project_id)
         if hard:
             with self._lock, self._connect() as conn:
                 cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
@@ -286,6 +302,8 @@ class ProjectStore:
                  position: Optional[int] = None) -> str:
         if not description or not description.strip():
             raise ValueError("description must be non-empty")
+        project_id = _canon_id(project_id)
+        parent_id = _canon_id(parent_id) or None
         task_id = _new_id()
         now = _now()
         depth = 0
@@ -331,6 +349,7 @@ class ProjectStore:
         return task_id
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
+        task_id = _canon_id(task_id)
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM tasks WHERE id = ?", (task_id,)
@@ -339,6 +358,7 @@ class ProjectStore:
 
     def list_tasks(self, project_id: str,
                    status_filter: Optional[str] = None) -> List[Dict[str, Any]]:
+        project_id = _canon_id(project_id)
         with self._lock, self._connect() as conn:
             if status_filter:
                 rows = conn.execute(
@@ -355,6 +375,7 @@ class ProjectStore:
             return [self._row_to_task(r) for r in rows]
 
     def update_task(self, task_id: str, **fields) -> bool:
+        task_id = _canon_id(task_id)
         if not fields:
             return False
         allowed = {"description", "status", "dependency_type", "alternatives",
@@ -451,6 +472,7 @@ class ProjectStore:
     def delete_task(self, task_id: str) -> bool:
         """Delete a task and its descendants (via FK cascade on parent_id=NULL
         we can't rely on cascade, so we delete manually)."""
+        task_id = _canon_id(task_id)
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT project_id FROM tasks WHERE id = ?", (task_id,)
@@ -494,6 +516,7 @@ class ProjectStore:
     # ------------------------------------------------------------------ artifacts
 
     def add_artifact(self, task_id: str, kind: str, payload: str) -> str:
+        task_id = _canon_id(task_id)
         if kind not in _ARTIFACT_KINDS:
             raise ValueError(f"unknown artifact kind: {kind}")
         task = self.get_task(task_id)
@@ -514,6 +537,8 @@ class ProjectStore:
 
     def list_artifacts(self, project_id: Optional[str] = None,
                        task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        project_id = _canon_id(project_id) or None
+        task_id = _canon_id(task_id) or None
         with self._lock, self._connect() as conn:
             if task_id:
                 rows = conn.execute(
@@ -533,6 +558,8 @@ class ProjectStore:
 
     def log_event(self, project_id: str, task_id: Optional[str], event_type: str,
                   payload: Optional[Dict[str, Any]] = None) -> int:
+        project_id = _canon_id(project_id)
+        task_id = _canon_id(task_id) or None
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 "INSERT INTO project_events(project_id, task_id, type, payload_json, ts) "
@@ -544,6 +571,7 @@ class ProjectStore:
 
     def list_events(self, project_id: str, limit: int = 50,
                     event_type: Optional[str] = None) -> List[Dict[str, Any]]:
+        project_id = _canon_id(project_id)
         with self._lock, self._connect() as conn:
             if event_type:
                 rows = conn.execute(

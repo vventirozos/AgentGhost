@@ -528,7 +528,10 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
 @router.post("/api/upload", dependencies=[Security(verify_api_key)])
 async def upload_file(request: Request, file: UploadFile = File(...)):
     agent = get_agent(request)
-    sandbox_dir = agent.context.sandbox_dir
+    # When a project is active, land the upload in its scoped dir so it joins
+    # the working set the model sees and the (scoped) file_system can read it.
+    from ..tools.file_system import project_scoped_sandbox
+    sandbox_dir = project_scoped_sandbox(agent.context)[0]
     # Reject path traversal AND the absent-filename case explicitly.
     if not file.filename or ".." in file.filename or file.filename.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid filename")
@@ -553,6 +556,17 @@ async def download_file(request: Request, filename: str):
     if ".." in filename or filename.startswith("/"):
         raise HTTPException(status_code=404, detail="File not found")
     file_path = (sandbox_dir / filename).resolve()
+    # Fallback: when a project is active, artefact tools (image_generation,
+    # execute-saved plots) write into <sandbox>/projects/<id>/, but the model
+    # often emits a BARE link (`/api/download/plot.png`). If the bare path
+    # isn't at the root, retry under the active project's scoped dir so the
+    # link still resolves. Containment is re-checked below.
+    if not file_path.exists() and "/" not in filename:
+        pid = getattr(agent.context, "current_project_id", None)
+        if isinstance(pid, str) and pid.strip():
+            cand = (sandbox_dir / "projects" / pid.strip().lower() / filename).resolve()
+            if _is_within(sandbox_dir, cand) and cand.exists():
+                file_path = cand
     if not _is_within(sandbox_dir, file_path) or not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path=str(file_path), filename=file_path.name)

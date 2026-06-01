@@ -439,7 +439,8 @@ class DockerSandbox:
         except Exception:
             return False
 
-    def execute(self, cmd: str, timeout: int = 300, memory_limit: str = None):
+    def execute(self, cmd: str, timeout: int = 300, memory_limit: str = None,
+                workdir: str = None):
         try:
             self.ensure_running()
             if not self._is_container_ready():
@@ -459,8 +460,12 @@ class DockerSandbox:
             import sys
             is_mac = sys.platform == "darwin"
             
+            # workdir defaults to /workspace; a project-scoped caller passes
+            # /workspace/projects/<id> so files written/run during a project
+            # land under that subdir (easy per-project cleanup). The path is
+            # under the bind-mounted root, so it exists in the container.
             exec_kwargs = {
-                "workdir": CONTAINER_WORKDIR,
+                "workdir": workdir or CONTAINER_WORKDIR,
                 "demux": False
             }
             if not is_mac:

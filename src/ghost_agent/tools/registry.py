@@ -285,6 +285,11 @@ TOOL_DEFINITIONS.append({
             "Use this whenever the user asks for a 'report', 'whitepaper', "
             "'market analysis', 'PDF', or any document deliverable. The PDF is "
             "rendered locally (no network) and exposed via /api/download/<file>. "
+            "For a DETAILED report compiled from files you already wrote (e.g. "
+            "per-task .md findings), pass source_files=[...]: the tool reads and "
+            "sections each file for you, so the FULL content reaches the PDF. Do "
+            "NOT paste large file contents into 'sections' — that forces you to "
+            "re-transcribe everything and reliably collapses into a thin summary. "
             "After this tool succeeds, include the returned markdown download "
             "link verbatim in your reply so the user can open the file."
         ),
@@ -321,6 +326,21 @@ TOOL_DEFINITIONS.append({
                         "required": ["body"],
                     },
                 },
+                "source_files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "OPTIONAL list of sandbox file paths (markdown/text) to "
+                        "compile INTO the report. The tool reads each file and "
+                        "splits it into sections on its headers, so the full "
+                        "detailed content reaches the PDF WITHOUT you re-typing "
+                        "it. USE THIS for 'a detailed report with all findings "
+                        "from all tasks' — list the task output files here "
+                        "instead of pasting their content into 'sections'. You "
+                        "may still pass 'sections' for an intro/summary that "
+                        "leads the compiled file content."
+                    ),
+                },
                 "filename": {
                     "type": "string",
                     "description": (
@@ -332,7 +352,7 @@ TOOL_DEFINITIONS.append({
                     ),
                 },
             },
-            "required": ["title", "sections"],
+            "required": ["title"],
         },
     },
 })
@@ -646,7 +666,36 @@ def get_available_tools(context):
         tool_stop_self_play,
         tool_list_lessons,
     )  # Lazy import to avoid circular dependencies
-    
+
+    def _proj_ws(stateful: bool = False):
+        """Working directory for file ops + code execution — see
+        ``file_system.project_scoped_sandbox`` (the shared source of truth).
+
+        When a project is active, files live under
+        ``sandbox/projects/<id>/`` instead of the sandbox root, so a whole
+        project's scratch space cleans up with a single
+        ``rm -rf sandbox/projects/<id>``. Returns
+        ``(host_dir, container_workdir)``; stateful kernel sessions opt out
+        (the kernel conn file is pinned to ``/workspace``).
+        """
+        from .file_system import project_scoped_sandbox
+        return project_scoped_sandbox(context, stateful=stateful)
+
+    async def _run_execute(**kwargs):
+        # Stateful kernel sessions can't be project-scoped (kernel conn file
+        # is pinned to /workspace), so they opt out; everything else runs
+        # from /workspace/projects/<id> with its host dir scoped to match.
+        host_dir, workdir = _proj_ws(stateful=bool(kwargs.get("stateful")))
+        return await tool_execute(
+            sandbox_dir=host_dir,
+            container_workdir=workdir,
+            sandbox_manager=context.sandbox_manager,
+            memory_dir=context.memory_dir,
+            _metacog_bundle=getattr(context, "metacog", None),
+            workspace_model=getattr(context, "workspace_model", None),
+            **kwargs,
+        )
+
     async def _replan(reason, **kwargs): return f"Strategy Reset Triggered. Reason: {reason}\nSYSTEM: The planner will see this and should update the TaskTree accordingly."
 
     # Escape hatch for the agent when it has PROVEN a task cannot be
@@ -669,10 +718,10 @@ def get_available_tools(context):
     
     tools = {
         "system_utility": lambda **kwargs: tool_system_utility(tor_proxy=context.tor_proxy, profile_memory=context.profile_memory, context=context, **kwargs),
-        "file_system": lambda **kwargs: tool_file_system(sandbox_dir=context.sandbox_dir, tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, **kwargs),
-        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=context.sandbox_dir, memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), **kwargs),
+        "file_system": lambda **kwargs: tool_file_system(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, **kwargs),
+        "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "recall": lambda **kwargs: tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs),
-        "execute": lambda **kwargs: tool_execute(sandbox_dir=context.sandbox_dir, sandbox_manager=context.sandbox_manager, memory_dir=context.memory_dir, _metacog_bundle=getattr(context, "metacog", None), workspace_model=getattr(context, "workspace_model", None), **kwargs),
+        "execute": _run_execute,
         "browser": lambda **kwargs: tool_browser(sandbox_dir=context.sandbox_dir, sandbox_manager=context.sandbox_manager, tor_proxy=context.tor_proxy, workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "learn_skill": lambda **kwargs: tool_learn_skill(skill_memory=context.skill_memory, memory_system=context.memory_system, memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "self_state": lambda **kwargs: tool_self_state(self_model=getattr(context, "self_model", None), **kwargs),
@@ -710,14 +759,14 @@ def get_available_tools(context):
     }
     
     from .vision import tool_vision_analysis
-    tools["vision_analysis"] = lambda **kwargs: tool_vision_analysis(llm_client=context.llm_client, sandbox_dir=context.sandbox_dir, tor_proxy=context.tor_proxy, **kwargs)
+    tools["vision_analysis"] = lambda **kwargs: tool_vision_analysis(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, **kwargs)
 
     from .report_pdf import tool_generate_pdf
-    tools["report_pdf"] = lambda **kwargs: tool_generate_pdf(sandbox_dir=context.sandbox_dir, **kwargs)
+    tools["report_pdf"] = lambda **kwargs: tool_generate_pdf(sandbox_dir=_proj_ws()[0], **kwargs)
 
     if getattr(context.llm_client, 'image_gen_clients', None):
         from .image_gen import tool_generate_image
-        tools["image_generation"] = lambda **kwargs: tool_generate_image(llm_client=context.llm_client, sandbox_dir=context.sandbox_dir, **kwargs)
+        tools["image_generation"] = lambda **kwargs: tool_generate_image(llm_client=context.llm_client, sandbox_dir=_proj_ws()[0], **kwargs)
         
     if context and getattr(context, 'sandbox_dir', None) and getattr(context, 'memory_system', None):
         try:

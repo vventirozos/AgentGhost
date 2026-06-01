@@ -43,10 +43,14 @@ async def test_tool_generate_image_success(mock_sandbox, mock_llm_client):
         "height": 1024,
     })
 
-    # Verify result string format
+    # Verify result string format. The tool was redesigned to embed a
+    # SHORT alt text ("generated image") and instruct the model to
+    # describe the image in its own words — deliberately NOT pasting the
+    # raw prompt back (so it isn't leaked verbatim into the reply).
     assert result.startswith("SUCCESS: Image generated and saved to sandbox.")
-    assert f"![{prompt}](/api/download/gen_" in result
-    assert f"**Description:** {prompt}" in result
+    assert "![generated image](/api/download/gen_" in result
+    assert "in your own words" in result
+    assert prompt not in result  # raw prompt must not be echoed
 
     # Extract filename and verify file was written exactly as fake_img_data
     import re

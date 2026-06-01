@@ -187,6 +187,24 @@ def _set_current(context, project_id: Optional[str]):
         _hydrate_scratchpad(context, None)
 
 
+def _workspace_note(project_id: str) -> str:
+    """Tell the model that entering a project moves its working directory.
+
+    File ops (file_system) and code execution (execute) are scoped to
+    ``sandbox/projects/<id>/`` while the project is active. Without this
+    cue the model writes a file, then runs it from a path it assumes is the
+    sandbox root, and burns strikes on "can't open file" before recovering
+    (observed live). Steering it toward bare relative names keeps writes and
+    runs in the same place."""
+    return (
+        f"Working directory is now projects/{project_id}/. Files you write "
+        "with file_system and run with execute live HERE — reference them by "
+        "bare name (e.g. 'chart.py', 'notes.md'), not '/workspace/...'. To "
+        "clean up this project's files later: remove sandbox/projects/"
+        f"{project_id}/."
+    )
+
+
 def _resolve_store(context) -> Optional[ProjectStore]:
     return getattr(context, "project_store", None)
 
@@ -394,6 +412,18 @@ async def tool_manage_projects(
             f"unknown action '{action}'. valid: {', '.join(sorted(_ACTIONS))}"
         )
 
+    # Canonicalise model-supplied ids at the boundary. IDs are lowercase
+    # hex, but the LLM routinely mangles the case of opaque hex tokens
+    # when it echoes one back (e.g. 9b5bd5cd812b -> 9B5Bd5Cd812B), which
+    # otherwise surfaced as "project not found". The store also
+    # canonicalises (defence in depth); doing it here too keeps
+    # context.current_project_id stored in canonical form.
+    from ..memory.projects import _canon_id as _canon_pid
+    if project_id:
+        project_id = _canon_pid(project_id)
+    if task_id:
+        task_id = _canon_pid(task_id)
+
     store = _resolve_store(context)
     if store is None:
         return _err("project_store is not configured on this context")
@@ -544,6 +574,8 @@ async def tool_manage_projects(
                 return _err(f"project not found: {project_id}")
             _set_current(context, project_id)
             return _ok({"switched_to": project_id,
+                        "workspace": f"projects/{project_id}",
+                        "note": _workspace_note(project_id),
                         "briefing": _briefing(store, project_id)})
 
         if act == "exit":
@@ -586,7 +618,11 @@ async def tool_manage_projects(
                 return _err(f"project not found: {project_id}")
             _set_current(context, project_id)
             store.log_event(project_id, None, "project_resumed", {})
-            return _ok(_briefing(store, project_id))
+            _b = _briefing(store, project_id)
+            if isinstance(_b, dict):
+                _b = {**_b, "workspace": f"projects/{project_id}",
+                      "note": _workspace_note(project_id)}
+            return _ok(_b)
 
         if act == "status":
             cur = getattr(context, "current_project_id", None)

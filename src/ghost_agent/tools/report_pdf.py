@@ -67,6 +67,101 @@ hr { border: 0; border-top: 1px solid #ddd; margin: 8pt 0; }
 """
 
 
+def _split_markdown_into_sections(md: str) -> list[dict]:
+    """Split a single markdown document into sections on its top-level
+    (``#`` / ``##``) ATX headers.
+
+    The agent frequently dumps a whole multi-part report into ONE markdown
+    string (``sections="# Report\\n## Task 1 …\\n## Task 2 …"``); rendered
+    as a single section that becomes a flat wall of text and reads "thin"
+    even when it's long. Splitting on the top-level headers turns it into a
+    properly structured multi-section PDF — one section per ``##`` — with
+    no extra work from the model. Deeper headers (``###`` +) stay inside
+    their parent section's body. Returns ``[]`` when there's nothing to
+    split on (< 2 top-level headers), so single-section reports are left
+    to the plain single-string fallback."""
+    header_re = re.compile(r"^\s{0,3}(#{1,2})\s+(.+?)\s*#*\s*$")
+    sections: list[dict] = []
+    heading = ""
+    body_lines: list[str] = []
+
+    def _flush() -> None:
+        if heading or "\n".join(body_lines).strip():
+            sections.append({"heading": heading, "body": "\n".join(body_lines).strip()})
+
+    found = False
+    for ln in md.splitlines():
+        m = header_re.match(ln)
+        if m:
+            found = True
+            _flush()
+            heading = m.group(2).strip()
+            body_lines = []
+        else:
+            body_lines.append(ln)
+    _flush()
+    if not found or len(sections) < 2:
+        return []
+    return sections
+
+
+def _sections_from_files(sandbox_dir: Path, files: Any) -> tuple[list[dict], list[str]]:
+    """Build report sections by reading sandbox markdown/text files.
+
+    The robust path for "generate a detailed report from all the task
+    files": the agent passes ``source_files=[...]`` and the bulk content
+    flows file → PDF directly, instead of the model having to
+    re-transcribe it into the tool-call argument — which made small models
+    either summarise it down to a thin blurb or stall emitting a giant
+    argument (observed repeatedly on the meta-cognitive report). Each file
+    is split on its top-level headers; a header-less file becomes one
+    section titled from its filename. Missing files are skipped and
+    returned so the caller can surface them."""
+    paths: list[str] = []
+    if isinstance(files, str):
+        s = files.strip()
+        if s[:1] == "[":
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, list):
+                    paths = [str(x) for x in parsed]
+            except (ValueError, TypeError):
+                paths = []
+        if not paths:
+            paths = [p.strip() for p in re.split(r"[,\n]", s) if p.strip()]
+    elif isinstance(files, (list, tuple)):
+        paths = [str(x).strip() for x in files if str(x).strip()]
+
+    out: list[dict] = []
+    missing: list[str] = []
+    try:
+        from .file_system import _get_safe_path
+    except Exception:
+        _get_safe_path = None
+    for p in paths:
+        try:
+            if _get_safe_path is not None:
+                fp = _get_safe_path(Path(sandbox_dir), p)
+            else:
+                fp = (Path(sandbox_dir) / str(p).lstrip("/")).resolve()
+            if not fp.exists() or not fp.is_file():
+                missing.append(p)
+                continue
+            text = fp.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            missing.append(p)
+            continue
+        if not text.strip():
+            continue
+        split = _split_markdown_into_sections(text)
+        if split:
+            out.extend(split)
+        else:
+            stem = Path(p).stem.replace("_", " ").replace("-", " ").strip().title()
+            out.append({"heading": stem, "body": text.strip()})
+    return out, missing
+
+
 def _normalise_sections(sections: Any, body: Any, content: Any) -> list[dict]:
     """Coerce whatever the LLM passed into ``[{heading, body}, ...]``.
 
@@ -116,6 +211,13 @@ def _normalise_sections(sections: Any, body: Any, content: Any) -> list[dict]:
             fallback = cand
             break
     if fallback:
+        # Auto-structure a whole-report-in-one-string into sections on its
+        # top-level headers, so a "dumped" report still renders as a proper
+        # multi-section PDF rather than one flat blob. Falls back to a
+        # single section when there are no headers to split on.
+        split = _split_markdown_into_sections(fallback)
+        if split:
+            return split
         return [{"heading": "", "body": fallback}]
     return []
 
@@ -221,6 +323,7 @@ async def tool_generate_pdf(
     author: str = "",
     filename: str = "",
     sandbox_dir: Path = None,
+    source_files: Any = None,
     **kwargs,
 ) -> str:
     """Native PDF report tool. See module docstring for input shape.
@@ -240,6 +343,22 @@ async def tool_generate_pdf(
         kwargs.get("content") or kwargs.get("markdown") or kwargs.get("text"),
     )
 
+    # Build sections directly from sandbox source files when asked. This is
+    # the scalable path for a detailed report compiled from many task
+    # files: the model lists the files (cheap) and the tool reads + splits
+    # them, so the full content reaches the PDF without being squeezed
+    # through the model's output tokens (which produced a thin summary /
+    # a stall). Any explicit sections (e.g. an intro) lead; file sections
+    # follow.
+    source_files = (
+        source_files or kwargs.get("files") or kwargs.get("from_files")
+        or kwargs.get("source_file") or kwargs.get("source")
+    )
+    file_missing: list[str] = []
+    if source_files and sandbox_dir is not None:
+        file_secs, file_missing = _sections_from_files(Path(sandbox_dir), source_files)
+        secs = secs + file_secs
+
     if not title:
         return (
             "SYSTEM ERROR: 'title' is REQUIRED for report_pdf. Pass the "
@@ -247,10 +366,14 @@ async def tool_generate_pdf(
             "Trends for 2027')."
         )
     if not secs:
+        _miss = (f" (source_files given but none readable: {file_missing})"
+                 if file_missing else "")
         return (
             "SYSTEM ERROR: 'sections' is REQUIRED for report_pdf. Pass a "
-            "list of {heading, body} dicts (body is markdown), or a single "
-            "markdown string if you only have one section."
+            "list of {heading, body} dicts (body is markdown), a single "
+            "markdown string, OR — to compile a detailed report from files "
+            "you already wrote — source_files=['a.md','b.md', …] and the "
+            "tool will read and section them for you." + _miss
         )
 
     total_chars = sum(len(s.get("body", "")) for s in secs)
@@ -287,6 +410,13 @@ async def tool_generate_pdf(
     final_name = safe_name or f"report_{uuid.uuid4().hex[:8]}.pdf"
     out_path = sandbox_dir / final_name
 
+    # The /api/download/<path> route resolves against the sandbox ROOT, but
+    # when a project is active sandbox_dir is scoped to <root>/projects/<id>.
+    # Build the download link RELATIVE TO THE ROOT so the file is reachable
+    # (the route accepts a sub-path and containment-checks it).
+    from .file_system import project_download_prefix
+    download_rel = f"{project_download_prefix(sandbox_dir)}{final_name}"
+
     pretty_log("PDF Report", f"Title: {title[:60]} | sections={len(secs)}", icon=Icons.REPORT_PDF)
 
     full_html = _build_html(title, subtitle, author, secs)
@@ -308,10 +438,15 @@ async def tool_generate_pdf(
         return f"SYSTEM ERROR: PDF render failed: {type(e).__name__}: {e}"
 
     size_kb = out_path.stat().st_size / 1024
+    _miss_note = (
+        f"\n\n(Note: {len(file_missing)} source file(s) could not be read and "
+        f"were skipped: {file_missing}.)" if file_missing else ""
+    )
     return (
         f"SUCCESS: PDF report generated ({pages} page(s), {size_kb:.1f} KB). "
         "DO NOT CALL THIS TOOL AGAIN with the same title. Respond DIRECTLY "
         "to the user by including this exact markdown so the file is "
         f"offered for download:\n\n"
-        f"[📄 {title} (PDF)](/api/download/{final_name})"
+        f"[📄 {title} (PDF)](/api/download/{download_rel})"
+        f"{_miss_note}"
     )

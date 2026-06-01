@@ -67,6 +67,12 @@ exact markdown so the file is offered for download:
     market analysis report, and save it as a PDF.</pre>
   <p>The agent fans out research via <code>deep_research</code> / <code>delegate_to_swarm</code>, assembles findings in the scratchpad, then makes one <code>report_pdf</code> call with section-shaped <code>{heading, body}</code> entries. The reply ends with the markdown download link, which the <a href="../interfaces/web_server.html">web client</a> auto-promotes into a clickable card with inline PDF preview.</p>
 
+  <h2>Compile from files (<code>source_files</code>)</h2>
+  <p>For a detailed report built from files the agent already wrote (per-task <code>.md</code> findings), passing <code>source_files=["a.md", "b.md", …]</code> makes the tool <strong>read each file and split it into sections on its headers</strong> — so the full content flows file → PDF without the model re-transcribing it into the tool-call argument. That re-transcription was the real failure on the meta-cognitive report: a small model squeezing 5 detailed files through its output tokens either stalled (30 s aborts) or collapsed to a thin 1-page summary (<code>sections=1</code>). The tool schema now steers the model toward <code>source_files</code> for "all findings from all tasks" requests, and <code>title</code> is the only hard-required field (provide <code>sections</code> <em>or</em> <code>source_files</code>). Missing files are skipped and reported. Covered by <code>tests/test_report_pdf_source_files.py</code>.</p>
+
+  <h2>Auto-sectioning a dumped report</h2>
+  <p>The model frequently dumps a whole multi-part report into ONE markdown string (<code>sections="# Report\n## Task 1 …\n## Task 2 …"</code>) instead of a structured list — rendering as a single flat section that reads "thin" even when long. <code>_normalise_sections</code> now <strong>auto-splits a single markdown string on its top-level (<code>#</code> / <code>##</code>) headers</strong> into one section per header (deeper <code>###</code>+ stay in the parent body); a string with fewer than two top-level headers stays a single section. This is on top of the existing JSON-string-list decode and the <code>body=</code>/<code>content=</code> alias healing. Covered by <code>tests/test_report_pdf_sections.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

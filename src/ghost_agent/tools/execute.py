@@ -14,7 +14,27 @@ from ..utils.logging import Icons, pretty_log
 from ..utils.sanitizer import sanitize_code
 from .file_system import _get_safe_path
 
-async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, workspace_model=None, **kwargs):
+
+def _looks_like_file_not_found(out) -> bool:
+    """Heuristic: did a command fail because the target file wasn't where it
+    looked? Used to trigger the project-scoped → root cwd retry. Matches the
+    common interpreter/shell messages (python, node, bash, cat, ...)."""
+    if not isinstance(out, str):
+        return False
+    o = out.lower()
+    return (
+        "can't open file" in o
+        or "no such file or directory" in o
+        or "cannot find" in o
+        or "not found" in o and ".py" in o
+    )
+
+
+async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, workspace_model=None, container_workdir: str = None, **kwargs):
+    # When a project is active, run from /workspace/projects/<id> so files
+    # written via file_system (also scoped) read back. Passed ONLY when set,
+    # so sandbox managers without a `workdir` param keep working unchanged.
+    _workdir_kw = {"workdir": container_workdir} if container_workdir else {}
     # --- PARAMETER HALLUCINATION HEALING ---
     command = command or kwargs.get("cmd")
     filename = filename or kwargs.get("file") or kwargs.get("script") or kwargs.get("name")
@@ -186,7 +206,18 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         import time as _time
         _t0 = _time.time()
         cmd_str = f"bash -c {shlex.quote(command)}"
-        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=300)
+        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=300, **_workdir_kw)
+        # Root fallback for project-scoped commands. When a project is active
+        # the command runs from /workspace/projects/<id>, but the model may
+        # reference a file that lives at the sandbox ROOT — e.g. one it wrote
+        # in the SAME turn it switched into the project, before the switch
+        # took effect (observed: file_system write emitted just before the
+        # `switch` tool call → file at root, then `python3 chart.py` from the
+        # scoped cwd fails). If the scoped run failed with a file-not-found
+        # signature, retry once from the root. Safe: "can't open file" means
+        # nothing executed, so there are no partial side effects to repeat.
+        if exit_code != 0 and _workdir_kw and _looks_like_file_not_found(output):
+            output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=300)
         _dt = _time.time() - _t0
 
         # Workspace command-outcome capture: record significant runs so
@@ -508,7 +539,7 @@ if has_error:
                  args = [args]
              cmd += " " + " ".join(shlex.quote(str(a)) for a in args)
 
-        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd)
+        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, **_workdir_kw)
 
         # --- Output truncation (head + tail) ---
         # The sandbox layer may already cap output at its own limit, but we

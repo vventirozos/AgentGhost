@@ -44,6 +44,15 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                     b64_images.append((content_type, base64.b64encode(file_bytes).decode("utf-8")))
         else:
             path = _get_safe_path(sandbox_dir, target)
+            # Root fallback: when a project is active, sandbox_dir is scoped to
+            # <root>/projects/<id>/, but the image may have been written by a
+            # tool that stays at the sandbox root (e.g. browser screenshots).
+            # As a READ-only tool, vision can safely look at the root too, so
+            # it finds images regardless of which tool produced them.
+            if not path.exists() and sandbox_dir is not None and Path(sandbox_dir).parent.name == "projects":
+                root_path = _get_safe_path(Path(sandbox_dir).parent.parent, target)
+                if root_path.exists():
+                    path = root_path
             if not path.exists():
                 return f"Error: File '{target}' not found. Use the `file_system` tool with operation='list_files' to check the sandbox directory."
             

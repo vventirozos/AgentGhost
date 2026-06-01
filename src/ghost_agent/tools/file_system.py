@@ -122,8 +122,37 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
     Write-then-read symmetry is still preserved: both tools now
     interpret ``/workspace/...`` as sandbox-root-relative.
     """
+    raw = str(filename).strip()
+
+    # 0. Host-absolute sandbox path → sandbox-relative. The LLM sometimes
+    # echoes the full HOST path of the sandbox (it sees it in a prior
+    # sandbox-tree listing / file-read error and passes it back), e.g.
+    # "/Users/x/.../sandbox/report.md". Joining that onto sandbox_dir
+    # produced a phantom nested path ("<sandbox>/Users/x/.../sandbox/
+    # report.md") → ENOENT, then a wasted strike + a retry with the
+    # relative form (2026 report-regeneration trace burned ~5 turns on
+    # this). If the given absolute path is already inside the sandbox
+    # root, strip the prefix and honour the remainder as sandbox-relative.
+    # Does NOT touch "/workspace/..." (handled below) — that host path is
+    # not under the sandbox dir, so the relative_to check skips it.
+    if raw.startswith("/"):
+        try:
+            _sb = sandbox_dir.resolve()
+            _abs = Path(raw).resolve()
+            try:
+                inside = (_abs == _sb) or _abs.is_relative_to(_sb)
+                rel = "" if _abs == _sb else str(_abs.relative_to(_sb))
+            except AttributeError:  # Python < 3.9
+                s_abs, s_sb = str(_abs), str(_sb).rstrip("/")
+                inside = s_abs == s_sb or s_abs.startswith(s_sb + "/")
+                rel = "" if s_abs == s_sb else s_abs[len(s_sb) + 1:]
+            if inside:
+                raw = rel
+        except Exception:
+            pass
+
     # 1. Strip leading slashes to treat as relative
-    clean_name = str(filename).strip().lstrip("/")
+    clean_name = raw.lstrip("/")
 
     # 1a. Strip a leading ``workspace/`` prefix (container WORKDIR).
     # Case-sensitive and exact-segment: ``workspaces/`` or
@@ -134,6 +163,24 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
         clean_name = ""
     elif clean_name.startswith("workspace/"):
         clean_name = clean_name[len("workspace/"):]
+
+    # 1b. Redundant project-prefix heal (project-scoped sandbox only).
+    # When a project is active the sandbox root IS <sandbox>/projects/<id>
+    # (so a project's files clean up with one `rm -rf`). The model usually
+    # still emits the full project-relative path it sees in directory
+    # listings — ``projects/<id>/X`` — which would double-nest to
+    # ``projects/<id>/projects/<id>/X``. If the sandbox root already ends
+    # in ``projects/<id>``, drop one redundant leading ``projects/<id>/``
+    # so the file lands once. Case-insensitive on the id (project ids are
+    # canonicalised to lowercase hex). Untouched for the normal unscoped
+    # root, whose parent dir is not literally named ``projects``.
+    if sandbox_dir.parent.name == "projects":
+        _pid = sandbox_dir.name
+        _pref = f"projects/{_pid}/".lower()
+        if clean_name.lower().startswith(_pref):
+            clean_name = clean_name[len(_pref):]
+        elif clean_name.lower() == f"projects/{_pid}".lower():
+            clean_name = ""
 
     # 2. Resolve to absolute path inside the sandbox root
     target_path = (sandbox_dir / clean_name).resolve()
@@ -148,6 +195,54 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
             raise ValueError(f"Security Error: Path '{filename}' attempts to access outside sandbox.")
 
     return target_path
+
+
+def project_scoped_sandbox(context, stateful: bool = False):
+    """Return ``(host_dir, container_workdir)`` scoped to the active project's
+    workspace (``<sandbox>/projects/<id>/``), creating the dir on demand; or
+    ``(sandbox_root, None)`` when no project is active (or ``stateful=True``,
+    since the Jupyter kernel is pinned to ``/workspace``).
+
+    This is the SINGLE SOURCE OF TRUTH for per-project sandbox scoping. Every
+    surface that reads or writes the agent's working files routes through it
+    so they all agree on "where the working directory is": the tool registry
+    (file_system/execute/report_pdf/vision/image_generation/knowledge_base),
+    the ambient sandbox-state listing injected into each turn, the
+    ``/api/upload`` route, and the swarm bridge. Keeping them in sync is what
+    prevents the model from being shown a root listing while its file ops land
+    in the project dir (the source of the "file is at sandbox root" confusion).
+
+    Scoping activates only for a genuine string project id (a MagicMock
+    context attribute can't trigger it).
+    """
+    sb = getattr(context, "sandbox_dir", None)
+    base = Path(sb) if sb is not None else None
+    pid = getattr(context, "current_project_id", None)
+    pid = pid.strip().lower() if isinstance(pid, str) else ""
+    if pid and not stateful and base is not None:
+        sub = base / "projects" / pid
+        try:
+            sub.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return sub, f"{_CONTAINER_WORKDIR}/projects/{pid}"
+    return base, None
+
+
+def project_download_prefix(sandbox_dir: Path) -> str:
+    """Return the ``projects/<id>/`` path prefix when ``sandbox_dir`` is a
+    project-scoped sandbox (its parent dir is literally ``projects``), else
+    "".
+
+    Artefact tools (report_pdf, image_generation) write into the scoped
+    dir but advertise a ``/api/download/<path>`` link; that route resolves
+    against the sandbox ROOT, so the link must carry this prefix to stay
+    reachable. Detected the same way as the file_system path heal and
+    ``_to_container_path`` un-scoping, so all three agree.
+    """
+    if sandbox_dir is not None and Path(sandbox_dir).parent.name == "projects":
+        return f"projects/{Path(sandbox_dir).name}/"
+    return ""
 
 
 # Container WORKDIR — kept in sync with sandbox.docker.CONTAINER_WORKDIR.
@@ -180,8 +275,17 @@ def _to_container_path(sandbox_dir: Path, host_path: Path) -> str:
     pathological caller still gets a usable command rather than an
     exception.
     """
+    # The bind mount is fixed at the sandbox ROOT, even when a project is
+    # active and file ops are scoped to <root>/projects/<id>. So the
+    # container path must be computed relative to the ROOT, not the scoped
+    # sub-dir — otherwise a file at <root>/projects/<id>/foo.py would be
+    # reported as /workspace/foo.py when it actually lives at
+    # /workspace/projects/<id>/foo.py. Un-scope before translating.
+    root = sandbox_dir
+    if sandbox_dir.parent.name == "projects":
+        root = sandbox_dir.parent.parent
     try:
-        rel = host_path.resolve().relative_to(sandbox_dir.resolve())
+        rel = host_path.resolve().relative_to(root.resolve())
     except (ValueError, OSError):
         # Should never happen post-_get_safe_path, but be defensive
         # rather than emit a malformed command.

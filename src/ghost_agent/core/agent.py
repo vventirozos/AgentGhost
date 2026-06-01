@@ -2189,9 +2189,12 @@ class GhostAgent:
             if self._sandbox_state is not None:
                 return self._sandbox_state
             try:
-                from ..tools.file_system import tool_list_files
+                from ..tools.file_system import tool_list_files, project_scoped_sandbox
+                # Scope the ambient listing to the active project's dir so the
+                # model is shown the SAME working set its file_system/execute
+                # operate on (else it sees a root listing and fumbles paths).
                 self._sandbox_state = await tool_list_files(
-                    sandbox_dir=self._agent_ref.context.sandbox_dir,
+                    sandbox_dir=project_scoped_sandbox(self._agent_ref.context)[0],
                     memory_system=getattr(self._agent_ref.context, "memory_system", None),
                 )
             except Exception:
@@ -3072,9 +3075,9 @@ class GhostAgent:
                         # one request's stale view to another. Local var =
                         # request-scoped lifetime by construction.
                         if 'request_sandbox_state' not in locals() or request_sandbox_state is None:
-                            from ..tools.file_system import tool_list_files
+                            from ..tools.file_system import tool_list_files, project_scoped_sandbox
                             params = {
-                                "sandbox_dir": self.context.sandbox_dir,
+                                "sandbox_dir": project_scoped_sandbox(self.context)[0],
                                 "memory_system": self.context.memory_system
                             }
                             request_sandbox_state = await tool_list_files(**params)
@@ -3481,7 +3484,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                         header, encoded = img_url.split(",", 1)
                                                         img_data = __base64.b64decode(encoded)
                                                         filename = f"vision_{uuid.uuid4().hex[:8]}.jpg"
-                                                        tmp_path = self.context.sandbox_dir / filename
+                                                        # Save into the active project's dir so the scoped
+                                                        # vision_analysis finds it by bare name and it shows
+                                                        # in the scoped listing (vision also has a root
+                                                        # fallback as a safety net).
+                                                        from ..tools.file_system import project_scoped_sandbox
+                                                        tmp_path = project_scoped_sandbox(self.context)[0] / filename
                                                         with open(tmp_path, "wb") as f:
                                                             f.write(img_data)
                                                         text_parts.append(f"[Image attached. SAVED LOCALLY to '{filename}'. You MUST use the `vision_analysis` tool with target='{filename}' to see it!]")
@@ -6152,8 +6160,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 if hint:
                                     fallback_hint = f"\n\n{hint}"
 
-                            from ..tools.file_system import tool_list_files
-                            sandbox_state = await tool_list_files(self.context.sandbox_dir, self.context.memory_system)
+                            from ..tools.file_system import tool_list_files, project_scoped_sandbox
+                            sandbox_state = await tool_list_files(project_scoped_sandbox(self.context)[0], self.context.memory_system)
                             messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {diagnostic_msg}{fallback_hint}\n\n{sandbox_state}"})
 
                             total_fail = execution_failure_count + transient_failure_count
@@ -6953,6 +6961,48 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                            icon=Icons.SHIELD)
                 except Exception as e:
                     logger.debug(f"principle gate skipped: {e}")
+
+                # Autonomous-progress digest — closes the user-facing half of
+                # phase 2.95. If projects were advanced in the background (by
+                # the idle autoadvance phase, the tool, or the HTTP route)
+                # since the user last saw a digest, surface a concise "while
+                # you were away" header on this turn, flagging the items that
+                # now need their input. Watermark-gated on the monotonic
+                # project-event id so each batch shows exactly once; the first
+                # run baselines silently (no historical backlog dump).
+                # Header-prepended so needs-user items lead the reply.
+                try:
+                    _ps = getattr(self.context, "project_store", None)
+                    if _ps is not None and final_ai_content:
+                        from pathlib import Path as _Path
+                        from .project_digest import (
+                            summarize_since, render_digest,
+                            load_watermark, save_watermark,
+                        )
+                        _wm_path = (_Path(str(self.context.memory_dir)).parent
+                                    / "projects_digest.json")
+                        _wm = load_watermark(_wm_path)
+                        if _wm is None:
+                            # First run: baseline to the current high-water mark.
+                            _base = await asyncio.to_thread(summarize_since, _ps, 0)
+                            save_watermark(_wm_path, _base.new_event_id)
+                        else:
+                            _dg = await asyncio.to_thread(summarize_since, _ps, _wm)
+                            if _dg.has_content:
+                                _digest = render_digest(_dg)
+                                if _digest and _digest[:40] not in final_ai_content:
+                                    final_ai_content = f"{_digest}\n\n---\n\n{final_ai_content}"
+                                    pretty_log(
+                                        "Autoadvance Digest",
+                                        f"{_dg.advanced} advanced, "
+                                        f"{len(_dg.needs_user)} need-user, "
+                                        f"{_dg.projects_touched} project(s)",
+                                        icon=Icons.BRAIN_PLAN,
+                                    )
+                            if _dg.new_event_id > _wm:
+                                save_watermark(_wm_path, _dg.new_event_id)
+                except Exception as _dgx:
+                    logger.debug(f"autoadvance digest skipped: {_dgx}")
 
                 # Chat→project promotion suggestion (advisory; previously unwired).
                 # When a free-chat session accumulates enough turns / sandbox

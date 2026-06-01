@@ -65,6 +65,11 @@
   <h3>project_events</h3>
   <p>id (auto PK) · project_id · task_id · type · payload_json · ts (REAL).</p>
 
+  <h2>ID canonicalisation</h2>
+  <p>
+    IDs are generated as lowercase 12-char hex (<code>uuid4().hex[:12]</code>), but an LLM that echoes one back in a <code>manage_projects</code> tool call routinely mangles the case of an opaque hex token — e.g. <code>9b5bd5cd812b</code> → <code>9B5Bd5Cd812B</code> — which used to make the case-sensitive <code>WHERE id = ?</code> lookups miss with <em>"project not found"</em>. Every store method that accepts a <code>project_id</code> / <code>task_id</code> now normalises it via <code>_canon_id</code> (strip + lowercase), and the <code>manage_projects</code> tool canonicalises model-supplied ids at the boundary, so generation and resolution always agree regardless of how the id was transmitted. Covered by <code>tests/test_project_id_canon.py</code>.
+  </p>
+
   <h2>Public API</h2>
   <h3>Projects</h3>
   <ul>

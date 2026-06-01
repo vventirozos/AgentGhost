@@ -32,6 +32,41 @@ def mock_context():
 @pytest.mark.asyncio
 @patch("ghost_agent.sandbox.docker.DockerSandbox")
 @patch("ghost_agent.core.agent.GhostAgent")
+async def test_synthetic_self_play_isolated_context_is_project_less(
+    mock_ghost_agent_class, mock_docker_sandbox_class, mock_context
+):
+    """Regression: self-play's ephemeral sandbox must NOT inherit the
+    agent's currently-open project id. If it does, get_available_tools'
+    per-project scoping redirects file_system/execute into
+    <temp>/projects/<id>/ while the setup/validator scripts read & write
+    at the temp root (/workspace) — the solver's solution.py then becomes
+    invisible to the judge ("can't open file '/workspace/solution.py'")."""
+    mock_context.current_project_id = "deadbeef0001"  # a project is open
+    dreamer = Dreamer(mock_context)
+
+    mock_context.llm_client.chat_completion = AsyncMock(return_value={
+        "choices": [{"message": {"content": dict_to_xml(
+            {"challenge_prompt": "Write a python script", "validation_script": "assert True"}
+        )}}]
+    })
+    mock_agent_instance = MagicMock()
+    mock_agent_instance.handle_chat = AsyncMock(return_value=("Code generated", None, None))
+    mock_agent_instance._get_recent_transcript.return_value = "Mock transcript"
+    mock_ghost_agent_class.return_value = mock_agent_instance
+    mock_sandbox_instance = MagicMock()
+    mock_sandbox_instance.execute.return_value = ("Success", 0)
+    mock_docker_sandbox_class.return_value = mock_sandbox_instance
+
+    await dreamer.synthetic_self_play("test-model")
+
+    mock_ghost_agent_class.assert_called_once()
+    isolated_context = mock_ghost_agent_class.call_args[0][0]
+    assert isolated_context.current_project_id is None  # cleared, stays unscoped
+
+
+@pytest.mark.asyncio
+@patch("ghost_agent.sandbox.docker.DockerSandbox")
+@patch("ghost_agent.core.agent.GhostAgent")
 async def test_synthetic_self_play_memory_proxies(mock_ghost_agent_class, mock_docker_sandbox_class, mock_context):
     """
     Test that the memory proxies (ReadOnlySkillMemory, ReadOnlyVectorMemory)

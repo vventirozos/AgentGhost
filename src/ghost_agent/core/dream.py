@@ -2590,6 +2590,15 @@ Return ONLY a JSON object with:
                 
             isolated_context = copy.copy(self.context)
             isolated_context.sandbox_dir = Path(temp_sandbox)
+            # Self-play runs in a fresh, project-less ephemeral sandbox. The
+            # shallow copy inherits whatever project the agent last opened,
+            # which would (via get_available_tools' _proj_ws scoping) redirect
+            # file_system/execute into <temp>/projects/<id>/ — while the
+            # setup/validator scripts read/write at the temp root (/workspace).
+            # That mismatch made the solver's solution.py invisible to the
+            # judge ("can't open file '/workspace/solution.py'"). Clear it so
+            # the worker stays unscoped at the sandbox root.
+            isolated_context.current_project_id = None
             isolated_context.args = copy.copy(self.context.args)
             isolated_context.args.perfect_it = False
             isolated_context.args.smart_memory = 0.0

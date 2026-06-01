@@ -70,6 +70,16 @@ async def test_create_requires_title(context):
     assert res.startswith("ERROR")
 
 
+async def test_switch_returns_workspace_note(context):
+    """Switching into a project tells the model its working directory moved
+    to projects/<id>/ (so it doesn't fumble file paths and burn strikes)."""
+    pid = _parse(await tool_manage_projects(context, action="create", title="WS"))["created"]
+    res = _parse(await tool_manage_projects(context, action="switch", project_id=pid))
+    assert res["workspace"] == f"projects/{pid}"
+    assert f"projects/{pid}" in res["note"]
+    assert "bare name" in res["note"]
+
+
 async def test_create_with_same_title_reuses_id_regardless_of_age(context):
     """The Qwen retry-storm symptom: same title called repeatedly creates
     duplicates. Now reuses the existing id forever (until archived)."""

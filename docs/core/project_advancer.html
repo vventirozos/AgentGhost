@@ -66,6 +66,11 @@
     <code>advance_once</code> was historically only reachable via the <code>manage_projects</code> tool or the HTTP <code>/advance</code> route — <strong>no idle phase ever called it</strong>, so the "self-advancing research loop" only advanced when a human or the model explicitly poked it. Under <code>--autoadvance-idle</code>, biological-watchdog <strong>phase 2.95</strong> picks one ACTIVE project and runs a single tick during the 15–60&nbsp;min idle window (30-min cooldown), building a registry-backed <code>tool_runner</code> and an LLM <code>code_generator</code> so coding tasks produce and run real code. Strictly bounded — one project, one tick per cooldown, on the same hard per-project budgets + human gates — and off by default. This is what turns the dormant loop into genuine background autonomy. Covered by <code>tests/test_project_advancer.py</code>.
   </p>
 
+  <h2>Telling the user (autonomous-progress digest)</h2>
+  <p>
+    Background advancement updates the project event log (<code>autoadvance_step</code>, <code>autoadvance_needs_user</code>, <code>human_gate_triggered</code>) but on its own only logs to the <em>operator</em> stream — the chatting <em>user</em> was never told. <code>core/project_digest.py</code> closes that loop: on the next chat turn, <code>core.agent.handle_chat</code> builds a concise <strong>"while you were away"</strong> header from the events since the user last saw a digest and prepends it to the reply, flagging the tasks that now need their input. It is watermark-gated on the monotonic project-event id (so each batch shows exactly once; the first run baselines silently with no historical backlog), fail-safe (a digest error never breaks a turn), and triggered by background progress from <em>any</em> source — the idle phase, the tool, or the HTTP route. Covered by <code>tests/test_project_digest.py</code>.
+  </p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

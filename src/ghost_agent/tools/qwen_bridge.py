@@ -33,7 +33,7 @@ except ModuleNotFoundError as _qwen_import_err:  # pragma: no cover — defensiv
         "qwen_bridge; only `agent_qwen.py` does."
     ) from _qwen_import_err
 
-from src.ghost_agent.tools.file_system import tool_file_system
+from src.ghost_agent.tools.file_system import tool_file_system, project_scoped_sandbox
 from src.ghost_agent.tools.execute import tool_execute
 from src.ghost_agent.tools.memory import tool_knowledge_base
 
@@ -197,7 +197,9 @@ class GhostFileSystem(BaseTool):
         if _ctx is None:
             return "Error: bridge context not set for this request."
 
-        sandbox_dir = getattr(_ctx, 'sandbox_dir', None)
+        # Project-scope file ops to match the registry path (the main runtime)
+        # so the alternate Qwen-Agent runtime doesn't silently write to root.
+        sandbox_dir = project_scoped_sandbox(_ctx)[0]
         tor_proxy = getattr(_ctx, 'tor_proxy', None)
 
         # Generic pass-through: anything in `params` or `kwargs` we didn't
@@ -281,7 +283,9 @@ class GhostExecute(BaseTool):
         if _ctx is None:
             return "Error: bridge context not set for this request."
 
-        sandbox_dir = getattr(_ctx, 'sandbox_dir', None)
+        # Project-scope to match the registry path; stateful kernel sessions
+        # opt out (kernel conn file pinned to /workspace).
+        sandbox_dir, container_workdir = project_scoped_sandbox(_ctx, stateful=bool(stateful))
         sandbox_manager = getattr(_ctx, 'sandbox_manager', None)
         memory_dir = getattr(_ctx, 'memory_dir', None)
 
@@ -298,6 +302,7 @@ class GhostExecute(BaseTool):
             args=args,
             stateful=stateful,
             sandbox_dir=sandbox_dir,
+            container_workdir=container_workdir,
             sandbox_manager=sandbox_manager,
             memory_dir=memory_dir,
             **extra
@@ -334,7 +339,7 @@ class GhostKnowledgeBase(BaseTool):
         if _ctx is None:
             return "Error: bridge context not set for this request."
 
-        sandbox_dir = getattr(_ctx, 'sandbox_dir', None)
+        sandbox_dir = project_scoped_sandbox(_ctx)[0]  # read source files from the project dir
         memory_system = getattr(_ctx, 'memory_system', None)
         profile_memory = getattr(_ctx, 'profile_memory', None)
 

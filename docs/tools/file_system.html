@@ -76,6 +76,9 @@
     <li>For ingestion via <code>knowledge_base</code>, the PDF is chunked into the vector store.</li>
   </ul>
 
+  <h2>Path resolution</h2>
+  <p><code>_get_safe_path</code> resolves every path against the sandbox root and rejects traversal. Beyond the leading-slash and <code>/workspace/</code> handling, it also accepts a <strong>host-absolute sandbox path</strong>: if the LLM echoes back the full host path of a sandbox file (e.g. <code>/Users/x/.../sandbox/report.md</code> — which it sees in a sandbox-tree listing or a prior error and passes verbatim), the sandbox-root prefix is stripped and the remainder honoured as sandbox-relative. Without this the path joined onto the sandbox root into a phantom nested path → ENOENT → a wasted strike + retry. Covered by <code>tests/test_file_system_sandbox_path.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>
