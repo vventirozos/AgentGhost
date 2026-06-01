@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..utils.logging import Icons, pretty_log
-from .file_system import _get_safe_path
+from .file_system import _get_safe_path, _to_container_path
 
 logger = logging.getLogger("GhostAgent")
 
@@ -816,6 +816,43 @@ def _browser_blocked_url(u: Optional[str]) -> Optional[str]:
     return None
 
 
+def _resolve_file_url(sandbox_dir, url):
+    """Rewrite a ``file://`` URL so it points at where the file actually
+    lives when a project scopes the sandbox to ``<root>/projects/<id>/``.
+
+    The model emits absolute container paths it can "see" — e.g.
+    ``file:///workspace/browser_os/index.html`` — but the project-scoped
+    ``file_system`` wrote that file to ``<root>/projects/<id>/browser_os/
+    index.html`` (``/workspace/projects/<id>/browser_os/index.html`` in the
+    container), so the bare ``/workspace/...`` URL is a 404. Resolve the
+    path the SAME way file_system does (``_get_safe_path`` heals the
+    ``/workspace/`` and redundant ``projects/<id>/`` prefixes) and translate
+    back with ``_to_container_path`` (which un-scopes to the root mount).
+
+    Only active when scoped (sandbox_dir's parent is literally ``projects``);
+    otherwise the URL passes through byte-for-byte so non-project behaviour
+    is untouched. Falls back to the sandbox-root location if the scoped file
+    is absent but the root one exists (mirrors the vision_analysis fallback).
+    Non-file URLs and unparseable inputs pass through unchanged.
+    """
+    if not isinstance(url, str) or not url.startswith("file://"):
+        return url
+    sb = Path(sandbox_dir) if sandbox_dir is not None else None
+    if sb is None or sb.parent.name != "projects":
+        return url
+    try:
+        path_part = url[len("file://"):]
+        host = _get_safe_path(sb, path_part)
+        if not host.exists():
+            root = sb.parent.parent
+            root_host = _get_safe_path(root, path_part)
+            if root_host.exists():
+                return "file://" + _to_container_path(root, root_host)
+        return "file://" + _to_container_path(sb, host)
+    except Exception:
+        return url
+
+
 async def tool_browser(
     operation: str = None,
     url: Optional[str] = None,
@@ -831,6 +868,7 @@ async def tool_browser(
     sandbox_manager=None,
     tor_proxy: Optional[str] = None,
     workspace_model=None,
+    container_workdir: Optional[str] = None,
     **kwargs,
 ):
     """Run a single browser operation inside the sandbox.
@@ -906,10 +944,11 @@ async def tool_browser(
         except ValueError as ve:
             return _err(str(ve))
         await asyncio.to_thread(host_out.parent.mkdir, parents=True, exist_ok=True)
-        # Translate host → container path. Sandbox bind-mounts host
-        # workspace at /workspace, so the relative path is identical.
-        rel = host_out.relative_to(sandbox_dir)
-        container_out_path = f"/workspace/{rel.as_posix()}"
+        # Translate host → container path. _to_container_path un-scopes a
+        # project-scoped sandbox_dir to the root mount, so a scoped file at
+        # <root>/projects/<id>/x.png maps to /workspace/projects/<id>/x.png
+        # (not /workspace/x.png — which is where it would NOT exist).
+        container_out_path = _to_container_path(sandbox_dir, host_out)
 
     # Same translation for any screenshot sub-action inside interact.
     # Without this, the runner would try to write to paths that were
@@ -939,9 +978,16 @@ async def tool_browser(
                 await asyncio.to_thread(
                     host_sub.parent.mkdir, parents=True, exist_ok=True
                 )
-                rel_sub = host_sub.relative_to(sandbox_dir)
-                new_step["out_path"] = f"/workspace/{rel_sub.as_posix()}"
+                new_step["out_path"] = _to_container_path(sandbox_dir, host_sub)
+            # Heal a goto/navigate sub-action's file:// URL the same way the
+            # top-level url is healed (so scoped files resolve mid-sequence).
+            if new_step.get("action") in ("goto", "navigate") and new_step.get("url"):
+                new_step["url"] = _resolve_file_url(sandbox_dir, new_step["url"])
             sanitised_actions.append(new_step)
+
+    # Heal file:// URLs to the project-scoped location (no-op when not in a
+    # project). Done after the SSRF guard (which already permits file://).
+    url = _resolve_file_url(sandbox_dir, url)
 
     payload = _build_op_payload(
         op=operation,
@@ -981,9 +1027,14 @@ async def tool_browser(
     # actually-hung browser produces a runner-level error, not a
     # sandbox-level kill that swallows diagnostics.
     subprocess_timeout = max(60, (effective_timeout_ms // 1000) + 30)
+    # When project-scoped, run from /workspace/projects/<id> so the runner
+    # (written into the scoped dir as `.browser_runner.py`) is found by its
+    # relative name. Passed ONLY when set, so managers without a `workdir`
+    # param are unaffected (matches execute.py).
+    _wd_kw = {"workdir": container_workdir} if container_workdir else {}
     try:
         output, exit_code = await asyncio.to_thread(
-            sandbox_manager.execute, cmd, timeout=subprocess_timeout
+            sandbox_manager.execute, cmd, timeout=subprocess_timeout, **_wd_kw
         )
     except Exception as e:
         pretty_log("Browser Failed", f"{operation}: {type(e).__name__}: {e}",

@@ -722,7 +722,7 @@ def get_available_tools(context):
         "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "recall": lambda **kwargs: tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs),
         "execute": _run_execute,
-        "browser": lambda **kwargs: tool_browser(sandbox_dir=context.sandbox_dir, sandbox_manager=context.sandbox_manager, tor_proxy=context.tor_proxy, workspace_model=getattr(context, "workspace_model", None), **kwargs),
+        "browser": lambda **kwargs: tool_browser(sandbox_dir=_proj_ws()[0], container_workdir=_proj_ws()[1], sandbox_manager=context.sandbox_manager, tor_proxy=context.tor_proxy, workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "learn_skill": lambda **kwargs: tool_learn_skill(skill_memory=context.skill_memory, memory_system=context.memory_system, memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "self_state": lambda **kwargs: tool_self_state(self_model=getattr(context, "self_model", None), **kwargs),
         "introspect": lambda **kwargs: tool_introspect(self_model=getattr(context, "self_model", None), **kwargs),

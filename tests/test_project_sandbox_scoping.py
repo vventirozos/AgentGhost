@@ -240,6 +240,48 @@ async def test_upload_route_root_when_no_project(tmp_path):
     assert (tmp_path / "data.csv").exists()  # root, no project
 
 
+def test_browser_file_url_heals_to_project_dir(tmp_path):
+    """A model-emitted file:///workspace/<rel> URL is rewritten to the
+    project-scoped container path (where the scoped file_system wrote it),
+    so the browser stops hitting ERR_FILE_NOT_FOUND on its own files."""
+    from ghost_agent.tools.browser import _resolve_file_url
+    sb = _scoped(tmp_path)
+    assert _resolve_file_url(sb, "file:///workspace/browser_os/index.html") == \
+        f"file:///workspace/projects/{PID}/browser_os/index.html"
+    # already-scoped is idempotent (no double-nest)
+    assert _resolve_file_url(sb, f"file:///workspace/projects/{PID}/x.html") == \
+        f"file:///workspace/projects/{PID}/x.html"
+    # http and non-project are untouched
+    assert _resolve_file_url(sb, "http://example.com") == "http://example.com"
+    assert _resolve_file_url(tmp_path, "file:///workspace/x.html") == "file:///workspace/x.html"
+
+
+def test_browser_file_url_root_fallback_when_scoped(tmp_path):
+    """If the file only exists at the sandbox root (e.g. an unscoped tool
+    wrote it), the scoped browser still finds it."""
+    from ghost_agent.tools.browser import _resolve_file_url
+    sb = _scoped(tmp_path)
+    (tmp_path / "at_root.html").write_text("<html></html>")  # root only
+    assert _resolve_file_url(sb, "file:///workspace/at_root.html") == \
+        "file:///workspace/at_root.html"
+
+
+def test_registry_browser_scoped(tmp_path, monkeypatch):
+    import ghost_agent.tools.registry as reg
+    cap = {}
+    monkeypatch.setattr(reg, "tool_browser",
+                        lambda **kw: cap.update(sandbox_dir=kw.get("sandbox_dir"),
+                                                container_workdir=kw.get("container_workdir")))
+    ctx = _ctx(tmp_path)
+    ctx.current_project_id = PID
+    ctx.tor_proxy = None
+    ctx.sandbox_manager = MagicMock()
+    tools = get_available_tools(ctx)
+    tools["browser"](operation="navigate", url="file:///workspace/x.html")
+    assert cap["sandbox_dir"] == tmp_path / "projects" / PID
+    assert cap["container_workdir"] == f"/workspace/projects/{PID}"
+
+
 def test_registry_unscoped_when_no_project(tmp_path, monkeypatch):
     import ghost_agent.tools.registry as reg
     captured = {}
