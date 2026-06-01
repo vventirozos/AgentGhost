@@ -41,7 +41,7 @@ _DUPLICATE_CREATE_WINDOW_SECONDS = None  # None == always reuse
 _ACTIONS = {
     # project-level
     "create", "list", "get", "switch", "exit", "update", "delete",
-    "resume", "status",
+    "archive", "resume", "status",
     # task-level
     "task_add", "task_update", "task_decompose", "task_next", "task_list",
     # artifacts / events
@@ -528,7 +528,7 @@ async def tool_manage_projects(
                         f"task_decompose / task_update on this id. To "
                         f"start a genuinely separate project with the "
                         f"same name, archive the existing one first "
-                        f"(action=update, status=ARCHIVED)."
+                        f"(action=archive)."
                     )
                 return _ok({
                     "refused": True,
@@ -603,12 +603,30 @@ async def tool_manage_projects(
             return _ok({"updated": ok, "fields": list(fields.keys())})
 
         if act == "delete":
+            # Hard, irreversible delete: DB row + all tasks/artifacts/events
+            # (cascade) + the on-disk workspace (<sandbox>/projects/<id>/).
+            # Use action=archive to merely hide a resumable project.
             if not project_id:
                 return _err("project_id is required for action=delete")
+            ok = store.delete_project(project_id, hard=True)
+            if getattr(context, "current_project_id", None) == project_id:
+                _set_current(context, None)
+            return _ok({"deleted": ok, "hard": True,
+                        "note": "Project, its tasks/artifacts/events, and its "
+                                "workspace files were permanently removed."})
+
+        if act == "archive":
+            # Soft delete: flips status to ARCHIVED; the project (and its
+            # files) survive and can be brought back with action=resume.
+            if not project_id:
+                return _err("project_id is required for action=archive")
             ok = store.delete_project(project_id, hard=False)
             if getattr(context, "current_project_id", None) == project_id:
                 _set_current(context, None)
-            return _ok({"archived": ok})
+            return _ok({"archived": ok,
+                        "note": "Project hidden but kept; use action=resume to "
+                                "bring it back, or action=delete to remove it "
+                                "permanently."})
 
         if act == "resume":
             if not project_id:
@@ -931,6 +949,12 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "described work is actually complete. `resume` when "
             "the user asks to pick up "
             "an old project; `exit` to leave project mode; "
+            "`archive` to HIDE a project (reversible — status→ARCHIVED, "
+            "files kept, `resume` brings it back); `delete` to "
+            "PERMANENTLY remove a project and ALL its data — tasks, "
+            "artifacts, events, AND its workspace files on disk (NOT "
+            "reversible). Use `delete` only when the user clearly means "
+            "to erase it; otherwise prefer `archive`. "
             "`promote_from_context` only when the user has explicitly "
             "accepted a suggestion to convert the current chat into a "
             "project."

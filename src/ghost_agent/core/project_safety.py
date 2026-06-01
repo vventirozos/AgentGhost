@@ -196,6 +196,7 @@ def should_suggest_promotion(
     sandbox_writes: int,
     plan_node_count: int,
     already_in_project: bool,
+    managing_projects: bool = False,
 ) -> PromotionSuggestion:
     """Decide whether to *offer* promoting the current chat into a project.
 
@@ -206,11 +207,18 @@ def should_suggest_promotion(
 
     Returns ``should_suggest=False`` in any of these cases:
       - already in a project (we never nag while a project is active)
+      - the turn used the project tool itself (list/delete/switch/...):
+        the user is administering projects, not doing promotable free
+        chat — offering to "promote this to a project" right after a
+        ``delete project`` is nonsensical (reported in the field)
       - too few turns AND no sandbox writes AND a small plan
       - the user already declined (caller tracks that in scratchpad)
     """
     if already_in_project:
         return PromotionSuggestion(False, reason="already in project mode",
+                                   signals={})
+    if managing_projects:
+        return PromotionSuggestion(False, reason="user is managing projects",
                                    signals={})
 
     signals: Dict[str, Any] = {

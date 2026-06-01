@@ -145,6 +145,35 @@ def test_hard_delete_removes_row_and_cascades(store):
     assert store.get_task(tid) is None
 
 
+def test_hard_delete_removes_workspace_dir(store):
+    pid = store.create_project("X")
+    ws = store.sandbox_root / "projects" / pid
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "a.txt").write_text("x")
+    assert store.delete_project(pid, hard=True) is True
+    assert not ws.exists()  # on-disk files removed too
+
+
+def test_hard_delete_never_escapes_sandbox_root(store, tmp_path):
+    """A custom workspace_dir OUTSIDE the sandbox root is left untouched —
+    hard delete only removes paths strictly inside the root."""
+    outside = tmp_path / "outside_dir"
+    outside.mkdir()
+    (outside / "important.txt").write_text("keep me")
+    pid = store.create_project("X", workspace_dir=str(outside))
+    assert store.delete_project(pid, hard=True) is True
+    assert outside.exists() and (outside / "important.txt").exists()
+
+
+def test_soft_delete_keeps_workspace_dir(store):
+    pid = store.create_project("X")
+    ws = store.sandbox_root / "projects" / pid
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "a.txt").write_text("x")
+    store.delete_project(pid, hard=False)  # archive
+    assert (ws / "a.txt").exists()  # preserved
+
+
 def test_ensure_workspace_creates_directory(store, tmp_path):
     pid = store.create_project("WS")
     proj = store.get_project(pid)

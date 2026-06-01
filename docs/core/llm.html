@@ -124,6 +124,17 @@
     <li>The breaker is process-local — restart resets state.</li>
   </ul>
 
+  <h2>Streaming idle timeouts</h2>
+  <p><code>_do_stream_chat_completion</code> guards each SSE read with <code>asyncio.wait_for</code> so a genuinely hung upstream can't hold the event-loop slot forever (which keeps <code>foreground_tasks &gt; 0</code> and parks the biological watchdog). The budget is <b>split</b> because the first token of a turn is legitimately slow — the upstream must prefill (prompt-eval) the whole context before emitting any bytes, and on a large context (e.g. 120k tokens) or a loaded/CPU node that prefill routinely takes longer than the inter-token gap, with <em>zero</em> bytes during it:</p>
+  <table>
+    <thead><tr><th>Constant</th><th>Env var</th><th>Default</th><th>Applies to</th></tr></thead>
+    <tbody>
+      <tr><td><code>_STREAM_FIRST_BYTE_TIMEOUT</code></td><td><code>GHOST_STREAM_FIRST_BYTE_TIMEOUT</code></td><td>180s</td><td>Time to the FIRST byte (prompt prefill / time-to-first-token).</td></tr>
+      <tr><td><code>_STREAM_IDLE_TIMEOUT</code></td><td><code>GHOST_STREAM_IDLE_TIMEOUT</code></td><td>60s</td><td>Gap between subsequent bytes (catches a real mid-stream hang).</td></tr>
+    </tbody>
+  </table>
+  <p>Any received line — including SSE keepalive/blank lines — ends the first-byte wait and resets the gap timer. A timeout yields an error SSE event + <code>[DONE]</code>; the agent then sees a turn with thinking but no actionable output and forces a retry. The earlier flat <b>30s</b> tripped that false "stall → forced retry" whenever a turn's prefill exceeded 30s, wastefully re-prefilling the whole (growing) context. The httpx client timeout (1200s) bounds the overall request above these. Tune the env vars for very slow or very fast nodes. Covered by <code>tests/test_stream_idle_timeout.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

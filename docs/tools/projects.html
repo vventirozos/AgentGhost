@@ -26,8 +26,14 @@
   <h2>Tool: <code>manage_projects</code></h2>
   <h3>Project-level actions</h3>
   <ul>
-    <li><code>create</code> · <code>list</code> · <code>get</code> · <code>switch</code> · <code>exit</code> · <code>update</code> · <code>delete</code> · <code>resume</code> · <code>status</code></li>
+    <li><code>create</code> · <code>list</code> · <code>get</code> · <code>switch</code> · <code>exit</code> · <code>update</code> · <code>archive</code> · <code>delete</code> · <code>resume</code> · <code>status</code></li>
   </ul>
+  <h3>Delete vs. archive</h3>
+  <ul>
+    <li><b><code>archive</code></b> — soft, reversible. Flips status to <code>ARCHIVED</code>; the row and the on-disk workspace are kept, and <code>resume</code> brings it back. This is what the old <code>delete</code> used to do.</li>
+    <li><b><code>delete</code></b> — hard, <b>permanent</b>. Removes the project row, all its tasks/artifacts/events (FK <code>ON DELETE CASCADE</code> with <code>PRAGMA foreign_keys=ON</code>, including scratchpad-snapshot events), <b>and</b> the project's workspace directory on disk (<code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code>). The on-disk removal only fires for a path strictly inside the configured sandbox root, so a stray/custom <code>workspace_dir</code> can never wipe an arbitrary directory. The tool schema steers the model toward <code>archive</code> unless the user clearly means to erase. Covered by <code>tests/test_projects_store.py</code> and <code>tests/test_projects_tool.py</code>.</li>
+  </ul>
+  <p>Note: the web API <code>DELETE /api/projects/{pid}</code> takes an explicit <code>?hard=</code> query flag (default soft/archive) — the frontend chooses; it is independent of the chat tool's <code>delete</code> (which is always hard).</p>
   <h3>Task-level actions</h3>
   <ul>
     <li><code>task_add</code> · <code>task_update</code> · <code>task_decompose</code> · <code>task_next</code> · <code>task_list</code></li>

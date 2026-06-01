@@ -2,12 +2,28 @@ import json
 import asyncio
 import logging
 import copy
+import os
 from typing import List, Dict, Any, Optional
 import httpx
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import get_utc_timestamp
 
 logger = logging.getLogger("GhostAgent")
+
+# --- Upstream streaming idle timeouts ---------------------------------------
+# The per-chunk read is guarded so a genuinely hung upstream can't hold the
+# event-loop slot forever (keeping foreground_tasks > 0 parks the biological
+# watchdog). But the FIRST token of a turn can be legitimately slow: the
+# upstream must prefill (prompt-eval) the whole context before emitting any
+# bytes, and on a large context (e.g. 120k tokens) or a loaded/CPU node that
+# prefill routinely exceeds the old flat 30s — with ZERO bytes during it —
+# which tripped a false "stall" and forced a wasteful full re-prefill retry.
+# So we split the budget: a generous time-to-FIRST-byte (covers prefill) and
+# a tighter inter-token gap (catches a real mid-stream hang). Both env-tunable
+# for slow/fast deployments. The httpx client timeout (1200s) bounds the whole
+# request above these.
+_STREAM_FIRST_BYTE_TIMEOUT = float(os.getenv("GHOST_STREAM_FIRST_BYTE_TIMEOUT", "180"))
+_STREAM_IDLE_TIMEOUT = float(os.getenv("GHOST_STREAM_IDLE_TIMEOUT", "60"))
 
 
 class NodeCircuitBreaker:
@@ -778,23 +794,28 @@ class LLMClient:
                         await resp.aread()
                     resp.raise_for_status()
 
-                    # Per-chunk timeout — without this a stalled upstream
-                    # (no bytes for minutes) holds the event-loop slot
-                    # forever and keeps `foreground_tasks > 0`, which in
-                    # turn parks the biological watchdog. 30s is generous
-                    # for a healthy stream and small enough to recover.
+                    # Per-chunk read guard (see module-level constants). The
+                    # FIRST byte gets a generous budget to cover prompt prefill
+                    # on large contexts / slow nodes; subsequent bytes get a
+                    # tighter gap so a real mid-stream hang is still caught.
                     chunk_iter = resp.aiter_lines().__aiter__()
+                    awaiting_first_byte = True
                     while True:
+                        _timeout = _STREAM_FIRST_BYTE_TIMEOUT if awaiting_first_byte else _STREAM_IDLE_TIMEOUT
                         try:
-                            chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=30.0)
+                            chunk = await asyncio.wait_for(chunk_iter.__anext__(), timeout=_timeout)
                         except StopAsyncIteration:
                             break
                         except asyncio.TimeoutError:
-                            pretty_log("Upstream Stream Stall", "No bytes for 30s — aborting", level="WARNING", icon=Icons.WARN)
-                            error_data = {"error": "Upstream stalled mid-stream (30s without data)."}
+                            _phase = "prefill/first token" if awaiting_first_byte else "mid-stream"
+                            pretty_log("Upstream Stream Stall", f"No bytes for {_timeout:.0f}s ({_phase}) — aborting", level="WARNING", icon=Icons.WARN)
+                            error_data = {"error": f"Upstream stalled ({_phase}, {_timeout:.0f}s without data)."}
                             yield f"data: {json.dumps(error_data)}\n\n".encode('utf-8')
                             yield b"data: [DONE]\n\n"
                             return
+                        # Any line received — including SSE keepalive/blank
+                        # lines — counts as activity and ends the prefill wait.
+                        awaiting_first_byte = False
                         if chunk:
                             yield f"{chunk}\n\n".encode('utf-8')
                 finally:

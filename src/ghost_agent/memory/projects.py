@@ -13,6 +13,7 @@ dream consolidator without cross-imports.
 
 import json
 import logging
+import shutil
 import sqlite3
 import threading
 import time
@@ -249,17 +250,48 @@ class ProjectStore:
     def delete_project(self, project_id: str, hard: bool = False) -> bool:
         """Archive (soft) or delete (hard) a project.
 
-        Soft-delete is the default: it flips status to ARCHIVED so the
-        project remains resumable. Hard delete removes the rows (and
-        cascades to tasks/artifacts/events via FK).
+        Soft-delete (``hard=False``) flips status to ARCHIVED so the
+        project remains resumable — this is what ``action=archive`` uses.
+
+        Hard delete (``hard=True``, what ``action=delete`` uses) removes
+        the project COMPLETELY: the DB row plus all tasks/artifacts/events
+        (FK ``ON DELETE CASCADE`` + ``PRAGMA foreign_keys=ON``, which
+        includes the scratchpad-snapshot events), AND the project's
+        workspace directory on disk (``<sandbox>/projects/<id>/``) so no
+        files are left behind. The workspace is removed only when it
+        resolves to a path strictly inside the configured sandbox root, so
+        a stray/custom ``workspace_dir`` can never delete an arbitrary dir.
         """
         project_id = _canon_id(project_id)
-        if hard:
-            with self._lock, self._connect() as conn:
-                cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
-                conn.commit()
-                return cur.rowcount > 0
-        return self.update_project(project_id, status=ProjectStatus.ARCHIVED.value)
+        if not hard:
+            return self.update_project(project_id, status=ProjectStatus.ARCHIVED.value)
+
+        # Resolve the workspace path BEFORE deleting the row.
+        proj = self.get_project(project_id)
+        ws_str = (proj or {}).get("workspace_dir")
+        if not ws_str and self.sandbox_root:
+            ws_str = str(self.sandbox_root / "projects" / project_id)
+
+        with self._lock, self._connect() as conn:
+            cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+            conn.commit()
+            deleted = cur.rowcount > 0
+
+        # Remove the on-disk workspace, but ONLY if it's safely contained in
+        # the sandbox root (never the root itself, never an outside path).
+        if ws_str and self.sandbox_root:
+            try:
+                ws_p = Path(ws_str).resolve()
+                root = Path(self.sandbox_root).resolve()
+                contained = ws_p != root and (
+                    ws_p.is_relative_to(root) if hasattr(ws_p, "is_relative_to")
+                    else str(ws_p).startswith(str(root) + "/")
+                )
+                if contained and ws_p.exists():
+                    shutil.rmtree(ws_p, ignore_errors=True)
+            except Exception as e:
+                logger.warning("Could not remove workspace for %s: %s", project_id, e)
+        return deleted
 
     def _row_to_project(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)

@@ -2622,17 +2622,30 @@ class GhostAgent:
 
                 working_memory_context = ""
 
-
+                # KV-CACHE FIX: per-turn / query-keyed blocks (selfhood
+                # wake-up, workspace continuity, uncertainty, graduated
+                # skills, MCTS hint) used to be prepended/appended to the
+                # system slot, which changed its bytes every turn and
+                # defeated ARCHITECTURAL OPTIMISATION #1 (byte-stable system
+                # prefix → upstream prefix-cache hits). They now ride in the
+                # per-turn TAIL injection instead (see `continuity_blocks`
+                # → transient_injection below), so the system slot is once
+                # again byte-identical across turns. The model still sees all
+                # of this content — just at the end of the prompt, next to
+                # the live system state, rather than the start.
+                continuity_blocks = []
 
                 base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_context)
 
                 # Selfhood wake-up prefix (recognition layer, proposal item #4).
                 # Splices the agent's own past — autobiographical
                 # experiences, open questions, mood, the running diary —
-                # into the system prompt as first-person continuity
-                # material. The block is bounded by SELFHOOD:BEGIN /
-                # SELFHOOD:END markers so evaluators can strip it. No-op
-                # when --no-memory / --no-self-model / no prior state.
+                # in as first-person continuity material (collected into
+                # `continuity_blocks` and emitted in the per-turn tail
+                # injection to keep the system slot KV-cache-stable). The
+                # block is bounded by SELFHOOD:BEGIN / SELFHOOD:END markers
+                # so evaluators can strip it. No-op when
+                # --no-memory / --no-self-model / no prior state.
                 # Non-fatal: a failure here must never break a user turn.
                 #
                 # Strict isinstance check on the SelfModel (NOT just
@@ -2657,23 +2670,23 @@ class GhostAgent:
                             query=last_user_content,
                         )
                         if isinstance(wakeup_prefix, str) and wakeup_prefix:
-                            base_prompt = wakeup_prefix + "\n" + base_prompt
+                            continuity_blocks.append(wakeup_prefix)
                 except Exception as e:
                     logger.debug(f"selfhood wake-up prefix skipped: {type(e).__name__}: {e}")
 
                 # Workspace continuity prefix (world-model counterpart
-                # to the selfhood prefix just spliced in above). Reads
+                # to the selfhood block just collected above). Reads
                 # workspace state, recent activity, file diffs since
-                # last scan. Same defensive isinstance gate against
-                # MagicMock contexts. Non-fatal: a failure must never
-                # break a user turn.
+                # last scan; also rides in the per-turn tail injection.
+                # Same defensive isinstance gate against MagicMock
+                # contexts. Non-fatal: a failure must never break a turn.
                 try:
                     from ..workspace import WorkspaceModel as _WorkspaceModel
                     workspace_model = getattr(self.context, 'workspace_model', None)
                     if isinstance(workspace_model, _WorkspaceModel) and getattr(workspace_model, 'enabled', False):
                         ws_prefix = workspace_model.build_wakeup_prefix()
                         if isinstance(ws_prefix, str) and ws_prefix:
-                            base_prompt = ws_prefix + "\n" + base_prompt
+                            continuity_blocks.append(ws_prefix)
                 except Exception as e:
                     logger.debug(f"workspace wake-up prefix skipped: {type(e).__name__}: {e}")
 
@@ -2693,7 +2706,7 @@ class GhostAgent:
                         # the system prompt. Same defensive pattern the
                         # selfhood wake-up path uses.
                         if isinstance(_uctx, str) and _uctx:
-                            base_prompt = base_prompt + "\n\n" + _uctx
+                            continuity_blocks.append(_uctx)
                 except Exception as e:
                     logger.debug(f"uncertainty context injection skipped: {e}")
 
@@ -2712,7 +2725,7 @@ class GhostAgent:
                         # injection above: a MagicMock context must not
                         # corrupt base_prompt.
                         if isinstance(_skblock, str) and _skblock:
-                            base_prompt = base_prompt + "\n\n" + _skblock
+                            continuity_blocks.append(_skblock)
                 except Exception as e:
                     logger.debug(f"graduated-skill injection skipped: {e}")
 
@@ -2801,7 +2814,7 @@ class GhostAgent:
                                 "\nTreat this as a strong hint, not a mandate — "
                                 "deviate if the task clearly needs another approach."
                             )
-                            base_prompt = base_prompt + "\n\n" + _hint
+                            continuity_blocks.append(_hint)
                             pretty_log(
                                 "Deep Reason",
                                 f"MCTS lookahead → {_w_desc[:80]}",
@@ -2824,6 +2837,11 @@ class GhostAgent:
                         f'5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (Last Tool Output: {last_tool_content}) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
                     )
                 base_prompt += working_memory_context
+
+                # Join the per-turn continuity/hint blocks collected above.
+                # These ride in the tail injection (transient_injection) so
+                # the system slot stays byte-stable for KV-cache reuse.
+                continuity_text = "\n\n".join(b for b in continuity_blocks if b).strip()
 
                 # Tool schemas are now generated dynamically inside the turn loop
                 # base_prompt is kept clean here
@@ -2940,10 +2958,22 @@ class GhostAgent:
                 # The system slot used to be rebuilt per turn (persona +
                 # skill_instruction + tool schemas) which changed bytes from
                 # turn to turn and invalidated upstream KV-cache prefixes.
-                # We now lock the system slot to persona + skill_instruction
-                # only — tool schemas move into the per-turn user-message
-                # header (which already changes every turn anyway because of
-                # the timestamp inside transient_injection).
+                # We lock the system slot to SYSTEM_PROMPT + {{PROFILE}} +
+                # skill_instruction only — tool schemas, live system state,
+                # AND the per-turn continuity/hint blocks (selfhood, workspace,
+                # uncertainty, graduated-skill, MCTS — collected above into
+                # `continuity_blocks`) all ride in the per-turn user-message
+                # header (transient_injection), which changes every turn anyway.
+                #
+                # This guarantee had silently regressed: the selfhood/workspace
+                # wake-up prefixes were being PREPENDED to the system slot and
+                # the uncertainty/skill/MCTS blocks APPENDED to it, all keyed to
+                # the live query — so the first bytes of the prompt differed
+                # every turn and llama-server logged `n_past=1 … forcing full
+                # prompt re-processing`, re-prefilling ~17k tokens (~20s) per
+                # turn. Moving them to the tail restores the byte-identical
+                # prefix; only {{PROFILE}} remains, and it changes rarely
+                # (update_profile only).
                 #
                 # Net effect: on a multi-turn request, the system prefix is
                 # byte-identical across turns and the upstream inference
@@ -3512,7 +3542,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # at the head of the transient injection (was: in the
                     # system slot). The system slot itself stays byte-stable
                     # across turns to maximise upstream KV-cache hits.
-                    transient_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{dynamic_state.strip()}"
+                    _continuity_tail = f"\n\n{continuity_text}" if continuity_text else ""
+                    transient_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{dynamic_state.strip()}{_continuity_tail}"
 
                     # Prepend transient state to the LAST message to preserve KV Cache and prevent burying user input
                     if req_messages and req_messages[-1]["role"] == "user":
@@ -7034,10 +7065,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 1 for t in (tools_run_this_turn or [])
                                 if isinstance(t, dict) and t.get("name") == "file_system"
                             )
+                            # If the user is administering the project system
+                            # itself this turn (list / delete / switch / ...),
+                            # don't nudge them to create one — they obviously
+                            # know about projects (reported: nudge fired right
+                            # after a `delete project`).
+                            _managing = any(
+                                isinstance(t, dict) and t.get("name") == "manage_projects"
+                                for t in (tools_run_this_turn or [])
+                            )
                             _sugg = _ssp(
                                 user_turns=_uturns, assistant_turns=_aturns,
                                 sandbox_writes=_writes, plan_node_count=0,
                                 already_in_project=False,
+                                managing_projects=_managing,
                             )
                             if getattr(_sugg, "should_suggest", False):
                                 final_ai_content = (

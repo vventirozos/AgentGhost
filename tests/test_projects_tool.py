@@ -105,10 +105,14 @@ async def test_duplicate_check_is_case_and_whitespace_insensitive(context):
 async def test_duplicate_check_ignores_archived(context):
     a = _parse(await tool_manage_projects(context, action="create", title="Foo"))
     # Archive it, then create again — should be allowed (legitimate restart)
-    await tool_manage_projects(context, action="delete",
+    await tool_manage_projects(context, action="archive",
                                project_id=a["created"])
     b = _parse(await tool_manage_projects(context, action="create", title="Foo"))
     assert a["created"] != b["created"]
+    # archive is reversible: the original row still exists, marked ARCHIVED
+    got = _parse(await tool_manage_projects(context, action="get",
+                                            project_id=a["created"]))
+    assert got["status"] == "ARCHIVED"
 
 
 async def test_duplicate_check_can_be_disabled_via_zero_window(context, monkeypatch):
@@ -149,7 +153,7 @@ async def test_duplicate_note_tells_user_how_to_force_new(context):
     _parse(await tool_manage_projects(context, action="create", title="X"))
     res = _parse(await tool_manage_projects(context, action="create", title="X"))
     assert "archive" in res["note"].lower()
-    assert "ARCHIVED" in res["note"]
+    assert "action=archive" in res["note"]  # the dedicated soft-delete action
 
 
 async def test_duplicate_response_has_refused_flag(context):
@@ -241,8 +245,8 @@ async def test_list_returns_all_projects_with_current(context):
 async def test_list_filters_by_status(context):
     a = _parse(await tool_manage_projects(context, action="create", title="A"))
     _parse(await tool_manage_projects(context, action="create", title="B"))
-    # Archive A
-    await tool_manage_projects(context, action="delete", project_id=a["created"])
+    # Archive A (still exists, just not ACTIVE)
+    await tool_manage_projects(context, action="archive", project_id=a["created"])
     res = _parse(await tool_manage_projects(context, action="list",
                                             status_filter="ACTIVE"))
     assert all(p["id"] != a["created"] for p in res["projects"])
@@ -268,11 +272,50 @@ async def test_update_changes_fields(context):
     assert got["status"] == "PAUSED"
 
 
-async def test_delete_archives_and_exits_if_current(context):
+async def test_delete_is_permanent_and_exits_if_current(context):
+    """`delete` is a HARD, irreversible removal: the row is gone (get →
+    error/None), and if it was the current project, project mode is exited."""
     p = _parse(await tool_manage_projects(context, action="create", title="A"))
-    assert context.current_project_id == p["created"]
-    await tool_manage_projects(context, action="delete", project_id=p["created"])
+    pid = p["created"]
+    assert context.current_project_id == pid
+    res = _parse(await tool_manage_projects(context, action="delete", project_id=pid))
+    assert res.get("deleted") is True and res.get("hard") is True
     assert context.current_project_id is None
+    # row is actually gone — not merely archived
+    assert context.project_store.get_project(pid) is None
+    assert all(p2["id"] != pid for p2 in context.project_store.list_projects())
+
+
+async def test_delete_removes_workspace_files(context, tmp_path):
+    """`delete` also wipes the project's on-disk workspace."""
+    p = _parse(await tool_manage_projects(context, action="create", title="WS"))
+    pid = p["created"]
+    ws = context.project_store.sandbox_root / "projects" / pid
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "scratch.txt").write_text("data")
+    await tool_manage_projects(context, action="delete", project_id=pid)
+    assert not ws.exists()  # files removed
+
+
+async def test_archive_is_reversible_and_keeps_row(context):
+    """`archive` is the soft path: row survives as ARCHIVED, resumable."""
+    p = _parse(await tool_manage_projects(context, action="create", title="A"))
+    pid = p["created"]
+    res = _parse(await tool_manage_projects(context, action="archive", project_id=pid))
+    assert res.get("archived") is True
+    assert context.current_project_id is None  # exited current
+    got = _parse(await tool_manage_projects(context, action="get", project_id=pid))
+    assert got["status"] == "ARCHIVED"  # still there
+
+
+async def test_archive_keeps_workspace_files(context):
+    p = _parse(await tool_manage_projects(context, action="create", title="WS2"))
+    pid = p["created"]
+    ws = context.project_store.sandbox_root / "projects" / pid
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "keep.txt").write_text("data")
+    await tool_manage_projects(context, action="archive", project_id=pid)
+    assert (ws / "keep.txt").exists()  # files preserved on archive
 
 
 # --------------------------------------------------------------------- tasks

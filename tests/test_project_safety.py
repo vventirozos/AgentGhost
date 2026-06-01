@@ -225,6 +225,22 @@ def test_suggestion_blocked_when_already_in_project():
     assert "already in project" in s.reason
 
 
+def test_suggestion_blocked_when_managing_projects():
+    """No promotion nudge while the user is administering projects (list /
+    delete / switch). Regression: the nudge fired right after a
+    `delete project`, even quoting a stale first-turn as the title."""
+    s = should_suggest_promotion(
+        user_turns=["show me all the projects", "delete project a64a41803358"]
+        + ["x"] * MIN_TURNS_FOR_SUGGESTION,
+        assistant_turns=["b"] * MIN_TURNS_FOR_SUGGESTION,
+        sandbox_writes=3, plan_node_count=5,  # would otherwise strongly trigger
+        already_in_project=False,
+        managing_projects=True,
+    )
+    assert s.should_suggest is False
+    assert "managing projects" in s.reason
+
+
 def test_suggestion_blocked_below_thresholds():
     s = should_suggest_promotion(
         user_turns=["a"], assistant_turns=["b"],

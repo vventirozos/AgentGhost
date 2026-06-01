@@ -531,6 +531,54 @@ async def test_system_prompt_byte_stable_across_two_turns():
     )
 
 
+@pytest.mark.asyncio
+async def test_continuity_blocks_ride_in_tail_not_system_slot():
+    """Regression: with the selfhood wake-up ENABLED (the production case),
+    the volatile continuity block must NOT land in the system slot — it
+    rides in the per-turn tail injection — so the system prefix stays
+    byte-identical across turns and the upstream KV cache is reusable.
+
+    The earlier byte-stable test used a MagicMock self_model, so the
+    `isinstance(self_model, SelfModel)` guard skipped the block entirely
+    and never exercised this path — which is why prepending the wake-up
+    prefix to the system slot silently regressed cache stability."""
+    from ghost_agent.selfhood import SelfModel
+    agent = _make_agent()
+    MARKER = "WAKEUP_CONTINUITY_MARKER_ZZ123"
+    sm = MagicMock(spec=SelfModel)          # spec → isinstance(sm, SelfModel) is True
+    sm.enabled = True
+    sm.build_wakeup_prefix = MagicMock(return_value=MARKER)
+    agent.context.self_model = sm
+
+    cap = {"system": [], "last_user": []}
+    call_n = {"n": 0}
+
+    async def mock_chat(payload, *a, **kw):
+        call_n["n"] += 1
+        msgs = payload["messages"]
+        cap["system"].append(next(m["content"] for m in msgs if m["role"] == "system"))
+        cap["last_user"].append(msgs[-1]["content"])
+        if call_n["n"] == 1:
+            return {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "t1", "function": {"name": "fake_tool", "arguments": "{}"}}
+            ]}}]}
+        return {"choices": [{"message": {"content": "done", "tool_calls": []}}]}
+
+    agent.context.llm_client.chat_completion = mock_chat
+    agent.available_tools = {"fake_tool": AsyncMock(return_value="ok")}
+
+    body = {"messages": [{"role": "user", "content": "Run a tool please"}], "model": "test"}
+    await agent.handle_chat(body, MagicMock())
+
+    assert len(cap["system"]) >= 2
+    # The volatile selfhood content must NOT be in the system slot...
+    assert MARKER not in cap["system"][0]
+    # ...the system slot stays byte-identical across turns even with it enabled...
+    assert cap["system"][0] == cap["system"][1]
+    # ...and the content is preserved — emitted in the per-turn tail injection.
+    assert any(MARKER in lu for lu in cap["last_user"] if isinstance(lu, str))
+
+
 # =====================================================================
 # #2 — Two-tier model routing
 # =====================================================================
