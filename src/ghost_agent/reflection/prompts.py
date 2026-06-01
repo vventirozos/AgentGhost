@@ -106,11 +106,23 @@ def build_reflection_prompt(
         trajectory.tool_calls or [],
         per_call_limit=max_per_call_output,
     )
-    return REFLECTION_PROMPT_TEMPLATE.format(
+    body = REFLECTION_PROMPT_TEMPLATE.format(
         user_request=user_request,
         failure_reason=failure_reason,
         tried_summary=tried_summary,
     )
+    # Prepend a GEPA-optimized critique instruction when one has been
+    # produced offline (run_gepa → system/optim/reflection.critique.json).
+    # reflection.critique was previously tuned-but-never-read; this is its
+    # natural read-site. Falls back to the baseline template when absent.
+    try:
+        from ..optim.loader import tuned_instruction
+        tuned = tuned_instruction("reflection.critique", "")
+        if tuned:
+            return f"{tuned}\n\n{body}"
+    except Exception:
+        pass
+    return body
 
 
 def parse_reflection_output(text: str) -> tuple[str, List[str]]:

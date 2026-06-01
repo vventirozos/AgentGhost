@@ -160,6 +160,69 @@ class ComplexityClassifier:
         return self
 
     # -----------------------------------------------------------------
+    # Online update (mirrors prm.model.StepValueModel)
+    # -----------------------------------------------------------------
+
+    def clone(self) -> "ComplexityClassifier":
+        """Copy with the same hyperparameters and weights — used by a
+        guarded online-update path so a candidate step is applied to a
+        throwaway model first."""
+        m = ComplexityClassifier(
+            learning_rate=self.learning_rate, l2=self.l2,
+            epochs=self.epochs, tol=self.tol, random_state=self.random_state,
+        )
+        m.weights_ = None if self.weights_ is None else self.weights_.copy()
+        m.bias_ = float(self.bias_)
+        m.feature_names_ = tuple(self.feature_names_)
+        m.report_ = self.report_
+        return m
+
+    def partial_fit(self, X: Iterable[Any], y: Iterable[Any], *,
+                    lr: Optional[float] = None, steps: int = 1) -> "ComplexityClassifier":
+        """Apply ``steps`` gradient steps to the existing weights (online
+        counterpart to batch ``fit``). Requires an already-fitted model;
+        small ``lr`` + few ``steps`` + the existing L2 bound the change."""
+        if self.weights_ is None:
+            raise RuntimeError(
+                "partial_fit requires an already-fitted model — online "
+                "updates refine the batch model, they don't bootstrap it"
+            )
+        X_arr, y_arr = self._to_arrays(X, y)
+        n = X_arr.shape[0]
+        if n == 0:
+            return self
+        rate = float(self.learning_rate if lr is None else lr)
+        w = self.weights_.astype(float).copy()
+        b = float(self.bias_)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            for _ in range(max(1, int(steps))):
+                probs = _sigmoid(X_arr @ w + b)
+                err = probs - y_arr
+                grad_w = (X_arr.T @ err) / n + self.l2 * w
+                grad_b = float(np.mean(err))
+                w -= rate * grad_w
+                b -= rate * grad_b
+        self.weights_ = w
+        self.bias_ = b
+        return self
+
+    def bce_loss(self, X: Iterable[Any], y: Iterable[Any]) -> float:
+        """Mean BCE of the current model on ``(X, y)`` — the holdout
+        metric a guarded online update compares before/after a step."""
+        if self.weights_ is None:
+            raise RuntimeError("model not fitted")
+        X_arr, y_arr = self._to_arrays(X, y)
+        if X_arr.shape[0] == 0:
+            return 0.0
+        eps = 1e-9
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            probs = _sigmoid(X_arr @ self.weights_ + self.bias_)
+            return -float(np.mean(
+                y_arr * np.log(np.clip(probs, eps, 1 - eps))
+                + (1 - y_arr) * np.log(np.clip(1 - probs, eps, 1 - eps))
+            ))
+
+    # -----------------------------------------------------------------
     # Predict
     # -----------------------------------------------------------------
 

@@ -37,13 +37,23 @@ from typing import Optional
 class ConfidenceReading:
     """The composite output. ``below_threshold`` is the precomputed
     decision callers actually use — keeping it on the dataclass means
-    the threshold convention lives in one place."""
+    the threshold convention lives in one place.
+
+    ``uncertainty_pressure`` is the verbalised-uncertainty signal that
+    fed this reading (0 = the agent flagged nothing; → 1 = heavy
+    unresolved high-impact unknowns). It is recorded by the calibration
+    spine (:mod:`core.calibration`) so the two previously-disjoint
+    tracks — objective entropy/competence and the agent's own "I'm not
+    sure" flags — are fit together. Defaulted so existing call sites
+    and tests that build a reading positionally keep working.
+    """
 
     composite: float
     entropy_component: float       # (1 - normalised_entropy)
     competence_component: float    # p(success) for the domain
     threshold: float
     below_threshold: bool
+    uncertainty_pressure: float = 0.0
 
 
 class CompositeConfidence:
@@ -55,6 +65,11 @@ class CompositeConfidence:
     DEFAULT_W_ENTROPY = 0.5
     DEFAULT_W_COMPETENCE = 0.5
     DEFAULT_THRESHOLD = 0.55
+    # Penalty weight on the verbalised-uncertainty pressure. 0.0 keeps
+    # the historical two-signal behaviour byte-for-byte; the calibration
+    # spine (:mod:`core.calibration`) raises it only if the agent's own
+    # "I'm not sure" flags turn out to predict failure on logged turns.
+    DEFAULT_LAMBDA_UNCERTAINTY = 0.0
 
     def __init__(
         self,
@@ -62,15 +77,41 @@ class CompositeConfidence:
         w_entropy: float = DEFAULT_W_ENTROPY,
         w_competence: float = DEFAULT_W_COMPETENCE,
         threshold: float = DEFAULT_THRESHOLD,
+        lambda_uncertainty: float = DEFAULT_LAMBDA_UNCERTAINTY,
     ):
         self.threshold = _clamp_unit(threshold)
         we, wc = _normalise_weights(w_entropy, w_competence)
         self.w_entropy = we
         self.w_competence = wc
+        self.lambda_uncertainty = _clamp_unit(lambda_uncertainty)
+
+    def apply_fitted(self, params) -> None:
+        """Hot-swap the threshold/weights/λ from a calibration fit.
+
+        ``params`` is a :class:`core.calibration.FittedParams` (or any
+        object exposing the same attributes). Called from the idle
+        calibration-refit phase and at startup when a persisted fit
+        exists, so a long-running agent's confidence becomes
+        empirically calibrated without a restart. Defensive: a malformed
+        params object leaves the current settings untouched.
+        """
+        try:
+            we, wc = _normalise_weights(
+                float(params.w_entropy), float(params.w_competence)
+            )
+            self.w_entropy = we
+            self.w_competence = wc
+            self.threshold = _clamp_unit(float(params.threshold))
+            self.lambda_uncertainty = _clamp_unit(
+                float(getattr(params, "lambda_uncertainty", 0.0))
+            )
+        except Exception:  # pragma: no cover — defensive
+            pass
 
     def score(self, *, normalised_entropy: float,
               competence_p_success: float,
-              n_observations: int = 0) -> ConfidenceReading:
+              n_observations: int = 0,
+              uncertainty_pressure: float = 0.0) -> ConfidenceReading:
         """Compute one composite reading.
 
         ``n_observations`` discounts the competence prior: when the
@@ -78,6 +119,14 @@ class CompositeConfidence:
         component is shrunk toward 0.5 so it doesn't dominate before
         the prior has earned its weight. This is the "calibration of
         calibration" check the doc's Level-1 critique calls out.
+
+        ``uncertainty_pressure`` (0..1) is the verbalised-uncertainty
+        signal from :class:`core.uncertainty.UncertaintyTracker`. It
+        applies a multiplicative penalty ``× (1 − λ·pressure)`` to the
+        composite, fusing the formerly-disjoint "the agent said it was
+        unsure" track into the objective score. With the default
+        ``λ = 0`` it is a no-op, so this is fully back-compatible until
+        the calibration spine fits a positive λ.
         """
         e = _clamp_unit(normalised_entropy)
         p = _clamp_unit(competence_p_success)
@@ -92,6 +141,10 @@ class CompositeConfidence:
         p = shrink * p + (1.0 - shrink) * 0.5
         entropy_component = 1.0 - e
         composite = self.w_entropy * entropy_component + self.w_competence * p
+        # Fuse the verbalised-uncertainty pressure as a multiplicative
+        # penalty (defaults to no-op at λ = 0).
+        pressure = _clamp_unit(uncertainty_pressure)
+        composite = composite * (1.0 - self.lambda_uncertainty * pressure)
         composite = _clamp_unit(composite)
         return ConfidenceReading(
             composite=composite,
@@ -99,6 +152,7 @@ class CompositeConfidence:
             competence_component=p,
             threshold=self.threshold,
             below_threshold=composite < self.threshold,
+            uncertainty_pressure=pressure,
         )
 
 

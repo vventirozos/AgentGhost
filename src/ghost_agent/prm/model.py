@@ -200,6 +200,90 @@ class StepValueModel:
         return self
 
     # -----------------------------------------------------------------
+    # Online update (roadmap phase: low-latency correction learning)
+    # -----------------------------------------------------------------
+
+    def clone(self) -> "StepValueModel":
+        """Deep-ish copy: same hyperparameters, copied weights/bias.
+
+        Used by the guarded online-update path so a candidate SGD step is
+        applied to a throwaway model and only committed (via
+        ``PRMScorer.set_model``) if it survives the holdout check —
+        the live scoring model is never mutated mid-flight.
+        """
+        m = StepValueModel(
+            learning_rate=self.learning_rate, l2=self.l2,
+            epochs=self.epochs, tol=self.tol, random_state=self.random_state,
+        )
+        m.weights_ = None if self.weights_ is None else self.weights_.copy()
+        m.bias_ = float(self.bias_)
+        m.feature_names_ = tuple(self.feature_names_)
+        m.report_ = self.report_
+        return m
+
+    def partial_fit(
+        self,
+        X: Iterable[Any],
+        y: Iterable[Any],
+        *,
+        lr: Optional[float] = None,
+        steps: int = 1,
+    ) -> "StepValueModel":
+        """Apply ``steps`` gradient steps on ``(X, y)`` to the EXISTING
+        weights — the online-learning counterpart to batch ``fit``.
+
+        Requires an already-fitted model: online updates refine the
+        batch-trained model, they don't bootstrap one (a single
+        correction can't span the input distribution). Mutates in place
+        and returns ``self``; callers wanting a guard should
+        ``clone()`` first. Uses a small ``lr`` by default and the same
+        L2 as ``fit`` so one step can't blow the weights up.
+        """
+        if self.weights_ is None:
+            raise RuntimeError(
+                "partial_fit requires an already-fitted model — online "
+                "updates refine the batch model, they don't bootstrap it"
+            )
+        X_arr, y_arr = self._to_arrays(X, y)
+        n = X_arr.shape[0]
+        if n == 0:
+            return self
+        rate = float(self.learning_rate if lr is None else lr)
+        w = self.weights_.astype(float).copy()
+        b = float(self.bias_)
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            for _ in range(max(1, int(steps))):
+                logits = X_arr @ w + b
+                probs = _sigmoid(logits)
+                err = probs - y_arr
+                grad_w = (X_arr.T @ err) / n + self.l2 * w
+                grad_b = float(np.mean(err))
+                w -= rate * grad_w
+                b -= rate * grad_b
+        self.weights_ = w
+        self.bias_ = b
+        return self
+
+    def bce_loss(self, X: Iterable[Any], y: Iterable[Any]) -> float:
+        """Mean binary cross-entropy of the current model on ``(X, y)``.
+
+        The metric the online-update holdout guard compares before/after
+        a candidate step — a step that raises holdout BCE is rejected
+        (catastrophic-forgetting guard)."""
+        if self.weights_ is None:
+            raise RuntimeError("model not fitted")
+        X_arr, y_arr = self._to_arrays(X, y)
+        if X_arr.shape[0] == 0:
+            return 0.0
+        eps = 1e-9
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            probs = _sigmoid(X_arr @ self.weights_ + self.bias_)
+            return -float(np.mean(
+                y_arr * np.log(np.clip(probs, eps, 1 - eps))
+                + (1 - y_arr) * np.log(np.clip(1 - probs, eps, 1 - eps))
+            ))
+
+    # -----------------------------------------------------------------
     # Predict
     # -----------------------------------------------------------------
 

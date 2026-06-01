@@ -42,6 +42,25 @@ from .model import StepValueModel, PRMTrainingReport
 logger = logging.getLogger("GhostAgent")
 
 
+def samples_to_xy(
+    trajectories: Iterable[Trajectory],
+    *,
+    spec: Optional[StepLabelSpec] = None,
+    use_continuous: bool = True,
+) -> Tuple[List, List[float]]:
+    """Build ``(X, y)`` feature/label lists from trajectories.
+
+    Shared by the batch trainer and the online-update path
+    (``PRMScorer.online_update``) so both featurise identically. ``X`` is
+    a list of ``FeatureVector``; ``y`` is the discount-weighted continuous
+    value (or the 0/1 binary when ``use_continuous`` is False)."""
+    spec = spec or StepLabelSpec()
+    samples = list(iter_step_samples(list(trajectories), spec))
+    X = [extract_step_features(s.state, s.action) for s in samples]
+    y = [s.value if use_continuous else s.binary for s in samples]
+    return X, y
+
+
 @dataclass
 class TrainerReport:
     """Summary of what the trainer did. Returned from ``run`` and also

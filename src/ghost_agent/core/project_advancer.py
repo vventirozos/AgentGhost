@@ -163,6 +163,7 @@ async def advance_once(
     project_id: str,
     tool_runner: Optional[ToolRunner] = None,
     llm_classifier: Optional[LLMClassifier] = None,
+    code_generator: Optional[Callable[[str], Awaitable[str]]] = None,
 ) -> AdvanceResult:
     """Run a single autoadvance tick for ``project_id``.
 
@@ -174,6 +175,11 @@ async def advance_once(
       llm_classifier: async callable returning one of
         "needs_user"/"coding"/"research" for a free-form description.
         Defaults to :func:`classify_task` (synchronous, wrapped).
+      code_generator: async callable ``(description) -> str`` returning an
+        executable command/snippet for a coding task. When supplied, a
+        coding task generates real code and runs it via ``execute``;
+        without it, a coding task degrades to *researching* the task
+        rather than running the old no-op stub.
     """
     store = getattr(context, "project_store", None)
     if store is None:
@@ -258,7 +264,23 @@ async def advance_once(
     # useful signal, so we don't treat it as a hard failure.
     if classification == "coding":
         tool_name = "execute"
-        tool_args = {"command": f"# Autoadvance stub for: {nxt.description[:120]}"}
+        generated = ""
+        if code_generator is not None:
+            try:
+                generated = (await code_generator(nxt.description) or "").strip()
+            except Exception as e:
+                logger.warning("autoadvance code_generator failed: %s", e)
+                generated = ""
+        if generated:
+            tool_args = {"command": generated}
+        else:
+            # No generator wired (or it produced nothing usable): research
+            # the task to gather context rather than executing an inert
+            # comment. The previous behaviour ran a shell COMMENT
+            # ("# Autoadvance stub for: …") which marked the task DONE
+            # having executed nothing — that is now fixed.
+            tool_name = "web_search"
+            tool_args = {"query": nxt.description[:200]}
     else:
         tool_name = "web_search"
         tool_args = {"query": nxt.description[:200]}

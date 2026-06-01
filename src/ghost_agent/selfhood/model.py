@@ -29,6 +29,7 @@ from .narrative import NarrativeSummariser
 from .recognition import build_wakeup_prefix
 from .schema import Experience
 from .state import SelfStateThread
+from .values import ValuesThread
 
 logger = logging.getLogger("GhostSelfhood")
 
@@ -66,10 +67,17 @@ class SelfModel:
                 max_recent_experiences=max_recent_experiences_for_narrative,
                 enabled=True,
             )
+            # Normative substrate (operating principles) — the values
+            # layer that moves selfhood from episodic-only to
+            # behaviour-shaping. Surfaced in the wake-up prefix every turn.
+            self.values: Optional[ValuesThread] = ValuesThread(
+                self.root, enabled=True,
+            )
         else:
             self.autobio = None
             self.state = None
             self.narrative = None
+            self.values = None
 
     # -----------------------------------------------------------------
     # Hot-path APIs (called by handle_chat per turn)
@@ -93,9 +101,77 @@ class SelfModel:
             autobio=self.autobio,
             state=self.state,
             narrative=narrative_text,
+            values=self.values,
             recent_experiences_n=recent_experiences_n,
             query=query,
         )
+
+    # -----------------------------------------------------------------
+    # Values / principles (normative substrate)
+    # -----------------------------------------------------------------
+
+    def note_principle(self, text: str):
+        """Author an operating principle. Returns the Principle (or None
+        when disabled / empty). Surfaced in the wake-up prefix every turn."""
+        if not self.enabled or self.values is None:
+            return None
+        try:
+            return self.values.note_principle(text)
+        except Exception as e:
+            logger.debug("note_principle skipped: %s", e)
+            return None
+
+    def principles(self):
+        """Current operating principles (list of Principle). Empty when
+        disabled / none authored."""
+        if not self.enabled or self.values is None:
+            return []
+        try:
+            return self.values.principles()
+        except Exception:
+            return []
+
+    def principles_text(self) -> str:
+        """Bulleted principle list for a self-critique gate prompt."""
+        if not self.enabled or self.values is None:
+            return ""
+        try:
+            return self.values.as_text()
+        except Exception:
+            return ""
+
+    async def evaluate_response_alignment(self, response: str, *, critique_fn):
+        """Independent check that ``response`` doesn't contradict a stated
+        operating principle. Returns ``(aligned, note)``. ``aligned`` is
+        True when there are no principles, no response, or no critique_fn
+        (fail-open — the gate must never block a turn on its own absence).
+
+        ``critique_fn`` is an async ``str -> str`` (the same shape the
+        Reflector / narrative summariser use); it is given the principles
+        and the response and asked for an ALIGNED/VIOLATION verdict."""
+        principles = self.principles_text()
+        if not principles or not (response or "").strip() or critique_fn is None:
+            return True, ""
+        prompt = (
+            "You are auditing whether a response honours the agent's own "
+            "stated operating principles.\n\nPRINCIPLES:\n"
+            f"{principles}\n\nRESPONSE:\n{str(response)[:2000]}\n\n"
+            "Does the response CONTRADICT any principle? Reply on the first "
+            "line with exactly 'VERDICT: ALIGNED' or 'VERDICT: VIOLATION', "
+            "then one sentence naming the principle if violated."
+        )
+        try:
+            out = await critique_fn(prompt)
+            up = (out or "").upper()
+            v_pos = up.find("VIOLATION")
+            a_pos = up.find("ALIGNED")
+            violated = v_pos != -1 and (a_pos == -1 or v_pos < a_pos)
+            lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+            note = (lines[0] if lines else "")[:200]
+            return (not violated), note
+        except Exception as e:
+            logger.debug("evaluate_response_alignment skipped: %s", e)
+            return True, ""
 
     def recall_relevant(self, query: str, *, limit: int = 5):
         """Relevance-ranked search over my own autobiographical past.
@@ -296,4 +372,5 @@ class SelfModel:
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
             "clusters": (self.autobio.cluster_counts() if self.autobio else {}),
+            "principle_count": len(self.values.principles()) if self.values else 0,
         }

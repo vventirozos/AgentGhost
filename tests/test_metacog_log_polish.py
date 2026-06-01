@@ -285,11 +285,11 @@ class TestReplanNoopSuppression:
 
 class TestSubsystemIcons:
     def test_every_subsystem_has_distinct_icon(self):
-        # All seven subsystems are mapped
+        # Every subsystem is mapped (CALIB added for the calibration spine)
         subsystems = {
             Subsystem.BOOT, Subsystem.SUMMARY, Subsystem.CONF,
-            Subsystem.ARBITER, Subsystem.VALID, Subsystem.HOST,
-            Subsystem.REPLAN, Subsystem.GATE,
+            Subsystem.CALIB, Subsystem.ARBITER, Subsystem.VALID,
+            Subsystem.HOST, Subsystem.REPLAN, Subsystem.GATE,
         }
         assert set(_SUBSYSTEM_ICONS.keys()) == subsystems
         # Icons distinct from each other

@@ -319,6 +319,35 @@ will produce a first-ever checkpoint at the default GHOST_HOME path
 when none was provided, and hot-swap it in. From that point onward
 the agent has a self-trained PRM that's been hot-swapped in mid-flight.
 
+## Online updates (low-latency correction learning)
+
+The batch retrain (phase 2.7) runs at most every 3 hours of idle time, so
+a user correction at turn N can't influence the PRM until hours later.
+`StepValueModel.partial_fit(X, y, *, lr, steps)` closes that gap with a
+small in-place SGD step on the existing weights (the online counterpart
+to batch `fit`; same numpy, no GPU). It requires an already-fitted model
+— online steps *refine* the batch model, they don't bootstrap one.
+
+`PRMScorer.online_update(new_X, new_y, *, holdout_X, holdout_y)` is the
+guarded entry point:
+
+* **clone, don't mutate** — the step is applied to a `clone()`; the live
+  scoring model is replaced atomically via `set_model` only if the guard
+  passes, so a concurrent `score` never sees a torn update;
+* **holdout guard** — the clone is committed only if its BCE on a holdout
+  of recent trajectories does **not** worsen (catastrophic-forgetting
+  guard via `bce_loss`); without a holdout the small `lr` + few `steps` +
+  the existing L2 bound the change;
+* **no bootstrap** — returns `False` when no model is loaded.
+
+Wired (opt-in, `--prm-online-update`) at the user-correction promotion
+path in `core/agent.py`: when a turn is promoted to FAILED by a user
+correction, its step samples become the new (negative) sample and a slice
+of recent trajectories the holdout — applied fire-and-forget in a worker
+thread so the turn never blocks. The same `partial_fit` / `clone` /
+`bce_loss` trio is mirrored on `router.model.ComplexityClassifier`.
+Covered by `tests/test_prm_online_update.py`.
+
 ## Honest tradeoffs
 
 * **Corpus size.** Logistic regression is the right shape for a small
@@ -336,13 +365,19 @@ the agent has a self-trained PRM that's been hot-swapped in mid-flight.
   treat all steps in a passed trajectory as equally valuable —
   helpful when most failures are diffuse, harmful when they're
   concentrated near the end. Tunable via `StepLabelSpec.discount_factor`.
-* **Wiring the hot path.** This work makes MCTS+PRM available; the
-  agent's existing planning hot path is **not** modified by default.
-  Callers that opt in (revision step, System 3 pivot, self-play
-  candidate generation) need to construct a `PlanState` and pass
-  `prm_state=` to engage the fast path. The deliberate caution avoids
-  regressing the existing 15/15 eval — wiring deeper into the live
-  hot path is a follow-up that should be gated by an A/B eval delta.
+* **Wiring the hot path.** The deep-reason MCTS lookahead in
+  `core/agent.py::handle_chat` now **constructs a `PlanState` at turn
+  start and passes `prm_state=`** to `select_best_action`, so a trained
+  PRM scores live candidates in microseconds instead of the lookahead
+  always paying 3–4 worker-LLM simulation round-trips. The turn-start
+  state pins `pending_count`/`plan_depth` to the same neutral constants
+  (`1/1`) used by `prm.labels._build_state_for_step` and
+  `frontier_selection.representative_state`, so there is zero train/serve
+  skew (asserted by `tests/test_prm_mcts_live_wiring.py`). When no
+  trained PRM is loaded, the MCTS gate falls back to LLM simulation
+  automatically — the fast path engages only once a checkpoint exists.
+  Other opt-in callers (revision step, System 3 pivot, self-play
+  candidate generation) follow the same pattern.
 
 ## See also
 

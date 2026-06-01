@@ -45,7 +45,7 @@
     <li>Classify task type.</li>
     <li>Mark IN_PROGRESS.</li>
     <li>If <code>needs_user</code>: flip to NEEDS_USER, log event, return.</li>
-    <li>Pick tool: coding → <code>execute</code>, research → <code>web_search</code>.</li>
+    <li>Pick tool: coding → <code>execute</code> with code from the injected <code>code_generator</code> (or, if none, <strong>degrade to <code>web_search</code></strong> — never the old inert <code>"# Autoadvance stub"</code> comment that marked the task DONE having run nothing); research → <code>web_search</code>.</li>
     <li>Run tool through the injected runner.</li>
     <li>Store result as a project artifact.</li>
     <li>Check human-gate postconditions (<a href="project_safety.html">project_safety</a>) → flip to NEEDS_USER if any fire.</li>
@@ -59,7 +59,12 @@
   <h2>AdvanceResult</h2>
   <pre><code>AdvanceResult(ok: bool, task_id: str, classification: str, summary: str, artifact_id: Optional[str])</code></pre>
 
-  <p>Async; tool_runner and llm_classifier are optional callbacks so the advancer can be tested without a real agent.</p>
+  <p>Async; <code>tool_runner</code>, <code>llm_classifier</code>, and <code>code_generator</code> are optional callbacks so the advancer can be tested without a real agent.</p>
+
+  <h2>Autonomous idle advancement (phase 2.95)</h2>
+  <p>
+    <code>advance_once</code> was historically only reachable via the <code>manage_projects</code> tool or the HTTP <code>/advance</code> route — <strong>no idle phase ever called it</strong>, so the "self-advancing research loop" only advanced when a human or the model explicitly poked it. Under <code>--autoadvance-idle</code>, biological-watchdog <strong>phase 2.95</strong> picks one ACTIVE project and runs a single tick during the 15–60&nbsp;min idle window (30-min cooldown), building a registry-backed <code>tool_runner</code> and an LLM <code>code_generator</code> so coding tasks produce and run real code. Strictly bounded — one project, one tick per cooldown, on the same hard per-project budgets + human gates — and off by default. This is what turns the dormant loop into genuine background autonomy. Covered by <code>tests/test_project_advancer.py</code>.
+  </p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

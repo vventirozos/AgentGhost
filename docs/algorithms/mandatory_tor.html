@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mandatory Tor (fail-closed egress) — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration</a>
+    <a class="current" href="mandatory_tor.html">Mandatory Tor</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+  </nav>
+</aside>
+<main>
+  <h1>Mandatory Tor — runtime fail-closed egress</h1>
+  <p class="subtitle">Makes the README's "fails closed if Tor is unreachable" promise real. Source: <code>utils/egress_guard.py</code>. Opt-in via <code>--mandatory-tor</code>.</p>
+
+  <h2>The gap it closes</h2>
+  <p>
+    Historically the promise was aspirational: every outbound helper degraded to a direct cleartext connection when the proxy was absent or down — <code>core.llm.get_proxy</code> returns <code>None</code> for a missing proxy, <code>tools.search</code> adds <code>proxy=</code> only <em>if</em> <code>tor_proxy</code> is set, and the SSRF/identity-rotation paths all guard on <code>if tor_proxy</code>. A blank <code>TOR_PROXY</code> silently de-anonymised every request. The only true fail-closed mechanism (<code>eval.network_guard</code>) ran only during offline evals.
+  </p>
+
+  <h2>The policy</h2>
+  <p>
+    When <code>--mandatory-tor</code> is set, a process-wide guard monkeypatches the outbound socket primitives (<code>connect</code> / <code>connect_ex</code> / <code>sendto</code> / <code>sendmsg</code>) and raises <code>MandatoryTorError</code> on any connection to a <strong>globally-routable (public) address</strong>. Allowed: loopback, RFC1918 private / LAN, link-local, multicast/reserved, and the configured SOCKS endpoint.
+  </p>
+  <p>Why that is exactly right and not over-broad:</p>
+  <ul>
+    <li>Anonymised traffic egresses through the Tor SOCKS proxy at <code>127.0.0.1:9050</code> — the socket layer sees a <strong>loopback</strong> connect, which is allowed. With <code>socks5h</code>, even DNS is resolved by Tor's exit, so no public connect appears here.</li>
+    <li>Local infrastructure — the llama.cpp upstream, ChromaDB, a LAN Postgres, LAN swarm / image-gen nodes (e.g. <code>192.168.0.20</code>) — is loopback or RFC1918, so it is allowed (LAN traffic does not deanonymise via a Tor exit).</li>
+    <li>The ONLY thing blocked is a <strong>direct connection to a public IP</strong> — which by construction is a connection that bypassed Tor. That is precisely the leak the README claims is impossible.</li>
+  </ul>
+
+  <h2>Boot-time liveness gate</h2>
+  <p>
+    Before any outbound-capable component is wired, <code>tor_liveness_ok()</code> probes the SOCKS port. If Tor is unreachable and <code>--mandatory-tor</code> is set, the agent <strong>refuses to start</strong> (raises during lifespan) rather than booting cleartext — "a silently-cleartext agent is worse than a stalled one." Emits a <code>Tor Fail-Closed</code> log line (🛡️ active / ❌ abort).
+  </p>
+
+  <h2>Embedding model: forced offline</h2>
+  <p>
+    sentence-transformers / huggingface_hub fire a <strong>cleartext HTTPS model-resolution / version check</strong> at load time even for a <em>cached</em> model — a public connect the guard (correctly) blocks, which would otherwise stall the embedder at boot. Because Ghost's embedder is local-only by design, <code>--mandatory-tor</code> also sets <code>HF_HUB_OFFLINE</code> / <code>TRANSFORMERS_OFFLINE</code> (in <code>_env.py</code>, before the heavy imports) so the embedder loads from cache with <strong>zero</strong> network. The model must therefore be pre-cached — which it is after one normal (non-fail-closed) run. A cold install that enables fail-closed first should pre-download the embedder (or route HF through the SOCKS proxy and set <code>HF_HUB_OFFLINE=0</code> to override). This also closes the small pre-existing cleartext leak that check represented.
+  </p>
+
+  <h2>Notes</h2>
+  <ul>
+    <li>Default OFF — existing deployments are never perturbed. Enabling it is the switch that turns the documented guarantee into an enforced one.</li>
+    <li>Inbound (uvicorn <code>accept()</code>) is unaffected — the guard only patches outbound <code>connect</code>/<code>send*</code>.</li>
+    <li>Complements the existing per-tool <code>socks5h://</code> routing and <code>--anonymous</code> search rather than replacing it; this is the backstop that catches any path that forgot to route.</li>
+  </ul>
+</main>
+</body>
+</html>

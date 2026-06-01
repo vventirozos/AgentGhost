@@ -50,12 +50,19 @@ class MemoryBus:
                  graph_memory: Any = None,
                  skill_memory: Any = None,
                  profile_memory: Any = None,
-                 episodic_memory: Any = None):
+                 episodic_memory: Any = None,
+                 intent_weights: Any = None):
         self.vector = vector_memory
         self.graph = graph_memory
         self.skill = skill_memory
         self.profile = profile_memory
         self.episodic = episodic_memory
+        # Learned RRF intent→source weights (core.rrf_weights). None →
+        # the hand-tuned class defaults are used (zero behaviour change);
+        # main.py injects a fitted matrix here only when a weights.json
+        # exists. Kept per-instance so the classmethod default stays
+        # intact for direct callers / tests.
+        self._intent_weights = intent_weights
         # LRU of recently-published fact signatures, used by publish_fact to
         # short-circuit duplicate writes from looping callers.
         self._publish_lru: "OrderedDict[str, bool]" = OrderedDict()
@@ -181,6 +188,7 @@ class MemoryBus:
         fused = self._reciprocal_rank_fusion(
             [combined_vector, combined_graph, combined_skill, combined_episodic],
             k=rrf_k, intent=intent,
+            weight_overrides=self._intent_weights,
         )
         return self._format_markdown(fused, max_chars=max_chars)
 
@@ -360,15 +368,19 @@ class MemoryBus:
     def _reciprocal_rank_fusion(cls, ranked_lists: List[List[Dict[str, Any]]],
                                 k: int = 60,
                                 intent: str = "contextual",
+                                weight_overrides: Optional[Dict[str, Dict[str, float]]] = None,
                                 ) -> List[Tuple[Dict[str, Any], float]]:
         """Weighted RRF: score(d) = sum_r weight_r / (k + rank_r(d)).
 
-        When ``intent`` is provided, source-specific weights from
-        ``_INTENT_WEIGHTS`` scale each ranker's contribution. This lets
-        factual queries boost graph results and procedural queries boost
-        skill results, rather than treating all sources equally.
+        When ``intent`` is provided, source-specific weights scale each
+        ranker's contribution so factual queries boost graph results and
+        procedural queries boost skill results. ``weight_overrides`` (a
+        learned matrix from :mod:`core.rrf_weights`) supersedes the
+        hand-tuned ``_INTENT_WEIGHTS`` when supplied; ``None`` falls back
+        to the defaults, so direct classmethod callers are unaffected.
         """
-        weights = cls._INTENT_WEIGHTS.get(intent, cls._INTENT_WEIGHTS["contextual"])
+        wmap = weight_overrides or cls._INTENT_WEIGHTS
+        weights = wmap.get(intent, wmap.get("contextual", cls._INTENT_WEIGHTS["contextual"]))
         # Map source names to their weights. Sources: vector, graph, skill
         _source_order = ["vector", "graph", "skill"]
 

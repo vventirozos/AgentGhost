@@ -176,12 +176,46 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
 async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
+    # Stylometric egress scrubbing: under anonymous mode, normalise the
+    # outbound query into a neutral keyword form so the agent's prose
+    # style (politeness, first-person framing, punctuation habits) — a
+    # stable author fingerprint — doesn't leave the box alongside the
+    # Tor-anonymised packets. Deterministic + keyword-preserving.
+    if anonymous and query:
+        try:
+            from ..utils.stylometry import scrub_query
+            query = scrub_query(query) or query
+        except Exception:
+            pass
+        # Per-identity Tor circuit isolation: tag the SOCKS auth by a hash
+        # of the (scrubbed) query so distinct searches ride distinct
+        # circuits — a colluding set of exits can't link a sequence of
+        # different searches into one session. Best-effort; falls back to
+        # the shared proxy on any issue.
+        if tor_proxy:
+            try:
+                import hashlib
+                from ..utils.helpers import socks_url_with_identity
+                _tag = hashlib.md5((query or "").encode("utf-8", "ignore")).hexdigest()[:12]
+                tor_proxy = socks_url_with_identity(tor_proxy, _tag) or tor_proxy
+            except Exception:
+                pass
     # Tavily support removed. Always using DDGS.
     return await tool_search_ddgs(query, tor_proxy)
 
 async def tool_deep_research(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, llm_client=None, model_name="default", max_context: int = 8192, workspace_model=None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
+    # Stylometric egress scrubbing (stronger tier): deep-research is
+    # already LLM-heavy and latency-tolerant, so under anonymous mode the
+    # query is re-authored into a neutral keyword form by the local model
+    # (falls back to the deterministic lexical scrub on any failure).
+    if anonymous and query:
+        try:
+            from ..utils.stylometry import neutralize_query
+            query = await neutralize_query(query, llm_client=llm_client, model=model_name) or query
+        except Exception:
+            pass
     # Ensure proxy is in correct format for ddgs/httpx
     if tor_proxy and "socks5://" in tor_proxy and "socks5h://" not in tor_proxy:
         tor_proxy = tor_proxy.replace("socks5://", "socks5h://")

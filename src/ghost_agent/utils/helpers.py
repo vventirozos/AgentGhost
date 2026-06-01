@@ -108,6 +108,32 @@ def request_new_tor_identity(control_port=9051, password=""):
         except Exception as fallback_e:
             return False, f"Tor control port error: {e}. Fallback restart also failed: {fallback_e}"
 
+
+def socks_url_with_identity(tor_proxy: Optional[str], identity: str) -> Optional[str]:
+    """Inject a SOCKS ``username:password`` into a SOCKS URL so Tor's
+    ``IsolateSOCKSAuth`` (on by default) assigns a SEPARATE CIRCUIT per
+    ``identity`` tag — circuit-per-identity isolation without the global
+    NEWNYM thrash, and without needing the control port.
+
+    Distinct identities → distinct circuits → a colluding set of exit
+    nodes / sites can't trivially link a sequence of differently-tagged
+    requests into one session. Returns ``tor_proxy`` unchanged when it is
+    falsy, has no parseable host, or already carries credentials.
+    """
+    if not tor_proxy or not identity:
+        return tor_proxy
+    import re as _re
+    from urllib.parse import urlparse, urlunparse
+    try:
+        p = urlparse(tor_proxy)
+        if not p.hostname or p.username:
+            return tor_proxy  # unparseable or already has creds
+        tag = _re.sub(r"[^A-Za-z0-9]", "", str(identity))[:32] or "ghost"
+        netloc = f"{tag}:isolate@{p.hostname}:{p.port or 9050}"
+        return urlunparse((p.scheme, netloc, p.path, p.params, p.query, p.fragment))
+    except Exception:
+        return tor_proxy
+
 async def helper_fetch_url_content(url: str) -> str:
     # --- URL VALIDATION (shared SSRF guard) ---
     # Reject non-http(s) schemes and any host that is/resolves to an

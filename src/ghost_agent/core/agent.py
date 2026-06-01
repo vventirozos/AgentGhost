@@ -744,6 +744,19 @@ class GhostContext:
         # lifespan populates this just after llm_client is wired so the
         # arbiter's runner/embedder have a live upstream to talk to.
         self.metacog = None
+        # Most-recent composite confidence reading (core.confidence).
+        # Set per tool-turn under --enable-metacog; read at turn end by
+        # the calibration spine to pair confidence with outcome.
+        self.last_confidence = None
+        self.last_entropy_reading = None
+        # Calibration spine (core.calibration). Populated by main.py
+        # lifespan; pairs confidence with realized outcome, measures
+        # Brier/ECE, and re-fits τ/weights/λ in idle phase 2.7c.
+        self.calibration_tracker = None
+        # Holds the turn's last confidence reading until the turn's
+        # outcome is known (then recorded + cleared). Per-turn, not
+        # cross-turn — set at the confidence-compute site.
+        self._calib_pending = None
 
 class GhostAgent:
     def __init__(self, context: GhostContext):
@@ -1174,6 +1187,8 @@ class GhostAgent:
     _WORKSPACE_NARRATIVE_COOLDOWN = 3600  # 60 min between workspace-narrative consolidations (phase 2.9)
     _STALE_QUESTIONS_COOLDOWN = 7200  # 2 h between stale open-question surfacings (phase 2.8b)
     _ROUTER_TRAIN_COOLDOWN = 10800   # 3 h between router-classifier retrains (phase 2.7b)
+    _CALIB_REFIT_COOLDOWN = 3600  # 60 min between calibration refits (phase 2.7c)
+    _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
     # already prevents same-batch refire, but a journal write that
@@ -1212,6 +1227,10 @@ class GhostAgent:
             self._last_stale_questions_at = datetime.datetime.min
         if not hasattr(self, '_last_router_train_at'):
             self._last_router_train_at = datetime.datetime.min
+        if not hasattr(self, '_last_calib_refit_at'):
+            self._last_calib_refit_at = datetime.datetime.min
+        if not hasattr(self, '_last_autoadvance_at'):
+            self._last_autoadvance_at = datetime.datetime.min
         if not hasattr(self, '_last_selfplay_at'):
             self._last_selfplay_at = datetime.datetime.min
         # Adaptive self-play cooldown (curiosity-driven). Starts at the
@@ -1582,6 +1601,128 @@ class GhostAgent:
                         logger.warning(f"Router retrain phase failed: {e}")
                     finally:
                         self._last_router_train_at = datetime.datetime.now()
+
+        # Phase 2.7c: Calibration refit (roadmap phase 2.5). Re-fits the
+        # confidence threshold τ + entropy/competence weights + the
+        # verbalised-uncertainty penalty λ on the accumulated
+        # (confidence, outcome) log, minimising Brier, and hot-swaps the
+        # result into the live CompositeConfidence — so the agent's
+        # "I'm 80% sure" becomes empirically calibrated without a
+        # restart. CPU-only, same idle window + cooldown-anchor
+        # discipline as the PRM/router phases (anchor advanced BEFORE the
+        # work AND in finally so a mid-fit crash can't refire every tick).
+        # No-op unless --enable-metacog produced confidence readings AND
+        # the bail floors (≥40 samples, both outcome classes) are met.
+        if 900 < idle_secs <= 3600:
+            _calib_cd_override = getattr(
+                getattr(ctx, 'args', None), 'calib_refit_cooldown', None,
+            )
+            if not isinstance(_calib_cd_override, (int, float)):
+                _calib_cd_override = None
+            _calib_cooldown = (
+                float(_calib_cd_override) if _calib_cd_override
+                else float(self._CALIB_REFIT_COOLDOWN)
+            )
+            since_last_calib = (
+                datetime.datetime.now() - self._last_calib_refit_at
+            ).total_seconds()
+            tracker = getattr(ctx, 'calibration_tracker', None)
+            from .calibration import CalibrationTracker as _CalibTrackerCls
+            if (since_last_calib >= _calib_cooldown
+                    and isinstance(tracker, _CalibTrackerCls)):
+                self._last_calib_refit_at = datetime.datetime.now()
+                try:
+                    params = await asyncio.to_thread(tracker.fit)
+                    if params is not None:
+                        from .metacog_log import (
+                            emit as _mc_emit, Subsystem as _mc_ss,
+                        )
+                        mc = getattr(ctx, 'metacog', None)
+                        if mc is not None and getattr(mc, 'confidence', None) is not None:
+                            mc.confidence.apply_fitted(params)
+                        _mc_emit(
+                            _mc_ss.CALIB, refit="ok",
+                            threshold=params.threshold,
+                            w_entropy=params.w_entropy,
+                            lam=params.lambda_uncertainty,
+                            brier=params.brier, n=params.n_samples,
+                        )
+                    else:
+                        logger.debug("calibration refit produced no fit (thin/single-class)")
+                except Exception as e:
+                    logger.warning(f"Calibration refit phase failed: {e}")
+                finally:
+                    self._last_calib_refit_at = datetime.datetime.now()
+
+        # Phase 2.95: Autonomous project advancement (opt-in
+        # --autoadvance-idle). The project autoadvancer existed but was
+        # only ever reachable via the manage_projects tool or the HTTP
+        # /advance route — NO idle phase ever called it, so "the
+        # self-advancing research loop" never actually advanced on its
+        # own. This phase picks one ACTIVE project and runs a single
+        # advance_once tick on it, on the SAME hard rails the tool uses
+        # (per-project step/runtime/tool-call budgets, human gates,
+        # contradiction routing) plus a code generator so coding tasks
+        # produce real code rather than the old no-op stub. Strictly
+        # opt-in and one project / one tick per cooldown, so a runaway
+        # is impossible. Anchor-before-await + finally, same as the
+        # other phases.
+        if (900 < idle_secs <= 3600
+                and getattr(getattr(ctx, 'args', None), 'autoadvance_idle', False) is True):
+            since_last_aa = (datetime.datetime.now() - self._last_autoadvance_at).total_seconds()
+            store = getattr(ctx, 'project_store', None)
+            if since_last_aa >= self._AUTOADVANCE_COOLDOWN and store is not None:
+                self._last_autoadvance_at = datetime.datetime.now()
+                try:
+                    actives = await asyncio.to_thread(store.list_projects, "ACTIVE")
+                    if actives:
+                        target = actives[0]  # one project per tick (bounded)
+                        pid = target.get("id")
+                        from .project_advancer import advance_once as _advance_once
+
+                        async def _aa_tool_runner(name, targs):
+                            try:
+                                from ..tools.registry import get_available_tools
+                                tmap = get_available_tools(ctx)
+                            except Exception:
+                                tmap = None
+                            handler = (tmap or {}).get(name)
+                            if not handler:
+                                return f"ERROR: tool {name} unavailable"
+                            return await handler(**targs)
+
+                        async def _aa_code_gen(description):
+                            _r = await ctx.llm_client.chat_completion({
+                                "model": getattr(ctx.args, 'model', 'default'),
+                                "messages": [{"role": "user", "content": (
+                                    "Write a SINGLE shell command (you may invoke "
+                                    "python3 -c). Output ONLY the command — no "
+                                    "explanation, no markdown fences.\n\nTASK: "
+                                    + str(description)[:500])}],
+                                "temperature": 0.2, "max_tokens": 1024, "stream": False,
+                            })
+                            out = ((_r or {}).get("choices", [{}])[0]
+                                   .get("message", {}).get("content", "") or "").strip()
+                            if out.startswith("```"):
+                                out = out.strip("`")
+                                if "\n" in out:
+                                    out = out.split("\n", 1)[1]
+                            return out.strip()
+
+                        result = await _advance_once(
+                            ctx, pid, tool_runner=_aa_tool_runner,
+                            code_generator=_aa_code_gen,
+                        )
+                        pretty_log(
+                            "Autoadvance",
+                            f"project={str(pid)[:8]} task={str(result.task_id)[:8]} "
+                            f"{result.classification}: {result.summary[:80]}",
+                            icon=Icons.BRAIN_PLAN,
+                        )
+                except Exception as e:
+                    logger.warning(f"Autoadvance phase failed: {e}")
+                finally:
+                    self._last_autoadvance_at = datetime.datetime.now()
 
         # Phase 2.8: Selfhood narrative consolidation (15-60 min idle).
         # Re-generates the agent's first-person running diary from the
@@ -2604,12 +2745,38 @@ class GhostAgent:
                             t["function"]["name"] for t in _MCTS_TD
                             if t.get("function", {}).get("name")
                         ]
+                        # Build the PRM prefix-state so the trained PRM
+                        # fast path engages (was dead: prm_state was never
+                        # constructed, so even a trained PRM never scored a
+                        # live candidate — MCTS always paid 3-4 worker-LLM
+                        # simulation round-trips). This is turn start, so
+                        # steps/failures are 0; pending_count/plan_depth are
+                        # pinned to the SAME neutral constants (1/1) the PRM
+                        # was trained against (prm.labels._build_state_for_step
+                        # / frontier_selection._seed_state_action) to avoid
+                        # train/serve skew. When no trained PRM is loaded the
+                        # MCTS gate falls back to LLM simulation automatically.
+                        _prm_state = None
+                        try:
+                            from ..prm.features import PlanState as _PRMPlanState
+                            _prm_state = _PRMPlanState(
+                                user_request=last_user_content,
+                                steps_so_far=0,
+                                failures_so_far=0,
+                                pending_count=1,
+                                plan_depth=1,
+                                tools_used_this_turn=(),
+                                tools_failed_this_turn=(),
+                            )
+                        except Exception:
+                            _prm_state = None
                         _winner = await asyncio.wait_for(
                             _mcts.select_best_action(
                                 task=last_user_content,
                                 plan_state="(turn start — no actions taken yet)",
                                 available_tools=_tool_names,
                                 context=working_memory_context or "",
+                                prm_state=_prm_state,
                             ),
                             timeout=75.0,
                         )
@@ -3007,9 +3174,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # when no tuned file exists. (Was write-only before.)
                         from ..optim.loader import tuned_instruction as _tuned_instruction
                         _tuned_plan = _tuned_instruction("planning.decompose", "")
+                        # Also surface the tuned tool-selection instruction:
+                        # the planner's next_action_id / required_tool IS the
+                        # tool-selection decision, so this is its natural
+                        # read-site. tool_selection.pick was previously
+                        # tuned-but-never-read (GEPA wrote it, nothing loaded it).
+                        _tuned_toolsel = _tuned_instruction("tool_selection.pick", "")
+                        _tuned_prefix = "\n\n".join(
+                            t for t in (_tuned_plan, _tuned_toolsel) if t
+                        )
                         _planner_system = (
-                            f"{_tuned_plan}\n\n{PLANNING_SYSTEM_PROMPT}"
-                            if _tuned_plan else PLANNING_SYSTEM_PROMPT
+                            f"{_tuned_prefix}\n\n{PLANNING_SYSTEM_PROMPT}"
+                            if _tuned_prefix else PLANNING_SYSTEM_PROMPT
                         )
                         planner_messages = [
                             {"role": "system", "content": _planner_system},
@@ -3520,9 +3696,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # the post-stream composite-confidence check.
                             _mc_for_stream = getattr(self.context, "metacog", None)
                             _entropy_tracker = None
+                            # Create the tracker whenever metacog is enabled —
+                            # NOT gated on logprobs_enabled. The post-stream
+                            # confidence calc is logprob-OPTIONAL (phase 2.5):
+                            # token entropy contributes when it flows, but
+                            # competence + verbalised-uncertainty drive the
+                            # score when the per-token logprob stream is sparse
+                            # (speculative decoding / MTP) or disabled. Keeping
+                            # the tracker present means that calc always runs
+                            # and calibration collects a sample every turn.
                             if (_mc_for_stream is not None
-                                    and getattr(_mc_for_stream, "enabled", False)
-                                    and getattr(_mc_for_stream, "logprobs_enabled", False)):
+                                    and getattr(_mc_for_stream, "enabled", False)):
                                 try:
                                     from .entropy import EntropyTracker
                                     _entropy_tracker = EntropyTracker(window=32, top_k=5)
@@ -3717,16 +3901,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             if _held_done_chunk is not None:
                                 yield _held_done_chunk
 
-                            # Metacog: stash the final entropy reading on
-                            # the context so the post-turn confidence /
-                            # arbiter step can fuse it with the per-domain
-                            # competence prior. Only stash when we observed
-                            # at least one token's logprobs.
+                            # Metacog: compute this turn's composite confidence
+                            # (logprob-OPTIONAL — phase 2.5). The entropy term
+                            # is used when the window observed tokens; otherwise
+                            # it is neutral (0.5) and competence + verbalised
+                            # uncertainty drive the score. Runs on every metacog
+                            # turn so calibration always records a sample, even
+                            # on speculative-decoding / no-logprobs upstreams.
                             if _entropy_tracker is not None:
                                 try:
                                     _reading = _entropy_tracker.reading()
-                                    if _reading.n > 0:
-                                        self.context.last_entropy_reading = _reading
+                                    if _reading is not None:
+                                        if _reading.n > 0:
+                                            self.context.last_entropy_reading = _reading
                                         # Composite confidence (roadmap
                                         # phase 2.4). Fuse entropy with the
                                         # per-domain competence prior for
@@ -3747,12 +3934,38 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 _dom = _domain_for_tool(fname or "")
                                                 _p = _mc_conf.competence.estimate(_dom, fname or None)
                                                 _n = _mc_conf.competence.observations(_dom, fname or None)
+                                                # Verbalised-uncertainty pressure
+                                                # (core.uncertainty) — fuses the
+                                                # "agent said it was unsure" track
+                                                # into the composite. No-op until
+                                                # the calibration spine fits λ > 0.
+                                                _upress = 0.0
+                                                try:
+                                                    _utk = getattr(self.context, "uncertainty_tracker", None)
+                                                    if _utk is not None:
+                                                        _upress = _utk.pressure()
+                                                except Exception:
+                                                    _upress = 0.0
+                                                # Entropy term is neutral (0.5)
+                                                # when the window is empty, so
+                                                # competence + uncertainty drive
+                                                # the score on logprob-starved
+                                                # upstreams instead of suppressing
+                                                # the whole reading.
+                                                _norm = _reading.norm if _reading.n > 0 else 0.5
                                                 _cr = _mc_conf.confidence.score(
-                                                    normalised_entropy=_reading.norm,
+                                                    normalised_entropy=_norm,
                                                     competence_p_success=_p,
                                                     n_observations=_n,
+                                                    uncertainty_pressure=_upress,
                                                 )
                                                 self.context.last_confidence = _cr
+                                                # Stash for the turn-end calibration
+                                                # record (paired with the realized
+                                                # outcome). Last reading of the turn
+                                                # wins — that's the one we score
+                                                # against the turn's outcome.
+                                                self.context._calib_pending = _cr
                                                 # Push the reading into the
                                                 # bundle so the mid-turn
                                                 # arbiter gate (consulted
@@ -3800,6 +4013,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                     n=_n,
                                                     domain=_dom,
                                                     tool=fname or None,
+                                                    ent_obs=_reading.n,
                                                     threshold=_cr.threshold,
                                                 )
                                             except Exception as _cex:
@@ -6500,6 +6714,126 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     except Exception:
                         pass
 
+                # Calibration spine (roadmap phase 2.5): pair THIS turn's
+                # last composite-confidence reading with the realized
+                # outcome (clean turn → 1.0; any structural tool failure
+                # → 0.0). This is the loop that finally makes "the agent
+                # is 80% confident" mean the turn succeeds ~80% of the
+                # time — the JSONL it appends feeds the idle Brier/ECE
+                # refit (phase 2.7c). Runs on BOTH clean and failed turns
+                # (outside the credit gate above) so both outcome classes
+                # are represented. `_calib_pending` is set only when a
+                # reading was computed this turn, so we never record a
+                # stale cross-turn pair.
+                try:
+                    _ct = getattr(self.context, "calibration_tracker", None)
+                    _pending = getattr(self.context, "_calib_pending", None)
+                    # Finalization fallback (the load-bearing path in practice):
+                    # most turns never enter the streaming
+                    # is_final_generation+stream_response branch where the
+                    # entropy/confidence path lives, so _pending is usually None
+                    # here. Compute the reading NOW — logprob-optional: neutral
+                    # entropy term, competence + verbalised uncertainty drive it
+                    # — so calibration records on EVERY full-loop metacog turn
+                    # (and the arbiter bundle gets a reading via record_confidence).
+                    if _pending is None and _ct is not None:
+                        try:
+                            _mc = getattr(self.context, "metacog", None)
+                            if (_mc is not None and getattr(_mc, "enabled", False)
+                                    and getattr(_mc, "confidence", None) is not None
+                                    and getattr(_mc, "competence", None) is not None):
+                                _last_tool = ""
+                                for _t in reversed(tools_run_this_turn or []):
+                                    if isinstance(_t, dict) and _t.get("name"):
+                                        _last_tool = _t["name"]
+                                        break
+                                from .metacog import _domain_for_tool
+                                _dom = _domain_for_tool(_last_tool or "")
+                                _p = _mc.competence.estimate(_dom, _last_tool or None)
+                                _n = _mc.competence.observations(_dom, _last_tool or None)
+                                _upress = 0.0
+                                try:
+                                    _ut = getattr(self.context, "uncertainty_tracker", None)
+                                    if _ut is not None:
+                                        _upress = _ut.pressure()
+                                except Exception:
+                                    _upress = 0.0
+                                _pending = _mc.confidence.score(
+                                    normalised_entropy=0.5,
+                                    competence_p_success=_p,
+                                    n_observations=_n,
+                                    uncertainty_pressure=_upress,
+                                )
+                                self.context.last_confidence = _pending
+                                try:
+                                    _mc.record_confidence(_pending)
+                                    _mc.count(confidence_total=True,
+                                              confidence_below=_pending.below_threshold)
+                                except Exception:
+                                    pass
+                                from .metacog_log import (
+                                    emit as _mc_emit, Subsystem as _mc_ss,
+                                    LEVEL_INFO, LEVEL_DEBUG,
+                                )
+                                _mc_emit(
+                                    _mc_ss.CONF,
+                                    level=(LEVEL_INFO if _pending.below_threshold else LEVEL_DEBUG),
+                                    below=_pending.below_threshold, C=_pending.composite,
+                                    entropy=_pending.entropy_component,
+                                    competence=_pending.competence_component,
+                                    n=_n, domain=_dom, tool=_last_tool or None,
+                                    src="finalize", threshold=_pending.threshold,
+                                )
+                        except Exception as _cfx:
+                            logger.debug("finalize confidence compute failed: %s", _cfx)
+                    if _ct is not None and _pending is not None:
+                        # Outcome from the signals available THIS turn: a
+                        # structural tool failure OR a verifier REFUTED verdict
+                        # (≥0.7 → verifier_backfill[0]=="failed") is a negative.
+                        # Without a real negative source, free-form chat turns
+                        # are almost all "clean" → single-class → the fit bails;
+                        # the verifier verdict is what gives calibration its
+                        # "confidently wrong" examples.
+                        _verifier_failed = bool(
+                            verifier_backfill and verifier_backfill[0] == "failed"
+                        )
+                        _calib_outcome = (
+                            0.0 if (execution_failure_count > 0 or _verifier_failed)
+                            else 1.0
+                        )
+                        await asyncio.to_thread(
+                            _ct.record,
+                            composite=_pending.composite,
+                            entropy_component=_pending.entropy_component,
+                            competence_component=_pending.competence_component,
+                            uncertainty_pressure=getattr(_pending, "uncertainty_pressure", 0.0),
+                            outcome=_calib_outcome,
+                        )
+                        # Stash the components keyed by this response's
+                        # fingerprint so a NEXT-turn user-correction can record
+                        # a (C, 0.0) negative for this turn — the strongest
+                        # "confidently wrong" calibration signal (the user is
+                        # the cheapest supervisor for free-form chat).
+                        try:
+                            from collections import OrderedDict as _OD
+                            _cc = getattr(self.context, "_recent_calib_for_correction", None)
+                            if _cc is None:
+                                _cc = _OD()
+                                self.context._recent_calib_for_correction = _cc
+                            _cc[self._response_fingerprint(final_ai_content or "")] = {
+                                "composite": _pending.composite,
+                                "entropy_component": _pending.entropy_component,
+                                "competence_component": _pending.competence_component,
+                                "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
+                            }
+                            while len(_cc) > 32:
+                                _cc.popitem(last=False)
+                        except Exception:
+                            pass
+                        self.context._calib_pending = None
+                except Exception as _calx:
+                    logger.debug("calibration record failed: %s", _calx)
+
                 # Surface critical unknowns/assumptions tracked during this
                 # turn. The UncertaintyTracker is a shared per-process
                 # instance — appending the risk summary lets the user see
@@ -6585,6 +6919,40 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         tracker.reset()
                 except Exception as e:
                     logger.debug(f"Uncertainty surfacing skipped: {e}")
+
+                # Value-alignment gate (opt-in --principle-gate). If the
+                # agent has authored operating principles (selfhood/values),
+                # an independent LLM check flags a response that contradicts
+                # one and appends a brief self-note — turning the principles
+                # from prompt decoration into an actual behavioural check.
+                # Default off (adds one LLM call to final turns); never
+                # blocks, only annotates.
+                try:
+                    if (getattr(getattr(self.context, "args", None), "principle_gate", False) is True
+                            and final_ai_content):
+                        _sm = getattr(self.context, "self_model", None)
+                        if _sm is not None and getattr(_sm, "enabled", False) and _sm.principles():
+                            async def _pg_critique(p):
+                                _r = await self.context.llm_client.chat_completion({
+                                    "model": self.context.args.model,
+                                    "messages": [{"role": "user", "content": p}],
+                                    "temperature": 0.0, "max_tokens": 512, "stream": False,
+                                })
+                                return ((_r or {}).get("choices", [{}])[0]
+                                        .get("message", {}).get("content", "") or "")
+                            _aligned, _note = await _sm.evaluate_response_alignment(
+                                final_ai_content, critique_fn=_pg_critique,
+                            )
+                            if not _aligned:
+                                final_ai_content = (
+                                    f"{final_ai_content}\n\n---\n"
+                                    f"**Self-check (principle):** {_note}"
+                                )
+                                pretty_log("Principle Gate",
+                                           f"response flagged: {_note[:80]}",
+                                           icon=Icons.SHIELD)
+                except Exception as e:
+                    logger.debug(f"principle gate skipped: {e}")
 
                 # Chat→project promotion suggestion (advisory; previously unwired).
                 # When a free-chat session accumulates enough turns / sandbox
@@ -6766,6 +7134,40 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         while len(cache) > 32:
             cache.popitem(last=False)
 
+    def _run_prm_online_update(self, scorer, traj) -> None:
+        """Apply a guarded online PRM step from one promoted-FAILED
+        trajectory. Runs in a worker thread (CPU-only). The promoted
+        trajectory is the new (negative) sample; a slice of recent
+        trajectories is the holdout the update must not regress on. All
+        best-effort — never raises into the scheduling task."""
+        try:
+            from ..prm.trainer import samples_to_xy
+            new_X, new_y = samples_to_xy([traj])
+            if not new_X:
+                return
+            holdout_X, holdout_y = [], []
+            collector = getattr(self.context, "trajectory_collector", None)
+            if collector is not None:
+                try:
+                    recent = list(collector.iter_trajectories())[-50:]
+                    holdout_X, holdout_y = samples_to_xy(recent)
+                except Exception:
+                    holdout_X, holdout_y = [], []
+            updated = scorer.online_update(
+                new_X, new_y, holdout_X=holdout_X, holdout_y=holdout_y,
+            )
+            if updated:
+                pretty_log(
+                    "PRM Online",
+                    f"nudged from user-correction "
+                    f"(traj={(traj.id or '')[:8]}, {len(new_X)} step samples)",
+                    icon=Icons.BRAIN_AIM,
+                )
+        except Exception as e:
+            logger.debug(
+                "PRM online update failed: %s: %s", type(e).__name__, e,
+            )
+
     def _maybe_promote_prior_turn_via_user_correction(
         self,
         messages,
@@ -6914,6 +7316,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         # doesn't re-fire on the same prior turn.
         cache.pop(fp, None)
 
+        # Calibration negative (phase 2.5): a user-correction is the
+        # strongest "confidently wrong" signal for free-form chat — the
+        # user is the cheapest supervisor. If the corrected turn produced
+        # a confidence reading (stashed by the turn-end calib block under
+        # the same response fingerprint), record (C, 0.0) so the
+        # calibration fit learns from overconfident misses that
+        # entropy/competence alone tend to rate as clean.
+        try:
+            _cc = getattr(ctx, "_recent_calib_for_correction", None)
+            _ct = getattr(ctx, "calibration_tracker", None)
+            if _cc is not None and _ct is not None and fp in _cc:
+                _comp = _cc.pop(fp)
+                _ct.record(outcome=0.0, **_comp)
+        except Exception as _cnx:
+            logger.debug("calibration correction-negative skipped: %s", _cnx)
+
         # Scrub any lessons the just-failed trajectory produced
         # before the user could push back. The dominant case is the
         # Perfection-Protocol writing an "Optimization Analysis"
@@ -6938,6 +7356,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     "lesson retraction skipped: %s: %s",
                     type(e).__name__, e,
                 )
+
+        # Low-latency online PRM update (opt-in via --prm-online-update).
+        # A user-correction-promoted FAILED trajectory is a high-signal
+        # negative; nudging the PRM now closes the hours-long gap until
+        # the next idle batch retrain (phase 2.7). Fire-and-forget in a
+        # thread (CPU-only) so the user turn never blocks; the update is
+        # guarded inside PRMScorer.online_update (clone + holdout BCE
+        # check) so it can only refine, never destabilise, the model.
+        try:
+            if getattr(getattr(ctx, "args", None), "prm_online_update", False) is True:
+                from ..prm.scorer import PRMScorer as _PRMScorer
+                scorer = getattr(ctx, "prm_scorer", None)
+                if isinstance(scorer, _PRMScorer) and scorer.has_model:
+                    loop2 = asyncio.get_running_loop()
+                    loop2.create_task(asyncio.to_thread(
+                        self._run_prm_online_update, scorer, traj,
+                    ))
+        except Exception as e:
+            logger.debug(
+                "PRM online update schedule skipped: %s: %s",
+                type(e).__name__, e,
+            )
 
         # Schedule single-trajectory reflection. Fire-and-forget; the
         # current user turn must not block on the LLM critique.

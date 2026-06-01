@@ -267,6 +267,47 @@ probe wrapper) `tests/test_run_selfhood_probes_script.py`.
 * **Prefix-utility tracker** — `detect_referenced_experiences()` + per-experience counter in `reference_counts.json`. A concrete signal for "this memory shaped the reply" that the next selfhood phase can use as a relevance prior.
 * **Probe wrapper script** — `scripts/run_selfhood_probes.sh` is the cron-friendly entry point. Writes dated summaries under `$GHOST_HOME/system/selfhood/probes/`.
 
+## Recall reference-count prior
+
+`reference_counts.json` (which experiences the agent actually echoed in a
+past reply) used to be **written but never read** — a dead loop.
+`search_my_past` now folds it into the relevance score as
+`idf_overlap × (1 + log1p(reference_count))`, so memories that have
+genuinely paid off before rank higher than ones that merely share
+vocabulary — the relevance prior the design always intended. Covered by
+`tests/test_quick_wins.py`.
+
+## Operating principles (normative substrate)
+
+Selfhood originally tracked only *episodic* continuity. The functional
+tests found that mood / open-questions feed only the wake-up prefix
+string and steer nothing, and that qualitative self-reports are
+paraphrase-unstable (the +0.40 confabulation gap) — because there was no
+*stable* internal state to anchor to. `selfhood/values.py` adds that
+missing normative layer:
+
+* **`ValuesThread`** — a small bounded list of agent-authored operating
+  principles ("I verify before asserting", "I prefer reversible
+  actions"), JSON-persisted with the same atomic-write / corrupt-recovery
+  discipline as `SelfStateThread` (`$GHOST_HOME/system/selfhood/
+  values.json`, capped at 12, most-recent-wins).
+* **Authoring** — the `self_state` tool gains an action
+  `note_principle`; the agent writes its own principles, just as it
+  writes open questions and mood.
+* **Surfacing** — principles render high in the wake-up prefix (right
+  after the narrative, *above* episodic recall — deliberately, since the
+  functional test showed the model favours concrete recent experiences
+  over material buried lower). So they are in-context every turn and
+  shape generation: the move from cosmetic to behaviour-influencing.
+* **Gate (opt-in `--principle-gate`)** — `SelfModel.
+  evaluate_response_alignment` runs an independent LLM check after a
+  final response and appends a self-note when the response contradicts a
+  stated principle. Never blocks (annotates only); fail-open. Unlike
+  mood, principles are explicit and checkable — they give the
+  confabulation-prone self-reports a stable referent.
+
+Covered by `tests/test_values_substrate.py`.
+
 ## Honest limitations
 
 * **The agent behaves consistent with continuous selfhood.** It

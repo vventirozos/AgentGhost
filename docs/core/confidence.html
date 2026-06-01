@@ -14,6 +14,7 @@
     <h3>Metacognition uplift</h3>
     <a href="entropy.html">entropy</a>
     <a class="current" href="confidence.html">confidence</a>
+    <a href="calibration.html">calibration</a>
     <a href="triggers.html">triggers</a>
     <a href="arbiter.html">arbiter</a>
     <a href="../memory/competence.html">memory/competence</a>
@@ -52,11 +53,22 @@ if r.below_threshold:
       <tr><td><code>competence_component</code></td><td>Post-shrinkage <code>p</code> — the effective domain prior used in the fuse.</td></tr>
       <tr><td><code>threshold</code></td><td>Echoed for ergonomics.</td></tr>
       <tr><td><code>below_threshold</code></td><td>Precomputed decision the caller acts on.</td></tr>
+      <tr><td><code>uncertainty_pressure</code></td><td>The verbalised-uncertainty signal that fed this reading (0 = nothing flagged → 1 = heavy unresolved high-impact unknowns). Recorded by the <a href="calibration.html">calibration spine</a>.</td></tr>
     </tbody>
   </table>
 
   <h2>Why additive, not geometric?</h2>
   <p>The two signals are asymmetric: entropy is per-generation; competence is historical. Weighted additive lets operators tune the balance per deployment — an edge build with a thin model raises <code>w_c</code> because token entropy is noisier there.</p>
+
+  <h2>Fusing the verbalised-uncertainty track</h2>
+  <p>
+    Historically the objective score (entropy + competence) and the agent's own "I'm not sure" flags (<a href="uncertainty.html">core.uncertainty</a>) were disjoint. <code>score()</code> now accepts <code>uncertainty_pressure ∈ [0,1]</code> (from <code>UncertaintyTracker.pressure()</code>) and applies a multiplicative penalty <code>× (1 − λ·pressure)</code>. The default <code>λ = 0</code> is a no-op, so this is byte-for-byte back-compatible — the <a href="calibration.html">calibration spine</a> only raises <code>λ</code> if the agent's hedges actually predict failure on logged turns.
+  </p>
+
+  <h2>Self-calibration</h2>
+  <p>
+    <code>apply_fitted(params)</code> hot-swaps the threshold τ, weights, and λ from a <a href="calibration.html">calibration fit</a> — at startup (loading a persisted fit) and from the idle refit phase (2.7c). A long-running agent's confidence becomes empirically calibrated against realized outcomes instead of the hardcoded τ = 0.55 / 0.5–0.5 defaults, with no restart.
+  </p>
 </main>
 </body>
 </html>

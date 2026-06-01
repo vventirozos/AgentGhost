@@ -52,6 +52,7 @@
 
   <h3>Parameter healing</h3>
   <p>Mirrors the kwarg-aliasing in <code>tool_generate_image</code>. Self-play logs show the LLM regularly hallucinates parameter names (<code>body</code>, <code>content</code>, <code>text</code>, <code>report_title</code>, <code>name</code>). The tool accepts all of them rather than failing hard. HTML-escapes <code>title</code>, <code>subtitle</code>, and <code>author</code> so a stray <code>&lt;</code> can't break the document.</p>
+  <p><strong>JSON-string <code>sections</code>.</strong> The model — or the XML tool-call parser, which stores a <code>&lt;parameter name="sections"&gt;[…]&lt;/parameter&gt;</code> body verbatim — frequently passes <code>sections</code> as a JSON-encoded <em>string</em> rather than a real list (e.g. <code>sections='[{"heading": "Intro", "body": "…"}]'</code>). <code>_normalise_sections</code> now detects a string starting with <code>[</code> or <code>{</code>, <code>json.loads</code>es it, and uses the decoded list/dict. Without this the whole JSON blob collapsed into a single section body, producing a 1-page report of raw JSON — which made the agent retry the call dozens of times trying to "add the missing sections."</p>
 
   <h3>Return value</h3>
   <pre>SUCCESS: PDF report generated (N page(s), KB.K KB). DO NOT CALL THIS TOOL

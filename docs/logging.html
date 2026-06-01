@@ -103,6 +103,19 @@
     console handler (file only). <code>NO_COLOR</code> / a non-TTY sink disables ANSI so piped logs
     stay clean.
   </div>
+
+  <h2>Stream redaction (anonymity)</h2>
+  <p>
+    The operator monitors this stream live, which made it the single largest cleartext sink in the
+    system — redaction historically ran only at the JSONL trajectory boundary, never at the log
+    boundary, so secrets, <code>.onion</code> addresses, full URLs, and absolute home paths reached
+    the console verbatim. <code>pretty_log</code> now routes content through
+    <code>distill.redact.redact_text</code> before rendering (post-truncation, so the regex cost is
+    bounded to the visible line), and the WARNING+ auto-render path inherits it. On by default;
+    <code>--no-redact-logs</code> opts out for debugging. <code>redact_text</code> only rewrites
+    known sensitive patterns, so ordinary log lines stay byte-identical and readable. Covered by
+    <code>tests/test_quick_wins.py</code>.
+  </p>
 </main>
 </body>
 </html>

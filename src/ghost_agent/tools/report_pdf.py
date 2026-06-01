@@ -33,6 +33,7 @@ tool.
 
 import asyncio
 import html
+import json
 import re
 import uuid
 from pathlib import Path
@@ -74,6 +75,25 @@ def _normalise_sections(sections: Any, body: Any, content: Any) -> list[dict]:
     sometimes passes a single string when it should have passed a list.
     Mirrors the healing block at the top of ``tool_generate_image``.
     """
+    # The section list frequently arrives as a JSON-encoded *string* rather
+    # than a real list — e.g. ``sections='[{"heading": "Intro", "body": ...}]'``.
+    # This happens when the model stringifies the argument, or when the XML
+    # tool-call parser stores a ``<parameter name="sections">[...]</parameter>``
+    # body verbatim. Without this decode the call collapses into ONE section
+    # whose body is the raw JSON text — the agent then sees a 1-page report and
+    # retries the call forever. Recover the structure before anything else.
+    if isinstance(sections, str):
+        stripped = sections.strip()
+        if stripped[:1] in ("[", "{"):
+            try:
+                parsed = json.loads(stripped)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, list):
+                sections = parsed
+            elif isinstance(parsed, dict):
+                sections = [parsed]
+
     if isinstance(sections, list) and sections:
         out = []
         for i, s in enumerate(sections):

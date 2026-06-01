@@ -44,6 +44,7 @@ def build_wakeup_prefix(
     autobio: Optional[AutobiographicalMemory],
     state: Optional[SelfStateThread],
     narrative: Optional[str],
+    values: Optional[object] = None,
     recent_experiences_n: int = 3,
     query: Optional[str] = None,
     relevant_experiences_n: int = 3,
@@ -53,13 +54,17 @@ def build_wakeup_prefix(
 
     Order is deliberate:
       1. Narrative ("the running diary I've been keeping") — sets voice
-      2. State thread (open questions, unfinished, mood) — load-bearing
+      2. Operating principles (the normative "how I work" substrate) —
+         placed high so they aren't buried under episodic recall (the
+         functional test found the model favours concrete recent
+         experiences over abstract material rendered lower down).
+      3. State thread (open questions, unfinished, mood) — load-bearing
          continuity material
-      3. Relevant past (when ``query`` is given) — experiences that match
+      4. Relevant past (when ``query`` is given) — experiences that match
          what the user is asking *now*, not just the most recent ones.
          This is what turns recall from a sliding window into genuine
          "I remember the time I did something like this".
-      4. Recent experiences (most recent N) — episodic flavour
+      5. Recent experiences (most recent N) — episodic flavour
 
     Empty when all sources are empty; the caller is expected to skip
     prefix injection in that case rather than splicing a blank block."""
@@ -69,6 +74,14 @@ def build_wakeup_prefix(
     if narrative and narrative.strip():
         parts.append("Where I last left off (my running first-person diary):")
         parts.append(narrative.strip())
+
+    if values is not None:
+        try:
+            values_block = values.format_as_prefix()
+        except Exception:
+            values_block = ""
+        if values_block:
+            parts.append(values_block)
 
     if state is not None:
         state_block = state.format_as_prefix()

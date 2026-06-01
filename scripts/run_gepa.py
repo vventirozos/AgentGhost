@@ -52,6 +52,10 @@ async def main() -> int:
                         help="Where to write the tuned instruction JSON. Defaults to $GHOST_HOME/system/optim/<signature>.json")
     parser.add_argument("--max-examples", type=int, default=200)
     parser.add_argument("--eval-fraction", type=float, default=0.2)
+    parser.add_argument("--ab-gate", action="store_true", default=False,
+                        help="After optimizing, A/B the candidate vs the baseline on the eval split and only KEEP the tuned file if it beats the baseline by --ab-min-delta. Otherwise the file is removed so an unproven prompt never supersedes the baseline at inference (compare_prompts was previously unwired).")
+    parser.add_argument("--ab-min-delta", type=float, default=0.02,
+                        help="Minimum eval pass-rate improvement for --ab-gate to ship the candidate. Default 0.02.")
     args = parser.parse_args()
 
     # Resolve default paths
@@ -117,6 +121,54 @@ async def main() -> int:
     print(f"optimized instruction written to {output_path}")
     print(f"baseline: {result.baseline_instruction[:120]}...")
     print(f"optimized: {result.optimized_instruction[:120]}...")
+
+    # A/B ship-gate (opt-in): only let the tuned prompt supersede the
+    # baseline at inference if it actually wins on the eval split. The
+    # compare_prompts harness existed but had no caller — GEPA output
+    # shipped unconditionally. This closes that gap.
+    if args.ab_gate:
+        from ghost_agent.optim.ab_eval import compare_prompts
+        import json as _json
+
+        async def _ab_runner(payload):
+            instruction = payload.get("prompt", "")
+            inputs = payload.get("inputs") or {}
+            user_req = (
+                inputs.get("user_request")
+                or next((str(v) for v in inputs.values() if v), "")
+                or _json.dumps(inputs, default=str)
+            )
+            res = await llm_client.chat_completion({
+                "model": args.model,
+                "messages": [
+                    {"role": "system", "content": instruction},
+                    {"role": "user", "content": str(user_req)},
+                ],
+                "temperature": 0.0, "max_tokens": 1024, "stream": False,
+            })
+            got = ((res or {}).get("choices", [{}])[0]
+                   .get("message", {}).get("content", "") or "")
+            want = str((payload.get("expected_output") or {})
+                       .get("final_response", "")).strip().lower()
+            passed = bool(want and want[:120] in got.strip().lower())
+            return {"passed": passed, "output": got}
+
+        cmp = await compare_prompts(
+            result.baseline_instruction, result.optimized_instruction,
+            eval_set, _ab_runner, min_delta=args.ab_min_delta,
+        )
+        print(f"A/B: baseline={cmp.baseline_pass_rate:.2f} "
+              f"candidate={cmp.candidate_pass_rate:.2f} "
+              f"delta={cmp.delta:+.2f} ships={cmp.candidate_ships}")
+        if not cmp.candidate_ships:
+            try:
+                output_path.unlink()
+            except FileNotFoundError:
+                pass
+            print(f"A/B gate REJECTED the candidate (delta {cmp.delta:+.2f} "
+                  f"≤ {args.ab_min_delta}); removed {output_path} — baseline stands.")
+            return 1
+        print("A/B gate PASSED — candidate shipped.")
     return 0
 
 

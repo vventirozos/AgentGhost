@@ -47,7 +47,7 @@ from .core.hypothesis import HypothesisTester
 
 print(" - Importing utilities and tools...", flush=True)
 from .sandbox.docker import DockerSandbox
-from .utils.logging import setup_logging, pretty_log, Icons
+from .utils.logging import setup_logging, pretty_log, Icons, set_log_redaction
 from .utils.token_counter import load_tokenizer
 from .tools.registry import TOOL_DEFINITIONS
 
@@ -84,6 +84,8 @@ def parse_args():
     parser.add_argument("--default-db", default=os.getenv("GHOST_DEFAULT_DB", "postgresql://ghost@127.0.0.1:5432/agent"), help="Default PostgreSQL URI for the DBA agent")
     parser.add_argument("--smart-memory", type=float, default=0.0)
     parser.add_argument("--anonymous", action="store_true", default=True, help="Always use anonymous search (Tor + DuckDuckGo)")
+    parser.add_argument("--mandatory-tor", action="store_true", default=False, help="Fail-closed Tor: probe Tor liveness at boot (abort if unreachable) and install a process-wide guard that blocks any DIRECT connection to a public address. Anonymised traffic (via the loopback SOCKS proxy) and loopback/LAN infra are unaffected — only Tor-bypassing public egress is blocked. Makes the README's fail-closed promise real. Also forces HF offline (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE) so the local-only embedder loads from cache without the cleartext model-resolution call the guard would otherwise block — the embedding model must be pre-cached (it is after one normal run).")
+    parser.add_argument("--no-redact-logs", action="store_true", default=False, help="Disable redaction of the monitored log stream. By default secrets / API keys / .onion addresses / home paths / PII are masked in the live console + file logs (the operator watches the stream, historically the largest cleartext sink). Pass this to see raw content while debugging.")
     parser.add_argument("--perfect-it", action="store_true", help="Enable proactive optimization suggestions after successful heavy tasks")
     parser.add_argument("--deep-reason", action="store_true", help="Enable MCTS action-candidate lookahead and parallel hypothesis testing on hard problems (costs extra worker calls)")
     parser.add_argument("--native-tools", action=argparse.BooleanOptionalAction, default=True, help="Attach OpenAI-format tools/tool_choice to LLM payload in addition to the XML tool prompt. On by default for Qwen 3.6 35B-A3 and newer models that support native tool-calls natively; use --no-native-tools to disable.")
@@ -105,6 +107,10 @@ def parse_args():
     parser.add_argument("--prm-model", default=None, help="Path to a persisted PRM (Process Reward Model) JSON checkpoint. When set, the PRM is loaded and plugged into the MCTS reasoner as a fast scoring path.")
     parser.add_argument("--prm-train-cooldown", type=int, default=10800, help="Seconds between idle-time PRM retrains. Default 3 hours. Has no effect when --prm-model is unset.")
     parser.add_argument("--router-train-cooldown", type=int, default=10800, help="Seconds between idle-time router-classifier retrains. Default 3 hours.")
+    parser.add_argument("--calib-refit-cooldown", type=int, default=3600, help="Seconds between idle-time confidence-calibration refits (biological phase 2.7c). Default 60 min. Only active under --enable-metacog.")
+    parser.add_argument("--prm-online-update", action="store_true", default=False, help="Apply a guarded online PRM gradient step when a turn is promoted to FAILED by a user correction (closes the gap until the next idle PRM retrain). The step is applied to a clone and committed only if it doesn't worsen BCE on a holdout of recent trajectories. Requires a trained PRM (--prm-model or an idle-trained checkpoint).")
+    parser.add_argument("--principle-gate", action="store_true", default=False, help="After a final response, run an independent LLM check against the agent's own authored operating principles (selfhood/values) and append a self-note if the response contradicts one. Never blocks — annotates only. Adds one LLM call per final turn; off by default.")
+    parser.add_argument("--autoadvance-idle", action="store_true", default=False, help="Biological-watchdog phase 2.95: when idle, autonomously advance ONE ACTIVE project by a single tick (the autoadvancer was previously only reachable via the tool/HTTP). Runs on the existing hard per-project budgets + human gates; coding tasks now generate+run real code instead of a no-op stub. One project / one tick per 30-min cooldown. Off by default.")
     # Frontier-aware self-play. When on, the biological-watchdog phase-3
     # self-play picker weights candidate clusters by (PRM uncertainty ×
     # trajectory rarity) instead of only the brittle-pool score. This
@@ -210,6 +216,38 @@ def parse_args():
 async def lifespan(app):
     args = app.state.args
     context = app.state.context
+
+    # Fail-closed Tor egress (opt-in via --mandatory-tor). Probe Tor
+    # liveness BEFORE wiring any outbound-capable component and abort
+    # boot if it's unreachable — a stalled agent beats a silently-
+    # cleartext one — then install the process-wide guard that blocks
+    # any DIRECT connection to a public address. Anonymised traffic is
+    # unaffected (it egresses via the loopback SOCKS proxy) and so is
+    # loopback/LAN infra; only Tor-bypassing public connects are blocked.
+    context._tor_guard_uninstall = None
+    # `is True` (not truthy): argparse store_true yields a real bool, while
+    # MagicMock-backed test contexts auto-vivify a truthy attribute — the
+    # strict identity check keeps the guard from firing under those tests.
+    if getattr(args, "mandatory_tor", False) is True:
+        from .utils.egress_guard import (
+            install as _install_tor_guard, tor_liveness_ok,
+        )
+        if not tor_liveness_ok(context.tor_proxy):
+            pretty_log(
+                "Tor Fail-Closed",
+                f"Tor unreachable at {context.tor_proxy!r} and --mandatory-tor "
+                "is set — refusing to start (a silently-cleartext agent is "
+                "worse than a stalled one).",
+                level="ERROR", icon=Icons.FAIL,
+            )
+            raise RuntimeError("mandatory-tor: Tor proxy unreachable at boot")
+        context._tor_guard_uninstall = _install_tor_guard(context.tor_proxy)
+        pretty_log(
+            "Tor Fail-Closed",
+            f"mandatory-tor active — direct public egress blocked; all "
+            f"anonymised traffic must route through {context.tor_proxy}",
+            icon=Icons.SHIELD,
+        )
 
     context.llm_client = LLMClient(args.upstream_url, context.tor_proxy, args.swarm_nodes_parsed, args.worker_nodes_parsed, getattr(args, 'visual_nodes_parsed', None), getattr(args, 'coding_nodes_parsed', None), getattr(args, 'image_gen_nodes_parsed', None))
     
@@ -400,12 +438,27 @@ async def lifespan(app):
     # Cognitive Event Bus — fan-out/in-memory broker between the agent
     # and its memory subsystems. Wired here so all stores are constructed.
     from .core.bus import MemoryBus
+    # Learned RRF intent→source weights: load a fitted matrix if one exists
+    # (offline-produced under $GHOST_HOME/system/rrf/weights.json), else
+    # None → the bus keeps its hand-tuned defaults (zero behaviour change).
+    _learned_rrf = None
+    try:
+        from .core.rrf_weights import load_intent_weights
+        _md = getattr(context, "memory_dir", None)
+        if _md is not None:
+            _learned_rrf = load_intent_weights(Path(str(_md)).parent / "rrf" / "weights.json")
+            if _learned_rrf:
+                pretty_log("RRF Weights", "loaded learned intent→source weights",
+                           icon=Icons.EVENT_BUS)
+    except Exception as _rrfx:
+        logger.debug("rrf weights load skipped: %s", _rrfx)
     context.memory_bus = MemoryBus(
         vector_memory=getattr(context, 'memory_system', None),
         graph_memory=getattr(context, 'graph_memory', None),
         skill_memory=getattr(context, 'skill_memory', None),
         profile_memory=getattr(context, 'profile_memory', None),
         episodic_memory=getattr(context, 'episodic_memory', None),
+        intent_weights=_learned_rrf,
     )
     pretty_log("Memory Bus", "Cognitive event bus initialized", icon=Icons.EVENT_BUS)
 
@@ -600,8 +653,57 @@ async def lifespan(app):
                     .get("content", "")
                 )
 
+            async def _verify_plan_fn(traj, plan):
+                """Independent LLM judge: would the revised plan avoid the
+                diagnosed failure? Grounds reflection lessons that were
+                previously written un-checked (proposal #6 — reflection
+                was the one learning path with zero correctness grounding).
+                Returns (verified, note). Runs only in fire-and-forget /
+                idle contexts, so it adds no user-facing latency."""
+                plan_text = "\n".join(f"{i+1}. {s}" for i, s in enumerate(plan))
+                fr = (getattr(traj, "failure_reason", "") or "")[:600]
+                req = (getattr(traj, "user_request", "") or "")[:600]
+                judge_prompt = (
+                    "You are auditing a proposed fix. A prior attempt FAILED.\n\n"
+                    f"TASK: {req}\n"
+                    f"WHY IT FAILED: {fr or '(failure reason not recorded)'}\n\n"
+                    f"PROPOSED REVISED PLAN:\n{plan_text}\n\n"
+                    "Would executing this revised plan plausibly AVOID that "
+                    "specific failure? Be strict: a plan that ignores the "
+                    "stated failure cause, is generic boilerplate, or just "
+                    "repeats the failing approach is NOT a fix.\n"
+                    "Reply on the FIRST line with exactly "
+                    "'VERDICT: CONFIRMED' or 'VERDICT: REFUTED', then one "
+                    "sentence explaining why."
+                )
+                payload = {
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": judge_prompt}],
+                    "temperature": 0.0,
+                    "max_tokens": 2048,
+                    "stream": False,
+                }
+                res = await context.llm_client.chat_completion(payload)
+                content = (
+                    (res or {}).get("choices", [{}])[0]
+                    .get("message", {}).get("content", "") or ""
+                )
+                up = content.upper()
+                c_pos = up.find("CONFIRMED")
+                r_pos = up.find("REFUTED")
+                verified = c_pos != -1 and (r_pos == -1 or c_pos < r_pos)
+                lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+                note = (lines[0] if lines else "no verdict")[:200]
+                return verified, note
+
             context.reflector = Reflector(
                 critique_fn=_critique_fn,
+                # Proposal #6: ground reflection plans with an independent
+                # verdict before the lesson is trusted. The reflected
+                # trajectory is only upgraded to PASSED when the judge
+                # CONFIRMS the plan addresses the failure.
+                verify_fn=_verify_plan_fn,
+                verify_timeout_s=120.0,
                 # 120s ceiling: Qwen 3.6 is a reasoning model whose
                 # `reasoning_content` phase regularly burns 30-60s
                 # before emitting any visible content, AND the
@@ -863,6 +965,20 @@ async def lifespan(app):
     # the chat handler without needing access to the FastAPI app object.
     context.agent = agent
 
+    # Calibration spine (roadmap phase 2.5). Pairs each turn's composite
+    # confidence with the realized outcome, measures Brier/ECE, and (idle
+    # phase 2.7c) re-fits τ + weights + λ. Constructed unconditionally —
+    # it's cheap and the introspect tool reads its stats — but only fed
+    # readings when --enable-metacog computes confidence. Lives under
+    # $GHOST_HOME/system/calibration/ (mirrors prm/ and router/).
+    try:
+        from .core.calibration import CalibrationTracker
+        _calib_dir = Path(str(context.memory_dir)).parent / "calibration"
+        context.calibration_tracker = CalibrationTracker(_calib_dir)
+    except Exception as _cex:  # pragma: no cover — defensive
+        context.calibration_tracker = None
+        logger.debug("calibration tracker init failed: %s", _cex)
+
     # Metacognition uplift bundle (roadmap phases 1-3). Constructed
     # only when --enable-metacog is set; otherwise context.metacog
     # stays None and every wire-point inside the agent falls through
@@ -872,6 +988,24 @@ async def lifespan(app):
         from .core.metacog import MetacogBundle
         context.metacog = MetacogBundle.from_args(context, args)
         if context.metacog is not None:
+            # Load any persisted calibration fit into the composite
+            # confidence so a long-running agent boots already-calibrated
+            # rather than reverting to the hardcoded τ=0.55 / 0.5-0.5 each
+            # restart. No-op when no fit has been produced yet.
+            try:
+                _ct = getattr(context, "calibration_tracker", None)
+                _cp = _ct.load_params() if _ct is not None else None
+                if _cp is not None and getattr(context.metacog, "confidence", None) is not None:
+                    context.metacog.confidence.apply_fitted(_cp)
+                    from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss
+                    _mc_emit(
+                        _mc_ss.CALIB, loaded="startup",
+                        threshold=_cp.threshold, w_entropy=_cp.w_entropy,
+                        lam=_cp.lambda_uncertainty, brier=_cp.brier,
+                        n=_cp.n_samples,
+                    )
+            except Exception as _capx:  # pragma: no cover — defensive
+                logger.debug("calibration params apply failed: %s", _capx)
             # Bridge HostSignals to TriggerBus.resource events so the
             # ReplanBridge picks them up alongside loop / anomaly
             # events. Keep the import local — no need to pull it in
@@ -1085,6 +1219,10 @@ def main():
     tor_proxy = os.getenv("TOR_PROXY", "socks5://127.0.0.1:9050")
     
     setup_logging(str(log_file), args.debug, args.daemon, args.verbose)
+    # Redact secrets / .onion / home-paths / PII from the monitored log
+    # stream by default (the operator watches it live); --no-redact-logs
+    # opts out for debugging.
+    set_log_redaction(not getattr(args, "no_redact_logs", False))
     load_tokenizer(tokenizer_path)
     
     # Ensure directories exist

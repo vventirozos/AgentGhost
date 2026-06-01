@@ -43,6 +43,7 @@ logger = logging.getLogger("GhostAgent")
 class Subsystem:
     BOOT = "boot"          # lifecycle: enable / disable / shutdown
     CONF = "conf"          # composite confidence reading
+    CALIB = "calib"        # calibration spine: Brier / ECE / refit
     ARBITER = "arbiter"    # dual-solver arbiter decision
     VALID = "valid"        # pre-execution validator verdict
     HOST = "host"          # host telemetry signal
@@ -61,6 +62,7 @@ _SUBSYSTEM_ICONS = {
     Subsystem.BOOT:    "🌱",   # sprout — startup / lifecycle
     Subsystem.SUMMARY: "📊",   # bar chart — rollup
     Subsystem.CONF:    "🌡️",   # thermometer — calibration / measurement
+    Subsystem.CALIB:   "📐",   # ruler — calibration measurement / Brier refit
     Subsystem.ARBITER: "🧮",   # abacus — decision / weighing candidates
     Subsystem.VALID:   "🚧",   # construction barrier — pre-exec block
     Subsystem.HOST:    "🖥️",   # monitor — host resource signal

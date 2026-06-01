@@ -105,16 +105,50 @@ async def test_advance_research_task_runs_web_search(context, store):
     assert arts and arts[0]["kind"] == "tool_call"
 
 
-async def test_advance_coding_task_runs_execute(context, store):
+async def test_advance_coding_task_with_generator_runs_execute(context, store):
+    """With a code_generator, a coding task generates real code and runs
+    it via execute — NOT the old no-op comment stub."""
     pid = store.create_project("P", kind="CODING")
     tid = store.add_task(pid, "Implement the login flow")
 
+    seen = {}
+
     async def runner(name, args):
+        seen["name"] = name
+        seen["args"] = args
+        return "ok"
+
+    async def code_gen(desc):
+        return "python3 -c \"print('login flow')\""
+
+    r = await advance_once(context, pid, tool_runner=runner, code_generator=code_gen)
+    assert r.classification == "coding"
+    assert store.get_task(tid)["actual_tool_used"] == "execute"
+    assert seen["name"] == "execute"
+    # The generated command is run; the old "# Autoadvance stub" comment
+    # is gone for good.
+    assert "Autoadvance stub" not in seen["args"].get("command", "")
+    assert "print('login flow')" in seen["args"]["command"]
+
+
+async def test_advance_coding_task_without_generator_degrades_to_research(context, store):
+    """Without a code_generator there is no code to run, so a coding task
+    now RESEARCHES the task (web_search) instead of executing an inert
+    comment that marked it DONE having done nothing."""
+    pid = store.create_project("P", kind="CODING")
+    tid = store.add_task(pid, "Implement the login flow")
+
+    seen = {}
+
+    async def runner(name, args):
+        seen["name"] = name
+        seen["args"] = args
         return "ok"
 
     r = await advance_once(context, pid, tool_runner=runner)
     assert r.classification == "coding"
-    assert store.get_task(tid)["actual_tool_used"] == "execute"
+    assert seen["name"] == "web_search"
+    assert store.get_task(tid)["actual_tool_used"] == "web_search"
 
 
 async def test_advance_needs_user_marks_task(context, store):

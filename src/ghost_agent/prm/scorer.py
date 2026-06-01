@@ -85,6 +85,66 @@ class PRMScorer:
         restarting the agent."""
         self._model = model
 
+    def online_update(
+        self,
+        new_X,
+        new_y,
+        *,
+        holdout_X=None,
+        holdout_y=None,
+        lr: float = 0.05,
+        max_steps: int = 3,
+        tol: float = 1e-4,
+    ) -> bool:
+        """Guarded low-latency SGD update.
+
+        Closes the hours-long gap between a user correction and the next
+        idle batch retrain: a correction promoted to FAILED can nudge the
+        PRM *now* instead of waiting for biological phase 2.7.
+
+        Safety:
+          * **No bootstrap.** Returns ``False`` when no model is loaded —
+            online steps refine the batch model, they don't create one.
+          * **Clone, don't mutate.** The step is applied to a clone; the
+            live scoring model is replaced atomically via ``set_model``
+            only if the guard passes (so concurrent ``score`` never sees
+            a torn update).
+          * **Holdout guard.** When a holdout set is supplied, the clone
+            is committed ONLY if its BCE on the holdout does not worsen
+            (catastrophic-forgetting guard). Without a holdout the small
+            ``lr`` + few ``max_steps`` bound the change.
+
+        Returns ``True`` if the model was updated, ``False`` otherwise.
+        Never raises — an online-update failure must not break the turn.
+        """
+        if not self.has_model:
+            return False
+        try:
+            nx = list(new_X)
+            ny = list(new_y)
+            if not nx:
+                return False
+            shadow = self._model.clone()
+            base_loss = None
+            hx = list(holdout_X) if holdout_X is not None else []
+            hy = list(holdout_y) if holdout_y is not None else []
+            if hx and hy:
+                base_loss = shadow.bce_loss(hx, hy)
+            shadow.partial_fit(nx, ny, lr=lr, steps=max_steps)
+            if base_loss is not None:
+                new_loss = shadow.bce_loss(hx, hy)
+                if new_loss > base_loss + tol:
+                    logger.debug(
+                        "PRM online_update rejected: holdout BCE %.4f → %.4f",
+                        base_loss, new_loss,
+                    )
+                    return False
+            self.set_model(shadow)
+            return True
+        except Exception as exc:
+            logger.debug("PRM online_update failed: %s", exc)
+            return False
+
     @property
     def has_model(self) -> bool:
         return self._model is not None and self._model.weights_ is not None

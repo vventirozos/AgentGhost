@@ -439,10 +439,20 @@ class AutobiographicalMemory:
             for t in q_tokens
         }
 
+        # Reference-count prior: memories the agent has actually reached
+        # for before (their summary echoed in a past reply — tracked in
+        # reference_counts.json) are more useful than ones that merely
+        # match vocabulary. Previously this signal was WRITTEN but never
+        # READ — a dead loop. Folding `(1 + log1p(refs))` into the score
+        # makes "memories that paid off" rank higher, the relevance prior
+        # the design always intended. Cheap: ref counts are an in-memory
+        # dict loaded once.
         scored: List[tuple] = []
         for exp, hs_tokens in zip(experiences, haystacks):
             score = sum(idf[t] for t in q_tokens if t in hs_tokens)
             if score > 0:
+                refs = self.reference_count(exp.id)
+                score *= (1.0 + math.log1p(refs))
                 scored.append((score, exp))
         scored.sort(key=lambda s: (s[0], s[1].timestamp), reverse=True)
         return [exp for _, exp in scored[:limit]]

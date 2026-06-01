@@ -383,6 +383,33 @@ def _wrap_content(content_str: str) -> str:
     return ("\n" + _CONTINUATION_INDENT).join(lines)
 
 
+# Operator-stream redaction. The operator MONITORS the live log stream,
+# which historically was the single largest cleartext sink in the system:
+# secrets, .onion addresses, full URLs, and absolute home paths flowed to
+# the console verbatim (redaction was applied ONLY at the JSONL trajectory
+# boundary, never at the log boundary). On by default (fail-safe toward
+# privacy); flip via set_log_redaction() / --no-redact-logs. redact_text
+# only rewrites known sensitive patterns, so ordinary log lines are
+# untouched and stay readable.
+_REDACT_LOGS = True
+
+
+def set_log_redaction(enabled: bool) -> None:
+    global _REDACT_LOGS
+    _REDACT_LOGS = bool(enabled)
+
+
+def _redact_log(s: str) -> str:
+    if not _REDACT_LOGS or not s:
+        return s
+    try:
+        from ..distill.redact import redact_text
+        return redact_text(s)
+    except Exception:
+        # Never let a redaction failure break the monitored stream.
+        return s
+
+
 def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None):
     req_id = request_id_context.get()
     tag = _req_tag(req_id)
@@ -458,6 +485,9 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     if level.upper() in ("WARNING", "WARN", "ERROR", "CRITICAL"):
         _limit = max(LOG_TRUNCATE_LIMIT, 240)
     content_str = _truncate(content_str, _limit).replace("\n", " ").replace("\r", "")
+    # Redact secrets / .onion / home-paths / PII from the monitored stream
+    # (post-truncation so the regex cost is bounded to the visible line).
+    content_str = _redact_log(content_str)
     content_str = _wrap_content(content_str)
 
     lvl_col = _LEVEL_COLOR.get(level.upper(), "")
@@ -475,4 +505,4 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         # f-string built the full string (and the full `repr(content)`)
         # eagerly, on EVERY call, which became a measurable cost when
         # `content` was a giant payload. `%.1000s` truncates at format time.
-        logger.debug("[%s] %s: %.1000s", req_id, title, str(content))
+        logger.debug("[%s] %s: %.1000s", req_id, title, _redact_log(str(content)[:1000]))

@@ -64,6 +64,11 @@ k = 60  (rrf_k default)</code></pre>
   <h2>Dedup gate (write side)</h2>
   <p><code>publish_fact</code> uses an LRU of 256 most-recent <code>(event_type, fact_data)</code> MD5 signatures to short-circuit replays. Without it, an LLM that repeats itself across turns would re-write the same triplet to the graph and accumulate weight unnecessarily.</p>
 
+  <h2>Learned intent→source weights</h2>
+  <p>
+    The 3×4 <code>_INTENT_WEIGHTS</code> matrix (graph/vector/skill/episodic per factual/procedural/contextual) is hand-tuned magic. <code>core/rrf_weights.py</code> makes it learnable: <code>fit_intent_weights</code> derives a matrix from <code>(intent, source, success)</code> observations (a source that correlates with successful turns under an intent is up-weighted, clamped to <code>[0.1, 3.0]</code>), and the bus loads a fitted <code>weights.json</code> if one exists under <code>$GHOST_HOME/system/rrf/</code>. <strong>Absent → the hand-tuned defaults stand, byte-for-byte</strong> — the fusion weights sit on the hot path that feeds every turn, so an ungrounded fit must never silently degrade recall (same load-if-present posture as the PRM / router checkpoints). The <code>_reciprocal_rank_fusion</code> classmethod stays back-compatible (the learned matrix is an optional <code>weight_overrides=</code>). Covered by <code>tests/test_rrf_weights.py</code>.
+  </p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

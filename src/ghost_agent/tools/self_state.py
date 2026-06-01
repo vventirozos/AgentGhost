@@ -27,16 +27,26 @@ logger = logging.getLogger("GhostAgent")
 
 _VALID_ACTIONS = frozenset(
     {"note_question", "resolve_question", "add_unfinished",
-     "close_unfinished", "set_mood", "list"}
+     "close_unfinished", "set_mood", "note_principle", "list"}
 )
 
 
-def _render_state(state) -> str:
+def _render_state(state, self_model=None) -> str:
     """One-shot human-readable dump of the current self-state."""
     open_qs = state.open_questions()
     unfin = state.unfinished_threads()
     mood = state.mood()
     lines = []
+    principles = []
+    try:
+        if self_model is not None:
+            principles = self_model.principles()
+    except Exception:
+        principles = []
+    if principles:
+        lines.append("Operating principles:")
+        for p in principles:
+            lines.append(f"  [{p.id[:8]}] {p.text}")
     if mood and mood.label:
         ev = f" — {mood.evidence}" if mood.evidence else ""
         lines.append(f"Mood: {mood.label}{ev}")
@@ -114,7 +124,7 @@ async def tool_self_state(
 
     try:
         if action == "list":
-            return _render_state(state)
+            return _render_state(state, self_model)
 
         if action == "note_question":
             text = (text or "").strip()
@@ -168,6 +178,20 @@ async def tool_self_state(
                 return "Nothing recorded — the mood label was empty."
             ev = f" ({m.evidence})" if m.evidence else ""
             return f"Mood set to '{m.label}'{ev}."
+
+        if action == "note_principle":
+            text = (text or "").strip()
+            if not text:
+                return "SYSTEM ERROR: 'text' is required for note_principle."
+            p = self_model.note_principle(text)
+            if p is None:
+                return "Nothing recorded — principle text was empty or values disabled."
+            pretty_log("Self-State", f"principle noted: {text}", icon=Icons.SHIELD)
+            return (
+                f"Recorded operating principle [{p.id[:8]}]: {p.text}\n"
+                "(This now appears in my wake-up prefix every session and "
+                "shapes how I work.)"
+            )
     except Exception as e:  # noqa: BLE001 — self-state is secondary
         logger.warning("self_state tool failed: %s: %s", type(e).__name__, e)
         return f"Self-state operation failed: {type(e).__name__}: {e}"

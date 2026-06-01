@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.calibration — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Metacognition uplift</h3>
+    <a href="entropy.html">entropy</a>
+    <a href="confidence.html">confidence</a>
+    <a class="current" href="calibration.html">calibration</a>
+    <a href="triggers.html">triggers</a>
+    <a href="arbiter.html">arbiter</a>
+    <a href="../memory/competence.html">memory/competence</a>
+    <a href="../algorithms/metacognition.html">Overview</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / calibration.py — Calibration Spine</h1>
+  <p class="subtitle">Closes the loop on confidence: pair each turn's composite confidence with the realized outcome, measure Brier / ECE, and re-fit τ + weights + λ to the data. Roadmap phase 2.5.</p>
+
+  <h2>The problem it closes</h2>
+  <p>
+    The <a href="confidence.html">composite confidence</a> was computed every turn but never checked against what actually happened. The threshold <code>τ = 0.55</code> and the entropy/competence weights <code>0.5 / 0.5</code> were asserted constants — so "the agent is 80&nbsp;% confident" had no demonstrated relationship to the turn succeeding 80&nbsp;% of the time. The calibration spine turns that assertion into a measured, self-correcting loop.
+  </p>
+
+  <h2>The three jobs</h2>
+  <ol>
+    <li><strong>Measure.</strong> Every metacog turn produces a confidence reading paired with the realized outcome, appended to <code>$GHOST_HOME/system/calibration/calibration.jsonl</code>; from that we compute a rolling <strong>Brier score</strong> <code>mean((C − outcome)²)</code> and an <strong>Expected Calibration Error</strong> over a 10-bin reliability table.
+      <ul>
+        <li><strong>Logprob-optional confidence.</strong> The composite is computed at turn <em>finalization</em> for every full-loop metacog turn — not gated behind the streaming <code>is_final_generation+stream_response</code> branch (which many turns never enter) nor behind a populated token-entropy window. The entropy term is used when the per-token window observed tokens and is neutral (0.5) otherwise, so on speculative-decoding / MTP / no-logprobs upstreams (where the per-token logprob stream is sparse or absent) competence + verbalised-uncertainty drive the score and a sample is still recorded. Verified live on the MTP llama-server: samples land with <code>entropy_component=0.5</code>, <code>competence</code> driving <code>C</code>.</li>
+        <li><strong>Outcome signal.</strong> A turn is a <em>negative</em> (0.0) on a structural tool failure, a verifier <strong>REFUTED</strong> verdict (≥0.7), or a next-turn <strong>user-correction</strong> promotion (the strongest "confidently wrong" signal — recorded against the prior turn's stashed confidence); otherwise 1.0. Real negatives are what stop the fit from bailing single-class on free-form chat (which is otherwise almost all "clean").</li>
+      </ul>
+    </li>
+    <li><strong>Self-tune.</strong> Once ≥ 40 samples (both outcome classes present) accumulate, an idle-time grid search re-fits the entropy/competence weights, the verbalised-uncertainty penalty <code>λ</code>, and the decision threshold <code>τ</code> to minimise Brier. The threshold is then chosen to maximise Youden's J on the "predict success when C ≥ τ" decision.</li>
+    <li><strong>Unify.</strong> The recorded sample carries the verbalised-uncertainty <em>pressure</em> alongside the objective entropy/competence components, so the formerly-disjoint "the agent said it was unsure" track and "the generation/domain was uncertain" track are fit together.</li>
+  </ol>
+
+  <h2>Wiring</h2>
+  <table>
+    <thead><tr><th>Stage</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td>Construct tracker</td><td><code>main.lifespan</code> — <code>context.calibration_tracker</code> (unconditional; only fed under <code>--enable-metacog</code>)</td></tr>
+      <tr><td>Record (confidence, outcome)</td><td><code>core.agent.handle_chat</code> turn-end — pairs <code>_calib_pending</code> with <code>execution_failure_count == 0</code></td></tr>
+      <tr><td>Startup load</td><td><code>main.lifespan</code> — <code>confidence.apply_fitted(load_params())</code></td></tr>
+      <tr><td>Idle refit (phase 2.7c)</td><td><code>core.agent._biological_tick</code> — <code>fit()</code> then hot-swap, 60-min cooldown (<code>--calib-refit-cooldown</code>)</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Design non-negotiables</h2>
+  <ul>
+    <li><strong>Local-only, pure stdlib.</strong> <code>math</code> + <code>json</code> only — no numpy, no hosted scorer, no outbound traffic.</li>
+    <li><strong>JSONL / JSON on disk.</strong> Append-only history, atomic param writes (<code>.tmp</code> + <code>os.replace</code>), schema-versioned (<code>ghost.calibration.v1</code>).</li>
+    <li><strong>Fail-safe.</strong> A recording or fit failure is logged at debug and never breaks a turn; <code>load_params</code> returns <code>None</code> on any problem so a corrupt file degrades to the hardcoded defaults.</li>
+    <li><strong>Bail-on-thin-data.</strong> Below 40 samples, or with only one outcome class present, <code>fit</code> returns <code>None</code> and writes no params — a confidently-miscalibrated threshold is worse than the neutral default (same posture as <code>prm.trainer</code>).</li>
+  </ul>
+
+  <h2>Observability</h2>
+  <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier. <code>tracker.stats()</code> exposes <code>{samples, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty}</code> for introspection.</p>
+</main>
+</body>
+</html>

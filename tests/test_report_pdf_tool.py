@@ -1,4 +1,5 @@
 """Unit tests for tools/report_pdf.py + its registry wiring."""
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -153,6 +154,58 @@ def test_normalise_sections_handles_dicts_with_aliases():
 def test_normalise_sections_string_in_list_becomes_section():
     out = _normalise_sections(["just a string"], None, None)
     assert out == [{"heading": "Section 1", "body": "just a string"}]
+
+
+def test_normalise_sections_json_string_list_is_decoded():
+    """Regression: the model (or the XML tool-call parser) often hands
+    `sections` as a JSON-encoded *string* of a list. It must be decoded
+    back into real sections, NOT wrapped whole into a single section —
+    that collapse is what caused the agent to emit a 1-page report and
+    retry the tool dozens of times."""
+    out = _normalise_sections(
+        '[{"heading": "Intro", "body": "b1"}, {"heading": "Risks", "body": "b2"}]',
+        None,
+        None,
+    )
+    assert out == [
+        {"heading": "Intro", "body": "b1"},
+        {"heading": "Risks", "body": "b2"},
+    ]
+
+
+def test_normalise_sections_json_string_single_dict_is_decoded():
+    out = _normalise_sections('{"heading": "Only", "body": "solo"}', None, None)
+    assert out == [{"heading": "Only", "body": "solo"}]
+
+
+@pytest.mark.asyncio
+async def test_generate_pdf_json_string_sections_multipage(tmp_path):
+    """End-to-end guard for the bug: a stringified multi-section array
+    must produce a real multi-section report, not a 1-page JSON dump."""
+    big = ("Lorem ipsum dolor sit amet. " * 400).strip()
+    payload = json.dumps([
+        {"heading": "Introduction", "body": big},
+        {"heading": "Strategy", "body": big},
+    ])
+    res = await tool_generate_pdf(
+        title="Investment Strategy",
+        sections=payload,
+        sandbox_dir=tmp_path,
+    )
+    assert res.startswith("SUCCESS")
+
+    import fitz
+    pdfs = list(tmp_path.glob("report_*.pdf"))
+    doc = fitz.open(pdfs[0])
+    try:
+        # Two long sections must overflow past a single page, and the raw
+        # JSON braces must NOT appear as literal body text.
+        assert doc.page_count >= 2
+        text = "".join(page.get_text() for page in doc)
+        assert "Introduction" in text and "Strategy" in text
+        assert '"body":' not in text
+    finally:
+        doc.close()
 
 
 def test_normalise_sections_empty_returns_empty():

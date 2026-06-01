@@ -31,7 +31,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Iterable, List, Optional, Set, Union
+from typing import Any, Awaitable, Callable, Iterable, List, Optional, Set, Tuple, Union
 
 from ..distill.schema import Trajectory, Outcome
 from .prompts import build_reflection_prompt, parse_reflection_output
@@ -40,6 +40,15 @@ logger = logging.getLogger("GhostReflect")
 
 
 CritiqueCallable = Callable[[str], Union[str, Awaitable[str]]]
+# Verifies a revised plan against the failed trajectory. Returns
+# ``(verified, note)``: ``verified`` upgrades the reflection trajectory's
+# outcome to PASSED (and tags the lesson verified); ``note`` is a short
+# human-readable reason. May be sync or async. Injected (like
+# ``critique_fn``) so the backend — an LLM soundness judge, or a sandbox
+# re-run for self-play-derived reflections — stays out of the driver.
+VerifyCallable = Callable[
+    [Trajectory, List[str]], Union[Tuple[bool, str], Awaitable[Tuple[bool, str]]]
+]
 
 
 @dataclass
@@ -51,6 +60,11 @@ class ReflectionOutcome:
     diagnosis: str = ""
     revised_plan: List[str] = field(default_factory=list)
     error: str = ""
+    # None = not verified (no verify_fn, or verification errored). True/
+    # False = the verify_fn's verdict on whether the revised plan
+    # addresses the diagnosed failure.
+    plan_verified: Optional[bool] = None
+    verify_note: str = ""
 
     @property
     def ok(self) -> bool:
@@ -96,8 +110,17 @@ class Reflector:
         session_id_prefix: str = "reflect",
         accept_low_novelty_passes: bool = False,
         novelty_threshold: float = 0.15,
+        verify_fn: Optional[VerifyCallable] = None,
+        verify_timeout_s: float = 60.0,
     ):
         self.critique_fn = critique_fn
+        # Optional plan-verification backend (proposal #6: ground the
+        # one learning path that previously had zero correctness
+        # grounding). When set, each revised plan is checked and the
+        # reflection's outcome is upgraded to PASSED only on a verified
+        # verdict; otherwise it stays UNKNOWN (current behaviour).
+        self.verify_fn = verify_fn
+        self.verify_timeout_s = float(verify_timeout_s)
         self.per_call_timeout_s = float(per_call_timeout_s)
         self.max_failures = int(max_failures)
         self.model = model
@@ -303,5 +326,44 @@ class Reflector:
                 "source_outcome": traj.outcome,
             },
         )
+
+        # Plan verification (proposal #6). Reflection was previously the
+        # ONE learning path with no correctness grounding — the revised
+        # plan was written straight to SkillMemory, executed-or-not,
+        # correct-or-not. When a verify_fn is wired, the plan is checked
+        # against the failure; only a verified plan upgrades the
+        # reflection trajectory to PASSED (and tags the lesson verified).
+        # An unverified / errored check leaves outcome=UNKNOWN — same as
+        # before, so this never regresses the un-wired path.
+        if self.verify_fn is not None and plan:
+            try:
+                vcall = self.verify_fn(traj, plan)
+                if inspect.isawaitable(vcall):
+                    verified, note = await asyncio.wait_for(
+                        vcall, timeout=self.verify_timeout_s
+                    )
+                else:
+                    verified, note = vcall
+                verified = bool(verified)
+                out.plan_verified = verified
+                out.verify_note = str(note or "")
+                reflected.extra["plan_verified"] = verified
+                reflected.extra["plan_verify_note"] = out.verify_note
+                if verified:
+                    reflected.outcome = Outcome.PASSED.value
+                    reflected.final_response += (
+                        f"\n\nPLAN VERIFIED: {out.verify_note}"
+                    )
+                else:
+                    reflected.final_response += (
+                        f"\n\nPLAN UNVERIFIED: {out.verify_note}"
+                    )
+            except asyncio.TimeoutError:
+                logger.debug("reflection plan verify timed out")
+                reflected.extra["plan_verify_note"] = "verify timed out"
+            except Exception as e:
+                logger.debug("reflection plan verify failed: %s", e)
+                reflected.extra["plan_verify_note"] = f"verify error: {type(e).__name__}"
+
         out.reflected_trajectory = reflected
         return out

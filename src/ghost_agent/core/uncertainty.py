@@ -192,6 +192,36 @@ class UncertaintyTracker:
             if not u.resolved and u.impact >= min_impact
         ]
 
+    def pressure(self) -> float:
+        """Scalar verbalised-uncertainty pressure in ``[0, 1]``.
+
+        Fuses the per-turn unknowns and risky assumptions into one
+        signal the calibration spine (:mod:`core.calibration`) feeds
+        into the composite-confidence penalty. The exact shape is a
+        heuristic — the fitted ``λ`` decides how much it actually
+        counts, so this only has to be monotone in "how loudly did the
+        agent flag that it was unsure".
+
+          * impact term — the most impactful unresolved unknown (/5);
+          * count term  — number of unresolved unknowns, saturating at 3;
+          * assumption term — count of low-confidence unverified
+            assumptions, saturating at 3.
+
+        Returns 0.0 when the agent flagged nothing this turn.
+        """
+        unresolved = [u for u in self.unknowns if not u.resolved]
+        risky = [
+            a for a in self.assumptions
+            if not a.verified and a.confidence < 0.7
+        ]
+        if not unresolved and not risky:
+            return 0.0
+        impact_term = (max((u.impact for u in unresolved), default=0)) / 5.0
+        count_term = min(1.0, len(unresolved) / 3.0)
+        assum_term = min(1.0, len(risky) / 3.0)
+        pressure = 0.5 * impact_term + 0.3 * count_term + 0.2 * assum_term
+        return max(0.0, min(1.0, pressure))
+
     def get_unverified_assumptions(self, max_confidence: float = 0.5) -> List[Assumption]:
         """Return unverified assumptions with confidence <= max_confidence."""
         return [

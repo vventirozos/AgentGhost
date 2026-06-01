@@ -256,6 +256,31 @@ lesson (planner pre-fetch at `agent.py:2260`, execution-stage
 fetch at `agent.py:2402`), the agent enters the turn already primed
 with the corrected plan.
 
+### Plan verification (proposal #6 — grounding the reflection loop)
+
+Reflection used to be the **one** learning path with no correctness
+grounding: the revised plan was written straight to `SkillMemory`,
+executed-or-not, correct-or-not (unlike self-play lessons, which pass
+through `dream._verify_lesson_helpful`). The `Reflector` now takes an
+optional injected `verify_fn(traj, plan) -> (verified, note)` (sync or
+async, mirroring `critique_fn`). When wired:
+
+* the revised plan is checked against the diagnosed failure before the
+  lesson is trusted;
+* the reflection trajectory's outcome is upgraded to `PASSED` **only**
+  on a verified verdict — otherwise it stays `UNKNOWN` (so the un-wired
+  path is byte-for-byte unchanged);
+* the verdict + note land in `extra["plan_verified"]` /
+  `extra["plan_verify_note"]` and are appended to `final_response`.
+
+`main.py` wires `verify_fn` to an **independent LLM judge** (temp 0,
+strict `VERDICT: CONFIRMED|REFUTED` rubric) that asks "would this revised
+plan avoid that specific failure?". It runs only on the fire-and-forget /
+idle reflection paths, so it adds no user-facing latency. The injection
+point also lets a sandbox re-run back the verifier for self-play-derived
+reflections (where a validator exists) without touching the driver.
+Covered by `tests/test_reflection_plan_verify.py`.
+
 ## Cooldown anchor discipline
 
 All idle-triggered phases mirror the same pattern — fail to follow
