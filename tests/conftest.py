@@ -38,6 +38,30 @@ def disable_self_play_templates(monkeypatch):
     )
 
 @pytest.fixture(autouse=True)
+def clear_search_cache():
+    """Reset the in-process web-search TTL cache between tests.
+
+    `ghost_agent.tools.search` memoises successful searches keyed on the
+    normalised query so the model's repeated near-identical queries in a
+    single turn don't re-pay the Tor round trip. That cache is
+    module-global, so without this reset a successful search in one test
+    could satisfy a later test that mocks DDGS for a *different* outcome
+    under the same query string. Clearing it per-test keeps each test
+    hermetic."""
+    try:
+        from ghost_agent.tools import search as _search
+        _search._SEARCH_CACHE.clear()
+    except Exception:
+        pass
+    yield
+    try:
+        from ghost_agent.tools import search as _search
+        _search._SEARCH_CACHE.clear()
+    except Exception:
+        pass
+
+
+@pytest.fixture(autouse=True)
 def inject_global_stream_adapter(monkeypatch):
     """Injects a `stream_chat_completion` adapter on MagicMock LLM clients so
     tests that only stub `chat_completion` still work when the agent tries

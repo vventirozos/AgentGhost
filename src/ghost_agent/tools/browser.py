@@ -48,6 +48,20 @@ logger = logging.getLogger("GhostAgent")
 _BROWSER_PROFILE_DIR = ".browser_profile"
 _BROWSER_RUNNER_FILENAME = ".browser_runner.py"
 
+# Serializes Chromium launches against the shared persistent profile dir.
+# `launch_persistent_context` takes an exclusive SingletonLock on its
+# user-data-dir; when the agent fires several browser tool-calls in one
+# turn (e.g. navigate three URLs at once), the concurrent Chromium
+# processes contend for that lock and the losers SIGSEGV / TargetClosed —
+# 2 of 3 succeed, the rest crash (verified). We can't just hand each op
+# its own profile: the persistent profile is what gives cross-op cookie/
+# session continuity and the `.last_url` sidecar. So instead we serialize
+# launches — browser ops queue and run one at a time. They're seconds-long
+# and inherently single-writer, so this is the correct semantics, not a
+# perf regression. Module-global so it spans all tool_browser calls in the
+# (single-event-loop) agent process.
+_BROWSER_PROFILE_LOCK = asyncio.Lock()
+
 # Keep outputs reasonable — a single page's HTML can be 5+ MB and would
 # blow the LLM context window, so we cap before returning. These caps
 # match `helper_fetch_url_content`'s 5 MB ceiling.
@@ -163,21 +177,38 @@ def _chromium_args(proxy):
 
     --no-sandbox / --disable-dev-shm-usage: required when Chromium runs
         non-root inside a container without a large /dev/shm.
-    --host-resolver-rules: force every non-localhost hostname through
+    --host-resolver-rules: force every non-excluded hostname through
         the SOCKS proxy's DNS instead of the container's /etc/resolv.
         Without this, Chromium can resolve names locally (the classic
         SOCKS DNS leak) even when traffic itself goes via SOCKS.
+
+        CRITICAL: the proxy server's OWN host must be excluded from the
+        `MAP * ~NOTFOUND` rule. Otherwise Chromium runs the proxy host
+        (e.g. `127.0.0.1`) through the same rule, resolves it to NOTFOUND,
+        and cannot connect to the proxy at all — every navigation then
+        dies with `net::ERR_PROXY_CONNECTION_FAILED`. `EXCLUDE localhost`
+        does NOT cover the `127.0.0.1` literal, so we add an explicit
+        EXCLUDE for the parsed proxy host. (Verified: with only
+        `EXCLUDE localhost` a socks5://127.0.0.1 proxy fails; adding
+        `EXCLUDE 127.0.0.1` makes it return 200.)
     --disable-webrtc: WebRTC can expose the real host IP via STUN
         even when HTTP traffic is proxied. Flat-disable for Tor paths.
     """
     args = ["--no-sandbox", "--disable-dev-shm-usage"]
     if proxy:
         # EXCLUDE localhost so the self-play fixture server (and any
-        # in-container service) is reachable without routing through
-        # Tor. Everything else is forced through the proxy's DNS.
-        args.append(
-            "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE localhost"
-        )
+        # in-container service) is reachable without routing through Tor,
+        # AND exclude the proxy's own host so Chromium can actually reach
+        # the SOCKS server. Everything else is forced through SOCKS DNS.
+        excludes = ["EXCLUDE localhost"]
+        try:
+            from urllib.parse import urlparse
+            phost = urlparse(proxy).hostname
+        except Exception:
+            phost = None
+        if phost and phost != "localhost":
+            excludes.append("EXCLUDE " + phost)
+        args.append("--host-resolver-rules=MAP * ~NOTFOUND , " + " , ".join(excludes))
         args.append("--disable-features=WebRtcHideLocalIpsWithMdns")
         args.append("--webrtc-ip-handling-policy=disable_non_proxied_udp")
     return args
@@ -744,6 +775,19 @@ def _build_op_payload(
     if proxy and proxy.startswith("socks5h://"):
         proxy = "socks5://" + proxy[len("socks5h://"):]
 
+    # Tor-robust navigation default: the full `load` event frequently
+    # NEVER fires within the timeout on JS-heavy pages over Tor —
+    # analytics beacons, long-poll sockets, and slow third-party
+    # subresources stall on a slow exit, so a navigation that had already
+    # delivered the real content times out and the runner exits 1 (the
+    # exact "navigate: runner exit 1" seen in production). When the caller
+    # hasn't pinned `wait_until` AND we're going through a proxy, default
+    # to `domcontentloaded` (the HTML-parsed milestone) — far more
+    # reliable over Tor and sufficient for navigate/extract_text. An
+    # explicit `wait_until` from the caller always wins.
+    if wait_until is None and proxy:
+        wait_until = "domcontentloaded"
+
     payload: dict = {
         "op": op,
         "profile_dir": f"/workspace/{_BROWSER_PROFILE_DIR}",
@@ -1033,9 +1077,12 @@ async def tool_browser(
     # param are unaffected (matches execute.py).
     _wd_kw = {"workdir": container_workdir} if container_workdir else {}
     try:
-        output, exit_code = await asyncio.to_thread(
-            sandbox_manager.execute, cmd, timeout=subprocess_timeout, **_wd_kw
-        )
+        # Serialize on the shared profile dir — concurrent Chromium launches
+        # on one user-data-dir crash each other (see _BROWSER_PROFILE_LOCK).
+        async with _BROWSER_PROFILE_LOCK:
+            output, exit_code = await asyncio.to_thread(
+                sandbox_manager.execute, cmd, timeout=subprocess_timeout, **_wd_kw
+            )
     except Exception as e:
         pretty_log("Browser Failed", f"{operation}: {type(e).__name__}: {e}",
                    icon=Icons.TOOL_BROWSER, level="ERROR")
@@ -1043,7 +1090,17 @@ async def tool_browser(
 
     ok, parsed = _parse_runner_output(output or "")
     if not ok:
-        pretty_log("Browser Failed", f"{operation}: runner exit {exit_code}",
+        # Surface the ACTUAL failure cause in the operator's live stream,
+        # not just "runner exit 1". `parsed` holds the runner's
+        # [BROWSER_ERR] line (or, when the runner died before emitting a
+        # sentinel, the raw stdout+stderr tail — stderr is merged in via
+        # docker exec demux=False). Truncated so a long Playwright
+        # traceback doesn't flood the stream; the full text still goes to
+        # the agent in the returned error below.
+        _cause = str(parsed).replace("\n", " ⏎ ")
+        if len(_cause) > 300:
+            _cause = _cause[:300] + "…"
+        pretty_log("Browser Failed", f"{operation}: runner exit {exit_code} — {_cause}",
                    icon=Icons.TOOL_BROWSER, level="WARNING")
         return _err(
             f"Runner failed (exit {exit_code}): {parsed}",

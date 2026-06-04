@@ -196,11 +196,11 @@
   <p><code>request_new_tor_identity()</code> in <code>utils/helpers.py</code> is the agent's circuit-burn primitive. Mechanically, it speaks the Tor control protocol to the local daemon and issues a <code>SIGNAL NEWNYM</code>: Tor marks the current circuit dirty, and every subsequent stream opens through a brand-new entry-guard / middle / exit chain. The agent's previous exit node is no longer reachable from the next hop.</p>
   <p>Rotation fires:</p>
   <ul>
-    <li><strong>Automatically on HTTP 401 / 403 / 503</strong> from <a href="tools/search.html"><code>web_search</code></a> — a gateway or exit refusal usually clears on a different chain.</li>
+    <li><strong>Automatically on HTTP 503</strong> from page <em>fetches</em> (<code>helper_fetch_url_content</code>) and file downloads — a gateway/exit-node rate-limit usually clears on a different chain. Note <code>401</code>/<code>403</code> do <em>not</em> rotate: those are application-level refusals (auth, geo-block) that a new exit won't fix.</li>
     <li><strong>Between retries</strong> in <a href="tools/system.html"><code>check_weather</code></a> (3 attempts with identity refresh) and any tool that elects to re-enter the pool rather than hammer the same circuit.</li>
-    <li><strong>Between parallel reformulations</strong> in <code>deep_research</code> — the N parallel queries do not all emerge from the same exit.</li>
     <li><strong>On explicit agent intent</strong> — the agent can invoke rotation as a tool step when a task's anonymity posture demands it (e.g. before re-visiting a site that just saw traffic).</li>
   </ul>
+  <p class="note">The <a href="tools/search.html"><code>web_search</code></a> / <code>deep_research</code> path deliberately does <strong>not</strong> use NEWNYM. Each query instead rides its own circuit via per-query SOCKS-auth isolation (<code>IsolateSOCKSAuth</code>), which is cheaper than a global re-circuit and doesn't serialize searches behind a slow rotation. See <a href="tools/search.html">search</a>.</p>
 
   <h3>What is and isn't routed through Tor</h3>
   <table>

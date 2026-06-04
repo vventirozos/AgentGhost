@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost Agent — Claude Trainer</title>
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <h3>Overview</h3>
+    <a href="index.html">Home</a>
+    <a href="capabilities.html">Capabilities</a>
+    <a href="architecture.html">System Architecture</a>
+    <a href="installation.html">Install &amp; Run</a>
+    <a href="cli_reference.html">CLI Reference</a>
+    <a href="audit_fixes.html">Audit &amp; hardening</a>
+    <a href="logging.html">Logging &amp; monitoring</a>
+
+    <h3>Core</h3>
+    <a href="core/agent.html">agent</a>
+    <a href="core/llm.html">llm</a>
+    <a href="core/bus.html">bus (memory)</a>
+    <a href="core/context_manager.html">context_manager</a>
+
+    <h3>Tooling &amp; scripts</h3>
+    <a class="current" href="claude_trainer.html">Claude trainer</a>
+
+    <h3>Sandbox &amp; API</h3>
+    <a href="sandbox/docker.html">Docker sandbox</a>
+    <a href="api/routes.html">HTTP routes</a>
+  </nav>
+</aside>
+
+<main>
+  <section class="hero">
+    <div class="eyebrow">Tooling &amp; scripts</div>
+    <h1>Claude trainer</h1>
+    <p class="subtitle"><code>scripts/claude_trainer.py</code> drives the agent's interactive learning loop using Claude as the teacher: it poses tasks, grades the answers, and issues corrections engineered to fire the agent's own <code>classify_user_correction</code> predicate — then re-tests in a fresh conversation to measure whether the lesson stuck.</p>
+    <div class="hero-meta">
+      <span class="badge">teacher = Claude</span>
+      <span class="badge">student = Ghost Agent</span>
+      <span class="badge good">closes the chat-learning loop</span>
+      <span class="badge">no weight updates</span>
+    </div>
+  </section>
+
+  <div class="note">
+    <strong>What it trains, and what it does not.</strong> The agent's interactive
+    self-improvement path is: a user message classified as a <em>correction</em> promotes the
+    prior assistant turn to <code>FAILED</code>
+    (<code>agent.py:_maybe_promote_prior_turn_via_user_correction</code>), which schedules a
+    fire-and-forget reflection that distils a lesson into <code>SkillMemory</code>
+    (<code>skills_playbook.json</code>). A later turn retrieves that lesson through the RRF
+    memory bus. The trainer exercises <em>exactly</em> this loop. It teaches retrieval-backed
+    <em>lessons</em>, not model weights — there is no fine-tuning.
+  </div>
+
+  <h2>The critical detail: making a correction actually trigger learning</h2>
+  <p>The agent only learns from a correction when
+  <code>distill/user_correction.py::classify_user_correction</code> returns
+  <code>is_correction=True</code>, which requires <strong>both</strong> signals:</p>
+  <table>
+    <thead><tr><th>Signal</th><th>Requirement</th></tr></thead>
+    <tbody>
+      <tr><td>A — phrase</td><td>An <em>anchored</em> correction phrase ("No, that's not right…") at the very start of the message.</td></tr>
+      <tr><td>B — rephrase</td><td>Jaccard token overlap ≥ 0.40 between the prior user question and the correction (the correction must restate the ask).</td></tr>
+    </tbody>
+  </table>
+  <p>A naive "you're wrong, the answer is X" satisfies A but misses B, so it
+  <strong>silently fails to record any lesson</strong>. <code>build_correction_message()</code>
+  therefore restates the question and is <em>trigger-first</em>: it appends the correct answer
+  only when the extra tokens don't dilute the overlap below 0.40; for short questions it
+  degrades to opener+question (learning still fires — the answer simply isn't embedded in the
+  trigger turn). When the package is importable the trainer verifies each correction against
+  the <em>real</em> classifier before sending via <code>correction_will_trigger()</code>.</p>
+
+  <h2>Per-task flow</h2>
+  <pre><code>1. ASK        send the question to the live agent (/api/chat)
+2. JUDGE      Claude grades the answer vs. an authoritative reference (0.0–1.0)
+3. CORRECT    if wrong, send a both-signals correction → agent promotes the
+              prior turn to FAILED and schedules a reflection that writes a lesson
+4. RE-JUDGE   grade the in-context follow-up answer
+5. WAIT       pause so the fire-and-forget reflection lands
+6. RETEST     re-ask in a FRESH conversation; Claude scores retention</code></pre>
+
+  <div class="note">
+    <strong>Teacher = official Anthropic SDK, in an isolated venv.</strong> The trainer calls
+    Claude through the official <code>anthropic</code> SDK (<code>messages.parse()</code> with
+    Pydantic schemas for structured grading/curriculum output, plus adaptive thinking, on
+    <code>claude-opus-4-8</code>) — not raw HTTP. The repo's shared <code>.agent.venv</code> pins
+    <code>anthropic</code> 0.4.1 (pre-Messages-API, required by evalplus/tau_bench), so the
+    trainer runs from a dedicated <code>.trainer.venv</code> to avoid disturbing that pin. The
+    <code>Ghost</code> client still uses <code>httpx</code> directly — it speaks the local agent's
+    OpenAI/Ollama API, which is not the Anthropic API.
+  </div>
+
+  <h2>Usage</h2>
+  <pre><code># One-time: isolated venv with a modern anthropic SDK
+python -m venv .trainer.venv
+.trainer.venv/bin/pip install anthropic pydantic 'httpx[socks]'
+
+# Claude invents a 6-task curriculum on a topic, then trains:
+ANTHROPIC_API_KEY=sk-... \
+.trainer.venv/bin/python scripts/claude_trainer.py --topic "PostgreSQL internals" --tasks 6
+
+# Train from a curriculum file (JSON list of {question, reference, domain}):
+.trainer.venv/bin/python scripts/claude_trainer.py --curriculum mytasks.json
+
+# Faster: skip the fresh-conversation retention re-test:
+.trainer.venv/bin/python scripts/claude_trainer.py --topic "Python asyncio" --no-retention
+
+# Write a machine-readable report:
+.trainer.venv/bin/python scripts/claude_trainer.py --topic "TCP/IP" --report /tmp/train.json</code></pre>
+
+  <h2>Configuration</h2>
+  <table>
+    <thead><tr><th>Flag</th><th>Env</th><th>Default</th></tr></thead>
+    <tbody>
+      <tr><td>--ghost-url</td><td>GHOST_URL</td><td>http://127.0.0.1:8000</td></tr>
+      <tr><td>--ghost-key</td><td>GHOST_API_KEY</td><td>(empty; sent as X-Ghost-Key + Bearer)</td></tr>
+      <tr><td>--ghost-model</td><td>GHOST_MODEL</td><td>qwen-3.6-35b-a3</td></tr>
+      <tr><td>--anthropic-key</td><td>ANTHROPIC_API_KEY</td><td>(required)</td></tr>
+      <tr><td>--claude-model</td><td>CLAUDE_MODEL</td><td>claude-opus-4-8</td></tr>
+      <tr><td>--tasks</td><td>—</td><td>6</td></tr>
+      <tr><td>--retention-delay</td><td>—</td><td>20 (seconds)</td></tr>
+      <tr><td>--no-retention</td><td>—</td><td>off</td></tr>
+    </tbody>
+  </table>
+
+  <h2>The report</h2>
+  <p>The console summary (and the optional <code>--report</code> JSON) tracks:
+  <code>first_try_correct</code>, <code>needed_teaching</code>,
+  <code>corrections_that_triggered_learning</code> (the count whose corrections actually fired
+  the predicate — watch this; if it is below <code>needed_teaching</code>, some lessons were
+  never recorded), <code>retention_tested</code>, and <code>retention_improved</code> (fresh
+  re-asks that scored materially higher than the first attempt — the real evidence a lesson
+  stuck).</p>
+
+  <div class="note">
+    <strong>Caveats.</strong> Requires the live agent (see Install &amp; Run) and an
+    <code>ANTHROPIC_API_KEY</code>. Reflection is judge-gated and fire-and-forget, so a lesson
+    can land slightly after the correction turn — that's why retention is measured after a
+    delay in a fresh conversation. Bad corrections poison retrieval, so teacher-grading quality
+    matters; the curriculum prompt asks Claude for single-answer, verifiable questions.
+  </div>
+
+  <p class="footer-note">Source: <code>scripts/claude_trainer.py</code> ·
+  Tests: <code>tests/test_claude_trainer_correction.py</code> ·
+  Learning loop: <code>core/agent.py</code>, <code>distill/user_correction.py</code>,
+  <code>reflection/loop.py</code>, <code>memory/skills.py</code>.</p>
+</main>
+</body>
+</html>

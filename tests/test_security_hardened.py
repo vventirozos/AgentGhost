@@ -176,10 +176,17 @@ async def test_search_ddgs_converts_proxy(mock_tor_proxy, mock_tor_proxy_h):
         # We also need to mock importlib.util.find_spec to return True
         with patch("importlib.util.find_spec", return_value=True):
             await tool_search_ddgs("test query", mock_tor_proxy)
-        
-        # Verify DDGS init
+
+        # Verify DDGS init. The security-relevant property is that the
+        # socks5:// scheme was upgraded to socks5h:// (DNS resolved at the
+        # proxy — no DNS leak). The proxy now ALSO carries a per-attempt
+        # circuit-isolation credential (_proxy_for_attempt rotates the Tor
+        # circuit each retry), so assert the scheme + host survive rather
+        # than exact string equality.
         _, kwargs = mock_ddgs.call_args
-        assert kwargs.get("proxy") == mock_tor_proxy_h
+        proxy_used = kwargs.get("proxy", "")
+        assert proxy_used.startswith("socks5h://"), f"DNS-leak-safe scheme lost: {proxy_used!r}"
+        assert "127.0.0.1:9050" in proxy_used, f"proxy host/port lost: {proxy_used!r}"
 
 # --- 6. Path Traversal Tests ---
 def test_path_traversal_prevention():

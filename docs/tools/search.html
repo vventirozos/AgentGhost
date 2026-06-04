@@ -37,17 +37,48 @@
 </aside>
 <main>
   <h1>tools / search.py</h1>
-  <p class="subtitle">Anonymous web search via DuckDuckGo + Tor, with reformulated fallbacks and multi-source synthesis.</p>
+  <p class="subtitle">Anonymous web search via Tor, over a <strong>Tor-reliable backend set</strong>, with operator sanitization, a short result cache, reformulated fallbacks and multi-source synthesis.</p>
 
   <h2>Tools</h2>
   <table>
     <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>web_search</code></td><td>DDG search via <code>ddgs</code> with Tor SOCKS proxy. 3 retries on transient errors. <code>request_new_tor_identity()</code> is called on 401/403/503 to rotate Tor circuits.</td></tr>
-      <tr><td><code>deep_research</code></td><td>Searches multiple reformulations and synthesises results via the LLM. Falls back to <code>web_search</code> when synthesis fails.</td></tr>
+      <tr><td><code>web_search</code></td><td>Search via <code>ddgs</code> over a Tor SOCKS proxy, against a curated backend set (<code>mojeek,duckduckgo,yandex,brave,google</code>). The query is sanitized first, then served from a short TTL cache on repeat. 3 attempts with a 1&nbsp;s backoff, <strong>each on a fresh Tor circuit</strong>; if all miss, two reformulated queries are tried before giving up. <strong>No <code>NEWNYM</code> rotation</strong> — per-attempt SOCKS circuit isolation handles freshness (see below).</td></tr>
+      <tr><td><code>deep_research</code></td><td>Same hardened search front-end (3 rotating attempts), then fetches the top URLs and synthesises results via the LLM. Falls back to <code>web_search</code> when synthesis fails.</td></tr>
       <tr><td><code>fact_check</code></td><td>Verifies a claim by calling <code>deep_research</code> as a sub-process.</td></tr>
     </tbody>
   </table>
+
+  <h2>Backend set + circuit rotation (Tor reliability)</h2>
+  <p>
+    <code>ddgs&nbsp;&ge;&nbsp;9</code> defaults to <code>backend="auto"</code>, which fans every query across <em>all</em> text engines. Two are excluded:
+  </p>
+  <ul>
+    <li><code>wikipedia</code> — its engine reads <code>region="wt-wt"</code> as language <code>wt</code> and builds the host <code>wt.wikipedia.org</code>, which doesn't exist, so it <strong>always</strong> raises a <code>ConnectError</code> over Tor.</li>
+    <li><code>yahoo</code> — never returned useful results in testing and is a known hang-until-timeout offender; pure latency risk, no upside.</li>
+  </ul>
+  <p>
+    The current set is <code>_TOR_BACKENDS = "mojeek,duckduckgo,yandex,brave,google"</code>. The crucial empirical finding (measured directly over Tor): <strong>no single engine is reliable — reachability is exit-node-dependent.</strong> On one circuit <code>mojeek</code> and <code>yandex</code> return results while <code>duckduckgo</code>/<code>brave</code>/<code>google</code> are CAPTCHA/empty; on the next circuit it flips. The engines that fast-fail (&ldquo;No results found&rdquo; in ~1.5&nbsp;s) are cheap lottery tickets, so breadth is kept; only genuine hangers are excluded.
+  </p>
+  <p>
+    Because reachability is per-exit, the real fix is <strong>rotating the Tor circuit on every attempt</strong>. <code>_proxy_for_attempt</code> folds the attempt index into the SOCKS <code>username:password</code>, so Tor's <code>IsolateSOCKSAuth</code> hands each attempt a different exit node (verified: distinct tags → distinct exit IPs). Previously every attempt reused the same per-query circuit, so a retry on a blocked exit was pointless — the most common reason a search would burn three tries and still return nothing. There are 3 primary attempts (8&nbsp;s timeout each, 1&nbsp;s backoff) plus 2 reformulations, every one on its own circuit. This replaces the old global <code>NEWNYM</code>, which re-circuited <em>all</em> of Tor and cost seconds per call.
+  </p>
+
+  <h2>Query sanitization</h2>
+  <p>
+    The DuckDuckGo / Brave / Mojeek <em>scraper</em> backends do not honour Google-style operators the way a real search API does: at best they're ignored, at worst the whole query returns <strong>zero results</strong>. The LLM is nonetheless prone to emitting them (the tool descriptions previously even encouraged <code>site:</code>). <code>_sanitize_query</code> strips them at the boundary, before a Tor round trip is spent:
+  </p>
+  <ul>
+    <li><code>site:</code> / <code>inurl:</code> / <code>intitle:</code> / <code>filetype:</code> / <code>ext:</code> operators (with their argument token).</li>
+    <li>Standalone boolean <code>OR</code> / <code>AND</code> (boundary-gated and case-insensitive, so an <code>or</code> buried inside a word survives, and dropping a stopword from natural prose is invisible to the scrapers).</li>
+    <li>Quotation marks (the words inside are kept).</li>
+  </ul>
+  <p>If stripping would empty the query (a pure-operator query with no keywords), the original is returned unchanged rather than sending an empty search. The tool descriptions in <code>registry.py</code> now instruct <strong>plain keywords only</strong> to match.</p>
+
+  <h2>Result cache</h2>
+  <p>
+    The model habitually fires many near-identical queries in one turn. A small in-process TTL cache (<code>_SEARCH_CACHE</code>, 300&nbsp;s, 64 entries, FIFO eviction) keyed on the normalized query serves the repeats from memory instead of re-paying the Tor round trip. <strong>Only successful results are cached</strong> — error strings never are, so a transient failure is always retried fresh.
+  </p>
 
   <h2>Reformulation strategy</h2>
   <ol>
@@ -71,7 +102,18 @@
 
   <h2>Per-identity Tor circuit isolation</h2>
   <p>
-    Under <code>--anonymous</code>, each search also rides a <strong>distinct Tor circuit</strong>: <code>helpers.socks_url_with_identity</code> injects a per-query SOCKS <code>username:password</code> into the proxy URL, and Tor's <code>IsolateSOCKSAuth</code> (on by default) maps distinct credentials to distinct circuits — so a colluding set of exit nodes / sites can't trivially link a sequence of different searches into one session. No NEWNYM thrash, no control port needed. The tag is a hash of the (scrubbed) query, so identical repeated queries reuse a circuit while different queries separate. Covered by <code>tests/test_quick_wins.py</code>.
+    Under <code>--anonymous</code>, each search also rides a <strong>distinct Tor circuit</strong>: <code>helpers.socks_url_with_identity</code> injects a SOCKS <code>username:password</code> into the proxy URL, and Tor's <code>IsolateSOCKSAuth</code> (on by default) maps distinct credentials to distinct circuits — so a colluding set of exit nodes / sites can't trivially link a sequence of different searches into one session. No NEWNYM thrash, no control port needed. Covered by <code>tests/test_quick_wins.py</code>.
+  </p>
+  <p>
+    The search path takes this one step further: <code>_proxy_for_attempt</code> folds <em>both</em> a query hash and the <em>attempt index</em> into the SOCKS tag, so retries of the same query land on <em>different</em> exits. This serves reliability (escape a blocked exit) and anonymity (a single logical search isn't pinned to one exit) at once.
+  </p>
+  <p>
+    This is also <em>why the search retry path no longer calls <code>request_new_tor_identity()</code></em>: a global <code>NEWNYM</code> re-circuits all of Tor (slow) and fights the per-attempt isolation above. The previous behaviour — 3 attempts, each rotating the identity and sleeping 5&nbsp;s, then two reformulations — could stretch a single failing search past 200&nbsp;s. The retry path now pauses 1&nbsp;s and rotates to a fresh circuit instead. (Page <em>fetches</em> in <code>helpers.helper_fetch_url_content</code> still rotate on <code>503</code>, where the exit node itself is rate-limited — that's the right place for it.)
+  </p>
+
+  <h2>Tests</h2>
+  <p>
+    The backend set, the query sanitizer, the result cache, and per-attempt circuit rotation (<code>_proxy_for_attempt</code>) are covered by <code>tests/test_search_tor_hardening.py</code>; the NEWNYM-free rotating-retry contract by <code>tests/test_tor_resilience.py</code>; the tool-description guidance and 3-attempt/2-reformulation counts by <code>tests/test_search_enhancements.py</code>.
   </p>
 
   <footer><a href="../index.html">← Back to index</a></footer>

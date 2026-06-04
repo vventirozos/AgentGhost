@@ -104,6 +104,13 @@ async def test_helper_fetch_url_content_retry_503_renews_tor():
 
 @pytest.mark.asyncio
 async def test_tool_search_ddgs_retry():
+    """Tor-resilience redesign: the search path no longer calls a global
+    NEWNYM between attempts. A global re-circuit is slow; instead each
+    attempt rotates onto its OWN Tor circuit via _proxy_for_attempt, so a
+    retry escapes a bad exit node without the NEWNYM cost. On a transient
+    failure we just pause briefly (1s) and try the next circuit — NO
+    request_new_tor_identity call.
+    """
     mock_ddgs_module = MagicMock()
     mock_ddgs_class = MagicMock()
     mock_ddgs_module.DDGS = mock_ddgs_class
@@ -112,22 +119,24 @@ async def test_tool_search_ddgs_retry():
          patch("importlib.util.find_spec", return_value=True), \
          patch("src.ghost_agent.utils.helpers.request_new_tor_identity") as mock_renew, \
          patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-         
-        # Make DDGS context manager raise exception first time, return results second time
+
+        # Fail once, then succeed on the second attempt (a fresh circuit).
         mock_ddgs_instance = MagicMock()
         mock_ddgs_class.return_value.__enter__.return_value = mock_ddgs_instance
-        
-        mock_ddgs_instance.text.side_effect = [Exception("Tor blocked")] * 2 + [[{"title": "t", "body": "b", "href": "h"}]]
-        
+
+        mock_ddgs_instance.text.side_effect = [Exception("Tor blocked")] + [[{"title": "t", "body": "b", "href": "h"}]]
+
         result = await tool_search_ddgs("test query", "socks5://127.0.0.1:9050")
-        
+
         assert "1. t" in result
-        # Check that it called renew because it had tor_proxy
-        assert mock_renew.call_count == 2
-        mock_sleep.assert_called_with(5)
+        # NEWNYM thrash removed — rotation no longer happens on search retry.
+        assert mock_renew.call_count == 0
+        # Backoff between the two attempts is a short 1s pause, not 5s.
+        mock_sleep.assert_called_with(1)
 
 @pytest.mark.asyncio
 async def test_tool_deep_research_retry():
+    """Same NEWNYM-free retry contract as web_search (see above)."""
     mock_ddgs_module = MagicMock()
     mock_ddgs_class = MagicMock()
     mock_ddgs_module.DDGS = mock_ddgs_class
@@ -136,21 +145,21 @@ async def test_tool_deep_research_retry():
          patch("importlib.util.find_spec", return_value=True), \
          patch("src.ghost_agent.utils.helpers.request_new_tor_identity") as mock_renew, \
          patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-         
+
         mock_ddgs_instance = MagicMock()
         mock_ddgs_class.return_value.__enter__.return_value = mock_ddgs_instance
-        
-        # 2 Exceptions to exhaust the first attempts, then valid results on attempt 3
-        mock_ddgs_instance.text.side_effect = [Exception("Tor blocked deep")] * 2 + [[{"title": "t1", "body": "b1", "href": "http://example.com/good"}]]
-        
+
+        # Fail once, then valid results on the second attempt (fresh circuit).
+        mock_ddgs_instance.text.side_effect = [Exception("Tor blocked deep")] + [[{"title": "t1", "body": "b1", "href": "http://example.com/good"}]]
+
         # mock semaphore and requests for deep research parsing
         with patch("src.ghost_agent.tools.search.helper_fetch_url_content", new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = "Mocked content of site"
             result = await tool_deep_research("test query deep", anonymous=True, tor_proxy="socks5://127.0.0.1:9050")
-            
+
             assert "http://example.com/good" in result
-            assert mock_renew.call_count == 2
-            mock_sleep.assert_called_with(5)
+            assert mock_renew.call_count == 0
+            mock_sleep.assert_called_with(1)
 
 
 from src.ghost_agent.tools.file_system import tool_download_file

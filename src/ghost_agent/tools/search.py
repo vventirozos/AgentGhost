@@ -3,7 +3,9 @@ import importlib.util
 import json
 import os
 import copy
-from typing import List, Dict, Any, Callable, Optional
+import re
+import time
+from typing import List, Dict, Any, Callable, Optional, Tuple
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import helper_fetch_url_content
 
@@ -20,6 +22,116 @@ _JUNK_DOMAINS = [
     "medium.com", "msn.com", "cnn.com", "foxnews.com", "wsj.com",
     "csdn.net", "sohu.com", "sina.com", "forums.att.com",
 ]
+
+# Search backends queried over Tor. ddgs>=9 defaults to backend="auto",
+# which fans EVERY query across all text engines. Two are actively
+# harmful here and are dropped:
+#   * wikipedia — its engine treats region="wt-wt" as language "wt" and
+#     builds `https://wt.wikipedia.org/...`, a host that doesn't exist, so
+#     it ALWAYS raises a ConnectError over Tor (observed in traces).
+#   * yahoo     — never returns useful results in testing and is a known
+#     hang-until-timeout offender over Tor; pure latency risk, no upside.
+# The rest are kept. Empirically (measured directly over Tor) NO single
+# engine is reliable — reachability is EXIT-NODE-dependent: `mojeek` and
+# `yandex` return results on one circuit while `duckduckgo`/`brave`/
+# `google` are CAPTCHA/empty, and on the next circuit it flips. Breadth +
+# per-attempt circuit rotation (see _proxy_for_attempt) is what actually
+# wins, so we keep a WIDE set rather than betting on one engine. The
+# fast-failing engines ("No results found" in ~1.5s) are cheap lottery
+# tickets; only genuine hangers are worth excluding. Order is advisory;
+# ddgs re-sorts by engine.priority internally.
+_TOR_BACKENDS = "mojeek,duckduckgo,yandex,brave,google"
+
+# Small in-process TTL cache so the model's habit of firing many
+# near-identical queries in one turn doesn't re-pay the full Tor round
+# trip each time. Keyed on the normalized (sanitized, lower-cased) query.
+# Only SUCCESSFUL results are cached — never error strings.
+_SEARCH_CACHE_TTL = 300.0  # seconds
+_SEARCH_CACHE_MAX = 64
+_SEARCH_CACHE: Dict[str, Tuple[float, str]] = {}
+
+
+def _sanitize_query(query: str) -> str:
+    """Strip search operators the ddgs scraper backends choke on.
+
+    The LLM is prone to emitting Google-style operators — `site:`,
+    quoted phrases, boolean `OR`/`AND` (e.g.
+    ``foo "bar" site:x.com or site:y.com``). The DuckDuckGo / Brave /
+    Mojeek HTML scrapers don't honour these the way a real search API
+    does: at best they're ignored, at worst the whole query returns ZERO
+    results. We reduce to plain keywords so the backends can match. If
+    stripping empties the query, the original is returned unchanged.
+    """
+    if not query:
+        return query
+    q = query
+    # Drop site:/inurl:/intitle:/filetype: operators along with their argument
+    q = re.sub(r'\b(?:site|inurl|intitle|filetype|ext)\s*:\s*\S+', ' ', q, flags=re.IGNORECASE)
+    # Drop standalone boolean operators. Case-insensitive but boundary-gated,
+    # so only the free-standing token `or`/`and`/`OR`/`AND` goes — never an
+    # `or` buried inside a word, and the loss of a stopword in natural prose
+    # (e.g. "law and order") is invisible to the DDG/Brave/Mojeek scrapers,
+    # which treat or/and as stopwords regardless.
+    q = re.sub(r'(?<!\w)(?:or|and)(?!\w)', ' ', q, flags=re.IGNORECASE)
+    # Drop quotes but keep the words inside them
+    q = q.replace('"', ' ').replace("“", ' ').replace("”", ' ')
+    # Collapse whitespace
+    q = re.sub(r'\s+', ' ', q).strip()
+    return q or query
+
+
+def _cache_get(key: str) -> Optional[str]:
+    entry = _SEARCH_CACHE.get(key)
+    if not entry:
+        return None
+    ts, value = entry
+    if (time.monotonic() - ts) > _SEARCH_CACHE_TTL:
+        _SEARCH_CACHE.pop(key, None)
+        return None
+    return value
+
+
+def _cache_put(key: str, value: str) -> None:
+    # Bounded FIFO eviction — drop the oldest entry when full.
+    if len(_SEARCH_CACHE) >= _SEARCH_CACHE_MAX:
+        oldest = min(_SEARCH_CACHE, key=lambda k: _SEARCH_CACHE[k][0])
+        _SEARCH_CACHE.pop(oldest, None)
+    _SEARCH_CACHE[key] = (time.monotonic(), value)
+
+
+def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int) -> Optional[str]:
+    """Return the SOCKS proxy URL for a given retry attempt, tagged so each
+    attempt rides a DISTINCT Tor circuit (a fresh exit node).
+
+    Search-engine reachability over Tor is exit-node-dependent: a query
+    that fails on one exit (block / CAPTCHA / connect error) routinely
+    succeeds on the next. Retrying on the SAME circuit is therefore
+    near-useless — yet that's exactly what happened before, because the
+    per-query SOCKS tag was identical across attempts. Here we fold the
+    attempt index into the SOCKS ``username:password`` so Tor's
+    ``IsolateSOCKSAuth`` (on by default) maps each attempt to its own
+    circuit. Cheap, control-port-free, and verified to yield different
+    exit IPs per tag — the alternative to a slow global NEWNYM.
+
+    Any credentials already on the incoming proxy are stripped and
+    replaced: the ``tool_search`` wrapper may have applied a per-query
+    tag, but we fold the query hash into our own tag so per-query
+    isolation is preserved while still rotating per attempt.
+    """
+    if not base_proxy:
+        return base_proxy
+    try:
+        import hashlib
+        from urllib.parse import urlparse, urlunparse
+        from ..utils.helpers import socks_url_with_identity
+        p = urlparse(base_proxy)
+        if not p.hostname:
+            return base_proxy
+        bare = urlunparse((p.scheme, f"{p.hostname}:{p.port or 9050}", "", "", "", ""))
+        qh = hashlib.md5((query or "").encode("utf-8", "ignore")).hexdigest()[:8]
+        return socks_url_with_identity(bare, f"{qh}a{attempt}") or base_proxy
+    except Exception:
+        return base_proxy
 
 
 def truncate_query(query: str, limit: int = 35) -> str:
@@ -91,9 +203,21 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
     if tor_proxy and "socks5://" in tor_proxy and "socks5h://" not in tor_proxy:
         tor_proxy = tor_proxy.replace("socks5://", "socks5h://")
 
+    # Strip Google-style operators the ddgs scraper backends choke on
+    # (site:/quotes/boolean OR) BEFORE we spend a Tor round trip on a
+    # query that would return nothing. This is the in-code backstop for
+    # the LLM occasionally ignoring the "plain keywords only" guidance.
+    query = _sanitize_query(query)
+
     # Log with TOR status and truncated query
     pretty_log("DDGS Search", query, icon=Icons.TOOL_SEARCH)
-    
+
+    # Cache hit: the model fires many near-identical queries per turn.
+    _cache_key = (query or "").strip().lower()
+    _cached = _cache_get(_cache_key)
+    if _cached is not None:
+        return _cached
+
     def format_search_results(results: List[Dict]) -> str:
         formatted = []
         for i, res in enumerate(results, 1):
@@ -107,15 +231,20 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         return "CRITICAL ERROR: 'ddgs' library is missing. Search is impossible."
 
     from ddgs import DDGS
-    from ..utils.helpers import request_new_tor_identity
+    # NOTE: we deliberately do NOT call request_new_tor_identity() between
+    # attempts. A global NEWNYM re-circuits all of Tor (slow). Instead each
+    # attempt rotates onto its OWN circuit via _proxy_for_attempt — search
+    # reachability over Tor is exit-node-dependent, so a fresh exit per try
+    # is what actually beats a block, and it's far cheaper than NEWNYM.
     for attempt in range(3):
         try:
+            attempt_proxy = _proxy_for_attempt(tor_proxy, query, attempt)
             def run():
-                kwargs: Dict[str, Any] = {"timeout": 20}
-                if tor_proxy:
-                    kwargs["proxy"] = tor_proxy
+                kwargs: Dict[str, Any] = {"timeout": 8}
+                if attempt_proxy:
+                    kwargs["proxy"] = attempt_proxy
                 with DDGS(**kwargs) as ddgs:
-                    res = list(ddgs.text(query, max_results=20, region="wt-wt", safesearch="moderate"))
+                    res = list(ddgs.text(query, max_results=20, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS))
                     if res: return res
                 return []
             raw_results = await asyncio.to_thread(run)
@@ -128,34 +257,34 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
                 valid_results.append(r)
 
             if not valid_results:
-                raise ValueError("DuckDuckGo returned empty or CAPTCHA garbage. Force IP cycling.")
+                raise ValueError("DuckDuckGo returned empty or CAPTCHA garbage.")
 
             valid_results = valid_results[:8]  # type: ignore # Keep the top 8 relevant valid results
-                
+
             clean_output = format_search_results(valid_results)
+            _cache_put(_cache_key, clean_output)
             return clean_output
         except Exception as e:
             pretty_log("Search Error", str(e), level="WARNING", icon=Icons.WARN)
             if attempt < 2:
-                if tor_proxy:
-                    await asyncio.to_thread(request_new_tor_identity)
-                    await asyncio.sleep(5)
-                else:
-                    await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
     # --- QUERY REFORMULATION ---
     # All 3 attempts with the original query failed. Before giving up,
-    # try 2 reformulated queries: one broader, one as a question.
+    # try 2 reformulated queries: one broader, one as a question. Each
+    # also rides its own fresh circuit (offset index so its tags don't
+    # collide with the primary attempts').
     reformulations = _reformulate_query(query)
-    for reformulated in reformulations:
+    for ridx, reformulated in enumerate(reformulations):
         pretty_log("Search Retry", f"Reformulated: {truncate_query(reformulated)}", icon=Icons.TOOL_SEARCH)
         try:
+            attempt_proxy = _proxy_for_attempt(tor_proxy, reformulated, 10 + ridx)
             def run_reformulated():
-                kwargs_r: Dict[str, Any] = {"timeout": 20}
-                if tor_proxy:
-                    kwargs_r["proxy"] = tor_proxy
+                kwargs_r: Dict[str, Any] = {"timeout": 8}
+                if attempt_proxy:
+                    kwargs_r["proxy"] = attempt_proxy
                 with DDGS(**kwargs_r) as ddgs:
-                    res = list(ddgs.text(reformulated, max_results=20, region="wt-wt", safesearch="moderate"))
+                    res = list(ddgs.text(reformulated, max_results=20, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS))
                     return res or []
             raw_results = await asyncio.to_thread(run_reformulated)
             valid_results = []
@@ -167,7 +296,9 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
             if valid_results:
                 valid_results = valid_results[:8]
                 clean_output = format_search_results(valid_results)
-                return f"[Reformulated query: '{reformulated}']\n\n{clean_output}"
+                result = f"[Reformulated query: '{reformulated}']\n\n{clean_output}"
+                _cache_put(_cache_key, result)
+                return result
         except Exception:
             continue
 
@@ -220,29 +351,37 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     if tor_proxy and "socks5://" in tor_proxy and "socks5h://" not in tor_proxy:
         tor_proxy = tor_proxy.replace("socks5://", "socks5h://")
 
+    # Strip Google-style operators the scraper backends choke on (runs
+    # AFTER the optional anonymous re-authoring above so we sanitize
+    # whatever query actually goes to the wire).
+    query = _sanitize_query(query)
+
     pretty_log("Deep Research", query, icon=Icons.TOOL_DEEP)
-    
+
     urls = []
-    
+
     if not importlib.util.find_spec("ddgs"):
         return "CRITICAL ERROR: 'ddgs' library is missing. Search is impossible."
-        
+
     from ddgs import DDGS
-    from ..utils.helpers import request_new_tor_identity
-    
+    # NEWNYM thrash removed; each attempt rotates onto its own Tor circuit
+    # via _proxy_for_attempt instead (see tool_search_ddgs for the why).
+    # Pinned backend set drops the broken `wikipedia` (wt-wt → bad host)
+    # and useless `yahoo` engines.
     for attempt in range(3):
         try:
+            attempt_proxy = _proxy_for_attempt(tor_proxy, query, attempt)
             def run():
-                kwargs: Dict[str, Any] = {"timeout": 20}
-                if tor_proxy:
-                    kwargs["proxy"] = tor_proxy
+                kwargs: Dict[str, Any] = {"timeout": 8}
+                if attempt_proxy:
+                    kwargs["proxy"] = attempt_proxy
                 with DDGS(**kwargs) as ddgs:
-                    res = list(ddgs.text(query, max_results=15, region="wt-wt", safesearch="moderate"))
+                    res = list(ddgs.text(query, max_results=15, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS))
                     if res: return res
                 return []
             results = await asyncio.to_thread(run)
             if not results:
-                raise ValueError("DuckDuckGo returned empty list (Likely Tor Block). Force IP cycling.")
+                raise ValueError("DuckDuckGo returned empty list (Likely Tor Block).")
 
             valid_urls = []
             for r in results:
@@ -251,18 +390,14 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
                     continue
                 valid_urls.append(r.get('href', r.get('url', '')))
             if not valid_urls:
-                raise ValueError("DuckDuckGo returned empty or CAPTCHA garbage. Force IP cycling.")
-            
+                raise ValueError("DuckDuckGo returned empty or CAPTCHA garbage.")
+
             urls = valid_urls[:8]  # type: ignore
             break # Success, we have our URLs
         except Exception as e:
             pretty_log("Search Error", str(e), level="WARNING", icon=Icons.WARN)
             if attempt < 2:
-                if tor_proxy:
-                    await asyncio.to_thread(request_new_tor_identity)
-                    await asyncio.sleep(5)
-                else:
-                    await asyncio.sleep(1)
+                await asyncio.sleep(1)
             else:
                 return f"CRITICAL ERROR: Deep Research search phase failed."
 

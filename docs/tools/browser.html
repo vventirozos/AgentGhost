@@ -130,11 +130,19 @@ browser(operation="close")                             # wipes profile + sidecar
   <h2>Tor &amp; DNS-leak hardening</h2>
   <p>When the sandbox was started with a <code>tor_proxy</code>, every op forwards it as Chromium's <code>--proxy-server</code>. The in-sandbox runner (<code>_chromium_args</code>) always adds, alongside the Docker-safe flags:</p>
   <ul>
-    <li><code>--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost"</code> — forces DNS through the SOCKS proxy; <code>EXCLUDE localhost</code> keeps the self-play fixture server + in-container services reachable.</li>
+    <li><code>--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost , EXCLUDE &lt;proxy-host&gt;"</code> — forces DNS through the SOCKS proxy; <code>EXCLUDE localhost</code> keeps the self-play fixture server + in-container services reachable, and <strong>the proxy's own host is excluded too</strong> (see the warning below).</li>
     <li><code>--webrtc-ip-handling-policy=disable_non_proxied_udp</code> — blocks WebRTC STUN/TURN egress that could expose the host IP.</li>
     <li><code>--disable-features=WebRtcHideLocalIpsWithMdns</code> — pairs with the above.</li>
   </ul>
+  <p class="note">
+    <strong>The proxy host MUST be excluded from the <code>MAP * ~NOTFOUND</code> rule.</strong> The rule maps every hostname to a non-existent address to defeat DNS leaks — but it also catches the proxy server's own host (e.g. <code>127.0.0.1</code>), so Chromium can't resolve/reach the SOCKS proxy and <em>every</em> navigation dies with <code>net::ERR_PROXY_CONNECTION_FAILED</code>. <code>EXCLUDE localhost</code> does <em>not</em> cover the <code>127.0.0.1</code> literal. <code>_chromium_args</code> therefore parses the proxy URL and appends <code>EXCLUDE &lt;host&gt;</code> for whatever host it uses (an IP like <code>127.0.0.1</code> or a name like <code>host.docker.internal</code>). This was a silent, total break of browser-over-Tor — every <code>navigate</code> returned a bare <code>runner exit 1</code> until the failure-cause was surfaced to the stream (see below) and the missing exclude was found. Regression-guarded in <code>tests/test_browser_tool.py</code>.
+  </p>
   <p>Chromium only accepts the <code>socks5://</code> URL scheme. If the caller supplies <code>socks5h://</code> (some repo helpers do, for <code>httpx</code> compatibility), the tool auto-rewrites — DNS-over-proxy is enforced via <code>--host-resolver-rules</code> regardless of URL scheme.</p>
+
+  <h3>Navigation milestone over Tor: <code>domcontentloaded</code> by default</h3>
+  <p>
+    The full <code>load</code> event waits for <em>every</em> subresource — images, fonts, analytics beacons, long-poll sockets. Over a slow Tor exit those frequently never settle within the timeout, so a page that had already delivered the content the agent wanted would raise a Playwright <code>TimeoutError</code> and the runner would exit 1 (the classic <code>navigate: runner exit 1</code>). So <code>_build_op_payload</code> now applies a proxy-aware default: <strong>when a proxy is set and the caller hasn't pinned <code>wait_until</code>, it defaults to <code>domcontentloaded</code></strong> (the HTML-parsed milestone) instead of <code>load</code>. An explicit <code>wait_until</code> always wins, and without a proxy (e.g. a local <code>file://</code> fixture) the runner keeps its own <code>load</code> default. For SPAs that paint after DOMContentLoaded, pass an explicit <code>wait_until="networkidle"</code> or use <code>interact</code> with a <code>wait_for_selector</code>. Covered by <code>tests/test_browser_tor_diagnostics.py</code>.
+  </p>
 
   <h2>Runner protocol</h2>
   <p>A tiny script <code>.browser_runner.py</code> is written into <code>/workspace</code> on every call and invoked as <code>python3 .browser_runner.py &lt;op_json&gt;</code>. It emits exactly one sentinel line:</p>
@@ -155,8 +163,11 @@ TITLE: Example Domain</code></pre>
   <ul>
     <li>Unknown operation → <code>STATUS: ERROR</code> with valid-ops list.</li>
     <li>Runner exits non-zero with a sentinel → the error is surfaced verbatim, plus a timeout/install hint.</li>
-    <li>Chromium crashes before printing a sentinel → raw tail of stderr is returned so the agent has something to debug with.</li>
+    <li>Chromium crashes before printing a sentinel → raw tail of stdout+stderr is returned so the agent has something to debug with (docker <code>exec_run</code> uses <code>demux=False</code>, so stderr is merged into the captured stream).</li>
   </ul>
+  <p>
+    <strong>Operator visibility:</strong> the failure is also logged to the live stream with the <em>actual cause</em> (truncated to one line), e.g. <code>Browser Failed — navigate: runner exit 1 — TimeoutError: page.goto: Timeout 30000ms exceeded</code>, rather than a bare <code>runner exit 1</code>. Previously the cause only reached the agent's tool result, leaving anyone watching the stream blind to <em>why</em> a browser op failed. The full text still goes to the agent.
+  </p>
 
   <h2>Interact abort semantics (navigation failures are terminal)</h2>
   <p>Under the default <code>stop_on_error=False</code>, a per-action failure (e.g. a click on a missing selector) is recorded and the loop continues — useful for "try all these selectors, tell me which matched" exploratory flows.</p>

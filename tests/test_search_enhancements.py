@@ -15,11 +15,18 @@ def test_registry_descriptions():
     desc_ws = web_search["function"]["description"]
     desc_dr = deep_research["function"]["description"]
 
+    # The descriptions now STEER AWAY from operators: the ddgs scraper
+    # backends (DuckDuckGo/Brave/Mojeek) ignore site:/quotes/boolean and
+    # return zero results when the model includes them. So the guidance
+    # must (a) keep the concise-keyword rule and (b) explicitly forbid
+    # search operators rather than recommend them.
     assert "CRITICAL: Keep your queries concise" in desc_ws
-    assert "site:wikipedia.org" in desc_ws
+    assert "PLAIN KEYWORDS ONLY" in desc_ws
+    assert "site:wikipedia.org" not in desc_ws
 
     assert "CRITICAL: Keep your queries concise" in desc_dr
-    assert "site:wikipedia.org" in desc_dr
+    assert "PLAIN KEYWORDS ONLY" in desc_dr
+    assert "site:wikipedia.org" not in desc_dr
 
 @pytest.mark.asyncio
 @patch("ddgs.DDGS")
@@ -36,7 +43,10 @@ async def test_tool_search_ddgs_params(mock_find_spec, mock_ddgs):
     # Audit fix #9: bumped DDGS request from max_results=10 to 20 (we
     # still keep only the top 8 valid results after junk-domain filtering;
     # over-fetching gives the filter more material to work with).
-    mock_ddgs_instance.text.assert_any_call("test param query", max_results=20, region="wt-wt", safesearch="moderate")
+    # Tor-resilience fix: backend is now PINNED to the engines that work
+    # over Tor (yahoo/yandex dropped — they hung until timeout).
+    from src.ghost_agent.tools.search import _TOR_BACKENDS
+    mock_ddgs_instance.text.assert_any_call("test param query", max_results=20, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS)
     assert "1. Test" in result
 
 @pytest.mark.asyncio
@@ -63,8 +73,9 @@ async def test_tool_deep_research_params_and_sorting(mock_find_spec, mock_fetch,
 
     result = await tool_deep_research("test query", False, None)
 
-    mock_ddgs_instance.text.assert_any_call("test query", max_results=15, region="wt-wt", safesearch="moderate")
-    
+    from src.ghost_agent.tools.search import _TOR_BACKENDS
+    mock_ddgs_instance.text.assert_any_call("test query", max_results=15, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS)
+
     # Junk domains should be filtered out
     assert "https://www.forbes.com" not in result
     assert "tiktok.com" not in result
@@ -89,13 +100,15 @@ async def test_tool_search_ddgs_empty_list_triggers_tor_cycle(mock_find_spec, mo
     mock_ddgs.return_value.__enter__.return_value = mock_ddgs_instance
     mock_ddgs_instance.text.return_value = [] # Empty list to trigger ValueError
     
-    # We pass an invalid tor_proxy parameter to force the ValueError to be swallowed
-    # inside the Except block and it should sleep for 1 sec rather than crashing. 
-    # Because there are 3 retries, the final error message should be returned:
+    # Empty results raise ValueError, swallowed in the except block (1s
+    # sleep, no NEWNYM — each attempt rotates circuits instead). After the
+    # primary attempts exhaust, query reformulation kicks in. Final tally:
+    # 3 primary attempts + 2 reformulation attempts = 5 calls, then the
+    # ZERO-results message.
     result = await tool_search_ddgs("test query", None)
-    
+
     assert "DuckDuckGo returned ZERO results" in result
-    assert mock_ddgs_instance.text.call_count >= 3
+    assert mock_ddgs_instance.text.call_count == 5
 
 
 @pytest.mark.asyncio
@@ -109,10 +122,11 @@ async def test_tool_deep_research_empty_list_triggers_tor_cycle(mock_find_spec, 
     mock_ddgs_instance.text.return_value = [] # Empty list to trigger error
     
     result = await tool_deep_research("test query", False, None)
-    
-    # Ensure it reaches the final failure block and the deep research fails gracefully
+
+    # Ensure it reaches the final failure block and the deep research fails gracefully.
+    # deep_research does 3 attempts (no reformulation stage), each on a fresh circuit.
     assert "CRITICAL ERROR: Deep Research search phase failed." in result
-    assert mock_ddgs_instance.text.call_count >= 3
+    assert mock_ddgs_instance.text.call_count == 3
 
 
 @pytest.mark.asyncio
@@ -129,7 +143,7 @@ async def test_tool_search_ddgs_exception_logging(mock_find_spec, mock_ddgs, moc
 
     await tool_search_ddgs("test params", None)
 
-    # 3 original retries + 2 reformulation attempts = 5 total calls
+    # 3 primary attempts + 2 reformulation attempts = 5 total calls
     assert mock_ddgs_instance.text.call_count == 5
 
     logs = [call.args[1] for call in mock_pretty_log.call_args_list]
@@ -148,7 +162,7 @@ async def test_tool_deep_research_exception_logging(mock_find_spec, mock_ddgs, m
     mock_ddgs.return_value = mock_ddgs_instance
 
     result = await tool_deep_research("test params", False, None)
-    
+
     assert mock_ddgs_instance.text.call_count == 3
     assert "CRITICAL ERROR: Deep Research search phase failed." in result
     

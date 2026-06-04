@@ -381,8 +381,24 @@ def test_runner_chromium_args_dns_leak_guard_with_proxy(monkeypatch):
     assert "--host-resolver-rules=MAP * ~NOTFOUND" in joined
     # Localhost must be excluded (self-play + container services)
     assert "EXCLUDE localhost" in joined
+    # CRITICAL regression guard: the proxy's OWN host must be excluded from
+    # the MAP-everything-to-NOTFOUND rule, or Chromium can't resolve/reach
+    # the SOCKS server and every navigation dies with
+    # net::ERR_PROXY_CONNECTION_FAILED. `EXCLUDE localhost` does NOT cover
+    # the 127.0.0.1 literal — so the parsed proxy host must appear too.
+    assert "EXCLUDE 127.0.0.1" in joined
     # WebRTC IP-leak guards
     assert "--webrtc-ip-handling-policy=disable_non_proxied_udp" in joined
+
+
+def test_runner_chromium_args_excludes_hostname_proxy(monkeypatch):
+    """The proxy-host exclusion must work for a hostname proxy too (e.g.
+    a bridge-networked container reaching the host via
+    host.docker.internal), not just the 127.0.0.1 literal."""
+    mod = _load_runner_module(monkeypatch)
+    joined = " ".join(mod._chromium_args("socks5://host.docker.internal:9050"))
+    assert "EXCLUDE host.docker.internal" in joined
+    assert "EXCLUDE localhost" in joined
 
 
 # --- 5b. last_url sidecar: cross-op continuity ------------------------------
