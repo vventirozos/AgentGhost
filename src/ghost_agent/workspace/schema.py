@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import re
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
@@ -139,6 +140,12 @@ class WorkspaceEvent:
     timestamp: str = field(default_factory=_utcnow_iso)
     payload: Dict[str, Any] = field(default_factory=dict)
     summary: str = ""
+    # Which project this event belongs to ("" = project-agnostic, e.g. a
+    # web research pull or a generic note). Stamped at record time so the
+    # wake-up prefix can scope events to the ACTIVE project and not bleed a
+    # PRIOR project's files into a new one (the cross-project file:// pull
+    # that trapped a fresh build in an infinite "read missing file" loop).
+    project_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -154,7 +161,53 @@ class WorkspaceEvent:
             timestamp=str(d.get("timestamp") or _utcnow_iso()),
             payload=dict(d.get("payload") or {}),
             summary=str(d.get("summary") or ""),
+            project_id=str(d.get("project_id") or ""),
         )
+
+
+# Project ids are hex hashes (e.g. ``991e52bce912``); the canonical
+# on-disk layout scopes a project's files under ``projects/<id>/``. We
+# anchor on that segment to recover an event's project from a file path
+# even for LEGACY events written before ``project_id`` stamping existed.
+_PROJECTS_PATH_RE = re.compile(r"projects/([0-9a-fA-F]{6,})\b")
+
+
+def derive_event_project_id(ev: "WorkspaceEvent") -> str:
+    """Best-effort: which project does this workspace event belong to?
+
+    Returns the lowercased project id, or ``""`` when the event is
+    project-agnostic (a web research pull, a generic note/command with no
+    project path). Prefers the explicit ``project_id`` stamp; falls back
+    to parsing a ``projects/<id>/`` segment out of the event's URL / path /
+    summary so events logged before stamping existed are still scoped."""
+    pid = (getattr(ev, "project_id", "") or "").strip()
+    if pid:
+        return pid.lower()
+    payload = getattr(ev, "payload", None) or {}
+    hay = " ".join(
+        str(payload.get(k, "")) for k in ("url", "path", "command", "filename")
+    ) + " " + (getattr(ev, "summary", "") or "")
+    m = _PROJECTS_PATH_RE.search(hay)
+    return m.group(1).lower() if m else ""
+
+
+def filter_events_for_project(
+    events: List["WorkspaceEvent"], active_project_id: Optional[str],
+) -> List["WorkspaceEvent"]:
+    """Keep events that are project-agnostic OR belong to the active
+    project; drop events that clearly belong to a DIFFERENT project.
+
+    When ``active_project_id`` is falsy (no project in context), keep
+    everything — a free-chat / cross-project view is correct there."""
+    active = (active_project_id or "").strip().lower()
+    if not active:
+        return list(events)
+    kept: List["WorkspaceEvent"] = []
+    for ev in events:
+        owner = derive_event_project_id(ev)
+        if not owner or owner == active:
+            kept.append(ev)
+    return kept
 
 
 @dataclass

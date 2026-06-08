@@ -11,13 +11,22 @@ Two capabilities:
 """
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("GhostAgent")
+
+# Hard cap per image fed to the visual verifier. The vision node rasterises
+# and base64-encodes every image into the prompt; an oversized screenshot
+# (or a hostile artifact) would blow the context / OOM the host. Mirrors the
+# tools/vision.py MAX_VISION_BYTES guard.
+_MAX_VISUAL_BYTES = 16 * 1024 * 1024
 
 
 class VerifyVerdict(str, Enum):
@@ -111,6 +120,32 @@ Respond ONLY with a JSON object:
   "confidence": 0.0-1.0,
   "reasoning": "one sentence",
   "issues": ["list of specific problems, if any"]
+}}"""
+
+_VERIFY_VISUAL_PROMPT = """You are a meticulous UI auditor. The user reported a VISUAL problem; the agent then acted and gave a RESPONSE. Looking ONLY at the image(s), decide whether the agent's RESPONSE is HONEST about the current rendered state. You are catching FALSE claims of success — not grading whether the work is done.
+
+USER SYMPTOM (the visual problem, in the user's words):
+{symptom}
+
+AGENT'S RESPONSE (its claim about the result):
+{claim}
+
+IMAGES PROVIDED (in order):
+{images_desc}
+
+Judge the agent's RESPONSE against the pixels:
+- The RESPONSE accurately describes what is visible — whether it claims the problem is FIXED and the image confirms it, OR it honestly reports the problem is STILL PRESENT and the image confirms that → CONFIRMED. (An honest "it's still broken" is accurate and must NOT be refuted.)
+- The RESPONSE MISREPRESENTS the pixels — most importantly, it claims the problem is fixed/resolved while the image still shows it broken; or it claims success while the screenshot is blank/black or stuck on a loading screen; or it claims it's broken when the image is actually fine → REFUTED.
+- The image is blank, mid-load, or genuinely ambiguous so you cannot tell → UNCERTAIN.
+
+A stuck loading/"Starting…" screen is NOT a fixed UI. Be conservative: only REFUTE when the image clearly contradicts the response.
+
+Respond ONLY with a JSON object:
+{{
+  "verdict": "CONFIRMED" | "REFUTED" | "UNCERTAIN",
+  "confidence": 0.0-1.0,
+  "reasoning": "one sentence describing what you actually see vs. what the response claims",
+  "issues": ["specific contradictions, if any"]
 }}"""
 
 _ADVERSARIAL_PROBE_PROMPT = """You are a devil's advocate. Given a PROBLEM and proposed SOLUTION, generate edge cases and counterexamples that could break it.
@@ -290,4 +325,107 @@ class Verifier:
             response=(response or "(response not provided to verifier)")[:4000],
         )
         data = await self._call_llm(prompt, temperature=0.1)
+        return self._build_verify_result(data)
+
+    async def _call_llm_vision(self, prompt: str, image_paths: List[str],
+                               temperature: float = 0.1) -> dict:
+        """Vision-enabled verification call. Loads each image off disk,
+        base64-embeds it, and asks the vision-capable model for a verdict.
+
+        Distinct from ``_call_llm`` in two ways: (1) it does NOT route to
+        the text VERIFY worker pool (that pool isn't multimodal) — it goes
+        straight to the main client's ``chat_completion(..., use_vision=True)``
+        path, which the client routes to the vision node; (2) it carries
+        images. Returns {} on any failure so the caller surfaces a skipped
+        verdict rather than a false REFUTED."""
+        if not self.llm_client or not image_paths:
+            return {}
+
+        content_array: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
+        loaded = 0
+        for pth in image_paths:
+            if not pth:
+                continue
+            try:
+                p = Path(pth)
+                if not p.exists():
+                    continue
+                if p.stat().st_size > _MAX_VISUAL_BYTES:
+                    logger.debug("visual verify: skipping oversized image %s", pth)
+                    continue
+                data_bytes = await asyncio.to_thread(p.read_bytes)
+            except Exception as exc:
+                logger.debug("visual verify: could not read %s: %s", pth, exc)
+                continue
+            mime, _ = mimetypes.guess_type(str(pth))
+            mime = mime or "image/png"
+            b64 = base64.b64encode(data_bytes).decode("utf-8")
+            content_array.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
+            })
+            loaded += 1
+
+        if loaded == 0:  # nothing renderable to judge
+            return {}
+
+        payload = {
+            "messages": [
+                {"role": "system", "content": "You are a meticulous UI auditor. Judge only what is visible in the images."},
+                {"role": "user", "content": content_array},
+            ],
+            "temperature": temperature,
+            "max_tokens": 1024,
+            "stream": False,
+        }
+        try:
+            result = await self.llm_client.chat_completion(payload, use_vision=True)
+            text = (
+                (result or {})
+                .get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            return self._parse_json(text)
+        except Exception as exc:
+            logger.warning("Visual verifier call failed: %s", exc)
+            return {}
+
+    async def verify_visual(self, *, symptom: str, claim: str,
+                            after_image: str,
+                            before_image: Optional[str] = None
+                            ) -> Optional[VerifyResult]:
+        """Check whether a reported VISUAL symptom is still present in the
+        rendered artifact, by looking at the actual pixels.
+
+        ``after_image`` is the current rendered state (a screenshot taken
+        AFTER the agent's change). ``before_image`` is the user's original
+        screenshot showing the problem, if available — passing both lets the
+        model do a before/after comparison, which is far more reliable than
+        judging a fresh frame cold.
+
+        Returns ``None`` when nothing could be rendered/loaded — the caller
+        treats that as *skipped* and applies NO penalty, so the agent is
+        never punished for infra it can't control (no browser, headless run).
+        """
+        if not after_image:
+            return None
+        if before_image:
+            images = [before_image, after_image]
+            images_desc = (
+                "[1] the user's ORIGINAL screenshot showing the problem.\n"
+                "[2] the CURRENT rendered state after the agent's change."
+            )
+        else:
+            images = [after_image]
+            images_desc = (
+                "[1] the CURRENT rendered state after the agent's change "
+                "(the user's original screenshot was not available)."
+            )
+        prompt = _VERIFY_VISUAL_PROMPT.format(
+            symptom=(symptom or "")[:1000],
+            claim=(claim or "")[:1500],
+            images_desc=images_desc,
+        )
+        data = await self._call_llm_vision(prompt, images, temperature=0.1)
         return self._build_verify_result(data)

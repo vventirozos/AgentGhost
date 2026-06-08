@@ -170,6 +170,15 @@ def _set_current(context, project_id: Optional[str]):
     if prev and prev != project_id:
         _snapshot_scratchpad(context, prev)
     context.current_project_id = project_id
+    # Keep the workspace model's active-project pointer in lock-step so any
+    # research/file events recorded after a mid-request create/switch are
+    # stamped with the right project (and the wake-up prefix scopes to it).
+    _wm = getattr(context, "workspace_model", None)
+    if _wm is not None:
+        try:
+            _wm.current_project_id = project_id or ""
+        except Exception:
+            pass
     sp = getattr(context, "scratchpad", None)
     if sp is not None:
         try:

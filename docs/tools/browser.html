@@ -159,6 +159,23 @@ URL: https://example.com/
 HTTP_STATUS: 200
 TITLE: Example Domain</code></pre>
 
+  <h2>JS diagnostics: console + uncaught exceptions (2026-06-07)</h2>
+  <p>Every op routes through <code>_with_context</code>, which now attaches two Playwright listeners to the page before running the op: <code>page.on("pageerror", …)</code> (uncaught exceptions) and <code>page.on("console", …)</code> (console messages). The captured <code>js_errors</code> and <code>console</code> lists are merged into the op's result dict (only when non-empty) and rendered for the agent by <code>_format_js_diagnostics</code>.</p>
+  <p><strong>Why this exists.</strong> Before this, the tool exposed only navigate / extract_text / screenshot / click — none of which reveal a JavaScript error. A single uncaught exception in an inline script (e.g. <code>TypeError: Cannot read properties of undefined (reading 'y')</code> from a <code>player.spawnPos</code> that was never defined) halts <code>init()</code> and leaves a loading screen frozen <em>forever</em>. The agent's only channels — a screenshot of the frozen screen and <code>extract_text</code> of the loader text — cannot distinguish "crashed" from "slow", so it would misdiagnose the crash as a performance problem and burn tens of minutes optimising world-gen that was never the bottleneck (observed: a 43-minute request that rewrote the file six times without ever fixing the actual one-line bug).</p>
+  <p>An uncaught exception now appears verbatim at the top of the result, ahead of any page text, so the very next turn can fix the throwing line:</p>
+  <pre><code>--- BROWSER RESULT ---
+STATUS: OK
+OP: navigate
+URL: file:///workspace/projects/…/index.html
+HTTP_STATUS: 200
+TITLE: Minecraft Clone
+⚠ UNCAUGHT JS EXCEPTIONS (1) — these crash the page silently and are
+almost always the real bug; fix these BEFORE assuming a performance/
+timeout problem:
+  • TypeError: Cannot read properties of undefined (reading 'y')
+      at init (file:///…/index.html:132:14)</code></pre>
+  <p>Caps keep a <code>console.log</code>-in-a-loop page from flooding the context window: uncaught exceptions get the larger budget (<code>_MAX_JS_ERRORS</code>), ordinary console chatter the smaller one (<code>_MAX_CONSOLE_MSGS</code>), and only <code>error</code>/<code>warning</code> console types are surfaced to the agent. <code>_with_context</code> also yields one extra event-loop tick (<code>wait_for_timeout(50)</code>) after the op so a <code>setTimeout</code>-deferred crash still lands. Covered by <code>tests/test_browser_js_diagnostics.py</code>.</p>
+
   <h2>Failure modes surfaced</h2>
   <ul>
     <li>Unknown operation → <code>STATUS: ERROR</code> with valid-ops list.</li>

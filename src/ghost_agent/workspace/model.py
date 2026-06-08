@@ -26,6 +26,7 @@ from .schema import (
     ResearchArtifact,
     TaskOutcome,
     WorkspaceEvent,
+    _PROJECTS_PATH_RE,
 )
 from .state import WorkspaceStateThread
 
@@ -48,6 +49,12 @@ class WorkspaceModel:
     ):
         self.root = Path(root)
         self.enabled = bool(enabled)
+        # The project the agent is currently working in ("" = none/free
+        # chat). Kept in sync by the agent each request so (a) recorded
+        # events are stamped with their owning project and (b) the wake-up
+        # prefix scopes events to THIS project — preventing a prior
+        # project's file:// pulls from bleeding into a new one.
+        self.current_project_id: str = ""
         if self.enabled:
             self.activity: Optional[WorkspaceActivity] = WorkspaceActivity(
                 self.root, enabled=True,
@@ -70,10 +77,14 @@ class WorkspaceModel:
     # Wake-up path
     # -----------------------------------------------------------------
 
-    def build_wakeup_prefix(self) -> str:
+    def build_wakeup_prefix(self, active_project_id: Optional[str] = None) -> str:
         """Compose the workspace prefix the prompt assembly path
         splices into the system prompt. Empty when there's nothing to
         say.
+
+        ``active_project_id`` (defaults to ``self.current_project_id``)
+        scopes the rendered events to the current project so a prior
+        project's research artifacts / narrative don't leak in.
 
         We route through the model's own ``scan_tracked()`` (not the
         state thread's bare scan) so any detected changes are MIRRORED
@@ -84,6 +95,7 @@ class WorkspaceModel:
         them in this turn."""
         if not self.enabled:
             return ""
+        active = active_project_id if active_project_id is not None else self.current_project_id
         narrative_text = self.narrative.latest() if self.narrative else ""
         file_changes: List[dict] = []
         if self.state is not None and self.state.tracked_files():
@@ -91,11 +103,22 @@ class WorkspaceModel:
                 file_changes = self.scan_tracked()
             except Exception as e:  # noqa: BLE001
                 logger.debug("workspace scan_tracked failed: %s", e)
+        # Scope tracked-file changes the same way: a change to a file under
+        # a DIFFERENT project's directory isn't relevant to this turn.
+        if active and file_changes:
+            _a = str(active).strip().lower()
+            scoped = []
+            for ch in file_changes:
+                m = _PROJECTS_PATH_RE.search(str(ch.get("path", "")))
+                if not m or m.group(1).lower() == _a:
+                    scoped.append(ch)
+            file_changes = scoped
         return build_workspace_prefix(
             activity=self.activity,
             state=self.state,
             narrative=narrative_text,
             file_changes=file_changes,
+            active_project_id=active or None,
         )
 
     # -----------------------------------------------------------------
@@ -131,6 +154,7 @@ class WorkspaceModel:
                     f"task {task_name or job_id}: {outcome}"
                     if not error else f"task {task_name or job_id}: failed ({error[:80]})"
                 ),
+                project_id=self.current_project_id,
             ))
             return t
         except Exception as e:  # noqa: BLE001
@@ -166,6 +190,7 @@ class WorkspaceModel:
                 kind="research",
                 payload=art.to_dict(),
                 summary=f"pulled {url}"[:200],
+                project_id=self.current_project_id,
             ))
             return art
         except Exception as e:  # noqa: BLE001
@@ -205,6 +230,7 @@ class WorkspaceModel:
                 summary=(
                     f"ran `{(command or '')[:80]}` exit={exit_code}"
                 ),
+                project_id=self.current_project_id,
             ))
             return c
         except Exception as e:  # noqa: BLE001
@@ -221,7 +247,10 @@ class WorkspaceModel:
         if not summary:
             return None
         try:
-            ev = WorkspaceEvent(kind="note", payload=dict(payload), summary=summary[:600])
+            ev = WorkspaceEvent(
+                kind="note", payload=dict(payload), summary=summary[:600],
+                project_id=self.current_project_id,
+            )
             self.activity.append(ev)
             return ev
         except Exception as e:  # noqa: BLE001
@@ -255,10 +284,16 @@ class WorkspaceModel:
         if changes and self.activity is not None:
             for ch in changes:
                 try:
+                    # Derive the owning project from the changed path when
+                    # possible (a tracked file lives under projects/<id>/),
+                    # else fall back to the active project.
+                    _m = _PROJECTS_PATH_RE.search(str(ch.get("path", "")))
+                    _pid = _m.group(1).lower() if _m else self.current_project_id
                     self.activity.append(WorkspaceEvent(
                         kind="file_changed",
                         payload=ch,
                         summary=f"{ch.get('path')}: {ch.get('change')}",
+                        project_id=_pid,
                     ))
                 except Exception:  # noqa: BLE001
                     continue

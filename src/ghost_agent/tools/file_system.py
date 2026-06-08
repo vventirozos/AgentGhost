@@ -295,6 +295,49 @@ def _to_container_path(sandbox_dir: Path, host_path: Path) -> str:
         return _CONTAINER_WORKDIR
     return f"{_CONTAINER_WORKDIR}/{rel_str}"
 
+def _missing_file_message(filename, sandbox_dir) -> str:
+    """Loop-breaking 'not found' message for a missing read target.
+
+    The bare ``Error: '<f>' not found.`` caused a documented infinite
+    loop: when stale cross-project context (a workspace narrative about a
+    PRIOR project's files, a memory hint, or a DYNAMIC SYSTEM STATE line)
+    asserted a file existed, the model re-read the same missing path every
+    turn — the tool said "no", the injected state said "yes", and nothing
+    reconciled the two. This message resolves the contradiction in the
+    model's favour-of-reality: the live sandbox is authoritative, lists
+    what actually exists, and gives a concrete exit (create it, or pick a
+    real file). Best-effort directory scan; never raises."""
+    existing = []
+    try:
+        import os
+        for root, dirs, files in os.walk(sandbox_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".")
+                       and d not in ("__pycache__", "node_modules", "venv", "env")]
+            for f in sorted(files):
+                if f.startswith("."):
+                    continue
+                existing.append(os.path.relpath(os.path.join(root, f), sandbox_dir))
+                if len(existing) >= 20:
+                    break
+            if len(existing) >= 20:
+                break
+    except Exception:
+        pass
+    if existing:
+        listing = "Files that DO exist here: " + ", ".join(existing[:20]) + "."
+    else:
+        listing = "This project's sandbox is currently EMPTY (no files yet)."
+    return (
+        f"Error: '{filename}' does not exist in the current project's sandbox. "
+        f"{listing} The live sandbox is AUTHORITATIVE — if a workspace narrative, "
+        f"memory, prior session, or DYNAMIC SYSTEM STATE hint referenced "
+        f"'{filename}', that was a DIFFERENT project/session and does NOT apply "
+        f"here. Do NOT read this path again (it will keep failing). To proceed: "
+        f"CREATE it with file_system(operation='write', filename='{filename}', "
+        f"content=…), or pick a file from the list above."
+    )
+
+
 async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 8192):
     pretty_log("File Read", filename, icon=Icons.TOOL_FILE_R)
     # GUARD 1: Stop model from trying to read URLs as files. The error
@@ -321,8 +364,9 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
 
     try:
         path = _get_safe_path(sandbox_dir, filename)
-        if not path.exists(): return f"Error: '{filename}' not found."
-        
+        if not path.exists():
+            return _missing_file_message(filename, sandbox_dir)
+
         file_size = path.stat().st_size
         max_bytes = max(150000, int(max_context * 3.5 * 0.5))
         if file_size > max_bytes: # dynamic limit for raw reads
@@ -522,7 +566,35 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         elif len(matches) > 1:
             return "SYSTEM INSTRUCTION: Multiple instances of this text block found. Please provide a larger, more unique block of code in 'content' to ensure we replace the correct one."
 
-        # 3. Neither exact nor flexible match. Return a snippet of the
+        # 2.5 Fuzzy contiguous-block match. The flexible matcher above
+        # only forgives whitespace; a single misremembered character or a
+        # stray/missing token makes it miss, and the model's documented
+        # next move is to rewrite the WHOLE file (a 200s+ regeneration of a
+        # large index.html, and a fresh chance to introduce new bugs). A
+        # high-confidence, UNIQUE difflib window match rescues exactly that
+        # case surgically. Conservative on purpose: ratio >= 0.92 AND a
+        # clear margin over the runner-up, so we never silently patch the
+        # wrong region.
+        fuzzy = _fuzzy_block_match(file_content, str(old_text))
+        if fuzzy is not None:
+            matched_text, ratio = fuzzy
+            replacement = str(new_text)
+            # The matched block was sliced with keepends, so it may carry a
+            # trailing newline the model's replacement omits. Preserve it,
+            # else a single-line fuzzy replace would weld the following line
+            # onto the edited one.
+            if matched_text.endswith("\n") and not replacement.endswith("\n"):
+                replacement += "\n"
+            new_file_content = file_content.replace(matched_text, replacement, 1)
+            await asyncio.to_thread(path.write_text, new_file_content)
+            return (
+                f"SUCCESS: Fuzzy match ({ratio:.0%} similar) found and replaced "
+                f"in '{filename}'. Your `old_text` did not byte-match, but a single "
+                f"near-identical block was unambiguous. VERIFY the change is what you "
+                f"intended:\n--- REPLACED BLOCK (was) ---\n{matched_text[:600]}"
+            )
+
+        # 3. Neither exact nor flexible nor fuzzy match. Return a snippet of the
         # file at the closest-looking neighborhood so the model can see
         # what the text actually is. Common cause: the model's
         # remembered `old_text` has slightly different whitespace,
@@ -535,6 +607,36 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         # — so do NOT tell the model the file was reformatted (false
         # hint that sends it into a debugging spiral).
         snippet = _nearest_snippet(file_content, str(old_text))
+        # Scale the recovery advice to file size. A full rewrite is fine
+        # for a small file but catastrophic for a large one: regenerating
+        # a 400+ line index.html costs minutes of model output AND risks
+        # introducing brand-new bugs, which is exactly the 200s-per-edit
+        # spiral seen in production. For large files, forbid the rewrite
+        # and force a surgical single-line replace anchored on the exact
+        # current text we just handed back (with line numbers).
+        line_count = file_content.count("\n") + 1
+        is_large = file_size > 16 * 1024 or line_count > 250
+        if is_large:
+            primary = (
+                f"  1. This file is LARGE ({line_count} lines). DO NOT use "
+                "operation='write' to rewrite it — a full regeneration is slow "
+                "and routinely introduces NEW bugs. Instead, copy the exact "
+                "current text from the CLOSEST MATCH below (line numbers shown) "
+                "and emit a tight single-line SEARCH block for the surgical edit.\n"
+                "  2. Only if the edit genuinely spans many lines, replace each "
+                "line as its own one-line SEARCH/REPLACE rather than rewriting "
+                "the file.\n"
+            )
+        else:
+            primary = (
+                "  1. If the edit is >3 lines or touches a block with "
+                "decorators/docstrings/nested classes, use operation='write' "
+                f"to overwrite this small file ({line_count} lines) — that's "
+                "byte-exact and eliminates all matching issues.\n"
+                "  2. Otherwise, READ the file first to get the current exact "
+                "text, then emit a tighter SEARCH block (ideally a single line) "
+                "for the surgical edit.\n"
+            )
         return (
             "SYSTEM INSTRUCTION: The search block was NOT found in '"
             + filename
@@ -545,17 +647,11 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             "uniquely, or (c) the file changed since you last read it. "
             "DO NOT retry replace with the same old_text. Options in "
             "priority order:\n"
-            "  1. If the edit is >3 lines or touches a block with "
-            "decorators/docstrings/nested classes, use "
-            "operation='write' to overwrite the whole file — that's "
-            "byte-exact and eliminates all matching issues.\n"
-            "  2. Otherwise, READ the file first to get the current "
-            "exact text, then emit a tighter SEARCH block (ideally a "
-            "single line) for the surgical edit.\n"
+            + primary +
             "  3. If two replace attempts have already failed on this "
-            "file, STOP retrying replace and pivot to write (option 1) "
-            "— do not loop.\n"
-            "CLOSEST MATCH IN THE FILE:\n" + snippet
+            "file, STOP retrying the SAME old_text — copy the exact text from "
+            "the snippet below instead. Do not loop.\n"
+            "CLOSEST MATCH IN THE FILE (with line numbers):\n" + snippet
         )
         
     except ValueError as ve: return str(ve)
@@ -601,6 +697,69 @@ def _nearest_snippet(file_content: str, target: str,
     if len(out) > max_len:
         out = out[:max_len] + "\n   ... [truncated]"
     return out
+
+
+def _fuzzy_block_match(file_content: str, target: str,
+                       min_ratio: float = 0.92,
+                       margin: float = 0.04,
+                       max_target_chars: int = 4000):
+    """Find a UNIQUE contiguous line-block in ``file_content`` that is a
+    near-identical match to ``target`` once per-line whitespace is ignored.
+
+    Returns ``(matched_text, ratio)`` — ``matched_text`` is the ORIGINAL
+    (un-normalised) bytes to replace — or ``None`` when there is no high-
+    confidence, unambiguous match. Runs only AFTER the exact and flexible-
+    whitespace matchers miss; it rescues a single misremembered character
+    or stray token surgically instead of letting the model fall back to a
+    slow, bug-prone full-file rewrite.
+
+    Deliberately conservative: the best window must clear ``min_ratio`` AND
+    beat the runner-up by ``margin``, so an ambiguous edit never silently
+    lands in the wrong place. Cost is O(file_lines) difflib calls for the
+    common single-line target (``quick_ratio`` prefilters before the exact
+    ``ratio``); bounded by the window size for multi-line targets. Very
+    large targets are skipped to keep the cost predictable.
+    """
+    import difflib
+    if not target or not file_content:
+        return None
+    if len(target) > max_target_chars:
+        return None
+    target_lines = target.splitlines()
+    n = len(target_lines)
+    if n == 0:
+        return None
+    norm_target = "\n".join(line.strip() for line in target_lines)
+    if not norm_target.strip():
+        return None  # all-whitespace target is too ambiguous to anchor
+    file_lines = file_content.splitlines(keepends=True)
+    if n > len(file_lines):
+        return None
+    best_ratio = -1.0
+    second_ratio = -1.0
+    best_idx = -1
+    sm = difflib.SequenceMatcher(autojunk=False)
+    sm.set_seq2(norm_target)
+    for i in range(0, len(file_lines) - n + 1):
+        norm_w = "\n".join(line.strip() for line in file_lines[i:i + n])
+        sm.set_seq1(norm_w)
+        # quick_ratio is a cheap upper bound on ratio; skip the exact
+        # (more expensive) computation for windows that can't qualify.
+        if sm.quick_ratio() < min_ratio:
+            continue
+        ratio = sm.ratio()
+        if ratio > best_ratio:
+            second_ratio = best_ratio
+            best_ratio = ratio
+            best_idx = i
+        elif ratio > second_ratio:
+            second_ratio = ratio
+    if best_idx < 0 or best_ratio < min_ratio:
+        return None
+    if best_ratio - second_ratio < margin:
+        return None  # two windows nearly equally good — refuse to guess
+    matched_text = "".join(file_lines[best_idx:best_idx + n])
+    return matched_text, best_ratio
 
 
 _DATA_FILE_EXTS = frozenset({
@@ -937,7 +1096,8 @@ async def tool_inspect_file(filename: str, sandbox_dir: Path, lines: int = 10):
     pretty_log("File Peek", filename, icon=Icons.TOOL_FILE_I)
     try:
         path = _get_safe_path(sandbox_dir, filename)
-        if not path.exists(): return f"Error: '{filename}' not found."
+        if not path.exists():
+            return _missing_file_message(filename, sandbox_dir)
         def _read_peek():
             content = []
             with open(path, 'r', errors='ignore') as f:

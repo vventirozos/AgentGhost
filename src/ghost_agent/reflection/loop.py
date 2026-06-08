@@ -39,6 +39,34 @@ from .prompts import build_reflection_prompt, parse_reflection_output
 logger = logging.getLogger("GhostReflect")
 
 
+# User prompts that are system-generated error-recovery scaffolding rather
+# than real tasks. Reflecting on them turns a transient tooling failure (a
+# malformed one-off diagnostic command, a self-repeating-loop trip) into a
+# saved "lesson", polluting the skill playbook with recovery trivia keyed on
+# the AUTO-DIAGNOSTIC banner itself — the exact failure where reflection
+# learned "when you get this browser error, do X" instead of task knowledge.
+# Deliberately NARROWER than selfhood.autobiographical._TEMPLATE_PROMPT_MARKERS:
+# synthetic-training and judge-rejection turns ARE legitimate self-play
+# learning signal and must still be reflected on.
+_RECOVERY_SCAFFOLD_MARKERS = (
+    "AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR",
+    "SYSTEM ALERT: Your previous turn entered a self-repeating",
+)
+
+
+def _is_recovery_scaffold(traj: Trajectory) -> bool:
+    """True when the trajectory's user prompt is agent self-recovery
+    scaffolding (see ``_RECOVERY_SCAFFOLD_MARKERS``) rather than a
+    substantive task. System banners always lead the user message, so a
+    leading-prefix match is sufficient (mirrors autobiographical
+    ``_template_marker_for``)."""
+    req = getattr(traj, "user_request", "")
+    if not isinstance(req, str):
+        return False
+    head = req.lstrip()[:120]
+    return any(head.startswith(m) for m in _RECOVERY_SCAFFOLD_MARKERS)
+
+
 CritiqueCallable = Callable[[str], Union[str, Awaitable[str]]]
 # Verifies a revised plan against the failed trajectory. Returns
 # ``(verified, note)``: ``verified`` upgrades the reflection trajectory's
@@ -219,6 +247,14 @@ class Reflector:
         otherwise adds ``traj.id`` to the set BEFORE awaiting the
         critique so a concurrent ``run`` tick can't double-reflect.
         """
+        # Same scaffolding gate as the batch path (_is_reflectable); this
+        # public entrypoint bypasses it, so re-check here or the post-turn
+        # scheduler would still save lessons from AUTO-DIAGNOSTIC turns.
+        if _is_recovery_scaffold(traj):
+            return ReflectionOutcome(
+                source_trajectory_id=traj.id,
+                error="recovery-scaffold: not reflected",
+            )
         reflected_set: Set[str] = (
             already_reflected if already_reflected is not None else set()
         )
@@ -248,6 +284,10 @@ class Reflector:
         produced no learning signal under the new score (proposal F).
         Everything else is ignored.
         """
+        # Never learn from the agent's own error-recovery turns — they
+        # yield transient tooling trivia, not task knowledge.
+        if _is_recovery_scaffold(traj):
+            return False
         if traj.outcome == Outcome.FAILED.value:
             return True
         if not self.accept_low_novelty_passes:

@@ -111,7 +111,8 @@ class CompositeConfidence:
     def score(self, *, normalised_entropy: float,
               competence_p_success: float,
               n_observations: int = 0,
-              uncertainty_pressure: float = 0.0) -> ConfidenceReading:
+              uncertainty_pressure: float = 0.0,
+              outcome_penalty: float = 0.0) -> ConfidenceReading:
         """Compute one composite reading.
 
         ``n_observations`` discounts the competence prior: when the
@@ -127,6 +128,18 @@ class CompositeConfidence:
         unsure" track into the objective score. With the default
         ``λ = 0`` it is a no-op, so this is fully back-compatible until
         the calibration spine fits a positive λ.
+
+        ``outcome_penalty`` (0..1) is a DIRECT, objective negative signal
+        about THIS turn's result — set when the verifier REFUTED the
+        answer or the turn finalised on an unverified mutation. Unlike the
+        two priors above (which are historical/verbalised), this is ground
+        truth that the just-produced answer is wrong/unconfirmed, so it
+        applies an un-discounted multiplicative penalty ``× (1 − penalty)``.
+        It exists because competence + neutral-entropy alone make composite
+        ≈ competence, so a domain the agent is historically good at reports
+        high confidence even when the verifier just said the answer is
+        broken (the "C=0.92 below=no on a REFUTED build" failure). Defaults
+        to 0.0 → no-op, fully back-compatible.
         """
         e = _clamp_unit(normalised_entropy)
         p = _clamp_unit(competence_p_success)
@@ -145,6 +158,11 @@ class CompositeConfidence:
         # penalty (defaults to no-op at λ = 0).
         pressure = _clamp_unit(uncertainty_pressure)
         composite = composite * (1.0 - self.lambda_uncertainty * pressure)
+        # Apply the objective outcome penalty LAST and un-discounted: a
+        # verifier REFUTED / unverified-mutation verdict is ground truth
+        # about this specific answer and must pull the reading below
+        # threshold regardless of how strong the historical priors are.
+        composite = composite * (1.0 - _clamp_unit(outcome_penalty))
         composite = _clamp_unit(composite)
         return ConfidenceReading(
             composite=composite,

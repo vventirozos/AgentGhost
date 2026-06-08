@@ -14,11 +14,27 @@ from __future__ import annotations
 from typing import List, Optional
 
 from .activity import WorkspaceActivity
+from .schema import _PROJECTS_PATH_RE, filter_events_for_project
 from .state import WorkspaceStateThread
 
 
 WORKSPACE_PREFIX_OPEN = "<!-- WORKSPACE:BEGIN -->"
 WORKSPACE_PREFIX_CLOSE = "<!-- WORKSPACE:END -->"
+
+
+def _narrative_is_cross_project(narrative: str, active_project_id: str) -> bool:
+    """True when the (global) narrative paragraph references a project
+    OTHER than the active one. The persisted narrative is consolidated
+    across all projects, so on a project-scoped turn it can describe a
+    DIFFERENT project's files — exactly the bleed that trapped a fresh
+    build. When that's the case we drop it rather than mislead."""
+    if not active_project_id:
+        return False
+    active = active_project_id.strip().lower()
+    for m in _PROJECTS_PATH_RE.finditer(narrative or ""):
+        if m.group(1).lower() != active:
+            return True
+    return False
 
 
 def build_workspace_prefix(
@@ -29,6 +45,7 @@ def build_workspace_prefix(
     recent_events_n: int = 5,
     file_changes: Optional[list] = None,
     max_chars: int = 2400,
+    active_project_id: Optional[str] = None,
 ) -> str:
     """Compose the workspace wake-up prefix.
 
@@ -44,7 +61,14 @@ def build_workspace_prefix(
 
     parts: List[str] = []
 
-    if narrative and narrative.strip():
+    # Drop the global narrative when a project is active AND the narrative
+    # talks about a DIFFERENT project — otherwise a new project inherits a
+    # prior one's "I pulled minecraft-clone/index.html" summary and chases
+    # files that don't exist in its sandbox.
+    if (
+        narrative and narrative.strip()
+        and not _narrative_is_cross_project(narrative, active_project_id or "")
+    ):
         parts.append("My running summary of the workspace:")
         parts.append(narrative.strip())
 
@@ -60,7 +84,10 @@ def build_workspace_prefix(
             parts.append(state_block)
 
     if activity is not None and recent_events_n > 0:
-        events = activity.recent(limit=recent_events_n)
+        # Pull a wider window THEN scope to the active project, so a busy
+        # OTHER project can't crowd this project's events out of the tail.
+        events = activity.recent(limit=max(recent_events_n * 4, recent_events_n))
+        events = filter_events_for_project(events, active_project_id)[-recent_events_n:]
         if events:
             parts.append("Recent things that happened in my workspace:")
             for ev in events:

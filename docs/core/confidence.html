@@ -65,6 +65,14 @@ if r.below_threshold:
     Historically the objective score (entropy + competence) and the agent's own "I'm not sure" flags (<a href="uncertainty.html">core.uncertainty</a>) were disjoint. <code>score()</code> now accepts <code>uncertainty_pressure ∈ [0,1]</code> (from <code>UncertaintyTracker.pressure()</code>) and applies a multiplicative penalty <code>× (1 − λ·pressure)</code>. The default <code>λ = 0</code> is a no-op, so this is byte-for-byte back-compatible — the <a href="calibration.html">calibration spine</a> only raises <code>λ</code> if the agent's hedges actually predict failure on logged turns.
   </p>
 
+  <h2>Fusing the objective outcome signal (2026-06-07)</h2>
+  <p>
+    <code>score()</code> also accepts <code>outcome_penalty ∈ [0,1]</code>, applied as a final un-discounted multiplicative penalty <code>× (1 − outcome_penalty)</code>. Unlike entropy (per-generation) and competence (historical prior), this is <em>ground truth about the answer just produced</em>: it is set when the <a href="verifier.html">verifier</a> REFUTED the response or the turn finalised on an unverified file mutation.
+  </p>
+  <p>
+    <strong>Why it was needed.</strong> The finalize reading uses a neutral entropy term, and once the <a href="calibration.html">calibration refit</a> collapses the entropy weight toward zero, <code>composite ≈ competence</code>. So a domain the agent is historically good at (e.g. <code>fs</code>, competence ≈ 0.96) reported high confidence even when the verifier had just rejected the work — the observed "<code>C=0.92 below=no</code> on a REFUTED build" and "<code>C=0.96</code> on an untested write" failures. A REFUTED/unverified verdict now drives <code>outcome_penalty = 0.8</code>, which reliably pulls a 0.92–0.96 reading below the 0.89 threshold so <code>below_threshold</code> flips true and the turn is recorded as a failed outcome. Default <code>0.0</code> is a no-op, fully back-compatible. Covered by <code>tests/test_verifier_gate_teeth.py</code>.
+  </p>
+
   <h2>Self-calibration</h2>
   <p>
     <code>apply_fitted(params)</code> hot-swaps the threshold τ, weights, and λ from a <a href="calibration.html">calibration fit</a> — at startup (loading a persisted fit) and from the idle refit phase (2.7c). A long-running agent's confidence becomes empirically calibrated against realized outcomes instead of the hardcoded τ = 0.55 / 0.5–0.5 defaults, with no restart.

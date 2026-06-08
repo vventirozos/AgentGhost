@@ -177,18 +177,25 @@ def test_nearest_snippet_respects_max_len():
 async def test_replace_failure_returns_nearest_snippet(tmp_path):
     """The trace regression: model retries replace 4 times because the
     error just said 'copy exactly'. Now the error surfaces the actual
-    file content around the closest match."""
+    file content around the closest match.
+
+    The search block must be far enough from every line that the
+    fuzzy-block matcher (ratio >= 0.92) does NOT claim it — otherwise a
+    near-miss is auto-resolved instead (that path is covered by
+    test_file_replace_fuzzy_and_size_guidance). Here the search shares
+    tokens with the `count` line so _nearest_snippet anchors there and
+    surfaces it, but is structurally too different to fuzzy-match."""
     src = (
         "def test_parser():\n"
         "    if results['/health']['count'] != 11:\n"
         "        print('wrong count')\n"
     )
     (tmp_path / "test_parser.py").write_text(src)
-    # Model tries to replace stale text (the '!= 10' version it
-    # remembers from before black / prior edit)
+    # Model remembers a wholly different shape of the assertion than what
+    # is on disk — token overlap, but no near-match for fuzzy to claim.
     res = await tool_replace_text(
         "test_parser.py",
-        "if results['/health']['count'] != 10:",
+        "if results['/health']['count'] > 999 and cache['/health']['count'] < 0:",
         "if results['/health']['count'] != 11:",
         tmp_path,
     )

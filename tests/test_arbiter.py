@@ -223,6 +223,15 @@ async def test_timeout_handled_as_failure():
     assert all("timeout" in c.error for c in decision.candidates)
 
 
+def test_default_per_sample_timeout_clears_real_model_latency():
+    """Regression: the default per-sample timeout was 10.0s, shorter than a
+    real LLM completion over Tor (20-40s), so BOTH candidates timed out
+    every turn and the arbiter degenerated into a constant ask_user. The
+    default must comfortably clear real model latency."""
+    arbiter = DualSolverArbiter(runner=lambda p: "x")
+    assert arbiter.per_sample_timeout_s >= 30.0
+
+
 @pytest.mark.asyncio
 async def test_empty_prompt_skipped():
     runner = make_runner({})

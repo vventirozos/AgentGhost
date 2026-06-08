@@ -42,7 +42,7 @@ both ok, diverged:
   <h2>Cost discipline</h2>
   <ul>
     <li>Two candidates only (not the five-sample default in <code>distill/self_consistency.py</code>).</li>
-    <li>Per-sample timeout (default 10 s); a timeout is treated as a failure, NOT a halt.</li>
+    <li>Per-sample timeout (default <strong>60 s</strong>, operator-tunable via <code>--metacog-arbiter-timeout-s</code>); a timeout is treated as a failure, NOT a halt. Each candidate is a full LLM completion routed over Tor, so the budget must clear real model latency (20&ndash;40 s). The previous 10 s default was shorter than a single completion, so <em>both</em> candidates timed out every turn and the arbiter degenerated into a constant <code>ask_user</code>; sized up so it actually arbitrates.</li>
     <li>Empty prompt → <code>skipped</code> action; arbiter never doubles a no-op turn.</li>
   </ul>
 

@@ -87,6 +87,21 @@ class TestMetacogBundleConstruction:
         # Everything else still up
         assert bundle.competence is not None
 
+    def test_arbiter_timeout_default_clears_model_latency(self, fake_context):
+        # Regression: a 10s per-candidate timeout was shorter than a real
+        # LLM completion, so both candidates always timed out and the
+        # arbiter degenerated into a constant ask_user. The default the
+        # bundle wires in must clear real model latency.
+        bundle = MetacogBundle.from_args(fake_context, _args(enable_metacog=True))
+        assert bundle.arbiter.per_sample_timeout_s >= 30.0
+
+    def test_arbiter_timeout_threaded_through(self, fake_context):
+        bundle = MetacogBundle.from_args(
+            fake_context,
+            _args(enable_metacog=True, metacog_arbiter_timeout_s=90.0),
+        )
+        assert bundle.arbiter.per_sample_timeout_s == pytest.approx(90.0)
+
     def test_threshold_threaded_through(self, fake_context):
         bundle = MetacogBundle.from_args(
             fake_context, _args(enable_metacog=True, metacog_confidence_threshold=0.4),
@@ -505,11 +520,18 @@ def test_cli_flags_present_in_parser():
             "--enable-metacog",
             "--metacog-confidence-threshold", "0.4",
             "--metacog-disable-arbiter",
+            "--metacog-arbiter-timeout-s", "75",
         ]
         args = main_module.parse_args()
         assert args.enable_metacog is True
         assert args.metacog_confidence_threshold == 0.4
         assert args.metacog_disable_arbiter is True
+        assert args.metacog_arbiter_timeout_s == 75.0
         assert args.metacog_disable_logprobs is False  # default
+
+        # Default applies when the flag is omitted.
+        sys.argv = ["ghost_agent", "--enable-metacog"]
+        args = main_module.parse_args()
+        assert args.metacog_arbiter_timeout_s == 60.0
     finally:
         sys.argv = old_argv

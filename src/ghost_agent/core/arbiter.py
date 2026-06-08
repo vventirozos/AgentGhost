@@ -174,11 +174,18 @@ class DualSolverArbiter:
         *,
         embedder: Optional[EmbedFn] = None,
         temperatures: Tuple[float, float] = (0.2, 0.7),
-        per_sample_timeout_s: float = 10.0,
+        per_sample_timeout_s: float = 60.0,
         divergence_threshold: float = SemanticDivergence.DEFAULT_THRESHOLD,
     ):
         self.runner = runner
         self.temperatures = (float(temperatures[0]), float(temperatures[1]))
+        # Each candidate is a full LLM completion (see _make_arbiter_runner:
+        # up to 1024 tokens on the agent's own model, routed over Tor). That
+        # routinely takes 20-40s, so a tight timeout makes BOTH candidates
+        # time out every turn — the arbiter then never arbitrates and just
+        # falls through to ask_user ("both candidates failed: timeout after
+        # 10.0s"). The budget must clear real model latency; 60s default,
+        # operator-tunable via --metacog-arbiter-timeout-s.
         self.per_sample_timeout_s = float(per_sample_timeout_s)
         self.divergence = SemanticDivergence(
             embedder, threshold=divergence_threshold,

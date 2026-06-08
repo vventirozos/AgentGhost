@@ -214,8 +214,66 @@ def _chromium_args(proxy):
     return args
 
 
+# Cap captured diagnostics so a console.log-in-a-loop page can't blow the
+# LLM context window. Uncaught exceptions (pageerror) are the gold — a
+# silent `init()` crash is invisible in a screenshot but fires here — so
+# they get their own (larger) budget than ordinary console chatter.
+_MAX_JS_ERRORS = 12
+_MAX_CONSOLE_MSGS = 25
+_MAX_DIAG_CHARS = 600
+
+
+def _attach_diagnostics(page):
+    """Wire console + uncaught-exception listeners onto ``page`` and
+    return the (js_errors, console_msgs) lists they fill.
+
+    Playwright fires ``pageerror`` for every uncaught exception in page
+    JS (the classic "TypeError: Cannot read properties of undefined" that
+    crashes ``init()`` and leaves a loading screen frozen forever — the
+    failure mode a screenshot can NEVER reveal) and ``console`` for every
+    console.* call. Capturing both turns blind "the page is just stuck"
+    debugging into "here's the exact exception and line". Listeners are
+    sync callbacks; they only append, so they can't raise into the op."""
+    js_errors: list = []
+    console_msgs: list = []
+
+    def _on_error(exc):
+        if len(js_errors) >= _MAX_JS_ERRORS:
+            return
+        # `exc` is a playwright Error (has .message/.stack) on modern
+        # builds but is a bare str on some — coerce defensively.
+        msg = getattr(exc, "message", None) or str(exc)
+        stack = getattr(exc, "stack", "") or ""
+        text = (msg + ("\n" + stack if stack and stack != msg else "")).strip()
+        js_errors.append(text[:_MAX_DIAG_CHARS])
+
+    def _on_console(msg):
+        try:
+            mtype = msg.type
+            mtext = msg.text
+        except Exception:
+            return
+        # Errors/warnings are diagnostic signal; plain logs are usually
+        # noise, so only keep them until the budget fills.
+        if mtype not in ("error", "warning") and len(console_msgs) >= _MAX_CONSOLE_MSGS:
+            return
+        if len(console_msgs) >= _MAX_CONSOLE_MSGS * 2:
+            return
+        console_msgs.append({"type": mtype, "text": str(mtext)[:_MAX_DIAG_CHARS]})
+
+    page.on("pageerror", _on_error)
+    page.on("console", _on_console)
+    return js_errors, console_msgs
+
+
 async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
-    """Open a persistent context, run op_fn(page), close cleanly."""
+    """Open a persistent context, run op_fn(page), close cleanly.
+
+    Every op funnels through here, so this is also where we attach the
+    console/pageerror diagnostics: any dict an op returns is augmented
+    with ``js_errors`` and ``console`` keys (only when non-empty) so the
+    agent can SEE a silent JS crash instead of guessing at a frozen page.
+    """
     os.makedirs(profile_dir, exist_ok=True)
     async with async_playwright() as p:
         launch_kwargs = dict(
@@ -229,7 +287,22 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             page.set_default_timeout(timeout_ms)
-            return await op_fn(page)
+            js_errors, console_msgs = _attach_diagnostics(page)
+            result = await op_fn(page)
+            if isinstance(result, dict):
+                # Errors can fire microtasks after the op's last await
+                # (e.g. a setTimeout-deferred crash). A zero-ish settle
+                # gives the event loop one more tick to drain them
+                # without materially slowing the op.
+                try:
+                    await page.wait_for_timeout(50)
+                except Exception:
+                    pass
+                if js_errors:
+                    result.setdefault("js_errors", js_errors)
+                if console_msgs:
+                    result.setdefault("console", console_msgs)
+            return result
         finally:
             try:
                 await ctx.close()
@@ -897,6 +970,39 @@ def _resolve_file_url(sandbox_dir, url):
         return url
 
 
+def _format_js_diagnostics(parsed: dict) -> str:
+    """Render captured uncaught exceptions + console errors as a block the
+    LLM can act on. Returns "" when the page was clean.
+
+    This is the antidote to the "loading screen frozen forever, agent
+    burns 40 minutes guessing it's a perf problem" failure: an uncaught
+    TypeError in init() shows up here verbatim, so the very next turn can
+    fix the actual line instead of poll-screenshotting a dead page."""
+    if not isinstance(parsed, dict):
+        return ""
+    out = []
+    js_errors = parsed.get("js_errors") or []
+    if js_errors:
+        out.append(
+            f"⚠ UNCAUGHT JS EXCEPTIONS ({len(js_errors)}) — these crash the "
+            "page silently and are almost always the real bug; fix these "
+            "BEFORE assuming a performance/timeout problem:"
+        )
+        for e in js_errors:
+            first = str(e).splitlines()[0] if str(e).splitlines() else str(e)
+            out.append(f"  • {first}")
+            rest = str(e).splitlines()[1:]
+            for ln in rest[:4]:
+                out.append(f"      {ln}")
+    console = parsed.get("console") or []
+    errs = [c for c in console if isinstance(c, dict) and c.get("type") in ("error", "warning")]
+    if errs:
+        out.append(f"CONSOLE ({len(errs)} error/warning):")
+        for c in errs[:10]:
+            out.append(f"  • [{c.get('type')}] {c.get('text')}")
+    return ("\n" + "\n".join(out)) if out else ""
+
+
 async def tool_browser(
     operation: str = None,
     url: Optional[str] = None,
@@ -1136,11 +1242,12 @@ async def tool_browser(
     # Pretty-print the success result for the LLM. Keep each op's
     # return shape deterministic so downstream prompts can rely on it.
     header = f"--- BROWSER RESULT ---\nSTATUS: OK\nOP: {operation}"
+    js_diag = _format_js_diagnostics(parsed)
     if operation == "navigate":
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
             f"HTTP_STATUS: {parsed.get('status')}\n"
-            f"TITLE: {parsed.get('title')}"
+            f"TITLE: {parsed.get('title')}{js_diag}"
         )
     if operation == "extract_text":
         body = parsed.get("text", "")
@@ -1148,7 +1255,7 @@ async def tool_browser(
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
             f"TITLE: {parsed.get('title')}\n"
-            f"LENGTH: {parsed.get('length')}{trunc}\n"
+            f"LENGTH: {parsed.get('length')}{trunc}{js_diag}\n"
             f"--- TEXT ---\n{body}"
         )
     if operation == "click":
@@ -1163,7 +1270,7 @@ async def tool_browser(
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
             f"SAVED: {host_rel}\n"
-            f"DOWNLOAD: /api/download/{host_rel}"
+            f"DOWNLOAD: /api/download/{host_rel}{js_diag}"
         )
     if operation == "close":
         return f"{header}\nPROFILE_DIR: {parsed.get('profile_dir')}\nCLEARED: {parsed.get('closed')}"
@@ -1191,6 +1298,11 @@ async def tool_browser(
                 "page would have just timed out one-by-one. Fix the URL "
                 "and retry the whole interact call."
             )
+        if js_diag:
+            # Surface uncaught exceptions / console errors collected across
+            # the whole interact sequence — strip the leading newline the
+            # helper adds (we're already line-buffered here).
+            lines.append(js_diag.lstrip("\n"))
         lines.append("--- PER-ACTION RESULTS ---")
         for r in action_results:
             status = "OK" if r.get("ok") else "ERR"

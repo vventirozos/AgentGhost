@@ -144,6 +144,7 @@ def parse_args():
     parser.add_argument("--metacog-confidence-threshold", type=float, default=0.55, help="Composite confidence threshold below which the dual-solver arbiter is invoked. Default 0.55.")
     parser.add_argument("--metacog-disable-logprobs", action="store_true", help="Skip adding `logprobs=true, top_logprobs=5` to streaming payloads. Use when the upstream LLM server doesn't honour the OpenAI logprobs extension. Disables token-level entropy calibration.")
     parser.add_argument("--metacog-disable-arbiter", action="store_true", help="Keep the rest of the uplift but skip dual-solver arbitration on low-confidence turns. Useful for cost-sensitive deployments.")
+    parser.add_argument("--metacog-arbiter-timeout-s", type=float, default=60.0, help="Per-candidate timeout (seconds) for dual-solver arbitration. Each candidate is a full LLM completion over Tor; the budget must clear real model latency or both candidates time out and the arbiter degenerates into a constant ask_user. Default 60; raise on slow exits.")
     # Host telemetry thresholds — operator-tunable because the right
     # values are deployment-specific (an edge box vs. a fat dev host
     # vs. a node where the LLM server itself pins RAM at 95% as steady

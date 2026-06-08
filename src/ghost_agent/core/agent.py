@@ -164,6 +164,202 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
     return None
 
 
+# Mutation-verb markers in a file_system SUCCESS message. A file READ
+# returns the file's CONTENT (no SUCCESS:/verb), so it is correctly NOT
+# flagged — only write/replace confirmations are.
+_FILE_MUTATION_MARKERS = (
+    "wrote", "written", "replaced", "replace applied",
+    "auto-promoted", "search/replace", "overwrote", "overwritten",
+)
+
+
+def _is_unverified_mutation(tool: Optional[dict]) -> bool:
+    """True when ``tool`` is a SUCCESSFUL file write/replace — i.e. the
+    turn's final substantive action mutated a file but the turn ended
+    without ever running or rendering it.
+
+    The verifier gate uses this to refuse a clean "success" finish on an
+    untested change: the req_C0 failure was a 33-minute build that
+    "finished" immediately after a `file_system` write that was never
+    executed or screenshotted, yet reported C=0.96. Conservative — fires
+    only for the ``file_system`` tool AND only on a write/replace SUCCESS
+    confirmation, so a file READ (which also carries evidence) is not
+    mistaken for a mutation."""
+    if not tool or not isinstance(tool, dict):
+        return False
+    name = str(tool.get("name", "")).lower().replace("-", "_").replace(" ", "_")
+    if name not in ("file_system", "filesystem", "file"):
+        return False
+    content = str(tool.get("content", "")).lower()
+    if "success" not in content:
+        return False
+    return any(marker in content for marker in _FILE_MUTATION_MARKERS)
+
+
+# ── Visual verification evidence ─────────────────────────────────────
+# A text-only verifier cannot tell whether a reported VISUAL symptom
+# ("the blocks look transparent", "the layout is broken") was actually
+# fixed — the truth lives in the rendered pixels, not in the agent's
+# self-claim. These helpers gate + gather the before/after screenshots so
+# the verifier can look at the artifact and override an over-optimistic
+# text CONFIRMED. See the visual-verify block in handle_chat.
+_VISUAL_INTENT_RE = re.compile(
+    r"\b(screenshot|screen[\s-]?grab|\bscreen\b|render(?:s|ed|ing)?|"
+    r"transparen\w*|see[\s-]?through|invisible|blank|black\s+screen|"
+    r"\bui\b|layout|css|displayed?|visual\w*|pixel\w*|graphic\w*|"
+    r"looks?\s+(?:wrong|off|broken|weird|transparent)|appears?)\b",
+    re.IGNORECASE,
+)
+_IMAGE_TOKEN_RE = re.compile(
+    r"[\w./\\-]+\.(?:png|jpe?g|webp|gif|bmp)", re.IGNORECASE,
+)
+
+
+def _is_visual_intent(text: Optional[str]) -> bool:
+    """Cheap (no-LLM) gate: does the user's request describe a VISUAL
+    symptom or reference an image? Keeps the extra vision call off the
+    ~99% of turns that aren't about how something looks."""
+    if not text:
+        return False
+    if _IMAGE_TOKEN_RE.search(text):
+        return True
+    return bool(_VISUAL_INTENT_RE.search(text))
+
+
+def _extract_image_tokens(blob: Optional[str]) -> List[str]:
+    """All image-file-looking tokens in a text blob, in order."""
+    if not blob:
+        return []
+    return _IMAGE_TOKEN_RE.findall(str(blob))
+
+
+def _resolve_image_path(token: str, sandbox_dir: Any) -> Optional[str]:
+    """Resolve an image reference (which may be a container path like
+    ``/sandbox/x.png`` or ``/workspace/projects/<id>/y.png``, or a bare
+    filename) to an existing host path under ``sandbox_dir``. Mirrors the
+    container→host + project-root fallbacks used by tools/vision.py.
+    Returns ``None`` if nothing matching exists."""
+    if not token or sandbox_dir is None:
+        return None
+    t = str(token).strip().strip("'\"")
+    for pre in ("/api/download/", "/sandbox/", "/workspace/"):
+        if t.startswith(pre):
+            t = t[len(pre):]
+    candidates: List[Path] = []
+    try:
+        p = Path(t)
+        if p.is_absolute():
+            candidates.append(p)
+    except Exception:
+        pass
+    try:
+        from ..tools.file_system import _get_safe_path
+        candidates.append(_get_safe_path(sandbox_dir, t))
+        if Path(sandbox_dir).parent.name == "projects":
+            candidates.append(_get_safe_path(Path(sandbox_dir).parent.parent, t))
+    except Exception:
+        candidates.append(Path(sandbox_dir) / t)
+    for c in candidates:
+        try:
+            if c.exists() and c.is_file():
+                return str(c)
+        except Exception:
+            continue
+    # Last resort: match the basename anywhere under the sandbox (newest wins).
+    try:
+        base = Path(t).name
+        roots = [Path(sandbox_dir)]
+        if Path(sandbox_dir).parent.name == "projects":
+            roots.append(Path(sandbox_dir).parent.parent)
+        matches: List[Path] = []
+        for root in roots:
+            matches.extend(root.rglob(base))
+        matches = [m for m in matches if m.is_file()]
+        if matches:
+            matches.sort(key=lambda m: m.stat().st_mtime, reverse=True)
+            return str(matches[0])
+    except Exception:
+        pass
+    return None
+
+
+def _select_visual_evidence(messages: list, last_user_content: str,
+                            sandbox_dir: Any) -> tuple:
+    """Pick (before_image, after_image) host paths for visual verification.
+
+    * before = an image the user referenced in their request (the symptom
+      screenshot), if any — taken from ``last_user_content`` directly.
+    * after  = a screenshot the agent produced this turn (a DIFFERENT image
+      than the user's own). If the only image in play is the user's own,
+      ``after`` is None — the agent never re-rendered, so there is no
+      post-fix evidence and we must not judge.
+
+    Scans ALL assistant/tool-role messages rather than "everything after the
+    last user message": the agent loop injects synthetic user-role messages
+    mid-turn (planning nudges, "### ACTIVE STRATEGY", AUTO-DIAGNOSTIC), so the
+    last user message is often NOT the human's request and the screenshot can
+    sit before it. The user's own before-image lives in a user-role message,
+    so restricting to assistant/tool roles keeps before/after distinct.
+    Among candidates the NEWEST file on disk wins — this turn's screenshot was
+    just written, so it beats any stale image from an earlier turn.
+
+    Returns ``(before|None, after|None)``."""
+    before_img = None
+    for tok in _extract_image_tokens(last_user_content):
+        before_img = _resolve_image_path(tok, sandbox_dir)
+        if before_img:
+            break
+
+    candidates: List[str] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") not in ("assistant", "tool"):
+            continue
+        blob_parts: List[str] = []
+        c = msg.get("content")
+        if isinstance(c, str):
+            blob_parts.append(c)
+        tcs = msg.get("tool_calls")
+        if isinstance(tcs, list):
+            for tc in tcs:
+                try:
+                    blob_parts.append(json.dumps(tc))
+                except Exception:
+                    blob_parts.append(str(tc))
+        for tok in _extract_image_tokens(" ".join(blob_parts)):
+            resolved = _resolve_image_path(tok, sandbox_dir)
+            if resolved and resolved != before_img and resolved not in candidates:
+                candidates.append(resolved)
+
+    after_img = None
+    if candidates:
+        try:
+            after_img = max(candidates, key=lambda p: Path(p).stat().st_mtime)
+        except Exception:
+            after_img = candidates[-1]
+    return before_img, after_img
+
+
+def _note_repeated_failure(sigs: dict, fname, error, threshold: int = 3):
+    """Record one structural tool failure and report whether the SAME
+    failure has now recurred enough times to be a persistent loop.
+
+    The signature is ``tool | whitespace-normalised error head`` — stable
+    across byte-identical repeats (e.g. the same "'x' not found." every
+    turn) but distinct for different tools/errors. Pure aside from mutating
+    the caller-owned ``sigs`` dict, so it is unit-testable. Returns
+    ``(signature, count, is_persistent)``. Used to freeze the strike-decay
+    once a loop is detected — otherwise an interleaved success cancels the
+    strike and the cap never fires."""
+    sig = f"{fname or '?'}|" + re.sub(
+        r"\s+", " ", str(error or "")[:160].lower()
+    ).strip()
+    count = sigs.get(sig, 0) + 1
+    sigs[sig] = count
+    return sig, count, count >= threshold
+
+
 def _reconstruct_executed_code(
     messages: Optional[list],
     tool_msg: Optional[dict],
@@ -2684,7 +2880,16 @@ class GhostAgent:
                     from ..workspace import WorkspaceModel as _WorkspaceModel
                     workspace_model = getattr(self.context, 'workspace_model', None)
                     if isinstance(workspace_model, _WorkspaceModel) and getattr(workspace_model, 'enabled', False):
-                        ws_prefix = workspace_model.build_wakeup_prefix()
+                        # Keep the model's active-project pointer in sync so
+                        # both recorded events and the wake-up prefix are
+                        # scoped to THIS project — a prior project's research
+                        # artifacts / narrative must not bleed into a new one.
+                        _active_pid = getattr(self.context, 'current_project_id', None) or ""
+                        try:
+                            workspace_model.current_project_id = _active_pid
+                        except Exception:
+                            pass
+                        ws_prefix = workspace_model.build_wakeup_prefix(active_project_id=_active_pid)
                         if isinstance(ws_prefix, str) and ws_prefix:
                             continuity_blocks.append(ws_prefix)
                 except Exception as e:
@@ -3003,6 +3208,19 @@ class GhostAgent:
                 raw_tools_called = set()
                 execution_failure_count = 0
                 transient_failure_count = 0   # Separate budget for retryable errors
+                # Repeated-IDENTICAL-failure tracking. The structural strike
+                # count decays by 1 on any successful tool turn, so an agent
+                # that oscillates "same failing read → list sandbox (succeeds)
+                # → same failing read …" never trips the strike cap and burns
+                # all 40 turns (observed: a new project whose stale workspace
+                # narrative kept asserting a prior project's index.html existed
+                # → the model re-read the missing path every other turn forever).
+                # Keyed by (tool, normalised-error) signature; once a signature
+                # recurs, decay is frozen so genuine accumulation resumes and
+                # the loop-breaker can fire, and the model is told ONCE to stop.
+                repeated_failure_sigs: dict = {}
+                persistent_failure_seen = False
+                persistent_warned_sigs: set = set()
                 # Counts CONSECUTIVE `system_parse_error` events across turns
                 # within this request. Reset on any successful parse. After
                 # threshold (≥2) we pivot the recovery prompt to suggest
@@ -6180,6 +6398,37 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 execution_failure_count += 1
                                 pretty_log("Execution Fail", f"Strike {execution_failure_count}/6 ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL)
                                 diagnostic_msg = format_failure_context(last_error_preview, failure_class)
+                                # Detect the SAME structural failure recurring.
+                                # At ≥3 repeats: freeze the success-decay (so the
+                                # cap can finally fire on this oscillating loop)
+                                # and tell the model ONCE to stop retrying — the
+                                # live tool result is authoritative over any stale
+                                # context/system-state hint that says otherwise.
+                                _sig, _cnt, _persist = _note_repeated_failure(
+                                    repeated_failure_sigs, fname, last_error_preview
+                                )
+                                if _persist:
+                                    persistent_failure_seen = True
+                                    if _sig not in persistent_warned_sigs:
+                                        persistent_warned_sigs.add(_sig)
+                                        pretty_log(
+                                            "Loop Breaker",
+                                            f"Same failure ×{_cnt} "
+                                            f"({fname}) — freezing strike decay & redirecting.",
+                                            level="WARNING", icon=Icons.STOP,
+                                        )
+                                        messages.append({"role": "user", "content": (
+                                            f"SYSTEM ALERT: This exact action has now failed "
+                                            f"{_cnt} times with the SAME error: "
+                                            f"{str(last_error_preview)[:160]}. STOP repeating it — "
+                                            "retrying will not change the result. The live tool "
+                                            "result and the current sandbox listing are AUTHORITATIVE "
+                                            "over any prior context, memory, workspace narrative, or "
+                                            "DYNAMIC SYSTEM STATE hint that suggested otherwise. Pick a "
+                                            "DIFFERENT action now: if a file is missing, CREATE it with "
+                                            "file_system(operation='write', …) or choose an existing "
+                                            "file from the listing; if an approach is wrong, change it."
+                                        )})
 
                             last_was_failure = True
 
@@ -6238,7 +6487,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # Only reset transient failures on success; structural
                             # failures require consecutive successes to decay.
                             transient_failure_count = 0
-                            if execution_failure_count > 0:
+                            # Freeze the decay once a SAME-failure loop has been
+                            # detected: otherwise an interleaved success (e.g. the
+                            # auto sandbox-listing that follows every failed read)
+                            # cancels the strike and the cap never fires. With the
+                            # decay frozen, the recurring failure accumulates to
+                            # the cap and the loop-breaker can stop the request.
+                            if execution_failure_count > 0 and not persistent_failure_seen:
                                 execution_failure_count = max(0, execution_failure_count - 1)
 
                             # Terminal tools: `self_play` and `dream_mode`
@@ -6620,6 +6875,69 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 context=(last_user_content or "")[:1000],
                             )
                         from .verifier import VerifyVerdict
+                        # Visual ground-truth override. A text verdict can't
+                        # see whether a reported VISUAL symptom ("blocks look
+                        # transparent") actually got fixed — the truth is in
+                        # the rendered pixels, so a self-claim like "I split
+                        # the meshes" sails through as CONFIRMED. When the
+                        # user described a visual symptom AND the agent
+                        # produced an after-screenshot this turn, re-read the
+                        # pixels and let a CONFIDENT visual REFUTED override an
+                        # optimistic text pass. Skipped silently (no penalty)
+                        # when nothing renderable is available.
+                        try:
+                            if _is_visual_intent(last_user_content):
+                                # Use the SAME per-request sandbox the browser
+                                # tool writes screenshots to. GhostAgent holds
+                                # no `sandbox_dir` of its own (it lives on the
+                                # context) — referencing self.sandbox_dir here
+                                # silently AttributeError'd, so the visual check
+                                # never ran. project_scoped_sandbox is what the
+                                # rest of handle_chat uses for file resolution.
+                                from ..tools.file_system import project_scoped_sandbox
+                                _sbx = project_scoped_sandbox(self.context)[0]
+                                _before_img, _after_img = _select_visual_evidence(
+                                    messages, last_user_content or "", _sbx,
+                                )
+                                if _after_img:
+                                    _vv = await verifier.verify_visual(
+                                        symptom=last_user_content or "",
+                                        claim=final_ai_content or "",
+                                        after_image=_after_img,
+                                        before_image=_before_img,
+                                    )
+                                    if _vv is not None:
+                                        if _vv.confidence >= 0.7 and _vv.verdict == VerifyVerdict.REFUTED:
+                                            # Pixels show the symptom persists.
+                                            v_result = _vv
+                                        elif _vv.confidence >= 0.7 and v_result is None:
+                                            v_result = _vv
+                                        pretty_log(
+                                            "Verifier",
+                                            f"VISUAL {_vv.verdict.value} "
+                                            f"({_vv.confidence:.0%}): "
+                                            f"{(_vv.reasoning or '')[:120]}",
+                                            icon=Icons.BRAIN_THINK,
+                                        )
+                                    else:
+                                        pretty_log(
+                                            "Verifier",
+                                            "VISUAL check skipped (vision returned no verdict)",
+                                            icon=Icons.BRAIN_THINK,
+                                        )
+                                else:
+                                    pretty_log(
+                                        "Verifier",
+                                        "VISUAL check skipped (no rendered after-image "
+                                        f"this turn; before={'yes' if _before_img else 'no'})",
+                                        icon=Icons.BRAIN_THINK,
+                                    )
+                        except Exception as _vv_exc:
+                            pretty_log(
+                                "Verifier",
+                                f"VISUAL check error: {type(_vv_exc).__name__}: {_vv_exc}",
+                                icon=Icons.WARN, level="WARNING",
+                            )
                         # Record the verdict for the selfhood backfill that
                         # runs after the autobiographical record is written.
                         if v_result and v_result.confidence >= 0.7:
@@ -6681,10 +6999,43 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             else:
                                 # v_result is None → the verifier pipeline FAILED
                                 # (e.g. LLM error); it did NOT pass. Don't show ✅.
-                                pretty_log(
-                                    "Verifier", "unavailable — gate skipped",
-                                    icon=Icons.WARN, level="WARNING",
-                                )
+                                #
+                                # Unverified-mutation guard: when the gate is
+                                # skipped AND the turn's final substantive action
+                                # was a successful file write/replace, the agent
+                                # is finalising on an UNTESTED change — the exact
+                                # req_C0 failure (33-min build that "finished"
+                                # right after a write that was never run, yet
+                                # reported C=0.96). Treat that as a failed outcome
+                                # so confidence drops below threshold and the turn
+                                # is recorded as unverified rather than success.
+                                if _is_unverified_mutation(last_tool):
+                                    verifier_backfill = (
+                                        "failed",
+                                        "unverified mutation — finalised on an "
+                                        "untested file write/replace; the change "
+                                        "was never run or screenshotted",
+                                    )
+                                    note = (
+                                        "\n\n---\n**⚠ Unverified:** the final action "
+                                        "was a file write that was never executed or "
+                                        "rendered, so I cannot confirm it works. Treat "
+                                        "this as INCOMPLETE — run/preview it before "
+                                        "relying on it."
+                                    )
+                                    if note[:40] not in final_ai_content:
+                                        final_ai_content = f"{final_ai_content}{note}"
+                                    pretty_log(
+                                        "Verifier",
+                                        "unavailable — finalised on UNVERIFIED write "
+                                        "(outcome=failed)",
+                                        icon=Icons.WARN, level="WARNING",
+                                    )
+                                else:
+                                    pretty_log(
+                                        "Verifier", "unavailable — gate skipped",
+                                        icon=Icons.WARN, level="WARNING",
+                                    )
                 except Exception as e:
                     logger.debug(f"Verifier gate skipped: {e}")
 
@@ -6797,11 +7148,27 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         _upress = _ut.pressure()
                                 except Exception:
                                     _upress = 0.0
+                                # Objective outcome penalty: a REFUTED verdict or
+                                # an unverified mutation (both surface as
+                                # verifier_backfill[0]=="failed") is ground truth
+                                # that THIS answer is wrong/unconfirmed. Without
+                                # it the reading is ≈ competence, so a historically
+                                # strong domain reports high confidence on a build
+                                # the verifier just rejected (the req_44/C0
+                                # "below=no on broken work" failure). 0.8 reliably
+                                # pulls a 0.92–0.96 competence reading below the
+                                # 0.89 threshold.
+                                _outcome_penalty = (
+                                    0.8 if (verifier_backfill
+                                            and verifier_backfill[0] == "failed")
+                                    else 0.0
+                                )
                                 _pending = _mc.confidence.score(
                                     normalised_entropy=0.5,
                                     competence_p_success=_p,
                                     n_observations=_n,
                                     uncertainty_pressure=_upress,
+                                    outcome_penalty=_outcome_penalty,
                                 )
                                 self.context.last_confidence = _pending
                                 try:

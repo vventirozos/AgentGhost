@@ -199,6 +199,17 @@
     </tbody>
   </table>
 
+  <h2>Round 4 — live-log regressions (2026-06-08)</h2>
+  <p>Two defects surfaced by a long agent session log: each silently defeated a whole subsystem rather than crashing, so neither showed up as an error. Both fixed with tests.</p>
+  <table>
+    <thead><tr><th>Item</th><th>Resolution</th><th>Where</th></tr></thead>
+    <tbody>
+      <tr><td>Arbiter never arbitrated</td><td>The dual-solver per-sample timeout defaulted to <code>10.0 s</code>, but each candidate is a full LLM completion over Tor (20&ndash;40 s). Both candidates timed out <em>every</em> turn (<code>both candidates failed: timeout after 10.0s</code>), so the arbiter degenerated into a constant <code>ask_user</code> while still paying two completions of latency. Default raised to <code>60 s</code> and threaded through as operator-tunable <code>--metacog-arbiter-timeout-s</code>; the bundle now passes it explicitly instead of inheriting the bare class default.</td><td><a href="core/arbiter.html">core/arbiter</a>, core/metacog, main</td></tr>
+      <tr><td>Reflection learned from its own error-recovery</td><td>Idle reflection promoted <code>AUTO-DIAGNOSTIC</code> / self-repeating-loop turns to FAILED and distilled them into saved <em>skills</em> &mdash; keyed on the system banner itself (e.g. a lesson triggered by a one-off malformed diagnostic command), polluting the playbook with recovery trivia instead of task knowledge. Added a narrow <code>_is_recovery_scaffold</code> gate in <code>reflection/loop.py</code>, applied in both <code>_is_reflectable</code> (batch path) and <code>reflect_one</code> (post-turn path). Deliberately narrower than the autobiographical template-marker set: synthetic-training and judge-rejection turns remain legitimate self-play learning signal.</td><td><a href="self_improvement.md">reflection/loop</a></td></tr>
+      <tr><td>Verifier confirmed a still-broken VISUAL fix</td><td>The text verifier audits words, so a visual bug report ("blocks look transparent") got CONFIRMED at 90% off the agent's self-claim while the screenshot still showed the defect &mdash; the truth lives in pixels it never saw. Added <code>Verifier.verify_visual</code> (vision node via <code>use_vision=True</code>, before/after when available) plus a cheap <code>_is_visual_intent</code> gate and <code>_select_visual_evidence</code> in <code>agent.py</code>. A confident visual REFUTED overrides an optimistic text CONFIRMED and feeds the existing <code>outcome_penalty</code>; missing/unreadable renders skip with no penalty. Verdict judges claim-vs-pixels honesty, so a truthful "still broken" is not penalized. Live testing against the running agent caught three integration bugs unit tests missed: evidence selection broke on mid-turn synthetic user messages; <code>self.sandbox_dir</code> doesn't exist on <code>GhostAgent</code> (it's on the context) so the block silently <code>AttributeError</code>'d; and the symptom-only prompt would have refuted honest failure reports.</td><td><a href="core/verifier.html">core/verifier</a>, core/agent</td></tr>
+    </tbody>
+  </table>
+
   <h2>Remaining by design</h2>
   <ul>
     <li><strong>Sandbox host-networking</strong> — remains the Linux default (the in-sandbox Tor proxy needs host loopback); isolation is opt-in via <code>GHOST_SANDBOX_NETWORK</code>. Not a bug; left as a deliberate, documented trade-off.</li>

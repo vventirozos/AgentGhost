@@ -149,3 +149,73 @@ async def test_reflect_one_returns_error_on_critique_raise():
     out = await refl.reflect_one(_failed_traj())
     assert not out.ok
     assert "RuntimeError" in out.error
+
+
+# ------------------------------------------------------ recovery scaffolding
+
+
+from ghost_agent.reflection.loop import _is_recovery_scaffold
+
+
+def _scaffold_traj(prefix, tid="tS"):
+    """A FAILED trajectory whose user prompt is system-generated recovery
+    scaffolding (e.g. an AUTO-DIAGNOSTIC retry), exactly the kind that must
+    NOT become a saved lesson."""
+    return Trajectory(
+        id=tid,
+        user_request=prefix,
+        failure_reason="browser selector '#loading-text' used 4x (>= 4 threshold)",
+        outcome=Outcome.FAILED.value,
+        tool_calls=[
+            ToolCall(name="execute", arguments={"code": "scripts[1]"},
+                     result="TypeError: Cannot read properties of undefined"),
+        ],
+    )
+
+
+def test_is_recovery_scaffold_detects_markers():
+    assert _is_recovery_scaffold(_scaffold_traj(
+        "AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR — analyze and fix: [eval]:6 ..."))
+    assert _is_recovery_scaffold(_scaffold_traj(
+        "SYSTEM ALERT: Your previous turn entered a self-repeating loop ..."))
+    # Leading whitespace is tolerated (banners are matched after lstrip).
+    assert _is_recovery_scaffold(_scaffold_traj(
+        "\n  AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR — foo"))
+
+
+def test_is_recovery_scaffold_allows_real_tasks_and_learning_signal():
+    assert not _is_recovery_scaffold(_failed_traj())  # ordinary user task
+    # Self-play / judge-rejection turns ARE legitimate learning signal and
+    # must remain reflectable — they are deliberately not in the marker set.
+    assert not _is_recovery_scaffold(_scaffold_traj(
+        "### SYNTHETIC TRAINING EXERCISE\nbuild a parser"))
+    assert not _is_recovery_scaffold(_scaffold_traj(
+        "SYSTEM JUDGE REJECTION: your last attempt was wrong"))
+
+
+def test_is_reflectable_skips_recovery_scaffold_even_when_failed():
+    refl = Reflector(critique_fn=lambda _p: _VALID)
+    scaffold = _scaffold_traj("AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR — fix it")
+    assert scaffold.outcome == Outcome.FAILED.value
+    assert refl._is_reflectable(scaffold) is False
+    # A normal failed task is still reflectable (regression guard).
+    assert refl._is_reflectable(_failed_traj()) is True
+
+
+async def test_reflect_one_skips_scaffold_without_calling_critique_or_sink():
+    calls = []
+    sink_received = []
+
+    async def critique(prompt):
+        calls.append(prompt)
+        return _VALID
+
+    refl = Reflector(critique_fn=critique)
+    out = await refl.reflect_one(
+        _scaffold_traj("AUTO-DIAGNOSTIC: DIAGNOSTIC ERROR — fix it"),
+        sink=sink_received.append,
+    )
+    assert not out.ok
+    assert "recovery-scaffold" in out.error
+    assert calls == []          # no LLM critique burned
+    assert sink_received == []  # no lesson saved to the playbook

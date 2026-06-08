@@ -76,7 +76,12 @@ async def test_path_traversal_protection(sandbox):
 async def test_read_nonexistent(sandbox):
     result = await tool_read_file("ghost_file.txt", sandbox)
     assert "Error" in result
-    assert "not found" in result
+    # The bare "not found" was replaced with a loop-breaking, reconciling
+    # message (see tests/test_not_found_loop_breaker.py) — assert the new
+    # contract: it names the file, says it doesn't exist, and gives an exit.
+    assert "ghost_file.txt" in result
+    assert "does not exist" in result
+    assert "operation='write'" in result
 
 @pytest.mark.asyncio
 async def test_write_empty_content(sandbox):

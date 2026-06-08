@@ -146,9 +146,15 @@ class MetacogBundle:
         bundle.bridge.attach()
 
         if bundle.arbiter_enabled:
+            # Candidate sampling is a real LLM completion over Tor; the
+            # per-sample timeout has to clear that latency or both
+            # candidates time out and the arbiter degenerates into a
+            # constant ask_user (the "timeout after 10.0s" failure mode).
             bundle.arbiter = DualSolverArbiter(
                 runner=_make_arbiter_runner(context),
                 embedder=_make_arbiter_embedder(context),
+                per_sample_timeout_s=float(getattr(
+                    args, "metacog_arbiter_timeout_s", 60.0)),
                 divergence_threshold=0.85,
             )
 
