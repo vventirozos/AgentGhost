@@ -220,6 +220,54 @@ def _resolve_store(context) -> Optional[ProjectStore]:
     return getattr(context, "project_store", None)
 
 
+# A project in one of these states is finished — the duplicate-create guard
+# treats it as superseded (a same-title `create` starts a fresh project)
+# rather than reusing it.
+_TERMINAL_PROJECT_STATUSES = {"DONE", "FAILED", "BLOCKED", "ARCHIVED"}
+
+
+def _resolve_project_ref(store, project_id: Optional[str],
+                         title: str = "") -> tuple:
+    """Resolve a project reference to a concrete id.
+
+    Users (and the model on their behalf) refer to projects by NAME —
+    e.g. "delete the minecraft clone project" — but the destructive
+    actions key on the opaque hex id. When the given ``project_id`` isn't a
+    real id, fall back to a case-insensitive title match (also accepting an
+    explicit ``title``). This is what stops a delete from silently no-
+    op'ing when a name was passed where an id was expected.
+
+    Returns ``(resolved_id, error)``:
+      * a real id was found            → (id, None)
+      * exactly one title match        → (id, None)
+      * several title matches          → (None, "ambiguous … <ids>")
+      * nothing matched                → (None, None)
+    """
+    if project_id:
+        try:
+            if store.get_project(project_id):
+                return project_id, None
+        except Exception:
+            pass
+    needle = (title or project_id or "").strip().lower()
+    if not needle:
+        return None, None
+    try:
+        matches = [p for p in store.list_projects()
+                   if (p.get("title") or "").strip().lower() == needle]
+    except Exception:
+        matches = []
+    if len(matches) == 1:
+        return matches[0]["id"], None
+    if len(matches) > 1:
+        listing = ", ".join(f"{p['id']} ({p['status']})" for p in matches)
+        return None, (
+            f"ambiguous: {len(matches)} projects are titled '{needle}'. "
+            f"Pass a specific project_id — candidates: {listing}"
+        )
+    return None, None
+
+
 def _coerce_str_list(value) -> Optional[List[str]]:
     """Normalize a parameter that the schema declares as ``array<string>``
     but small LLMs routinely pass as a bare string.
@@ -493,16 +541,26 @@ async def tool_manage_projects(
             normalized = title.strip().lower()
             now = time.time()
             for existing in store.list_projects():
-                if existing["status"] == "ARCHIVED":
+                # Only reuse a same-title project that is still IN-FLIGHT.
+                # The guard exists to stop the model spawning duplicates of
+                # work that is still in progress — NOT to block starting a
+                # genuinely new effort once the old one has finished. Reusing
+                # a terminal (DONE/FAILED/BLOCKED/ARCHIVED) project here
+                # resurrected a completed "Minecraft Clone" — with its stale
+                # tasks and on-disk files — when the user explicitly asked to
+                # create a NEW one (observed live, after a delete that never
+                # took effect). Terminal projects are superseded by a fresh
+                # create; only ACTIVE / PAUSED / NEEDS_USER are reused.
+                if existing["status"] in _TERMINAL_PROJECT_STATUSES:
                     continue
                 if (existing["title"] or "").strip().lower() != normalized:
                     continue
-                # Existence-based guard: a non-archived project with
-                # the same title means the user is asking us to
-                # continue, not start over. We reuse it regardless of
-                # how long ago it was created. ``_DUPLICATE_CREATE_WINDOW_SECONDS``
-                # is honored as a max-age only when explicitly set to
-                # an int (tests patch it to 0 to disable the guard).
+                # Existence-based guard: an in-flight project with the same
+                # title means the user is asking us to continue, not start
+                # over. We reuse it regardless of how long ago it was created.
+                # ``_DUPLICATE_CREATE_WINDOW_SECONDS`` is honored as a max-age
+                # only when explicitly set to an int (tests patch it to 0 to
+                # disable the guard).
                 window = _DUPLICATE_CREATE_WINDOW_SECONDS
                 if window is not None:
                     age = now - float(existing.get("created_at", 0))
@@ -634,24 +692,48 @@ async def tool_manage_projects(
             # Hard, irreversible delete: DB row + all tasks/artifacts/events
             # (cascade) + the on-disk workspace (<sandbox>/projects/<id>/).
             # Use action=archive to merely hide a resumable project.
-            if not project_id:
-                return _err("project_id is required for action=delete")
-            ok = store.delete_project(project_id, hard=True)
-            if getattr(context, "current_project_id", None) == project_id:
+            if not project_id and not title:
+                return _err("project_id (or title) is required for action=delete")
+            rid, rerr = _resolve_project_ref(store, project_id, title)
+            if rerr:
+                return _err(rerr)
+            if not rid:
+                # Fail LOUDLY. A silent no-op here is what let a "delete"
+                # be reported as done while the project survived — and then
+                # be resurrected by the duplicate-create guard.
+                return _err(
+                    f"project not found: {project_id or title!r} — NOTHING was "
+                    f"deleted. Use action=list to see the real ids, then pass "
+                    f"the exact project_id."
+                )
+            ok = store.delete_project(rid, hard=True)
+            if not ok:
+                return _err(f"delete failed for {rid} — nothing was removed.")
+            if getattr(context, "current_project_id", None) == rid:
                 _set_current(context, None)
-            return _ok({"deleted": ok, "hard": True,
+            return _ok({"deleted": True, "project_id": rid, "hard": True,
                         "note": "Project, its tasks/artifacts/events, and its "
                                 "workspace files were permanently removed."})
 
         if act == "archive":
             # Soft delete: flips status to ARCHIVED; the project (and its
             # files) survive and can be brought back with action=resume.
-            if not project_id:
-                return _err("project_id is required for action=archive")
-            ok = store.delete_project(project_id, hard=False)
-            if getattr(context, "current_project_id", None) == project_id:
+            if not project_id and not title:
+                return _err("project_id (or title) is required for action=archive")
+            rid, rerr = _resolve_project_ref(store, project_id, title)
+            if rerr:
+                return _err(rerr)
+            if not rid:
+                return _err(
+                    f"project not found: {project_id or title!r} — NOTHING was "
+                    f"archived. Use action=list to see the real ids."
+                )
+            ok = store.delete_project(rid, hard=False)
+            if not ok:
+                return _err(f"archive failed for {rid} — nothing was changed.")
+            if getattr(context, "current_project_id", None) == rid:
                 _set_current(context, None)
-            return _ok({"archived": ok,
+            return _ok({"archived": True, "project_id": rid,
                         "note": "Project hidden but kept; use action=resume to "
                                 "bring it back, or action=delete to remove it "
                                 "permanently."})
