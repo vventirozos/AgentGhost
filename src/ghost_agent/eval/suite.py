@@ -180,10 +180,25 @@ class EvalSuite:
 
         # Unpack runner return shape.
         if isinstance(result_val, dict):
-            output = result_val.get("output", "")
             metrics = result_val
+            output_text = result_val.get("output", "")
+            # A dict carrying a `passed` key is a sandbox-runner VERDICT
+            # (the documented ChallengeTemplateTask contract) — hand the
+            # dict itself to validate() so its dict branch is reachable.
+            # Stripping it to ["output"] inverted template results:
+            # {"passed": True} failed as "empty output" while
+            # {"passed": False, "output": "<traceback>"} passed as a
+            # non-empty string. Scoped to template tasks: every other
+            # task type's validator expects a string.
+            from .tasks import ChallengeTemplateTask as _CTT
+            output = (
+                result_val
+                if ("passed" in result_val and isinstance(task, _CTT))
+                else output_text
+            )
         else:
             output = result_val
+            output_text = result_val
             metrics = {"output": output}
 
         try:
@@ -207,7 +222,7 @@ class EvalSuite:
             tool_calls=int(metrics.get("tool_calls") or 0),
             tool_errors=int(metrics.get("tool_errors") or 0),
             tokens_used=int(metrics.get("tokens_used") or 0),
-            final_output=str(output) if not isinstance(output, str) else output,
+            final_output=str(output_text) if not isinstance(output_text, str) else output_text,
             failure_reason=failure_reason,
             extra=dict(metrics.get("extra") or {}),
         )

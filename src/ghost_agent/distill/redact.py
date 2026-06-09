@@ -36,9 +36,11 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
         r"[\s\S]+?-----END (?:RSA |EC |DSA |OPENSSH |PGP |ENCRYPTED )?PRIVATE KEY-----"
     ), "<REDACTED_PRIVATE_KEY>"),
 
-    # Bearer / Authorization headers (HTTP header form + JSON form).
+    # Authorization headers (HTTP header form + JSON form). All schemes:
+    # Basic carries reversible base64(user:pass), Token/Digest carry
+    # credentials too — a Bearer-only rule leaked every other scheme.
     ("auth_header", re.compile(
-        r"(?i)(authorization\"?\s*:\s*\"?)(bearer\s+[^\s\"',]+)"
+        r"(?i)(authorization\"?\s*:\s*\"?)((?:bearer|basic|token|digest)\s+[^\s\"',]+)"
     ), r"\1<REDACTED_BEARER>"),
 
     # JWTs (header.payload.signature, all base64url).
@@ -70,21 +72,38 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
 
     # Credentials embedded in a DB / broker connection URI: redact only the
     # password between `user:` and `@host` (host/scheme are topology, not secret).
+    # Username is OPTIONAL (`*` not `+`): the canonical Redis requirepass
+    # form is `redis://:password@host` with an empty user — requiring a
+    # username char leaked exactly that form.
     ("conn_uri_password", re.compile(
-        r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql)://[^\s:\"'/]+:)"
+        r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql)://[^\s:\"'/]*:)"
         r"([^\s:\"'@/]+)(@)"
     ), r"\1<REDACTED>\3"),
 
     # Named secret env-var assignments (NAME=value or "NAME": "value").
+    # The `\"?` BEFORE the separator is load-bearing: in the JSON form the
+    # key's closing quote sits between the name and the colon, and without
+    # it `{"GHOST_API_KEY": "..."}` never matched — leaking exactly the
+    # named, non-self-identifying secrets (AWS secret keys have no prefix)
+    # this rule exists for.
     ("env_assignment_secret", re.compile(
-        r"((?:GHOST_API_KEY|SLACK_BOT_TOKEN|SLACK_APP_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|GH_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY)\s*[=:]\s*\"?)[^\s\"',]+",
+        r"((?:GHOST_API_KEY|SLACK_BOT_TOKEN|SLACK_APP_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|HF_TOKEN|HUGGINGFACE_TOKEN|AWS_SECRET_ACCESS_KEY|GITHUB_TOKEN|GH_TOKEN|GOOGLE_API_KEY|STRIPE_SECRET_KEY)\"?\s*[=:]\s*\"?)[^\s\"',]+",
     ), r"\1<REDACTED>"),
 
     # Generic ALL-CAPS secret-shaped env assignment (…KEY/TOKEN/SECRET/
     # PASSWORD/PASSWD/CREDENTIAL = value). Prefers false positives.
+    # Same optional closing quote before the separator as above.
     ("generic_secret_assignment", re.compile(
-        r"\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)S?)(\s*[=:]\s*\"?)([^\s\"',]+)"
+        r"\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)S?)(\"?\s*[=:]\s*\"?)([^\s\"',]+)"
     ), r"\1\2<REDACTED>"),
+
+    # Lowercase form/query-string secrets (`client_secret=…`, `password=…`
+    # in curl bodies and URLs). OAuth token exchanges and login form posts
+    # are conventionally lowercase; the ALL-CAPS rule above and the JSON
+    # rule below both miss the `key=value` spelling.
+    ("form_secret_assignment", re.compile(
+        r"(?i)\b((?:[a-z0-9_\-]*(?:password|passwd|secret|token|api_key|apikey))=)([^\s&\"',]+)"
+    ), r"\1<REDACTED>"),
 
     # JSON-style "api_key": "..." / "token": "..."
     ("json_secret_field", re.compile(
@@ -113,8 +132,15 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
         r"(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d\d?)){3})\b"
     ), "<REDACTED_IP>"),
 
-    # IPv6 addresses (>=4 hextet groups so `::1` loopback stays readable).
-    ("ipv6", re.compile(r"\b(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}\b"), "<REDACTED_IP>"),
+    # IPv6 addresses: full form (>=4 hextet groups so `::1` loopback stays
+    # readable) PLUS `::`-compressed forms — most real-world IPv6 is
+    # compressed (`2001:db8::8a2e:370:7334`), and the full-form-only rule
+    # leaked all of them. Bare `::1` still stays readable (the compressed
+    # alternative needs at least one hextet before the `::`).
+    ("ipv6", re.compile(
+        r"\b(?:(?:[0-9A-Fa-f]{1,4}:){3,7}[0-9A-Fa-f]{1,4}"
+        r"|(?:[0-9A-Fa-f]{1,4}:)+:(?:[0-9A-Fa-f]{1,4}:)*[0-9A-Fa-f]{1,4})\b"
+    ), "<REDACTED_IP>"),
 
     # Phone numbers and credit-card numbers (ported from the selfhood diary
     # redactor so the higher-stakes corpus is at least as strict as the diary).
@@ -171,8 +197,31 @@ _SENSITIVE_KEYS = frozenset({
 })
 
 
+# Compound names that END in a secret-ish suffix but are structurally
+# public/benign — redacting them would corrupt otherwise-useful tool args
+# (DB column names, key-pair public halves) for no privacy gain.
+_BENIGN_COMPOUND_KEYS = frozenset({
+    "primary_key", "foreign_key", "sort_key", "partition_key", "row_key",
+    "public_key", "ssh_public_key", "cache_key", "idempotency_key",
+})
+
+_SENSITIVE_KEY_SUFFIXES = (
+    "_key", "_token", "_secret", "_password", "_passwd", "_pwd",
+    "_credential", "_credentials", "apikey",
+)
+
+
 def _is_sensitive_key(key) -> bool:
-    return str(key).strip().lower().replace("-", "_").replace(" ", "_") in _SENSITIVE_KEYS
+    norm = str(key).strip().lower().replace("-", "_").replace(" ", "_")
+    if norm in _SENSITIVE_KEYS:
+        return True
+    if norm in _BENIGN_COMPOUND_KEYS:
+        return False
+    # Compound env-style names (GHOST_API_KEY, DB_PASSWORD, HF_TOKEN…):
+    # exact-match keying missed every one of them, so structured tool
+    # args like {"env": {"GHOST_API_KEY": …}} leaked the very key this
+    # agent itself uses.
+    return norm.endswith(_SENSITIVE_KEY_SUFFIXES)
 
 
 def _redact_subtree(value):

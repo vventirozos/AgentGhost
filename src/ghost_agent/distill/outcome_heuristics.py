@@ -78,32 +78,6 @@ class FailureClassification:
 # ---------------------------------------------------------------- helpers
 
 
-def _extract_browser_selectors(traj: Trajectory) -> List[str]:
-    """Return all selectors used by browser tool calls in this turn.
-
-    Pulls from both the atomic ops (selector at the top of the args
-    dict) and from `interact` sequences (each sub-action's selector).
-    Returns the raw selector strings — no normalization — so a
-    "#start-btn" called four times shows up as four "#start-btn"
-    entries.
-    """
-    selectors: List[str] = []
-    for tc in traj.tool_calls or []:
-        if (tc.name or "").lower() != "browser":
-            continue
-        args = tc.arguments if isinstance(tc.arguments, dict) else {}
-        sel = args.get("selector")
-        if isinstance(sel, str) and sel:
-            selectors.append(sel)
-        for step in args.get("actions") or []:
-            if not isinstance(step, dict):
-                continue
-            inner = step.get("selector")
-            if isinstance(inner, str) and inner:
-                selectors.append(inner)
-    return selectors
-
-
 _TOOL_ERROR_PREFIX_RE = re.compile(
     r"^\s*(?:error|\[error\]|failed|exception)[:\-]?\s*",
     re.IGNORECASE,
@@ -185,16 +159,36 @@ def classify_chat_outcome(
         )
 
     # 2. Repeated browser selector — agent stuck clicking same thing.
-    selectors = _extract_browser_selectors(traj)
-    if selectors:
+    # Per the module contract (signal 2), the repeats only count as
+    # "stuck" when there was NO observable progress between them: a
+    # successful navigation resets the tallies, so paginating through
+    # results by clicking `#next-page` four times (each click followed
+    # by a new page) is NOT promoted to FAILED.
+    if traj.tool_calls:
         max_repeat = 0
         worst_sel = ""
         seen: dict = {}
-        for sel in selectors:
-            seen[sel] = seen.get(sel, 0) + 1
-            if seen[sel] > max_repeat:
-                max_repeat = seen[sel]
-                worst_sel = sel
+        for tc in traj.tool_calls:
+            if (tc.name or "").lower() != "browser":
+                continue
+            args = tc.arguments if isinstance(tc.arguments, dict) else {}
+            op = str(args.get("operation") or args.get("op") or "").lower()
+            result = getattr(tc, "result", "") or ""
+            if op in ("navigate", "goto") and not _looks_like_tool_error(result):
+                seen.clear()  # observable progress — restart the window
+                continue
+            sels = []
+            sel = args.get("selector")
+            if isinstance(sel, str) and sel:
+                sels.append(sel)
+            for step in args.get("actions") or []:
+                if isinstance(step, dict) and isinstance(step.get("selector"), str) and step.get("selector"):
+                    sels.append(step["selector"])
+            for sel in sels:
+                seen[sel] = seen.get(sel, 0) + 1
+                if seen[sel] > max_repeat:
+                    max_repeat = seen[sel]
+                    worst_sel = sel
         if max_repeat >= repeated_selector_threshold:
             return FailureClassification(
                 outcome=Outcome.FAILED.value,

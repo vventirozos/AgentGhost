@@ -438,12 +438,19 @@ async def chat_proxy(request: Request):
 
 @app.get("/api/chat/resume/{task_id}", dependencies=[Depends(verify_interface_key)])
 async def chat_resume_proxy(task_id: str, offset: int = 0):
+    """Resume a buffered chat stream.
+
+    ``offset`` is a CHUNK index into the task's buffer (the i-th upstream
+    HTTP chunk), NOT a byte offset. The bundled client always sends 0
+    (full replay); a client passing a byte count would silently skip
+    whole chunks, so clamp to the valid range instead of trusting it.
+    """
     task = active_chat_tasks.get(task_id)
     if not task:
         return _err_json(404, "Task not found or expired")
-        
+
     async def stream_generator():
-        client_offset = offset
+        client_offset = max(0, min(offset, len(task["buffer"])))
         while True:
             # See chat_proxy.stream_generator — clear before draining so a
             # set() racing the drain is preserved across the wait().

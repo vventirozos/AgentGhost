@@ -352,7 +352,23 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             if sys.platform != "darwin":
                 exec_kwargs["user"] = f"{user_id}:{group_id}"
                 
-            sandbox_manager.container.exec_run(f"python3 -m ipykernel_launcher -f {conn_file}", **exec_kwargs)
+            # Guarded: `container` is None when the sandbox died or was
+            # never started; the bare attribute access raised an unhandled
+            # AttributeError out of tool_execute instead of the formatted
+            # tool error every other path returns.
+            _container = getattr(sandbox_manager, "container", None)
+            if _container is None:
+                return _format_error(
+                    "Error: Sandbox container is not running — cannot boot the stateful Jupyter kernel.",
+                    hint="Retry without stateful=True, or re-run the command so the sandbox restarts.",
+                )
+            try:
+                _container.exec_run(f"python3 -m ipykernel_launcher -f {conn_file}", **exec_kwargs)
+            except Exception as _boot_err:
+                return _format_error(
+                    f"Error: Failed to boot the stateful Jupyter kernel: {_boot_err}",
+                    hint="Retry without stateful=True, or re-run the command so the sandbox restarts.",
+                )
             
             for _ in range(20):
                 out_chk, c_code = await asyncio.to_thread(sandbox_manager.execute, f"test -f {conn_file}")

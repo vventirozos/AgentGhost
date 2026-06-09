@@ -420,6 +420,83 @@ async def test_tool_remember_keeps_graph_task_reference(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Deferred-findings round: eval suite verdict contract, execute container
+# guard, resume offset clamp, docker dead param removal
+# ---------------------------------------------------------------------------
+
+async def test_eval_suite_honors_template_verdict_dict():
+    """A sandbox runner returning {"passed": ...} per the documented
+    ChallengeTemplateTask contract must be judged on that verdict — the old
+    unpack stripped it to ["output"], failing {"passed": True} as "empty
+    output" and PASSING {"passed": False, "output": "<traceback>"}."""
+    from ghost_agent.eval.suite import EvalSuite
+    from ghost_agent.eval.tasks import ChallengeTemplateTask
+
+    async def verdict_runner(task, _ctx):
+        if task.task_id == "t-pass":
+            return {"passed": True}
+        return {"passed": False, "output": "Traceback: assertion failed"}
+
+    tasks = [
+        ChallengeTemplateTask(task_id="t-pass", category="", prompt="p1"),
+        ChallengeTemplateTask(task_id="t-fail", category="", prompt="p2"),
+    ]
+    result = await EvalSuite("verdicts", tasks).run(runner=verdict_runner)
+    by_id = {r.task_id: r for r in result.results}
+    assert by_id["t-pass"].passed is True
+    assert by_id["t-fail"].passed is False
+
+
+async def test_eval_suite_keeps_string_contract_for_non_template():
+    """Non-template tasks must still validate on the output STRING even if
+    the runner dict happens to carry a `passed` key."""
+    from ghost_agent.eval.suite import EvalSuite
+    from ghost_agent.eval.tasks import CuratedRequestTask
+
+    async def runner(task, _ctx):
+        return {"passed": False, "output": "hello world"}
+
+    tasks = [CuratedRequestTask(task_id="c1", category="", prompt="x",
+                                validator=["hello"])]
+    result = await EvalSuite("curated", tasks).run(runner=runner)
+    assert result.results[0].passed is True  # keyword matched the string
+
+
+async def test_stateful_execute_dead_container_returns_formatted_error(tmp_path):
+    """A missing sandbox container on a stateful call must surface as the
+    tool's formatted error, not an unhandled AttributeError."""
+    from ghost_agent.tools.execute import tool_execute
+
+    sm = MagicMock()
+    sm.container = None
+    # Connection-file probe: "test -f" fails, pgrep irrelevant → boot path.
+    sm.execute = MagicMock(return_value=("", 1))
+    sm.tor_proxy = None
+
+    result = await tool_execute(
+        filename="t.py", content="print(1)", sandbox_dir=tmp_path,
+        sandbox_manager=sm, stateful=True,
+    )
+    assert isinstance(result, str)
+    assert "EXIT CODE: 1" in result
+    assert "container is not running" in result.lower() or "Sandbox container" in result
+
+
+def test_chat_resume_offset_is_clamped():
+    src = (ROOT / "interface" / "server.py").read_text()
+    assert "max(0, min(offset, len(task[\"buffer\"])))" in src, \
+        "resume offset (a CHUNK index) must be clamped, not trusted"
+
+
+def test_docker_execute_has_no_dead_memory_limit_param():
+    import inspect as _inspect
+    from ghost_agent.sandbox.docker import DockerSandbox
+    params = _inspect.signature(DockerSandbox.execute).parameters
+    assert "memory_limit" not in params, \
+        "memory_limit was accepted but silently ignored (container-level setting)"
+
+
+# ---------------------------------------------------------------------------
 # Structural contracts — fixes whose behavior needs a live server/upstream.
 # Source-level assertions so a refactor that silently reverts them fails CI.
 # ---------------------------------------------------------------------------

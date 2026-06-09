@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from .extractor import SkillCandidate
+from .extractor import SkillCandidate, _signature_hash
 
 
 @dataclass
@@ -99,7 +99,13 @@ def consolidate(
             exemplar_trajectory_id=best.exemplar_trajectory_id,
             trigger_examples=triggers,
             confidence=float(total_confidence),
-            signature_hash=best.signature_hash,
+            # Recompute from the merged identity (sequence-only — the
+            # merge collapses clusters). Inheriting `best`'s hash made
+            # the store's dedupe key depend on which member happened to
+            # have the most support THAT run: the same skill graduated
+            # under different keys across extraction runs, splitting
+            # verification counts into duplicate entries.
+            signature_hash=_signature_hash(None, seq),
         )
         out.append(merged)
 

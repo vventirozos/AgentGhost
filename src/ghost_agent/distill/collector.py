@@ -151,10 +151,17 @@ class TrajectoryCollector:
             return False
         try:
             ts = datetime.datetime.utcnow().isoformat() + "Z"
+            # Redact like every other corpus write ("Redaction runs on
+            # every write" is the package contract): iter_trajectories
+            # copies this reason into the yielded trajectory's
+            # failure_reason, so an unredacted reason — e.g. a future
+            # caller passing the user's correcting message — would put
+            # raw user text in the training corpus through the overlay.
+            from .redact import redact_text
             record = {
                 "trajectory_id": trajectory_id,
                 "outcome": str(new_outcome or ""),
-                "reason": str(reason or "")[:500],
+                "reason": redact_text(str(reason or ""), self.redaction)[:500],
                 "source": str(source or "")[:100],
                 "timestamp": ts,
             }

@@ -93,24 +93,28 @@ class _GhostLMAdapter:
         self.kwargs: Dict[str, Any] = {"model": model}
         self.history: List[Dict[str, Any]] = []
 
-    async def _acall(self, prompt: str, **kwargs) -> List[str]:
+    async def _acall(self, prompt: str = None, messages: List[Dict[str, Any]] = None, **kwargs) -> List[str]:
         payload = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            # dspy 3.x chat adapters pass `messages=[...]`; older flows
+            # (and our tests) pass a bare prompt string.
+            "messages": messages if messages else [{"role": "user", "content": prompt or ""}],
             "temperature": float(kwargs.get("temperature", 0.2)),
             "max_tokens": int(kwargs.get("max_tokens", 512)),
             "stream": False,
         }
         res = await self.llm_client.chat_completion(payload)
-        text = (
-            (res or {})
-            .get("choices", [{}])[0]
-            .get("message", {})
-            .get("content", "")
-        )
+        # `or [{}]`: an error/empty completion is `{"choices": []}` — the
+        # .get default only covers a MISSING key, so `[0]` raised
+        # IndexError inside the optimizer thread and killed the run.
+        choices = (res or {}).get("choices") or [{}]
+        text = choices[0].get("message", {}).get("content", "")
         return [text]
 
-    def __call__(self, prompt: str, **kwargs) -> List[str]:
+    def __call__(self, prompt: str = None, messages: List[Dict[str, Any]] = None, **kwargs) -> List[str]:
+        # dspy 3.2 invokes the LM as `lm(messages=inputs, **lm_kwargs)`
+        # (dspy/adapters/base.py) — a positional-`prompt`-only signature
+        # raised TypeError on every call, so no GEPA run ever optimized.
         import asyncio
         try:
             asyncio.get_running_loop()
@@ -128,11 +132,11 @@ class _GhostLMAdapter:
             # SEPARATE thread with its own loop and block on the result.
             import concurrent.futures
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(lambda: asyncio.run(self._acall(prompt, **kwargs)))
+                fut = ex.submit(lambda: asyncio.run(self._acall(prompt, messages, **kwargs)))
                 return fut.result()
         # No running loop on this thread (e.g. driven via asyncio.to_thread)
         # — safe to spin up one directly.
-        return asyncio.run(self._acall(prompt, **kwargs))
+        return asyncio.run(self._acall(prompt, messages, **kwargs))
 
 
 def run_gepa(
@@ -163,7 +167,16 @@ def run_gepa(
 
     # GEPA was introduced in dspy 2.5+; fall back if unavailable.
     if optimizer == "GEPA" and hasattr(dspy, "GEPA"):
-        tuner = dspy.GEPA(metric=metric, max_iterations=max_iterations)
+        # dspy 3.x GEPA takes exactly one budget kwarg (auto /
+        # max_full_evals / max_metric_calls) — `max_iterations` was never
+        # one of them, so every GEPA run died on TypeError before
+        # optimizing (and the hasattr guard meant the MIPROv2 fallback
+        # was unreachable). Map our iteration budget to full evals.
+        # reflection_lm is mandatory in dspy 3.x; the Ghost upstream is
+        # the only model this deployment can reach (Tor-only egress), so
+        # it reflects with the same adapter.
+        tuner = dspy.GEPA(metric=metric, max_full_evals=max_iterations,
+                          reflection_lm=lm)
     elif hasattr(dspy, "MIPROv2"):
         logger.info("GEPA unavailable; falling back to MIPROv2")
         tuner = dspy.MIPROv2(metric=metric, num_trials=max_iterations)

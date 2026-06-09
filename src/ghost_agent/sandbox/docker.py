@@ -439,8 +439,11 @@ class DockerSandbox:
         except Exception:
             return False
 
-    def execute(self, cmd: str, timeout: int = 300, memory_limit: str = None,
-                workdir: str = None):
+    # NB: no per-exec memory limit — Docker memory is a CONTAINER-level
+    # setting (mem_limit from GHOST_SANDBOX_MEM at creation). The old
+    # `memory_limit` parameter here was accepted but silently ignored,
+    # implying a per-call cap that never applied; removed.
+    def execute(self, cmd: str, timeout: int = 300, workdir: str = None):
         try:
             self.ensure_running()
             if not self._is_container_ready():
