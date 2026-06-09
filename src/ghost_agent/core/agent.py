@@ -1872,7 +1872,18 @@ class GhostAgent:
                 try:
                     actives = await asyncio.to_thread(store.list_projects, "ACTIVE")
                     if actives:
-                        target = actives[0]  # one project per tick (bounded)
+                        # Round-robin fairness: pick the project advanced
+                        # LEAST recently (never-advanced projects, ts=0, go
+                        # first). `list_projects` orders by `updated_at DESC`,
+                        # but advancing a project bumps its updated_at, so the
+                        # old `actives[0]` always re-selected the project just
+                        # advanced and every other ACTIVE project starved.
+                        target = min(
+                            actives,
+                            key=lambda p: float(
+                                (p.get("metadata") or {}).get("last_autoadvance_ts", 0) or 0
+                            ),
+                        )
                         pid = target.get("id")
                         from .project_advancer import advance_once as _advance_once
 
@@ -1886,6 +1897,35 @@ class GhostAgent:
                             if not handler:
                                 return f"ERROR: tool {name} unavailable"
                             return await handler(**targs)
+
+                        async def _aa_classify(description):
+                            # LLM router for autonomous tasks. The keyword
+                            # bucket classifier (project_advancer.classify_task)
+                            # mislabels anything without an exact keyword —
+                            # "Design the schema" has none, so it defaulted to
+                            # research/web_search. Ask the model for the bucket
+                            # and fall back to the heuristic on any failure.
+                            from .project_advancer import classify_task as _kw
+                            try:
+                                _r = await ctx.llm_client.chat_completion({
+                                    "model": getattr(ctx.args, 'model', 'default'),
+                                    "messages": [{"role": "user", "content": (
+                                        "Classify this task into EXACTLY one word: "
+                                        "'coding' (writes/runs code), 'research' "
+                                        "(reads/searches/summarizes), or 'needs_user' "
+                                        "(requires a human decision/approval/publish). "
+                                        "Output ONLY the one word.\n\nTASK: "
+                                        + str(description)[:500])}],
+                                    "temperature": 0.0, "max_tokens": 8, "stream": False,
+                                })
+                                out = ((_r or {}).get("choices", [{}])[0]
+                                       .get("message", {}).get("content", "") or "").strip().lower()
+                                for label in ("needs_user", "coding", "research"):
+                                    if label in out:
+                                        return label
+                            except Exception as _ce:
+                                logger.debug(f"autoadvance classify failed: {_ce}")
+                            return _kw(description)
 
                         async def _aa_code_gen(description):
                             _r = await ctx.llm_client.chat_completion({
@@ -1907,6 +1947,7 @@ class GhostAgent:
 
                         result = await _advance_once(
                             ctx, pid, tool_runner=_aa_tool_runner,
+                            llm_classifier=_aa_classify,
                             code_generator=_aa_code_gen,
                         )
                         pretty_log(

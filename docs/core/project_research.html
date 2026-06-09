@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.project_research — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="project_safety.html">project_safety</a>
+    <a class="current" href="project_research.html">project_research</a>
+    <a href="../memory/projects.html">memory.projects</a>
+    <a href="../tools/projects.html">tools.projects</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / project_research.py</h1>
+  <p class="subtitle">Auto-research for long-term projects (any domain, not just code): search → summarise → persist a Markdown brief in the project workspace → index it → surface it in the briefing.</p>
+
+  <h2>Why</h2>
+  <p>Projects are multi-session efforts of any kind. While working one — on demand or during background auto-advance — the agent should be able to research relevant topics, keep the <em>findings</em> (not just raw search dumps), and stay aware of what it has already looked into. This module turns a web search into a durable, summarised brief inside the project's own <code>workspace_dir</code>, and records it so every later turn sees it.</p>
+
+  <h2>Entry points</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>async research_topic(context, project_id, topic, *, tool_runner=None, llm_summarizer=None, queries=None, task_id=None)</code></td><td>Research ONE topic: run web search(es), summarise, persist the brief. Falls back to the tool registry for search and to <code>context.llm_client</code> for summarisation; with neither it still writes a (sourceless) brief so the topic is recorded.</td></tr>
+      <tr><td><code>async research_project(context, project_id, *, topics=None, max_topics=5, ...)</code></td><td>Research several topics. When <code>topics</code> is empty, auto-derives them via <code>propose_topics</code>.</td></tr>
+      <tr><td><code>async propose_topics(context, project_id, n=5, ...)</code></td><td>LLM-derive up to <em>n</em> distinct topics from the project goal + open tasks. Fallback when no LLM: the open task descriptions, then the goal.</td></tr>
+      <tr><td><code>async persist_research_from_output(context, project_id, topic, search_output, *, task_id=None)</code></td><td>Turn a search output already in hand into a brief — used by the autoadvancer so it doesn't search twice.</td></tr>
+      <tr><td><code>get_research_index(store, project_id) -&gt; list[dict]</code></td><td>The project's research index (read by the briefing).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>What a run produces</h2>
+  <ul>
+    <li><strong>A Markdown brief</strong> at <code>&lt;workspace&gt;/research/&lt;slug&gt;.md</code> — title, <code>## Summary</code> + <code>## Key findings</code> (LLM-written, or a heuristic title list when no LLM), a <code>## Sources</code> section parsed from the search tool's <code>[Source: url]</code> markers, and a timestamp. The slug is alphanumerics + dashes only, so a topic can never escape the research dir.</li>
+    <li><strong>A research index entry</strong> in project metadata (<code>metadata.research_index</code>): <code>{topic, slug, path, ts, summary_preview, sources_count}</code>, replace-by-slug (re-researching refreshes rather than duplicates), capped at 50 entries.</li>
+    <li><strong>A <code>research/INDEX.md</code></strong> human-readable mirror of the index.</li>
+    <li><strong>A <code>file</code> artifact</strong> (when tied to a task) + a <strong><code>research_added</code> event</strong> on the project log.</li>
+  </ul>
+
+  <h2>Triggers</h2>
+  <ul>
+    <li><strong>On demand</strong> — <a href="../tools/projects.html"><code>manage_projects</code></a> <code>action=research</code> (a single <code>topic</code>, or omit it to auto-derive several from the goal) and <code>action=research_list</code>.</li>
+    <li><strong>Automatic during auto-advance</strong> — a research-classified task in <a href="project_advancer.html">advance_once</a> that ran a real <code>web_search</code> and got usable output calls <code>persist_research_from_output</code> on that output (no second search), so background ticks leave durable findings, not just a transient <code>tool_call</code> artifact. The synthesised summary becomes the task's <code>result_summary</code>; the brief path is added to the <code>autoadvance_step</code> event and the result summary.</li>
+  </ul>
+
+  <h2>Awareness</h2>
+  <p><a href="prompts.html"><code>build_project_briefing</code></a> reads the metadata index (no file I/O) and appends a <strong>RESEARCH NOTES</strong> section listing recent topics → file paths with a one-line preview, so the agent sees what it has already researched on every turn it works the project — and is told to read a brief with <code>file_system</code> before re-researching it. The <code>manage_projects</code> create/switch/resume briefing dict carries a compact <code>research</code> list too.</p>
+
+  <h2>Robustness</h2>
+  <p>Every path degrades and never raises into the caller: missing LLM → heuristic summary (the top result titles); missing search runner → sourceless brief; missing workspace → a clean <code>ok=False</code> result. The autoadvance hook is wrapped so a research failure can't break a tick.</p>
+  <p>The summariser and topic-proposer issue a <strong>no-think</strong> utility completion (<code>_llm_complete</code>): a plain foreground <code>chat_completion</code> with thinking disabled — the <code>/no_think</code> soft-switch + <code>chat_template_kwargs:{enable_thinking:false}</code> hard-switch + a system nudge, mirroring <a href="dream.html">core.dream</a>. This matters because the upstream runs as a reasoning model under <code>--deep-reason</code>: a utility call with thinking left ON burns the entire token budget inside <code>&lt;think&gt;</code> and returns an <em>empty</em> <code>content</code> (verified live: <code>finish_reason=length</code>, all completion tokens spent on <code>reasoning_content</code>), which silently dropped the summary to the title-list fallback. Responses are still defensively cleaned — <code>_strip_think</code> removes any stray <code>&lt;think&gt;</code> block and <code>_message_text</code> salvages <code>reasoning_content</code> if <code>content</code> is empty. The index <code>summary_preview</code> skips Markdown headings so it reads as a real sentence. Covered by <code>tests/test_project_research.py</code> and <code>tests/test_project_advancer.py</code>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

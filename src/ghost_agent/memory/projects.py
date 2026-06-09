@@ -35,6 +35,14 @@ class ProjectStatus(str, Enum):
     PAUSED = "PAUSED"
     DONE = "DONE"
     ARCHIVED = "ARCHIVED"
+    # Terminal-with-failure and waiting states. Before these existed the
+    # status rollup collapsed *every* terminal outcome to DONE — a project
+    # whose tasks all FAILED reported as "done". FAILED/BLOCKED record a
+    # genuinely unsuccessful project; NEEDS_USER marks a project parked on
+    # human input (not terminal — it re-rolls forward once the task moves).
+    FAILED = "FAILED"
+    BLOCKED = "BLOCKED"
+    NEEDS_USER = "NEEDS_USER"
 
 
 _SCHEMA = """
@@ -59,6 +67,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     dependency_type TEXT NOT NULL DEFAULT 'ALL',
     alternatives_json TEXT NOT NULL DEFAULT '[]',
     postconditions_json TEXT NOT NULL DEFAULT '[]',
+    depends_on_json TEXT NOT NULL DEFAULT '[]',
     result_summary TEXT NOT NULL DEFAULT '',
     failure_reason TEXT NOT NULL DEFAULT '',
     revision_count INTEGER NOT NULL DEFAULT 0,
@@ -150,12 +159,59 @@ class ProjectStore:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
+        # WAL + a busy timeout so the cross-process readers/writers the
+        # module is designed for (API server, Slack bot, dream
+        # consolidator — each opens its own connection, often its own
+        # process, so the in-process RLock can't serialize them) don't
+        # immediately fail with "database is locked". WAL lets readers and
+        # a single writer proceed concurrently; busy_timeout makes a
+        # contended writer wait up to 5s instead of raising. journal_mode
+        # is persistent (a no-op once set); busy_timeout is per-connection.
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA busy_timeout = 5000")
+        except sqlite3.Error as e:  # pragma: no cover - exotic FS / :memory:
+            logger.debug("Could not set WAL/busy_timeout pragmas: %s", e)
         return conn
 
     def _init_db(self):
         with self._lock, self._connect() as conn:
             conn.executescript(_SCHEMA)
+            self._migrate(conn)
             conn.commit()
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        """Additive, idempotent column migrations for older DBs.
+
+        ``CREATE TABLE IF NOT EXISTS`` never alters an existing table, so a
+        DB created before a column was added to ``_SCHEMA`` lacks it. Each
+        entry here is an ``ALTER TABLE ... ADD COLUMN`` guarded by a
+        column-presence check, so re-running is safe.
+        """
+        wanted = {
+            "tasks": [
+                ("depends_on_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ],
+        }
+        for table, columns in wanted.items():
+            try:
+                existing = {
+                    r["name"] for r in conn.execute(
+                        f"PRAGMA table_info({table})"
+                    ).fetchall()
+                }
+            except sqlite3.Error:
+                continue
+            for name, decl in columns:
+                if name not in existing:
+                    try:
+                        conn.execute(
+                            f"ALTER TABLE {table} ADD COLUMN {name} {decl}"
+                        )
+                    except sqlite3.Error as e:  # pragma: no cover
+                        logger.warning(
+                            "migration: could not add %s.%s: %s", table, name, e
+                        )
 
     # ------------------------------------------------------------------ projects
 
@@ -330,6 +386,7 @@ class ProjectStore:
                  dependency_type: str = "ALL",
                  alternatives: Optional[List[str]] = None,
                  postconditions: Optional[List[str]] = None,
+                 depends_on: Optional[List[str]] = None,
                  estimated_cost: float = 0.0,
                  position: Optional[int] = None) -> str:
         if not description or not description.strip():
@@ -360,15 +417,18 @@ class ProjectStore:
                         "WHERE parent_id = ?", (parent_id,),
                     ).fetchone()
                 position = int(row["m"]) + 1
+            depends_on_canon = [_canon_id(d) for d in (depends_on or []) if _canon_id(d)]
             conn.execute(
                 "INSERT INTO tasks(id, project_id, parent_id, description, status, "
                 "dependency_type, alternatives_json, postconditions_json, "
+                "depends_on_json, "
                 "result_summary, failure_reason, revision_count, actual_tool_used, "
                 "estimated_cost, actual_cost, depth, position, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, project_id, parent_id, description.strip(),
                  status.upper(), dependency_type.upper(),
                  json.dumps(alternatives or []), json.dumps(postconditions or []),
+                 json.dumps(depends_on_canon),
                  "", "", 0, None, estimated_cost, 0.0, depth, position, now, now),
             )
             conn.execute(
@@ -411,15 +471,20 @@ class ProjectStore:
         if not fields:
             return False
         allowed = {"description", "status", "dependency_type", "alternatives",
-                   "postconditions", "result_summary", "failure_reason",
-                   "revision_count", "actual_tool_used", "estimated_cost",
-                   "actual_cost", "parent_id", "position"}
+                   "postconditions", "depends_on", "result_summary",
+                   "failure_reason", "revision_count", "actual_tool_used",
+                   "estimated_cost", "actual_cost", "parent_id", "position"}
         sets = []
         values: List[Any] = []
         for key, val in fields.items():
             if key not in allowed:
                 raise ValueError(f"unknown task field: {key}")
-            if key in ("alternatives", "postconditions"):
+            if key == "depends_on":
+                sets.append("depends_on_json = ?")
+                values.append(json.dumps(
+                    [_canon_id(d) for d in (val or []) if _canon_id(d)]
+                ))
+            elif key in ("alternatives", "postconditions"):
                 sets.append(f"{key}_json = ?")
                 values.append(json.dumps(val or []))
             elif key == "status":
@@ -463,16 +528,20 @@ class ProjectStore:
         return updated
 
     def _maybe_rollup_project_status(self, project_id: str) -> None:
-        """Transition `project_id` to a terminal status if all its tasks
-        have reached one. No-op if any task is still open or if the
-        project is already terminal.
+        """Transition `project_id` to its correct aggregate status when its
+        tasks settle. No-op if work is still open or the project is locked.
 
-        Rules:
-          * any task FAILED → project FAILED (mapped to DONE-with-fail-
-            note since ProjectStatus has no FAILED member; we leave
-            status DONE but emit an event so the rollup is observable).
-          * all tasks DONE → project DONE.
-          * otherwise → no-op.
+        Rules (task terminal set = DONE / FAILED / BLOCKED):
+          * all tasks DONE                       → project DONE
+          * all tasks terminal, ≥1 FAILED/BLOCKED → project FAILED
+          * all remaining-open tasks are NEEDS_USER (≥1 of them, rest
+            terminal)                            → project NEEDS_USER
+          * otherwise (real open work remains)   → no-op
+
+        DONE and ARCHIVED are *locked*: once reached we never auto-undo
+        them (a manual archive or a genuine completion stays put). FAILED
+        and NEEDS_USER are NOT locked — a revised/answered task can roll
+        the project forward to DONE on a later update.
         """
         proj = self.get_project(project_id)
         if not proj:
@@ -483,12 +552,28 @@ class ProjectStore:
         tasks = self.list_tasks(project_id)
         if not tasks:
             return
-        terminal = {"DONE", "FAILED", "CANCELLED"}
         statuses = [str(t.get("status", "")).upper() for t in tasks]
-        if not all(s in terminal for s in statuses):
+        terminal = {"DONE", "FAILED", "BLOCKED"}
+        failure = {"FAILED", "BLOCKED"}
+
+        all_terminal = all(s in terminal for s in statuses)
+        if all_terminal:
+            if any(s in failure for s in statuses):
+                new_status = ProjectStatus.FAILED.value
+            else:
+                new_status = ProjectStatus.DONE.value
+        else:
+            # Not all terminal — only roll up if the *only* non-terminal
+            # work is waiting on the user. Anything else means there is
+            # still autonomous work to do, so leave the project ACTIVE.
+            open_states = {s for s in statuses if s not in terminal}
+            if open_states and open_states == {"NEEDS_USER"}:
+                new_status = ProjectStatus.NEEDS_USER.value
+            else:
+                return
+
+        if new_status == current:
             return
-        # All terminal. Roll the project up.
-        new_status = ProjectStatus.DONE.value
         with self._lock, self._connect() as conn:
             conn.execute(
                 "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
@@ -498,7 +583,7 @@ class ProjectStore:
         self.log_event(
             project_id, None, "project_auto_rollup",
             {"new_status": new_status,
-             "had_failures": any(s == "FAILED" for s in statuses)},
+             "had_failures": any(s in failure for s in statuses)},
         )
 
     def delete_task(self, task_id: str) -> bool:
@@ -543,6 +628,10 @@ class ProjectStore:
             d["postconditions"] = json.loads(d.pop("postconditions_json") or "[]")
         except Exception:
             d["postconditions"] = []
+        try:
+            d["depends_on"] = json.loads(d.pop("depends_on_json") or "[]")
+        except Exception:
+            d["depends_on"] = []
         return d
 
     # ------------------------------------------------------------------ artifacts
@@ -598,8 +687,20 @@ class ProjectStore:
                 "VALUES (?,?,?,?,?)",
                 (project_id, task_id, event_type, json.dumps(payload or {}), _now()),
             )
+            new_id = int(cur.lastrowid)
+            # Prune superseded scratchpad snapshots. Only the most recent
+            # snapshot is ever read back (_hydrate_scratchpad uses limit=1),
+            # but each one carries the full free-chat key/value dict, so on a
+            # long-lived project they were the dominant source of unbounded
+            # project_events growth. Keep just the row we wrote.
+            if event_type == "scratchpad_snapshot":
+                conn.execute(
+                    "DELETE FROM project_events WHERE project_id = ? "
+                    "AND type = 'scratchpad_snapshot' AND id < ?",
+                    (project_id, new_id),
+                )
             conn.commit()
-            return int(cur.lastrowid)
+            return new_id
 
     def list_events(self, project_id: str, limit: int = 50,
                     event_type: Optional[str] = None) -> List[Dict[str, Any]]:

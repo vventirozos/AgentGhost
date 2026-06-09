@@ -97,12 +97,19 @@ async def test_advance_research_task_runs_web_search(context, store):
     assert r.task_id == tid
     assert calls and calls[0][0] == "web_search"
     assert "BGE-M3" in calls[0][1]["query"]
-    # Task marked DONE with summary
+    # Task marked DONE; result_summary is now the synthesised research brief
+    # (auto-research persistence), not the raw search output.
     assert store.get_task(tid)["status"] == "DONE"
-    assert "search results" in store.get_task(tid)["result_summary"]
-    # Artifact recorded
+    assert store.get_task(tid)["result_summary"]
+    # The raw search output is still recorded as a tool_call artifact, and
+    # the persisted research brief is recorded as a file artifact.
     arts = store.list_artifacts(task_id=tid)
-    assert arts and arts[0]["kind"] == "tool_call"
+    kinds = {a["kind"] for a in arts}
+    assert arts[0]["kind"] == "tool_call"  # tool_call written first
+    assert "file" in kinds                  # research brief persisted
+    # And a research_added event + brief path are surfaced.
+    assert "saved research to" in r.summary
+    assert store.list_events(pid, event_type="research_added")
 
 
 async def test_advance_coding_task_with_generator_runs_execute(context, store):

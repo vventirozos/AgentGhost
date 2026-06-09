@@ -43,6 +43,11 @@ class TaskNode:
     dependency_type: DependencyType = DependencyType.ALL
     alternatives: List[str] = field(default_factory=list)  # fallback task IDs
     postconditions: List[str] = field(default_factory=list)  # validation descriptions
+    # Sibling-DAG prerequisites: task IDs that must be DONE before this
+    # task becomes eligible for execution. Distinct from parent/child
+    # rollup (dependency_type) — this orders *peers*. An empty list means
+    # "no prerequisites" (the historical behaviour, every leaf eligible).
+    depends_on: List[str] = field(default_factory=list)
     estimated_cost: float = 0.0
     actual_cost: float = 0.0
 
@@ -61,7 +66,8 @@ class TaskTree:
                  status: TaskStatus = TaskStatus.PENDING,
                  dependency_type: DependencyType = DependencyType.ALL,
                  alternatives: Optional[List[str]] = None,
-                 postconditions: Optional[List[str]] = None) -> str:
+                 postconditions: Optional[List[str]] = None,
+                 depends_on: Optional[List[str]] = None) -> str:
         node_id = str(uuid.uuid4())[:8]
         # Guard against (astronomically unlikely) collisions
         while node_id in self.nodes:
@@ -70,6 +76,7 @@ class TaskTree:
             id=node_id, description=description, status=status,
             parent_id=parent_id, dependency_type=dependency_type,
             alternatives=alternatives or [], postconditions=postconditions or [],
+            depends_on=depends_on or [],
         )
         self.nodes[node_id] = node
 
@@ -367,6 +374,7 @@ class TaskTree:
                 dep_type = DependencyType.ALL
             alternatives = node_data.get("alternatives", [])
             postconditions = node_data.get("postconditions", [])
+            depends_on = node_data.get("depends_on", [])
 
             if node_id in self.nodes:
                 # Update existing node
@@ -391,6 +399,8 @@ class TaskTree:
                     node.alternatives = alternatives
                 if postconditions:
                     node.postconditions = postconditions
+                if depends_on:
+                    node.depends_on = depends_on
                 # Parent ID might theoretically change in a re-org, though rare.
                 # If parent_id is provided here (from recursion), we update it.
                 if parent_id: node.parent_id = parent_id
@@ -400,7 +410,7 @@ class TaskTree:
                     id=node_id, description=desc, status=status,
                     parent_id=parent_id, children=[],
                     dependency_type=dep_type, alternatives=alternatives,
-                    postconditions=postconditions,
+                    postconditions=postconditions, depends_on=depends_on,
                 )
                 self.nodes[node_id] = node
             
@@ -536,6 +546,8 @@ class TaskTree:
                 result["alternatives"] = node.alternatives
             if node.postconditions:
                 result["postconditions"] = node.postconditions
+            if node.depends_on:
+                result["depends_on"] = node.depends_on
             return result
 
         return serialize(self.root_id)
@@ -591,6 +603,7 @@ class ProjectPlan:
                 dependency_type=dep,
                 alternatives=list(row.get("alternatives") or []),
                 postconditions=list(row.get("postconditions") or []),
+                depends_on=list(row.get("depends_on") or []),
                 estimated_cost=float(row["estimated_cost"] or 0.0),
                 actual_cost=float(row["actual_cost"] or 0.0),
             )
@@ -611,11 +624,13 @@ class ProjectPlan:
                  dependency_type: DependencyType = DependencyType.ALL,
                  alternatives: Optional[List[str]] = None,
                  postconditions: Optional[List[str]] = None,
+                 depends_on: Optional[List[str]] = None,
                  estimated_cost: float = 0.0) -> str:
         task_id = self.store.add_task(
             self.project_id, description, parent_id=parent_id,
             status=status.value, dependency_type=dependency_type.value,
             alternatives=alternatives, postconditions=postconditions,
+            depends_on=depends_on,
             estimated_cost=estimated_cost,
         )
         node = TaskNode(
@@ -624,6 +639,7 @@ class ProjectPlan:
             dependency_type=dependency_type,
             alternatives=list(alternatives or []),
             postconditions=list(postconditions or []),
+            depends_on=list(depends_on or []),
             estimated_cost=estimated_cost,
         )
         self.tree.nodes[task_id] = node
@@ -637,17 +653,28 @@ class ProjectPlan:
                       result: str = "", failure_reason: str = "",
                       actual_tool: str = ""):
         """Cascade through the in-memory tree, then persist every node
-        whose status changed as a side effect."""
-        before = {tid: (n.status, n.result_summary, n.failure_reason,
-                        n.actual_tool_used, n.revision_count)
-                  for tid, n in self.tree.nodes.items()}
+        whose state changed as a side effect.
+
+        The diff tracks ``parent_id`` and ``alternatives`` in addition to
+        the status fields because the failure-cascade path
+        (``TaskTree._check_parent_failure``) *consumes* an alternative by
+        popping it off the parent and re-parenting it onto the failed
+        parent. Those mutations are silent on status, so a status-only diff
+        never persisted them — on the next hydrate the alternative was no
+        longer linked and the fallback edge was lost. Tracking both keys
+        makes the alternatives/fallback feature durable across sessions."""
+        def _snapshot(n: "TaskNode"):
+            return (n.status, n.result_summary, n.failure_reason,
+                    n.actual_tool_used, n.revision_count, n.parent_id,
+                    tuple(n.alternatives), tuple(n.depends_on))
+
+        before = {tid: _snapshot(n) for tid, n in self.tree.nodes.items()}
         self.tree.update_status(task_id, status, result=result,
                                 failure_reason=failure_reason,
                                 actual_tool=actual_tool)
         for tid, node in self.tree.nodes.items():
             prev = before.get(tid)
-            current = (node.status, node.result_summary, node.failure_reason,
-                       node.actual_tool_used, node.revision_count)
+            current = _snapshot(node)
             if prev != current:
                 self.store.update_task(
                     tid,
@@ -656,18 +683,34 @@ class ProjectPlan:
                     failure_reason=node.failure_reason,
                     actual_tool_used=node.actual_tool_used,
                     revision_count=node.revision_count,
+                    parent_id=node.parent_id,
+                    alternatives=node.alternatives,
+                    depends_on=node.depends_on,
                 )
 
     def decompose(self, task_id: str,
-                  subtask_descriptions: List[str]) -> List[str]:
-        """Expand a task into ordered subtasks. Returns new task ids."""
+                  subtask_descriptions: List[str],
+                  sequential: bool = False) -> List[str]:
+        """Expand a task into ordered subtasks. Returns new task ids.
+
+        When ``sequential`` is True each subtask declares a ``depends_on``
+        edge to the previous one, so the autoadvancer runs them strictly in
+        order (subtask N+1 only becomes eligible once subtask N is DONE).
+        The default (False) preserves the historical behaviour where all
+        subtasks are independently eligible.
+        """
         if task_id not in self.tree.nodes:
             raise ValueError(f"unknown task: {task_id}")
         ids: List[str] = []
+        prev_id: Optional[str] = None
         for desc in subtask_descriptions:
             if not desc or not desc.strip():
                 continue
-            ids.append(self.add_task(desc.strip(), parent_id=task_id))
+            deps = [prev_id] if (sequential and prev_id) else None
+            new_id = self.add_task(desc.strip(), parent_id=task_id,
+                                   depends_on=deps)
+            ids.append(new_id)
+            prev_id = new_id
         return ids
 
     # ------------------------------------------------------------------ query
@@ -699,12 +742,27 @@ class ProjectPlan:
                 cur = parent
             return False
 
+        def deps_satisfied(node: TaskNode) -> bool:
+            """Every declared prerequisite must be DONE before this task is
+            eligible. Unknown dep ids (stale/typo'd) are treated as
+            satisfied so a bad reference can't deadlock the whole plan;
+            a known dep in any non-DONE state holds this task back."""
+            for dep_id in node.depends_on or []:
+                dep = self.tree.nodes.get(dep_id)
+                if dep is None:
+                    continue
+                if dep.status != TaskStatus.DONE:
+                    return False
+            return True
+
         for node in self.tree.nodes.values():
             if node.children:
                 continue
             if node.status not in eligible:
                 continue
             if ancestor_blocked(node):
+                continue
+            if not deps_satisfied(node):
                 continue
             return node
         return None

@@ -87,6 +87,27 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             for n in open_nodes[:max_open_tasks]:
                 desc = (n.description or "")[:80]
                 lines.append(f"  - [{n.id}] {desc}  ({n.status.value})")
+    # Research awareness: surface the project's persisted research briefs so
+    # the agent knows what it has already looked into (and where the file
+    # lives) on every turn it works the project — instead of re-researching
+    # the same topic. Read from the cheap metadata index, no file I/O.
+    try:
+        from .project_research import get_research_index
+        research = get_research_index(store, project_id)
+    except Exception:
+        research = []
+    if research:
+        recent = research[-5:]
+        lines.append(f"RESEARCH NOTES ({len(recent)} of {len(research)}):")
+        for r in reversed(recent):
+            prev = (r.get("summary_preview") or "").strip()
+            prev = f" — {prev[:80]}" if prev else ""
+            lines.append(f"  - {r.get('topic', '')}  →  {r.get('path', '')}{prev}")
+        lines.append(
+            "  (Read a brief with file_system before re-researching it; "
+            "create more with manage_projects action=research.)"
+        )
+
     try:
         events = store.list_events(project_id, limit=max_events)
     except Exception:

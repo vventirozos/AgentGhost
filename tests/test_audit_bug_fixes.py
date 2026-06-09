@@ -521,10 +521,11 @@ def test_bug12_project_auto_done_when_all_tasks_done(tmp_path):
     assert store.get_project(pid)["status"] == "DONE"
 
 
-def test_bug12_failed_task_does_not_block_rollup(tmp_path):
-    """A FAILED task counts as terminal for rollup purposes — the
-    project still transitions to DONE so the user sees it's no longer
-    in flight."""
+def test_bug12_failed_task_rolls_project_up_to_failed(tmp_path):
+    """A FAILED task counts as terminal for rollup purposes — the project
+    leaves the in-flight (ACTIVE) state. It now rolls up to FAILED rather
+    than DONE: a project whose work ended in failure must not masquerade
+    as completed (see test_project_mgmt_fixes for the full matrix)."""
     from ghost_agent.memory.projects import ProjectStore
     store = ProjectStore(tmp_path / "mem", sandbox_root=tmp_path / "sb")
     pid = store.create_project(title="X", kind="CODING")
@@ -532,7 +533,7 @@ def test_bug12_failed_task_does_not_block_rollup(tmp_path):
     b = store.add_task(pid, "broken")
     store.update_task(a, status="DONE")
     store.update_task(b, status="FAILED")
-    assert store.get_project(pid)["status"] == "DONE"
+    assert store.get_project(pid)["status"] == "FAILED"
 
 
 def test_bug12_archived_project_not_rolled_back(tmp_path):

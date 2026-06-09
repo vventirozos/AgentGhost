@@ -17,6 +17,7 @@
     <a class="current" href="projects.html">projects</a>
     <a href="../memory/projects.html">memory.projects</a>
     <a href="../core/project_advancer.html">project_advancer</a>
+    <a href="../core/project_research.html">project_research</a>
   </nav>
 </aside>
 <main>
@@ -38,10 +39,20 @@
   <ul>
     <li><code>task_add</code> · <code>task_update</code> · <code>task_decompose</code> · <code>task_next</code> · <code>task_list</code></li>
   </ul>
+  <h3>Task ordering (prerequisites)</h3>
+  <ul>
+    <li><code>task_add</code> accepts <code>depends_on=[ids]</code> — prerequisite sibling task ids that must be DONE before the new task becomes eligible for <code>task_next</code> / autoadvance. A peer-ordering edge, distinct from parent/child <code>dependency_type</code>.</li>
+    <li><code>task_decompose</code> accepts <code>sequential=true</code> — chains the generated subtasks so each runs only after the previous is DONE (works for both the under-a-task and top-level fan-out forms). Default <code>false</code> = all subtasks independently runnable.</li>
+  </ul>
   <h3>Other</h3>
   <ul>
     <li><code>artifact_add</code> · <code>event_log</code></li>
     <li><code>advance</code> — calls <a href="../core/project_advancer.html"><code>advance_once()</code></a> for one autoadvance tick.</li>
+  </ul>
+  <h3>Auto-research</h3>
+  <ul>
+    <li><code>research</code> — research a topic and persist a summarised brief in the project workspace. Pass <code>topic="…"</code> for a single topic, or omit it (optionally with <code>max_topics</code>) to auto-derive several from the project goal + open tasks. Each brief lands at <code>research/&lt;slug&gt;.md</code>, is indexed in project metadata, and is surfaced under <strong>RESEARCH NOTES</strong> in the project briefing. See <a href="../core/project_research.html">core.project_research</a>.</li>
+    <li><code>research_list</code> — return the project's research index (topic → path → preview). Read a brief with <code>file_system</code> before re-researching the same thing.</li>
   </ul>
 
   <h2>Duplicate guard</h2>

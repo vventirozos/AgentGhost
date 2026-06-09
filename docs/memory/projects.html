@@ -30,7 +30,8 @@
   <p class="subtitle">Multi-session project &amp; task store. SQLite-only; no ORM. Designed for cross-process access from API, Slack bot, dream consolidator.</p>
 
   <h2>Storage</h2>
-  <p>SQLite at <code>memory_dir/projects.db</code>; <code>threading.RLock</code>; <code>PRAGMA foreign_keys=ON</code>.</p>
+  <p>SQLite at <code>memory_dir/projects.db</code>; <code>threading.RLock</code>; <code>PRAGMA foreign_keys=ON</code>. Each connection also sets <code>PRAGMA journal_mode=WAL</code> and <code>PRAGMA busy_timeout=5000</code> so the cross-process readers/writers this store is designed for (API server, Slack bot, dream consolidator — each opens its own connection, often its own process, beyond the reach of the in-process <code>RLock</code>) get concurrent-reader + waiting-writer semantics instead of an immediate <em>"database is locked"</em>.</p>
+  <p>Schema upgrades for pre-existing DBs are handled by additive, idempotent <code>ALTER TABLE ADD COLUMN</code> calls in <code>_migrate</code> (guarded by a <code>PRAGMA table_info</code> presence check), since <code>CREATE TABLE IF NOT EXISTS</code> never alters an existing table.</p>
 
   <h2>Tables</h2>
   <h3>projects</h3>
@@ -38,9 +39,9 @@
     <thead><tr><th>Column</th><th>Type / values</th></tr></thead>
     <tbody>
       <tr><td>id</td><td>TEXT PK (12-char hex)</td></tr>
-      <tr><td>title / kind / goal / status</td><td>TEXT (kind ∈ CODING/GENERAL · status ∈ ACTIVE/PAUSED/DONE/ARCHIVED)</td></tr>
+      <tr><td>title / kind / goal / status</td><td>TEXT (kind ∈ CODING/GENERAL · status ∈ ACTIVE/PAUSED/DONE/ARCHIVED/<strong>FAILED</strong>/<strong>BLOCKED</strong>/<strong>NEEDS_USER</strong>)</td></tr>
       <tr><td>workspace_dir</td><td>TEXT</td></tr>
-      <tr><td>metadata_json</td><td>TEXT</td></tr>
+      <tr><td>metadata_json</td><td>TEXT — free-form JSON. Holds advancer budget knobs (<code>steps_cap/steps_used</code>, <code>last_autoadvance_ts</code>) and the <code>research_index</code> (list of persisted research briefs — see <a href="../core/project_research.html">core.project_research</a>).</td></tr>
       <tr><td>created_at / updated_at</td><td>REAL</td></tr>
     </tbody>
   </table>
@@ -51,9 +52,10 @@
     <tbody>
       <tr><td>id, project_id, parent_id</td><td>FKs (parent_id NULL = root).</td></tr>
       <tr><td>description</td><td>TEXT.</td></tr>
-      <tr><td>status</td><td>PENDING / IN_PROGRESS / DONE / BLOCKED.</td></tr>
-      <tr><td>dependency_type</td><td>ALL / ANY (BEST not persisted).</td></tr>
+      <tr><td>status</td><td>PENDING / READY / IN_PROGRESS / DONE / FAILED / BLOCKED / PAUSED / NEEDS_USER.</td></tr>
+      <tr><td>dependency_type</td><td>ALL / ANY / BEST (governs how children roll up to a parent).</td></tr>
       <tr><td>alternatives_json / postconditions_json</td><td>list[str].</td></tr>
+      <tr><td>depends_on_json</td><td>list[str] — sibling-DAG prerequisites: task ids that must be DONE before this task becomes eligible. Distinct from <code>dependency_type</code> (parent/child rollup); this orders <em>peers</em>. Empty = no prerequisites (every leaf eligible — the historical default). Added via the <code>_migrate</code> path on legacy DBs.</td></tr>
       <tr><td>result_summary / failure_reason / actual_tool_used</td><td>TEXT.</td></tr>
       <tr><td>revision_count, estimated_cost, actual_cost, depth, position</td><td>numeric.</td></tr>
     </tbody>
@@ -64,6 +66,17 @@
 
   <h3>project_events</h3>
   <p>id (auto PK) · project_id · task_id · type · payload_json · ts (REAL).</p>
+  <p><strong>Snapshot pruning:</strong> only the most recent <code>scratchpad_snapshot</code> event is ever read back (<code>_hydrate_scratchpad</code> uses <code>limit=1</code>), but each one carries the full free-chat key/value dict, so on a long-lived project they were the dominant source of unbounded event growth. <code>log_event</code> now deletes superseded <code>scratchpad_snapshot</code> rows for the project as it writes the new one, keeping just the latest. Other event types are never pruned.</p>
+
+  <h2>Status rollup</h2>
+  <p><code>_maybe_rollup_project_status</code> transitions the <em>project</em> when its tasks settle (task terminal set = DONE / FAILED / BLOCKED):</p>
+  <ul>
+    <li>all tasks DONE → project <strong>DONE</strong>;</li>
+    <li>all terminal, ≥1 FAILED/BLOCKED → project <strong>FAILED</strong> (previously this collapsed to DONE because <code>ProjectStatus</code> had no FAILED member — a wholly-failed project reported as completed);</li>
+    <li>only-remaining-open work is NEEDS_USER → project <strong>NEEDS_USER</strong>;</li>
+    <li>any other open work → no-op (stays ACTIVE).</li>
+  </ul>
+  <p>DONE and ARCHIVED are <em>locked</em> (never auto-undone). FAILED and NEEDS_USER are <em>not</em> locked, so a revised or answered task rolls the project forward to DONE on a later update. Covered by <code>tests/test_project_mgmt_fixes.py</code> and <code>tests/test_audit_bug_fixes.py</code>.</p>
 
   <h2>ID canonicalisation</h2>
   <p>

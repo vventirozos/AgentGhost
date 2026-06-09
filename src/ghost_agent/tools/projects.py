@@ -50,6 +50,8 @@ _ACTIONS = {
     "promote_from_context",
     # self-advancing loop
     "autoadvance",
+    # auto-research
+    "research", "research_list",
 }
 
 
@@ -361,6 +363,14 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
     plan = ProjectPlan(store, project_id)
     nxt = plan.next_ready_leaf()
     events = store.list_events(project_id, limit=5)
+    try:
+        from ..core.project_research import get_research_index
+        research = [
+            {"topic": r.get("topic"), "path": r.get("path")}
+            for r in get_research_index(store, project_id)[-5:]
+        ]
+    except Exception:
+        research = []
     return {
         "project": {
             "id": proj["id"],
@@ -378,6 +388,7 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
             {"type": e["type"], "ts": e["ts"], "payload": e["payload"]}
             for e in events
         ],
+        "research": research,
     }
 
 
@@ -402,12 +413,18 @@ async def tool_manage_projects(
     dependency_type: str = "ALL",
     alternatives: Optional[List[str]] = None,
     postconditions: Optional[List[str]] = None,
+    depends_on: Optional[List[str]] = None,
+    sequential: bool = False,
     result: str = "",
     failure_reason: str = "",
     subtasks: Optional[List[str]] = None,
     # artifacts
     artifact_kind: str = "",
     payload: str = "",
+    # research
+    topic: str = "",
+    topics: Optional[List[str]] = None,
+    max_topics: int = 5,
     # misc
     status_filter: Optional[str] = None,
     limit: int = 20,
@@ -443,6 +460,8 @@ async def tool_manage_projects(
     subtasks = _coerce_str_list(subtasks)
     alternatives = _coerce_str_list(alternatives)
     postconditions = _coerce_str_list(postconditions)
+    depends_on = _coerce_str_list(depends_on)
+    topics = _coerce_str_list(topics)
     task_ids = _coerce_str_list(task_ids)
 
     # Rescue path: the model routinely confuses `task_id` (singular)
@@ -701,6 +720,7 @@ async def tool_manage_projects(
                 description=description, parent_id=parent_id,
                 dependency_type=dep,
                 alternatives=alternatives, postconditions=postconditions,
+                depends_on=depends_on,
             )
             _link_task_in_graph(context, project_id, tid, description)
             return _ok({
@@ -792,7 +812,8 @@ async def tool_manage_projects(
             pairs: List[tuple] = []  # (task_id, description) for graph linking
             try:
                 if target_id:
-                    ids = plan.decompose(target_id, subtasks)
+                    ids = plan.decompose(target_id, subtasks,
+                                         sequential=sequential)
                     # decompose drops blank descriptions, so the non-blank
                     # (stripped) subtasks align 1:1 with the returned ids.
                     # zip-ing against the RAW subtasks shifted the pairing
@@ -800,18 +821,25 @@ async def tool_manage_projects(
                     non_blank = [d.strip() for d in subtasks if d and d.strip()]
                     pairs = list(zip(ids, non_blank))
                 else:
+                    # Top-level fan-out. When `sequential`, chain each new
+                    # task to the previous one via depends_on so the
+                    # autoadvancer runs them strictly in order.
+                    prev_id = None
                     for desc in subtasks:
                         if not desc or not desc.strip():
                             continue
-                        tid = plan.add_task(desc.strip())
+                        deps = [prev_id] if (sequential and prev_id) else None
+                        tid = plan.add_task(desc.strip(), depends_on=deps)
                         ids.append(tid)
                         pairs.append((tid, desc.strip()))
+                        prev_id = tid
             except ValueError as e:
                 return _err(str(e))
             for tid, desc in pairs:
                 _link_task_in_graph(context, project_id, tid, desc)
             return _ok({"created": ids,
-                        "parent_id": target_id})
+                        "parent_id": target_id,
+                        "sequential": bool(sequential)})
 
         if act == "task_next":
             if not project_id:
@@ -888,6 +916,53 @@ async def tool_manage_projects(
                 "summary": result.summary,
                 "artifact_id": result.artifact_id,
             })
+
+        # ---- auto-research ----------------------------------------------
+
+        if act == "research":
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            from ..core.project_research import (
+                research_topic, research_project,
+            )
+            if topic and topic.strip():
+                rr = await research_topic(context, project_id, topic.strip())
+                if not rr.ok:
+                    return _err(f"research failed: {rr.error}")
+                return _ok({
+                    "researched": rr.topic, "path": rr.path,
+                    "sources": len(rr.sources),
+                    "summary_preview": (rr.summary or "")[:280],
+                    "agent_instruction": (
+                        f"Findings saved to {rr.path} in the project workspace. "
+                        "Read that file with file_system when you need the "
+                        "detail; it is also listed under RESEARCH NOTES in the "
+                        "project briefing from now on."
+                    ),
+                })
+            # No explicit topic → auto-derive several from goal + tasks.
+            results = await research_project(
+                context, project_id, topics=topics, max_topics=max_topics)
+            ok_results = [r for r in results if r.ok]
+            return _ok({
+                "researched": [
+                    {"topic": r.topic, "path": r.path, "sources": len(r.sources)}
+                    for r in ok_results
+                ],
+                "count": len(ok_results),
+                "agent_instruction": (
+                    "Auto-derived and researched the topics above; each brief is "
+                    "saved in research/ in the project workspace and surfaced "
+                    "under RESEARCH NOTES in the briefing. Read a file when you "
+                    "need its detail."
+                ) if ok_results else "No topics could be derived or researched.",
+            })
+
+        if act == "research_list":
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            from ..core.project_research import get_research_index
+            return _ok({"research": get_research_index(store, project_id)})
 
         # ---- inbox promotion (suggestion-accepted path) -----------------
 
@@ -966,7 +1041,12 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "to erase it; otherwise prefer `archive`. "
             "`promote_from_context` only when the user has explicitly "
             "accepted a suggestion to convert the current chat into a "
-            "project."
+            "project. `research` to web-research a topic (pass `topic`) or "
+            "auto-derive several from the project goal (omit `topic`) — each "
+            "is summarized into research/<slug>.md in the project workspace "
+            "and listed under RESEARCH NOTES in the briefing; `research_list` "
+            "to see what has already been researched (read a brief with "
+            "file_system before re-researching the same thing)."
         ),
         "parameters": {
             "type": "object",
@@ -994,6 +1074,16 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "dependency_type": {"type": "string", "enum": ["ALL", "ANY", "BEST"]},
                 "alternatives": {"type": "array", "items": {"type": "string"}},
                 "postconditions": {"type": "array", "items": {"type": "string"}},
+                "depends_on": {"type": "array", "items": {"type": "string"},
+                               "description": "task_add: ids of sibling tasks that must be DONE before THIS task becomes eligible to run (a prerequisite edge, distinct from parent/child). Use it to order peer tasks; omit for independent tasks."},
+                "sequential": {"type": "boolean",
+                               "description": "task_decompose: when true, chain the subtasks so each one only runs after the previous is DONE (the autoadvancer executes them in order). Default false = all subtasks independently runnable."},
+                "topic": {"type": "string",
+                          "description": "action=research: a single topic to research now. The agent web-searches it, summarizes the findings into research/<slug>.md in the project workspace, and surfaces it in the project briefing. Omit topic (and topics) to auto-derive several topics from the project goal + open tasks."},
+                "topics": {"type": "array", "items": {"type": "string"},
+                           "description": "action=research: an explicit list of topics to research (each persisted as its own brief). If omitted and no single topic is given, topics are auto-derived from the project."},
+                "max_topics": {"type": "integer",
+                               "description": "action=research: cap on how many auto-derived topics to research (default 5)."},
                 "result": {"type": "string", "description": "Short result summary (task_update with status=DONE)."},
                 "failure_reason": {"type": "string"},
                 "subtasks": {"type": "array", "items": {"type": "string"},

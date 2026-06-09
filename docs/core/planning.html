@@ -43,7 +43,8 @@
     <tbody>
       <tr><td><code>TaskStatus</code> enum (line 9)</td><td>PENDING · READY · IN_PROGRESS · DONE · FAILED · BLOCKED · PAUSED · NEEDS_USER</td></tr>
       <tr><td><code>DependencyType</code> enum (line 24)</td><td>ALL — every child must succeed · ANY — first success satisfies parent · BEST — run all, pick best</td></tr>
-      <tr><td><code>TaskNode</code> (line 32)</td><td>id, description, status, parent_id, children, dependency_type, alternatives, postconditions, estimated_cost, actual_cost, revision_count, result_summary, failure_reason, actual_tool_used, depth, position</td></tr>
+      <tr><td><code>TaskNode</code> (line 32)</td><td>id, description, status, parent_id, children, dependency_type, alternatives, postconditions, <strong>depends_on</strong>, estimated_cost, actual_cost, revision_count, result_summary, failure_reason, actual_tool_used, depth, position</td></tr>
+      <tr><td><code>depends_on</code></td><td>Sibling-DAG prerequisites — task ids that must be DONE before this node is eligible. Distinct from <code>dependency_type</code> (which governs parent/child rollup); <code>depends_on</code> orders <em>peers</em>. Empty = no prerequisites.</td></tr>
     </tbody>
   </table>
 
@@ -110,6 +111,9 @@
 
   <h2>ProjectPlan</h2>
   <p>Same shape as <code>TaskTree</code> but persisted via <a href="../memory/projects.html">memory.projects</a>'s SQLite store. <code>ProjectPlan.update_status()</code> wraps <code>TaskTree.update_status()</code> with a write-through to the database.</p>
+  <p><strong>Durable fallback edges.</strong> The write-through diff tracks <code>parent_id</code>, <code>alternatives</code> and <code>depends_on</code> in addition to the status fields. The failure cascade (<code>_check_parent_failure</code>) consumes an alternative by popping it off the parent and re-parenting it onto the failed parent — mutations that are silent on status. A status-only diff never persisted them, so on the next hydrate the alternative was no longer linked and the fallback edge was lost. Tracking those keys makes the alternatives/fallback path durable across sessions.</p>
+  <p><strong>Prerequisite-gated scheduling.</strong> <code>next_ready_leaf()</code> skips any leaf whose <code>depends_on</code> prerequisites are not all DONE (unknown/stale dep ids are treated as satisfied so a bad reference can't deadlock the plan). <code>decompose(task_id, subtasks, sequential=True)</code> chains each subtask to the previous via <code>depends_on</code>, so the autoadvancer runs them strictly in order; <code>sequential=False</code> (default) leaves every subtask independently eligible, the historical behaviour.</p>
+  <p>Covered by <code>tests/test_project_mgmt_fixes.py</code>.</p>
 
   <h2>Concurrency</h2>
   <p>Synchronous tree mutation. Persistence happens via the <code>ProjectStore</code> RLock; in-memory <code>TaskTree</code> is per-request only.</p>

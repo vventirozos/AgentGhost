@@ -143,6 +143,13 @@ def _increment_budget(store, project_id: str) -> None:
     new_meta = dict(budget["meta"])
     new_meta["steps_used"] = budget["used"] + 1
     new_meta.setdefault("steps_cap", budget["cap"])
+    # Stamp when this project was last autonomously advanced so the idle
+    # scheduler can round-robin across ACTIVE projects (least-recently-
+    # advanced first) instead of repeatedly picking whichever project sorts
+    # to the top of `updated_at DESC` — which was always the one just
+    # advanced, so a single project monopolised every tick and the rest
+    # starved.
+    new_meta["last_autoadvance_ts"] = time.time()
     store.update_project(project_id, metadata=new_meta)
 
 
@@ -307,6 +314,29 @@ async def advance_once(
         except Exception:
             logger.debug("artifact write skipped", exc_info=True)
 
+        # Stricter completion: a tool that ran but returned an error or
+        # produced nothing usable must NOT be recorded as DONE. The old
+        # path marked the task DONE on *any* output, so a failed
+        # web_search ("ERROR: …") or an empty result still counted as
+        # progress — theatrical completion. Detect the failure signal and
+        # fail the task instead, so the next tick can retry/alternative it
+        # rather than leaving a dead task masquerading as finished. (Only
+        # applies when a runner actually executed — the no-runner classify-
+        # only path below still marks DONE, as before.)
+        if _looks_like_failure(output):
+            reason = (_short_summary(output) or "empty tool output") if output \
+                else "tool produced no output"
+            plan.update_status(
+                nxt.id, TaskStatus.FAILED,
+                failure_reason=f"{tool_name} failed: {reason}",
+            )
+            store.log_event(project_id, nxt.id, "autoadvance_failed",
+                            {"tool": tool_name, "reason": reason[:200]})
+            _increment_budget(store, project_id)
+            return AdvanceResult(True, nxt.id, classification,
+                                 f"{tool_name} produced no usable result",
+                                 artifact_id)
+
     result_summary = _short_summary(output) if output else "(no tool runner)"
 
     # Human-gate postconditions force NEEDS_USER regardless of output.
@@ -351,6 +381,27 @@ async def advance_once(
             )
             break
 
+    # Auto-research persistence: when a research-classified task ran a real
+    # web_search and got usable output, turn that output into a durable,
+    # summarised brief in the project's workspace (research/<slug>.md) +
+    # index it, so background auto-advance leaves persistent findings the
+    # agent stays aware of (surfaced in the project briefing) rather than
+    # just a transient tool_call artifact. Reuses the output already in
+    # hand — no second search. Best-effort: never breaks the tick.
+    research_path: Optional[str] = None
+    if classification == "research" and output and tool_name == "web_search":
+        try:
+            from .project_research import persist_research_from_output
+            rr = await persist_research_from_output(
+                context, project_id, nxt.description, output, task_id=nxt.id)
+            if rr.ok:
+                research_path = rr.path
+                # Prefer the synthesised summary as the task's result.
+                if rr.summary:
+                    result_summary = _short_summary(rr.summary)
+        except Exception:
+            logger.debug("auto-research persist skipped", exc_info=True)
+
     plan.update_status(nxt.id, TaskStatus.DONE,
                        result=result_summary, actual_tool=tool_name)
     _metacog_set_task(context, None)  # node finished → don't replan a done task
@@ -359,10 +410,38 @@ async def advance_once(
     _record(store, project_id,
             seconds=max(0.0, time.time() - _tick_started_at),
             tool_calls=1 if tool_runner is not None else 0)
-    store.log_event(project_id, nxt.id, "autoadvance_step",
-                    {"tool": tool_name, "classification": classification})
-    return AdvanceResult(True, nxt.id, classification,
-                         f"advanced via {tool_name}", artifact_id)
+    step_payload: Dict[str, Any] = {"tool": tool_name,
+                                     "classification": classification}
+    if research_path:
+        step_payload["research_path"] = research_path
+    store.log_event(project_id, nxt.id, "autoadvance_step", step_payload)
+    summary = (f"advanced via {tool_name}"
+               + (f"; saved research to {research_path}" if research_path else ""))
+    return AdvanceResult(True, nxt.id, classification, summary, artifact_id)
+
+
+def _looks_like_failure(output: str) -> bool:
+    """True when a tool ran but its output indicates failure or emptiness.
+
+    Used to stop the advancer from recording a task DONE on a result that
+    accomplished nothing. Deliberately conservative — it fires on an empty
+    result or on an output whose FIRST non-empty line is an explicit error
+    marker (the convention every tool here uses: ``ERROR: …``). It does NOT
+    scan the whole body for the word "error", which would misfire on a
+    legitimate search result that merely *mentions* errors.
+    """
+    if output is None:
+        return True
+    s = str(output).strip()
+    if not s:
+        return True
+    first = s.splitlines()[0].strip().lower()
+    return (
+        first.startswith("error:")
+        or first.startswith("error ")
+        or first.startswith("traceback")
+        or first == "error"
+    )
 
 
 def _short_summary(output: str, max_len: int = 200) -> str:

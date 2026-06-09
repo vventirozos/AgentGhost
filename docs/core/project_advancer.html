@@ -15,6 +15,7 @@
     <a href="planning.html">planning</a>
     <a class="current" href="project_advancer.html">project_advancer</a>
     <a href="project_safety.html">project_safety</a>
+    <a href="project_research.html">project_research</a>
     <a href="../memory/projects.html">memory.projects</a>
   </nav>
 </aside>
@@ -48,9 +49,11 @@
     <li>Pick tool: coding → <code>execute</code> with code from the injected <code>code_generator</code> (or, if none, <strong>degrade to <code>web_search</code></strong> — never the old inert <code>"# Autoadvance stub"</code> comment that marked the task DONE having run nothing); research → <code>web_search</code>.</li>
     <li>Run tool through the injected runner.</li>
     <li>Store result as a project artifact.</li>
+    <li><strong>Stricter completion:</strong> if the tool ran but returned an error or no usable output (<code>_looks_like_failure</code> — empty, or a first line starting <code>ERROR:</code> / <code>Traceback</code>), flip the task to <strong>FAILED</strong> and log <code>autoadvance_failed</code> instead of marking it DONE. The old path recorded DONE on <em>any</em> output, so a failed <code>web_search</code> still counted as progress (theatrical completion). The no-runner classify-only path still marks DONE, as before.</li>
     <li>Check human-gate postconditions (<a href="project_safety.html">project_safety</a>) → flip to NEEDS_USER if any fire.</li>
+    <li><strong>Auto-research persistence (research tasks):</strong> when a research-classified task ran a real <code>web_search</code> and got usable output, that output is turned into a durable, summarised brief in the project workspace (<code>research/&lt;slug&gt;.md</code>) and indexed via <a href="project_research.html">project_research</a> — no second search. The synthesised summary becomes the task's <code>result_summary</code> and the brief path is added to the step event + result. Best-effort: never breaks the tick.</li>
     <li>Detect contradictions with DONE siblings.</li>
-    <li>Mark DONE; increment <code>steps_used</code>; record runtime + tool_calls.</li>
+    <li>Mark DONE; increment <code>steps_used</code>; record runtime + tool_calls; stamp <code>last_autoadvance_ts</code> (drives round-robin project selection — see phase 2.95).</li>
   </ol>
 
   <h2>Budget enforcement</h2>
@@ -63,7 +66,10 @@
 
   <h2>Autonomous idle advancement (phase 2.95)</h2>
   <p>
-    <code>advance_once</code> was historically only reachable via the <code>manage_projects</code> tool or the HTTP <code>/advance</code> route — <strong>no idle phase ever called it</strong>, so the "self-advancing research loop" only advanced when a human or the model explicitly poked it. Under <code>--autoadvance-idle</code>, biological-watchdog <strong>phase 2.95</strong> picks one ACTIVE project and runs a single tick during the 15–60&nbsp;min idle window (30-min cooldown), building a registry-backed <code>tool_runner</code> and an LLM <code>code_generator</code> so coding tasks produce and run real code. Strictly bounded — one project, one tick per cooldown, on the same hard per-project budgets + human gates — and off by default. This is what turns the dormant loop into genuine background autonomy. Covered by <code>tests/test_project_advancer.py</code>.
+    <code>advance_once</code> was historically only reachable via the <code>manage_projects</code> tool or the HTTP <code>/advance</code> route — <strong>no idle phase ever called it</strong>, so the "self-advancing research loop" only advanced when a human or the model explicitly poked it. Under <code>--autoadvance-idle</code>, biological-watchdog <strong>phase 2.95</strong> picks one ACTIVE project and runs a single tick during the 15–60&nbsp;min idle window (30-min cooldown), building a registry-backed <code>tool_runner</code>, an LLM <code>code_generator</code> so coding tasks produce and run real code, and an LLM <code>llm_classifier</code> so task routing no longer depends on the brittle keyword buckets (a task like <em>"design the schema"</em> matches no keyword and used to default to research/web_search). Strictly bounded — one project, one tick per cooldown, on the same hard per-project budgets + human gates — and off by default.
+  </p>
+  <p>
+    <strong>Round-robin fairness.</strong> The project picked each tick is the one advanced <em>least recently</em> (by <code>metadata.last_autoadvance_ts</code>; never-advanced projects sort first). Previously the phase took <code>actives[0]</code>, but <code>list_projects</code> orders by <code>updated_at DESC</code> and advancing a project bumps its <code>updated_at</code>, so the same project re-selected itself every tick and all other ACTIVE projects starved. This is what turns the dormant loop into genuine, fair background autonomy. Covered by <code>tests/test_project_advancer.py</code> and <code>tests/test_project_mgmt_fixes.py</code>.
   </p>
 
   <h2>Telling the user (autonomous-progress digest)</h2>
