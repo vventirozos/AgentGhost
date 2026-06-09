@@ -285,7 +285,15 @@ class VectorMemory:
     def smart_update(self, text: str, type_label: str = "auto"):
         try:
             with self._get_lock():
-                results = self.collection.query(query_texts=[text], n_results=1)
+                # Only consider plain memory entries as dedup candidates —
+                # without the filter the nearest neighbor can be an ingested
+                # document chunk, skill twin, or episode, and dist<0.50 would
+                # permanently delete it (cf. delete_by_query's $ne guard).
+                results = self.collection.query(
+                    query_texts=[text],
+                    n_results=1,
+                    where={"type": {"$nin": ["document", "skill", "episode"]}},
+                )
                 if results['ids'] and results['ids'][0]:
                     dist = results['distances'][0][0]
                     existing_id = results['ids'][0][0]
@@ -517,9 +525,10 @@ class VectorMemory:
 
                     prefix = ""
                     if item['p_score'] <= -15: prefix = "**[MASTER SUMMARY]** "
+                    elif item['p_score'] == -12: prefix = "**[EPISODE]** "
                     elif item['p_score'] <= -10: prefix = "**[IDENTITY]** "
+                    elif item['p_score'] == -5: prefix = "**[DOCUMENT SOURCE]** "
                     elif item['p_score'] == 0: prefix = "**[USER PRIORITY]** "
-                    elif item['p_score'] == 2: prefix = "**[DOCUMENT SOURCE]** "
 
                     output.append(f"[{ts}] ({m_type}) {prefix}{doc_text}")
 

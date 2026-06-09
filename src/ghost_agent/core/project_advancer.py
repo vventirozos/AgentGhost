@@ -139,18 +139,26 @@ def _get_budget(store, project_id: str) -> Dict[str, int]:
 
 
 def _increment_budget(store, project_id: str) -> None:
-    budget = _get_budget(store, project_id)
-    new_meta = dict(budget["meta"])
-    new_meta["steps_used"] = budget["used"] + 1
-    new_meta.setdefault("steps_cap", budget["cap"])
-    # Stamp when this project was last autonomously advanced so the idle
-    # scheduler can round-robin across ACTIVE projects (least-recently-
-    # advanced first) instead of repeatedly picking whichever project sorts
-    # to the top of `updated_at DESC` — which was always the one just
-    # advanced, so a single project monopolised every tick and the rest
-    # starved.
-    new_meta["last_autoadvance_ts"] = time.time()
-    store.update_project(project_id, metadata=new_meta)
+    # The read-modify-write below replaces the WHOLE metadata dict. Two
+    # concurrent ticks on the same project (claiming different leaves) would
+    # otherwise lose an increment — undercounting the budget so the cap can
+    # be exceeded — and could clobber keys other writers (research index,
+    # safety runtime) merged in between the read and the write. Callers
+    # never hold this lock here (the leaf-claim span releases it before any
+    # increment), and the span is fully synchronous, so this cannot deadlock.
+    with _get_project_lock(project_id):
+        budget = _get_budget(store, project_id)
+        new_meta = dict(budget["meta"])
+        new_meta["steps_used"] = budget["used"] + 1
+        new_meta.setdefault("steps_cap", budget["cap"])
+        # Stamp when this project was last autonomously advanced so the idle
+        # scheduler can round-robin across ACTIVE projects (least-recently-
+        # advanced first) instead of repeatedly picking whichever project sorts
+        # to the top of `updated_at DESC` — which was always the one just
+        # advanced, so a single project monopolised every tick and the rest
+        # starved.
+        new_meta["last_autoadvance_ts"] = time.time()
+        store.update_project(project_id, metadata=new_meta)
 
 
 def _metacog_set_task(context, task_id) -> None:

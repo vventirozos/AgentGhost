@@ -960,18 +960,23 @@ async def tool_list_files(sandbox_dir: Path, memory_system=None):
                     line = f"  {root_prefix}{f}"
                     
                     # --- REPO MAP: Extract AST Signatures for Python files ---
-                    if f.endswith('.py') and path.stat().st_size < 100000:
+                    if f.endswith('.py'):
                         try:
-                            code = path.read_text(errors='ignore')
-                            parsed = ast.parse(code)
-                            sigs = []
-                            for node in parsed.body:
-                                if isinstance(node, ast.FunctionDef):
-                                    sigs.append(f"def {node.name}()")
-                                elif isinstance(node, ast.ClassDef):
-                                    sigs.append(f"class {node.name}")
-                            if sigs:
-                                line += f"  [{', '.join(sigs[:5])}{'...' if len(sigs)>5 else ''}]"
+                            # stat() must stay inside the try: a broken
+                            # symlink or a file deleted between os.walk and
+                            # here raises OSError, which would otherwise
+                            # abort the ENTIRE listing.
+                            if path.stat().st_size < 100000:
+                                code = path.read_text(errors='ignore')
+                                parsed = ast.parse(code)
+                                sigs = []
+                                for node in parsed.body:
+                                    if isinstance(node, ast.FunctionDef):
+                                        sigs.append(f"def {node.name}()")
+                                    elif isinstance(node, ast.ClassDef):
+                                        sigs.append(f"class {node.name}")
+                                if sigs:
+                                    line += f"  [{', '.join(sigs[:5])}{'...' if len(sigs)>5 else ''}]"
                         except Exception:
                             pass
                     tree_lines.append(line)

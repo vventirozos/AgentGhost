@@ -1401,8 +1401,21 @@ Return ONLY a JSON object with:
                         test_payload=_test_payload,
                     )
                     if isinstance(create_result, str) and create_result.strip().lower().startswith("success"):
-                        playbook[idx]["graduated"] = True
-                        skill_memory.save_playbook(playbook)
+                        # Re-load under the lock and flip ONLY the matching
+                        # lesson. The snapshot read at the top of this method
+                        # is minutes stale by now (LLM + sandbox awaits) —
+                        # writing it back wholesale would silently destroy any
+                        # lessons learned concurrently, and `idx` may no
+                        # longer point at the same entry.
+                        _key = (lesson.get("task") or lesson.get("trigger") or "").strip()
+                        with skill_memory._get_lock():
+                            _fresh = skill_memory._load_playbook()
+                            for _entry in _fresh:
+                                _ek = (_entry.get("task") or _entry.get("trigger") or "").strip()
+                                if _ek and _ek == _key and not _entry.get("graduated"):
+                                    _entry["graduated"] = True
+                                    break
+                            skill_memory._save_playbook_unlocked(_fresh)
                         graduated += 1
                         pretty_log(
                             "Skill Graduated",

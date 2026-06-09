@@ -270,6 +270,18 @@ class TaskTree:
                     alt_id = parent.alternatives.pop(0)
                     if alt_id in self.nodes:
                         self.nodes[alt_id].status = TaskStatus.READY
+                        # Unlink the failed child(ren) the alternative
+                        # supersedes. Leaving them in the rollup makes an
+                        # ALL parent unsatisfiable: `all(s == DONE)` can
+                        # never hold with a FAILED child still counted, so
+                        # the parent would hang forever even after the
+                        # alternative succeeds. The nodes stay in
+                        # self.nodes for history; they just stop counting.
+                        parent.children = [
+                            cid for cid in parent.children
+                            if cid not in self.nodes
+                            or self.nodes[cid].status not in failed_statuses
+                        ]
                         # Integrate the alternative into the parent's children
                         # so completion/failure cascading sees it.
                         if alt_id not in parent.children:
@@ -298,6 +310,13 @@ class TaskTree:
                     parent.status = TaskStatus.FAILED
                     parent.failure_reason = "All BEST-dependency children failed"
                     self._check_parent_failure(parent.parent_id, visited)
+                else:
+                    # Mixed outcomes with at least one DONE: when the LAST
+                    # child to finish FAILED, only this failure path runs —
+                    # _check_parent_completion never re-fires, so without
+                    # this delegation the parent stays unresolved forever
+                    # and the winning result is never rolled up.
+                    self._check_parent_completion(parent_id)
 
     def get_active_node(self) -> Optional[TaskNode]:
         if not self.root_id: return None

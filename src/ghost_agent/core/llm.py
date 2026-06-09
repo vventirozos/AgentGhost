@@ -537,6 +537,12 @@ class LLMClient:
                         node = self.get_worker_node(None)
                         loop_breaker += 1
 
+                    # Every worker node has been exhausted — break the outer
+                    # retry loop instead of re-appending and hammering the
+                    # same dead node again (mirrors the vision/coding guard).
+                    if node in tried_nodes:
+                        break
+
                     tried_nodes.append(node)
 
                     pretty_log("Worker Compute", f"Routing background task to Worker Node ({node['model']})", level="INFO", icon=Icons.NODE_WORKER)
@@ -632,6 +638,12 @@ class LLMClient:
                     while node in tried_nodes and loop_breaker < len(self.swarm_clients):
                         node = self.get_swarm_node(None)
                         loop_breaker += 1
+
+                    # Every swarm node has been exhausted — break the outer
+                    # retry loop instead of re-appending and hammering the
+                    # same dead node again (mirrors the vision/coding guard).
+                    if node in tried_nodes:
+                        break
 
                     tried_nodes.append(node)
 
@@ -776,6 +788,7 @@ class LLMClient:
 
         # We wrap in a generic retry similar to the non-streaming one if it fails at the start.
         # But once bytes are yielded, if it fails mid-stream, it breaks.
+        yielded_any = False
         for attempt in range(2):
             try:
                 # We use stream() to keep the connection open and read chunks.
@@ -817,11 +830,23 @@ class LLMClient:
                         # lines — counts as activity and ends the prefill wait.
                         awaiting_first_byte = False
                         if chunk:
+                            yielded_any = True
                             yield f"{chunk}\n\n".encode('utf-8')
                 finally:
                     await resp.aclose()
                 return
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.ConnectError) as e:
+                if yielded_any:
+                    # Bytes already reached the client — retrying would
+                    # replay the ENTIRE completion after the partial one
+                    # (duplicated/garbled text in the UI). Surface the
+                    # break instead, honoring the contract in the comment
+                    # above the loop.
+                    pretty_log("Upstream Stream Broke", f"Mid-stream {type(e).__name__} after output started — not retrying", level="WARNING", icon=Icons.WARN)
+                    error_data = {"error": f"Stream broke mid-response: {str(e)}"}
+                    yield f"data: {json.dumps(error_data)}\n\n".encode('utf-8')
+                    yield b"data: [DONE]\n\n"
+                    return
                 if attempt < 1:
                     wait_time = 2
                     pretty_log("Upstream Stream Retry", f"[{attempt+1}/2] {type(e).__name__}. Retrying in {wait_time}s...", icon=Icons.RETRY)

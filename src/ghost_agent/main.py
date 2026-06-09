@@ -1264,9 +1264,23 @@ def main():
 
     context = GhostContext(args, sandbox_dir, memory_dir, tor_proxy)
     context.scratchpad = Scratchpad()
-    context.journal = MemoryJournal(context.memory_dir)
-    context.skill_memory = SkillMemory(memory_dir)
-    context.frontier_tracker = FrontierTracker(memory_dir)
+    if args.no_memory:
+        # --no-memory promises NOTHING is written to any persistent memory
+        # store (the lifespan gate covers profile/graph/vector). These three
+        # were previously constructed against the real memory dir regardless
+        # — SkillMemory.__init__ writes skills_playbook.json immediately,
+        # and the reflection sink keeps appending lessons. They have no
+        # disable flag and are dereferenced un-guarded across the codebase,
+        # so back them with a session-scoped throwaway dir instead of None.
+        import tempfile
+        _ephemeral_dir = Path(tempfile.mkdtemp(prefix="ghost_no_memory_"))
+        context.journal = MemoryJournal(_ephemeral_dir)
+        context.skill_memory = SkillMemory(_ephemeral_dir)
+        context.frontier_tracker = FrontierTracker(_ephemeral_dir)
+    else:
+        context.journal = MemoryJournal(context.memory_dir)
+        context.skill_memory = SkillMemory(memory_dir)
+        context.frontier_tracker = FrontierTracker(memory_dir)
     
     app = create_app()
     app.router.lifespan_context = lifespan

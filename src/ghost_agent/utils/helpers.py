@@ -325,15 +325,17 @@ def recursive_split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 
         if buffer:
             temp_chunks.append(buffer.strip())
 
+        # Push everything back through the stack (reversed, so LIFO pops in
+        # document order) — appending fitting chunks to final_chunks here
+        # while iterating reversed would emit them backwards.
         for chunk in reversed(temp_chunks):
-            if len(chunk) > chunk_size:
-                if found_sep == "" or chunk == current_text:
-                    for i in range(0, len(chunk), chunk_size - chunk_overlap):
-                        final_chunks.append(chunk[i:i+chunk_size])
-                else:
-                    stack.append(chunk)
+            if len(chunk) > chunk_size and (found_sep == "" or chunk == current_text):
+                # Can't be reduced by separators — hard character split.
+                pieces = [chunk[i:i+chunk_size]
+                          for i in range(0, len(chunk), chunk_size - chunk_overlap)]
+                stack.extend(reversed(pieces))
             else:
-                final_chunks.append(chunk)
+                stack.append(chunk)
 
     return final_chunks
 

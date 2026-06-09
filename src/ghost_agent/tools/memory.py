@@ -10,6 +10,11 @@ from ..memory.scratchpad import Scratchpad
 
 logger = logging.getLogger("GhostAgent")
 
+# Strong references to in-flight fire-and-forget graph-extraction tasks.
+# The event loop holds only weak refs to tasks (CPython docs warn about
+# this explicitly), so unreferenced tasks can be GC'd before they run.
+_GRAPH_EXTRACT_TASKS: set = set()
+
 
 def _is_within_root(path: Path, root: Path) -> bool:
     """True iff `path` is inside `root`, compared path-component-wise.
@@ -109,7 +114,12 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
                     if triplets:
                         await asyncio.to_thread(graph_memory.add_triplets, triplets)
                 except Exception: pass
-            asyncio.create_task(_extract_graph())
+            # Keep a strong reference: the event loop only holds weak refs
+            # to tasks, so a bare create_task can be garbage-collected
+            # mid-flight and the graph extraction silently never completes.
+            _task = asyncio.create_task(_extract_graph())
+            _GRAPH_EXTRACT_TASKS.add(_task)
+            _task.add_done_callback(_GRAPH_EXTRACT_TASKS.discard)
 
         return f"Memory stored: '{text}'"
     except Exception as e:

@@ -60,11 +60,15 @@ def load_tokenizer(local_tokenizer_path: Path):
     global TOKEN_ENCODER
     # 1. Try Local Disk (Offline Mode) - PREFERRED
     if local_tokenizer_path.exists() and (local_tokenizer_path / "tokenizer.json").exists():
+        # Restore (not pop) the prior value afterwards: --mandatory-tor sets
+        # HF_HUB_OFFLINE=1 deliberately (see _env.py) and an operator may
+        # have set it too — unconditionally deleting it would re-enable
+        # cleartext HF model-resolution calls the egress guard then blocks.
+        _prev_hf_offline = os.environ.get("HF_HUB_OFFLINE")
         os.environ["HF_HUB_OFFLINE"] = "1"
         try:
             print(f"📂 Loading Tokenizer from local cache: {local_tokenizer_path}")
             TOKEN_ENCODER = AutoTokenizer.from_pretrained(str(local_tokenizer_path), local_files_only=True)
-            os.environ.pop("HF_HUB_OFFLINE", None)
             # Tokenizer became available — re-arm the warn-once gate AND
             # drop the LRU cache so previously-approximated counts are
             # recomputed accurately on next access.
@@ -72,8 +76,12 @@ def load_tokenizer(local_tokenizer_path: Path):
             clear_token_cache()
             return TOKEN_ENCODER
         except Exception as e:
-            os.environ.pop("HF_HUB_OFFLINE", None)
             print(f"⚠️ Local tokenizer corrupted: {e}")
+        finally:
+            if _prev_hf_offline is None:
+                os.environ.pop("HF_HUB_OFFLINE", None)
+            else:
+                os.environ["HF_HUB_OFFLINE"] = _prev_hf_offline
 
     # 2. Try Network Download (Direct Mode) - FALLBACK
     print(f"⏳ Local missing. Downloading {QWEN_MODEL_ID} via Direct Network...")

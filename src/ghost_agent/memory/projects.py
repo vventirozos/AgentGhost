@@ -493,6 +493,12 @@ class ProjectStore:
             elif key == "dependency_type":
                 sets.append("dependency_type = ?")
                 values.append(str(val).upper())
+            elif key == "parent_id":
+                # Canonicalize like add_task does — LLM-echoed ids arrive
+                # case-mangled, and a raw value here breaks every
+                # `WHERE parent_id = ?` lookup (position calc, cascade delete).
+                sets.append("parent_id = ?")
+                values.append(_canon_id(val) or None)
             else:
                 sets.append(f"{key} = ?")
                 values.append(val)

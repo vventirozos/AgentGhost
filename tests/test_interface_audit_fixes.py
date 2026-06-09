@@ -141,6 +141,7 @@ async def test_non_streaming_chat_reuses_shared_http_client():
     import interface.server as server
 
     fake_resp = MagicMock()
+    fake_resp.status_code = 200
     fake_resp.json = MagicMock(return_value={"choices": []})
 
     fake_client = MagicMock()
@@ -157,7 +158,11 @@ async def test_non_streaming_chat_reuses_shared_http_client():
         result = await server.chat_proxy(req)
 
     assert mock_get_client.called, "non-streaming path did not reuse _get_http_client"
-    assert result == {"choices": []}
+    # The route now propagates the upstream status instead of returning a
+    # bare dict with an implicit 200 (which masked agent 4xx/5xx errors).
+    import json as _json
+    assert result.status_code == 200
+    assert _json.loads(result.body) == {"choices": []}
     fake_client.post.assert_called_once()
 
 

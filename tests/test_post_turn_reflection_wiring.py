@@ -348,6 +348,14 @@ async def test_correction_retracts_lessons_from_promoted_trajectory(tmp_path):
     )
     a._maybe_promote_prior_turn_via_user_correction(msgs, msgs[-1]["content"])
 
+    # Retraction is now scheduled off the event loop (asyncio.to_thread)
+    # so the user turn never blocks on the playbook lock + Chroma delete;
+    # drain the scheduled task before asserting.
+    import asyncio as _asyncio
+    pending = [t for t in _asyncio.all_tasks() if t is not _asyncio.current_task()]
+    if pending:
+        await _asyncio.gather(*pending)
+
     # The opt-prot's poisoned lesson is gone; the unrelated one
     # survives.
     import json as _json

@@ -443,18 +443,31 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
 # Tasks whose description implies a RUNNABLE / VISUAL artifact — a page, a
 # game, a rendered scene, a chart. Marking one DONE without any verification
 # evidence is the "wrote index.html, declared victory, never looked" anti-
-# pattern from the live Minecraft run. Kept tight (rendering-specific) so it
-# doesn't gate ordinary tasks. Matched as whole-ish substrings, lowercased.
+# pattern from the live Minecraft run.
+#
+# Kept HIGH-PRECISION on purpose. The first cut used broad words (game,
+# scene, render, animation, 3d, graphics) and false-positived on a
+# *philosophy* project: a text reflection titled "…whether the scene is
+# pre-existing or being constructed" matched " scene", and "game theory"
+# matched "game" — gating ordinary research tasks and costing ~6 wasted
+# turns. So the set is now limited to tokens that are unambiguous in a
+# software-task context, matched on word boundaries (so "hud" doesn't fire
+# inside "shudder", nor "3d" inside "add").
 _VISUAL_ARTIFACT_KEYWORDS = (
-    "render", "webgl", "three.js", "threejs", "canvas", "game", "playable",
-    "animation", "shader", "hud", "sprite", "frontend", "front-end",
-    "screenshot", "3d ", "graphics", "wireframe", " scene",
+    "webgl", "three.js", "threejs", "babylon.js", "pixi.js", "canvas",
+    "shader", "hud", "sprite", "playable", "gameplay", "game loop",
+    "render loop", "frame loop", "minecraft", "frontend", "front-end",
+)
+
+_VISUAL_ARTIFACT_RE = re.compile(
+    r"(?<![a-z0-9])(?:"
+    + "|".join(re.escape(k) for k in _VISUAL_ARTIFACT_KEYWORDS)
+    + r")(?![a-z0-9])"
 )
 
 
 def _is_visual_artifact_task(description: str) -> bool:
-    d = (description or "").lower()
-    return any(kw in d for kw in _VISUAL_ARTIFACT_KEYWORDS)
+    return bool(_VISUAL_ARTIFACT_RE.search((description or "").lower()))
 
 
 # ------------------------------------------------------------------ handler
@@ -528,6 +541,15 @@ async def tool_manage_projects(
     depends_on = _coerce_str_list(depends_on)
     topics = _coerce_str_list(topics)
     task_ids = _coerce_str_list(task_ids)
+
+    # `result` is the canonical name for a task's completion summary, but the
+    # model very naturally reaches for `result_summary` / `summary` — and when
+    # it does, the value lands in **_unused and the DONE-gate never sees the
+    # evidence, so a legit close keeps getting refused (observed: 6 wasted
+    # turns). Accept the obvious aliases.
+    if not (result or "").strip():
+        result = (_unused.get("result_summary") or _unused.get("summary")
+                  or _unused.get("result_text") or result or "")
 
     # Rescue path: the model routinely confuses `task_id` (singular)
     # with `task_ids` (list) and sends `'["real_id"]'` in the singular
@@ -910,15 +932,18 @@ async def tool_manage_projects(
             if gated:
                 payload["gated_unverified"] = gated
                 payload["agent_instruction"] = (
-                    f"REFUSED to mark {len(gated)} task(s) DONE: they describe a "
-                    f"VISUAL/RUNNABLE artifact but you gave NO verification "
-                    f"evidence. 'Written' is not 'works'. VERIFY first: open it "
-                    f"with the browser tool (operation='screenshot', and "
-                    f"click_center=true for an interactive canvas/game), then "
-                    f"READ the RENDER_CHECK line in the result — if it says "
-                    f"UNIFORM, the page is blank/sky-only and the task is NOT "
-                    f"done. Once you have actually seen it render, re-call "
-                    f"task_update with a `result` summarising what rendered."
+                    f"Held {len(gated)} task(s) at non-DONE pending verification "
+                    f"evidence: {gated}. Two ways to clear the gate:\n"
+                    f"  • If the task BUILDS A VISUAL/RUNNABLE artifact (a game, "
+                    f"page, canvas, chart): VERIFY it first — browser "
+                    f"operation='screenshot' (click_center=true for a game), "
+                    f"check the RENDER_CHECK / PRE_INTERACTION lines — then "
+                    f"re-call task_update with a `result` describing what you saw.\n"
+                    f"  • If the task is NOT visual (a text / research / markdown "
+                    f"/ analysis task — this gate can misfire on wording): just "
+                    f"re-call task_update with a one-line `result` describing what "
+                    f"you produced. That counts as evidence and clears the gate "
+                    f"immediately. (Pass it as `result=...`.)"
                 )
             return _ok(payload)
 

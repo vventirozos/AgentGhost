@@ -235,11 +235,30 @@ def context(tmp_path, store):
 
 
 def test_is_visual_artifact_task():
+    # Real visual/runnable builds → gated.
     assert _is_visual_artifact_task("Core Three.js setup and render loop")
     assert _is_visual_artifact_task("Build the WebGL canvas game")
     assert _is_visual_artifact_task("UI/HUD with crosshair")
+    assert _is_visual_artifact_task("Make the Minecraft clone playable")
+    assert _is_visual_artifact_task("Wire up gameplay and the game loop")
+    # Ordinary tasks → not gated.
     assert not _is_visual_artifact_task("research local regulations")
     assert not _is_visual_artifact_task("write the database migration")
+
+
+def test_is_visual_artifact_task_no_false_positives():
+    # Regression: the first keyword set false-positived on a PHILOSOPHY
+    # project — "the scene being constructed" matched " scene", "game theory"
+    # matched "game" — gating text reflection tasks (6 wasted turns live).
+    assert not _is_visual_artifact_task(
+        "Compare how I process a familiar vs novel concept while observing "
+        "whether the scene is pre-existing or being constructed")
+    assert not _is_visual_artifact_task("Analyze game theory equilibria")
+    assert not _is_visual_artifact_task("Render a verdict on the claim")
+    assert not _is_visual_artifact_task("Animate the onboarding copy (write text)")
+    # word-boundary safety: 'hud' inside 'shudder', '3d' inside 'add'
+    assert not _is_visual_artifact_task("fix the shudder on scroll")
+    assert not _is_visual_artifact_task("add a config option")
 
 
 async def _new_task(context, store, desc):
@@ -265,6 +284,29 @@ async def test_done_gate_allows_visual_task_with_result(context, store):
     out = json.loads(await tool_manage_projects(
         context, action="task_update", task_id=tid, status="DONE",
         result="browser screenshot RENDER_CHECK=HAS_CONTENT, terrain visible"))
+    assert "gated_unverified" not in out
+    assert store.get_task(tid)["status"] == "DONE"
+
+
+async def test_done_gate_cleared_by_result_summary_alias(context, store):
+    # The model naturally passes `result_summary=` (not `result=`); that must
+    # still clear the gate, else a legit close keeps getting refused.
+    pid, tid = await _new_task(context, store, "Render the game scene")
+    out = json.loads(await tool_manage_projects(
+        context, action="task_update", task_id=tid, status="DONE",
+        result_summary="rendered + screenshotted, terrain visible"))
+    assert "gated_unverified" not in out
+    assert store.get_task(tid)["status"] == "DONE"
+
+
+async def test_done_gate_does_not_fire_on_philosophy_task(context, store):
+    # The exact live false-positive: a text reflection mentioning "scene".
+    pid, tid = await _new_task(
+        context, store,
+        "Compare familiar vs novel processing — is the scene pre-existing or "
+        "being constructed (validate claim #4)")
+    out = json.loads(await tool_manage_projects(
+        context, action="task_update", task_id=tid, status="DONE"))
     assert "gated_unverified" not in out
     assert store.get_task(tid)["status"] == "DONE"
 

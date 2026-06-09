@@ -120,10 +120,13 @@ connected_websockets = set()
 
 async def log_streamer():
     """Reads agent logs and broadcasts them to connected clients."""
+    # stderr → DEVNULL: tail -F writes rotation notices ("file truncated",
+    # "has appeared") to stderr, and nothing ever drains that pipe — once
+    # the 64KB buffer fills, tail blocks and the live log stream freezes.
     process = await asyncio.create_subprocess_exec(
         "tail", "-n", "10", "-F", AGENT_LOG_PATH,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.DEVNULL
     )
 
     logger.info(f"Started log streamer for {AGENT_LOG_PATH}")
@@ -270,10 +273,32 @@ async def _active_chat_tasks_janitor():
                         stale.append(tid)
             for tid in stale:
                 active_chat_tasks.pop(tid, None)
-            # Hard cap evict-oldest
-            while len(active_chat_tasks) > ACTIVE_TASK_HARD_CAP:
-                oldest_tid = next(iter(active_chat_tasks))
-                active_chat_tasks.pop(oldest_tid, None)
+            # Hard cap evict-oldest. Done tasks go first; a live stream is
+            # never silently dropped — popping a still-running entry left
+            # its worker raising KeyError and its reader parked on
+            # new_data_event forever (the client connection hung). If we
+            # must evict a live task, cancel it and wake its reader first.
+            overflow = len(active_chat_tasks) - ACTIVE_TASK_HARD_CAP
+            if overflow > 0:
+                for tid, t in list(active_chat_tasks.items()):
+                    if overflow <= 0:
+                        break
+                    if t.get("done"):
+                        active_chat_tasks.pop(tid, None)
+                        overflow -= 1
+                for tid, t in list(active_chat_tasks.items()):
+                    if overflow <= 0:
+                        break
+                    bg = t.get("background_task")
+                    if bg is not None:
+                        bg.cancel()
+                    t["error"] = t.get("error") or "evicted: active task cap exceeded"
+                    t["done"] = True
+                    ev = t.get("new_data_event")
+                    if ev is not None:
+                        ev.set()
+                    active_chat_tasks.pop(tid, None)
+                    overflow -= 1
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -308,11 +333,17 @@ async def chat_proxy(request: Request):
             async def background_stream_worker(t_id, payload):
                 import time as _time
                 client = _get_http_client()  # reuse pooled client
+                # Hold the entry directly: if the janitor evicts this task
+                # from the dict mid-stream, `active_chat_tasks[t_id]` would
+                # raise KeyError in the handlers/finally below, leaving
+                # done/new_data_event unset and the reader hung.
+                t = active_chat_tasks.get(t_id)
+                if t is None:
+                    return
                 try:
                     async with client.stream("POST", "http://localhost:8000/api/chat", json=payload, headers={"X-Ghost-Key": GHOST_API_KEY}, timeout=_chat_timeout()) as response:
                         response.raise_for_status()
                         async for chunk in response.aiter_bytes(chunk_size=None):
-                            t = active_chat_tasks[t_id]
                             # Enforce per-task buffer cap. A stuck client +
                             # runaway producer would otherwise OOM us; drop
                             # further chunks and flag the task as truncated.
@@ -324,16 +355,16 @@ async def chat_proxy(request: Request):
                             t["buffer"].append(chunk)
                             t["buffer_size"] += chunk_len
                             t["new_data_event"].set()
-                    active_chat_tasks[t_id]["done"] = True
+                    t["done"] = True
                 except asyncio.CancelledError:
-                    active_chat_tasks[t_id]["done"] = True
+                    t["done"] = True
                     raise
                 except Exception as e:
-                    active_chat_tasks[t_id]["error"] = str(e)
-                    active_chat_tasks[t_id]["done"] = True
+                    t["error"] = str(e)
+                    t["done"] = True
                 finally:
-                    active_chat_tasks[t_id]["finished_at"] = _time.time()
-                    active_chat_tasks[t_id]["new_data_event"].set()
+                    t["finished_at"] = _time.time()
+                    t["new_data_event"].set()
 
             # Start detached generation task
             bg_task = asyncio.create_task(background_stream_worker(task_id, body))
@@ -390,7 +421,16 @@ async def chat_proxy(request: Request):
                 headers={"X-Ghost-Key": GHOST_API_KEY},
                 timeout=_chat_timeout(),
             )
-            return response.json()
+            # Propagate the upstream status — returning the body with an
+            # implicit 200 masks agent 4xx/5xx errors and defeats the
+            # client's retry/backoff contract (_err_json).
+            try:
+                payload = response.json()
+            except Exception:
+                if response.status_code >= 400:
+                    return _err_json(response.status_code, response.text[:500])
+                raise
+            return JSONResponse(payload, status_code=response.status_code)
                 
     except Exception as e:
         logger.error(f"Chat proxy error: {e}")
@@ -440,13 +480,23 @@ async def workspace_save_proxy(request: Request):
     try:
         body = await request.json()
         client = httpx.AsyncClient(timeout=120.0)
-        req = client.build_request("POST", "http://localhost:8000/api/workspace/save", json=body, headers={"X-Ghost-Key": GHOST_API_KEY})
-        resp = await client.send(req, stream=True)
-        resp.raise_for_status()
-        
-        headers = {}
-        if "content-disposition" in resp.headers:
-            headers["content-disposition"] = resp.headers["content-disposition"]
+        # Close resp/client on any failure BEFORE the StreamingResponse
+        # takes ownership — otherwise every upstream error leaks an open
+        # streamed connection and a client pool (socket/FD exhaustion).
+        resp = None
+        try:
+            req = client.build_request("POST", "http://localhost:8000/api/workspace/save", json=body, headers={"X-Ghost-Key": GHOST_API_KEY})
+            resp = await client.send(req, stream=True)
+            resp.raise_for_status()
+
+            headers = {}
+            if "content-disposition" in resp.headers:
+                headers["content-disposition"] = resp.headers["content-disposition"]
+        except Exception:
+            if resp is not None:
+                await resp.aclose()
+            await client.aclose()
+            raise
             
         async def stream_generator():
             try:
@@ -552,15 +602,23 @@ async def download_proxy(filename: str):
         raise HTTPException(status_code=400, detail="Invalid filename")
     try:
         client = httpx.AsyncClient(timeout=120.0)
-        req = client.build_request("GET", f"http://localhost:8000/api/download/{filename}", headers={"X-Ghost-Key": GHOST_API_KEY})
-        resp = await client.send(req, stream=True)
-        resp.raise_for_status()
+        # Same leak guard as workspace_save: close on pre-stream failure.
+        resp = None
+        try:
+            req = client.build_request("GET", f"http://localhost:8000/api/download/{filename}", headers={"X-Ghost-Key": GHOST_API_KEY})
+            resp = await client.send(req, stream=True)
+            resp.raise_for_status()
 
-        headers = {}
-        if "content-type" in resp.headers:
-            headers["content-type"] = resp.headers["content-type"]
-        if "content-disposition" in resp.headers:
-            headers["content-disposition"] = resp.headers["content-disposition"]
+            headers = {}
+            if "content-type" in resp.headers:
+                headers["content-type"] = resp.headers["content-type"]
+            if "content-disposition" in resp.headers:
+                headers["content-disposition"] = resp.headers["content-disposition"]
+        except Exception:
+            if resp is not None:
+                await resp.aclose()
+            await client.aclose()
+            raise
 
         async def stream_generator():
             try:
@@ -606,12 +664,20 @@ async def tts_proxy(request: Request):
         body = await request.json()
         payload = {"text": body.get("text", "")}
         client = httpx.AsyncClient(timeout=60.0)
-        req = client.build_request("POST", f"{PI_VOICE_URL}/tts", json=payload)
-        resp = await client.send(req, stream=True)
-        if resp.status_code != 200:
-            await resp.aread()
-            logger.error(f"PI 500 Error Body: {resp.text}")
-            resp.raise_for_status()
+        # Same leak guard as workspace_save: close on pre-stream failure.
+        resp = None
+        try:
+            req = client.build_request("POST", f"{PI_VOICE_URL}/tts", json=payload)
+            resp = await client.send(req, stream=True)
+            if resp.status_code != 200:
+                await resp.aread()
+                logger.error(f"PI 500 Error Body: {resp.text}")
+                resp.raise_for_status()
+        except Exception:
+            if resp is not None:
+                await resp.aclose()
+            await client.aclose()
+            raise
         
         async def stream_generator():
             try:

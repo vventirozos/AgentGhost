@@ -122,10 +122,15 @@ async def api_generate(request: Request):
     model = body.get("model", "default")
     stream = body.get("stream", False)
 
+    # Always request a non-streaming upstream completion: this handler
+    # parses the body with resp.json(), and the local "stream" emulation
+    # below sends the full response as a single NDJSON frame anyway.
+    # Forwarding stream=True made the upstream return SSE frames, so
+    # resp.json() raised and every Ollama-style streaming client got a 500.
     chat_payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "stream": stream
+        "stream": False
     }
 
     try:

@@ -60,6 +60,11 @@ def mock_dreamer_for_graduation():
     context.skill_memory.file_path = MagicMock()
     context.skill_memory.file_path.read_text.return_value = json.dumps(playbook)
     context.skill_memory.save_playbook = MagicMock()
+    # graduate_lessons now re-loads the playbook under the lock right before
+    # saving (the stale-snapshot write-back destroyed concurrently-learned
+    # lessons) and saves via _save_playbook_unlocked.
+    context.skill_memory._load_playbook = MagicMock(return_value=json.loads(json.dumps(playbook)))
+    context.skill_memory._save_playbook_unlocked = MagicMock()
 
     context.llm_client = MagicMock()
     context.llm_client.chat_completion = AsyncMock(return_value={
@@ -85,8 +90,13 @@ class TestSkillGraduation:
         result = await mock_dreamer_for_graduation.graduate_lessons()
 
         assert "1 lessons graduated" in result
-        # save_playbook should have been called to mark graduation
-        mock_dreamer_for_graduation.context.skill_memory.save_playbook.assert_called()
+        # The freshly re-loaded playbook must be saved with graduated=True
+        # flipped on the matching lesson (not a stale snapshot write-back).
+        sm = mock_dreamer_for_graduation.context.skill_memory
+        sm._save_playbook_unlocked.assert_called()
+        saved = sm._save_playbook_unlocked.call_args[0][0]
+        graduated_tasks = [l["task"] for l in saved if l.get("graduated")]
+        assert "Parse mixed-encoding CSV" in graduated_tasks
 
     @pytest.mark.asyncio
     async def test_skips_already_graduated(self, mock_dreamer_for_graduation):
@@ -109,8 +119,9 @@ class TestSkillGraduation:
         _mock_create_skill.return_value = "Skill creation failed: test exited 1."
         result = await mock_dreamer_for_graduation.graduate_lessons()
         assert "0 lessons graduated" in result
-        # save_playbook must NOT be called to flip graduated=True
+        # The playbook must NOT be saved to flip graduated=True
         mock_dreamer_for_graduation.context.skill_memory.save_playbook.assert_not_called()
+        mock_dreamer_for_graduation.context.skill_memory._save_playbook_unlocked.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_candidates(self):

@@ -2769,6 +2769,14 @@ class GhostAgent:
                 # `context.last_user_content`. Set BEFORE any tool
                 # dispatch path can run in this turn.
                 self.context.last_user_content = last_user_content
+                # Discard any confidence reading left over from a PREVIOUS
+                # streaming turn: its stream wrapper sets `_calib_pending`
+                # while the client drains the SSE stream, i.e. AFTER
+                # handle_chat returned, so the turn-end pairing below never
+                # consumed it. Without this reset the next turn would pair
+                # that stale reading with ITS OWN outcome, systematically
+                # mispairing the calibration JSONL.
+                self.context._calib_pending = None
 
                 # Stage-1 self-improvement: user-correction promotion.
                 # If `last_user_content` looks like a correction of the
@@ -3073,14 +3081,14 @@ class GhostAgent:
 
                 # Dynamic "Perfect It" Protocol Injection
                 if getattr(self.context.args, 'perfect_it', False):
-                    # Inject as item 5 before Tool Orchestration
-                    last_tool_content = "None"
-                    if locals().get('tools_run_this_turn') and len(tools_run_this_turn) > 0:
-                        last_tool_content = str(tools_run_this_turn[-1].get('content', ''))[:15000]
-
+                    # Inject as item 5 before Tool Orchestration. This runs at
+                    # request start — no tool has executed yet, so we point the
+                    # model at the tool_response blocks it will see in-context
+                    # rather than embedding output here (the old inline
+                    # placeholder was always the literal string "None").
                     base_prompt = base_prompt.replace(
                         "### TOOL ORCHESTRATION",
-                        f'5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (Last Tool Output: {last_tool_content}) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
+                        '5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
                     )
                 base_prompt += working_memory_context
 
@@ -3270,6 +3278,11 @@ class GhostAgent:
                 # (see selfplay session, attempt 2: 5 identical failures).
                 consecutive_parse_errors = 0
                 tools_run_this_turn = []
+                # Last dispatched tool name. Must be initialised here: the
+                # streaming metacog block references it from a closure, and on
+                # turns where no tool ran an unbound `fname` raises NameError
+                # — silently swallowed, killing the calibration sample.
+                fname = ""
                 forget_was_called = False
                 thought_content = ""
                 was_complex_task = False
@@ -3736,7 +3749,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     target_tool = locals().get("required_tool", "all")
                     # With the planner disabled, default to final generation (stream directly).
                     # If the model returns tool_calls, the turn loop below will handle them.
-                    is_final_generation = force_final_response or target_tool.lower() == "none"
+                    # str(... or "all"): planners routinely emit `"required_tool": null`,
+                    # which arrives here as None — .lower() on it would 500 the request.
+                    is_final_generation = force_final_response or str(target_tool or "all").lower() == "none"
 
                     # Translate messages to bypass strict API validation and emulate Qwen-Agent
                     req_messages = []
@@ -4824,12 +4839,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 tools_run_this_turn
                             )
                             if real_tool is not None:
-                                last_tool = {
-                                    k: v for k, v in real_tool.items()
-                                    if not k.startswith("_")
-                                }
-                                last_tool["content"] = str(last_tool.get("content", ""))[:1000] + "\n... [EMERGENCY TRUNCATION] ..."
-                                recovery_msgs.append(last_tool)
+                                # Wrap as a <tool_response> user message — the
+                                # same translation the main request path applies.
+                                # A raw orphan role:"tool" message (no preceding
+                                # assistant tool_calls) is rejected by strict
+                                # chat templates, turning a recoverable overflow
+                                # into a hard failure.
+                                _rt_content = str(real_tool.get("content", ""))[:1000] + "\n... [EMERGENCY TRUNCATION] ..."
+                                recovery_msgs.append({
+                                    "role": "user",
+                                    "content": (
+                                        f"<tool_response name=\"{real_tool.get('name', 'unknown')}\">\n"
+                                        f"{_rt_content}\n</tool_response>"
+                                    ),
+                                })
 
                             recovery_msgs.append({"role": "user", "content": "SYSTEM ALERT: The conversation history was truncated to fit within context limits. Continue task. Assume previous context has been handled."})
 
@@ -6724,12 +6747,33 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 is_simulation = getattr(getattr(self.context, "skill_memory", None), "is_read_only", False) is True
 
                 if not is_simulation and tools_run_this_turn and heavy_tools_used and execution_failure_count == 0 and not last_was_failure and (not final_ai_content or len(final_ai_content) < 50):
-                    pretty_log("Perfect It Protocol", "Generating proactive optimization...", icon=Icons.IDEA)
+                    # Whether the optimization is part of the user-facing
+                    # response. When the flag is OFF the generation is pure
+                    # internal learning — so it runs as a tracked background
+                    # task instead of blocking the reply (observed: a 24s
+                    # task delivered at +271s because the response waited on
+                    # this call, which also let the watchdog cross its 120s
+                    # idle threshold and pile hippocampus consolidation onto
+                    # the same single-slot upstream).
+                    _pp_show_to_user = getattr(self.context.args, 'perfect_it', False) is True
+                    pretty_log(
+                        "Perfect It Protocol",
+                        "Generating proactive optimization..."
+                        + ("" if _pp_show_to_user else " (deferred off the response path)"),
+                        icon=Icons.IDEA,
+                    )
+                    # Heartbeat: end-of-turn post-processing is outside the
+                    # turn loop's heartbeats; without this, a long inline
+                    # generation makes the biological watchdog think the
+                    # system is idle MID-REQUEST and wake the hippocampus.
+                    self.context.last_activity_time = datetime.datetime.now()
                     perfect_it_prompt = f"Task completed successfully. Final tool output:\n\n{tools_run_this_turn[-1]['content']}\n\n<system_directive>First, succinctly present the tool output/result to the user. Then, based on your Perfection Protocol, analyze the result and proactively suggest one concrete way to optimize, scale, secure, or automate this work further. RESPOND IN PLAIN TEXT ONLY. DO NOT USE TOOLS.</system_directive>"
-                    messages.append({"role": "user", "content": perfect_it_prompt})
 
                     p_req_messages = []
-                    for m in messages:
+                    # Snapshot — deliberately NOT messages.append(): the
+                    # synthetic directive must not leak into the trajectory
+                    # record or any later consumer of `messages`.
+                    for m in messages + [{"role": "user", "content": perfect_it_prompt}]:
                         if m.get("role") == "tool":
                             p_req_messages.append({"role": "user", "content": f"<tool_response name=\"{m.get('name', 'unknown')}\">\n{m.get('content')}\n</tool_response>"})
                         elif m.get("role") == "assistant":
@@ -6750,52 +6794,57 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 content_val = "\n".join(text_parts) if all(isinstance(x, str) for x in text_parts) else text_parts
                             p_req_messages.append({"role": m.get("role", "user"), "content": content_val})
 
-                    payload["messages"] = p_req_messages
+                    # Build a payload COPY: the original is left untouched
+                    # for anything downstream, and the deferred task must
+                    # not share mutable state with the live request.
+                    # 🔴 Physically remove tools so it cannot hallucinate a tool call
+                    p_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+                    p_payload["messages"] = p_req_messages
+                    p_payload["stream"] = False  # Prevent SSE streaming leak from the main loop
+                    _pp_lesson_label = f"Optimization Analysis: {last_user_content[:50]}..."
 
-                    # 🔴 CRITICAL FIX: Physically remove tools from payload so it cannot hallucinate a tool call
-                    if "tools" in payload: del payload["tools"]
-                    if "tool_choice" in payload: del payload["tool_choice"]
-                    payload["stream"] = False  # Prevent SSE streaming leak from the main loop
-
-                    try:
-                        perfection_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
-                        p_msg = perfection_data["choices"][0]["message"].get("content", "")
-                        p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()
-
-                        # 1. User Display (Conditional on Flag)
-                        if getattr(self.context.args, 'perfect_it', False):
-                            if final_ai_content:
-                                final_ai_content += "\n\n" + p_msg
-                            else:
-                                final_ai_content = p_msg
-
-                        # 2. Internal Learning (Always)
-                        if p_msg and getattr(self.context, 'skill_memory', None):
-                            # Tag the lesson with this turn's trajectory
-                            # id. If the user corrects on the next turn,
-                            # `_maybe_promote_prior_turn_via_user_correction`
-                            # promotes this trajectory to FAILED and
-                            # calls `retract_lessons_from_trajectory`,
-                            # which scrubs this exact entry from both
-                            # the JSON playbook and the vector store.
-                            # Without provenance, the rubber-stamped
-                            # opt-prot lesson would survive the
-                            # correction and poison future retrieval.
-                            await asyncio.to_thread(
-                                self.context.skill_memory.learn_lesson,
-                                task=f"Optimization Analysis: {last_user_content[:50]}...",
-                                mistake="Sub-optimal pattern identified via Perfection Protocol",
-                                solution=p_msg,
-                                memory_system=self.context.memory_system,
-                                source_trajectory_id=current_trajectory_id,
-                                source="perfection_protocol",
+                    if _pp_show_to_user:
+                        # --perfect-it: the optimization IS part of the
+                        # reply, so it must block the response path.
+                        try:
+                            p_msg = await self._perfect_it_generate_and_learn(
+                                p_payload, _pp_lesson_label, current_trajectory_id
                             )
-                            pretty_log("Internal Learning", "Saved optimization strategy to playbook.", icon=Icons.MEM_SAVE)
-
-                    except Exception as e:
-                        # Only report failure to user if they expected to see it
-                        if getattr(self.context.args, 'perfect_it', False) and not final_ai_content:
-                            final_ai_content = "Task finished successfully, but optimization generation failed."
+                            if p_msg:
+                                if final_ai_content:
+                                    final_ai_content += "\n\n" + p_msg
+                                else:
+                                    final_ai_content = p_msg
+                        except Exception:
+                            # Only report failure to user if they expected to see it
+                            if not final_ai_content:
+                                final_ai_content = "Task finished successfully, but optimization generation failed."
+                    else:
+                        # Internal-learning only: fire-and-forget, tracked in
+                        # the context-level set (strong ref — bare tasks can
+                        # be GC'd — and drained by the lifespan shutdown).
+                        # The background queue in llm.py yields to any
+                        # foreground call, so the verifier below still gets
+                        # upstream priority.
+                        async def _deferred_perfect_it(
+                            _payload=p_payload,
+                            _label=_pp_lesson_label,
+                            _tid=current_trajectory_id,
+                        ):
+                            try:
+                                await self._perfect_it_generate_and_learn(_payload, _label, _tid)
+                            except Exception as _e:
+                                logger.debug(
+                                    "Deferred Perfect-It skipped: %s: %s",
+                                    type(_e).__name__, _e,
+                                )
+                        _bg = getattr(self.context, "_pending_background_tasks", None)
+                        if _bg is None:
+                            _bg = set()
+                            self.context._pending_background_tasks = _bg
+                        _pp_task = asyncio.create_task(_deferred_perfect_it())
+                        _bg.add(_pp_task)
+                        _pp_task.add_done_callback(_bg.discard)
 
                 if tools_run_this_turn and not final_ai_content:
                     # Walk back to the last *real* tool output. Reading
@@ -6846,6 +6895,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # on the hot path). `(outcome, failure_reason)` or None.
                 verifier_backfill: tuple | None = None
                 try:
+                    # Heartbeat: the verifier completion can run for a minute
+                    # on a cold prefill; without refreshing the activity
+                    # clock here the biological watchdog (idle > 120s) wakes
+                    # the hippocampus MID-REQUEST and its consolidation LLM
+                    # calls compete with this one on the same upstream.
+                    self.context.last_activity_time = datetime.datetime.now()
                     verifier = getattr(self.context, "verifier", None)
                     # Gate: any tool-using turn is worth verifying. The old
                     # `was_complex_task` constraint (turn > 2) silently
@@ -7019,7 +7074,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             try:
                                 _sm = getattr(self.context, "skill_memory", None)
                                 if _sm is not None and current_trajectory_id:
-                                    _sm.retract_lessons_from_trajectory(
+                                    # to_thread: retraction takes a file lock,
+                                    # rewrites the playbook and does a sync
+                                    # Chroma delete — run it off the event
+                                    # loop like every other SkillMemory call
+                                    # on this path.
+                                    await asyncio.to_thread(
+                                        _sm.retract_lessons_from_trajectory,
                                         current_trajectory_id,
                                         memory_system=getattr(
                                             self.context, "memory_system", None
@@ -7527,6 +7588,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         req_id=req_id,
                         model=model,
                         trajectory_id=current_trajectory_id,
+                        user_request=last_user_content,
                     )
                 except Exception as e:
                     # Debug-level: a turn-logging failure must never be
@@ -7846,10 +7908,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         vector_memory = getattr(ctx, "memory_system", None)
         if skill_memory is not None and traj.id:
             try:
-                skill_memory.retract_lessons_from_trajectory(
-                    traj.id,
-                    memory_system=vector_memory,
-                )
+                # Retraction blocks (file lock + playbook rewrite + sync
+                # Chroma delete). This helper runs ON the event loop, so
+                # offload to a thread like the PRM online-update below;
+                # inline only when no loop is running (sync/test callers).
+                try:
+                    asyncio.get_running_loop().create_task(asyncio.to_thread(
+                        skill_memory.retract_lessons_from_trajectory,
+                        traj.id,
+                        memory_system=vector_memory,
+                    ))
+                except RuntimeError:
+                    skill_memory.retract_lessons_from_trajectory(
+                        traj.id,
+                        memory_system=vector_memory,
+                    )
             except Exception as e:
                 logger.debug(
                     "lesson retraction skipped: %s: %s",
@@ -8006,6 +8079,46 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception:
             pass
 
+    async def _perfect_it_generate_and_learn(
+        self,
+        p_payload: dict,
+        lesson_label: str,
+        trajectory_id: str,
+    ) -> str:
+        """Run the Perfect-It completion and persist the lesson.
+
+        Shared by the inline path (--perfect-it: the text joins the reply,
+        so the caller awaits it on the response path) and the deferred path
+        (flag off: internal learning only, scheduled as a background task).
+        Returns the generated optimization text ('' when the model produced
+        nothing usable). Raises on LLM failure — each caller decides how to
+        surface that.
+
+        The lesson is tagged with this turn's trajectory id: if the user
+        corrects on the next turn, `retract_lessons_from_trajectory` scrubs
+        this exact entry from both the JSON playbook and the vector store.
+        Without provenance, the rubber-stamped opt-prot lesson would survive
+        the correction and poison future retrieval.
+        """
+        perfection_data = await self.context.llm_client.chat_completion(
+            p_payload, use_worker=True, is_background=True
+        )
+        p_msg = perfection_data["choices"][0]["message"].get("content", "")
+        p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()
+
+        if p_msg and getattr(self.context, 'skill_memory', None):
+            await asyncio.to_thread(
+                self.context.skill_memory.learn_lesson,
+                task=lesson_label,
+                mistake="Sub-optimal pattern identified via Perfection Protocol",
+                solution=p_msg,
+                memory_system=self.context.memory_system,
+                source_trajectory_id=trajectory_id,
+                source="perfection_protocol",
+            )
+            pretty_log("Internal Learning", "Saved optimization strategy to playbook.", icon=Icons.MEM_SAVE)
+        return p_msg
+
     def _record_turn_trajectory(
         self,
         *,
@@ -8014,6 +8127,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         req_id: str,
         model: str,
         trajectory_id: str = "",
+        user_request: str = "",
     ) -> None:
         """Build and persist a Trajectory for the turn that just finished.
 
@@ -8034,7 +8148,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
         msgs = list(messages or [])
         system_prompt = ""
-        user_request = ""
+        # The caller passes the HUMAN's request explicitly. Re-deriving it
+        # from the message list ("last user-role message wins") is wrong:
+        # the turn loop injects synthetic user-role messages mid-turn
+        # (SYSTEM ALERT / AUTO-DIAGNOSTIC / Perfect-It nudges), and on any
+        # turn with a tool failure those would masquerade as the request —
+        # poisoning reflection, frontier clustering, and PRM features.
+        user_request = str(user_request or "")
+        fallback_user_request = ""
         for m in msgs:
             if not isinstance(m, dict):
                 continue
@@ -8048,7 +8169,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             if role == "system" and not system_prompt:
                 system_prompt = str(content or "")
             elif role == "user":
-                user_request = str(content or "")
+                fallback_user_request = str(content or "")
+        if not user_request:
+            # Legacy fallback (last user-role message) — only correct when
+            # the caller couldn't supply the real request.
+            user_request = fallback_user_request
 
         # Reconstruct tool call pairs. Walk the messages left-to-right;
         # every assistant with tool_calls gets paired with the tool

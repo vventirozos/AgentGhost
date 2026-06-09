@@ -346,7 +346,9 @@ def _delete_lesson_twin(memory_system, lesson) -> None:
             return
         trig = (lesson.get("trigger") or lesson.get("task") or "")[:200]
         if trig:
-            coll.delete(where={"type": "skill", "trigger": trig})
+            # Chroma requires multi-key filters to be wrapped in $and; a flat
+            # two-key dict raises ValueError (silently caught below).
+            coll.delete(where={"$and": [{"type": "skill"}, {"trigger": trig}]})
             return
         src = lesson.get("source_trajectory_id")
         if isinstance(src, str) and src:
@@ -517,10 +519,20 @@ class SkillMemory:
             )
             if duplicate:
                 if duplicate.get("source") == "json":
-                    idx = duplicate.get("index", 0)
                     with self._get_lock():
                         playbook = self._load_playbook()
-                        if idx < len(playbook):
+                        # Re-locate the duplicate by key under the lock — the
+                        # index from _find_duplicate_lesson came from an older
+                        # snapshot, and a concurrent learn_lesson prepends
+                        # entries, shifting every index. Trusting the stale
+                        # index could merge into an unrelated lesson.
+                        key = (effective_trigger or "").lower().strip()
+                        idx = next(
+                            (i for i, p in enumerate(playbook)
+                             if (p.get("task") or p.get("trigger") or "").lower().strip() == key),
+                            None,
+                        )
+                        if idx is not None:
                             existing = _normalize_lesson(playbook[idx])
                             existing["frequency"] = int(existing.get("frequency") or 1) + 1
                             # Prefer the new solution if it's richer or

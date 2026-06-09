@@ -25,16 +25,22 @@ class _FakeMem:
         pass
 
 
+def _twin_where(trigger):
+    # Chroma requires multi-key filters wrapped in $and — the old flat
+    # two-key dict raised ValueError and silently orphaned every twin.
+    return {"$and": [{"type": "skill"}, {"trigger": trigger}]}
+
+
 class TestDeleteTwinHelper:
     def test_keys_by_trigger(self):
         m = _FakeMem()
         _delete_lesson_twin(m, {"trigger": "parse CSV with quoted commas", "solution": "s"})
-        assert m.collection.deletes == [{"type": "skill", "trigger": "parse CSV with quoted commas"}]
+        assert m.collection.deletes == [_twin_where("parse CSV with quoted commas")]
 
     def test_falls_back_to_task_then_source(self):
         m = _FakeMem()
         _delete_lesson_twin(m, {"task": "fix encoding"})
-        assert m.collection.deletes[-1] == {"type": "skill", "trigger": "fix encoding"}
+        assert m.collection.deletes[-1] == _twin_where("fix encoding")
         m2 = _FakeMem()
         _delete_lesson_twin(m2, {"source_trajectory_id": "tj-9"})  # no trigger/task
         assert m2.collection.deletes[-1] == {"source_trajectory_id": "tj-9"}
@@ -50,7 +56,7 @@ class TestRemoveByTriggerDeletesTwin:
         sm.save_playbook([{"trigger": "lesson A", "task": "lesson A", "solution": "s", "timestamp": "2026-01-01"}])
         m = _FakeMem()
         assert sm.remove_by_trigger("lesson A", memory_system=m) is True
-        assert m.collection.deletes == [{"type": "skill", "trigger": "lesson A"}]
+        assert m.collection.deletes == [_twin_where("lesson A")]
 
     def test_remove_without_memory_still_works(self):
         sm = SkillMemory(Path(tempfile.mkdtemp()))
@@ -76,4 +82,4 @@ class TestPruneDeletesTwins:
         # Every pruned lesson's twin should have been deleted (one delete per prune).
         assert removed >= 1
         assert len(m.collection.deletes) == removed
-        assert all(d.get("type") == "skill" for d in m.collection.deletes)
+        assert all({"type": "skill"} in d.get("$and", []) for d in m.collection.deletes)

@@ -257,8 +257,21 @@ class SelfStateThread:
     @staticmethod
     def _cap(seq, limit: int) -> None:
         # Bounded list, most-recent-wins. Mutates in place so the
-        # caller's reference stays valid.
+        # caller's reference stays valid. Resolved/closed entries are
+        # evicted first — they count toward the cap but carry no live
+        # value, and a blind head-first eviction could drop the only
+        # still-open entry while retaining dead ones.
         overflow = len(seq) - limit
+        if overflow <= 0:
+            return
+        i = 0
+        while overflow > 0 and i < len(seq):
+            item = seq[i]
+            if getattr(item, "resolved_at", None) or getattr(item, "closed_at", None):
+                del seq[i]
+                overflow -= 1
+            else:
+                i += 1
         if overflow > 0:
             del seq[:overflow]
 
