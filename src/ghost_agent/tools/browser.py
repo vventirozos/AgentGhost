@@ -310,6 +310,33 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
                 pass
 
 
+async def _probe_pre_interaction(page):
+    """Detect a visible start / play / loading control on the page.
+
+    A "Click to Play" button or a loading screen means the app has NOT
+    started — a screenshot then shows the MENU, not the running app, and a
+    claim that "the game works / renders" is grading the wrong thing (the
+    exact false-positive seen live: the agent declared a Minecraft clone
+    "fully functional" from a capture that still had the start modal up).
+    Returns ``{pre_interaction: bool, controls: [text,…]}`` (or {} on any
+    failure — never raises into the op)."""
+    js = """() => {
+      const KW = /click to (play|start)|press (to )?start|start game|tap to (play|start)|enter game|^play$|^start$|^begin$|loading/i;
+      const vis = (el) => { try { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width>4 && r.height>4 && s.visibility!=='hidden' && s.display!=='none' && parseFloat(s.opacity||'1')>0.1; } catch(e){ return false; } };
+      const out = [];
+      const sel = 'button,a,[role=button],h1,h2,[id*=start i],[id*=play i],[class*=start i],[class*=play i],[class*=overlay i],[class*=modal i]';
+      for (const el of document.querySelectorAll(sel)) {
+        const t = (el.innerText||el.textContent||'').trim();
+        if (t && t.length<80 && KW.test(t) && vis(el)) { out.push(t.slice(0,40)); if(out.length>=3) break; }
+      }
+      return { pre_interaction: out.length>0, controls: out };
+    }"""
+    try:
+        return await page.evaluate(js)
+    except Exception:
+        return {}
+
+
 async def op_navigate(op):
     url = op.get("url")
     if not url:
@@ -322,7 +349,11 @@ async def op_navigate(op):
         final_url = page.url
         title = await page.title()
         _write_last_url(op["profile_dir"], final_url)
-        return {"status": status, "url": final_url, "title": title}
+        result = {"status": status, "url": final_url, "title": title}
+        probe = await _probe_pre_interaction(page)
+        if probe.get("pre_interaction"):
+            result["pre_interaction"] = probe
+        return result
 
     return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)
 
@@ -403,12 +434,36 @@ async def op_screenshot(op):
     url, used_fallback = _resolve_url_or_error(op, "screenshot")
     wait_until = op.get("wait_until", "load")
 
+    settle_ms = int(op.get("settle_ms") or 0)
+    click_center = bool(op.get("click_center"))
+
     async def run(page):
         await page.goto(url, wait_until=wait_until)
+        # Interaction-gated content (e.g. a pointer-lock WebGL game that only
+        # starts rendering after a click, or a scene that needs a beat to
+        # paint) is invisible to a bare goto→shoot. settle_ms waits for the
+        # first frames; click_center clicks the viewport centre to focus/lock
+        # a canvas before capturing what a USER would actually see.
+        if settle_ms > 0:
+            await page.wait_for_timeout(settle_ms)
+        if click_center:
+            try:
+                vp = page.viewport_size or {"width": 1280, "height": 720}
+                await page.mouse.click(vp["width"] // 2, vp["height"] // 2)
+                await page.wait_for_timeout(int(op.get("post_click_ms") or 800))
+            except Exception:
+                pass
         await page.screenshot(path=out_path, full_page=full_page)
         final_url = page.url
         _write_last_url(op["profile_dir"], final_url)
-        return {"path": out_path, "url": final_url, "used_last_url": used_fallback}
+        result = {"path": out_path, "url": final_url, "used_last_url": used_fallback}
+        # Reflect the state AT capture time: if a start/play control is still
+        # visible the screenshot shows the menu, not the running app (and
+        # click_center, if used, failed to dismiss it).
+        probe = await _probe_pre_interaction(page)
+        if probe.get("pre_interaction"):
+            result["pre_interaction"] = probe
+        return result
 
     return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)
 
@@ -835,6 +890,8 @@ def _build_op_payload(
     tor_proxy: Optional[str],
     actions: Optional[list] = None,
     stop_on_error: Optional[bool] = None,
+    click_center: Optional[bool] = None,
+    settle_ms: Optional[int] = None,
 ) -> dict:
     """Assemble the op dict the runner expects.
 
@@ -883,7 +940,94 @@ def _build_op_payload(
         payload["actions"] = actions
     if stop_on_error is not None:
         payload["stop_on_error"] = bool(stop_on_error)
+    if click_center is not None:
+        payload["click_center"] = bool(click_center)
+    if settle_ms is not None:
+        payload["settle_ms"] = int(settle_ms)
     return payload
+
+
+def _pre_interaction_line(parsed: dict) -> str:
+    """Render the PRE_INTERACTION warning for a navigate/screenshot result.
+
+    The verifier reads tool output as EVIDENCE, so surfacing "a start/play
+    control is visible" here is what lets a 'the app works' claim made over a
+    menu/loading screen be REFUTED instead of confabulated-and-confirmed."""
+    pre = parsed.get("pre_interaction") if isinstance(parsed, dict) else None
+    if not (pre and pre.get("pre_interaction")):
+        return ""
+    ctrls = ", ".join(repr(c) for c in (pre.get("controls") or [])[:3])
+    return (
+        f"\nPRE_INTERACTION: a start/play/loading control is visible "
+        f"({ctrls}). The app has NOT started — this is the MENU/LOADING "
+        f"screen, not the running app. Do NOT claim it works/renders from "
+        f"this capture. Interact FIRST (screenshot with click_center=true, or "
+        f"operation='click' the control, e.g. selector='#startBtn'), THEN "
+        f"re-capture and judge that."
+    )
+
+
+def analyze_screenshot_render(host_path, sample_max: int = 200):
+    """Objective "did anything actually render?" check on a screenshot PNG.
+
+    The live failure was the agent claiming a Minecraft world rendered when
+    the screenshot was empty blue sky (the world only loads after a pointer-
+    lock click). A screenshot + an LLM/vision self-assessment couldn't catch
+    it — the model described what it EXPECTED. This is the un-gameable
+    ground-truth signal: a near-UNIFORM frame (one colour dominating, very
+    few distinct colours) is the signature of a blank / loading / sky-only
+    capture, regardless of what the model claims.
+
+    Returns ``{dominant_pct, distinct_colors, verdict, note}`` or ``None``
+    when PIL or the file is unavailable (caller treats None as "no signal").
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        img = Image.open(host_path).convert("RGB")
+    except Exception:
+        return None
+    try:
+        img.thumbnail((sample_max, sample_max))
+        px = list(img.getdata())
+    except Exception:
+        return None
+    total = len(px)
+    if total == 0:
+        return None
+    from collections import Counter
+    # Quantise to 5-bit/channel buckets so anti-aliasing/gradient noise
+    # doesn't inflate the distinct-colour count (a sky gradient is still
+    # "basically one colour" for our purposes).
+    buckets = Counter((r >> 3, g >> 3, b >> 3) for r, g, b in px)
+    dominant = buckets.most_common(1)[0][1]
+    dominant_pct = dominant / total
+    distinct = len(buckets)
+    if dominant_pct >= 0.80 or distinct <= 6:
+        verdict = "uniform"
+        note = (
+            f"{dominant_pct:.0%} of the frame is a single colour "
+            f"({distinct} distinct colours) — this capture looks BLANK / "
+            f"sky-only / a loading screen, NOT a populated scene. Any claim "
+            f"that content (terrain, a chart, a UI) renders is UNSUPPORTED "
+            f"by this screenshot. Interact first (e.g. screenshot with "
+            f"click_center=true to focus/lock a canvas game, or raise "
+            f"settle_ms), re-capture, or honestly report it is still broken."
+        )
+    else:
+        verdict = "has_content"
+        note = (
+            f"{dominant_pct:.0%} dominant colour across {distinct} distinct "
+            f"colours — the frame contains visual content."
+        )
+    return {
+        "dominant_pct": round(dominant_pct, 3),
+        "distinct_colors": distinct,
+        "verdict": verdict,
+        "note": note,
+    }
 
 
 def _parse_runner_output(stdout: str) -> tuple[bool, object]:
@@ -1099,6 +1243,7 @@ async def tool_browser(
         # <root>/projects/<id>/x.png maps to /workspace/projects/<id>/x.png
         # (not /workspace/x.png — which is where it would NOT exist).
         container_out_path = _to_container_path(sandbox_dir, host_out)
+        screenshot_host_path = host_out  # host-side PNG, for the render check
 
     # Same translation for any screenshot sub-action inside interact.
     # Without this, the runner would try to write to paths that were
@@ -1151,6 +1296,8 @@ async def tool_browser(
         tor_proxy=tor_proxy,
         actions=sanitised_actions,
         stop_on_error=stop_on_error,
+        click_center=kwargs.get("click_center"),
+        settle_ms=kwargs.get("settle_ms"),
     )
 
     # For interact, the timeout budget grows with the number of actions —
@@ -1247,7 +1394,7 @@ async def tool_browser(
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
             f"HTTP_STATUS: {parsed.get('status')}\n"
-            f"TITLE: {parsed.get('title')}{js_diag}"
+            f"TITLE: {parsed.get('title')}{js_diag}{_pre_interaction_line(parsed)}"
         )
     if operation == "extract_text":
         body = parsed.get("text", "")
@@ -1267,10 +1414,26 @@ async def tool_browser(
         # Echo the host-relative path so the user can reference it via
         # /api/download/<name>.
         host_rel = str(Path(parsed.get("path", "")).relative_to("/workspace")) if parsed.get("path", "").startswith("/workspace/") else parsed.get("path", "")
+        # Objective render check: read the PNG the runner just wrote and
+        # report whether the frame actually contains visual content. This is
+        # the un-gameable counter to the model confabulating "it renders"
+        # over a blank/sky-only capture (verifier reads this as EVIDENCE).
+        render_line = ""
+        try:
+            probe = analyze_screenshot_render(screenshot_host_path)
+            if probe:
+                render_line = (
+                    f"\nRENDER_CHECK: {probe['verdict'].upper()} "
+                    f"(dominant_colour={probe['dominant_pct']:.0%}, "
+                    f"distinct_colours={probe['distinct_colors']}) — {probe['note']}"
+                )
+        except Exception:
+            pass
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
             f"SAVED: {host_rel}\n"
-            f"DOWNLOAD: /api/download/{host_rel}{js_diag}"
+            f"DOWNLOAD: /api/download/{host_rel}{js_diag}{render_line}"
+            f"{_pre_interaction_line(parsed)}"
         )
     if operation == "close":
         return f"{header}\nPROFILE_DIR: {parsed.get('profile_dir')}\nCLEARED: {parsed.get('closed')}"

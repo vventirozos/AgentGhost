@@ -440,6 +440,23 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
     }
 
 
+# Tasks whose description implies a RUNNABLE / VISUAL artifact — a page, a
+# game, a rendered scene, a chart. Marking one DONE without any verification
+# evidence is the "wrote index.html, declared victory, never looked" anti-
+# pattern from the live Minecraft run. Kept tight (rendering-specific) so it
+# doesn't gate ordinary tasks. Matched as whole-ish substrings, lowercased.
+_VISUAL_ARTIFACT_KEYWORDS = (
+    "render", "webgl", "three.js", "threejs", "canvas", "game", "playable",
+    "animation", "shader", "hud", "sprite", "frontend", "front-end",
+    "screenshot", "3d ", "graphics", "wireframe", " scene",
+)
+
+
+def _is_visual_artifact_task(description: str) -> bool:
+    d = (description or "").lower()
+    return any(kw in d for kw in _VISUAL_ARTIFACT_KEYWORDS)
+
+
 # ------------------------------------------------------------------ handler
 
 async def tool_manage_projects(
@@ -636,7 +653,17 @@ async def tool_manage_projects(
             )
             _link_project_in_graph(context, pid, title)
             _set_current(context, pid)
-            return _ok({"created": pid, "briefing": _briefing(store, pid)})
+            # Tell the model its working directory moved to the project dir —
+            # the SAME note switch/resume return. Without it (create used to
+            # omit it), the model wrote `index.html` expecting the sandbox
+            # ROOT, then burned ~4 turns discovering the file_system write had
+            # been project-scoped and "moving" it (observed live). The note
+            # steers it to bare relative filenames that land in the right
+            # place the first time.
+            return _ok({"created": pid,
+                        "workspace": f"projects/{pid}",
+                        "note": _workspace_note(pid),
+                        "briefing": _briefing(store, pid)})
 
         if act == "list":
             return _ok({
@@ -843,9 +870,21 @@ async def tool_manage_projects(
             plan = ProjectPlan(store, project_id)
             updated: List[Dict[str, Any]] = []
             missing: List[str] = []
+            gated: List[str] = []
             for tid in target_ids:
                 if tid not in plan.tree.nodes:
                     missing.append(tid)
+                    continue
+                # DONE-gate: a visual/runnable-artifact task cannot be marked
+                # DONE with NO verification evidence. The model must either
+                # pass a `result` (what it actually observed rendered) or go
+                # verify first — the browser screenshot now carries an
+                # objective RENDER_CHECK it can cite. 'Written' is not 'works'.
+                if (st_enum == TaskStatus.DONE
+                        and not (result or "").strip()
+                        and not (plan.tree.nodes[tid].result_summary or "").strip()
+                        and _is_visual_artifact_task(plan.tree.nodes[tid].description)):
+                    gated.append(tid)
                     continue
                 if st_enum is not None:
                     plan.update_status(tid, st_enum, result=result,
@@ -868,6 +907,19 @@ async def tool_manage_projects(
                                        "count": len(updated)}
             if missing:
                 payload["missing"] = missing
+            if gated:
+                payload["gated_unverified"] = gated
+                payload["agent_instruction"] = (
+                    f"REFUSED to mark {len(gated)} task(s) DONE: they describe a "
+                    f"VISUAL/RUNNABLE artifact but you gave NO verification "
+                    f"evidence. 'Written' is not 'works'. VERIFY first: open it "
+                    f"with the browser tool (operation='screenshot', and "
+                    f"click_center=true for an interactive canvas/game), then "
+                    f"READ the RENDER_CHECK line in the result — if it says "
+                    f"UNIFORM, the page is blank/sky-only and the task is NOT "
+                    f"done. Once you have actually seen it render, re-call "
+                    f"task_update with a `result` summarising what rendered."
+                )
             return _ok(payload)
 
         if act == "task_decompose":

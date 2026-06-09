@@ -594,9 +594,33 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 f"intended:\n--- REPLACED BLOCK (was) ---\n{matched_text[:600]}"
             )
 
-        # 3. Neither exact nor flexible nor fuzzy match. Return a snippet of the
-        # file at the closest-looking neighborhood so the model can see
-        # what the text actually is. Common cause: the model's
+        # 2.7 Anchor-block match. When the block's BOUNDARIES are stable but
+        # its middle drifted (the model remembers the signature + shape but
+        # mis-transcribes the body), fuzzy's whole-block ratio falls below
+        # threshold and misses. Anchoring on the unique first+last lines (or
+        # a brace-balanced block from a unique signature) rescues exactly the
+        # live `addFace` case that otherwise thrashed for minutes and forced
+        # a full-file rewrite. Safe: both anchors must be unique and the span
+        # is capped relative to the target size.
+        anchor = _anchor_block_match(file_content, str(old_text))
+        if anchor is not None:
+            matched_text, info = anchor
+            replacement = str(new_text)
+            if matched_text.endswith("\n") and not replacement.endswith("\n"):
+                replacement += "\n"
+            new_file_content = file_content.replace(matched_text, replacement, 1)
+            await asyncio.to_thread(path.write_text, new_file_content)
+            return (
+                f"SUCCESS: Anchor match — replaced the block spanning lines "
+                f"{info['start_line']}–{info['end_line']} in '{filename}' "
+                f"(matched on its unique {'first+last lines' if info['strategy']=='first_last' else 'signature + balanced braces'}; "
+                f"the middle differed from your old_text). VERIFY the change:\n"
+                f"--- REPLACED BLOCK (was) ---\n{matched_text[:600]}"
+            )
+
+        # 3. Neither exact nor flexible nor fuzzy nor anchor match. Return a
+        # snippet of the file at the closest-looking neighborhood so the
+        # model can see what the text actually is. Common cause: the model's
         # remembered `old_text` has slightly different whitespace,
         # indentation, or a missing/extra line relative to what is on
         # disk — the flexible-whitespace matcher handles most cases
@@ -760,6 +784,85 @@ def _fuzzy_block_match(file_content: str, target: str,
         return None  # two windows nearly equally good — refuse to guess
     matched_text = "".join(file_lines[best_idx:best_idx + n])
     return matched_text, best_ratio
+
+
+def _anchor_block_match(file_content: str, target: str,
+                        min_anchor_len: int = 10, max_span_factor: int = 3):
+    """Locate a block whose BOUNDARIES are stable even though its middle
+    drifted from ``target`` — the exact failure mode that made the live
+    ``addFace`` edit thrash for ~4 minutes and then force a full-file
+    rewrite. The model remembers the method signature and the overall shape
+    but mis-transcribes the body, so exact/flex/fuzzy all miss.
+
+    Two safe-by-construction strategies, tried in order:
+
+      1. **first+last anchor** — the first AND last non-blank lines of
+         ``target`` each occur EXACTLY ONCE in the file; replace the exact
+         file bytes spanning them.
+      2. **brace-balanced anchor** — ``target`` opens a ``{ … }`` block and
+         its first non-blank line is unique; replace from that line through
+         the matching closing brace (balanced count).
+
+    Both require a UNIQUE anchor and bound the matched span to
+    ``max_span_factor`` × the target's line count, so a bad anchor can never
+    silently swallow a huge region. Returns ``(matched_text, info)`` or
+    ``None``.
+    """
+    if not target or not file_content:
+        return None
+    tgt_nonblank = [ln for ln in target.splitlines() if ln.strip()]
+    if len(tgt_nonblank) < 2:
+        return None
+    target_n = target.count("\n") + 1
+    span_cap = max(target_n * max_span_factor, target_n + 8)
+    file_lines = file_content.splitlines(keepends=True)
+    stripped = [ln.strip() for ln in file_lines]
+
+    # Strategy 1: unique first + last non-blank line.
+    first, last = tgt_nonblank[0].strip(), tgt_nonblank[-1].strip()
+    if len(first) >= min_anchor_len and len(last) >= min_anchor_len:
+        starts = [i for i, s in enumerate(stripped) if s == first]
+        ends = [i for i, s in enumerate(stripped) if s == last]
+        if len(starts) == 1 and len(ends) == 1 and ends[0] >= starts[0]:
+            span = ends[0] - starts[0] + 1
+            if span <= span_cap:
+                matched = "".join(file_lines[starts[0]:ends[0] + 1])
+                return matched, {"strategy": "first_last",
+                                 "start_line": starts[0] + 1,
+                                 "end_line": ends[0] + 1}
+
+    # Strategy 2: brace-balanced block from a unique block-opener line.
+    # Anchor on the FIRST line of `target` that ends with "{" (a block
+    # opener like a function/method signature) AND occurs exactly once in
+    # the file — not merely target's first non-blank line, which may be a
+    # comment or leading context the model included. Brace-balancing is
+    # self-validating, so a shorter unique opener is safe.
+    if "{" in target:
+        opener = None
+        for ln in tgt_nonblank:
+            s = ln.strip()
+            if s.endswith("{") and len(s) >= 8 and stripped.count(s) == 1:
+                opener = s
+                break
+        if opener is not None:
+            start = stripped.index(opener)
+            depth, started, end = 0, False, None
+            for i in range(start, len(file_lines)):
+                for ch in file_lines[i]:
+                    if ch == "{":
+                        depth += 1
+                        started = True
+                    elif ch == "}":
+                        depth -= 1
+                if started and depth <= 0:
+                    end = i
+                    break
+            if end is not None and end >= start and (end - start + 1) <= span_cap:
+                matched = "".join(file_lines[start:end + 1])
+                return matched, {"strategy": "brace",
+                                 "start_line": start + 1,
+                                 "end_line": end + 1}
+    return None
 
 
 _DATA_FILE_EXTS = frozenset({
@@ -1320,7 +1423,20 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         return await tool_read_document_chunked(target_path, sandbox_dir, page=page, chunk_size=chunk_size, max_context=max_context)
     elif operation == "inspect": return await tool_inspect_file(target_path, sandbox_dir)
     elif operation == "write": return await tool_write_file(target_path, final_content, sandbox_dir)
-    elif operation == "replace": return await tool_replace_text(target_path, final_content, replace_with if replace_with is not None else kwargs.get("replace_with"), sandbox_dir)
+    elif operation == "replace":
+        # Accept the param-name variants the model routinely reaches for
+        # (the live run's FIRST replace failed purely because it passed
+        # `old_text=`/`replace_with=`, and `old_text` was not an alias for
+        # `content`). Old text: content/data/text → old_text/old_string/
+        # search/old. New text: replace_with → new_text/new_string/new/
+        # replacement.
+        _old = (final_content or kwargs.get("old_text") or kwargs.get("old_string")
+                or kwargs.get("search") or kwargs.get("old"))
+        _new = (replace_with if replace_with is not None else kwargs.get("replace_with"))
+        if _new is None:
+            _new = (kwargs.get("new_text") or kwargs.get("new_string")
+                    or kwargs.get("new") or kwargs.get("replacement"))
+        return await tool_replace_text(target_path, _old, _new, sandbox_dir)
     
     if operation == "copy":
         copy_target = destination or final_content

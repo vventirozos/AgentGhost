@@ -140,6 +140,8 @@ Judge the agent's RESPONSE against the pixels:
 
 A stuck loading/"Starting…" screen is NOT a fixed UI. Be conservative: only REFUTE when the image clearly contradicts the response.
 
+START/MENU SCREEN = NOT RUNNING. If the image still shows a start menu, a "Click to Play"/"Start"/"Press to start" button, an instructions modal, or a loading screen, then the app has NOT started — it is showing its MENU, not its running state. A claim that the app/game "works", "renders correctly", is "fully functional", or "is playable" is REFUTED in that case: the agent graded the menu, not the app. The app must be shown actually running (the menu dismissed, the scene/gameplay visible) before any such claim can be CONFIRMED.
+
 Respond ONLY with a JSON object:
 {{
   "verdict": "CONFIRMED" | "REFUTED" | "UNCERTAIN",
