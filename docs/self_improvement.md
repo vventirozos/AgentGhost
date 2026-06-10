@@ -36,6 +36,7 @@ the agent's first action — all without any weight update.
 | `ghost_agent.optim` | DSPy/GEPA prompt optimisation (scope-gated) | Tunes planning / tool-selection / reflection prompts |
 | `ghost_agent.skills_auto` | Passive skill extraction from validator-passing trajectories | Biological phase 2.6 (logs candidates) |
 | `ghost_agent.reflection` | Self-critique biological phase on FAILED trajectories | Biological phase 2.5 → composite sink (JSONL + SkillMemory) |
+| `ghost_agent.reflection.postmortem` | Whole-transcript post-mortem → classified, durable defect reports (behavioural / configuration / code_defect) | Biological phase 2.5c (`--postmortem`) → SkillMemory (behavioural) + `DefectQueue` (`$GHOST_HOME/postmortem/`) → `postmortem` tool |
 | `ghost_agent.prm` | Per-step value model — scores `(state, action)` for MCTS lookahead | Biological phase 2.7 (retrain) → `core.mcts.MCTSReasoner` (fast scoring) |
 | `ghost_agent.selfhood` | First-person autobiographical diary + self-state + recognition / wake-up + narrative consolidation | Biological phase 2.8 (narrative regen) → wake-up prefix on every `handle_chat` |
 
@@ -923,6 +924,84 @@ contract:
   `na_fraction = 0.0`.
 
 Full suite: **3670 passed, 11 skipped, 0 failed.** No regressions.
+
+## Whole-transcript post-mortem → self-defect reports (2026-06-10)
+
+The reflection phase (2.5) raises the learning loop to "adjust how I
+*act* next time" — but it only ever sees one failed turn's final
+outcome + `failure_reason`, and its only durable output is a behavioural
+lesson injected into prompts. That ceiling is visible in this project's
+own history: the most valuable learning cycles (e.g. the June-7 triage
+that produced the browser-`pageerror` capture, the fuzzy block-replace
+guard, and the verifier outcome-penalty) were **tool- and control-loop
+fixes** that no prompt-lesson could have produced — and they ran through
+the operator by hand.
+
+**Phase 2.5c (`--postmortem`)** automates that triage. It reads the
+*whole tool-call transcript* of the worst recent FAILED runs and files a
+durable, classified **defect report** into a `DefectQueue` at
+`$GHOST_HOME/postmortem/defects.jsonl`:
+
+* **behavioural** — the agent chose badly; every tool worked. Routed
+  straight into `SkillMemory.learn_lesson` (same channel reflection
+  uses) so it's retrieved on the next similar request, *and* logged to
+  the queue with `status="routed"`.
+* **configuration** — a flag/threshold let the failure mode through
+  (e.g. a decay rate that let an oscillation evade the loop cap). Queued
+  as a proposed config change.
+* **code_defect** — a tool or the control loop is broken or blind.
+  Queued, and under `--postmortem-propose-patch` an LLM-generated
+  *reproducing test + unified diff* is attached. **Stored as a proposal
+  only — never auto-applied.** The queue is the artifact the operator
+  reviews, exactly the input that was previously assembled by hand.
+
+### The trust anchor: a pure structural signature
+
+Run selection and the evidence block are **LLM-free** (`compute_signature`,
+`select_failed_runs`). Each transcript gets a deterministic fingerprint —
+repeated-identical-error count, two-tool oscillation length, same-target
+read/act-loop count, dominant tool share — blended into a `severity`
+score. This does two things:
+
+1. **No wasted calls.** A run below `--postmortem-min-severity` (default
+   0.4) never costs a model call. Selection picks the top-N by severity.
+2. **Grounded evidence.** The operator (and the classifier prompt) sees
+   concrete facts — "the same not-found error from `read_file` recurred
+   11×" — not an LLM's guess. The June-7 read-loop scores 0.66 and
+   classifies as `code_defect` straight from its signature.
+
+Dedup is by a **bucketed** signature hash: two runs that fail the same
+way (11× vs 13× of the same error) collapse to one defect, so the queue
+never re-files a known pathology on every idle window.
+
+### Wiring & safety
+
+```python
+from ghost_agent.reflection import PostMortemEngine, DefectQueue
+
+engine = PostMortemEngine(
+    analyze_fn,                 # classifier LLM (wraps LLMClient.chat_completion)
+    queue=DefectQueue(root),
+    lesson_sink=skill_memory.learn_lesson,   # behavioural → existing channel
+    patch_fn=coding_llm,        # optional; code_defect → test+diff PROPOSAL
+    min_severity=0.4,
+)
+report = await engine.run(source=collector.iter_trajectories)
+```
+
+Same safety posture as the Reflector: never raises into the watchdog,
+never mutates input trajectories, per-call timeouts, anchor-before-await
+cooldown discipline (3 h default, `--postmortem-cooldown`). Read the
+queue with the read-only **`postmortem`** tool (`pending` / `list` /
+`show <id>` / `stats`). Tests: `tests/test_postmortem_engine.py` (34
+cases — signature, selection, queue dedup/status, parsers, and the async
+engine's routing / classification / patch-attachment / failure-safety).
+
+This phase is the dual of the in-run repair loop noted under
+interactive-session failures: the retry loop fixes a run *while it's
+happening*; the post-mortem engine diagnoses the machinery *between
+runs*. Neither auto-applies code — the post-mortem queue is a reviewed
+gate by design.
 
 ## Stage 2 hook (future work)
 

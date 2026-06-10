@@ -95,6 +95,10 @@ def parse_args():
     # implicitly disables reflection (it has nothing to read).
     parser.add_argument("--no-trajectories", action="store_true", help="Disable the distill/trajectory JSONL log. Also disables idle-time self-critique on failed turns, since it depends on the log.")
     parser.add_argument("--no-reflection", action="store_true", help="Disable idle-time self-critique on failed turns even if trajectory logging is on.")
+    parser.add_argument("--postmortem", action="store_true", default=False, help="Biological-watchdog phase 2.5c: run whole-transcript post-mortems on the worst recent FAILED runs and file durable, classified DEFECT REPORTS (behavioural / configuration / code_defect) to $GHOST_HOME/postmortem/defects.jsonl. Behavioural findings also route into SkillMemory (same channel as reflection). Code-defect findings get an LLM-proposed reproducing test + unified diff attached — stored for review, NEVER auto-applied. Read the queue with the `postmortem` tool. Opt-in, off by default. Requires the trajectory log (no effect under --no-trajectories).")
+    parser.add_argument("--postmortem-cooldown", type=int, default=10800, help="Seconds between idle-time post-mortem passes (phase 2.5c). Default 3 hours. Only active under --postmortem.")
+    parser.add_argument("--postmortem-min-severity", type=float, default=0.4, help="Minimum structural-severity (0..1) a failed run must score before it earns a post-mortem LLM call. Lower = more runs analysed. Default 0.4.")
+    parser.add_argument("--postmortem-propose-patch", action="store_true", default=False, help="For code_defect post-mortems, also ask the coding model for a reproducing test + unified diff and attach them to the defect report (stored as a PROPOSAL, never applied). Requires --postmortem. Adds one coding-model call per code-defect finding.")
     parser.add_argument("--router-model", default=None, help="Path to a persisted ComplexityClassifier JSON. When set, the router is loaded and consulted; when unset (default), the dispatcher is a no-op that always allows the full swarm pool list.")
     parser.add_argument("--router-confidence-threshold", type=float, default=0.3, help="Minimum router confidence required to route a request to a cheap path. Below this, the dispatcher escalates to the full swarm.")
     # Process Reward Model. When --prm-model points at a valid
@@ -788,6 +792,101 @@ async def lifespan(app):
             context.reflector = None
     else:
         context.reflector = None
+
+    # Post-mortem engine: biological phase 2.5c (opt-in --postmortem).
+    # Where the Reflector turns ONE failed turn into a behavioural
+    # lesson, the post-mortem engine reads the WHOLE transcript of the
+    # worst recent failures and files a classified, durable DEFECT
+    # REPORT — behavioural / configuration / code_defect. It's the
+    # autonomous version of the manual "evaluate the last N bad runs"
+    # pass: it raises the learning loop from "adjust my prompt" to
+    # "diagnose my own tooling". Needs the trajectory collector (corpus
+    # of failures) and the LLM client. Never auto-applies anything.
+    context.postmortem_engine = None
+    if (
+        getattr(args, "postmortem", False)
+        and not getattr(args, "no_trajectories", False)
+        and context.trajectory_collector is not None
+        and context.llm_client is not None
+    ):
+        try:
+            from .reflection import PostMortemEngine, DefectQueue
+
+            async def _analyze_fn(prompt: str) -> str:
+                """Wrap LLMClient.chat_completion as the post-mortem
+                classifier. Same generous max_tokens rationale as the
+                reflector's critique_fn — the reasoning model needs head-
+                room for its hidden thinking phase before the verdict."""
+                payload = {
+                    "model": args.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.2,
+                    "max_tokens": 4096,
+                    "stream": False,
+                }
+                res = await context.llm_client.chat_completion(payload)
+                return (
+                    (res or {}).get("choices", [{}])[0]
+                    .get("message", {}).get("content", "") or ""
+                )
+
+            _patch_fn = None
+            if getattr(args, "postmortem_propose_patch", False):
+                async def _patch_fn(prompt: str) -> str:  # noqa: F811
+                    """Coding-model call for a code_defect: returns a
+                    reproducing test + unified diff. Routed through the
+                    coding pool when one is configured (chat_completion
+                    honours the model field); the result is stored as a
+                    proposal only — it is never applied."""
+                    payload = {
+                        "model": args.model,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "temperature": 0.1,
+                        "max_tokens": 4096,
+                        "stream": False,
+                    }
+                    res = await context.llm_client.chat_completion(payload)
+                    return (
+                        (res or {}).get("choices", [{}])[0]
+                        .get("message", {}).get("content", "") or ""
+                    )
+
+            _pm_queue_root = context.memory_dir.parent / "postmortem"
+            context.defect_queue = DefectQueue(_pm_queue_root, enabled=True)
+
+            # Reuse the existing failure→lesson channel for behavioural
+            # findings: SkillMemory.learn_lesson, the same write the
+            # reflection sink performs, so post-mortem lessons get
+            # retrieved on the next similar request via the memory bus.
+            _pm_skill_memory = getattr(context, "skill_memory", None)
+            _pm_vector_memory = getattr(context, "memory_system", None)
+
+            def _lesson_sink(**kwargs):
+                if _pm_skill_memory is None:
+                    return
+                kwargs.setdefault("memory_system", _pm_vector_memory)
+                _pm_skill_memory.learn_lesson(**kwargs)
+
+            context.postmortem_engine = PostMortemEngine(
+                _analyze_fn,
+                queue=context.defect_queue,
+                lesson_sink=_lesson_sink,
+                patch_fn=_patch_fn,
+                per_call_timeout_s=120.0,
+                patch_timeout_s=180.0,
+                max_runs=2,
+                min_severity=float(getattr(args, "postmortem_min_severity", 0.4)),
+                model=args.model,
+            )
+            pretty_log(
+                "Post-Mortem Engine",
+                f"phase 2.5c enabled: worst failed runs → defect reports in {_pm_queue_root}"
+                + (" (+patch proposals)" if _patch_fn is not None else ""),
+                icon=Icons.BRAIN_THINK,
+            )
+        except Exception as e:
+            pretty_log("Post-Mortem Engine Failed", str(e), level="WARNING", icon=Icons.WARN)
+            context.postmortem_engine = None
 
     # Complexity router: consulted by core/llm.py before swarm
     # dispatch. When --router-model points at a valid classifier JSON,

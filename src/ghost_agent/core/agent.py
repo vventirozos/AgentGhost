@@ -1377,6 +1377,7 @@ class GhostAgent:
     # cycles or two self-play sessions back-to-back when the user remains AFK.
     _DREAM_COOLDOWN = 1800        # 30 min between dreams
     _REFLECTION_COOLDOWN = 2400   # 40 min between reflections
+    _POSTMORTEM_COOLDOWN = 10800  # 3 h between whole-transcript post-mortems (phase 2.5c)
     _SKILLS_AUTO_COOLDOWN = 7200  # 2 hours between skill auto-extractions
     _PRM_TRAIN_COOLDOWN = 10800   # 3 hours between PRM retrain passes
     _NARRATIVE_COOLDOWN = 3600    # 60 min between selfhood-narrative consolidations
@@ -1411,6 +1412,8 @@ class GhostAgent:
             self._last_dream_at = datetime.datetime.min
         if not hasattr(self, '_last_reflection_at'):
             self._last_reflection_at = datetime.datetime.min
+        if not hasattr(self, '_last_postmortem_at'):
+            self._last_postmortem_at = datetime.datetime.min
         if not hasattr(self, '_last_skills_auto_at'):
             self._last_skills_auto_at = datetime.datetime.min
         if not hasattr(self, '_last_prm_train_at'):
@@ -1588,6 +1591,55 @@ class GhostAgent:
                         logger.warning(f"Reflection phase failed: {e}")
                     finally:
                         self._last_reflection_at = datetime.datetime.now()
+
+        # Phase 2.5c: Whole-transcript post-mortem (opt-in --postmortem).
+        # Where phase 2.5 turns one failed turn into a behavioural
+        # lesson, this reads the FULL tool-call sequence of the worst
+        # recent failures and files a classified, durable defect report
+        # (behavioural / configuration / code_defect) — the autonomous
+        # form of the manual "evaluate the last N bad runs" pass. Runs at
+        # a longer cadence than reflection (it's heavier — whole
+        # transcripts, optional patch-proposal calls) and only when the
+        # engine was wired in main.py (gated behind --postmortem). Same
+        # anchor-before-await discipline as every other phase so a crash
+        # can't pin it re-firing. Never resets last_activity_time; never
+        # applies anything — output is a review queue.
+        if 900 < idle_secs <= 3600:
+            engine = getattr(ctx, 'postmortem_engine', None)
+            traj_collector = getattr(ctx, 'trajectory_collector', None)
+            if engine is not None and traj_collector is not None:
+                # Read the configurable cooldown only once we know the
+                # engine is wired — keeps this phase a true no-op (no
+                # arg access) on deployments without --postmortem, and
+                # the float() coercion tolerates a mocked args object.
+                try:
+                    pm_cooldown = float(getattr(
+                        getattr(ctx, 'args', None),
+                        'postmortem_cooldown', self._POSTMORTEM_COOLDOWN,
+                    ))
+                except (TypeError, ValueError):
+                    pm_cooldown = float(self._POSTMORTEM_COOLDOWN)
+                since_last_pm = (datetime.datetime.now() - self._last_postmortem_at).total_seconds()
+                if since_last_pm >= pm_cooldown:
+                    pretty_log(
+                        "Biological Hook",
+                        "Agent is idle. Running post-mortem on worst recent failures...",
+                        icon=Icons.BRAIN_THINK,
+                    )
+                    self._last_postmortem_at = datetime.datetime.now()
+                    try:
+                        pm_report = await engine.run(
+                            source=lambda: traj_collector.iter_trajectories(),
+                        )
+                        pretty_log(
+                            "Biological Hook",
+                            pm_report.summary(),
+                            icon=Icons.BRAIN_THINK,
+                        )
+                    except Exception as e:
+                        logger.warning(f"Post-mortem phase failed: {e}")
+                    finally:
+                        self._last_postmortem_at = datetime.datetime.now()
 
         # Phase 2.6: Skill auto-extraction (every ~2 hours during idle).
         # Pure data-level pass — no LLM call, no network, CPU-only —

@@ -26,6 +26,15 @@ shape where a reflected path succeeds while the original failed.
 
 from .prompts import REFLECTION_PROMPT_TEMPLATE, build_reflection_prompt
 from .loop import Reflector, ReflectionOutcome, ReflectionRunReport
+from .postmortem import (
+    PostMortemEngine,
+    PostMortemRunReport,
+    DefectReport,
+    DefectQueue,
+    TranscriptSignature,
+    compute_signature,
+    select_failed_runs,
+)
 
 __all__ = [
     "REFLECTION_PROMPT_TEMPLATE",
@@ -33,4 +42,11 @@ __all__ = [
     "Reflector",
     "ReflectionOutcome",
     "ReflectionRunReport",
+    "PostMortemEngine",
+    "PostMortemRunReport",
+    "DefectReport",
+    "DefectQueue",
+    "TranscriptSignature",
+    "compute_signature",
+    "select_failed_runs",
 ]
