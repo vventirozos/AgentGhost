@@ -77,17 +77,28 @@ _VALID_CATEGORIES = frozenset(
 )
 
 
-def _primary_target(tc: ToolCall) -> str:
-    """The value of the first recognised primary-arg key on a tool call,
-    or "" when none is present. Lower-cased + stripped so trivially
-    different spellings of the same target collapse together."""
-    args = getattr(tc, "arguments", None) or {}
+def primary_target_from_args(args) -> str:
+    """The value of the first recognised primary-arg key in ``args``, or
+    "" when none is present (or ``args`` isn't a dict). Lower-cased +
+    stripped so trivially different spellings of the same target collapse
+    together.
+
+    Shared by the offline post-mortem signature (``_primary_target``) and
+    the in-run no-progress loop-breaker in ``core/agent.py`` so both agree
+    on what "the same target" means — a single definition of the thing a
+    tool call operated on."""
     if not isinstance(args, dict):
         return ""
     for k in _PRIMARY_ARG_KEYS:
         if k in args and args[k] is not None:
             return str(args[k]).strip().lower()[:200]
     return ""
+
+
+def _primary_target(tc: ToolCall) -> str:
+    """Primary target of a ToolCall (offline path) — delegates to
+    ``primary_target_from_args`` on the call's arguments dict."""
+    return primary_target_from_args(getattr(tc, "arguments", None) or {})
 
 
 def _error_key(tc: ToolCall) -> str:

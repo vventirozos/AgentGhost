@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import hashlib
 import json
 import logging
 import random
@@ -19,6 +20,11 @@ from pathlib import Path
 
 from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
 from .planning import TaskTree, TaskStatus
+# Shared "what did this call operate on" helper — same definition the
+# offline post-mortem signature uses, so the in-run no-progress
+# loop-breaker and the post-mortem read-loop detector agree on what
+# "the same target" means.
+from ..reflection.postmortem import primary_target_from_args
 from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print
 from ..utils import logging as _glog
 
@@ -355,6 +361,41 @@ def _note_repeated_failure(sigs: dict, fname, error, threshold: int = 3):
     sig = f"{fname or '?'}|" + re.sub(
         r"\s+", " ", str(error or "")[:160].lower()
     ).strip()
+    count = sigs.get(sig, 0) + 1
+    sigs[sig] = count
+    return sig, count, count >= threshold
+
+
+def _action_result_fingerprint(result: str) -> str:
+    """Whitespace-normalised, bounded fingerprint of a tool result.
+
+    Used by ``_note_repeated_action`` to decide whether two SUCCESSFUL
+    calls produced "the same observation". Whitespace-only normalisation
+    (digits intentionally kept) so a result whose content genuinely
+    changed — a re-read that now returns edited bytes, a counter that
+    advanced — looks different and does NOT count as a no-progress
+    repeat. Bounded slice keeps it cheap and stable."""
+    norm = re.sub(r"\s+", " ", str(result or "")).strip().lower()[:600]
+    return hashlib.sha1(norm.encode("utf-8", "ignore")).hexdigest()[:12]
+
+
+def _note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 3):
+    """Companion to ``_note_repeated_failure`` for the INVERSE pathology:
+    a turn loop where every tool call SUCCEEDS but the agent keeps taking
+    the same action against the same target and getting the same result —
+    the ungrounded-verification loop (double-click the icon → screenshot →
+    "no change" → repeat). ``_note_repeated_failure`` can't see this
+    because nothing errors and the strike counter never moves; the
+    reasoning-similarity breaker misses it because the prose phrasing
+    varies turn to turn.
+
+    Keyed by ``tool | target | result-fingerprint`` — so it fires only on
+    a genuine no-progress repeat (same action, same target, same
+    observation), not on an action whose target or result is changing.
+    Pure aside from mutating the caller-owned ``sigs`` dict. Returns
+    ``(signature, count, tripped)`` where ``tripped`` is count >=
+    threshold."""
+    sig = f"{fname or '?'}|{target or ''}|{result_fp or ''}"
     count = sigs.get(sig, 0) + 1
     sigs[sig] = count
     return sig, count, count >= threshold
@@ -2762,6 +2803,115 @@ class GhostAgent:
 
         return content, created_time, req_id
 
+    # Max bounded VERIFIER-GATE AUTO-REPAIR rounds per request. When the
+    # verifier REFUTES the final answer (or it finalised on an unverified
+    # mutation), the agent gets up to this many extra in-loop attempts to
+    # diagnose and fix the issue before the answer ships. Kept at 1: a
+    # single grounded re-attempt fixes the common case (a wrong/untested
+    # claim) without doubling latency on every hard task. Bounded
+    # independently of the turn budget so a repair can't extend a runaway.
+    _MAX_VERIFIER_REPAIRS = 1
+
+    async def _compute_verifier_verdict(
+        self, *, tools_run_this_turn, messages, final_ai_content,
+        last_user_content, lc,
+    ):
+        """Pure verifier verdict computation — NO side effects.
+
+        Extracted from the post-loop verifier gate so the same verdict can
+        drive (a) the in-loop AUTO-REPAIR decision at finalisation and
+        (b) the post-loop gate's auditor-note / backfill / lesson-retraction
+        consumption, computed exactly once per final answer (the gate
+        reuses the cached in-loop result). Returns
+        ``(v_result_or_None, last_tool_or_None)``. Side effects (note,
+        retraction, backfill, trajectory) stay at the post-loop call site so
+        they run once, on the truly-final (possibly repaired) answer.
+        """
+        from .verifier import VerifyVerdict
+        verifier = getattr(self.context, "verifier", None)
+        last_tool = _find_substantive_tool_for_verifier(tools_run_this_turn)
+        # Flat early-return (not an `if (verifier is not None and ...)`
+        # block) so the post-loop gate stays the single match for the
+        # gate-strictness source check — and so a missing verifier /
+        # tool / trivial chat skips the LLM call cleanly.
+        if (verifier is None
+                or getattr(verifier, "llm_client", None) is None
+                or last_tool is None
+                or not final_ai_content
+                or self._is_strict_trivial_chat(lc)):
+            return None, last_tool
+        v_result = None
+        tool_output = str(last_tool.get("content", ""))[:4000]
+        tool_name = str(last_tool.get("name", ""))[:80]
+        if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
+            code_text = _reconstruct_executed_code(messages, last_tool)
+            if code_text:
+                v_result = await verifier.verify_code_output(
+                    code=code_text,
+                    output=tool_output,
+                    intent=last_user_content or "",
+                    response=final_ai_content or "",
+                )
+            else:
+                v_result = await verifier.verify_claim(
+                    claim=final_ai_content[:2000],
+                    evidence=tool_output,
+                    context=(last_user_content or "")[:1000],
+                )
+        else:
+            v_result = await verifier.verify_claim(
+                claim=final_ai_content[:2000],
+                evidence=tool_output,
+                context=(last_user_content or "")[:1000],
+            )
+        # Visual ground-truth override (unchanged from the inline gate).
+        try:
+            if _is_visual_intent(last_user_content):
+                from ..tools.file_system import project_scoped_sandbox
+                _sbx = project_scoped_sandbox(self.context)[0]
+                _before_img, _after_img = _select_visual_evidence(
+                    messages, last_user_content or "", _sbx,
+                )
+                if _after_img:
+                    _vv = await verifier.verify_visual(
+                        symptom=last_user_content or "",
+                        claim=final_ai_content or "",
+                        after_image=_after_img,
+                        before_image=_before_img,
+                    )
+                    if _vv is not None:
+                        if _vv.confidence >= 0.7 and _vv.verdict == VerifyVerdict.REFUTED:
+                            v_result = _vv
+                        elif _vv.confidence >= 0.7 and v_result is None:
+                            v_result = _vv
+                        pretty_log(
+                            "Verifier",
+                            f"VISUAL {_vv.verdict.value} "
+                            f"({_vv.confidence:.0%}): "
+                            f"{(_vv.reasoning or '')[:120]}",
+                            icon=Icons.BRAIN_THINK,
+                        )
+                    else:
+                        pretty_log(
+                            "Verifier",
+                            "VISUAL check skipped (vision returned no verdict)",
+                            icon=Icons.BRAIN_THINK,
+                        )
+                else:
+                    pretty_log(
+                        "Verifier",
+                        "VISUAL check skipped (no rendered after-image "
+                        f"this turn; before={'yes' if _before_img else 'no'})",
+                        icon=Icons.BRAIN_THINK,
+                    )
+        except Exception as _vv_exc:
+            pretty_log(
+                "Verifier",
+                f"VISUAL check error: {type(_vv_exc).__name__}: {_vv_exc}",
+                icon=Icons.WARN, level="WARNING",
+            )
+        return v_result, last_tool
+
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
@@ -3345,6 +3495,23 @@ class GhostAgent:
                 _request_sys3_prev_justification = ""
                 force_final_response = False
 
+                # --- VERIFIER-GATE AUTO-REPAIR state (bounded) ---
+                # When the verifier REFUTES the final answer (or the turn
+                # finalised on an unverified mutation), inject the critique
+                # and re-run the turn loop up to `_MAX_VERIFIER_REPAIRS`
+                # times so the agent can actually FIX the issue rather than
+                # ship a noted-but-wrong answer. Re-entry reuses the existing
+                # `for turn` loop (a `continue` at the normal-success
+                # finalisation) — no outer loop. `repair_round` bounds it
+                # independently of the turn budget. The verdict computed at
+                # finalisation is cached + reused by the post-loop gate
+                # (`_verdict_is_fresh`) so a clean success costs exactly one
+                # verifier pass, same as before.
+                repair_round = 0
+                _verifier_verdict_cache = None
+                _verdict_is_fresh = False
+                _final_len_at_turn_start = 0
+
                 # NB: the `[EPHEMERAL_TERMINAL_DIRECTIVE]` sweep that used
                 # to run here was retired alongside the directive itself —
                 # terminal tools now populate `final_ai_content` directly
@@ -3375,12 +3542,35 @@ class GhostAgent:
                 prev_turn_opening_words: set = set()
                 cross_turn_repeat_hits = 0
 
+                # No-progress (ungrounded-verification) loop tracking — the
+                # companion to `repeated_failure_sigs`. That catches the same
+                # FAILING action looping; this catches the same SUCCEEDING
+                # action looping with no new information (e.g. re-click the
+                # icon → screenshot → "no change" → repeat). The error-keyed
+                # strike counter never moves (nothing errors) and the
+                # reasoning-similarity breaker misses it (prose phrasing
+                # varies), so this is the only thing that sees an all-success
+                # thrash. Keyed by (tool, target, result-fingerprint) via
+                # `_note_repeated_action`; on the first trip we force a
+                # grounded final answer, escalating to force_stop if it
+                # somehow continues.
+                repeated_action_sigs: dict = {}
+                repeated_action_steered: set = set()
+
                 # Self-play can cap a single attempt's turn count via
                 # `max_turns_override` on the GhostAgent instance, so a
                 # runaway simulation can't silently chew through 40 turns.
                 effective_max_turns = getattr(self, "max_turns_override", None) or 40
                 for turn in range(effective_max_turns):
                     self.context.last_activity_time = datetime.datetime.now() # Heartbeat
+                    # Per-turn auto-repair bookkeeping: the verdict cache is
+                    # only "fresh" for the post-loop gate if THIS turn reached
+                    # the normal-success finalisation; reset each turn so an
+                    # error/abort exit can't reuse a stale verdict. Snapshot
+                    # the answer length so a repair `continue` can discard
+                    # exactly this turn's text contribution.
+                    _verdict_is_fresh = False
+                    _final_len_at_turn_start = len(final_ai_content or "")
 
                     # Differentiated strike budgets: structural failures
                     # (logic errors, assertion failures) get 6 strikes, while
@@ -5782,6 +5972,97 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 final_ai_content += "\n\n"
                             final_ai_content += ui_content
 
+                        # --- VERIFIER-GATE AUTO-REPAIR (in-loop re-entry) ---
+                        # We're at the normal-success finalisation (model
+                        # produced a final answer with no further tool calls).
+                        # Verify it HERE so a high-confidence REFUTED verdict
+                        # (or finalising on an unverified mutation) can trigger
+                        # a bounded repair: inject the critique and `continue`
+                        # the turn loop so the agent FIXES the issue instead of
+                        # shipping a noted-but-wrong answer. The verdict is
+                        # cached for the post-loop gate (no double LLM call on
+                        # the clean path). Gated to clean first-pass successes
+                        # (`execution_failure_count == 0`, `not force_stop`) so
+                        # error/abort answers — which exit via other breaks —
+                        # are never "repaired".
+                        if (repair_round < self._MAX_VERIFIER_REPAIRS
+                                and not force_stop
+                                and execution_failure_count == 0):
+                            # Defensive like the post-loop gate: a verifier
+                            # error (or a misconfigured/non-async verifier in
+                            # tests) must NEVER crash or block finalisation —
+                            # on any failure we simply skip the repair and ship.
+                            _do_repair = False
+                            _directive = ""
+                            _crit = ""
+                            _refuted = False
+                            try:
+                                from .verifier import VerifyVerdict as _VV
+                                _vr, _lt = await self._compute_verifier_verdict(
+                                    tools_run_this_turn=tools_run_this_turn,
+                                    messages=messages,
+                                    final_ai_content=final_ai_content,
+                                    last_user_content=last_user_content,
+                                    lc=lc,
+                                )
+                                _verifier_verdict_cache = (_vr, _lt)
+                                _verdict_is_fresh = True
+                                _refuted = (
+                                    _vr is not None
+                                    and _vr.verdict == _VV.REFUTED
+                                    and _vr.confidence >= 0.7
+                                )
+                                _unverified = (_vr is None and _is_unverified_mutation(_lt))
+                                if _refuted:
+                                    _crit = (
+                                        "; ".join(_vr.issues[:3]) if _vr.issues
+                                        else (_vr.reasoning
+                                              or "the answer was not supported by the evidence")
+                                    )
+                                    _directive = (
+                                        "SYSTEM ALERT — the verifier REFUTED your previous "
+                                        f"answer: {_crit}. Do NOT repeat the same claim. "
+                                        "Diagnose the underlying problem and FIX it using tools "
+                                        "(run / test / inspect the ACTUAL result), then give a "
+                                        "corrected final answer grounded in that evidence."
+                                    )
+                                    _do_repair = True
+                                elif _unverified:
+                                    _crit = "unverified mutation (untested write)"
+                                    _directive = (
+                                        "SYSTEM ALERT — you finalised on an UNVERIFIED change: "
+                                        "the last action was a file write/replace that was never "
+                                        "executed or rendered, so it is unconfirmed. Actually RUN "
+                                        "or preview it now (execute it, or screenshot the rendered "
+                                        "result) and confirm it works, THEN give your final answer."
+                                    )
+                                    _do_repair = True
+                            except Exception as _rep_exc:
+                                logger.debug(
+                                    "verifier auto-repair check skipped: %s: %s",
+                                    type(_rep_exc).__name__, _rep_exc,
+                                )
+                                _do_repair = False
+                            if _do_repair:
+                                messages.append(msg)
+                                messages.append({"role": "user", "content": _directive})
+                                repair_round += 1
+                                force_final_response = False
+                                # Discard exactly this turn's text contribution
+                                # so the repaired answer replaces (not appends to)
+                                # the refuted one.
+                                final_ai_content = (final_ai_content or "")[:_final_len_at_turn_start]
+                                _verdict_is_fresh = False
+                                _verifier_verdict_cache = None
+                                pretty_log(
+                                    "Verifier Gate",
+                                    f"{'REFUTED' if _refuted else 'UNVERIFIED'} → "
+                                    f"auto-repair round {repair_round}/"
+                                    f"{self._MAX_VERIFIER_REPAIRS}: {_crit[:100]}",
+                                    icon=Icons.BRAIN_THINK, level="WARNING",
+                                )
+                                continue
+
                         if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure:
                             micro_msgs = []
                             for m in [msg for msg in messages if msg.get("role") in ["user", "assistant"]][-4:]:
@@ -6197,7 +6478,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 _coro = self.available_tools[fname](**t_args)
                                 tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
                                 tool_durations.append(None)
-                                tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating))
+                                tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args)))
                                 # Record the idempotency hash only now that the
                                 # call has actually been dispatched (not at the
                                 # guard above) so an aborted gate doesn't block a
@@ -6258,14 +6539,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         last_error_res = ""
                         last_error_preview = "Unknown Error"
 
+                        # Tracks the worst no-progress signature seen this
+                        # turn (the same SUCCEEDING action+target+result
+                        # repeating), handled once after the results loop.
+                        _noprogress_trip = None
+
                         # We reached the parallel-execution path, which means
                         # at least one tool call parsed cleanly this turn.
                         # Drop the consecutive-parse-error streak so a single
                         # earlier failure can't latch the pivot prompt.
                         consecutive_parse_errors = 0
-
                         for i, result in enumerate(results):
-                            fname, tool_id, a_hash, is_mutating = tool_call_metadata[i]
+                            fname, tool_id, a_hash, is_mutating, ptarget = tool_call_metadata[i]
                             str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
 
                             # Metacog per-tool outcome (roadmap phase 2.3):
@@ -6388,6 +6673,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             messages.append(tool_msg)
                             tools_run_this_turn.append(tool_msg)
 
+                            # No-progress (ungrounded-verification) loop
+                            # detection — ONLY on SUCCESSFUL, NON-MUTATING
+                            # calls. Errors are already handled by the strike
+                            # path + `_note_repeated_failure`; mutations
+                            # (file writes) are exempt so legitimate iterative
+                            # editing of one file is never mistaken for a loop.
+                            # What's left — repeated reads of the same file,
+                            # repeated browser interaction with the same
+                            # selector, repeated screenshots returning the same
+                            # view — is exactly the "succeeds but learns
+                            # nothing" thrash from the Browser-OS run.
+                            _res_is_error = isinstance(result, Exception) or str_res.lstrip().startswith(
+                                ("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error")
+                            ) or "Traceback" in str_res
+                            if fname and not is_mutating and not _res_is_error:
+                                _asig, _acnt, _atrip = _note_repeated_action(
+                                    repeated_action_sigs, fname, ptarget,
+                                    _action_result_fingerprint(str_res),
+                                )
+                                if _atrip and (_noprogress_trip is None or _acnt > _noprogress_trip[1]):
+                                    _noprogress_trip = (_asig, _acnt, fname, ptarget)
+
                             # Escape-hatch tool: the solver has declared
                             # the current task structurally unwinnable.
                             # Stop the turn loop immediately and promote
@@ -6500,6 +6807,62 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                         # (Metacog per-tool outcomes are now recorded inside
                         # the enumerate(results) loop above, keyed per result.)
+
+                        # No-progress loop breaker. When the same SUCCEEDING
+                        # action on the same target returned the same result
+                        # >=3x this request, the agent is in an ungrounded
+                        # verification loop (it keeps re-observing instead of
+                        # trusting evidence it already has). FIRST trip: force
+                        # a grounded final answer (drop tools next turn via
+                        # force_final_response) + tell it to trust the
+                        # authoritative state and report how to verify if it
+                        # cannot. If it somehow keeps looping to >=5, hard-stop.
+                        # Independent of turn_has_failure — this path is for
+                        # all-success thrash, which the strike machinery below
+                        # never sees.
+                        if _noprogress_trip is not None and not force_stop and not force_final_response:
+                            _asig, _acnt, _afname, _atarget = _noprogress_trip
+                            _tgt_desc = f" on '{_atarget}'" if _atarget else ""
+                            if _acnt >= 5:
+                                pretty_log(
+                                    "Loop Breaker",
+                                    f"No-progress loop: '{_afname}'{_tgt_desc} repeated {_acnt}x "
+                                    "with no change — aborting turn loop.",
+                                    level="WARNING", icon=Icons.STOP,
+                                )
+                                if not final_ai_content:
+                                    final_ai_content = (
+                                        f"[ATTEMPT_ABORTED_NO_PROGRESS] I repeated the same "
+                                        f"'{_afname}' action{_tgt_desc} {_acnt} times and got the "
+                                        "same result each time, so I stopped to avoid an endless "
+                                        "verification loop. The change I made is in place; I could "
+                                        "not confirm it by re-observing in this environment. Please "
+                                        "verify it directly (e.g. open it in a real browser)."
+                                    )
+                                force_stop = True
+                            elif _asig not in repeated_action_steered:
+                                repeated_action_steered.add(_asig)
+                                pretty_log(
+                                    "Loop Breaker",
+                                    f"No-progress: '{_afname}'{_tgt_desc} repeated {_acnt}x with no "
+                                    "new info — forcing a grounded conclusion.",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
+                                force_final_response = True
+                                messages.append({"role": "user", "content": (
+                                    f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
+                                    "and gotten the SAME result with no change. Repeating it will NOT "
+                                    "produce new information — STOP re-observing. The strongest "
+                                    "evidence you already have (a DOM/state inspection, the sandbox "
+                                    "file listing, the actual file contents, or a tool result you "
+                                    "already received) is AUTHORITATIVE; trust it instead of looking "
+                                    "again. Write your FINAL answer now: if you have already confirmed "
+                                    "the change via state/DOM/file inspection, report success and say "
+                                    "how you confirmed it; if this environment cannot show you the "
+                                    "result (e.g. a visual check that headless rendering won't "
+                                    "display), say so plainly and tell the user exactly how to verify "
+                                    "it themselves. Do NOT call this tool again."
+                                )})
 
                         if turn_has_failure:
                             # Classify the failure to route to the right budget
@@ -6959,22 +7322,29 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # skipped the common 1–2 turn tool path, so the verifier
                     # almost never fired. `tools_run_this_turn` alone is
                     # sufficient — trivial greetings already have no tools.
-                    last_tool = _find_substantive_tool_for_verifier(
-                        tools_run_this_turn
-                    )
-                    # Use the STRICT trivial-chat check (allowlist of
-                    # actual greetings like "hi", "thanks") rather than
-                    # the loose `is_trivial_greeting` flag. The loose
-                    # flag fires on any 5-word conversational message
-                    # without "remember"/"previous" — including
-                    # correction-shaped prompts ("thanks but wrong",
-                    # "no try again", "ok do it again") which are
-                    # exactly the highest-leverage place to verify.
-                    # The fast-path at the top of handle_chat already
-                    # uses `_is_strict_trivial_chat` to decide whether
-                    # to bypass the full turn loop; mirror that gate
-                    # here so any prompt that DID run the full loop
-                    # (and produced tool output) gets verified.
+                    # Reuse the verdict the in-loop AUTO-REPAIR finalisation
+                    # already computed for THIS final answer (one verifier
+                    # pass per clean success — same cost as before the gate
+                    # was split). Recompute only when the loop exited without
+                    # a fresh in-loop verdict (error / abort / terminal path,
+                    # or repair budget spent on a non-5851 exit).
+                    if _verdict_is_fresh and _verifier_verdict_cache is not None:
+                        v_result, last_tool = _verifier_verdict_cache
+                    else:
+                        v_result, last_tool = await self._compute_verifier_verdict(
+                            tools_run_this_turn=tools_run_this_turn,
+                            messages=messages,
+                            final_ai_content=final_ai_content,
+                            last_user_content=last_user_content,
+                            lc=lc,
+                        )
+                    from .verifier import VerifyVerdict
+                    # Consumption guard mirrors the original gate exactly: only
+                    # annotate / backfill / retract when the verifier was
+                    # actually applicable (installed, a substantive tool ran,
+                    # not strict trivial chat). `_compute_verifier_verdict`
+                    # returns `last_tool` even when it produces no verdict, so
+                    # the unverified-mutation branch below still fires.
                     if (
                         verifier is not None
                         and verifier.llm_client is not None
@@ -6982,110 +7352,6 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         and final_ai_content
                         and not self._is_strict_trivial_chat(lc)
                     ):
-                        tool_output = str(last_tool.get("content", ""))[:4000]
-                        tool_name = str(last_tool.get("name", ""))[:80]
-                        if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
-                            # Recover the code that was actually executed.
-                            # Previously this slot held `tool_name` ("execute"),
-                            # which the verifier couldn't audit — it
-                            # hallucinated reasons the output didn't
-                            # match. `_reconstruct_executed_code` walks
-                            # messages → assistant → tool_calls[tool_id]
-                            # and returns the content/code/command arg.
-                            code_text = _reconstruct_executed_code(messages, last_tool)
-                            if code_text:
-                                v_result = await verifier.verify_code_output(
-                                    code=code_text,
-                                    output=tool_output,
-                                    intent=last_user_content or "",
-                                    # Pass the agent's user-facing reply so
-                                    # the verifier can audit whether the
-                                    # RESPONSE matches the user's request,
-                                    # not just whether the tool output
-                                    # matches the agent's printed claim.
-                                    # Catches the "user asked for code,
-                                    # agent gave a number" failure shape.
-                                    response=final_ai_content or "",
-                                )
-                            else:
-                                # Couldn't recover the submitted code —
-                                # fall back to claim-shape verification,
-                                # which doesn't need a code slot.
-                                v_result = await verifier.verify_claim(
-                                    claim=final_ai_content[:2000],
-                                    evidence=tool_output,
-                                    context=(last_user_content or "")[:1000],
-                                )
-                        else:
-                            v_result = await verifier.verify_claim(
-                                claim=final_ai_content[:2000],
-                                evidence=tool_output,
-                                context=(last_user_content or "")[:1000],
-                            )
-                        from .verifier import VerifyVerdict
-                        # Visual ground-truth override. A text verdict can't
-                        # see whether a reported VISUAL symptom ("blocks look
-                        # transparent") actually got fixed — the truth is in
-                        # the rendered pixels, so a self-claim like "I split
-                        # the meshes" sails through as CONFIRMED. When the
-                        # user described a visual symptom AND the agent
-                        # produced an after-screenshot this turn, re-read the
-                        # pixels and let a CONFIDENT visual REFUTED override an
-                        # optimistic text pass. Skipped silently (no penalty)
-                        # when nothing renderable is available.
-                        try:
-                            if _is_visual_intent(last_user_content):
-                                # Use the SAME per-request sandbox the browser
-                                # tool writes screenshots to. GhostAgent holds
-                                # no `sandbox_dir` of its own (it lives on the
-                                # context) — referencing self.sandbox_dir here
-                                # silently AttributeError'd, so the visual check
-                                # never ran. project_scoped_sandbox is what the
-                                # rest of handle_chat uses for file resolution.
-                                from ..tools.file_system import project_scoped_sandbox
-                                _sbx = project_scoped_sandbox(self.context)[0]
-                                _before_img, _after_img = _select_visual_evidence(
-                                    messages, last_user_content or "", _sbx,
-                                )
-                                if _after_img:
-                                    _vv = await verifier.verify_visual(
-                                        symptom=last_user_content or "",
-                                        claim=final_ai_content or "",
-                                        after_image=_after_img,
-                                        before_image=_before_img,
-                                    )
-                                    if _vv is not None:
-                                        if _vv.confidence >= 0.7 and _vv.verdict == VerifyVerdict.REFUTED:
-                                            # Pixels show the symptom persists.
-                                            v_result = _vv
-                                        elif _vv.confidence >= 0.7 and v_result is None:
-                                            v_result = _vv
-                                        pretty_log(
-                                            "Verifier",
-                                            f"VISUAL {_vv.verdict.value} "
-                                            f"({_vv.confidence:.0%}): "
-                                            f"{(_vv.reasoning or '')[:120]}",
-                                            icon=Icons.BRAIN_THINK,
-                                        )
-                                    else:
-                                        pretty_log(
-                                            "Verifier",
-                                            "VISUAL check skipped (vision returned no verdict)",
-                                            icon=Icons.BRAIN_THINK,
-                                        )
-                                else:
-                                    pretty_log(
-                                        "Verifier",
-                                        "VISUAL check skipped (no rendered after-image "
-                                        f"this turn; before={'yes' if _before_img else 'no'})",
-                                        icon=Icons.BRAIN_THINK,
-                                    )
-                        except Exception as _vv_exc:
-                            pretty_log(
-                                "Verifier",
-                                f"VISUAL check error: {type(_vv_exc).__name__}: {_vv_exc}",
-                                icon=Icons.WARN, level="WARNING",
-                            )
                         # Record the verdict for the selfhood backfill that
                         # runs after the autobiographical record is written.
                         if v_result and v_result.confidence >= 0.7:

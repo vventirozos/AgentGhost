@@ -149,15 +149,22 @@ async def test_premature_loop_breaker(agent):
     Verifies that exceeding the max tool usage triggers force_final_response (so it says 'SYSTEM ALERT' to the user)
     instead of force_stop (which crashes loop instantly without an LLM apology turn).
     """
-    # Max usage for deep_research is 10. Let's return deep_research 11 times!
     tool_call_msg = {"choices": [{"message": {"content": "Run!", "tool_calls": [{"id": "t1", "function": {"name": "deep_research", "arguments": "{}"}}]}}]}
     # Shortened from `"... " * 20` — tightened loop detector catches
     # that as an enumeration loop (real 2026-04-19 trace 0B fix).
     final_msg = {"choices": [{"message": {"content": "I apologize, I failed.", "tool_calls": []}}]}
-    
+
     side_effects = [tool_call_msg for _ in range(21)] + [final_msg]
     agent.context.llm_client.chat_completion = AsyncMock(side_effect=side_effects)
-    agent.available_tools["deep_research"] = AsyncMock(return_value="executed")
+    # Return a DISTINCT result per call. The point of this test is that an
+    # over-long tool loop reaches a graceful model-authored final response
+    # (not a hard force_stop). Byte-identical results would (correctly)
+    # trip the no-progress loop breaker (`_note_repeated_action`) at the
+    # 3rd repeat — a DIFFERENT mechanism — and finalise early; distinct
+    # results isolate the natural-completion path this test targets.
+    agent.available_tools["deep_research"] = AsyncMock(
+        side_effect=[f"executed research pass {i}" for i in range(21)]
+    )
     
     body = {"messages": [{"role": "user", "content": "Execute infinite loop"}], "model": "Qwen-Test"}
     

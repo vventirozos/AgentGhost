@@ -34,6 +34,7 @@ from .postmortem import (
     TranscriptSignature,
     compute_signature,
     select_failed_runs,
+    primary_target_from_args,
 )
 
 __all__ = [
@@ -49,4 +50,5 @@ __all__ = [
     "TranscriptSignature",
     "compute_signature",
     "select_failed_runs",
+    "primary_target_from_args",
 ]

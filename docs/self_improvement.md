@@ -1003,6 +1003,92 @@ happening*; the post-mortem engine diagnoses the machinery *between
 runs*. Neither auto-applies code — the post-mortem queue is a reviewed
 gate by design.
 
+### In-run companion: the no-progress loop breaker (2026-06-10)
+
+The post-mortem engine catches this pathology *between* runs. Its live
+dual closes the same loop *during* a run. The Browser-OS build surfaced
+the gap: after applying a fix, the agent entered an ungrounded
+verification loop — double-click the icon → screenshot → "no window" →
+repeat — and narrated ~8 failed attempts with no conclusion until it hit
+the turn budget. Neither existing breaker caught it:
+
+* the error-strike counter (`execution_failure_count`) keys on tool
+  **errors**; here every call *succeeded*, so it never moved;
+* the cross-turn repetition breaker keys on **reasoning lexical
+  overlap**; the prose varied turn to turn and slipped under the bar.
+
+The fix is `_note_repeated_action` (companion to `_note_repeated_failure`
+in `core/agent.py`), keyed by `(tool, target, result-fingerprint)` —
+where `target` comes from the **same** `primary_target_from_args` the
+offline signature uses. It runs in the results loop on **successful,
+non-mutating** calls only:
+
+* mutating calls (iterative `file_system` writes) are exempt, so building
+  one file up over several edits is never mistaken for a loop;
+* errored calls stay on the existing failure/strike path;
+* a result whose content genuinely changed yields a new fingerprint, so
+  real progress resets the count.
+
+On the **first** trip (same action+target+result ≥3×) it sets
+`force_final_response` and injects one directive: stop re-observing, trust
+the authoritative evidence already in hand (DOM/state/file inspection),
+and either report success or state plainly that the environment can't show
+the result and tell the user how to verify. If it somehow loops to ≥5, it
+hard-stops with a grounded `[ATTEMPT_ABORTED_NO_PROGRESS]` answer. Tests:
+`tests/test_no_progress_loop_breaker.py` (15 — helpers + scenario replays
+covering the Browser-OS loop, iterative-edit exemption, identical-read
+loop, error exemption, and genuine-progress no-trip).
+
+### Verifier-gate AUTO-REPAIR (2026-06-10)
+
+The verifier gate (post-loop) catches a wrong/untested final answer and,
+historically, *annotated* it — appended an auditor note, dropped
+confidence, retracted any lesson the turn produced — but shipped it
+anyway. The agent never got a chance to **fix** what the verifier just
+flagged. Auto-repair closes that: when the verifier returns a
+high-confidence `REFUTED` on the final answer (or the turn finalised on
+an **unverified mutation** — an untested `file_system` write, the req_C0
+"finished on a write that never ran" failure), the agent gets up to
+`_MAX_VERIFIER_REPAIRS` (default **1**) extra in-loop attempts to
+diagnose and correct the issue.
+
+**Re-entry without an outer loop.** The repair reuses the existing
+`for turn` loop. At the normal-success finalisation (the model produced
+a final answer with no further tool calls), the verdict is computed
+*there*; on a refute/unverified trigger the critique is injected as a
+corrective user message and the turn loop `continue`s — the agent re-runs
+with the verifier's objection in context, then re-verifies. No
+~3,900-line re-indent, no method extraction of the turn loop.
+
+Key safety properties (all tested):
+
+* **One verifier pass on the clean path.** The verdict computed at
+  finalisation is cached (`_verdict_is_fresh`) and reused by the
+  post-loop gate, so a confirmed success costs exactly one verifier call
+  — same as before the gate was split (`_compute_verifier_verdict` is the
+  shared, side-effect-free verdict function).
+* **Strictly bounded.** `repair_round` caps repairs independently of the
+  turn budget; the strike-cap and all anti-loop accumulators
+  (`execution_failure_count`, `repeated_failure_sigs`,
+  `repeated_action_sigs`, …) are **preserved** across the repair `continue`
+  (a repair turn is just another turn), so a repair can't reset the
+  budgets that stop a runaway.
+* **Repairs only clean successes.** Gated on
+  `not tool_calls and not force_stop and execution_failure_count == 0`, so
+  error / abort / terminal answers (which exit via other breaks) are never
+  fed back for "repair".
+* **Records once.** Trajectory recording + the `verifier_backfill` run
+  once post-loop on the truly-final (possibly repaired) answer — no
+  double-record.
+
+Only thing reset on re-entry is `force_final_response` (so the repair turn
+may run tools to actually fix the issue). Tests:
+`tests/test_verifier_auto_repair.py` (6 — refute→repair→confirm,
+critique-injection, single-pass clean cost, bounded budget,
+unverified-mutation trigger, trivial-chat no-op). This is the **in-run**
+counterpart to the post-mortem engine's between-runs repair; it makes the
+verifier gate *act* on its verdict instead of only annotating it.
+
 ## Stage 2 hook (future work)
 
 The trajectory log is the ingredient Stage 2 (local SFT via rejection
