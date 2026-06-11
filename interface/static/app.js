@@ -1388,6 +1388,7 @@ if (!window.marked || !window.DOMPurify) {
     );
 }
 
+// Restore the previously chosen face (default = first) and start it.
 activeFace.init();
 loadChatState();
 connectWebSocket();

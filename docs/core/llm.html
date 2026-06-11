@@ -135,6 +135,18 @@
   </table>
   <p>Any received line — including SSE keepalive/blank lines — ends the first-byte wait and resets the gap timer. A timeout yields an error SSE event + <code>[DONE]</code>; the agent then sees a turn with thinking but no actionable output and forces a retry. The earlier flat <b>30s</b> tripped that false "stall → forced retry" whenever a turn's prefill exceeded 30s, wastefully re-prefilling the whole (growing) context. The httpx client timeout (1200s) bounds the overall request above these. Tune the env vars for very slow or very fast nodes. Covered by <code>tests/test_stream_idle_timeout.py</code>.</p>
 
+  <h2>Foreground-request yield (2026-06-11)</h2>
+  <p>Background LLM callers (<code>is_background=True</code>) used to wait only on <code>foreground_tasks</code> — LLM calls <em>in flight</em> — capped at 30s. But a user turn spends much of its wall-clock <em>between</em> LLM calls (tools, file I/O, browser); in those gaps the counter reads 0, a background turn grabs the single llama slot, and the user's next turn queues behind a full background generation. Post-req-70 this starved the prompt for ~12 minutes while consolidation/self-play churned.</p>
+  <p>Two-signal policy in <code>_wait_for_foreground_clear</code> (shared by <code>chat_completion</code> and <code>stream_chat_completion</code>):</p>
+  <table>
+    <thead><tr><th>Signal</th><th>Meaning</th><th>Background waits</th></tr></thead>
+    <tbody>
+      <tr><td><code>foreground_tasks &gt; 0</code></td><td>a foreground LLM call is in flight</td><td>up to 30s, then proceed (stale result beats none)</td></tr>
+      <tr><td><code>foreground_requests &gt; 0</code></td><td>a USER REQUEST is anywhere in its <code>handle_chat</code> lifecycle</td><td>as long as it takes (600s hard ceiling against a leaked counter)</td></tr>
+    </tbody>
+  </table>
+  <p><code>foreground_requests</code> is bracketed at the API layer by <code>routes._mark_foreground(agent, ±1)</code> around both chat handlers (the streaming one spans the whole SSE generator, agent loop + final-answer streaming). The helper only touches a counter that is actually an <code>int</code>, so mocked test apps and partial contexts no-op instead of raising. Self-play's isolated <code>handle_chat</code> runs never pass the API layer, so background cycles cannot deadlock themselves. Covered by <code>tests/test_foreground_yield.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

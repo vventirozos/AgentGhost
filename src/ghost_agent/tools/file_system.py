@@ -437,6 +437,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                     f"module and 'replace_with' was missing. The file has been "
                     f"overwritten. Next time, use operation='write' directly "
                     f"when you intend to rewrite the whole file."
+                    + await _syntax_feedback(path, filename)
                 )
             except Exception as e:
                 return (
@@ -540,7 +541,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 msg = f"SUCCESS: Applied {success_count} SEARCH/REPLACE blocks to '{filename}'."
                 if errors:
                     msg += f" SYSTEM INSTRUCTION: {len(errors)} blocks failed:\n" + "\n".join(errors)
-                return msg
+                return msg + await _syntax_feedback(path, filename)
             else:
                 return f"SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in '{filename}'.\n" + "\n".join(errors)
 
@@ -551,7 +552,7 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             await asyncio.to_thread(path.write_text, new_file_content)
             msg = f"SUCCESS: Exact match found and replaced in '{filename}'."
             if occurrences > 1: msg += f" WARNING: Replaced {occurrences} identical occurrences."
-            return msg
+            return msg + await _syntax_feedback(path, filename)
             
         # 2. Heuristic match (ignore arbitrary whitespace & newlines)
         import re
@@ -562,7 +563,8 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         if len(matches) == 1:
             new_file_content = file_content.replace(matches[0], new_text)
             await asyncio.to_thread(path.write_text, new_file_content)
-            return f"SUCCESS: Flexible match found and replaced in '{filename}'."
+            return (f"SUCCESS: Flexible match found and replaced in '{filename}'."
+                    + await _syntax_feedback(path, filename))
         elif len(matches) > 1:
             return "SYSTEM INSTRUCTION: Multiple instances of this text block found. Please provide a larger, more unique block of code in 'content' to ensure we replace the correct one."
 
@@ -590,7 +592,9 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             return (
                 f"SUCCESS: Fuzzy match ({ratio:.0%} similar) found and replaced "
                 f"in '{filename}'. Your `old_text` did not byte-match, but a single "
-                f"near-identical block was unambiguous. VERIFY the change is what you "
+                f"near-identical block was unambiguous."
+                + await _syntax_feedback(path, filename)
+                + f" VERIFY the change is what you "
                 f"intended:\n--- REPLACED BLOCK (was) ---\n{matched_text[:600]}"
             )
 
@@ -614,7 +618,9 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 f"SUCCESS: Anchor match — replaced the block spanning lines "
                 f"{info['start_line']}–{info['end_line']} in '{filename}' "
                 f"(matched on its unique {'first+last lines' if info['strategy']=='first_last' else 'signature + balanced braces'}; "
-                f"the middle differed from your old_text). VERIFY the change:\n"
+                f"the middle differed from your old_text)."
+                + await _syntax_feedback(path, filename)
+                + f" VERIFY the change:\n"
                 f"--- REPLACED BLOCK (was) ---\n{matched_text[:600]}"
             )
 
@@ -892,6 +898,77 @@ def _fixture_summary(content: str, ext: str) -> str:
     return " | FIXTURE-COUNT: " + ", ".join(parts)
 
 
+_SYNTAX_CHECK_TIMEOUT_S = 10.0
+
+
+async def _syntax_feedback(path: Path, filename: str) -> str:
+    """Best-effort post-write syntax check. Returns "" when clean or unknown.
+
+    Write time is the cheapest place to catch a parse error: the same tool
+    result that says SUCCESS also names the exact broken line, so the fix
+    lands on the very next turn. (Production failure this prevents: data.js
+    shipped with unescaped apostrophes in single-quoted strings, the
+    verifier confirmed the build without loading it, and the user found the
+    bug by clicking a dead button.)
+
+    .py / .json parse in-process; .js / .mjs / .cjs shell out to
+    ``node --check`` when a node binary exists on PATH (skipped silently
+    otherwise — a missing checker must never fail a successful write).
+    """
+    ext = str(filename).split(".")[-1].lower()
+    err = ""
+    try:
+        if ext == "py":
+            import ast
+            try:
+                ast.parse(await asyncio.to_thread(path.read_text))
+            except SyntaxError as se:
+                err = f"{se.msg} (line {se.lineno}, col {se.offset})"
+        elif ext == "json":
+            try:
+                json.loads(await asyncio.to_thread(path.read_text))
+            except json.JSONDecodeError as je:
+                err = f"{je.msg} (line {je.lineno}, col {je.colno})"
+        elif ext in ("js", "mjs", "cjs"):
+            import shutil
+            node = shutil.which("node")
+            if not node:
+                return ""
+            proc = await asyncio.create_subprocess_exec(
+                node, "--check", str(path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr_b = await asyncio.wait_for(
+                    proc.communicate(), timeout=_SYNTAX_CHECK_TIMEOUT_S
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                return ""
+            if proc.returncode != 0:
+                # node prints "path:line", the offending source line, a
+                # caret marker, then "SyntaxError: ..." — keep those, drop
+                # the trailing module-loader noise.
+                lines = (stderr_b or b"").decode("utf-8", "replace").splitlines()
+                err = "\n".join(ln[:200] for ln in lines if ln.strip())[:800]
+    except Exception:
+        return ""
+    if not err:
+        return ""
+    pretty_log(
+        "syntax check",
+        f"{filename}: {err.splitlines()[0] if err.splitlines() else err}",
+        icon=Icons.FAIL, level="WARNING",
+    )
+    return (
+        f"\n⚠ SYNTAX CHECK FAILED: '{filename}' was written but does NOT "
+        f"parse. Fix this BEFORE any other step — a browser loads a broken "
+        f"script silently and every downstream symptom (dead buttons, blank "
+        f"page) traces back here:\n{err}"
+    )
+
+
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
     pretty_log("File Write", filename, icon=Icons.TOOL_FILE_W)
     try:
@@ -931,10 +1008,11 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
         except Exception:
             rel_str = str(filename)
         summary = _fixture_summary(content, ext)
+        syntax_note = await _syntax_feedback(path, filename)
         return (
             f"SUCCESS: Wrote {len(content)} chars to '{filename}'. "
             f"Script-side path (from sandbox cwd): '{rel_str}'."
-            f"{summary}"
+            f"{summary}{syntax_note}"
         )
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"

@@ -202,6 +202,34 @@ def _is_unverified_mutation(tool: Optional[dict]) -> bool:
     return any(marker in content for marker in _FILE_MUTATION_MARKERS)
 
 
+# Quoted filenames with a web extension inside a file_system SUCCESS
+# message ("SUCCESS: Wrote 8214 chars to 'index.html'. ...").
+_WEB_ARTIFACT_RE = re.compile(r"'([^']+\.(?:html?|js|mjs|cjs))'")
+
+
+def _web_artifacts_written(tools_run: Optional[list]) -> list:
+    """Filenames of web files (html/js) successfully written this turn.
+
+    Feeds the verifier's execution check: a turn that WROTE web files must
+    have its entry page actually loaded before a CONFIRMED is credible.
+    Parses the recorded tool SUCCESS messages because turn records carry
+    only (name, content), not the original call arguments."""
+    out: list = []
+    for t in tools_run or []:
+        if not isinstance(t, dict) or t.get("_synthetic"):
+            continue
+        if str(t.get("name", "")).lower().replace("-", "_") not in (
+                "file_system", "filesystem", "file"):
+            continue
+        content = str(t.get("content", ""))
+        if not content.startswith("SUCCESS"):
+            continue
+        for m in _WEB_ARTIFACT_RE.findall(content):
+            if m not in out:
+                out.append(m)
+    return out
+
+
 # ── Visual verification evidence ─────────────────────────────────────
 # A text-only verifier cannot tell whether a reported VISUAL symptom
 # ("the blocks look transparent", "the layout is broken") was actually
@@ -230,6 +258,30 @@ def _is_visual_intent(text: Optional[str]) -> bool:
     if _IMAGE_TOKEN_RE.search(text):
         return True
     return bool(_VISUAL_INTENT_RE.search(text))
+
+
+_BUG_REPORT_RE = re.compile(
+    r"(nothing happens|doesn'?t work|does not work|not working|"
+    r"isn'?t working|stopped working|won'?t (load|start|open|run)|"
+    r"when i (click|press|open|run|load|type)\b.{0,60}"
+    r"(nothing|fails?|error|crash|blank|stuck)|"
+    r"\b(button|link|page|screen|app|game)\b.{0,40}"
+    r"\b(broken|dead|stuck|frozen|blank)\b|"
+    r"\bcrash(es|ed)?\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_bug_report_intent(text: Optional[str]) -> bool:
+    """Cheap (no-LLM) gate: the user is REPORTING a defect in something
+    that already exists ("when I click X nothing happens"). These turns
+    have a known best first move — reproduce and observe — and a known
+    catastrophic first move — re-reading the source and hypothesizing
+    (req 70: six wrong "I found it!" theories and a killed thinking loop
+    before the first observation, which then named the bug instantly)."""
+    if not text:
+        return False
+    return bool(_BUG_REPORT_RE.search(text))
 
 
 def _extract_image_tokens(blob: Optional[str]) -> List[str]:
@@ -2780,6 +2832,44 @@ class GhostAgent:
     # independently of the turn budget so a repair can't extend a runaway.
     _MAX_VERIFIER_REPAIRS = 1
 
+    async def _execute_web_artifact(self, written: list):
+        """Headless-load the entry page for web files written this turn.
+
+        Returns ``(page_rel, error_block)`` — ``error_block`` is "" when the
+        page loaded with no uncaught JS exception — or ``None`` when the
+        check cannot run (no entry page on disk, no browser tool, or the
+        navigation itself failed; a failed probe must stay inconclusive,
+        never read as "clean"). JS-only edits load the conventional
+        ``index.html`` next to the edited file.
+        """
+        browser = (getattr(self, "available_tools", None) or {}).get("browser")
+        if browser is None:
+            return None
+        from ..tools.file_system import project_scoped_sandbox
+        sbx = project_scoped_sandbox(self.context)[0]
+        page_rel = next(
+            (f for f in written if f.lower().endswith((".html", ".htm"))), None)
+        if page_rel is None:
+            for f in written:
+                cand = Path(f).parent / "index.html"
+                if (Path(sbx) / cand).exists():
+                    page_rel = str(cand)
+                    break
+        if page_rel is None or not (Path(sbx) / page_rel).exists():
+            return None
+        res = await browser(
+            operation="navigate",
+            url=f"file://{page_rel}",
+            wait_until="domcontentloaded",
+        )
+        text = str(res)
+        if text.lstrip().startswith("Error") or "[BROWSER_ERR]" in text:
+            return None
+        marker = "UNCAUGHT JS EXCEPTIONS"
+        if marker not in text:
+            return page_rel, ""
+        return page_rel, text[text.index(marker):][:1200]
+
     async def _compute_verifier_verdict(
         self, *, tools_run_this_turn, messages, final_ai_content,
         last_user_content, lc,
@@ -2878,6 +2968,57 @@ class GhostAgent:
                 f"VISUAL check error: {type(_vv_exc).__name__}: {_vv_exc}",
                 icon=Icons.WARN, level="WARNING",
             )
+        # Web-artifact ground-truth override — execute, don't trust. The
+        # text verifier CONFIRMED (95%) a build whose data.js had a parse
+        # error: every claim/evidence pair read fine, but the page threw on
+        # load and the user found out by clicking a dead button. When this
+        # turn WROTE web files, load the entry page headless; an uncaught
+        # exception refutes the answer regardless of how plausible the
+        # claim text is. Runs last so it outranks the visual check —
+        # execution is harder ground truth than pixels.
+        try:
+            written = _web_artifacts_written(tools_run_this_turn)
+            if written:
+                check = await self._execute_web_artifact(written)
+                if check is None:
+                    pretty_log(
+                        "Verifier",
+                        "WEB-EXEC check skipped (no loadable entry page "
+                        "or navigation failed)",
+                        icon=Icons.BRAIN_THINK,
+                    )
+                else:
+                    page_rel, err_block = check
+                    if err_block:
+                        from .verifier import VerifyResult
+                        v_result = VerifyResult(
+                            verdict=VerifyVerdict.REFUTED,
+                            confidence=0.95,
+                            reasoning=(
+                                f"Execution check: loading '{page_rel}' raised "
+                                f"uncaught JS exceptions — the artifact does not "
+                                f"run, regardless of the claim text.\n{err_block}"
+                            ),
+                            issues=[f"uncaught JS exception(s) on {page_rel}"],
+                        )
+                        pretty_log(
+                            "Verifier",
+                            f"WEB-EXEC REFUTED: '{page_rel}' throws on load",
+                            icon=Icons.BRAIN_THINK,
+                        )
+                    else:
+                        pretty_log(
+                            "Verifier",
+                            f"WEB-EXEC clean: '{page_rel}' loaded with no "
+                            f"uncaught exceptions",
+                            icon=Icons.BRAIN_THINK,
+                        )
+        except Exception as _wx_exc:
+            pretty_log(
+                "Verifier",
+                f"WEB-EXEC check error: {type(_wx_exc).__name__}: {_wx_exc}",
+                icon=Icons.WARN, level="WARNING",
+            )
         return v_result, last_tool
 
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
@@ -2947,6 +3088,34 @@ class GhostAgent:
                 # that stale reading with ITS OWN outcome, systematically
                 # mispairing the calibration JSONL.
                 self.context._calib_pending = None
+
+                # Repro-first nudge for bug reports. Injected BEFORE the
+                # first LLM call so the very first action is an
+                # observation, not a theory. Suppressed in simulations
+                # (same flag as the meta-task nudge).
+                if (_is_bug_report_intent(lc)
+                        and not getattr(self, "suppress_meta_task_nudges", False)):
+                    pretty_log(
+                        "Repro-First Nudge",
+                        "Bug-report intent detected — steering first action "
+                        "to reproduce/observe",
+                        icon=Icons.SHIELD,
+                    )
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "SYSTEM HINT (repro-first): The message above reports "
+                            "that something already built is not working. Do NOT "
+                            "start by re-reading source files and hypothesizing "
+                            "about causes. Your FIRST tool call must reproduce and "
+                            "observe the failure: load the page in the browser (or "
+                            "execute the code) and read the captured errors — "
+                            "uncaught exceptions and console messages name the "
+                            "exact file:line:col. Diagnose strictly from observed "
+                            "output, and never apply a fix you cannot causally tie "
+                            "to an observed error message."
+                        ),
+                    })
 
                 # Stage-1 self-improvement: user-correction promotion.
                 # If `last_user_content` looks like a correction of the
@@ -5018,7 +5187,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 )
                                 force_stop = True
                                 break
-                            messages.append({"role": "user", "content": "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Otherwise output a <tool_call> immediately. Do not write a long <think> block."})
+                            messages.append({"role": "user", "content": "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."})
                             if execution_failure_count >= 6:
                                 pretty_log("Loop Breaker", "Forcing final response after thinking loops", icon=Icons.STOP)
                                 force_final_response = True

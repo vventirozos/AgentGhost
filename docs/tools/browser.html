@@ -206,6 +206,12 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
   retry the whole interact call.</code></pre>
   <p>…so the next-turn planner reads the failure as "bad URL, retry the whole interact" rather than misinterpreting it as 53 mysterious per-action selector bugs. The return dict grows two fields: <code>aborted: bool</code> and <code>abort_reason: "goto_failed" | "initial_goto_failed" | None</code>. Non-navigation failures still honour the <code>stop_on_error</code> contract. Covered by <code>tests/test_browser_interact_abort.py</code> (9 cases including initial-goto failure, explicit-goto failure, implicit-nav failure, mid-sequence goto, <code>stop_on_error</code> preservation, and happy path).</p>
 
+  <h2>Console source location — file:line:col (2026-06-11)</h2>
+  <p>A script <em>parse</em> error (the classic <code>SyntaxError: Unexpected identifier 't'</code> from an unescaped apostrophe inside a single-quoted string) fires <code>pageerror</code> with <strong>no stack frames</strong> — the exception object carries only the message. The source location for parse errors only ever arrives on the <code>console</code> event, via <code>msg.location</code> (<code>url</code> / 0-based <code>lineNumber</code> / <code>columnNumber</code>). The runner's <code>_on_console</code> now captures that location, shortens the URL to its last two path segments, converts to 1-based, and stores it as a <code>loc</code> key; <code>_format_js_diagnostics</code> renders it <em>before</em> the message:</p>
+  <pre>CONSOLE (1 error/warning):
+  • [error] 00cbdc4b2dc7/data.js:35:47 — Uncaught SyntaxError: Unexpected identifier 't'</pre>
+  <p>Production motivation (req 70, 2026-06-11): the agent received the bare message with no file/line, spent 807s hypothesizing (and "fixed" harmless em-dashes), while the actual broken line was one read away. With <code>loc</code>, the next turn opens the exact line. Messages without a usable location (older Playwright, synthetic messages, empty URL) degrade to the old text-only entry. Covered by <code>tests/test_browser_console_location.py</code>.</p>
+
   <h2>Related</h2>
   <ul>
     <li><a href="execute.html">execute</a> — raw Playwright fallback path.</li>

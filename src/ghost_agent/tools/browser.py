@@ -259,7 +259,25 @@ def _attach_diagnostics(page):
             return
         if len(console_msgs) >= _MAX_CONSOLE_MSGS * 2:
             return
-        console_msgs.append({"type": mtype, "text": str(mtext)[:_MAX_DIAG_CHARS]})
+        # Source location is the difference between an actionable error
+        # and a guessing game: a script PARSE error ("Unexpected
+        # identifier 't'") fires pageerror with NO stack frames — the
+        # file:line:col only ever arrives on the console event. Without
+        # it the agent has the message but not the line (the req-70
+        # em-dash misdiagnosis). lineNumber/columnNumber are 0-based.
+        loc = ""
+        try:
+            l = msg.location or {}
+            u = str(l.get("url") or "")
+            if u:
+                u = "/".join(u.rstrip("/").split("/")[-2:])
+                loc = f"{u}:{int(l.get('lineNumber', -1)) + 1}:{int(l.get('columnNumber', -1)) + 1}"
+        except Exception:
+            loc = ""
+        entry = {"type": mtype, "text": str(mtext)[:_MAX_DIAG_CHARS]}
+        if loc:
+            entry["loc"] = loc
+        console_msgs.append(entry)
 
     page.on("pageerror", _on_error)
     page.on("console", _on_console)
@@ -1143,7 +1161,13 @@ def _format_js_diagnostics(parsed: dict) -> str:
     if errs:
         out.append(f"CONSOLE ({len(errs)} error/warning):")
         for c in errs[:10]:
-            out.append(f"  • [{c.get('type')}] {c.get('text')}")
+            # `loc` (source file:line:col, captured from msg.location in
+            # the runner) turns "Unexpected identifier 't'" into
+            # "data.js:35:47 — Unexpected identifier 't'" — the agent can
+            # open the exact line instead of hypothesizing causes.
+            loc = c.get("loc") or ""
+            prefix = f"{loc} — " if loc else ""
+            out.append(f"  • [{c.get('type')}] {prefix}{c.get('text')}")
     return ("\n" + "\n".join(out)) if out else ""
 
 

@@ -82,6 +82,15 @@
   </ul>
   <p>Covered by <code>tests/test_verifier_visual.py</code>. Runs only under <code>--enable-metacog</code> (the verifier gate). A proactive <em>re-render</em> step (screenshot the edited artifact when the agent didn't) is a natural follow-on; today it reuses a screenshot the turn already produced.</p>
 
+  <h2>Web-artifact execution check (2026-06-11)</h2>
+  <p>Sibling of the visual override, living in <code>agent._compute_verifier_verdict</code> and running <em>after</em> it (execution is harder ground truth than pixels). When the finishing turn <strong>wrote web files</strong> (<code>_web_artifacts_written</code> parses <code>file_system</code> SUCCESS messages for quoted <code>.html/.js/.mjs/.cjs</code> names), <code>_execute_web_artifact</code> loads the entry page headless through the regular <code>browser</code> tool: the written <code>.html</code> itself, or for JS-only edits the conventional <code>index.html</code> next to the edited file.</p>
+  <ul>
+    <li><strong>Uncaught JS exception on load → REFUTED (0.95)</strong> with the captured exception block in the reasoning, overriding any text-level CONFIRMED. This feeds the existing auto-repair / backfill machinery, so the agent fixes the artifact instead of shipping it.</li>
+    <li><strong>Clean load → text verdict stands</strong> (logged as <code>WEB-EXEC clean</code>).</li>
+    <li><strong>Inconclusive ≠ clean.</strong> No entry page on disk, no browser tool, or a failed navigation returns <code>None</code> and changes nothing — a broken probe must never certify a build.</li>
+  </ul>
+  <p>Production motivation (req EA, 2026-06-11): the text verifier said CONFIRMED (95%) on "The Infinite Corridor" — claim, evidence and request all aligned — but data.js had a parse error and the page threw on load; the user found out by clicking a dead button. Covered by <code>tests/test_verifier_web_exec.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

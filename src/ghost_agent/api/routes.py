@@ -23,6 +23,21 @@ router = APIRouter()
 API_KEY_NAME = "X-Ghost-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
+def _mark_foreground(agent, delta: int) -> None:
+    """Adjust the llm client's active-user-request counter (see
+    LLMClient.foreground_requests — it parks background LLM work for the
+    whole life of a user request, not just per LLM call). Tolerant of
+    mocked/missing clients: instrumentation must never break a request,
+    so it only touches a counter that is actually an int."""
+    try:
+        llm = getattr(getattr(agent, "context", None), "llm_client", None)
+        cur = getattr(llm, "foreground_requests", None)
+        if isinstance(cur, int):
+            llm.foreground_requests = max(0, cur + delta)
+    except Exception:
+        pass
+
+
 def get_agent(request: Request):
     return request.app.state.agent
 
@@ -278,6 +293,11 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             # programmatic detection; emitting an extra content chunk
             # corrupts the visible reply.
             content_started = False
+            # Mark a user request active for its WHOLE lifecycle (agent
+            # loop + final-answer streaming) so background LLM work parks
+            # instead of stealing the inference slot between this
+            # request's tool calls. See LLMClient.foreground_requests.
+            _mark_foreground(agent, +1)
             try:
                 # Yield an SSE comment to send HTTP headers instantly and keep reverse proxies alive
                 yield b": processing request...\n\n"
@@ -307,6 +327,8 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                     yield f"data: {json.dumps({'choices': [{'delta': {'content': err_msg}}]})}\n\n".encode('utf-8')
                 yield b"data: [DONE]\n\n"
                 return
+            finally:
+                _mark_foreground(agent, -1)
 
         return StreamingResponse(stream_generator(), media_type="text/event-stream", headers=headers)
     
@@ -315,6 +337,7 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
     # page instead of a parseable error. Mirror the streaming path's
     # error-shape (OpenAI-style ``error.message``/``error.type``) so the
     # Slack bot and web UI can render a useful message to the user.
+    _mark_foreground(agent, +1)
     try:
         content, created_time, req_id = await agent.handle_chat(body, background_tasks, request_id=request_id)
     except Exception as e:
@@ -340,6 +363,8 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
             },
             status_code=500,
         )
+    finally:
+        _mark_foreground(agent, -1)
 
     return JSONResponse({
         "id": f"chatcmpl-{req_id}", "object": "chat.completion", "created": created_time, "model": model,

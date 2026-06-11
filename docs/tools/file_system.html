@@ -98,6 +98,22 @@
   <h2>Path resolution</h2>
   <p><code>_get_safe_path</code> resolves every path against the sandbox root and rejects traversal. Beyond the leading-slash and <code>/workspace/</code> handling, it also accepts a <strong>host-absolute sandbox path</strong>: if the LLM echoes back the full host path of a sandbox file (e.g. <code>/Users/x/.../sandbox/report.md</code> — which it sees in a sandbox-tree listing or a prior error and passes verbatim), the sandbox-root prefix is stripped and the remainder honoured as sandbox-relative. Without this the path joined onto the sandbox root into a phantom nested path → ENOENT → a wasted strike + retry. Covered by <code>tests/test_file_system_sandbox_path.py</code>.</p>
 
+  <h2>Post-write syntax check (2026-06-11)</h2>
+  <p>Every successful write path — <code>tool_write_file</code> plus all content-landing branches of <code>tool_replace_text</code> (aider blocks, exact, flexible, fuzzy, anchor, and the replace→write auto-promote) — now runs <code>_syntax_feedback(path, filename)</code> on the result and <em>appends</em> any failure to the SUCCESS message:</p>
+  <pre>SUCCESS: Wrote 9241 chars to 'data.js'. …
+⚠ SYNTAX CHECK FAILED: 'data.js' was written but does NOT parse. Fix this
+BEFORE any other step — a browser loads a broken script silently and every
+downstream symptom (dead buttons, blank page) traces back here:
+/…/data.js:35
+    'every decision you didn't make…',
+SyntaxError: Unexpected identifier 't'</pre>
+  <ul>
+    <li><strong>Checkers:</strong> <code>.py</code> → in-process <code>ast.parse</code>; <code>.json</code> → <code>json.loads</code>; <code>.js/.mjs/.cjs</code> → <code>node --check</code> (skipped silently when node isn't on PATH; 10s timeout). Other extensions are not checked.</li>
+    <li><strong>The write always stands.</strong> The file is on disk either way — the agent needs to read its own broken file to fix it. The warning rides the same tool result, so the fix lands on the very next turn.</li>
+    <li><strong>Fail-safe:</strong> any checker error returns "" — a broken checker can never fail a good write. A <code>pretty_log</code> WARNING mirrors the failure to the operator stream.</li>
+  </ul>
+  <p>Production motivation (req EA → req 70, 2026-06-11): data.js/game.js shipped with unescaped apostrophes in single-quoted strings; four bare SUCCESS messages later the verifier confirmed a build that throws on load, and the bug cost an 807-second debugging session that still misdiagnosed it. Covered by <code>tests/test_write_syntax_check.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

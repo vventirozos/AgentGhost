@@ -133,6 +133,17 @@ class LLMClient:
 
         self.circuit_breaker = NodeCircuitBreaker(failure_threshold=3, cooldown_seconds=60.0)
         self.foreground_tasks = 0
+        # Active USER REQUESTS (handle_chat in flight at the API layer), as
+        # opposed to in-flight foreground LLM calls. A user turn spends much
+        # of its wall-clock BETWEEN LLM calls (tools, file I/O, browser);
+        # `foreground_tasks` drops to 0 in those gaps, a background turn
+        # grabs the single llama slot, and the user's NEXT turn queues
+        # behind a full background generation — the post-req-70 "no prompt
+        # for 12 minutes" starvation. The API layer increments this for the
+        # whole life of a user request; background callers wait on BOTH
+        # counters. Plain int (not lock-guarded): all writers live on the
+        # one event loop and the readers tolerate one-tick staleness.
+        self.foreground_requests = 0
         # Guards mutations of `foreground_tasks`. Without this the biological
         # watchdog could observe a stale (negative or stuck) value and either
         # spin forever or fire mid-request. Asyncio.Lock is sufficient because
@@ -707,22 +718,38 @@ class LLMClient:
 
         raise Exception("Max retries exceeded")
 
+    async def _wait_for_foreground_clear(self):
+        """Park a background caller until the foreground is idle.
+
+        Two signals, two budgets:
+        - ``foreground_tasks`` (an LLM call in flight): wait up to 30s,
+          then proceed — a slightly stale background result beats no
+          result, and the in-flight call may be long.
+        - ``foreground_requests`` (a USER REQUEST anywhere in its
+          handle_chat lifecycle): wait essentially as long as it takes
+          (10-minute hard ceiling against a leaked counter). While a user
+          is actively being served, background work has NO claim on the
+          single inference slot — letting it sneak in between the user
+          turn's tool calls is exactly what starved the prompt for ~12
+          minutes after req 70.
+        """
+        waited = 0.0
+        while waited < 600.0:
+            async with self._foreground_lock:
+                request_active = self.foreground_requests > 0
+                if self.foreground_tasks <= 0 and not request_active:
+                    return
+            if not request_active and waited >= 30.0:
+                return
+            await asyncio.sleep(1.0)
+            waited += 1.0
+
     async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, is_background: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
         if is_background:
-            # Background tasks wait for foreground to clear, but with a
-            # maximum wait time to prevent indefinite starvation. After
-            # 30 seconds of waiting, proceed anyway — a slightly stale
-            # background result is better than no result at all.
-            # Wait for foreground to clear, then acquire a semaphore
-            # slot (allows up to 3 concurrent background tasks).
-            waited = 0.0
-            max_bg_wait = 30.0
-            while waited < max_bg_wait:
-                async with self._foreground_lock:
-                    if self.foreground_tasks <= 0:
-                        break
-                await asyncio.sleep(1.0)
-                waited += 1.0
+            # Wait for foreground to clear (see _wait_for_foreground_clear
+            # for the two-signal policy), then acquire a semaphore slot
+            # (allows up to 3 concurrent background tasks).
+            await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
                 return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, timeout)
         else:
@@ -881,14 +908,7 @@ class LLMClient:
 
     async def stream_chat_completion(self, payload: Dict[str, Any], use_coding: bool = False, is_background: bool = False):
         if is_background:
-            waited = 0.0
-            max_bg_wait = 30.0
-            while waited < max_bg_wait:
-                async with self._foreground_lock:
-                    if self.foreground_tasks <= 0:
-                        break
-                await asyncio.sleep(1.0)
-                waited += 1.0
+            await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
                 async for chunk in self._do_stream_chat_completion(payload, use_coding):
                     yield chunk

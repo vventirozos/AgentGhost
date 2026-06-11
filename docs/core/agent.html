@@ -189,6 +189,14 @@
     <li><a href="verifier.html">core.verifier</a> &amp; <a href="uncertainty.html">core.uncertainty</a> — adjudication and metacognition.</li>
   </ul>
 
+  <h2>Repro-first nudge &amp; post-abort grounding (2026-06-11)</h2>
+  <p>Two steering fixes from the req-70 postmortem (807s spent on "when i click … nothing happens" without fixing it):</p>
+  <ul>
+    <li><strong>Repro-first nudge.</strong> <code>_is_bug_report_intent</code> is a cheap regex gate (mirroring <code>_is_visual_intent</code>) for defect reports — "nothing happens", "doesn't work", "won't load", "crashed", "page … blank". When it fires, <code>handle_chat</code> injects a <code>SYSTEM HINT (repro-first)</code> user message <em>before the first LLM call</em>: the FIRST tool call must reproduce and observe (load the page / run the code and read the captured errors), and no fix may be applied that isn't causally tied to an observed error message. Req 70 produced six wrong "I found it!" theories and a killed thinking loop before its first observation — which then surfaced the real error instantly. Suppressed under <code>suppress_meta_task_nudges</code> (simulations), like the meta-task nudge.</li>
+    <li><strong>Post-abort grounding directive.</strong> The SYSTEM ALERT injected after a killed thinking loop now demands ONE grounding tool call (execute / browser-load / re-read the actual error) instead of just "stop re-deriving" — a killed loop means the mental model is missing a fact only observation can supply. The existing escape hatches (wrong self-generated test assertion, <code>abort_attempt</code>) are preserved.</li>
+  </ul>
+  <p>Related ground-truth gate: the verifier's <a href="verifier.html">web-artifact execution check</a> refutes a finishing turn whose freshly written page throws on load. Covered by <code>tests/test_repro_first_nudge.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>
