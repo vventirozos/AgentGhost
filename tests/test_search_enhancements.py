@@ -107,7 +107,7 @@ async def test_tool_search_ddgs_empty_list_triggers_tor_cycle(mock_find_spec, mo
     # ZERO-results message.
     result = await tool_search_ddgs("test query", None)
 
-    assert "DuckDuckGo returned ZERO results" in result
+    assert "ZERO results" in result
     assert mock_ddgs_instance.text.call_count == 5
 
 

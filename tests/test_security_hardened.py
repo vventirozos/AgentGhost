@@ -55,6 +55,9 @@ def test_llm_client_ignores_proxy_for_localhost(mock_client_cls, mock_tor_proxy)
 @patch("chromadb.PersistentClient")
 @patch("chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction")
 def test_vector_memory_does_not_inject_env_vars(mock_embed, mock_client, mock_tor_proxy, mock_tor_proxy_h):
+    # The embedder instance must return a trained-model-shaped probe
+    # (384-d, L2-normalised) so VectorMemory's boot self-check passes.
+    mock_embed.return_value.return_value = [[1.0] + [0.0] * 383]
     # We also need to patch os.environ carefully
     with patch.dict(os.environ, {}, clear=True):
         # Initialize VectorMemory with Tor

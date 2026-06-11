@@ -26,12 +26,19 @@ def test_vector_retry_success(mock_sys_exit, mock_sleep, mock_environ, mock_chro
     # Mock SentenceTransformerEmbeddingFunction to fail on first attempt, succeed on second
     mock_stef = MagicMock()
     
+    # A realistic embedder: callable returning a trained-model-shaped probe
+    # (384-d, L2-normalised) so VectorMemory's boot self-check passes.
+    def _good_embedder():
+        emb = MagicMock()
+        emb.return_value = [[1.0] + [0.0] * 383]
+        return emb
+
     call_count = [0]
     def stef_side_effect(*args, **kwargs):
         call_count[0] += 1
         if call_count[0] == 1:
             raise Exception("Hugging Face download timeout")
-        return MagicMock() # Succeed on 2nd attempt
+        return _good_embedder()  # Succeed on 2nd attempt
         
     # We patch it where it is used
     with patch("chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction", side_effect=stef_side_effect):
@@ -79,6 +86,8 @@ def test_vector_tor_proxy_ignored_for_hf(mock_sys_exit, mock_sleep, mock_chroma,
     from ghost_agent.memory.vector import VectorMemory
     
     with patch("chromadb.utils.embedding_functions.SentenceTransformerEmbeddingFunction") as mock_stef:
+        # embedder returns a trained-model-shaped probe so the self-check passes
+        mock_stef.return_value.return_value = [[1.0] + [0.0] * 383]
         with patch.dict(os.environ, clear=True):
             memory_dir = tmp_path / "memory"
             tor_proxy = "socks5://127.0.0.1:9050"

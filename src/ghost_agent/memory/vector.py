@@ -16,6 +16,47 @@ from ..utils.helpers import get_utc_timestamp
 logger = logging.getLogger("GhostAgent")
 
 
+# The embedder is all-MiniLM-L6-v2 (hardcoded below): 384-d, L2-NORMALISED
+# (its sentence-transformers config ends in a Normalize module). When the
+# model config can't be resolved — HF unreachable and not forced offline —
+# sentence-transformers logs "Creating a new one with mean pooling" and
+# silently builds an UNTRAINED Transformer+Pooling model with NO Normalize.
+# That model still returns 384-d vectors, so nothing errors, but the
+# embeddings are wrong and poison every retrieval. The distinguishing
+# signal: the trained model emits norm≈1.0; the degraded fallback does NOT
+# (observed ~7.7). Probe once at boot and refuse to serve garbage.
+EXPECTED_EMBED_DIM = 384
+_EMBED_NORM_TOLERANCE = 0.1  # |norm - 1.0| must be within this
+
+
+def _embedding_degradation_reason(probe_vector) -> Optional[str]:
+    """Return None if ``probe_vector`` looks like the trained
+    all-MiniLM-L6-v2 output (right dim, L2-normalised, finite), else a
+    human-readable reason the embedder is in the degraded mean-pooling
+    fallback state. Pure — unit-testable without loading a real model."""
+    if probe_vector is None:
+        return "embedder returned no vector for the probe text"
+    try:
+        vec = [float(x) for x in probe_vector]
+    except (TypeError, ValueError):
+        return "embedder returned a non-numeric vector"
+    if len(vec) != EXPECTED_EMBED_DIM:
+        return (
+            f"unexpected embedding dimension {len(vec)} "
+            f"(trained all-MiniLM-L6-v2 is {EXPECTED_EMBED_DIM}-d)"
+        )
+    if not all(x == x and x not in (float("inf"), float("-inf")) for x in vec):
+        return "embedding contains non-finite values"
+    norm = sum(x * x for x in vec) ** 0.5
+    if abs(norm - 1.0) > _EMBED_NORM_TOLERANCE:
+        return (
+            f"embedding is not L2-normalised (norm={norm:.2f}); "
+            "sentence-transformers fell back to an untrained mean-pooling "
+            "model — the real all-MiniLM-L6-v2 config was not loaded"
+        )
+    return None
+
+
 def _bm25_score(query_tokens: list, doc_tokens: list, avg_dl: float, k1: float = 1.5, b: float = 0.75) -> float:
     """Simplified BM25 scoring for a single document against a query.
 
@@ -114,6 +155,7 @@ class VectorMemory:
         self._lock = threading.RLock()
 
         # --- GRANITE4 STYLE: LOCAL EMBEDDINGS ---
+        self.embedding_fn = None
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -130,6 +172,42 @@ class VectorMemory:
                 else:
                     logger.error(f"Failed to load embedding model after {max_retries} attempts.")
                     sys.exit(1)
+
+        # Load exhausted all retries. In production sys.exit() above already
+        # terminated; this guard only matters when sys.exit is patched (tests)
+        # — without it the self-check below would dereference an unset
+        # embedder. Nothing more to set up if there's no embedder.
+        if self.embedding_fn is None:
+            return
+
+        # Embedder self-check: the load above does NOT raise when the model
+        # config can't be resolved — it silently degrades to an untrained
+        # mean-pooling model that returns wrong embeddings. Probe once and
+        # fail loud (the project stance: a stalled agent beats a silently-
+        # wrong one) rather than poison every memory retrieval.
+        try:
+            _probe = self.embedding_fn(["ghost embedder self-check probe"])
+            _probe_vec = _probe[0] if _probe else None
+        except Exception as e:
+            logger.error(f"FATAL: embedder self-check could not embed a probe: {e}")
+            sys.exit(1)
+        _degraded = _embedding_degradation_reason(_probe_vec)
+        if _degraded:
+            logger.error(
+                "FATAL: embedding model loaded in a DEGRADED state — %s. The "
+                "all-MiniLM-L6-v2 cache is likely missing and the model-"
+                "resolution call was blocked (fail-closed Tor) or failed DNS. "
+                "Fix: pre-cache the model by booting ONCE with "
+                "--no-mandatory-tor, or route Hugging Face through the SOCKS "
+                "proxy (HF_HUB_OFFLINE=0). Refusing to serve wrong embeddings.",
+                _degraded,
+            )
+            sys.exit(1)
+        pretty_log(
+            "Memory System",
+            "Embedder self-check OK (trained MiniLM, 384-d L2-normalised)",
+            icon=Icons.VECTOR_EMBED,
+        )
 
         try:
             self.client = chromadb.PersistentClient(

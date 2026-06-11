@@ -110,31 +110,67 @@ class ComplexityClassifier:
         w = rng.normal(0.0, 0.01, size=n_features)
         b = 0.0
 
+        # Sanitise the design matrix: a single non-finite feature value
+        # (e.g. an inf slipping through extract_features) contaminates the
+        # whole matmul and the model diverges to NaN. A non-finite feature
+        # is always a bug, never signal, so map it to the neutral 0.
+        X_arr = np.nan_to_num(X_arr, nan=0.0, posinf=0.0, neginf=0.0)
+
         prev_loss = math.inf
         converged = False
         epochs_run = 0
         final_loss = 0.0
-        for epoch in range(self.epochs):
-            epochs_run = epoch + 1
-            logits = X_arr @ w + b
-            probs = _sigmoid(logits)
-            err = probs - y_arr
-            grad_w = (X_arr.T @ err) / n_samples + self.l2 * w
-            grad_b = float(np.mean(err))
-            w -= self.learning_rate * grad_w
-            b -= self.learning_rate * grad_b
+        # errstate: divergence shows up as over/invalid/divide warnings on
+        # the matmul; we DETECT it explicitly below and bail, so suppress
+        # the warning spam (the production log filled with these). Mirrors
+        # partial_fit / bce_loss.
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            for epoch in range(self.epochs):
+                epochs_run = epoch + 1
+                logits = X_arr @ w + b
+                probs = _sigmoid(logits)
+                err = probs - y_arr
+                grad_w = (X_arr.T @ err) / n_samples + self.l2 * w
+                grad_b = float(np.mean(err))
+                w -= self.learning_rate * grad_w
+                b -= self.learning_rate * grad_b
 
-            # Loss with L2 term
-            eps = 1e-9
-            loss = -float(np.mean(
-                y_arr * np.log(np.clip(probs, eps, 1 - eps))
-                + (1 - y_arr) * np.log(np.clip(1 - probs, eps, 1 - eps))
-            )) + 0.5 * self.l2 * float(np.dot(w, w))
-            final_loss = loss
-            if abs(prev_loss - loss) < self.tol:
-                converged = True
-                break
-            prev_loss = loss
+                # Divergence guard: an LR too large for the feature scale
+                # blows the weights up to inf/NaN (the production failure was
+                # the L2 feedback term `(1 - lr·l2)·w` going < -1 → exponential
+                # blowup). Once any weight is non-finite every subsequent
+                # matmul is poisoned and the model would be hot-swapped into
+                # the live router returning NaN confidences. Check the weights
+                # directly each epoch and bail loudly rather than persist
+                # garbage — RouterTrainer.run() catches this into bail_reason
+                # and the router stays in its safe escalate-all pass-through.
+                if not (np.all(np.isfinite(w)) and math.isfinite(b)):
+                    raise ValueError(
+                        f"router training diverged to non-finite weights at "
+                        f"epoch {epoch + 1} (learning_rate={self.learning_rate} "
+                        "is likely too large for the feature scale); refusing "
+                        "to persist a NaN model"
+                    )
+
+                # Loss with L2 term
+                eps = 1e-9
+                loss = -float(np.mean(
+                    y_arr * np.log(np.clip(probs, eps, 1 - eps))
+                    + (1 - y_arr) * np.log(np.clip(1 - probs, eps, 1 - eps))
+                )) + 0.5 * self.l2 * float(np.dot(w, w))
+                final_loss = loss
+                if abs(prev_loss - loss) < self.tol:
+                    converged = True
+                    break
+                prev_loss = loss
+
+        # Final backstop: never expose a non-finite model even if the loss
+        # check above was somehow skipped (0 epochs, etc.).
+        if not (np.all(np.isfinite(w)) and math.isfinite(b)):
+            raise ValueError(
+                "router training produced non-finite weights; refusing to "
+                "persist a NaN model"
+            )
 
         self.weights_ = w
         self.bias_ = b
@@ -162,6 +198,20 @@ class ComplexityClassifier:
     # -----------------------------------------------------------------
     # Online update (mirrors prm.model.StepValueModel)
     # -----------------------------------------------------------------
+
+    def is_finite(self) -> bool:
+        """True iff the model is fitted with all-finite weights and bias.
+
+        A guard for callers that hot-swap a freshly-trained classifier into
+        the live router (``core.agent`` idle retrain) or load one from disk:
+        a diverged NaN/inf model must NEVER be installed, because
+        ``predict_proba`` would then return NaN and every routing decision
+        would be garbage. Returns False for an unfitted model too."""
+        if self.weights_ is None:
+            return False
+        return bool(np.all(np.isfinite(self.weights_))) and math.isfinite(
+            float(self.bias_)
+        )
 
     def clone(self) -> "ComplexityClassifier":
         """Copy with the same hyperparameters and weights — used by a
@@ -202,6 +252,12 @@ class ComplexityClassifier:
                 grad_b = float(np.mean(err))
                 w -= rate * grad_w
                 b -= rate * grad_b
+        # Reject a diverged online step rather than poisoning the live
+        # model: keep the prior (finite) weights if the update went
+        # non-finite. The caller's holdout BCE gate would also reject it,
+        # but this keeps the model self-consistent regardless of caller.
+        if not (np.all(np.isfinite(w)) and math.isfinite(b)):
+            return self
         self.weights_ = w
         self.bias_ = b
         return self
@@ -232,6 +288,12 @@ class ComplexityClassifier:
             raise RuntimeError("classifier not fitted")
         vec = self._vectorize(x)
         logit = float(np.dot(self.weights_, vec) + self.bias_)
+        if not math.isfinite(logit):
+            # Defensive: a non-finite model should never reach here (fit /
+            # load / partial_fit all reject one), but if it does, return the
+            # neutral 0.5 so the dispatcher escalates rather than acting on
+            # a NaN. Never let NaN reach a routing decision.
+            return 0.5
         return float(_sigmoid(logit))
 
     def predict(self, x: Any, *, decision_threshold: float = 0.5) -> Tuple[str, float]:
@@ -295,6 +357,15 @@ class ComplexityClassifier:
         clf.feature_names_ = names
         if raw.get("report"):
             clf.report_ = TrainingReport(**raw["report"])
+        # Reject a persisted NaN/inf checkpoint (e.g. one written by a
+        # pre-guard training run that diverged). Loading it would silently
+        # poison routing; the boot loader catches this and falls back to
+        # the safe escalate-all pass-through dispatcher.
+        if not clf.is_finite():
+            raise ValueError(
+                f"router checkpoint at {p} has non-finite weights — refusing "
+                "to load a corrupt (diverged) model"
+            )
         return clf
 
     # -----------------------------------------------------------------

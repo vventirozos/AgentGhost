@@ -1830,17 +1830,27 @@ class GhostAgent:
                             trajectories=traj_collector.iter_trajectories(),
                             save_path=save_path,
                         )
-                        if report.fit_succeeded and trainer.classifier is not None:
+                        _new_clf = trainer.classifier
+                        if (report.fit_succeeded and _new_clf is not None
+                                and _new_clf.is_finite()):
                             # Hot-swap: the dispatcher re-reads .classifier /
                             # .disabled on every route() call, so this takes
-                            # effect immediately (no restart).
-                            dispatcher.classifier = trainer.classifier
+                            # effect immediately (no restart). The is_finite()
+                            # gate is defence-in-depth — fit() already raises on
+                            # divergence, but a NaN classifier must NEVER reach
+                            # the live router (it would return NaN confidences).
+                            dispatcher.classifier = _new_clf
                             dispatcher.disabled = False
                             pretty_log(
                                 "Router Retrain",
                                 f"classifier refit on idle: {report.summary()} · "
                                 f"router now routing (was escalate-all)",
                                 icon=Icons.BRAIN_PLAN,
+                            )
+                        elif _new_clf is not None and not _new_clf.is_finite():
+                            logger.warning(
+                                "Router idle retrain produced a non-finite model "
+                                "— NOT hot-swapping; router stays escalate-all."
                             )
                         else:
                             logger.debug("Router idle retrain skipped: %s", report.bail_reason or "unknown")

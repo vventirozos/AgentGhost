@@ -42,6 +42,18 @@ _JUNK_DOMAINS = [
 # ddgs re-sorts by engine.priority internally.
 _TOR_BACKENDS = "mojeek,duckduckgo,yandex,brave,google"
 
+# Per-request ddgs timeout, in seconds. CRITICAL for Tor reliability and
+# measured directly: the engine that actually returns results over Tor
+# (usually mojeek) responds in ~10-18s through a Tor circuit, while the
+# others fail fast (~1-6s). The previous 8s ceiling KILLED mojeek mid-
+# request — producing "error sending request for url (mojeek...)" — so
+# EVERY engine came back empty and the search failed even though results
+# were reachable; the agent then burned minutes on retries that could
+# never win. 18s comfortably clears mojeek's Tor latency; the fast-failing
+# engines still fail fast, so a successful search costs ~12-18s and only an
+# all-circuits-blocked search pays the full timeout. Do not drop below ~15.
+_DDGS_TOR_TIMEOUT = 18
+
 # Small in-process TTL cache so the model's habit of firing many
 # near-identical queries in one turn doesn't re-pay the full Tor round
 # trip each time. Keyed on the normalized (sanitized, lower-cased) query.
@@ -240,7 +252,7 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         try:
             attempt_proxy = _proxy_for_attempt(tor_proxy, query, attempt)
             def run():
-                kwargs: Dict[str, Any] = {"timeout": 8}
+                kwargs: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
                 if attempt_proxy:
                     kwargs["proxy"] = attempt_proxy
                 with DDGS(**kwargs) as ddgs:
@@ -280,7 +292,7 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         try:
             attempt_proxy = _proxy_for_attempt(tor_proxy, reformulated, 10 + ridx)
             def run_reformulated():
-                kwargs_r: Dict[str, Any] = {"timeout": 8}
+                kwargs_r: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
                 if attempt_proxy:
                     kwargs_r["proxy"] = attempt_proxy
                 with DDGS(**kwargs_r) as ddgs:
@@ -302,7 +314,15 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
         except Exception:
             continue
 
-    return "ERROR: DuckDuckGo returned ZERO results after query reformulation. This usually means the query was too specific or the search engine is blocking the request (CAPTCHA/Tor). TRY A COMPLETELY DIFFERENT APPROACH."
+    return (
+        "ERROR: web search returned ZERO results across all engines and "
+        "circuits, even after reformulation. Likely the query was too "
+        "specific/long or every Tor exit was transiently blocked. DO NOT "
+        "retry the same search. Instead: (a) drop to 2-4 PLAIN keywords (no "
+        "quotes/operators/years), or (b) if you already have enough context, "
+        "proceed with your own knowledge and state that web search was "
+        "unavailable, rather than looping on more searches."
+    )
 
 async def tool_search(query: Optional[str] = None, anonymous: bool = False, tor_proxy: str = None, **kwargs):
     if not query:
@@ -372,7 +392,7 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
         try:
             attempt_proxy = _proxy_for_attempt(tor_proxy, query, attempt)
             def run():
-                kwargs: Dict[str, Any] = {"timeout": 8}
+                kwargs: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
                 if attempt_proxy:
                     kwargs["proxy"] = attempt_proxy
                 with DDGS(**kwargs) as ddgs:

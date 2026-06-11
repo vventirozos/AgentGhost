@@ -35,6 +35,7 @@
     <li>Library index JSON at <code>memory_dir/library_index.json</code> (atomic temp + <code>os.replace</code>).</li>
     <li>Embedding via a local <code>SentenceTransformerEmbeddingFunction</code> (<code>all-MiniLM-L6-v2</code>).</li>
   </ul>
+  <p class="note"><strong>Boot self-check (2026-06-11):</strong> sentence-transformers does not raise when it can't resolve the model config (HF unreachable / not forced offline — common under default-on fail-closed Tor); it silently builds an untrained mean-pooling model that returns non-normalised 384-d vectors and poisons retrieval. <code>__init__</code> now probes the embedder once and <code>sys.exit(1)</code>s with a remediation message if the output isn't the trained, L2-normalised model (<code>_embedding_degradation_reason</code>). Fix on a cold install: pre-cache the model by booting once with <code>--no-mandatory-tor</code>.</p>
 
   <h2>Record schema</h2>
   <table>
