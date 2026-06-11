@@ -63,7 +63,7 @@
   <table>
     <thead><tr><th>Variable</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
-      <tr><td><code>GHOST_API_KEY</code></td><td><code>ghost-secret-123</code></td><td>Value matched against the <code>X-Ghost-Key</code> header on every authed route. Mandatory for <code>interface/server.py</code>; agent itself ships a default but you should override.</td></tr>
+      <tr><td><code>GHOST_API_KEY</code></td><td><em>unset</em></td><td>Value matched against the <code>X-Ghost-Key</code> header on every authed route. Mandatory for <code>interface/server.py</code>. The agent ships <strong>no default key</strong>: unset on a loopback bind means auth disabled; unset on a non-loopback bind refuses to boot (pass <code>--api-key ''</code> to explicitly disable auth on a trusted network).</td></tr>
       <tr><td><code>GHOST_HOME</code></td><td><code>~/ghost_llamacpp</code></td><td>Base directory; agent creates <code>sandbox/</code> and <code>system/memory/</code> beneath it.</td></tr>
       <tr><td><code>GHOST_MODEL</code></td><td><code>qwen-3.6-35b-a3</code></td><td>Default model name advertised on Ollama-compatibility routes.</td></tr>
       <tr><td><code>GHOST_SANDBOX_DIR</code></td><td>derived from <code>GHOST_HOME</code></td><td>Host directory bind-mounted into the container at <code>/workspace</code>.</td></tr>

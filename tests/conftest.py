@@ -98,6 +98,32 @@ def inject_global_stream_adapter(monkeypatch):
 
     monkeypatch.setattr(GhostAgent, '__init__', wrapped_init)
 
+@pytest.fixture(scope="session", autouse=True)
+def _no_mock_path_residue():
+    """Session safety net: fail loudly if any test splattered a mock-derived
+    directory tree into the repo root.
+
+    `Path(MagicMock().memory_dir)` silently yields a real relative path like
+    `MagicMock/mock.memory_dir/<id>`; a subsequent `.mkdir()` then creates it
+    under the CWD. Production code now rejects mock base dirs (see
+    AcquiredSkillManager), but this catches any new offender immediately
+    instead of letting junk accumulate unnoticed across runs."""
+    repo_root = Path(__file__).resolve().parent.parent
+    leaks = ("MagicMock", "Mock")
+    for name in leaks:
+        shutil.rmtree(repo_root / name, ignore_errors=True)
+    yield
+    stragglers = [repo_root / name for name in leaks if (repo_root / name).exists()]
+    for p in stragglers:
+        shutil.rmtree(p, ignore_errors=True)
+    assert not stragglers, (
+        f"A test created mock-derived path residue: {stragglers}. A bare "
+        "MagicMock was used where a real directory path was expected (its "
+        "`__fspath__` stringifies to a real relative path). Use tmp_path / "
+        "temp_dirs instead."
+    )
+
+
 @pytest.fixture
 def temp_dirs():
     base = Path(tempfile.mkdtemp())
@@ -129,3 +155,4 @@ def mock_context(temp_dirs, mock_llm):
     context.scratchpad.list_all.return_value = "Scratchpad Data"
     
     return context
+

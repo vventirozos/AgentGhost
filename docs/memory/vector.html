@@ -54,7 +54,8 @@
   <table>
     <thead><tr><th>Method</th><th>Behaviour</th></tr></thead>
     <tbody>
-      <tr><td><code>add(text, meta)</code></td><td>Insert. MD5 dedup; skip if &lt; 5 chars.</td></tr>
+      <tr><td><code>add(text, meta)</code></td><td>Insert. MD5 dedup; skip if &lt; 5 chars. Every <code>_PRUNE_CHECK_EVERY</code> (200) adds, triggers <code>_prune_if_needed</code>.</td></tr>
+      <tr><td><code>_prune_if_needed()</code></td><td>Bounded growth: when the open-ended prunable tiers (<code>auto</code> / <code>manual</code>) exceed <code>MAX_PRUNABLE_MEMORIES</code> (5000), evict the lowest-utility entries — fewest <code>retrieval_count</code>, then oldest <code>last_accessed</code> (the same spaced-repetition signal the ranker uses). Documents, skill twins and episodes are exempt (owned by their own capped stores). Amortised: the cap is probed once per 200 adds, not per write. Never raises.</td></tr>
       <tr><td><code>smart_update(text, type_label)</code></td><td>Vector dedup with distance &lt; 0.50 → if existing similar memory, delete + re-add atomically under lock.</td></tr>
       <tr><td><code>search(query, inject_identity)</code></td><td>Hybrid search: optional dual-query (user query + identity probe) → wide candidate pool (30) → priority filter → BM25 re-rank → top-12 with section labels.</td></tr>
       <tr><td><code>search_advanced(query, limit)</code></td><td>Raw results + retrieval-count bump.</td></tr>

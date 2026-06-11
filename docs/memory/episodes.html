@@ -61,7 +61,8 @@
   </table>
 
   <h2>Retention</h2>
-  <p><code>MAX_EPISODES = 500</code>. When exceeded the oldest non-lesson, non-consolidated episodes are deleted first. <code>MAX_ACTIONS_PER_EPISODE = 20</code>.</p>
+  <p><code>MAX_EPISODES = 500</code>. When exceeded the oldest non-lesson, non-consolidated episodes are deleted first; a fallback then deletes the oldest of any kind so the cap is always enforced. <code>MAX_ACTIONS_PER_EPISODE = 20</code>.</p>
+  <p><strong>Orphan reaping (2026-06-11):</strong> <code>episode_actions</code> has a declared but un-enforced FK (no cascade), so deleting an episode leaves its action rows orphaned. <code>record_episode</code> now reaps orphans <em>unconditionally</em> on every write via an indexed anti-join (<code>idx_ea_episode</code>) — not only when an insert breaches the cap, as before — so orphans from non-cap delete paths (consolidation, external deletes) can no longer accumulate unboundedly. Covered by <code>tests/test_memory_growth_bounds.py</code>.</p>
 
   <h2>Public API</h2>
   <table>

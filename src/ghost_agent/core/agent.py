@@ -347,58 +347,16 @@ def _select_visual_evidence(messages: list, last_user_content: str,
     return before_img, after_img
 
 
-def _note_repeated_failure(sigs: dict, fname, error, threshold: int = 3):
-    """Record one structural tool failure and report whether the SAME
-    failure has now recurred enough times to be a persistent loop.
-
-    The signature is ``tool | whitespace-normalised error head`` — stable
-    across byte-identical repeats (e.g. the same "'x' not found." every
-    turn) but distinct for different tools/errors. Pure aside from mutating
-    the caller-owned ``sigs`` dict, so it is unit-testable. Returns
-    ``(signature, count, is_persistent)``. Used to freeze the strike-decay
-    once a loop is detected — otherwise an interleaved success cancels the
-    strike and the cap never fires."""
-    sig = f"{fname or '?'}|" + re.sub(
-        r"\s+", " ", str(error or "")[:160].lower()
-    ).strip()
-    count = sigs.get(sig, 0) + 1
-    sigs[sig] = count
-    return sig, count, count >= threshold
-
-
-def _action_result_fingerprint(result: str) -> str:
-    """Whitespace-normalised, bounded fingerprint of a tool result.
-
-    Used by ``_note_repeated_action`` to decide whether two SUCCESSFUL
-    calls produced "the same observation". Whitespace-only normalisation
-    (digits intentionally kept) so a result whose content genuinely
-    changed — a re-read that now returns edited bytes, a counter that
-    advanced — looks different and does NOT count as a no-progress
-    repeat. Bounded slice keeps it cheap and stable."""
-    norm = re.sub(r"\s+", " ", str(result or "")).strip().lower()[:600]
-    return hashlib.sha1(norm.encode("utf-8", "ignore")).hexdigest()[:12]
-
-
-def _note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 3):
-    """Companion to ``_note_repeated_failure`` for the INVERSE pathology:
-    a turn loop where every tool call SUCCEEDS but the agent keeps taking
-    the same action against the same target and getting the same result —
-    the ungrounded-verification loop (double-click the icon → screenshot →
-    "no change" → repeat). ``_note_repeated_failure`` can't see this
-    because nothing errors and the strike counter never moves; the
-    reasoning-similarity breaker misses it because the prose phrasing
-    varies turn to turn.
-
-    Keyed by ``tool | target | result-fingerprint`` — so it fires only on
-    a genuine no-progress repeat (same action, same target, same
-    observation), not on an action whose target or result is changing.
-    Pure aside from mutating the caller-owned ``sigs`` dict. Returns
-    ``(signature, count, tripped)`` where ``tripped`` is count >=
-    threshold."""
-    sig = f"{fname or '?'}|{target or ''}|{result_fp or ''}"
-    count = sigs.get(sig, 0) + 1
-    sigs[sig] = count
-    return sig, count, count >= threshold
+# Per-request loop-detection accounting lives in core.strikes. These names
+# are re-exported here because existing tests import them from
+# ghost_agent.core.agent; the StrikeLedger (also in core.strikes) bundles
+# the request-scoped state the turn loop used to track as bare locals.
+from .strikes import (  # noqa: E402
+    StrikeLedger,
+    note_repeated_failure as _note_repeated_failure,
+    note_repeated_action as _note_repeated_action,
+    action_result_fingerprint as _action_result_fingerprint,
+)
 
 
 def _reconstruct_executed_code(
@@ -3469,9 +3427,12 @@ class GhostAgent:
                 # Keyed by (tool, normalised-error) signature; once a signature
                 # recurs, decay is frozen so genuine accumulation resumes and
                 # the loop-breaker can fire, and the model is told ONCE to stop.
-                repeated_failure_sigs: dict = {}
-                persistent_failure_seen = False
-                persistent_warned_sigs: set = set()
+                # All of this request-scoped state — the failure/action
+                # signature dicts, the persistent-failure freeze flag + warned
+                # set, and the consecutive-clean-success counter that unfreezes
+                # the decay after a genuine pivot — lives in one StrikeLedger
+                # (core.strikes) instead of five interacting locals.
+                strikes = StrikeLedger()
                 # Counts CONSECUTIVE `system_parse_error` events across turns
                 # within this request. Reset on any successful parse. After
                 # threshold (≥2) we pivot the recovery prompt to suggest
@@ -3553,8 +3514,9 @@ class GhostAgent:
                 # thrash. Keyed by (tool, target, result-fingerprint) via
                 # `_note_repeated_action`; on the first trip we force a
                 # grounded final answer, escalating to force_stop if it
-                # somehow continues.
-                repeated_action_sigs: dict = {}
+                # somehow continues. The (tool, target, result) signature
+                # dict lives on the StrikeLedger above; only the "already
+                # steered once" set is loop-local.
                 repeated_action_steered: set = set()
 
                 # Self-play can cap a single attempt's turn count via
@@ -4593,7 +4555,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
                                 if getattr(self.context, 'journal', None):
 
-                                    await asyncio.to_thread(self.context.journal.append, 'smart_memory', {'text': recent_arc, 'model': stream_model})
+                                    await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': stream_model})
 
                             # --- EXTRACT & LOG INTERNAL THINKING (STREAM) ---
                             think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', full_content, flags=re.DOTALL | re.IGNORECASE)
@@ -4622,7 +4584,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     # every complex/failing turn.
                                     if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
 
-                                        await asyncio.to_thread(self.context.journal.append, 'post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
+                                        await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
                                     await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
 
                             # Retrieval feedback loop: credit lessons that
@@ -5485,7 +5447,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     args_val = t_data.get("arguments", {})
                                     if isinstance(args_val, str):
                                         try: args_val = json.loads(args_val, strict=False)
-                                        except: args_val = {}
+                                        except Exception:
+                                            # Never silently dispatch with empty args — the
+                                            # tool's "missing argument" error reads like the
+                                            # MODEL's mistake and can trap it in a retry loop.
+                                            pretty_log(
+                                                "Agent Parser",
+                                                f"Unparseable JSON arguments for tool "
+                                                f"'{t_data.get('name')}' — dispatching empty "
+                                                f"args (raw head: {args_val[:120]!r})",
+                                                level="WARNING", icon=Icons.WARN,
+                                            )
+                                            args_val = {}
 
                                     # Un-nest hallucinatory wrappers like <arguments> or <parameters>
                                     if isinstance(args_val, dict) and len(args_val) == 1:
@@ -5719,7 +5692,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     args_val = possible_json.get("arguments", {})
                                     if isinstance(args_val, str):
                                         try: args_val = json.loads(args_val)
-                                        except: pass
+                                        except Exception:
+                                            pretty_log(
+                                                "Agent Parser",
+                                                f"Raw-JSON tool call for "
+                                                f"'{possible_json.get('name')}' has non-JSON "
+                                                f"arguments — passing the raw string through",
+                                                level="WARNING", icon=Icons.WARN,
+                                            )
                                     tool_calls.append({
                                         "id": f"call_{uuid.uuid4().hex[:8]}",
                                         "type": "function",
@@ -6072,7 +6052,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             clean_ai = re.sub(r'```.*?```', '', final_ai_content, flags=re.DOTALL)
                             recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
                             if getattr(self.context, 'journal', None):
-                                await asyncio.to_thread(self.context.journal.append, 'smart_memory', {'text': recent_arc, 'model': model})
+                                await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': model})
                         break
 
                     # Capture the end-of-prior-iteration boundary so we
@@ -6111,7 +6091,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             try:
                                 args_dict = json.loads(tc["function"]["arguments"], strict=False)
                                 tc["function"]["arguments"] = json.dumps(unescape_xml_values(args_dict))
-                            except: pass
+                            except Exception:
+                                pretty_log(
+                                    "Agent Parser",
+                                    f"Arguments for tool "
+                                    f"'{tc.get('function', {}).get('name')}' are not valid "
+                                    f"JSON at the unescape step — leaving them raw",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
 
                     tool_tasks, tool_call_metadata = [], []
                     tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
@@ -6688,8 +6675,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 ("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error")
                             ) or "Traceback" in str_res
                             if fname and not is_mutating and not _res_is_error:
-                                _asig, _acnt, _atrip = _note_repeated_action(
-                                    repeated_action_sigs, fname, ptarget,
+                                _asig, _acnt, _atrip = strikes.note_action(
+                                    fname, ptarget,
                                     _action_result_fingerprint(str_res),
                                 )
                                 if _atrip and (_noprogress_trip is None or _acnt > _noprogress_trip[1]):
@@ -6865,6 +6852,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 )})
 
                         if turn_has_failure:
+                            # Any failure (transient or structural) breaks the
+                            # consecutive-clean-success streak that unfreezes decay.
+                            strikes.reset_clean_streak()
                             # Classify the failure to route to the right budget
                             from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context
                             failure_class, failure_match = classify_tool_failure(last_error_res or last_error_preview)
@@ -6883,33 +6873,32 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # and tell the model ONCE to stop retrying — the
                                 # live tool result is authoritative over any stale
                                 # context/system-state hint that says otherwise.
-                                _sig, _cnt, _persist = _note_repeated_failure(
-                                    repeated_failure_sigs, fname, last_error_preview
+                                _sig, _cnt, _persist, _first_warn = strikes.note_failure(
+                                    fname, last_error_preview
                                 )
-                                if _persist:
-                                    persistent_failure_seen = True
-                                    if _sig not in persistent_warned_sigs:
-                                        persistent_warned_sigs.add(_sig)
-                                        pretty_log(
-                                            "Loop Breaker",
-                                            f"Same failure ×{_cnt} "
-                                            f"({fname}) — freezing strike decay & redirecting.",
-                                            level="WARNING", icon=Icons.STOP,
-                                        )
-                                        messages.append({"role": "user", "content": (
-                                            f"SYSTEM ALERT: This exact action has now failed "
-                                            f"{_cnt} times with the SAME error: "
-                                            f"{str(last_error_preview)[:160]}. STOP repeating it — "
-                                            "retrying will not change the result. The live tool "
-                                            "result and the current sandbox listing are AUTHORITATIVE "
-                                            "over any prior context, memory, workspace narrative, or "
-                                            "DYNAMIC SYSTEM STATE hint that suggested otherwise. Pick a "
-                                            "DIFFERENT action now: if a file is missing, CREATE it with "
-                                            "file_system(operation='write', …) or choose an existing "
-                                            "file from the listing; if an approach is wrong, change it."
-                                        )})
+                                if _first_warn:
+                                    pretty_log(
+                                        "Loop Breaker",
+                                        f"Same failure ×{_cnt} "
+                                        f"({fname}) — freezing strike decay & redirecting.",
+                                        level="WARNING", icon=Icons.STOP,
+                                    )
+                                    messages.append({"role": "user", "content": (
+                                        f"SYSTEM ALERT: This exact action has now failed "
+                                        f"{_cnt} times with the SAME error: "
+                                        f"{str(last_error_preview)[:160]}. STOP repeating it — "
+                                        "retrying will not change the result. The live tool "
+                                        "result and the current sandbox listing are AUTHORITATIVE "
+                                        "over any prior context, memory, workspace narrative, or "
+                                        "DYNAMIC SYSTEM STATE hint that suggested otherwise. Pick a "
+                                        "DIFFERENT action now: if a file is missing, CREATE it with "
+                                        "file_system(operation='write', …) or choose an existing "
+                                        "file from the listing; if an approach is wrong, change it."
+                                    )})
 
                             last_was_failure = True
+                            # strikes.note_failure already reset the clean-success
+                            # streak; this assignment is implicit in the ledger.
 
                             # Check for tool fallback suggestions
                             from ..tools.fallback_chains import get_fallback_hint
@@ -6966,13 +6955,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # Only reset transient failures on success; structural
                             # failures require consecutive successes to decay.
                             transient_failure_count = 0
-                            # Freeze the decay once a SAME-failure loop has been
-                            # detected: otherwise an interleaved success (e.g. the
-                            # auto sandbox-listing that follows every failed read)
-                            # cancels the strike and the cap never fires. With the
-                            # decay frozen, the recurring failure accumulates to
-                            # the cap and the loop-breaker can stop the request.
-                            if execution_failure_count > 0 and not persistent_failure_seen:
+                            # Record a clean success. The ledger freezes decay once
+                            # a SAME-failure loop is detected (otherwise an
+                            # interleaved success — e.g. the auto sandbox-listing
+                            # after a failed read — cancels the strike and the cap
+                            # never fires). The freeze is NOT permanent: 3
+                            # consecutive clean successes mean a genuine pivot, so
+                            # note_clean_success unfreezes it. Signature counts are
+                            # kept, so the same failure re-freezes on recurrence.
+                            if strikes.note_clean_success():
+                                pretty_log(
+                                    "Loop Breaker",
+                                    "Strike decay unfrozen after 3 consecutive clean successes.",
+                                    icon=Icons.OK,
+                                )
+                            if execution_failure_count > 0 and not strikes.decay_frozen:
                                 execution_failure_count = max(0, execution_failure_count - 1)
 
                             # Terminal tools: `self_play` and `dream_mode`
@@ -7504,7 +7501,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # producer has the same gate; both must agree.
                         if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
 
-                            await asyncio.to_thread(self.context.journal.append, 'post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
+                            await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
                             await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)
 
                 # Retrieval feedback: a clean, non-failing turn credits
@@ -8358,6 +8355,36 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 pass
 
         task.add_done_callback(_log_post_turn_reflection_result)
+
+    async def _journal_append_safe(self, kind: str, payload: dict,
+                                   timeout: float = 10.0) -> None:
+        """Bounded, best-effort journal append.
+
+        The journal write is a sync file op pushed to a thread; without a
+        timeout a hung disk parks the event loop awaiting the thread until
+        the biological watchdog's opaque "activity timeout" fires. Journal
+        entries are an idle-time work queue, never load-bearing for the
+        turn — so on timeout/error we log WHICH write was dropped and move
+        on instead of stalling the request.
+        """
+        journal = getattr(self.context, "journal", None)
+        if journal is None:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(journal.append, kind, payload),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            pretty_log(
+                "Journal Stalled",
+                f"append('{kind}') exceeded {timeout:.0f}s — entry dropped "
+                "(journal I/O hung?)",
+                level="WARNING", icon=Icons.WARN,
+            )
+        except Exception as exc:
+            logger.warning("journal append('%s') failed: %s: %s",
+                           kind, type(exc).__name__, exc)
 
     async def _record_episode_safe(self, user_text, tools, ai_text) -> None:
         """Best-effort episodic-memory write for a completed significant turn.

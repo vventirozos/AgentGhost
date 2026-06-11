@@ -32,14 +32,16 @@ _REQUIRED_FLAGS: dict[str, str] = {
 }
 
 
-# Forced ONLY under --mandatory-tor. A fail-closed agent must not make the
+# Forced under mandatory-tor (the DEFAULT; opt out with --no-mandatory-tor
+# or GHOST_MANDATORY_TOR=0). A fail-closed agent must not make the
 # cleartext Hugging Face model-resolution / version-check call that
 # sentence-transformers / huggingface_hub fire at load time even for a
 # CACHED model — that call hits a public HTTPS endpoint and the egress
 # guard (correctly) blocks it, which otherwise stalls the embedder boot.
 # Ghost's embedder is local-only by design, so a cache-only load is the
-# correct behaviour; pre-download the model once if a cold install turns
-# on --mandatory-tor. Applied with setdefault so an operator who has
+# correct behaviour; on a cold install either pre-download the model once
+# (run with --no-mandatory-tor) or pass GHOST_MANDATORY_TOR=0 for that one
+# boot. Applied with setdefault so an operator who has
 # deliberately routed HF through the SOCKS proxy can still override.
 _OFFLINE_FLAGS: dict[str, str] = {
     "HF_HUB_OFFLINE": "1",
@@ -49,15 +51,22 @@ _OFFLINE_FLAGS: dict[str, str] = {
 
 
 def _mandatory_tor_requested() -> bool:
-    """True when fail-closed Tor is being requested. Checked from argv
-    (populated at import time, before the heavy HF imports) plus an env
-    escape hatch for non-CLI entry points."""
-    if os.environ.get("GHOST_MANDATORY_TOR", "").lower() in ("1", "true", "yes"):
-        return True
+    """True when fail-closed Tor is in effect — which is the DEFAULT.
+    Checked from argv (populated at import time, before the heavy HF
+    imports) plus an env escape hatch for non-CLI entry points.
+    Precedence: explicit argv flag > GHOST_MANDATORY_TOR env > default ON."""
     try:
-        return "--mandatory-tor" in sys.argv
+        argv = list(sys.argv)
     except Exception:
+        argv = []
+    if "--no-mandatory-tor" in argv:
         return False
+    if "--mandatory-tor" in argv:
+        return True
+    env = os.environ.get("GHOST_MANDATORY_TOR", "").lower()
+    if env in ("0", "false", "no"):
+        return False
+    return True
 
 
 def ensure_disabled() -> None:

@@ -1,0 +1,120 @@
+"""StrikeLedger — the request-scoped loop-detection seam extracted from
+core.agent. Bundles the failure/action signature dicts, the decay-freeze
+flag + warned set, and the consecutive-clean-success counter the turn loop
+used to track as five interacting locals. Behaviour must match the inlined
+version exactly."""
+
+from ghost_agent.core.strikes import (
+    StrikeLedger,
+    action_result_fingerprint,
+    note_repeated_action,
+    note_repeated_failure,
+)
+
+# the old private names must still import from core.agent (tests rely on it)
+from ghost_agent.core.agent import (
+    _note_repeated_failure,
+    _note_repeated_action,
+    _action_result_fingerprint,
+)
+
+
+def test_reexports_are_the_same_callables():
+    assert _note_repeated_failure is note_repeated_failure
+    assert _note_repeated_action is note_repeated_action
+    assert _action_result_fingerprint is action_result_fingerprint
+
+
+def test_note_failure_freezes_after_threshold():
+    led = StrikeLedger()
+    sig1 = led.note_failure("read", "'x' not found")
+    sig2 = led.note_failure("read", "'x' not found")
+    assert not led.decay_frozen  # only 2 occurrences
+    sig3 = led.note_failure("read", "'x' not found")
+    assert led.decay_frozen
+    # is_first_warning fires exactly once for the signature
+    assert sig3[3] is True
+    sig4 = led.note_failure("read", "'x' not found")
+    assert sig4[3] is False
+
+
+def test_distinct_failures_tracked_separately():
+    led = StrikeLedger()
+    for _ in range(3):
+        led.note_failure("read", "'a' not found")
+    assert led.decay_frozen
+    led2 = StrikeLedger()
+    led2.note_failure("read", "'a' not found")
+    led2.note_failure("read", "'b' not found")
+    led2.note_failure("execute", "boom")
+    assert not led2.decay_frozen  # no single signature hit 3
+
+
+def test_clean_success_unfreezes_after_three():
+    led = StrikeLedger()
+    for _ in range(3):
+        led.note_failure("read", "'x' not found")
+    assert led.decay_frozen
+    assert led.note_clean_success() is False  # 1
+    assert led.note_clean_success() is False  # 2
+    assert led.note_clean_success() is True  # 3 → unfreeze
+    assert not led.decay_frozen
+
+
+def test_failure_resets_clean_streak():
+    led = StrikeLedger()
+    for _ in range(3):
+        led.note_failure("read", "'x' not found")
+    led.note_clean_success()
+    led.note_clean_success()
+    # a structural failure breaks the streak (note_failure does not reset,
+    # but reset_clean_streak does — the loop calls it on ANY failure)
+    led.reset_clean_streak()
+    led.note_failure("read", "'x' not found")
+    assert led.consecutive_clean_successes == 0
+    # need a fresh run of 3 to unfreeze again
+    assert led.note_clean_success() is False
+    assert led.note_clean_success() is False
+    assert led.note_clean_success() is True
+
+
+def test_transient_failure_breaks_streak_via_reset():
+    led = StrikeLedger()
+    for _ in range(3):
+        led.note_failure("read", "'x' not found")
+    led.note_clean_success()
+    led.note_clean_success()
+    led.reset_clean_streak()  # simulates a transient (non-structural) failure
+    assert led.consecutive_clean_successes == 0
+    assert not led.decay_frozen or led.decay_frozen  # still frozen
+    assert led.decay_frozen
+
+
+def test_recurring_failure_refreezes_after_unfreeze():
+    led = StrikeLedger()
+    for _ in range(3):
+        led.note_failure("read", "'x' not found")
+    for _ in range(3):
+        led.note_clean_success()
+    assert not led.decay_frozen
+    # the SAME failure recurs once more: count is already ≥3, so it re-freezes
+    led.reset_clean_streak()
+    sig = led.note_failure("read", "'x' not found")
+    assert sig[2] is True  # is_persistent
+    assert led.decay_frozen
+
+
+def test_note_action_trips_on_repeat():
+    led = StrikeLedger()
+    fp = action_result_fingerprint("no change")
+    assert led.note_action("browser", ".icon", fp)[2] is False
+    assert led.note_action("browser", ".icon", fp)[2] is False
+    assert led.note_action("browser", ".icon", fp)[2] is True
+
+
+def test_note_action_distinct_targets_dont_trip():
+    led = StrikeLedger()
+    fp = action_result_fingerprint("ok")
+    for n in range(5):
+        tripped = led.note_action("browser", f".icon-{n}", fp)[2]
+        assert tripped is False

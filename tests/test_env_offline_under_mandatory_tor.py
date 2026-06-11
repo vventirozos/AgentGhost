@@ -1,5 +1,6 @@
-"""--mandatory-tor must force HF offline so the cached embedder loads
-without the (guard-blocked) cleartext model-resolution network call."""
+"""Mandatory-tor (the DEFAULT) must force HF offline so the cached embedder
+loads without the (guard-blocked) cleartext model-resolution network call.
+Opt-outs: --no-mandatory-tor on argv, or GHOST_MANDATORY_TOR=0."""
 
 import os
 import sys
@@ -26,10 +27,29 @@ def test_requested_via_envvar(monkeypatch):
     assert env._mandatory_tor_requested() is True
 
 
-def test_not_requested(monkeypatch):
+def test_default_is_on(monkeypatch):
+    # Fail-closed by default: nothing on argv, no env var → requested.
     monkeypatch.setattr(sys, "argv", ["main", "--port", "8000"])
     monkeypatch.delenv("GHOST_MANDATORY_TOR", raising=False)
+    assert env._mandatory_tor_requested() is True
+
+
+def test_optout_via_argv(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main", "--no-mandatory-tor", "--port", "8000"])
+    monkeypatch.delenv("GHOST_MANDATORY_TOR", raising=False)
     assert env._mandatory_tor_requested() is False
+
+
+def test_optout_via_envvar(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main", "--port", "8000"])
+    monkeypatch.setenv("GHOST_MANDATORY_TOR", "0")
+    assert env._mandatory_tor_requested() is False
+
+
+def test_explicit_argv_beats_env_optout(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main", "--mandatory-tor"])
+    monkeypatch.setenv("GHOST_MANDATORY_TOR", "0")
+    assert env._mandatory_tor_requested() is True
 
 
 def test_offline_forced_under_mandatory_tor(monkeypatch):
@@ -44,12 +64,12 @@ def test_offline_forced_under_mandatory_tor(monkeypatch):
     assert os.environ.get("ANONYMIZED_TELEMETRY") == "False"
 
 
-def test_offline_not_forced_without_mandatory_tor(monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["main", "--port", "8000"])
+def test_offline_not_forced_when_opted_out(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["main", "--no-mandatory-tor", "--port", "8000"])
     monkeypatch.delenv("GHOST_MANDATORY_TOR", raising=False)
     _clear_offline(monkeypatch)
     env.ensure_disabled()
-    # cold-install model download must still be possible in normal mode
+    # cold-install model download must still be possible when opted out
     assert os.environ.get("HF_HUB_OFFLINE") is None
     # telemetry hardening still applies
     assert os.environ.get("ANONYMIZED_TELEMETRY") == "False"

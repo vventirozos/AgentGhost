@@ -24,7 +24,7 @@
   <p class="subtitle">All HTTP routes mounted on the FastAPI app. Ollama-compatible plus Ghost-specific.</p>
 
   <h2>Auth</h2>
-  <p>Every authed route validates the <code>X-Ghost-Key</code> header against <code>request.app.state.args.api_key</code> (which defaults to <code>$GHOST_API_KEY</code> or <code>ghost-secret-123</code>).</p>
+  <p>Every authed route validates the <code>X-Ghost-Key</code> header against <code>request.app.state.args.api_key</code> (which defaults to <code>$GHOST_API_KEY</code>; there is no hardcoded fallback key). An unset or empty key disables auth — allowed silently only on loopback binds. A non-loopback bind with an <em>unset</em> key refuses to boot (<code>enforce_api_key_policy</code> in <code>main.py</code>); an explicit <code>--api-key ''</code> boots with a loud warning.</p>
 
   <h2>CORS</h2>
   <p>Wildcard origin (<code>allow_origins=["*"]</code>) with credentials disabled. No cookies — auth is header-only.</p>

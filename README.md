@@ -83,12 +83,18 @@ The `eval / distill / router / optim / skills_auto / reflection` modules togethe
 ## Tests & lint
 
 ```bash
+scripts/ci.sh                                                   # local CI gate: full pytest suite (hard) + black drift (advisory)
+scripts/ci.sh --fix                                            # auto-format with black, then run the suite
+scripts/ci.sh --fast                                          # tests only (skip black)
+
 GHOST_API_KEY=test-key pytest                                   # full suite (key required at collection time — interface/server.py raises on missing key)
 GHOST_API_KEY=test-key pytest tests/test_agent_planning.py      # single file
 GHOST_API_KEY=test-key pytest -k "memory and not slack"         # filter
 black src interface tests
 pylint src/ghost_agent
 ```
+
+There is no hosted CI against this repo (the canonical git remote lives on another machine), so `scripts/ci.sh` is the pre-push gate.
 
 ## Telemetry
 

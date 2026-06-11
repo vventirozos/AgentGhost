@@ -94,6 +94,19 @@ class AcquiredSkillManager:
                 "memory_dir / base_dir positionally, or sandbox_dir= for "
                 "legacy callers)."
             )
+        # Reject a non-pathlike base (most commonly a test that passes a
+        # bare MagicMock's `.memory_dir`/`.sandbox_dir`). `Path(MagicMock())`
+        # does NOT raise — it stringifies the mock's repr into a real
+        # relative path like `MagicMock/mock.memory_dir/<id>` and the
+        # `skills_dir.mkdir()` below then splatters that tree into the CWD.
+        # Fail loudly instead so the misconfiguration is caught at the call
+        # site rather than accreting junk directories.
+        if type(base_dir).__module__.split(".")[0] == "unittest":
+            raise TypeError(
+                "AcquiredSkillManager base_dir must be a real path, not a "
+                f"{type(base_dir).__name__} — pass a tmp_path / temp_dirs "
+                "directory in tests, not a bare mock attribute."
+            )
         self.base_dir = Path(base_dir)
         # Kept for backward-compat with callers that read `.sandbox_dir`.
         # Semantically this is now "whatever base dir you gave me"; for

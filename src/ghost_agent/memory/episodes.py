@@ -73,6 +73,9 @@ class EpisodicMemory:
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_ep_trigger ON episodes(trigger)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_ep_cluster ON episodes(cluster_id)')
                 conn.execute('CREATE INDEX IF NOT EXISTS idx_ep_ts ON episodes(timestamp)')
+                # Supports the unconditional orphan-reap anti-join in
+                # record_episode (episode_actions has no enforced FK cascade).
+                conn.execute('CREATE INDEX IF NOT EXISTS idx_ea_episode ON episode_actions(episode_id)')
                 conn.commit()
 
     def record_episode(self, trigger: str, context: str = "",
@@ -130,13 +133,18 @@ class EpisodicMemory:
                             )''',
                             (still - self.MAX_EPISODES,)
                         )
-                    # Reap action rows orphaned by the deletes above — the FK is
-                    # declared but not enforced (no PRAGMA / cascade), so without
-                    # this episode_actions grows unboundedly with orphans.
-                    conn.execute(
-                        "DELETE FROM episode_actions WHERE episode_id NOT IN "
-                        "(SELECT id FROM episodes)"
-                    )
+                # Reap action rows orphaned by ANY delete (the cap-enforcement
+                # deletes above, but also consolidation / external deletes that
+                # never breach the cap). The FK is declared but not enforced (no
+                # PRAGMA / cascade), so without an UNCONDITIONAL reap here
+                # episode_actions grew unboundedly with orphans — the previous
+                # version only reaped inside the `count > MAX` branch, so orphans
+                # from non-cap deletes survived until an insert happened to breach
+                # the cap. Cheap: indexed anti-join (idx_ea_episode) at ≤500 rows.
+                conn.execute(
+                    "DELETE FROM episode_actions WHERE episode_id NOT IN "
+                    "(SELECT id FROM episodes)"
+                )
 
                 conn.commit()
         return episode_id

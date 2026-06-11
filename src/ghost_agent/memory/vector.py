@@ -83,6 +83,18 @@ def _cross_encoder_rerank(query: str, candidates: list, top_k: int = 12) -> list
     return candidates[:top_k]
 
 class VectorMemory:
+    # Bounded growth for the open-ended tiers. Only `auto` / `manual` /
+    # `name` / `summary` entries — the ones the agent accretes turn after
+    # turn — are eligible for eviction; ingested documents, skill twins and
+    # episodes are owned by their own capped stores and are never pruned
+    # here. Eviction is by utility (retrieval_count) then age (oldest
+    # last_accessed first), the same spaced-repetition signal the search
+    # ranker already uses, so frequently-recalled memories survive.
+    MAX_PRUNABLE_MEMORIES = 5000
+    _PRUNABLE_TYPES = ("auto", "manual")
+    # Re-check the cap every N adds rather than counting on every write.
+    _PRUNE_CHECK_EVERY = 200
+
     def __init__(self, memory_dir: Path, upstream_url: str, tor_proxy: str = None):
         """
         Robust Initialization with Explicit Settings.
@@ -280,7 +292,67 @@ class VectorMemory:
 
             metadata = meta or {"timestamp": get_utc_timestamp(), "type": "auto"}
             self.collection.add(documents=[text], metadatas=[metadata], ids=[mem_id])
+            # Amortised cap enforcement: only probe the count once every
+            # _PRUNE_CHECK_EVERY adds (a COUNT(*) per write would be wasteful),
+            # then prune the lowest-utility prunable entries back under cap.
+            self._adds_since_prune = getattr(self, "_adds_since_prune", 0) + 1
+            if self._adds_since_prune >= self._PRUNE_CHECK_EVERY:
+                self._adds_since_prune = 0
+                self._prune_if_needed()
         pretty_log("Memory Save", text, icon=Icons.MEM_SAVE)
+
+    def _prune_if_needed(self) -> int:
+        """Evict the lowest-utility prunable memories when the prunable
+        population exceeds ``MAX_PRUNABLE_MEMORIES``.
+
+        Caller must hold the lock (``add`` does). Only `_PRUNABLE_TYPES`
+        entries are candidates — documents / skills / episodes are owned by
+        their own capped stores. Ranking: keep the most-retrieved, break
+        ties toward the most-recently-accessed; evict the rest. Returns the
+        number of entries deleted. Never raises (pruning is housekeeping)."""
+        try:
+            prunable = self.collection.get(
+                where={"type": {"$in": list(self._PRUNABLE_TYPES)}},
+                include=["metadatas"],
+            )
+        except Exception as e:
+            logger.debug(f"Prune scan failed (non-critical): {e}")
+            return 0
+        ids = (prunable or {}).get("ids") or []
+        if len(ids) <= self.MAX_PRUNABLE_MEMORIES:
+            return 0
+        metas = prunable.get("metadatas") or [{} for _ in ids]
+
+        def _retrieval(m):
+            try:
+                return int((m or {}).get("retrieval_count", 0))
+            except (TypeError, ValueError):
+                return 0
+
+        # Sort by survival priority DESC (most retrievals, then most recent
+        # access); the tail beyond the cap is evicted.
+        ranked = sorted(
+            zip(ids, metas),
+            key=lambda im: (_retrieval(im[1]),
+                            str((im[1] or {}).get("last_accessed", "")
+                                or (im[1] or {}).get("timestamp", ""))),
+            reverse=True,
+        )
+        victims = [i for i, _ in ranked[self.MAX_PRUNABLE_MEMORIES:]]
+        if not victims:
+            return 0
+        try:
+            self.collection.delete(ids=victims)
+            pretty_log(
+                "Memory Prune",
+                f"Evicted {len(victims)} low-utility memories "
+                f"(cap {self.MAX_PRUNABLE_MEMORIES})",
+                icon=Icons.MEM_WIPE,
+            )
+            return len(victims)
+        except Exception as e:
+            logger.debug(f"Prune delete failed (non-critical): {e}")
+            return 0
 
     def smart_update(self, text: str, type_label: str = "auto"):
         try:

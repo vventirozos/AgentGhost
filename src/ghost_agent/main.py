@@ -64,9 +64,48 @@ print(" - All modules imported successfully!", flush=True)
 logger = logging.getLogger("GhostAgent")
 
 
+def enforce_api_key_policy(api_key, host) -> None:
+    """Refuse to boot on a non-loopback bind without an EXPLICIT key choice.
+
+    There is no default API key any more (the old hardcoded
+    'ghost-secret-123' was publicly known). On a non-loopback bind the
+    operator must decide: a real key, or --api-key '' to knowingly disable
+    auth (e.g. a trusted Tailscale mesh). An unset key there is
+    indistinguishable from a misconfiguration, so we refuse to start.
+    Loopback binds with no key run with auth disabled."""
+    loopback = host in ("127.0.0.1", "localhost", "::1")
+    if api_key is None and not loopback:
+        print(
+            f"❌ REFUSING TO START: binding to {host} (non-loopback) with no "
+            "API key configured. Set GHOST_API_KEY / --api-key to a real secret, "
+            "pass --api-key '' to explicitly disable auth on a trusted network, "
+            "or bind to 127.0.0.1."
+        )
+        raise SystemExit(2)
+    if api_key == "ghost-secret-123":
+        print(
+            "⚠️  SECURITY WARNING: 'ghost-secret-123' is the old publicly-known "
+            "default key — anyone who has read the Ghost source can use it. "
+            "Set a real secret."
+        )
+    if not api_key and not loopback:
+        print(
+            f"⚠️  SECURITY WARNING: auth explicitly DISABLED (--api-key '') while "
+            f"binding to {host} (non-loopback). Anyone who can reach this "
+            "port controls the agent."
+        )
+
+
+def _mandatory_tor_env_default() -> bool:
+    """Default for --mandatory-tor: ON unless GHOST_MANDATORY_TOR opts out.
+    Explicit --mandatory-tor / --no-mandatory-tor flags override this via
+    argparse. Mirrors the import-time check in _env._mandatory_tor_requested."""
+    return os.environ.get("GHOST_MANDATORY_TOR", "").lower() not in ("0", "false", "no")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Ghost Agent: Autonomous AI Service")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0 — reachable over the network, e.g. a Tailscale host). Use 127.0.0.1 to restrict to loopback. A non-loopback bind with the default API key prints a security warning.")
+    parser.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0 — reachable over the network, e.g. a Tailscale host). Use 127.0.0.1 to restrict to loopback. A non-loopback bind refuses to boot without an explicit API key.")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--upstream-url", default="http://127.0.0.1:8080")
     parser.add_argument("--swarm-nodes", default=None, help="Comma-separated list of url|model nodes")
@@ -80,11 +119,15 @@ def parse_args():
     parser.add_argument("--verbose", "-v", action="store_true", help="Disable log truncation for debugging")
     parser.add_argument("--no-memory", action="store_true")
     parser.add_argument("--max-context", type=int, default=65536)
-    parser.add_argument("--api-key", default=os.getenv("GHOST_API_KEY", "ghost-secret-123"))
+    # No hardcoded fallback key: unset (None) means "not configured", which
+    # is allowed only on a loopback bind (auth disabled there, like an
+    # explicit --api-key ''). A non-loopback bind without an explicit key
+    # refuses to boot — see the guard in main().
+    parser.add_argument("--api-key", default=os.getenv("GHOST_API_KEY"))
     parser.add_argument("--default-db", default=os.getenv("GHOST_DEFAULT_DB", "postgresql://ghost@127.0.0.1:5432/agent"), help="Default PostgreSQL URI for the DBA agent")
     parser.add_argument("--smart-memory", type=float, default=0.0)
     parser.add_argument("--anonymous", action="store_true", default=True, help="Always use anonymous search (Tor + DuckDuckGo)")
-    parser.add_argument("--mandatory-tor", action="store_true", default=False, help="Fail-closed Tor: probe Tor liveness at boot (abort if unreachable) and install a process-wide guard that blocks any DIRECT connection to a public address. Anonymised traffic (via the loopback SOCKS proxy) and loopback/LAN infra are unaffected — only Tor-bypassing public egress is blocked. Makes the README's fail-closed promise real. Also forces HF offline (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE) so the local-only embedder loads from cache without the cleartext model-resolution call the guard would otherwise block — the embedding model must be pre-cached (it is after one normal run).")
+    parser.add_argument("--mandatory-tor", action=argparse.BooleanOptionalAction, default=_mandatory_tor_env_default(), help="Fail-closed Tor (DEFAULT ON): probe Tor liveness at boot (abort if unreachable) and install a process-wide guard that blocks any DIRECT connection to a public address. Anonymised traffic (via the loopback SOCKS proxy) and loopback/LAN infra are unaffected — only Tor-bypassing public egress is blocked. Makes the README's fail-closed promise real. Also forces HF offline (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE) so the local-only embedder loads from cache without the cleartext model-resolution call the guard would otherwise block — the embedding model must be pre-cached (it is after one normal run; on a cold install boot once with --no-mandatory-tor to download it). Opt out with --no-mandatory-tor or GHOST_MANDATORY_TOR=0.")
     parser.add_argument("--no-redact-logs", action="store_true", default=False, help="Disable redaction of the monitored log stream. By default secrets / API keys / .onion addresses / home paths / PII are masked in the live console + file logs (the operator watches the stream, historically the largest cleartext sink). Pass this to see raw content while debugging.")
     parser.add_argument("--perfect-it", action="store_true", help="Enable proactive optimization suggestions after successful heavy tasks")
     parser.add_argument("--deep-reason", action="store_true", help="Enable MCTS action-candidate lookahead and parallel hypothesis testing on hard problems (costs extra worker calls)")
@@ -222,7 +265,8 @@ async def lifespan(app):
     args = app.state.args
     context = app.state.context
 
-    # Fail-closed Tor egress (opt-in via --mandatory-tor). Probe Tor
+    # Fail-closed Tor egress (DEFAULT ON; opt out via --no-mandatory-tor
+    # or GHOST_MANDATORY_TOR=0). Probe Tor
     # liveness BEFORE wiring any outbound-capable component and abort
     # boot if it's unreachable — a stalled agent beats a silently-
     # cleartext one — then install the process-wide guard that blocks
@@ -1330,17 +1374,7 @@ def main():
     memory_dir.mkdir(parents=True, exist_ok=True)
     
     print(f"👻 Ghost Agent (Ollama Compatible) running on {args.host}:{args.port}")
-    # Security: warn loudly (do NOT block startup) if the publicly-known
-    # default API key is in use on a non-loopback bind. Blocking startup here
-    # silently broke existing network deployments (e.g. a CLI client reaching
-    # the agent over Tailscale), so this is advisory — operators on a private
-    # mesh with the default key are making an informed choice.
-    if args.api_key == "ghost-secret-123" and args.host not in ("127.0.0.1", "localhost", "::1"):
-        print(
-            "⚠️  SECURITY WARNING: default API key ('ghost-secret-123') in use while "
-            f"binding to {args.host} (non-loopback). On an UNTRUSTED network, set "
-            "GHOST_API_KEY / --api-key to a real secret or bind to 127.0.0.1."
-        )
+    enforce_api_key_policy(args.api_key, args.host)
     print(f"🔗 Connected to Upstream LLM at: {args.upstream_url}")
     print(f"📏 Max Context: {args.max_context} tokens")
 
