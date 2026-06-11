@@ -39,7 +39,39 @@ async def test_chunked_reading_router(temp_dirs):
     res = await tool_file_system("read_chunked", sandbox, path="small_test.txt", page=1, chunk_size=1000)
     assert "TEXT DATA" in res
     assert "Hello World!" in res
-    
-    # Out of bounds request should fail gracefully
+
+    # Out-of-range page on a SINGLE-section file: the model over-estimated
+    # the size. Don't strike — serve the whole file so the turn progresses.
     res_bounds = await tool_file_system("read_chunked", sandbox, path="small_test.txt", page=999, chunk_size=1000)
-    assert "Error: Requested section 999 exceeds total sections" in res_bounds
+    assert not res_bounds.lstrip().lower().startswith("error")  # not a strike
+    assert "Hello World!" in res_bounds                          # real content served
+    assert "smaller than you expected" in res_bounds            # nudge to stop paginating
+
+
+@pytest.mark.asyncio
+async def test_out_of_range_multisection_is_terminal_not_error(temp_dirs):
+    # A genuinely chunked file where the model overshoots the end must get
+    # terminal, NON-erroring guidance (no strike, no "request higher page").
+    sandbox = temp_dirs["sandbox"]
+    f = sandbox / "multi.txt"
+    f.write_text("0123456789" * 2000)  # 20kb → 3 sections at chunk 8000
+    res = await tool_read_document_chunked("multi.txt", sandbox, page=75, chunk_size=8000)
+    assert not res.lstrip().lower().startswith("error")  # not a strike
+    assert "only 3 sections" in res
+    assert "do NOT request a higher page" in res.replace("\n", " ")
+
+
+@pytest.mark.asyncio
+async def test_last_section_footer_is_end_aware(temp_dirs):
+    # The final in-range section must NOT tell the model to "use page=N+1"
+    # (that footer is what produced the out-of-range requests).
+    sandbox = temp_dirs["sandbox"]
+    f = sandbox / "two.txt"
+    f.write_text("0123456789" * 1200)  # 12kb → 2 sections at chunk 8000
+    last = await tool_read_document_chunked("two.txt", sandbox, page=2, chunk_size=8000)
+    assert "Section 2 of 2" in last
+    assert "LAST section" in last
+    assert "page=3" not in last  # never invite the non-existent next page
+    # ...but a NON-last section still offers the continue hint
+    first = await tool_read_document_chunked("two.txt", sandbox, page=1, chunk_size=8000)
+    assert "Use page=2 to continue" in first

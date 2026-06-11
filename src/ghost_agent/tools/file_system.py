@@ -1317,6 +1317,10 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
             chunk_size = 32000
 
         def _extract_chunk():
+            # `page` is rebound below (out-of-range single-section files are
+            # served as page 1); declare nonlocal so that assignment doesn't
+            # shadow the enclosing parameter and UnboundLocalError the reads.
+            nonlocal page
             if filename.lower().endswith(".pdf"):
                 try:
                     import fitz # PyMuPDF
@@ -1328,12 +1332,26 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
                 
                 if page > total_pages:
                     doc.close()
-                    return f"Error: Requested page {page} exceeds total pages ({total_pages})."
-                    
+                    # Non-striking, terminal guidance (same rationale as the
+                    # text path): an out-of-range page is the model over-
+                    # estimating, and a higher-page retry will never succeed.
+                    return (
+                        f"NOTE: '{path.name}' has only {total_pages} page"
+                        f"{'s' if total_pages != 1 else ''} (valid: 1-{total_pages}); "
+                        f"page {page} does not exist. Do NOT request a higher "
+                        f"page — re-read with page=1..{total_pages} if needed."
+                    )
+
                 # 1-indexed to 0-indexed for fitz
                 text = doc[page - 1].get_text()
+                last = page >= total_pages
                 doc.close()
-                return f"[PDF Data - Page {page} of {total_pages}]\n{text}"
+                tail = (
+                    f"\n[End of PDF — page {page} is the last of {total_pages}; do not request page {page+1}.]"
+                    if last else
+                    f"\n[Page {page} of {total_pages}. Use page={page+1} to continue.]"
+                )
+                return f"[PDF Data - Page {page} of {total_pages}]\n{text}{tail}"
             else:
                 # Text-based file reading with overlap
                 file_size = path.stat().st_size
@@ -1341,20 +1359,62 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
                 
                 effective_chunk = chunk_size - overlap
                 total_pages = max(1, (file_size + effective_chunk - 1) // effective_chunk)
-                
-                if page > total_pages:
-                    return f"Error: Requested section {page} exceeds total sections ({total_pages})."
-                
+
+                # Out-of-range page is almost always the model OVER-ESTIMATING
+                # the file's size — guessing a page number instead of paginating
+                # from 1. Never strike on it: make the turn progress instead.
+                out_of_range = page > total_pages
+                if out_of_range:
+                    if total_pages == 1:
+                        # The whole file is one section. The model never read it
+                        # (it jumped straight to a high page), so serve the FULL
+                        # file as section 1 rather than erroring on a page that
+                        # was never going to exist.
+                        page = 1
+                    else:
+                        # Genuinely chunked and the model overshot the end. This
+                        # is terminal, not retryable — give actionable guidance
+                        # and DON'T prefix with "Error" (which would strike and
+                        # invite a higher-page retry loop).
+                        return (
+                            f"NOTE: '{path.name}' is only {total_pages} sections "
+                            f"long (valid pages: 1-{total_pages}); section {page} "
+                            f"does not exist and you have reached the END of the "
+                            f"file. There is nothing further to read — do NOT "
+                            f"request a higher page number. Re-read with "
+                            f"page=1..{total_pages} if you need earlier content."
+                        )
+
                 start_byte = (page - 1) * effective_chunk
                 # Read slightly more for overlap and to find a clean break if needed
-                read_amount = chunk_size 
-                
+                read_amount = chunk_size
+
                 with open(path, "rb") as f:
                     f.seek(start_byte)
                     raw_bytes = f.read(read_amount)
                 text = raw_bytes.decode("utf-8", errors="ignore")
-                    
-                return f"--- [TEXT DATA - Section {page} of {total_pages}] ---\n\n{text}\n\n--- [End of Section {page}. Use page={page+1} to continue reading] ---"
+
+                # End-aware footer: on the LAST section, telling the model to
+                # "use page=N+1 to continue" is exactly what produced the
+                # out-of-range requests — there is no N+1. Say so explicitly.
+                if page >= total_pages:
+                    if out_of_range:
+                        footer = (
+                            f"End of file — this is the COMPLETE content of "
+                            f"'{path.name}' ({total_pages} section"
+                            f"{'s' if total_pages != 1 else ''}). You requested a "
+                            f"higher page; the file is smaller than you expected. "
+                            f"Do not paginate further."
+                        )
+                    else:
+                        footer = (
+                            f"End of Section {page} — this is the LAST section "
+                            f"({total_pages} total). You have now read the whole "
+                            f"file; do NOT request page {page+1} (it does not exist)."
+                        )
+                else:
+                    footer = f"End of Section {page}. Use page={page+1} to continue reading"
+                return f"--- [TEXT DATA - Section {page} of {total_pages}] ---\n\n{text}\n\n--- [{footer}] ---"
 
         return await asyncio.to_thread(_extract_chunk)
         

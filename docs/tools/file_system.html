@@ -87,6 +87,14 @@
     <li>For ingestion via <code>knowledge_base</code>, the PDF is chunked into the vector store.</li>
   </ul>
 
+  <h2>Chunked-read pagination — out-of-range handling (2026-06-11)</h2>
+  <p>Section/page counts are computed dynamically from file size (<code>total_pages = ceil(file_size / effective_chunk)</code>), so a small file is 1&ndash;2 sections. The model frequently OVER-ESTIMATED and requested a wildly out-of-range page (e.g. <code>section 75 of 2</code>), which returned a bare <code>Error:</code> &rarr; a wasted strike with no recovery path. Two causes were fixed:</p>
+  <ul>
+    <li><strong>End-aware footer.</strong> Every section used to end with &ldquo;Use page=N+1 to continue reading&rdquo; &mdash; <em>even on the last section</em>, literally instructing the model to request a page that doesn't exist. The final in-range section now says it is the LAST section and not to request <code>page+1</code>; only non-last sections offer the continue hint.</li>
+    <li><strong>Graceful out-of-range.</strong> An out-of-range page no longer strikes. For a single-section file the whole file is served as section&nbsp;1 (the model jumped past it), so the turn makes real progress; for a genuinely chunked file that overshot the end, a terminal <strong>non-erroring</strong> <code>NOTE</code> states the valid range and tells the model to stop paginating (so the failure-classifier doesn't count it and no higher-page retry loop forms). PDF pages get the same treatment.</li>
+  </ul>
+  <p>Covered by <code>tests/test_file_system_chunked.py</code>.</p>
+
   <h2>Path resolution</h2>
   <p><code>_get_safe_path</code> resolves every path against the sandbox root and rejects traversal. Beyond the leading-slash and <code>/workspace/</code> handling, it also accepts a <strong>host-absolute sandbox path</strong>: if the LLM echoes back the full host path of a sandbox file (e.g. <code>/Users/x/.../sandbox/report.md</code> — which it sees in a sandbox-tree listing or a prior error and passes verbatim), the sandbox-root prefix is stripped and the remainder honoured as sandbox-relative. Without this the path joined onto the sandbox root into a phantom nested path → ENOENT → a wasted strike + retry. Covered by <code>tests/test_file_system_sandbox_path.py</code>.</p>
 
