@@ -188,6 +188,13 @@
   </ul>
   <p>The same postmortem fixed numeric false positives in the redactors (<code>LIMIT 1000000</code> became <code>&lt;REDACTED_PHONE&gt;</code> in stored trajectories) — see <a href="../algorithms/selfhood.html">selfhood</a> / <code>distill.redact</code>, covered by <code>tests/test_redact_numeric_false_positives.py</code> — and deconflicted the specialist prompt's <em>NATIVE TOOLS FIRST</em> rule with rule 8b (<em>return the source, not a file write</em>) in <a href="prompts.html">core.prompts</a>.</p>
 
+  <h2>2026-06-12 churn-loop fixes (delete/create oscillation postmortem)</h2>
+  <p>A test session where the model re-executed "delete it and make something else" on every turn (six hard deletes, five of self-created projects, nothing built in 20 turns) produced two more fixes:</p>
+  <ul>
+    <li><strong>Request-start project snapshot.</strong> <code>handle_chat</code> records <code>context.request_start_project_id</code> (the project active when the user's message arrived) right after conversation reconcile. The <a href="../tools/projects.html">project tool's delete-eligibility gate</a> uses it: a bare "delete it" can only target that project or one the user's message names — a project created mid-request is refused with an instruction to build it instead. This converts the success-oscillation loop (which the failure-keyed <code>StrikeLedger</code> structurally cannot see) into a loud tool error on its second iteration.</li>
+    <li><strong>Contextual <code>&lt;think&gt;</code>-fragment filter.</strong> The streaming display filter dropped any token whose stripped form was <code>"think"</code> or <code>"&gt;"</code> (meant to hide fragmented <code>&lt;think&gt;</code> tags split across SSE chunks) — and the model emits the literal word <code>" think"</code> as its own token, so every rendered thought lost it ("Let me think about…" displayed as "Let me about…"). <code>_is_think_tag_fragment(token, accumulated)</code> now suppresses those tokens only when the stream immediately before them ends with the matching tag opener (<code>&lt;</code>/<code>&lt;/</code> for <code>think</code>, <code>&lt;think</code>/<code>&lt;/think</code> for <code>&gt;</code>). The filter was and remains <em>display-only</em>: <code>reasoning_content</code>/<code>full_content</code> always accumulated the raw token, so model context was never corrupted. Covered by <code>tests/test_think_stream_fragment.py</code>.</li>
+  </ul>
+
   <h2>Cross-module dependencies</h2>
   <ul>
     <li><a href="planning.html">core.planning</a> — <code>TaskTree</code> for hierarchical decomposition.</li>

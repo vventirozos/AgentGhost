@@ -35,6 +35,14 @@
     <li><b><code>delete</code></b> — hard, <b>permanent</b>. Removes the project row, all its tasks/artifacts/events (FK <code>ON DELETE CASCADE</code> with <code>PRAGMA foreign_keys=ON</code>, including scratchpad-snapshot events), <b>and</b> the project's workspace directory on disk (<code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code>). The on-disk removal only fires for a path strictly inside the configured sandbox root, so a stray/custom <code>workspace_dir</code> can never wipe an arbitrary directory. The tool schema steers the model toward <code>archive</code> unless the user clearly means to erase. Covered by <code>tests/test_projects_store.py</code> and <code>tests/test_projects_tool.py</code>.</li>
   </ul>
   <p>Note: the web API <code>DELETE /api/projects/{pid}</code> takes an explicit <code>?hard=</code> query flag (default soft/archive) — the frontend chooses; it is independent of the chat tool's <code>delete</code> (which is always hard).</p>
+  <h3>Eligibility gate for unconfirmed hard deletes (2026-06-12)</h3>
+  <p>Observed live: one <em>"i don't really like it, delete it an make something else"</em> cascaded into <strong>six successive hard deletes</strong> — five of them of projects the agent had created seconds earlier in the same request and the user never saw — because each new turn re-read the user's instruction as unfulfilled and deleted the project it had just created. The agent's loop-breakers never fired: they are keyed on <em>failures</em>, and every delete/create succeeded.</p>
+  <p><code>_delete_eligibility_error()</code> now refuses any hard delete whose target the user cannot plausibly mean by "delete it". Eligible targets:</p>
+  <ul>
+    <li>the project that was <strong>active when the user's message arrived</strong> — <code>handle_chat</code> snapshots it as <code>context.request_start_project_id</code> right after conversation reconcile, so "delete it" always resolves against something the user has actually seen;</li>
+    <li>a project the user's own message <strong>names</strong> (case-insensitive title or id match against <code>context.last_user_content</code>).</li>
+  </ul>
+  <p>Everything else — most importantly a project created mid-request — is refused with an instruction to stop cycling ideas and BUILD the current project, pointing at <code>archive</code> (reversible) as the escape hatch. <code>archive</code> itself is not gated. Contexts without the snapshot attribute (direct tool use, tests, the web API route) bypass the gate, so non-chat surfaces keep legacy behavior. Covered by <code>tests/test_project_delete_eligibility.py</code>.</p>
   <h3>Task-level actions</h3>
   <ul>
     <li><code>task_add</code> · <code>task_update</code> · <code>task_decompose</code> · <code>task_next</code> · <code>task_list</code></li>

@@ -856,6 +856,38 @@ def _json_to_xml_schema_cached(frozen_funcs: tuple) -> str:
         parts.append('</function>\n</tool_def>\n')
     return "".join(parts).strip()
 
+def _is_think_tag_fragment(token: str, accumulated_with_token: str) -> bool:
+    """Display-stream filter: is this streamed token a fragment of a
+    literal ``<think>`` / ``</think>`` tag (arriving split across
+    chunks), rather than prose?
+
+    The old check dropped ANY token whose stripped form was "think" or
+    ">" — which deleted the literal word "think" from every rendered
+    thought ("Let me think about…" rendered as "Let me about…", observed
+    consistently in production logs; the model emits " think" as its own
+    token). A bare "think"/"think>"/">" token is only a tag fragment
+    when the stream immediately before it ends with the matching tag
+    opener, so the check is now contextual: `accumulated_with_token` is
+    the stream INCLUDING this token (both call sites append before
+    filtering).
+
+    This filter is cosmetic-only — it gates what `_emit_thinking` shows
+    the operator; the accumulated content is never modified.
+    """
+    t = token.strip().lower()
+    if t in ("<", "</", "<think", "<think>", "</think", "</think>"):
+        return True
+    if token.lower() != t:
+        # Surrounding whitespace → can't be part of a contiguous tag.
+        return False
+    before = accumulated_with_token[: len(accumulated_with_token) - len(token)]
+    if t in ("think", "think>"):
+        return before.endswith(("<", "</"))
+    if t == ">":
+        return before.lower().endswith(("<think", "</think"))
+    return False
+
+
 def _repair_truncated_json(t: str) -> dict:
     """Best-effort parse of a JSON object cut off mid-generation.
 
@@ -3237,6 +3269,16 @@ class GhostAgent:
                     )
                 except Exception as e:
                     logger.debug(f"project conversation reconcile skipped: {e}")
+                # Snapshot the project that was active when THIS user message
+                # arrived — the delete-eligibility gate in tools.projects
+                # only honours a bare "delete it" against this project. A
+                # project the agent creates mid-request was never seen by
+                # the user and therefore can't be what "it" refers to
+                # (observed live: one "delete it and make something else"
+                # cascaded into six hard deletes, five of them of projects
+                # created seconds earlier in the same request).
+                self.context.request_start_project_id = getattr(
+                    self.context, "current_project_id", None)
 
                 # Repro-first nudge for bug reports. Injected BEFORE the
                 # first LLM call so the very first action is an
@@ -5032,7 +5074,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 if "</think" in reasoning_content.lower() or "<tool_call" in reasoning_content.lower():
                                                     stop_printing = True
                                                 if not stop_printing:
-                                                    if r_token.strip().lower() in ["<", "</", "think", ">", "think>", "<think"]:
+                                                    if _is_think_tag_fragment(r_token, reasoning_content):
                                                         pass  # Cosmetic: skip printing fragmented XML tags
                                                     else:
                                                         clean_token = r_token.replace("<think>\n", "").replace("<think>", "")
@@ -5045,7 +5087,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 if "</think" in full_content.lower() or "<tool_call" in full_content.lower():
                                                     stop_printing = True
                                                 if not stop_printing and not reasoning_content:
-                                                    if text_chunk.strip().lower() in ["<", "</", "think", ">", "think>", "<function", "<parameter"]:
+                                                    if (text_chunk.strip().lower() in ("<function", "<parameter")
+                                                            or _is_think_tag_fragment(text_chunk, full_content)):
                                                         pass  # Cosmetic: skip printing fragmented XML tags
                                                     else:
                                                         clean_token = text_chunk.replace("<think>\n", "").replace("<think>", "")

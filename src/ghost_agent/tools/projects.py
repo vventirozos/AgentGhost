@@ -214,6 +214,54 @@ def _set_current(context, project_id: Optional[str]):
         _hydrate_scratchpad(context, None)
 
 
+def _delete_eligibility_error(context, store, rid: str) -> Optional[str]:
+    """Return a refusal string when `rid` is NOT eligible for a hard
+    delete in the current request, else None.
+
+    Hard delete is permanent (row + workspace wiped), and the model only
+    ever reaches it from a user message. A bare "delete it" can only
+    refer to something the user has actually seen, so eligibility is:
+
+      * the harness recorded no request-start snapshot
+        (``context.request_start_project_id`` attribute absent — direct
+        tool tests / non-chat surfaces): gate inactive;
+      * ``rid`` was the active project when the user's message arrived
+        (the snapshot), i.e. the thing "it" plausibly refers to;
+      * the user's own message names the project, by title or id.
+
+    Everything else is refused — most importantly a project the agent
+    created seconds earlier in the SAME request. Observed live: one
+    "i don't really like it, delete it an make something else" cascaded
+    into six successive hard deletes, five of them of self-created
+    projects the user never saw, because each new turn re-read the
+    instruction as unfulfilled.
+    """
+    if not hasattr(context, "request_start_project_id"):
+        return None
+    if rid == getattr(context, "request_start_project_id", None):
+        return None
+    user_msg = str(getattr(context, "last_user_content", "") or "").lower()
+    if user_msg:
+        if rid.lower() in user_msg:
+            return None
+        try:
+            proj = store.get_project(rid)
+        except Exception:
+            proj = None
+        title = (proj or {}).get("title") if isinstance(proj, dict) else ""
+        if title and str(title).lower() in user_msg:
+            return None
+    return (
+        f"REFUSED: hard delete of '{rid}' is not allowed in this request. "
+        "It was not the active project when the user's message arrived, and "
+        "the message does not name it — the user has never seen this project, "
+        "so 'delete it' cannot mean this one. If YOU created it earlier in "
+        "this request: STOP cycling ideas. Keep this project and BUILD it "
+        "now. To remove a different project, the user must name it "
+        "explicitly (or use action=archive, which is reversible)."
+    )
+
+
 def conversation_fingerprint(messages) -> str:
     """Stable identity for a conversation: hash of its FIRST user message.
 
@@ -857,6 +905,12 @@ async def tool_manage_projects(
                     f"deleted. Use action=list to see the real ids, then pass "
                     f"the exact project_id."
                 )
+            gate = _delete_eligibility_error(context, store, rid)
+            if gate:
+                pretty_log("Project Guard",
+                           f"Hard delete of '{rid}' refused (not user-visible "
+                           "in this request)", icon=Icons.STOP)
+                return _err(gate)
             ok = store.delete_project(rid, hard=True)
             if not ok:
                 return _err(f"delete failed for {rid} — nothing was removed.")
