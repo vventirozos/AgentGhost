@@ -856,13 +856,72 @@ def _json_to_xml_schema_cached(frozen_funcs: tuple) -> str:
         parts.append('</function>\n</tool_def>\n')
     return "".join(parts).strip()
 
-def extract_json_from_text(text: str) -> dict:
+def _repair_truncated_json(t: str) -> dict:
+    """Best-effort parse of a JSON object cut off mid-generation.
+
+    Strategy per attempt: close an unterminated string, drop a trailing
+    comma, complete a dangling ``"key":`` with ``null``, append the
+    missing closers, and parse. On failure, chop back to the previous
+    comma/opener and retry (bounded). Returns ``{}`` when nothing
+    salvageable remains — same contract as ``extract_json_from_text``.
+    """
+    import json
+    cur = (t or "").strip()
+    for _ in range(8):
+        if not cur or cur[0] != '{':
+            return {}
+        stack = []
+        in_str = False
+        esc = False
+        for ch in cur:
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == '\\':
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch in '{[':
+                    stack.append(ch)
+                elif ch in '}]':
+                    if stack:
+                        stack.pop()
+        cand = cur + ('"' if in_str else '')
+        cand = re.sub(r'[\s,]+$', '', cand)
+        if cand.endswith(':'):
+            cand += ' null'
+        cand += ''.join('}' if op == '{' else ']' for op in reversed(stack))
+        try:
+            res = json.loads(cand, strict=False)
+            if isinstance(res, dict):
+                return res
+        except json.JSONDecodeError:
+            pass
+        cut = max(cur.rfind(','), cur.rfind('{'), cur.rfind('['))
+        if cut <= 0:
+            return {}
+        cur = cur[:cut]
+    return {}
+
+
+def extract_json_from_text(text: str, repair_truncated: bool = False) -> dict:
     """Safely extracts JSON from LLM outputs, ignoring conversational filler and markdown blocks.
 
     Returns ``{}`` on every failure mode (missing JSON, malformed JSON, etc.)
     — the empty-dict contract is load-bearing for the dozens of call sites
     that do `result = extract_json_from_text(...).get("score", 0)` style
     access.
+
+    ``repair_truncated=True`` additionally salvages objects cut off at a
+    max_tokens cap (see ``_repair_truncated_json``). It is OPT-IN and must
+    only be set on background extraction paths (memory consolidation,
+    graph triplets, judges) where a partial result beats none. NEVER set
+    it when parsing tool-call ARGUMENTS: repairing a truncated
+    ``{"path": …, "content": …`` would execute the tool with half its
+    payload instead of triggering the parse-error retry loop.
 
     Distinguishing "no JSON present" from "JSON was malformed" is useful for
     debugging the planner / smart memory / post-mortem flows. We log a
@@ -903,13 +962,26 @@ def extract_json_from_text(text: str) -> dict:
 
         start = text.find('{')
         end = text.rfind('}')
-        if start != -1 and end != -1:
+        if start != -1:
+            # An opening brace alone counts: output truncated at max_tokens
+            # often has NO closing brace, and the old `end != -1` gate
+            # skipped exactly those.
             looked_like_json = True
-            p = _parse(text[start:end+1])
-            if p:
-                return p
+            if end > start:
+                p = _parse(text[start:end + 1])
+                if p:
+                    return p
 
         result = _parse(text)
+        if not result and repair_truncated and start != -1:
+            # TRUNCATION REPAIR (opt-in): background consolidation calls
+            # can hit their max_tokens cap mid-object. Salvage every
+            # complete key/value pair instead of dropping the extraction.
+            repaired = _repair_truncated_json(text[start:])
+            if repaired:
+                logger.info("extract_json_from_text: salvaged truncated JSON "
+                            f"({len(repaired)} top-level keys)")
+                return repaired
         if not result and looked_like_json:
             # We saw braces but couldn't parse them — that's an extraction
             # failure worth surfacing, not a "no JSON here" non-event.
@@ -919,6 +991,57 @@ def extract_json_from_text(text: str) -> dict:
     except Exception as e:
         logger.warning(f"extract_json_from_text raised {type(e).__name__}: {e}")
         return {}
+
+
+_CODING_KEYWORDS = [r"\bpython\b", r"\bbash\b", r"\bsh\b", r"\bscript\b", r"\bcode\b", r"\bdef\b", r"\bimport\b", r"\bhtml\b", r"\bcss\b", r"\bjs\b", r"\bjavascript\b", r"\btypescript\b", r"\breact\b", r"\bweb\b", r"\bfrontend\b"]
+_CODING_ACTIONS = [r"\bwrite\b", r"\brun\b", r"\bexecute\b", r"\bdebug\b", r"\bfix\b", r"\bcreate\b", r"\bgenerate\b", r"\bcount\b", r"\bcalculate\b", r"\banalyze\b", r"\bscrape\b", r"\bplot\b", r"\bgraph\b", r"\bbuild\b", r"\bdevelop\b"]
+_DBA_KEYWORDS = [r"\bsql\b", r"\bpostgres\b", r"\bpostgresql\b", r"\bpsql\b", r"\bdatabase\b", r"\bpg_stat\b", r"\bexplain analyze\b", r"\bquery\b", r"\bcte\b", r"\brdbms\b", r"\bdba\b", r"\bschema\b", r"\bvacuum\b", r"\bmvcc\b"]
+_META_KEYWORDS = [r"\btitle\b", r"\bname this\b", r"\brename\b", r"\bsummary\b", r"\bsummarize\b", r"\bcaption\b", r"\bdescribe\b"]
+# Pushback markers for the follow-up inheritance rule below. Deliberately
+# narrow: questions ("why did you…") and acknowledgements must NOT match.
+_CORRECTION_MARKERS = [
+    r"\bwrong\b", r"\bincorrect\b", r"\bnot optimal\b", r"\bmistake\b",
+    r"\bbroken\b", r"\bdoesn'?t work\b", r"\bnot working\b",
+    r"\byou forgot\b", r"\byou(?:'re| are) not using\b",
+]
+
+
+def detect_coding_intent(lc: str, messages: Optional[List[Dict]] = None) -> tuple:
+    """Classify the current user turn: ``(has_coding_intent, is_meta_task)``.
+
+    `lc` is the lowercased last user message. `messages` (the full chat
+    history) powers the FOLLOW-UP INHERITANCE rule: a correction of a
+    prior coding/SQL answer ("that is wrong — the insert belongs after
+    the swap") usually carries no coding keyword of its own, so it used
+    to fall through to the conversational sampling profile (temp 1.0)
+    and silently drop the specialist persona mid-task. If the user is
+    pushing back and the previous assistant turn shipped a fenced code
+    block, the turn stays in coding mode.
+    """
+    has_coding_intent = False
+    if any(re.search(k, lc) for k in _CODING_KEYWORDS):
+        if any(re.search(a, lc) for a in _CODING_ACTIONS):
+            has_coding_intent = True
+    if any(ext in lc for ext in [".py", ".js", ".html", ".css", ".ts", ".tsx", ".jsx", ".sh"]) or re.search(r'\bscript\b', lc):
+        has_coding_intent = True
+    if any(re.search(k, lc) for k in _DBA_KEYWORDS):
+        has_coding_intent = True
+
+    is_meta_task = any(re.search(k, lc) for k in _META_KEYWORDS)
+    if re.match(r'^[\d\s\+\-\*\/\(\)\=\?]+$', lc):
+        has_coding_intent = False
+
+    if not has_coding_intent and not is_meta_task and messages:
+        if any(re.search(k, lc) for k in _CORRECTION_MARKERS):
+            prev_assistant = next(
+                (m.get("content", "") for m in reversed(messages[:-1])
+                 if isinstance(m, dict) and m.get("role") == "assistant"),
+                "",
+            )
+            if isinstance(prev_assistant, str) and "```" in prev_assistant:
+                has_coding_intent = True
+
+    return has_coding_intent, is_meta_task
 
 
 async def _timed_tool_coro(coro, sink: list, idx: int):
@@ -2295,10 +2418,18 @@ class GhostAgent:
 
             final_prompt = SMART_MEMORY_PROMPT + f"\n\n### EPISODE LOG:\n{interaction_context}"
             try:
-                payload = {"model": model_name, "messages": [{"role": "user", "content": final_prompt}], "stream": False, "temperature": 0.1, "max_tokens": 1024}
+                # max_tokens 1024 truncated real consolidations mid-JSON
+                # (observed: output died at `"profile_update":` and the
+                # extractor logged a malformed-JSON warning). 3072 leaves
+                # room for score+fact+profile_update+graph_triplets; the
+                # json_object response_format (already used by the graph
+                # extractor) keeps the model from padding with prose.
+                payload = {"model": model_name, "messages": [{"role": "user", "content": final_prompt}], "stream": False, "temperature": 0.1, "max_tokens": 3072, "response_format": {"type": "json_object"}}
                 data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
                 content = data["choices"][0]["message"]["content"]
-                result_json = extract_json_from_text(content)
+                # repair_truncated: a cap hit here used to drop the whole
+                # consolidation; salvaging the complete pairs keeps the fact.
+                result_json = extract_json_from_text(content, repair_truncated=True)
                 score, fact, profile_up = float(result_json.get("score", 0.0)), result_json.get("fact", ""), result_json.get("profile_update", None)
 
                 # --- UNCONDITIONAL KNOWLEDGE GRAPH INGESTION ---
@@ -3089,6 +3220,24 @@ class GhostAgent:
                 # mispairing the calibration JSONL.
                 self.context._calib_pending = None
 
+                # CONVERSATION-SCOPED PROJECT BINDING. `current_project_id`
+                # is process-global; reconcile it against THIS request's
+                # conversation before anything touches the sandbox (the
+                # ambient tree listing, file_system, execute). Without
+                # this, a project activated in one chat captured every
+                # other conversation's file writes into its workspace
+                # (observed: migration.sql written into an unrelated
+                # project, then four turns burned explaining/undoing it).
+                try:
+                    from ..tools.projects import (
+                        conversation_fingerprint, reconcile_conversation,
+                    )
+                    reconcile_conversation(
+                        self.context, conversation_fingerprint(messages)
+                    )
+                except Exception as e:
+                    logger.debug(f"project conversation reconcile skipped: {e}")
+
                 # Repro-first nudge for bug reports. Injected BEFORE the
                 # first LLM call so the very first action is an
                 # observation, not a theory. Suppressed in simulations
@@ -3168,24 +3317,11 @@ class GhostAgent:
                 except Exception as e:
                     logger.debug(f"complexity router consultation skipped: {e}")
 
-                coding_keywords = [r"\bpython\b", r"\bbash\b", r"\bsh\b", r"\bscript\b", r"\bcode\b", r"\bdef\b", r"\bimport\b", r"\bhtml\b", r"\bcss\b", r"\bjs\b", r"\bjavascript\b", r"\btypescript\b", r"\breact\b", r"\bweb\b", r"\bfrontend\b"]
-                coding_actions = [r"\bwrite\b", r"\brun\b", r"\bexecute\b", r"\bdebug\b", r"\bfix\b", r"\bcreate\b", r"\bgenerate\b", r"\bcount\b", r"\bcalculate\b", r"\banalyze\b", r"\bscrape\b", r"\bplot\b", r"\bgraph\b", r"\bbuild\b", r"\bdevelop\b"]
-                has_coding_intent = False
-
-                if any(re.search(k, lc) for k in coding_keywords):
-                    if any(re.search(a, lc) for a in coding_actions):
-                        has_coding_intent = True
-                if any(ext in lc for ext in [".py", ".js", ".html", ".css", ".ts", ".tsx", ".jsx", ".sh"]) or re.search(r'\bscript\b', lc):
-                    has_coding_intent = True
-
-                dba_keywords = [r"\bsql\b", r"\bpostgres\b", r"\bpostgresql\b", r"\bpsql\b", r"\bdatabase\b", r"\bpg_stat\b", r"\bexplain analyze\b", r"\bquery\b", r"\bcte\b", r"\brdbms\b", r"\bdba\b", r"\bschema\b", r"\bvacuum\b", r"\bmvcc\b"]
-                if any(re.search(k, lc) for k in dba_keywords):
-                    has_coding_intent = True
-
-                meta_keywords = [r"\btitle\b", r"\bname this\b", r"\brename\b", r"\bsummary\b", r"\bsummarize\b", r"\bcaption\b", r"\bdescribe\b"]
-                is_meta_task = any(re.search(k, lc) for k in meta_keywords)
-                if re.match(r'^[\d\s\+\-\*\/\(\)\=\?]+$', lc):
-                    has_coding_intent = False
+                # Extracted to module level (testable) + follow-up
+                # inheritance: corrections of a prior fenced-code answer
+                # keep coding mode/sampling instead of falling back to the
+                # temp-1.0 conversational profile.
+                has_coding_intent, is_meta_task = detect_coding_intent(lc, messages)
 
                 # ARCHITECTURAL OPTIMISATION #4: Request-scoped lazy cache.
                 # Profile / playbook / tool defs / XML schema all become

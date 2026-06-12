@@ -18,10 +18,20 @@ def test_extract_json_with_markdown_and_filler():
     assert result == {"key": "value", "list": [1, 2, 3]}
 
 def test_extract_json_broken_brace():
-    """Test that missing closing brace returns empty dict gracefully."""
+    """Missing closing brace returns empty dict BY DEFAULT — tool-call
+    argument parsing must fail loudly (parse-error retry loop), never
+    execute a tool with a half-truncated payload."""
     text = '{"key": "value", "list": [1, 2, 3'
     result = extract_json_from_text(text)
     assert result == {}
+
+
+def test_extract_json_broken_brace_repair_opt_in():
+    """Background extraction paths (memory consolidation, judges) opt in
+    to truncation repair and salvage the complete key/value pairs."""
+    text = '{"key": "value", "list": [1, 2, 3'
+    result = extract_json_from_text(text, repair_truncated=True)
+    assert result == {"key": "value", "list": [1, 2, 3]}
 
 def test_extract_json_ast_fallback():
     """Test that python-dictionary syntax (single quotes, True/False) falls back via ast.literal_eval."""

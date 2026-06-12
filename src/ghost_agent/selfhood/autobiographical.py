@@ -108,14 +108,45 @@ def _template_marker_for(text: str) -> Optional[str]:
 _EMAIL_RE = re.compile(
     r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
 )
+# A phone match must carry phone STRUCTURE — a leading `+`, parenthesised
+# area code, or internal separators. The old core (`\d{3}[ -]?\d{4}` with
+# everything else optional) matched any bare 7-10 digit integer, mangling
+# numeric literals (row counts, ids) quoted in prompt prefixes. Kept in
+# sync with distill.redact's `phone` rule.
 _PHONE_RE = re.compile(
-    r"(?<!\d)(?:\+?\d{1,3}[ -]?)?(?:\(?\d{2,4}\)?[ -]?)?\d{3}[ -]?\d{4}(?!\d)"
+    r"(?<!\d)(?:"
+    r"\+\d{1,3}[ -]?(?:\(?\d{2,4}\)?[ -]?)?\d{3}[ -]?\d{4}"
+    r"|\(\d{2,4}\)[ -]?\d{3}[ -]?\d{4}"
+    r"|(?:\d{1,3}[ -])?\d{2,4}[ -]\d{3}[ -]?\d{4}"
+    r"|\d{3}[ -]\d{4}"
+    r")(?!\d)"
 )
 _API_KEY_RE = re.compile(
     r"\b(?:sk|pk|ghp|github_pat|AKIA|AIza|xoxb|xoxp|api[_-]?key)[A-Za-z0-9_-]{8,}\b",
     re.IGNORECASE,
 )
 _CREDIT_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+
+
+def _luhn_ok(digits: str) -> bool:
+    """True when `digits` passes the Luhn checksum (every real PAN does)."""
+    if not digits.isdigit() or not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = ord(ch) - 48
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _redact_cc_if_luhn(m) -> str:
+    """Redact a 13-19 digit run only when it Luhn-validates — bigint ids
+    and epoch-millis literals quoted in prompts otherwise get eaten."""
+    return "[REDACTED_CC]" if _luhn_ok(re.sub(r"\D", "", m.group(0))) else m.group(0)
 
 
 _ROLLUP_PHRASES = {
@@ -142,7 +173,7 @@ def redact_pii(text: str) -> str:
         return text
     out = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
     out = _API_KEY_RE.sub("[REDACTED_KEY]", out)
-    out = _CREDIT_CARD_RE.sub("[REDACTED_CC]", out)
+    out = _CREDIT_CARD_RE.sub(_redact_cc_if_luhn, out)
     out = _PHONE_RE.sub("[REDACTED_PHONE]", out)
     return out
 

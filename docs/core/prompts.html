@@ -56,6 +56,9 @@
     <li><code>WEB FACTS</code> → <code>web_search</code> first; <code>fact_check</code> / <code>deep_research</code> only for complex verification.</li>
   </ul>
 
+  <h2>Specialist rule deconfliction (2026-06-12)</h2>
+  <p><code>SPECIALIST_SYSTEM_PROMPT</code> carried two imperatives a small model resolved the wrong way: rule <strong>8b</strong> (<em>"give me the SQL" → the reply IS the code; do NOT save it with <code>file_system</code></em>) and the execution rule <strong>NATIVE TOOLS FIRST</strong> (<em>use <code>file_system write</code> for native file tasks</em>). Observed live: a "Just give me the SQL, no explanations" request produced an unrequested <code>migration.sql</code> write — twice. NATIVE TOOLS FIRST is now explicitly subordinated to 8b: it picks WHICH tool once tools are warranted, it does not make tool use warranted.</p>
+
   <h2>Self-play challenge-gen hardening (SYNTHETIC_CHALLENGE_PROMPT)</h2>
   <p>The challenge-generation system prompt carries explicit rules to prevent LLM-generated validators from being unwinnable:</p>
   <ul>

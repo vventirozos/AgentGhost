@@ -19,14 +19,44 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Iterable, List, Pattern, Tuple
+from typing import Callable, Iterable, List, Pattern, Tuple, Union
 
 from .schema import Trajectory
 
 
 # Each pattern is a (name, regex, replacement) triple. `name` is used
-# only for observability — counting how often each rule fires.
-_BuiltinRule = Tuple[str, Pattern[str], str]
+# only for observability — counting how often each rule fires. The
+# replacement is either a plain string or a match-callable (re.sub
+# accepts both) — the callable form lets a rule validate the match
+# before committing to the rewrite (see the Luhn-gated credit-card rule).
+_BuiltinRule = Tuple[str, Pattern[str], Union[str, Callable[["re.Match[str]"], str]]]
+
+
+def _luhn_ok(digits: str) -> bool:
+    """True when `digits` passes the Luhn checksum (every real PAN does)."""
+    if not digits.isdigit() or not 13 <= len(digits) <= 19:
+        return False
+    total = 0
+    for i, ch in enumerate(reversed(digits)):
+        d = ord(ch) - 48
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _redact_cc_if_luhn(m: "re.Match[str]") -> str:
+    """Redact a 13-19 digit run ONLY when it Luhn-validates.
+
+    A bare digit-run rule redacted every bigint id / sequence value /
+    epoch-millis literal that wandered through a trajectory, corrupting
+    the stored SQL/code corpus. Real card numbers always pass Luhn;
+    arbitrary numeric literals pass ~10% of the time — so this keeps
+    every true positive while dropping ~90% of the false ones.
+    """
+    return "<REDACTED_CC>" if _luhn_ok(re.sub(r"\D", "", m.group(0))) else m.group(0)
 
 _BUILTIN_RULES: List[_BuiltinRule] = [
     # PEM private-key blocks (multi-line) — most specific, run first so the
@@ -144,9 +174,27 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
 
     # Phone numbers and credit-card numbers (ported from the selfhood diary
     # redactor so the higher-stakes corpus is at least as strict as the diary).
-    ("credit_card", re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"), "<REDACTED_CC>"),
+    # Credit cards are Luhn-gated (see _redact_cc_if_luhn) so bigint ids and
+    # other long numeric literals in stored SQL/code survive intact.
+    ("credit_card", re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"), _redact_cc_if_luhn),
+    # A phone match must carry phone STRUCTURE — a leading `+`, a
+    # parenthesised area code, or internal space/dash separators. The old
+    # pattern's core (`\d{3}[ -]?\d{4}` with everything else optional)
+    # matched any bare 7-10 digit integer, so `LIMIT 1000000` in a stored
+    # SQL trajectory became `LIMIT <REDACTED_PHONE>`. Bare unseparated
+    # digit runs are now left alone — code corpora are full of them and
+    # an unformatted local number is not recoverable PII worth that cost.
     ("phone", re.compile(
-        r"(?<!\d)(?:\+?\d{1,3}[ -]?)?(?:\(?\d{2,4}\)?[ -]?)?\d{3}[ -]?\d{4}(?!\d)"
+        r"(?<!\d)(?:"
+        # +country, optional area code, separators optional: +1 (212) 555-0123, +306912345678
+        r"\+\d{1,3}[ -]?(?:\(?\d{2,4}\)?[ -]?)?\d{3}[ -]?\d{4}"
+        # parenthesised area code: (212) 555-0123
+        r"|\(\d{2,4}\)[ -]?\d{3}[ -]?\d{4}"
+        # separator-delimited groups: 212-555-0123, 30 210 5550123
+        r"|(?:\d{1,3}[ -])?\d{2,4}[ -]\d{3}[ -]?\d{4}"
+        # 7-digit local WITH separator: 555-0123
+        r"|\d{3}[ -]\d{4}"
+        r")(?!\d)"
     ), "<REDACTED_PHONE>"),
 ]
 

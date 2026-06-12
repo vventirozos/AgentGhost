@@ -70,6 +70,15 @@ def _ok(payload: Any) -> str:
 
 _PROJECT_KEY_PREFIX = "proj::"
 _CURRENT_SENTINEL = "__current_project__"
+# Conversation that owns the current project activation. Written next to
+# `__current_project__` by `_set_current` and compared by
+# `reconcile_conversation` at every request start. Without this binding,
+# `context.current_project_id` was process-global STICKY state: a project
+# activated in one chat silently captured every other conversation's file
+# writes into `<sandbox>/projects/<id>/` (observed in production — an SQL
+# snippet request landed `migration.sql` inside an unrelated project's
+# workspace).
+_CURRENT_CONV_SENTINEL = "__current_project_conv__"
 
 
 def _iter_scratchpad_items(scratchpad) -> List[tuple]:
@@ -88,7 +97,7 @@ def _iter_scratchpad_items(scratchpad) -> List[tuple]:
         return [
             (k, v) for k, v in data.items()
             if not str(k).startswith(_PROJECT_KEY_PREFIX)
-            and k != _CURRENT_SENTINEL
+            and k not in (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL)
         ]
     except Exception:
         return []
@@ -131,7 +140,7 @@ def _hydrate_scratchpad(context, project_id: Optional[str]):
         victims = [
             k for k in list(data.keys())
             if not str(k).startswith(_PROJECT_KEY_PREFIX)
-            and k != _CURRENT_SENTINEL
+            and k not in (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL)
         ]
         for k in victims:
             try:
@@ -186,8 +195,15 @@ def _set_current(context, project_id: Optional[str]):
         try:
             if project_id is None:
                 sp.delete(_CURRENT_SENTINEL)
+                sp.delete(_CURRENT_CONV_SENTINEL)
             else:
                 sp.set(_CURRENT_SENTINEL, project_id)
+                # Bind the activation to the conversation that asked for it
+                # (set per-request by `reconcile_conversation`). Empty/None
+                # means "unbound" — reconcile treats that as not owned by
+                # ANY conversation, so a stale activation can never leak.
+                sp.set(_CURRENT_CONV_SENTINEL,
+                       getattr(context, "conversation_key", None) or "")
         except Exception:
             pass
     if project_id and project_id != prev:
@@ -196,6 +212,92 @@ def _set_current(context, project_id: Optional[str]):
         # Leaving project mode: clear the hydrated keys so free chat
         # starts fresh. Named sentinels survive.
         _hydrate_scratchpad(context, None)
+
+
+def conversation_fingerprint(messages) -> str:
+    """Stable identity for a conversation: hash of its FIRST user message.
+
+    The chat API ships the full message history on every request and
+    carries no conversation id, so the first user turn — constant for the
+    lifetime of a conversation, different across conversations — is the
+    only stable thing to key on. Returns "" when there is no user message
+    (callers treat "" as "owns nothing").
+    """
+    first = next(
+        (m.get("content") for m in (messages or [])
+         if isinstance(m, dict) and m.get("role") == "user"),
+        None,
+    )
+    if isinstance(first, list):  # multimodal content blocks
+        first = " ".join(
+            b.get("text", "") for b in first
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    if not first:
+        return ""
+    import hashlib
+    return hashlib.sha1(str(first).strip().encode("utf-8", "replace")).hexdigest()
+
+
+def reconcile_conversation(context, conv_key: str):
+    """Scope the active project to the conversation that activated it.
+
+    Called once at request start, BEFORE any sandbox listing or file op.
+    `context.current_project_id` is process-global, so without this a
+    project switched-to in one conversation stayed active for every other
+    conversation hitting the same process — their file writes landed in
+    `<sandbox>/projects/<id>/` and their turns carried that project's
+    scratchpad. Policy:
+
+    * binding's conversation == `conv_key` → (re)activate the bound project
+      for this request (returning to the owning conversation resumes it);
+    * binding belongs to another conversation, is unbound (legacy bare
+      sentinel written before the conv sentinel existed), or `conv_key` is
+      "" → deactivate for this request, PRESERVING the binding so the
+      owning conversation gets it back.
+    """
+    context.conversation_key = conv_key or ""
+    sp = getattr(context, "scratchpad", None)
+    if sp is None:
+        return
+    try:
+        bound_pid = sp.get(_CURRENT_SENTINEL)
+        bound_conv = sp.get(_CURRENT_CONV_SENTINEL)
+    except Exception:
+        return
+    cur = getattr(context, "current_project_id", None)
+    if not bound_pid or not isinstance(bound_pid, str):
+        return
+    owns = bool(conv_key) and bound_conv == conv_key
+    if owns:
+        if cur != bound_pid:
+            context.current_project_id = bound_pid
+            _wm = getattr(context, "workspace_model", None)
+            if _wm is not None:
+                try:
+                    _wm.current_project_id = bound_pid
+                except Exception:
+                    pass
+            _hydrate_scratchpad(context, bound_pid)
+            pretty_log("Project Scope",
+                       f"Conversation owns project '{bound_pid}' — reactivated",
+                       icon=Icons.BRAIN_PLAN)
+        return
+    if cur:
+        # Another conversation's project is live — park it for this request.
+        _snapshot_scratchpad(context, cur)
+        context.current_project_id = None
+        _wm = getattr(context, "workspace_model", None)
+        if _wm is not None:
+            try:
+                _wm.current_project_id = ""
+            except Exception:
+                pass
+        _hydrate_scratchpad(context, None)
+        pretty_log("Project Scope",
+                   f"Project '{cur}' belongs to another conversation — "
+                   "deactivated for this request",
+                   icon=Icons.BRAIN_PLAN)
 
 
 def _workspace_note(project_id: str) -> str:
