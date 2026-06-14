@@ -26,6 +26,46 @@ _STREAM_FIRST_BYTE_TIMEOUT = float(os.getenv("GHOST_STREAM_FIRST_BYTE_TIMEOUT", 
 _STREAM_IDLE_TIMEOUT = float(os.getenv("GHOST_STREAM_IDLE_TIMEOUT", "60"))
 
 
+def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
+    """Decide whether traffic to ``url`` must egress via Tor.
+
+    Returns the (socks5h-normalised) proxy URL for genuinely public
+    destinations, or ``None`` when ``url`` is local/LAN infrastructure that
+    should be reached directly.
+
+    "Local" is defined as *not globally routable* — the same predicate
+    ``egress_guard.is_allowed_host`` uses. This deliberately covers more than
+    RFC1918+loopback: it also exempts CGNAT / Tailscale (100.64.0.0/10),
+    link-local, and IPv6 ULA. The older `is_private or is_loopback` test
+    missed those, so a tailnet compute node (e.g. an image-gen GPU at
+    ``100.x.x.x``) was forced through a Tor exit that cannot route a tailnet
+    address — every connect failed with "All connection attempts failed".
+    """
+    if not tor_proxy:
+        return None
+    if "127.0.0.1" in url or "localhost" in url:
+        return None
+    try:
+        import urllib.parse
+        import ipaddress
+
+        # Robustly handle URLs missing the http:// scheme
+        if not url.startswith("http://") and not url.startswith("https://"):
+            url = "http://" + url
+
+        hostname = urllib.parse.urlparse(url).hostname
+        if hostname:
+            if hostname.endswith(".local"):
+                return None
+            ip = ipaddress.ip_address(hostname)
+            if not ip.is_global:
+                return None
+    except ValueError:
+        # Non-IP hostname (or unparseable): fall through and route via Tor.
+        pass
+    return tor_proxy.replace("socks5://", "socks5h://")
+
+
 class NodeCircuitBreaker:
     """Circuit breaker for LLM nodes.
 
@@ -103,28 +143,7 @@ class LLMClient:
         limits = httpx.Limits(max_keepalive_connections=3, max_connections=15, keepalive_expiry=30.0)
 
         def get_proxy(url: str) -> Optional[str]:
-            if not tor_proxy:
-                return None
-            if "127.0.0.1" in url or "localhost" in url:
-                return None
-            try:
-                import urllib.parse
-                import ipaddress
-
-                # Robustly handle URLs missing the http:// scheme
-                if not url.startswith("http://") and not url.startswith("https://"):
-                    url = "http://" + url
-
-                hostname = urllib.parse.urlparse(url).hostname
-                if hostname:
-                    if hostname.endswith(".local"):
-                        return None
-                    ip = ipaddress.ip_address(hostname)
-                    if ip.is_private or ip.is_loopback:
-                        return None
-            except ValueError:
-                pass
-            return tor_proxy.replace("socks5://", "socks5h://")
+            return compute_tor_proxy(url, tor_proxy)
         # Determine if we need to route through Tor
         # If upstream is NOT localhost, we force Tor usage
         proxy_url = get_proxy(upstream_url)

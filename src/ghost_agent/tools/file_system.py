@@ -449,8 +449,17 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
     ext = str(filename).split('.')[-1].lower()
     if ext in ["py", "html", "css", "js", "ts", "json", "sh", "yaml", "yml", "csv", "xml"]:
         from ..utils.sanitizer import extract_code_from_markdown
-        old_text = extract_code_from_markdown(str(old_text))
-        if new_text is not None:
+        # Only un-fence when fences are ACTUALLY present. The extractor's
+        # no-fence fallback `.strip()`s the text, which dedents the FIRST
+        # line of an indented replacement block (and only the first) —
+        # corrupting the block's relative indentation before the matcher
+        # re-anchors it, which then lands continuation lines at the wrong
+        # column. Same guard the replace→write auto-promote path already
+        # uses. When fences are absent, preserve old_text/new_text
+        # byte-for-byte (indentation included).
+        if "```" in str(old_text):
+            old_text = extract_code_from_markdown(str(old_text))
+        if new_text is not None and "```" in str(new_text):
             new_text = extract_code_from_markdown(str(new_text))
             
     try:
@@ -520,28 +529,31 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             
             success_count = 0
             errors = []
-            
+            prev_content = file_content
+
             for search_str, replace_str in blocks:
                 if search_str in file_content:
                     file_content = file_content.replace(search_str, replace_str, 1)
                     success_count += 1
                 else:
-                    # Heuristic fallback (robust whitespace handling)
+                    # Heuristic fallback (robust whitespace handling). Re-anchor
+                    # the replacement's indentation to the matched region so the
+                    # whitespace-flexible match doesn't corrupt block indentation.
                     words = [re.escape(w) for w in str(search_str).split()]
                     flexible_search = r'\s+'.join(words)
                     matches = re.findall(flexible_search, file_content)
                     if len(matches) == 1:
-                        file_content = file_content.replace(matches[0], replace_str, 1)
+                        reindented = _reindent_replacement(file_content, matches[0], replace_str)
+                        file_content = file_content.replace(matches[0], reindented, 1)
                         success_count += 1
                     else:
                         errors.append(f"Could not find block:\n{search_str[:50]}...")
-                        
+
             if success_count > 0:
-                await asyncio.to_thread(path.write_text, file_content)
                 msg = f"SUCCESS: Applied {success_count} SEARCH/REPLACE blocks to '{filename}'."
                 if errors:
                     msg += f" SYSTEM INSTRUCTION: {len(errors)} blocks failed:\n" + "\n".join(errors)
-                return msg + await _syntax_feedback(path, filename)
+                return await _write_replace_guarded(path, prev_content, file_content, filename, msg)
             else:
                 return f"SYSTEM INSTRUCTION: None of the SEARCH/REPLACE blocks matched in '{filename}'.\n" + "\n".join(errors)
 
@@ -549,22 +561,25 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         if old_text in file_content:
             occurrences = file_content.count(old_text)
             new_file_content = file_content.replace(old_text, new_text)
-            await asyncio.to_thread(path.write_text, new_file_content)
             msg = f"SUCCESS: Exact match found and replaced in '{filename}'."
             if occurrences > 1: msg += f" WARNING: Replaced {occurrences} identical occurrences."
-            return msg + await _syntax_feedback(path, filename)
-            
-        # 2. Heuristic match (ignore arbitrary whitespace & newlines)
+            return await _write_replace_guarded(path, file_content, new_file_content, filename, msg)
+
+        # 2. Heuristic match (ignore arbitrary whitespace & newlines). The
+        # match starts at the first token, so re-anchor the replacement's
+        # indentation to the matched region before substituting (otherwise a
+        # multi-line block's continuation lines land at the wrong column).
         import re
         words = [re.escape(w) for w in str(old_text).split()]
         flexible_old = r'\s+'.join(words)
 
         matches = re.findall(flexible_old, file_content)
         if len(matches) == 1:
-            new_file_content = file_content.replace(matches[0], new_text)
-            await asyncio.to_thread(path.write_text, new_file_content)
-            return (f"SUCCESS: Flexible match found and replaced in '{filename}'."
-                    + await _syntax_feedback(path, filename))
+            reindented = _reindent_replacement(file_content, matches[0], str(new_text))
+            new_file_content = file_content.replace(matches[0], reindented)
+            return await _write_replace_guarded(
+                path, file_content, new_file_content, filename,
+                f"SUCCESS: Flexible match found and replaced in '{filename}'.")
         elif len(matches) > 1:
             return "SYSTEM INSTRUCTION: Multiple instances of this text block found. Please provide a larger, more unique block of code in 'content' to ensure we replace the correct one."
 
@@ -588,15 +603,15 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             if matched_text.endswith("\n") and not replacement.endswith("\n"):
                 replacement += "\n"
             new_file_content = file_content.replace(matched_text, replacement, 1)
-            await asyncio.to_thread(path.write_text, new_file_content)
-            return (
+            res = await _write_replace_guarded(
+                path, file_content, new_file_content, filename,
                 f"SUCCESS: Fuzzy match ({ratio:.0%} similar) found and replaced "
                 f"in '{filename}'. Your `old_text` did not byte-match, but a single "
-                f"near-identical block was unambiguous."
-                + await _syntax_feedback(path, filename)
-                + f" VERIFY the change is what you "
-                f"intended:\n--- REPLACED BLOCK (was) ---\n{matched_text[:600]}"
-            )
+                f"near-identical block was unambiguous.")
+            if res.startswith("SUCCESS"):
+                res += (f" VERIFY the change is what you "
+                        f"intended:\n--- REPLACED BLOCK (was) ---\n{matched_text[:600]}")
+            return res
 
         # 2.7 Anchor-block match. When the block's BOUNDARIES are stable but
         # its middle drifted (the model remembers the signature + shape but
@@ -613,16 +628,16 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             if matched_text.endswith("\n") and not replacement.endswith("\n"):
                 replacement += "\n"
             new_file_content = file_content.replace(matched_text, replacement, 1)
-            await asyncio.to_thread(path.write_text, new_file_content)
-            return (
+            res = await _write_replace_guarded(
+                path, file_content, new_file_content, filename,
                 f"SUCCESS: Anchor match — replaced the block spanning lines "
                 f"{info['start_line']}–{info['end_line']} in '{filename}' "
                 f"(matched on its unique {'first+last lines' if info['strategy']=='first_last' else 'signature + balanced braces'}; "
-                f"the middle differed from your old_text)."
-                + await _syntax_feedback(path, filename)
-                + f" VERIFY the change:\n"
-                f"--- REPLACED BLOCK (was) ---\n{matched_text[:600]}"
-            )
+                f"the middle differed from your old_text).")
+            if res.startswith("SUCCESS"):
+                res += (f" VERIFY the change:\n"
+                        f"--- REPLACED BLOCK (was) ---\n{matched_text[:600]}")
+            return res
 
         # 3. Neither exact nor flexible nor fuzzy nor anchor match. Return a
         # snippet of the file at the closest-looking neighborhood so the
@@ -967,6 +982,128 @@ async def _syntax_feedback(path: Path, filename: str) -> str:
         f"script silently and every downstream symptom (dead buttons, blank "
         f"page) traces back here:\n{err}"
     )
+
+
+def _reindent_replacement(file_content: str, matched_text: str, new_text: str) -> str:
+    """Re-anchor a multi-line replacement block to the indentation of the
+    region it is replacing.
+
+    The whitespace-flexible matcher (`r'\\s+'.join(words)`) matches starting
+    at the first non-whitespace token, so the matched span does NOT include
+    the leading indentation of its first line — that indent stays in the
+    file, before the insertion point. A raw ``str.replace(match, new_text)``
+    therefore puts line 1 of ``new_text`` after the file's indent but every
+    continuation line exactly as the model typed it. Whatever absolute
+    indentation the model chose, the result is broken: dedented → "unindent
+    does not match any outer indentation level"; absolute → "unexpected
+    indent". This was the cause of a ~10-turn replace/rewrite spiral in
+    production (a `set_input_size` guard removal that broke the file four
+    times in a row).
+
+    Fix: drop the model's absolute indentation entirely and rebuild it from
+    the anchor — line 1 gets no indent (the file supplies it), every
+    continuation line gets ``anchor_indent`` plus its own indentation
+    *relative* to the block's first line. Nesting inside the block is
+    preserved; the block as a whole lands at the right column.
+
+    Only fires when the match begins at the start of a line (so the anchor
+    is genuine indentation, not code) and the replacement is multi-line.
+    Returns ``new_text`` unchanged otherwise.
+    """
+    if "\n" not in new_text:
+        return new_text
+    idx = file_content.find(matched_text)
+    if idx < 0:
+        return new_text
+    line_start = file_content.rfind("\n", 0, idx) + 1
+    anchor_indent = file_content[line_start:idx]
+    if anchor_indent.strip():
+        # Match did not start at column 0 of its line (there's code before
+        # it) — re-indentation doesn't apply; insert verbatim.
+        return new_text
+
+    lines = new_text.split("\n")
+    base = None
+    for ln in lines:
+        if ln.strip():
+            base = len(ln) - len(ln.lstrip())
+            break
+    if base is None:
+        return new_text
+
+    out = []
+    for i, ln in enumerate(lines):
+        if not ln.strip():
+            out.append("")
+            continue
+        rel = max(0, (len(ln) - len(ln.lstrip())) - base)
+        prefix = (" " * rel) if i == 0 else (anchor_indent + " " * rel)
+        out.append(prefix + ln.lstrip())
+    return "\n".join(out)
+
+
+def _syntax_regression(prev_content: str, new_content: str, filename: str) -> str:
+    """Return a one-line error when ``new_content`` would INTRODUCE a syntax
+    error that ``prev_content`` did not have, else "".
+
+    Used to refuse a destructive replace *before* it touches disk. A replace
+    that turns a parsing file into a non-parsing one destroys the
+    known-good anchor state the model needs for its next surgical edit —
+    that's what compounded a single broken edit into a multi-turn rewrite
+    spiral (each subsequent SEARCH block failed to match the now-corrupted
+    file). If the file was ALREADY broken, the edit is allowed (it may be a
+    partial fix). Only .py / .json are checked in-process; other types pass
+    through (best-effort, unchanged behaviour).
+    """
+    ext = str(filename).split(".")[-1].lower()
+    if ext == "py":
+        import ast
+        try:
+            ast.parse(new_content)
+            return ""
+        except SyntaxError as se:
+            try:
+                ast.parse(prev_content)
+            except SyntaxError:
+                return ""  # already broken — not a regression
+            return f"{se.msg} (line {se.lineno}, col {se.offset})"
+    elif ext == "json":
+        try:
+            json.loads(new_content)
+            return ""
+        except json.JSONDecodeError as je:
+            try:
+                json.loads(prev_content)
+            except json.JSONDecodeError:
+                return ""
+            return f"{je.msg} (line {je.lineno}, col {je.colno})"
+    return ""
+
+
+async def _write_replace_guarded(path: Path, prev_content: str, new_content: str,
+                                 filename: str, success_msg: str) -> str:
+    """Apply a replace result with a syntax-regression rollback guard.
+
+    If ``new_content`` would introduce a NEW syntax error (see
+    `_syntax_regression`), the file is left UNCHANGED and a REJECTED message
+    is returned steering the model to a tight surgical edit instead of a
+    full-file rewrite. Otherwise the content is written and normal
+    post-write syntax feedback is appended.
+    """
+    regression = _syntax_regression(prev_content, new_content, filename)
+    if regression:
+        pretty_log("Replace Rejected",
+                   f"{filename}: edit would break syntax — file left unchanged",
+                   icon=Icons.WARN, level="WARNING")
+        return (
+            f"REJECTED: that replace would introduce a syntax error and was "
+            f"NOT applied — '{filename}' is unchanged on disk: {regression}. "
+            f"Your replacement block's indentation or structure is off. "
+            f"Re-read the file, then emit a TIGHT single-line SEARCH/REPLACE "
+            f"for the surgical edit. Do NOT rewrite the whole file."
+        )
+    await asyncio.to_thread(path.write_text, new_content)
+    return success_msg + await _syntax_feedback(path, filename)
 
 
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):

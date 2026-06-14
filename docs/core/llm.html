@@ -101,7 +101,7 @@
     <dt>timeout</dt><dd>1 200 s — long-context generations can run for many minutes.</dd>
     <dt>limits</dt><dd>3 keep-alive, 15 total connections per node.</dd>
     <dt>keep-alive expiry</dt><dd>30 s.</dd>
-    <dt>proxy</dt><dd>Tor SOCKS proxy used if <code>tor_proxy</code> set in constructor.</dd>
+    <dt>proxy</dt><dd>Per node, <code>compute_tor_proxy(url, tor_proxy)</code> decides: a node is reached via the Tor SOCKS proxy (normalised to <code>socks5h://</code>) only when its host is <strong>globally routable</strong> (<code>not ip.is_global</code> ⇒ direct). Loopback, RFC1918, link-local, IPv6 ULA <strong>and CGNAT/Tailscale (<code>100.64.0.0/10</code>)</strong> connect directly — the same predicate the <a href="../algorithms/mandatory_tor.html">mandatory-Tor guard</a> uses, so a tailnet GPU node is never wrongly forced through (and unreachable via) a Tor exit.</dd>
     <dt>headers</dt><dd>Forwards <code>X-Ghost-Key</code> when calling other Ghost Agent instances.</dd>
   </div>
 

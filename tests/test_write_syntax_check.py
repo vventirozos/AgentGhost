@@ -81,13 +81,30 @@ async def test_write_file_clean_python_has_no_warning(tmp_path):
     assert "SYNTAX CHECK FAILED" not in res
 
 
-async def test_replace_text_exact_match_reports_introduced_breakage(tmp_path):
+async def test_replace_text_rejects_introduced_breakage_and_rolls_back(tmp_path):
+    """A replace that turns a parsing file into a non-parsing one is now
+    REFUSED and the file is left unchanged on disk — persisting the
+    breakage used to destroy the known-good anchor state and trigger a
+    multi-turn rewrite spiral."""
     (tmp_path / "mod.py").write_text("value = 1\n")
     res = await tool_replace_text(
         "mod.py", "value = 1", "value = (1\n", tmp_path,
     )
+    assert "REJECTED" in res
+    assert "SUCCESS" not in res
+    # file is untouched
+    assert (tmp_path / "mod.py").read_text() == "value = 1\n"
+
+
+async def test_replace_text_allows_edit_on_already_broken_file(tmp_path):
+    """If the file was ALREADY broken, an edit (possibly a partial fix) is
+    NOT blocked — the regression guard only fires on parse → no-parse."""
+    (tmp_path / "broken.py").write_text("def f(:\n    pass\n")
+    res = await tool_replace_text(
+        "broken.py", "def f(:", "def f(x):", tmp_path,
+    )
     assert "SUCCESS" in res
-    assert "SYNTAX CHECK FAILED" in res
+    assert (tmp_path / "broken.py").read_text() == "def f(x):\n    pass\n"
 
 
 async def test_replace_text_clean_edit_has_no_warning(tmp_path):

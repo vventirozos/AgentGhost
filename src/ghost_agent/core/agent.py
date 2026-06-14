@@ -2463,6 +2463,13 @@ class GhostAgent:
                 # consolidation; salvaging the complete pairs keeps the fact.
                 result_json = extract_json_from_text(content, repair_truncated=True)
                 score, fact, profile_up = float(result_json.get("score", 0.0)), result_json.get("fact", ""), result_json.get("profile_update", None)
+                # The LLM is asked for profile_update as an object, but it
+                # sometimes returns a bare string (or other scalar). Anything
+                # that isn't a dict can't drive the profile-update path below,
+                # so normalize it to None — otherwise profile_up.get(...) later
+                # raises "'str' object has no attribute 'get'".
+                if not isinstance(profile_up, dict):
+                    profile_up = None
 
                 # --- UNCONDITIONAL KNOWLEDGE GRAPH INGESTION ---
                 graph_triplets = result_json.get("graph_triplets", [])

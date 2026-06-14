@@ -34,9 +34,21 @@
   <p>Why that is exactly right and not over-broad:</p>
   <ul>
     <li>Anonymised traffic egresses through the Tor SOCKS proxy at <code>127.0.0.1:9050</code> — the socket layer sees a <strong>loopback</strong> connect, which is allowed. With <code>socks5h</code>, even DNS is resolved by Tor's exit, so no public connect appears here.</li>
-    <li>Local infrastructure — the llama.cpp upstream, ChromaDB, a LAN Postgres, LAN swarm / image-gen nodes (e.g. <code>192.168.0.20</code>) — is loopback or RFC1918, so it is allowed (LAN traffic does not deanonymise via a Tor exit).</li>
+    <li>Local infrastructure — the llama.cpp upstream, ChromaDB, a LAN Postgres, LAN swarm / image-gen nodes (e.g. <code>192.168.0.20</code>, or a <strong>Tailscale/CGNAT</strong> GPU at <code>100.83.184.117</code>) — is not globally routable, so it is allowed (such traffic does not deanonymise via a Tor exit, and a Tor exit cannot route a tailnet address anyway).</li>
     <li>The ONLY thing blocked is a <strong>direct connection to a public IP</strong> — which by construction is a connection that bypassed Tor. That is precisely the leak the README claims is impossible.</li>
   </ul>
+
+  <h2>Egress decision: one predicate, two enforcers</h2>
+  <p>
+    "Local-or-LAN vs. public" is decided by a single rule — <strong><code>not ip.is_global</code></strong> — applied in two places that must agree:
+  </p>
+  <ul>
+    <li><code>egress_guard.is_allowed_host</code> — the fail-closed guard that <em>blocks</em> direct public connects.</li>
+    <li><code>core.llm.compute_tor_proxy</code> — chooses, per outbound LLM/compute node, whether to <em>route via Tor</em> (public) or connect directly (local-or-LAN).</li>
+  </ul>
+  <p>
+    <code>is_global</code> is <code>False</code> for loopback, RFC1918, link-local, IPv6 ULA, <strong>and CGNAT / Tailscale (<code>100.64.0.0/10</code>)</strong>. An earlier version of <code>compute_tor_proxy</code> used the narrower <code>is_private or is_loopback</code>, under which a Tailscale node reads as non-private — so an image-gen GPU at <code>100.x.x.x</code> was forced through a Tor exit that cannot route a tailnet address, and <em>every</em> generation failed with <code>ConnectError: All connection attempts failed</code>. Aligning both call sites on <code>is_global</code> fixes that and guarantees the guard never blocks a node the client was told to reach directly.
+  </p>
 
   <h2>Boot-time liveness gate</h2>
   <p>

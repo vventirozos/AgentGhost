@@ -66,6 +66,33 @@ async def test_run_smart_memory_task_no_contradiction(mock_context):
     mock_context.memory_system.add.assert_called()
 
 @pytest.mark.asyncio
+async def test_run_smart_memory_task_string_profile_update(mock_context):
+    """Regression: the LLM sometimes returns profile_update as a bare string
+    instead of an object. With score >= 0.9 that used to flow into the
+    'identity' path and crash with "'str' object has no attribute 'get'".
+    It should now degrade to a normal 'auto' memory without touching the
+    profile and without raising."""
+    agent = GhostAgent(mock_context)
+
+    # No contradiction candidates -> only the extraction call is made.
+    mock_context.memory_system.search_advanced.return_value = []
+    mock_context.llm_client.chat_completion.side_effect = [
+        {"choices": [{"message": {"content": '{"score": 0.9, "fact": "User prefers open-ended, imaginative project ideas.", "profile_update": "User prefers open-ended ideas"}'}}]},
+    ]
+
+    # Must not raise (the bug surfaced as a swallowed "Smart memory task failed").
+    await agent.run_smart_memory_task("User: give me wild ideas.\nAI: sure.", "test-model", 0.5)
+
+    # Fact still stored...
+    mock_context.memory_system.add.assert_called()
+    call_args = mock_context.memory_system.add.call_args[0]
+    assert call_args[0] == "User prefers open-ended, imaginative project ideas."
+    # ...but as 'auto', not 'identity', since profile_update wasn't a dict.
+    assert call_args[1]["type"] == "auto"
+    # And the profile is never updated from a string payload.
+    mock_context.profile_memory.update.assert_not_called()
+
+@pytest.mark.asyncio
 async def test_intent_driven_skill_recall(mock_context):
     agent = GhostAgent(mock_context)
     

@@ -46,6 +46,9 @@
   <h2>Merge semantics</h2>
   <p>Scalar → scalar: replace if different, else promote both to a list. Lists are deduped and order-preserved.</p>
 
+  <h2>Robustness — <code>profile_update</code> shape</h2>
+  <p>The smart-memory consolidation prompt asks the LLM to return <code>profile_update</code> as an object (<code>{category, key, value}</code>). The model occasionally ignores this and emits a bare string instead. The agent now coerces any non-dict <code>profile_update</code> to <code>None</code> at parse time: such a fact is still stored as a normal <code>auto</code> vector memory but skips the <code>identity</code> / <code>profile_memory.update</code> path entirely. This prevents the previous crash — <code>'str' object has no attribute 'get'</code> — which fired (and was swallowed) when a high-score string slipped into the identity branch.</p>
+
   <h2>API</h2>
   <table>
     <thead><tr><th>Method</th><th>Effect</th></tr></thead>
