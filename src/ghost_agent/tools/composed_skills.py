@@ -42,6 +42,41 @@ def _validate_composed_name(name: str) -> str:
     return name
 
 
+# Per-step result cap for composed-skill execution. Each step's body is
+# bounded so one chatty step can't blow the context budget when the macro's
+# combined output is handed back to the LLM. The original cap was 1000 chars,
+# which SILENTLY truncated a list-bearing step — e.g. the morning briefing's
+# "latest 10 headlines" step (well over 1000 chars for 10 items) was cut down
+# to ~2 headlines, which is exactly the "briefing only shows 2, not 10" bug.
+# 4000 chars comfortably carries ~10 headlines while still bounding a runaway
+# step; across a handful of steps the macro's total stays context-safe.
+MAX_STEP_RESULT_CHARS = 4000
+
+
+def _cap_step_result(result_str: str, limit: int = MAX_STEP_RESULT_CHARS) -> str:
+    """Bound a single step's result body, marking any truncation EXPLICITLY.
+
+    Returns ``result_str`` unchanged when it fits within ``limit``. When it
+    does not, truncates to ``limit`` chars and appends a visible marker noting
+    how many chars were dropped — so the truncation is never silent. The model
+    (and the verifier gate) can then SEE that content was cut and re-fetch the
+    step standalone, instead of believing it received the whole list and
+    delivering a short answer. That silent-drop-then-believe-it-was-complete
+    path is what made the briefing ship 2 (and later 8) of 10 headlines.
+    """
+    if result_str is None:
+        return ""
+    if len(result_str) <= limit:
+        return result_str
+    dropped = len(result_str) - limit
+    return (
+        f"{result_str[:limit]}\n"
+        f"…[truncated {dropped} chars — this step's full output exceeded the "
+        f"{limit}-char per-step cap; re-run this step's tool standalone to get "
+        f"the complete result]"
+    )
+
+
 @dataclass
 class SkillStep:
     """A single step in a composed skill."""
@@ -349,7 +384,7 @@ class ComposedSkillRegistry:
                 results.append({
                     "step": step.description,
                     "tool": step.tool_name,
-                    "result": result_str[:1000],
+                    "result": _cap_step_result(result_str),
                     "success": True,
                 })
 
@@ -400,7 +435,7 @@ class ComposedSkillRegistry:
                 return {
                     "step": step.description,
                     "tool": step.tool_name,
-                    "result": str(result)[:1000],
+                    "result": _cap_step_result(str(result)),
                     "success": True,
                 }
             except Exception as exc:
@@ -503,8 +538,10 @@ def _format_execution_result(skill_name: str, result: Dict[str, Any]) -> str:
 
     This is what the agent's dispatch loop hands back as the tool result;
     the model then synthesises the briefing/answer from the per-step
-    blocks. Each step's body is already bounded to 1000 chars by
-    `execute()`, so a chatty step can't blow the context budget.
+    blocks. Each step's body is already bounded to ``MAX_STEP_RESULT_CHARS``
+    by `execute()` (via `_cap_step_result`), so a chatty step can't blow the
+    context budget — and any step that DID hit the cap carries an explicit
+    truncation marker, so a list-bearing step is never silently shortened.
     """
     # Guard-style failures (unknown skill) carry an 'error' and no 'results'.
     if not result.get("success") and "error" in result and "results" not in result:

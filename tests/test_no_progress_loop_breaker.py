@@ -172,3 +172,83 @@ def test_scenario_genuine_progress_never_trips():
         for i in range(6)
     ]
     assert _replay(calls) is None
+
+
+# --------------------------------------------------------------------------
+# Read/write loop exemption — the FIRST-TRIP REMEDY decision
+# --------------------------------------------------------------------------
+#
+# Tripping the breaker is only half the story; the OTHER half is the remedy.
+# For an ordinary re-observation loop the first-trip remedy is to set
+# `force_final_response` (drop tools, finish as text). For a tool that both
+# READS and WRITES through one dispatch name (manage_composed_skills,
+# file_system, ...) that remedy is destructive: the loop is the agent
+# re-READING before it performs the WRITE it was asked to do, and forcing a
+# text-only turn bars that pending mutation forever. Observed bug: a request
+# to reconfigure a composed skill looped on action="list", got force-
+# finalised at 3x, and the follow-up action="define" never ran — the change
+# silently never landed. For those tools the breaker must STEER but keep
+# tools available.
+
+from ghost_agent.core.strikes import (
+    is_readwrite_loop_exempt,
+    READWRITE_LOOP_TOOLS,
+)
+from ghost_agent.core.agent import _is_readwrite_loop_exempt
+
+
+def test_readwrite_exempt_identifies_read_write_tools():
+    assert is_readwrite_loop_exempt("manage_composed_skills") is True
+    assert is_readwrite_loop_exempt("file_system") is True
+    assert is_readwrite_loop_exempt("knowledge_base") is True
+    assert is_readwrite_loop_exempt("manage_tasks") is True
+
+
+def test_readwrite_exempt_excludes_pure_observation_tools():
+    # Re-observation tools with no write side must NOT be exempted — their
+    # no-progress loop SHOULD force a grounded final answer as before.
+    assert is_readwrite_loop_exempt("browser") is False
+    assert is_readwrite_loop_exempt("system_weather") is False
+    assert is_readwrite_loop_exempt(None) is False
+    assert is_readwrite_loop_exempt("") is False
+
+
+def test_agent_reexports_same_predicate():
+    # agent.py imports the helper; the two names must be the same function so
+    # the loop breaker and the tests agree.
+    assert _is_readwrite_loop_exempt is is_readwrite_loop_exempt
+
+
+def _first_trip_remedy(fname):
+    """Replay the loop breaker's FIRST-TRIP remedy branch (agent.py): returns
+    True if `force_final_response` would be set (tools dropped, text-only
+    final turn), False if the breaker only steers and KEEPS tools available
+    so a pending write can land."""
+    return not _is_readwrite_loop_exempt(fname)
+
+
+def test_remedy_keeps_tools_for_composed_skill_reconfigure():
+    # The exact reported bug: looping on a read of manage_composed_skills must
+    # NOT force a text-only turn — the pending define/update has to run.
+    assert _first_trip_remedy("manage_composed_skills") is False
+
+
+def test_remedy_forces_final_for_browser_reobservation_loop():
+    # The original Browser-OS pathology is unchanged: still force a grounded
+    # conclusion, because there is no pending write to protect.
+    assert _first_trip_remedy("browser") is True
+
+
+def test_readwrite_tools_still_trip_the_detector():
+    # The exemption changes the REMEDY, not the DETECTION: a repeated read of
+    # a read/write tool still trips (so the steer fires) — it just doesn't
+    # force a text-only final turn.
+    calls = [
+        ("manage_composed_skills", "morning_briefing",
+         "Composed skills (macros): ...", False, False)
+        for _ in range(3)
+    ]
+    trip = _replay(calls)
+    assert trip is not None and trip[2] == "manage_composed_skills"
+    # And the remedy for that tripped tool keeps tools available.
+    assert _first_trip_remedy(trip[2]) is False

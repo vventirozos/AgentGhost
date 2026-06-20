@@ -32,9 +32,14 @@
       <tr><td><code>note_repeated_failure(sigs, fname, error)</code></td><td>Signature = <code>tool | whitespace-normalised error head</code>. Mutates the caller-owned dict; returns <code>(sig, count, is_persistent)</code>. Stable across byte-identical repeats, distinct per tool/error.</td></tr>
       <tr><td><code>action_result_fingerprint(result)</code></td><td>Whitespace-normalised, bounded SHA1 of a tool result. Digits kept, so a result whose content genuinely changed looks different and does NOT count as a no-progress repeat.</td></tr>
       <tr><td><code>note_repeated_action(sigs, fname, target, result_fp)</code></td><td>Signature = <code>tool | target | result-fingerprint</code>. Fires only on a genuine no-progress repeat (same action, same target, same observation).</td></tr>
+      <tr><td><code>is_readwrite_loop_exempt(fname)</code></td><td>True for tools that both READ and WRITE through one dispatch name (<code>READWRITE_LOOP_TOOLS</code>: <code>manage_composed_skills</code>, <code>file_system</code>, <code>knowledge_base</code>, <code>manage_tasks</code>, <code>update_profile</code>). Decides the no-progress <em>remedy</em>, not the detection — see below.</td></tr>
     </tbody>
   </table>
   <p>These stay standalone (not just methods) because existing tests import them directly; <code>core.agent</code> re-exports them under their old private names (<code>_note_repeated_failure</code>, etc.).</p>
+
+  <h2 id="readwrite">No-progress remedy: read/write tools</h2>
+  <p>Tripping the breaker is only half the story — the other half is the <em>remedy</em>. For an ordinary re-observation loop (re-screenshot, re-read the same file with nothing left to do) the first-trip remedy sets <code>force_final_response</code>: drop the toolset and finish the turn as plain text. For a tool that both reads and writes through one dispatch name that remedy is <strong>destructive</strong> — the loop is the agent re-<em>reading</em> to orient itself <em>before</em> performing the <em>write</em> it was actually asked to do, and forcing a text-only turn bars that pending mutation forever.</p>
+  <div class="note"><strong>Regression fixed:</strong> a request to reconfigure a composed skill looped on <code>manage_composed_skills(action="list")</code>, the breaker force-finalised at 3×, and the model's follow-up <code>action="define"</code> was then scrubbed by the final-generation stream guard — the change silently never landed. For <code>is_readwrite_loop_exempt</code> tools the breaker now still <em>steers</em> the model off the wasteful re-read but <strong>keeps tools available</strong> so the write can complete; the <code>≥5</code> hard stop remains the backstop. The companion fix on the dispatch side adds <code>manage_composed_skills</code>'s <code>define/approve/delete</code> actions to the <code>is_mutating</code> set so a real mutation is never mistaken for a no-progress read.</div>
 
   <h2>StrikeLedger API</h2>
   <table>

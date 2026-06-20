@@ -408,6 +408,7 @@ from .strikes import (  # noqa: E402
     note_repeated_failure as _note_repeated_failure,
     note_repeated_action as _note_repeated_action,
     action_result_fingerprint as _action_result_fingerprint,
+    is_readwrite_loop_exempt as _is_readwrite_loop_exempt,
 )
 
 
@@ -6626,7 +6627,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                         is_mutating = fname in ["execute", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
                                       (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename"]) or \
-                                      (fname == "knowledge_base" and t_args.get("action") in ["ingest_document", "forget", "reset_all", "insert_fact"])
+                                      (fname == "knowledge_base" and t_args.get("action") in ["ingest_document", "forget", "reset_all", "insert_fact"]) or \
+                                      (fname == "manage_composed_skills" and t_args.get("action") in ["define", "approve", "delete"])
 
                         # --- IDEMPOTENCY GUARD (production loop fix) ---
                         # Pure setters with no value in repetition. Re-issuing
@@ -7194,27 +7196,58 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 force_stop = True
                             elif _asig not in repeated_action_steered:
                                 repeated_action_steered.add(_asig)
+                                # Read/write tools (manage_composed_skills,
+                                # file_system, ...) get a SOFTER steer: the
+                                # loop is the agent re-READING to orient
+                                # itself, and the action it was asked to do is
+                                # a WRITE through the SAME tool. Forcing a
+                                # text-only final turn here would bar that
+                                # pending mutation forever — the agent would
+                                # "finish" having silently done nothing (the
+                                # reconfigure-a-composed-skill bug: looped on
+                                # action="list", force-finalised, never reached
+                                # action="define"). So we keep tools available
+                                # and tell it to perform the WRITE now instead
+                                # of reading again. The >=5 hard stop above is
+                                # the backstop if it keeps thrashing.
+                                _readwrite_loop = _is_readwrite_loop_exempt(_afname)
                                 pretty_log(
                                     "Loop Breaker",
                                     f"No-progress: '{_afname}'{_tgt_desc} repeated {_acnt}x with no "
-                                    "new info — forcing a grounded conclusion.",
+                                    "new info — "
+                                    + ("steering to the write action (tools kept)."
+                                       if _readwrite_loop
+                                       else "forcing a grounded conclusion."),
                                     level="WARNING", icon=Icons.WARN,
                                 )
-                                force_final_response = True
-                                messages.append({"role": "user", "content": (
-                                    f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
-                                    "and gotten the SAME result with no change. Repeating it will NOT "
-                                    "produce new information — STOP re-observing. The strongest "
-                                    "evidence you already have (a DOM/state inspection, the sandbox "
-                                    "file listing, the actual file contents, or a tool result you "
-                                    "already received) is AUTHORITATIVE; trust it instead of looking "
-                                    "again. Write your FINAL answer now: if you have already confirmed "
-                                    "the change via state/DOM/file inspection, report success and say "
-                                    "how you confirmed it; if this environment cannot show you the "
-                                    "result (e.g. a visual check that headless rendering won't "
-                                    "display), say so plainly and tell the user exactly how to verify "
-                                    "it themselves. Do NOT call this tool again."
-                                )})
+                                if _readwrite_loop:
+                                    messages.append({"role": "user", "content": (
+                                        f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} "
+                                        "times and gotten the SAME result — you are RE-READING, not "
+                                        "making progress. STOP listing/reading. You already have the "
+                                        "current state; it is AUTHORITATIVE. If the task requires a "
+                                        f"CHANGE, call '{_afname}' ONCE NOW with the mutating action "
+                                        "(e.g. define/write/update/create) to apply it, then report "
+                                        "what you changed. If no change is needed, write your FINAL "
+                                        "answer from the state you already have. Do NOT issue another "
+                                        "read/list of this tool."
+                                    )})
+                                else:
+                                    force_final_response = True
+                                    messages.append({"role": "user", "content": (
+                                        f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
+                                        "and gotten the SAME result with no change. Repeating it will NOT "
+                                        "produce new information — STOP re-observing. The strongest "
+                                        "evidence you already have (a DOM/state inspection, the sandbox "
+                                        "file listing, the actual file contents, or a tool result you "
+                                        "already received) is AUTHORITATIVE; trust it instead of looking "
+                                        "again. Write your FINAL answer now: if you have already confirmed "
+                                        "the change via state/DOM/file inspection, report success and say "
+                                        "how you confirmed it; if this environment cannot show you the "
+                                        "result (e.g. a visual check that headless rendering won't "
+                                        "display), say so plainly and tell the user exactly how to verify "
+                                        "it themselves. Do NOT call this tool again."
+                                    )})
 
                         if turn_has_failure:
                             # Any failure (transient or structural) breaks the

@@ -82,6 +82,41 @@ def note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 
     return sig, count, count >= threshold
 
 
+#: Tools that both READ and MUTATE through a single dispatch name, with the
+#: action chosen by an argument (e.g. ``manage_composed_skills(action="list"``
+#: vs ``"define")``, ``file_system(operation="read"`` vs ``"write")``). A
+#: no-progress loop on one of these is almost always the agent re-READING to
+#: orient itself before performing the WRITE it was actually asked to do.
+#:
+#: The no-progress breaker's first-trip remedy is to set
+#: ``force_final_response`` — which drops the toolset and routes the next turn
+#: as text-only. For an ordinary re-observation loop (re-screenshot, re-read
+#: the same file with nothing left to do) that is correct. For a read/write
+#: tool it is destructive: it bars the pending mutation forever, so the agent
+#: "finishes" having silently done nothing. Observed failure: a request to
+#: reconfigure a composed skill looped on ``action="list"``, got
+#: force-finalised at 3x, and the model's subsequent ``action="define"`` was
+#: scrubbed by the final-generation stream guard — the change never landed.
+#:
+#: For these tools the breaker still STEERS the model off the wasteful re-read
+#: but leaves tools available so the write can land. The >=5 hard stop is the
+#: backstop if it genuinely keeps thrashing.
+READWRITE_LOOP_TOOLS = frozenset({
+    "manage_composed_skills",
+    "manage_tasks",
+    "file_system",
+    "knowledge_base",
+    "update_profile",
+})
+
+
+def is_readwrite_loop_exempt(fname) -> bool:
+    """True if a no-progress READ loop on ``fname`` must NOT force a text-only
+    final response, because the same tool is how the agent performs the
+    pending WRITE. See :data:`READWRITE_LOOP_TOOLS`."""
+    return fname in READWRITE_LOOP_TOOLS
+
+
 class StrikeLedger:
     """Request-scoped loop-detection state for one ``handle_chat`` call.
 
