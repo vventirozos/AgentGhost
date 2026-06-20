@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.workspace_cleanup — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="planning.html">planning</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="coding_executor.html">coding_executor</a>
+    <a href="project_safety.html">project_safety</a>
+    <a href="project_research.html">project_research</a>
+    <a class="current" href="workspace_cleanup.html">workspace_cleanup</a>
+    <a href="../memory/projects.html">memory.projects</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / workspace_cleanup.py</h1>
+  <p class="subtitle">Mark-and-sweep of a finished project's scratch space. When a project completes, registered deliverables are kept and everything else under its workspace is deleted.</p>
+
+  <h2>Why</h2>
+  <p>While a project is in flight the agent litters its workspace
+  (<code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code>) with transient files —
+  screenshots, helper scripts, downloaded fixtures, <code>__pycache__</code>,
+  temp output. Historically these survived completion and accumulated. This
+  module removes them automatically the moment a project reaches
+  <strong>DONE</strong>, leaving only the files the user actually wanted.</p>
+
+  <h2>The contract</h2>
+  <p><strong>Registered <code>file</code> artifacts are kept; everything else
+  is deleted.</strong> Anything that should survive cleanup must be registered
+  as a deliverable — either explicitly (the
+  <code>deliverables=[...]</code> argument of the <code>manage_projects</code>
+  <code>task_update</code> action, or
+  <code>ProjectStore.register_file_artifact</code>) or automatically (the
+  research subsystem registers each brief). Whatever is not registered is, by
+  definition, scratch.</p>
+
+  <h2>API</h2>
+  <table>
+    <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>sweep_project_workspace(store, project_id, *, dry_run=False) -&gt; dict</code></td><td>Delete every file under the project workspace not registered as a <code>file</code> artifact, then prune the directories left empty. Returns <code>{project_id, status, deleted, kept, dirs_removed, freed_bytes}</code>. Never raises. <code>dry_run=True</code> reports what it would delete without touching disk.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Safety guards</h2>
+  <ul>
+    <li><strong>Scoped</strong> — only ever walks <code>&lt;sandbox_root&gt;/projects/&lt;id&gt;/</code>; the project dir itself is preserved so a resume still has a workspace.</li>
+    <li><strong>No symlink escape</strong> — the walk never follows symlinks; a symlink is removed as scratch but its target outside the tree is untouched.</li>
+    <li><strong>Fail-safe</strong> — if the keep-set (the artifact list) can't be read, the sweep deletes <em>nothing</em> and returns <code>status="skipped: artifact read failed"</code>.</li>
+    <li><strong>Non-fatal</strong> — wrapped end to end; a cleanup failure can never strand a project mid-transition.</li>
+    <li><strong>DONE only</strong> — never runs on FAILED / NEEDS_USER, which stay resumable (a revised task can roll them forward to DONE later), so their files survive.</li>
+  </ul>
+
+  <h2>Trigger wiring</h2>
+  <p>The sweep is hung off <code>ProjectStore.on_project_done</code>, a hook
+  fired by <code>_fire_project_done</code> exactly on the <em>transition</em>
+  to DONE — from both <code>_maybe_rollup_project_status</code> (autonomous and
+  task-driven completion both funnel through here) and a manual
+  <code>update_project(status="DONE")</code>. <code>main.py</code> wires the
+  hook to <code>sweep_project_workspace</code> when it constructs the store.
+  Because every completion path ends at <code>store.update_task</code> →
+  rollup, one store-level hook covers them all.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_workspace_cleanup.py</code> — keep/delete split, nested
+  deliverables, <code>__pycache__</code> removal, dry-run, the three skip
+  guards, symlink non-escape, path normalization, dedup registration, and the
+  end-to-end "complete a project → workspace swept" flow.</p>
+</main>
+</body>
+</html>

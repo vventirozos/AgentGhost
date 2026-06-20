@@ -166,21 +166,35 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
 
     # 1b. Redundant project-prefix heal (project-scoped sandbox only).
     # When a project is active the sandbox root IS <sandbox>/projects/<id>
-    # (so a project's files clean up with one `rm -rf`). The model usually
-    # still emits the full project-relative path it sees in directory
-    # listings — ``projects/<id>/X`` — which would double-nest to
-    # ``projects/<id>/projects/<id>/X``. If the sandbox root already ends
-    # in ``projects/<id>``, drop one redundant leading ``projects/<id>/``
-    # so the file lands once. Case-insensitive on the id (project ids are
-    # canonicalised to lowercase hex). Untouched for the normal unscoped
-    # root, whose parent dir is not literally named ``projects``.
+    # (so a project's files clean up with one `rm -rf`). The model reaches
+    # for a file via every route it has seen it referenced, and each one
+    # would double-nest under the already-scoped root:
+    #   * ``projects/<id>/X``          (container-root-relative listing)
+    #   * ``sandbox/projects/<id>/X``  (HOST-root-relative — the sandbox dir
+    #     is literally named ``sandbox`` on disk and surfaces that way in
+    #     the project's workspace_dir and some listings; the model then
+    #     builds e.g. ``file:///workspace/sandbox/projects/<id>/X`` and the
+    #     browser 404s on the doubled path — observed live, webOS build).
+    # Strip the longest matching redundant prefix so the file lands once.
+    # Case-insensitive on the id (project ids are canonicalised to lowercase
+    # hex). Untouched for the normal unscoped root, whose parent dir is not
+    # literally named ``projects``.
     if sandbox_dir.parent.name == "projects":
         _pid = sandbox_dir.name
-        _pref = f"projects/{_pid}/".lower()
-        if clean_name.lower().startswith(_pref):
-            clean_name = clean_name[len(_pref):]
-        elif clean_name.lower() == f"projects/{_pid}".lower():
-            clean_name = ""
+        _root_name = sandbox_dir.parent.parent.name
+        # Longest (root-qualified) form first so it wins over the bare one.
+        _redundant = []
+        if _root_name:
+            _redundant.append(f"{_root_name}/projects/{_pid}")
+        _redundant.append(f"projects/{_pid}")
+        for _p in _redundant:
+            _pl = _p.lower()
+            if clean_name.lower().startswith(_pl + "/"):
+                clean_name = clean_name[len(_p) + 1:]
+                break
+            if clean_name.lower() == _pl:
+                clean_name = ""
+                break
 
     # 2. Resolve to absolute path inside the sandbox root
     target_path = (sandbox_dir / clean_name).resolve()

@@ -2214,10 +2214,12 @@ class GhostAgent:
                                     out = out.split("\n", 1)[1]
                             return out.strip()
 
+                        from .coding_executor import build_coding_task as _aa_build
                         result = await _advance_once(
                             ctx, pid, tool_runner=_aa_tool_runner,
                             llm_classifier=_aa_classify,
                             code_generator=_aa_code_gen,
+                            coding_executor=_aa_build,
                         )
                         pretty_log(
                             "Autoadvance",

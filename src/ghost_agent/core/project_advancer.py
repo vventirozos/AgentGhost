@@ -66,6 +66,15 @@ _CODING_KEYWORDS = {
     "implement", "build", "write code", "refactor", "fix", "debug",
     "patch", "unit test", "add tests", "deploy", "migrate", "compile",
     "install", "scaffold", "ship", "benchmark",
+    # File-creation / build signals — high precision so a project leaf like
+    # "create a file hello.txt" or "build the parser module" routes to the
+    # real coding executor instead of being web-searched (theatrical
+    # completion observed live). File-extension tokens are unambiguous.
+    "create a file", "write a file", "make a file", "create file",
+    "create the file", "a script", "html page", "web page", "webpage",
+    "javascript", "css", "function ", "endpoint", "component", "module",
+    ".py", ".js", ".ts", ".html", ".css", ".json", ".md", ".txt", ".sh",
+    ".sql", ".jsx", ".tsx", ".vue",
 }
 
 _RESEARCH_KEYWORDS = {
@@ -105,18 +114,22 @@ ToolRunner = Callable[[str, Dict[str, Any]], Awaitable[str]]
 LLMClassifier = Callable[[str], Awaitable[str]]
 
 
-def classify_task(description: str) -> str:
+def classify_task(description: str, default: str = "research") -> str:
     """Return one of "needs_user", "coding", "research".
 
-    Precedence: ``needs_user`` → ``research`` → ``coding`` → default
-    research. ``research`` beats ``coding`` because a task like
-    "Research benchmarks" contains the word "benchmark" (coding
-    keyword) but clearly intends reading/summarizing, not writing
-    code. ``needs_user`` always wins so "Implement and approve X" is
-    routed to the human.
+    Precedence: ``needs_user`` → ``research`` → ``coding`` → ``default``.
+    ``research`` beats ``coding`` because a task like "Research benchmarks"
+    contains the word "benchmark" (coding keyword) but clearly intends
+    reading/summarizing, not writing code. ``needs_user`` always wins so
+    "Implement and approve X" is routed to the human.
+
+    ``default`` is the bucket for a task that hits no keyword. It defaults to
+    "research" (the side-effect-free autonomy mode), but a CODING-kind
+    project passes ``default="coding"`` so an unlabelled build leaf reaches
+    the real coding executor instead of being web-searched.
     """
     if not description:
-        return "research"
+        return default
     lower = description.lower()
     for kw in _NEEDS_USER_KEYWORDS:
         if kw in lower:
@@ -127,7 +140,7 @@ def classify_task(description: str) -> str:
     for kw in _CODING_KEYWORDS:
         if kw in lower:
             return "coding"
-    return "research"
+    return default
 
 
 def _get_budget(store, project_id: str) -> Dict[str, int]:
@@ -173,12 +186,60 @@ def _metacog_set_task(context, task_id) -> None:
         pass
 
 
+def _finalize_coding(context, store, plan, project_id, nxt, cres,
+                     tick_started_at) -> AdvanceResult:
+    """Persist the outcome of a real coding build (CodingResult) for one leaf.
+
+    On success: register the produced files as deliverable artifacts (so the
+    end-of-project cleanup keeps them), append the ledger note, mark DONE.
+    On failure: mark FAILED with the build's reason — this stops the batch
+    loop so the user can take the hard task themselves, instead of a shallow
+    DONE.
+    """
+    from .planning import TaskStatus
+    from .project_safety import record_runtime
+
+    if cres.ok:
+        for rel in (cres.files or []):
+            try:
+                store.register_file_artifact(nxt.id, rel)
+            except Exception:
+                logger.debug("artifact register skipped: %s", rel, exc_info=True)
+        if cres.ledger_note:
+            try:
+                store.append_ledger(project_id, cres.ledger_note)
+            except Exception:
+                logger.debug("ledger append skipped", exc_info=True)
+        plan.update_status(nxt.id, TaskStatus.DONE,
+                           result=cres.summary, actual_tool="code_executor")
+        _metacog_set_task(context, None)
+        _increment_budget(store, project_id)
+        record_runtime(store, project_id,
+                       seconds=max(0.0, time.time() - tick_started_at),
+                       tool_calls=1)
+        store.log_event(project_id, nxt.id, "autoadvance_step",
+                        {"tool": "code_executor", "classification": "coding",
+                         "files": list(cres.files or [])[:8]})
+        return AdvanceResult(True, nxt.id, "coding",
+                             f"built: {cres.summary}", None)
+
+    plan.update_status(nxt.id, TaskStatus.FAILED,
+                       failure_reason=f"code_executor: {cres.summary}")
+    _metacog_set_task(context, None)
+    _increment_budget(store, project_id)
+    store.log_event(project_id, nxt.id, "autoadvance_failed",
+                    {"tool": "code_executor", "reason": (cres.summary or "")[:200]})
+    return AdvanceResult(True, nxt.id, "coding",
+                         f"code build failed: {cres.summary}", None)
+
+
 async def advance_once(
     context,
     project_id: str,
     tool_runner: Optional[ToolRunner] = None,
     llm_classifier: Optional[LLMClassifier] = None,
     code_generator: Optional[Callable[[str], Awaitable[str]]] = None,
+    coding_executor: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> AdvanceResult:
     """Run a single autoadvance tick for ``project_id``.
 
@@ -190,11 +251,14 @@ async def advance_once(
       llm_classifier: async callable returning one of
         "needs_user"/"coding"/"research" for a free-form description.
         Defaults to :func:`classify_task` (synchronous, wrapped).
-      code_generator: async callable ``(description) -> str`` returning an
-        executable command/snippet for a coding task. When supplied, a
-        coding task generates real code and runs it via ``execute``;
-        without it, a coding task degrades to *researching* the task
-        rather than running the old no-op stub.
+      coding_executor: async callable ``(context, description, *,
+        tool_runner, ledger) -> CodingResult`` that BUILDS a coding leaf for
+        real (writes files, verifies). When supplied it handles every coding
+        task — the strong path. See :mod:`core.coding_executor`.
+      code_generator: async callable ``(description) -> str`` — the weaker
+        fallback used only when ``coding_executor`` is absent or crashes: it
+        returns a single executable command run via ``execute``. Without
+        either, a coding task degrades to *researching* the task.
     """
     store = getattr(context, "project_store", None)
     if store is None:
@@ -255,14 +319,17 @@ async def advance_once(
     # the entire trigger→replan pipeline was inert.)
     _metacog_set_task(context, nxt.id)
 
+    # A CODING-kind project biases an unlabelled leaf toward coding (so a
+    # build task that hits no keyword reaches the executor, not web_search).
+    _default_bucket = "coding" if (proj.get("kind") == "CODING") else "research"
     if llm_classifier is None:
-        classification = classify_task(nxt.description)
+        classification = classify_task(nxt.description, default=_default_bucket)
     else:
         try:
             classification = await llm_classifier(nxt.description)
         except Exception:
-            classification = classify_task(nxt.description)
-    classification = (classification or "research").lower()
+            classification = classify_task(nxt.description, default=_default_bucket)
+    classification = (classification or _default_bucket).lower()
 
     if classification == "needs_user":
         plan.update_status(nxt.id, TaskStatus.NEEDS_USER,
@@ -272,6 +339,25 @@ async def advance_once(
         _increment_budget(store, project_id)
         return AdvanceResult(True, nxt.id, "needs_user",
                              "task requires human input")
+
+    # STRONG coding path: when a coding_executor is wired, BUILD the leaf for
+    # real (write files + verify) and finalize from its structured result —
+    # the antidote to single-command theatrical completion. Falls through to
+    # the lighter command path only if the executor is unavailable/crashes.
+    if classification == "coding" and coding_executor is not None and tool_runner is not None:
+        try:
+            ledger = store.get_ledger(project_id)
+        except Exception:
+            ledger = ""
+        cres = None
+        try:
+            cres = await coding_executor(
+                context, nxt.description, tool_runner=tool_runner, ledger=ledger)
+        except Exception as e:
+            logger.warning("coding_executor crashed: %s", e)
+        if cres is not None:
+            return _finalize_coding(context, store, plan, project_id, nxt,
+                                    cres, _tick_started_at)
 
     # Pick a tool by classification. Research → web_search,
     # coding → execute (sandbox runs it). A missing tool runner means
@@ -426,6 +512,216 @@ async def advance_once(
     summary = (f"advanced via {tool_name}"
                + (f"; saved research to {research_path}" if research_path else ""))
     return AdvanceResult(True, nxt.id, classification, summary, artifact_id)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Multi-task pacing
+#
+# A single "proceed"/"next" stays a full agent turn (higher quality — the
+# agent writes files, runs, verifies). The loop below exists for the BATCH
+# case ("do the next 3", "proceed with all remaining tasks"), where the
+# alternative is one chat turn grinding the whole tree and flooding the
+# context window. Each iteration is a bounded advance_once tick that
+# checkpoints status+result to the store, so context stays bounded no
+# matter how many tasks run. NOTE: advance_once's coding path generates a
+# SINGLE command per task — adequate for scriptable/iterative work, lighter
+# than a full agent turn for complex multi-file builds (a task that needs
+# more will FAIL its tick and stop the loop for the user).
+# ──────────────────────────────────────────────────────────────────────
+
+# Backstop on an "all" run, independent of the project step budget — guards
+# against an uncapped project. The per-project budget and the stop
+# conditions normally end the loop well before this.
+ADVANCE_ALL_HARD_CAP = 40
+
+_INTENT_ALL = re.compile(
+    r"\b(all|everything|every\s+(remaining\s+)?task|the\s+rest|"
+    r"remaining\s+tasks?|finish\s+(the\s+)?project|complete\s+(the\s+)?project|"
+    r"whole\s+(project|thing)|to\s+the\s+end|until\s+(it'?s\s+|you'?re\s+)?done|"
+    r"keep\s+going\s+until)\b",
+    re.I,
+)
+_INTENT_NUM_WORDS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+}
+_INTENT_N = re.compile(
+    r"\b(\d+|a|an|one|two|three|four|five|six|seven|eight|nine|ten)\s+"
+    r"(?:more\s+|next\s+)?tasks?\b",
+    re.I,
+)
+
+
+@dataclass
+class AdvanceManyResult:
+    """Outcome of a bounded advance_many loop."""
+    advanced: list            # [{task_id, classification, status, summary}]
+    stop_reason: str          # project_done · count_reached · needs_user ·
+                              # budget_or_inactive · failed · hard_cap · no_store
+    requested: Optional[int]  # count asked for; None == "all"
+
+    @property
+    def count(self) -> int:
+        return len(self.advanced)
+
+
+def classify_advance_intent(text: str) -> Dict[str, Any]:
+    """Map a user pacing directive to ``{mode, count}``.
+
+      * "all"  → count=None   ("proceed with all remaining tasks", "finish the project")
+      * "n"    → count=N>1     ("do the next 3 tasks", "two more tasks")
+      * "one"  → count=1       ("proceed", "next task", or anything ambiguous —
+                               the safe default so a vague nudge never runs away)
+    """
+    t = (text or "").strip().lower()
+    if not t:
+        return {"mode": "one", "count": 1}
+    if _INTENT_ALL.search(t):
+        return {"mode": "all", "count": None}
+    m = _INTENT_N.search(t)
+    if m:
+        tok = m.group(1)
+        n = int(tok) if tok.isdigit() else _INTENT_NUM_WORDS.get(tok, 1)
+        if n > 1:
+            return {"mode": "n", "count": n}
+    return {"mode": "one", "count": 1}
+
+
+def default_llm_classifier(context):
+    """An LLM-backed task classifier from ``context.llm_client`` (or None →
+    callers fall back to the keyword heuristic). Mirrors the idle
+    autoadvancer so the tool path and idle path classify identically."""
+    llm = getattr(context, "llm_client", None)
+    if llm is None:
+        return None
+    model = getattr(getattr(context, "args", None), "model", "default")
+
+    async def _classify(description: str) -> str:
+        try:
+            r = await llm.chat_completion({
+                "model": model,
+                "messages": [{"role": "user", "content": (
+                    "Classify this task into EXACTLY one word: 'coding' "
+                    "(writes/runs code), 'research' (reads/searches/"
+                    "summarizes), or 'needs_user' (requires a human "
+                    "decision/approval/publish). Output ONLY the one word."
+                    "\n\nTASK: " + str(description)[:500])}],
+                "temperature": 0.0, "max_tokens": 8, "stream": False,
+            })
+            out = ((r or {}).get("choices", [{}])[0]
+                   .get("message", {}).get("content", "") or "").strip().lower()
+            for label in ("needs_user", "coding", "research"):
+                if label in out:
+                    return label
+        except Exception as e:  # pragma: no cover - network/LLM variance
+            logger.debug("advance classify failed: %s", e)
+        return classify_task(description)
+
+    return _classify
+
+
+def default_code_generator(context):
+    """A single-command code generator from ``context.llm_client`` (or None).
+    Produces ONE shell command per task — lighter than a full agent turn."""
+    llm = getattr(context, "llm_client", None)
+    if llm is None:
+        return None
+    model = getattr(getattr(context, "args", None), "model", "default")
+
+    async def _gen(description: str) -> str:
+        r = await llm.chat_completion({
+            "model": model,
+            "messages": [{"role": "user", "content": (
+                "Write a SINGLE shell command (you may invoke python3 -c). "
+                "Output ONLY the command — no explanation, no markdown "
+                "fences.\n\nTASK: " + str(description)[:500])}],
+            "temperature": 0.2, "max_tokens": 1024, "stream": False,
+        })
+        out = ((r or {}).get("choices", [{}])[0]
+               .get("message", {}).get("content", "") or "").strip()
+        if out.startswith("```"):
+            out = out.strip("`")
+            if "\n" in out:
+                out = out.split("\n", 1)[1]
+        return out.strip()
+
+    return _gen
+
+
+async def advance_many(
+    context,
+    project_id: str,
+    *,
+    max_tasks: Optional[int],
+    tool_runner: Optional[ToolRunner] = None,
+    llm_classifier: Optional[LLMClassifier] = None,
+    code_generator: Optional[Callable[[str], Awaitable[str]]] = None,
+    coding_executor: Optional[Callable[..., Awaitable[Any]]] = None,
+    stop_on_fail: bool = True,
+    hard_cap: int = ADVANCE_ALL_HARD_CAP,
+) -> AdvanceManyResult:
+    """Advance up to ``max_tasks`` tasks (``None`` == "all") as a BOUNDED
+    loop of advance_once ticks, checkpointing to the store between each.
+
+    Stops at the FIRST of: count reached · project done (no ready leaf) ·
+    a human-gate / NEEDS_USER task · budget exhausted · a task FAILED (when
+    ``stop_on_fail``) · the hard iteration cap. Each tick claims one leaf,
+    runs one constrained step, and persists status+result, so per-tick
+    context stays bounded however many tasks run. Returns what advanced and
+    why it stopped — the caller reports that and waits for the next
+    direction.
+    """
+    store = getattr(context, "project_store", None)
+    advanced: list = []
+    if store is None:
+        return AdvanceManyResult(advanced, "no_store", max_tasks)
+
+    # Iteration ceiling: the smaller of the requested count and the hard
+    # cap; "all" (None) runs to the hard cap (budget/stop-conditions end it
+    # first in practice).
+    limit = hard_cap if max_tasks is None else max(1, min(int(max_tasks), hard_cap))
+    stop_reason = "count_reached"
+
+    for _ in range(limit):
+        res = await advance_once(
+            context, project_id,
+            tool_runner=tool_runner,
+            llm_classifier=llm_classifier,
+            code_generator=code_generator,
+            coding_executor=coding_executor,
+        )
+        cls = (res.classification or "").lower()
+        if cls == "idle":
+            stop_reason = "project_done"
+            break
+        if cls == "blocked":
+            # "blocked" covers both budget exhaustion and a non-ACTIVE
+            # project — and a project that JUST rolled to DONE because its
+            # last task completed. Distinguish so we report completion as
+            # completion, not as a budget stall.
+            pstatus = (store.get_project(project_id) or {}).get("status")
+            stop_reason = "project_done" if pstatus == "DONE" else "budget_or_inactive"
+            break
+        # The tick targeted a task — record it with its persisted status.
+        status = None
+        if res.task_id:
+            status = (store.get_task(res.task_id) or {}).get("status")
+        advanced.append({
+            "task_id": res.task_id,
+            "classification": res.classification,
+            "status": status,
+            "summary": res.summary,
+        })
+        if cls == "needs_user" or status == "NEEDS_USER":
+            stop_reason = "needs_user"
+            break
+        if status == "FAILED" and stop_on_fail:
+            stop_reason = "failed"
+            break
+    else:
+        stop_reason = "hard_cap" if max_tasks is None else "count_reached"
+
+    return AdvanceManyResult(advanced, stop_reason, max_tasks)
 
 
 def _looks_like_failure(output: str) -> bool:

@@ -86,13 +86,15 @@ def test_briefing_tells_model_not_to_re_read_original_prompt(store):
     assert "start a new project" in b
 
 
-def test_briefing_points_to_batch_task_ids(store):
-    """Discoverability: briefing should mention task_ids=[] so the
-    model notices the bulk-update path instead of looping single
-    task_update calls."""
+def test_briefing_points_to_batch_path(store):
+    """Discoverability: for a MULTI-task request the briefing should point
+    the model at the bounded batch path (autoadvance count=N|all). The old
+    task_ids bulk-update hint was removed when one-task-at-a-time became the
+    default — bulk now goes through the autonomous loop, not a stacked
+    task_update."""
     pid = store.create_project("X")
     b = build_project_briefing(store, pid)
-    assert "task_ids" in b
+    assert "autoadvance count" in b
 
 
 def test_briefing_shows_next_task_and_open_tasks(store):
@@ -118,8 +120,10 @@ def test_briefing_no_open_tasks_shows_nothing_task_wise(store):
     tid = store.add_task(pid, "root")
     store.update_task(tid, status="DONE")
     b = build_project_briefing(store, pid)
-    assert "NEXT TASK" not in b
-    assert "OPEN TASKS" not in b
+    # match the SECTION HEADER ("NEXT TASK: [id] …"), not the mention of
+    # "the NEXT TASK shown below" inside the ONE TASK rule text.
+    assert "NEXT TASK: [" not in b
+    assert "OPEN TASKS (" not in b
 
 
 # --------------------------------------------------------------------- scratchpad snapshot/hydrate

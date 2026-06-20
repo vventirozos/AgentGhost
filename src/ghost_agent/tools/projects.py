@@ -44,8 +44,8 @@ _ACTIONS = {
     "archive", "resume", "status",
     # task-level
     "task_add", "task_update", "task_decompose", "task_next", "task_list",
-    # artifacts / events
-    "artifact_add", "event_log",
+    # artifacts / events / durable working memory
+    "artifact_add", "event_log", "ledger",
     # inbox promotion (suggestion-accepted path)
     "promote_from_context",
     # self-advancing loop
@@ -359,10 +359,52 @@ def _workspace_note(project_id: str) -> str:
     runs in the same place."""
     return (
         f"Working directory is now projects/{project_id}/. Files you write "
-        "with file_system and run with execute live HERE — reference them by "
-        "bare name (e.g. 'chart.py', 'notes.md'), not '/workspace/...'. To "
-        "clean up this project's files later: remove sandbox/projects/"
-        f"{project_id}/."
+        "with file_system and run with execute live HERE — ALWAYS reference "
+        "them by BARE name (e.g. 'chart.py', 'notes.md', 'sub/app.js'). Do "
+        "NOT prefix paths with '/workspace/', 'sandbox/', or 'projects/"
+        f"{project_id}/' — that double-nests the path and 404s (browser file "
+        "URLs especially). Scratch files are cleaned up automatically when "
+        "the project completes."
+    )
+
+
+def _parse_advance_count(count) -> Optional[int]:
+    """Coerce a model-supplied `count` for autoadvance into max_tasks:
+    a positive int, or ``None`` for "all" (run to completion). Anything
+    blank/unparseable defaults to 1 — a vague nudge never runs away."""
+    if count is None:
+        return 1
+    s = str(count).strip().lower()
+    if s in ("all", "*", "rest", "remaining", "everything", "finish"):
+        return None
+    try:
+        return max(1, int(s))
+    except (TypeError, ValueError):
+        return 1
+
+
+_ADVANCE_STOP_BLURB = {
+    "project_done": "All tasks are complete — the project is done.",
+    "count_reached": "Advanced the requested number of tasks; more remain.",
+    "hard_cap": "Hit the safety cap mid-run — call autoadvance again to continue.",
+    "needs_user": "Paused: a task needs your input/decision before continuing.",
+    "budget_or_inactive": "Paused: the project's step budget is exhausted "
+                          "(raise steps_cap to continue) or it is not ACTIVE.",
+    "failed": "Stopped: a task FAILED — review it before continuing.",
+    "no_store": "Project store unavailable.",
+}
+
+
+def _advance_batch_instruction(batch, max_tasks) -> str:
+    blurb = _ADVANCE_STOP_BLURB.get(batch.stop_reason, batch.stop_reason)
+    done = sum(1 for a in batch.advanced if (a.get("status") or "") == "DONE")
+    failed = sum(1 for a in batch.advanced if (a.get("status") or "") == "FAILED")
+    tail = f", {failed} FAILED" if failed else ""
+    return (
+        f"Autonomous batch ran {batch.count} task(s) ({done} DONE{tail}). "
+        f"{blurb} Summarize for the user what was built and STOP — wait for "
+        f"their next direction. (Each task ran as a single constrained step; "
+        f"if a complex task FAILED, do it yourself as a focused turn.)"
     )
 
 
@@ -649,6 +691,11 @@ async def tool_manage_projects(
     # artifacts
     artifact_kind: str = "",
     payload: str = "",
+    deliverables: Optional[List[str]] = None,
+    # durable project working memory
+    ledger: str = "",
+    # autonomous batch pacing
+    count: Any = None,
     # research
     topic: str = "",
     topics: Optional[List[str]] = None,
@@ -691,6 +738,7 @@ async def tool_manage_projects(
     depends_on = _coerce_str_list(depends_on)
     topics = _coerce_str_list(topics)
     task_ids = _coerce_str_list(task_ids)
+    deliverables = _coerce_str_list(deliverables)
 
     # `result` is the canonical name for a task's completion summary, but the
     # model very naturally reaches for `result_summary` / `summary` — and when
@@ -835,6 +883,19 @@ async def tool_manage_projects(
             return _ok({"created": pid,
                         "workspace": f"projects/{pid}",
                         "note": _workspace_note(pid),
+                        "agent_instruction": (
+                            "Project created. Break the goal into tasks with "
+                            "task_decompose — make EACH task own a file or a "
+                            "bounded function you can build and verify on its "
+                            "own (e.g. one file per feature behind a thin "
+                            "shell), NOT N tasks that all edit the same file. "
+                            "Then STOP and present the plan. DO NOT begin "
+                            "executing tasks now — advance ONE task at a time, "
+                            "and only when the user directs you (e.g. 'proceed "
+                            "to next task'). As you work, record durable facts "
+                            "(file layout, key APIs) with action=ledger so "
+                            "later turns don't re-derive them."
+                        ),
                         "briefing": _briefing(store, pid)})
 
         if act == "list":
@@ -1064,6 +1125,30 @@ async def tool_manage_projects(
                         and _is_visual_artifact_task(plan.tree.nodes[tid].description)):
                     gated.append(tid)
                     continue
+                # Register deliverables BEFORE flipping the task to DONE.
+                # update_status can roll the whole project to DONE on this
+                # same call (when it's the last open task), which fires the
+                # cleanup sweep synchronously — so anything registered after
+                # would already be gone. Accept both the explicit
+                # `deliverables=[...]` list and a legacy `artifact_kind=file`
+                # + `payload` pair; dedup is handled by the store.
+                if st_enum == TaskStatus.DONE:
+                    keep_paths = list(deliverables or [])
+                    if artifact_kind == "file" and (payload or "").strip():
+                        keep_paths.append(payload)
+                    for rel in keep_paths:
+                        try:
+                            store.register_file_artifact(tid, rel)
+                        except Exception:
+                            logger.debug("deliverable registration skipped: %s",
+                                         rel, exc_info=True)
+                    # Durable fact recorded at completion time → design ledger,
+                    # so the next turn inherits it instead of re-deriving it.
+                    if (ledger or "").strip() and project_id:
+                        try:
+                            store.append_ledger(project_id, ledger.strip())
+                        except Exception:
+                            logger.debug("ledger append skipped", exc_info=True)
                 if st_enum is not None:
                     plan.update_status(tid, st_enum, result=result,
                                        failure_reason=failure_reason)
@@ -1099,7 +1184,10 @@ async def tool_manage_projects(
                     f"/ analysis task — this gate can misfire on wording): just "
                     f"re-call task_update with a one-line `result` describing what "
                     f"you produced. That counts as evidence and clears the gate "
-                    f"immediately. (Pass it as `result=...`.)"
+                    f"immediately. (Pass it as `result=...`.)\n"
+                    f"  • Also pass `deliverables=[...]` with the files the user "
+                    f"should keep — everything else in the project workspace is "
+                    f"deleted when the project finishes."
                 )
             return _ok(payload)
 
@@ -1154,7 +1242,14 @@ async def tool_manage_projects(
                 _link_task_in_graph(context, project_id, tid, desc)
             return _ok({"created": ids,
                         "parent_id": target_id,
-                        "sequential": bool(sequential)})
+                        "sequential": bool(sequential),
+                        "agent_instruction": (
+                            f"Plan created with {len(ids)} task(s). STOP here: "
+                            "present this task list to the user and wait for "
+                            "direction. DO NOT start executing — advance ONE "
+                            "task per explicit go-ahead (e.g. 'proceed to next "
+                            "task'), never the whole tree in one turn."
+                        )})
 
         if act == "task_next":
             if not project_id:
@@ -1201,12 +1296,26 @@ async def tool_manage_projects(
                 ),
             })
 
+        if act == "ledger":
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            # With `ledger` text → append one durable fact. Without it → read
+            # the current ledger back (so the agent can review/refresh it).
+            note = (ledger or "").strip()
+            if note:
+                new = store.append_ledger(project_id, note)
+                return _ok({"ledger": new, "action_taken": "appended"})
+            return _ok({"ledger": store.get_ledger(project_id)})
+
         # ---- self-advancing loop ---------------------------------------
 
         if act == "autoadvance":
             if not project_id:
                 return _err("no active project (pass project_id or switch first)")
-            from ..core.project_advancer import advance_once
+            from ..core.project_advancer import (
+                advance_many, default_llm_classifier, default_code_generator,
+            )
+            from ..core.coding_executor import build_coding_task
 
             tool_runner = None
             tools_map = None
@@ -1222,14 +1331,26 @@ async def tool_manage_projects(
                         return f"ERROR: tool {name} unavailable"
                     return await handler(**args)
                 tool_runner = _run
-            result = await advance_once(context, project_id,
-                                        tool_runner=tool_runner)
+
+            # count → max_tasks: int, or None for "all" (run to completion).
+            # A bounded loop of advance_once ticks, checkpointing each task —
+            # the autonomous BATCH path. A single "proceed" the agent does
+            # itself as a full turn; this is for "do the next N" / "all".
+            max_tasks = _parse_advance_count(count)
+            batch = await advance_many(
+                context, project_id,
+                max_tasks=max_tasks,
+                tool_runner=tool_runner,
+                llm_classifier=default_llm_classifier(context),
+                code_generator=default_code_generator(context),
+                coding_executor=build_coding_task,
+            )
             return _ok({
-                "ok": result.ok,
-                "task_id": result.task_id,
-                "classification": result.classification,
-                "summary": result.summary,
-                "artifact_id": result.artifact_id,
+                "advanced": batch.advanced,
+                "count": batch.count,
+                "requested": ("all" if max_tasks is None else max_tasks),
+                "stop_reason": batch.stop_reason,
+                "agent_instruction": _advance_batch_instruction(batch, max_tasks),
             })
 
         # ---- auto-research ----------------------------------------------
@@ -1345,9 +1466,20 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "many at once — strongly preferred over looping). IMPORTANT: "
             "`task_add` creates tasks in PENDING status; 'Added' does "
             "NOT mean 'Done'. Do NOT mark a task DONE until its "
-            "described work is actually complete. `resume` when "
+            "described work is actually complete. PACING: after you "
+            "create or decompose a plan, present it and STOP — advance "
+            "ONE task per explicit user go-ahead ('proceed to next "
+            "task'), never the whole tree in a single turn (that floods "
+            "the context window on large projects). `resume` when "
             "the user asks to pick up "
-            "an old project; `exit` to leave project mode; "
+            "an old project. GRANULARITY when decomposing: make each task "
+            "own a FILE or bounded function you can build+verify alone; do "
+            "NOT split one file into N tasks. MEMORY: `ledger` records a "
+            "durable fact (file layout, key API/function name, convention) "
+            "that is surfaced in the briefing every turn — use it (or pass "
+            "`ledger=…` on a DONE task_update) so later turns inherit what "
+            "you learned instead of re-reading files. `exit` to leave "
+            "project mode; "
             "`archive` to HIDE a project (reversible — status→ARCHIVED, "
             "files kept, `resume` brings it back); `delete` to "
             "PERMANENTLY remove a project and ALL its data — tasks, "
@@ -1402,15 +1534,21 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "result": {"type": "string", "description": "Short result summary (task_update with status=DONE)."},
                 "failure_reason": {"type": "string"},
                 "subtasks": {"type": "array", "items": {"type": "string"},
-                             "description": "Ordered subtask descriptions for task_decompose / promote_from_context."},
+                             "description": "Ordered subtask descriptions for task_decompose / promote_from_context. GRANULARITY: make each task own a FILE or a clearly-bounded function/module you can build AND verify on its own (e.g. 'src/parser.py: parse the CSV', 'apps/terminal.js: terminal app'). AVOID splitting one file into N tasks (e.g. 6 tasks that all edit index.html) — that forces re-reading the whole file every turn and does not scale. Prefer a thin shell/entrypoint + one file per feature."},
                 "artifact_kind": {"type": "string",
                                   "enum": ["file", "url", "note", "tool_call"]},
                 "payload": {"type": "string"},
+                "deliverables": {"type": "array", "items": {"type": "string"},
+                                 "description": "task_update with status=DONE: the project-relative paths of files the USER should keep (the actual deliverables — reports, code, generated images). Everything else in the project workspace (screenshots, helper scripts, temp files) is DELETED when the project finishes, so list every file worth keeping here. Paths are relative to the project workspace, e.g. [\"report.pdf\", \"src/solver.py\"]."},
                 "status_filter": {"type": "string"},
                 "limit": {"type": "integer"},
                 "event_type": {"type": "string"},
                 "context_summary": {"type": "string",
                                     "description": "Optional textual snapshot captured at promotion time."},
+                "count": {"type": "string",
+                          "description": "action=autoadvance: how many tasks to advance autonomously in a bounded loop — a number (e.g. \"3\") or \"all\" to run to completion. Use this ONLY for an explicit MULTI-task request: 'do the next 3 tasks' → count=\"3\"; 'proceed with all remaining tasks' / 'finish the project' → count=\"all\". A single 'proceed'/'next' you do YOURSELF as one focused full turn — do NOT route that here (autoadvance runs a lighter single-step-per-task executor). The loop checkpoints each task and stops at the first of: done · a task that needs you · budget · a FAILED task."},
+                "ledger": {"type": "string",
+                           "description": "action=ledger: ONE durable fact to append to the project's design ledger — file layout, a key function/API name, a convention, where something lives (e.g. 'windows are .window divs, opened via openApp(id), drag via makeDraggable'). The ledger is surfaced in the project briefing every turn, so the next turn inherits these facts instead of re-reading files to rediscover them. Omit `ledger` to read the current ledger back. May also be passed on a task_update status=DONE to record the decision as the task closes."},
             },
             "required": ["action"],
         },

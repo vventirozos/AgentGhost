@@ -152,8 +152,32 @@ class ProjectStore:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.memory_dir / db_name
         self.sandbox_root = Path(sandbox_root) if sandbox_root else None
+        # Optional hook fired exactly when a project *transitions* to DONE
+        # (see _fire_project_done). main.py wires this to the workspace
+        # cleanup sweep so a finished project's scratch files are removed
+        # automatically. Left None in tests / headless contexts that don't
+        # care about cleanup. Signature: (project_id: str) -> None.
+        self.on_project_done = None
         self._lock = threading.RLock()
         self._init_db()
+
+    def _fire_project_done(self, project_id: str) -> None:
+        """Invoke the ``on_project_done`` hook for a just-completed project.
+
+        Called *outside* the DB lock (filesystem cleanup must not run under
+        the SQLite writer lock) and fully guarded — a cleanup failure can
+        never propagate back into the status-transition path that triggered
+        it. No-op when no hook is wired.
+        """
+        cb = getattr(self, "on_project_done", None)
+        if cb is None:
+            return
+        try:
+            cb(project_id)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning(
+                "on_project_done hook failed for %s", project_id, exc_info=True
+            )
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -272,6 +296,12 @@ class ProjectStore:
         project_id = _canon_id(project_id)
         if not fields:
             return False
+        # Capture the prior status so a manual transition *into* DONE can
+        # fire the cleanup hook exactly once (and not on a DONE→DONE no-op).
+        prev_status = None
+        if "status" in fields:
+            existing = self.get_project(project_id)
+            prev_status = (existing or {}).get("status")
         allowed = {"title", "kind", "goal", "status", "workspace_dir", "metadata"}
         sets = []
         values: List[Any] = []
@@ -301,6 +331,11 @@ class ProjectStore:
             updated = cur.rowcount > 0
         if updated:
             self.log_event(project_id, None, "project_updated", {"fields": list(fields.keys())})
+            if "status" in fields:
+                new_norm = ProjectStatus(fields["status"].upper()).value
+                if (new_norm == ProjectStatus.DONE.value
+                        and (prev_status or "").upper() != ProjectStatus.DONE.value):
+                    self._fire_project_done(project_id)
         return updated
 
     def delete_project(self, project_id: str, hard: bool = False) -> bool:
@@ -591,6 +626,11 @@ class ProjectStore:
             {"new_status": new_status,
              "had_failures": any(s in failure for s in statuses)},
         )
+        # A genuine completion is the cleanup trigger. Fire only for DONE —
+        # FAILED / NEEDS_USER stay resumable (a revised task can roll the
+        # project forward to DONE later), so their workspace must survive.
+        if new_status == ProjectStatus.DONE.value:
+            self._fire_project_done(project_id)
 
     def delete_task(self, task_id: str) -> bool:
         """Delete a task and its descendants (via FK cascade on parent_id=NULL
@@ -662,6 +702,37 @@ class ProjectStore:
                        {"kind": kind, "artifact_id": art_id})
         return art_id
 
+    def register_file_artifact(self, task_id: str, rel_path: str) -> Optional[str]:
+        """Register a deliverable file (``kind='file'``) for ``task_id``,
+        deduplicated within the project.
+
+        This is the durable "keep me" marker the workspace cleanup sweep
+        reads: any file path registered here survives a project's
+        end-of-life sweep; everything else under the project workspace is
+        deleted. Idempotent — re-registering the same project-relative path
+        returns the existing artifact id instead of creating a duplicate, so
+        callers can register on every DONE without accumulating rows.
+
+        Returns the artifact id, or ``None`` when the path is blank or the
+        task is unknown.
+        """
+        task_id = _canon_id(task_id)
+        rel = (rel_path or "").strip().replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        rel = rel.strip()
+        if not rel:
+            return None
+        task = self.get_task(task_id)
+        if not task:
+            return None
+        project_id = task["project_id"]
+        for art in self.list_artifacts(project_id=project_id):
+            if (art.get("kind") == "file"
+                    and (art.get("payload") or "").strip() == rel):
+                return art.get("id")
+        return self.add_artifact(task_id, "file", rel)
+
     def list_artifacts(self, project_id: Optional[str] = None,
                        task_id: Optional[str] = None) -> List[Dict[str, Any]]:
         project_id = _canon_id(project_id) or None
@@ -680,6 +751,68 @@ class ProjectStore:
             else:
                 raise ValueError("must provide project_id or task_id")
             return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ design ledger
+
+    # The ledger is the project's durable, compact working memory — file
+    # layout, key function/API names, conventions, "what exists and where".
+    # It lives in project metadata and is surfaced in the briefing every
+    # turn so a fresh turn doesn't re-derive the project's shape by
+    # re-reading files (the dominant cost observed on long projects).
+    LEDGER_MAX_CHARS = 2400
+    LEDGER_MAX_LINES = 30
+
+    def _write_metadata(self, project_id: str, meta: Dict[str, Any]) -> None:
+        """Persist a project's metadata WITHOUT logging a project_updated
+        event. Ledger writes happen often; routing them through
+        ``update_project`` would spam the event log (and the briefing's
+        RECENT EVENTS) with bookkeeping noise and bloat project_events.
+        Metadata never triggers a status transition, so skipping the event
+        is safe."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE projects SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(meta or {}), _now(), _canon_id(project_id)),
+            )
+            conn.commit()
+
+    def get_ledger(self, project_id: str) -> str:
+        proj = self.get_project(project_id)
+        return ((proj or {}).get("metadata") or {}).get("design_ledger") or ""
+
+    def append_ledger(self, project_id: str, line: str) -> str:
+        """Append one line to the project's design ledger (bounded, dedup'd
+        against an identical trailing line). Returns the new ledger text."""
+        line = " ".join((line or "").split())  # collapse whitespace/newlines
+        proj = self.get_project(project_id)
+        if not proj:
+            return ""
+        if not line:
+            return ((proj.get("metadata") or {}).get("design_ledger") or "")
+        meta = dict(proj.get("metadata") or {})
+        existing = [l for l in (meta.get("design_ledger") or "").splitlines() if l.strip()]
+        if not existing or existing[-1].strip() != line:
+            existing.append(line)
+        existing = existing[-self.LEDGER_MAX_LINES:]
+        text = "\n".join(existing)
+        if len(text) > self.LEDGER_MAX_CHARS:
+            # Drop whole lines from the front until under the char budget.
+            while existing and len("\n".join(existing)) > self.LEDGER_MAX_CHARS:
+                existing.pop(0)
+            text = "\n".join(existing)
+        meta["design_ledger"] = text
+        self._write_metadata(project_id, meta)
+        return text
+
+    def set_ledger(self, project_id: str, text: str) -> str:
+        """Replace the project's design ledger wholesale (bounded)."""
+        proj = self.get_project(project_id)
+        if not proj:
+            return ""
+        meta = dict(proj.get("metadata") or {})
+        meta["design_ledger"] = (text or "")[: self.LEDGER_MAX_CHARS]
+        self._write_metadata(project_id, meta)
+        return meta["design_ledger"]
 
     # ------------------------------------------------------------------ events
 

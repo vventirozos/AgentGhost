@@ -320,6 +320,13 @@ async def lifespan(app):
         context.project_store = ProjectStore(
             context.memory_dir, sandbox_root=context.sandbox_dir,
         )
+        # Auto-clean a project's scratch space the moment it completes:
+        # keep registered deliverables, delete the rest. Fires only on the
+        # transition to DONE (see ProjectStore._fire_project_done).
+        from .core.workspace_cleanup import sweep_project_workspace
+        context.project_store.on_project_done = (
+            lambda pid, _store=context.project_store: sweep_project_workspace(_store, pid)
+        )
         pretty_log("Project Store", "Long-term project store initialized",
                    icon=Icons.BRAIN_PLAN)
     except Exception as e:

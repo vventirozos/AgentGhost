@@ -1,0 +1,307 @@
+"""Unit tests for end-of-project workspace cleanup (mark-and-sweep).
+
+Covers the sweep itself (`core.workspace_cleanup`), the store-level
+`on_project_done` trigger firing only on the transition to DONE, the
+deduped deliverable registration, and the safety guards (fail-safe on an
+unreadable keep-set, no symlink escape, project dir preserved).
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../src')))
+
+import pytest
+
+from ghost_agent.core.planning import ProjectPlan, TaskStatus
+from ghost_agent.core.workspace_cleanup import (
+    sweep_project_workspace, _normalize_rel,
+)
+from ghost_agent.memory.projects import ProjectStore, ProjectStatus
+
+
+@pytest.fixture
+def store(tmp_path):
+    return ProjectStore(tmp_path / "mem", sandbox_root=tmp_path / "sb")
+
+
+def _proj_dir(store, pid):
+    d = store.sandbox_root / "projects" / pid
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write(base, rel, content="x"):
+    p = base / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return p
+
+
+# ----------------------------------------------------------------- sweep core
+
+def test_sweep_keeps_registered_deletes_rest(store):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    plan = ProjectPlan(store, pid)
+    tid = plan.add_task("t")
+
+    _write(pdir, "report.pdf", "deliverable")
+    _write(pdir, "screenshot.png", "junk")
+    _write(pdir, "helper.py", "scratch")
+    _write(pdir, "sub/notes.txt", "scratch")
+
+    store.register_file_artifact(tid, "report.pdf")
+
+    res = sweep_project_workspace(store, pid)
+
+    assert res["status"] == "ok"
+    assert (pdir / "report.pdf").exists()
+    assert not (pdir / "screenshot.png").exists()
+    assert not (pdir / "helper.py").exists()
+    assert not (pdir / "sub" / "notes.txt").exists()
+    # the now-empty subdir is pruned, the project dir itself survives
+    assert not (pdir / "sub").exists()
+    assert pdir.exists()
+    assert set(res["deleted"]) == {"screenshot.png", "helper.py", "sub/notes.txt"}
+    assert res["kept"] == ["report.pdf"]
+
+
+def test_sweep_keeps_nested_deliverable_and_its_dir(store):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "src/solver.py", "keep")
+    _write(pdir, "src/scratch.tmp", "drop")
+    store.register_file_artifact(tid, "src/solver.py")
+
+    sweep_project_workspace(store, pid)
+
+    assert (pdir / "src" / "solver.py").exists()
+    assert not (pdir / "src" / "scratch.tmp").exists()
+    assert (pdir / "src").exists()  # not empty -> not pruned
+
+
+def test_sweep_removes_pycache(store):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    _write(pdir, "__pycache__/mod.cpython-310.pyc", "bytecode")
+    # nothing registered -> everything (incl. pycache) is scratch
+
+    sweep_project_workspace(store, pid)
+
+    assert not (pdir / "__pycache__").exists()
+
+
+def test_sweep_empty_keepset_deletes_all_files_keeps_dir(store):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    _write(pdir, "a.txt")
+    _write(pdir, "b.txt")
+
+    res = sweep_project_workspace(store, pid)
+
+    assert sorted(res["deleted"]) == ["a.txt", "b.txt"]
+    assert pdir.exists()
+    assert not any(pdir.iterdir())
+
+
+def test_dry_run_reports_without_deleting(store):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    _write(pdir, "junk.txt")
+
+    res = sweep_project_workspace(store, pid, dry_run=True)
+
+    assert res["deleted"] == ["junk.txt"]
+    assert (pdir / "junk.txt").exists()  # untouched
+
+
+# ----------------------------------------------------------------- guards
+
+def test_sweep_skips_when_no_sandbox_root(tmp_path):
+    store = ProjectStore(tmp_path / "mem", sandbox_root=None)
+    pid = store.create_project("P")
+    res = sweep_project_workspace(store, pid)
+    assert res["status"] == "skipped: no sandbox_root"
+
+
+def test_sweep_skips_when_project_dir_missing(store):
+    pid = store.create_project("P")
+    # create_project makes an empty workspace dir; remove it to simulate a
+    # project whose dir never materialized (e.g. created headless).
+    (store.sandbox_root / "projects" / pid).rmdir()
+    res = sweep_project_workspace(store, pid)
+    assert res["status"] == "skipped: no project dir"
+
+
+def test_sweep_ok_on_empty_dir(store):
+    pid = store.create_project("P")  # empty workspace dir exists
+    res = sweep_project_workspace(store, pid)
+    assert res["status"] == "ok"
+    assert res["deleted"] == []
+
+
+def test_sweep_fail_safe_when_keepset_unreadable(store, monkeypatch):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    _write(pdir, "precious.txt", "do not delete")
+
+    def boom(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(store, "list_artifacts", boom)
+    res = sweep_project_workspace(store, pid)
+
+    assert res["status"] == "skipped: artifact read failed"
+    assert (pdir / "precious.txt").exists()  # nothing deleted
+
+
+def test_sweep_does_not_follow_symlink_out_of_tree(store, tmp_path):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "important.txt"
+    target.write_text("must survive")
+    link = pdir / "link.txt"
+    try:
+        link.symlink_to(target)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks unsupported on this platform")
+
+    sweep_project_workspace(store, pid)
+
+    # the link (scratch) is removed, but its target outside the tree is intact
+    assert not link.exists()
+    assert target.exists()
+    assert target.read_text() == "must survive"
+
+
+# ----------------------------------------------------------------- normalize
+
+@pytest.mark.parametrize("payload,expected", [
+    ("report.pdf", "report.pdf"),
+    ("./report.pdf", "report.pdf"),
+    ("/report.pdf", "report.pdf"),
+    ("sub/x.md", "sub/x.md"),
+    ("projects/abc123/report.pdf", "report.pdf"),  # redundant prefix stripped
+    ("../escape.txt", None),                        # traversal rejected
+    ("sub/../../escape", None),
+    ("", None),
+    (".env", ".env"),                               # leading dot file preserved
+])
+def test_normalize_rel(payload, expected):
+    assert _normalize_rel(payload, "abc123") == expected
+
+
+# ----------------------------------------------------------------- registration dedup
+
+def test_register_file_artifact_dedups(store):
+    pid = store.create_project("P")
+    tid = ProjectPlan(store, pid).add_task("t")
+    a1 = store.register_file_artifact(tid, "report.pdf")
+    a2 = store.register_file_artifact(tid, "./report.pdf")  # same path, normalized
+    a3 = store.register_file_artifact(tid, "report.pdf")
+    files = [a for a in store.list_artifacts(project_id=pid) if a["kind"] == "file"]
+    assert len(files) == 1
+    assert a1 == a2 == a3
+
+
+def test_register_file_artifact_blank_is_noop(store):
+    pid = store.create_project("P")
+    tid = ProjectPlan(store, pid).add_task("t")
+    assert store.register_file_artifact(tid, "   ") is None
+    assert store.list_artifacts(project_id=pid) == []
+
+
+# ----------------------------------------------------------------- trigger wiring
+
+def test_hook_fires_only_on_transition_to_done(store):
+    fired = []
+    store.on_project_done = lambda pid: fired.append(pid)
+    pid = store.create_project("P")
+    plan = ProjectPlan(store, pid)
+    t1 = plan.add_task("a")
+    t2 = plan.add_task("b")
+
+    plan.update_status(t1, TaskStatus.DONE, result="ok")
+    assert fired == []  # project not DONE yet (t2 still open)
+
+    plan.update_status(t2, TaskStatus.DONE, result="ok")
+    assert fired == [pid]  # fired exactly once on rollup to DONE
+
+
+def test_hook_does_not_fire_on_failed(store):
+    fired = []
+    store.on_project_done = lambda pid: fired.append(pid)
+    pid = store.create_project("P")
+    plan = ProjectPlan(store, pid)
+    t1 = plan.add_task("a")
+    plan.update_status(t1, TaskStatus.FAILED, failure_reason="nope")
+    assert store.get_project(pid)["status"] == ProjectStatus.FAILED.value
+    assert fired == []
+
+
+def test_manual_project_done_fires_hook_once(store):
+    fired = []
+    store.on_project_done = lambda pid: fired.append(pid)
+    pid = store.create_project("P")
+    store.update_project(pid, status="DONE")
+    store.update_project(pid, status="DONE")  # DONE -> DONE no-op
+    assert fired == [pid]
+
+
+@pytest.mark.asyncio
+async def test_tool_deliverables_survive_sweep_on_last_task(store, tmp_path):
+    """Through the real `manage_projects` tool: completing the *last* task
+    with `deliverables=[...]` must register them BEFORE the rollup-to-DONE
+    sweep fires, so the deliverable survives and scratch is removed."""
+    from types import SimpleNamespace
+    from ghost_agent.memory.scratchpad import Scratchpad
+    from ghost_agent.tools.projects import tool_manage_projects
+
+    store.on_project_done = lambda pid: sweep_project_workspace(store, pid)
+    ctx = SimpleNamespace(
+        project_store=store,
+        scratchpad=Scratchpad(persist_path=tmp_path / "sp.db"),
+        graph_memory=None,
+        contradiction_log=None,
+        current_project_id=None,
+    )
+    await tool_manage_projects(ctx, action="create", title="Build it")
+    pid = ctx.current_project_id
+    await tool_manage_projects(ctx, action="task_decompose",
+                               subtasks=["produce report"])
+    tid = store.list_tasks(pid)[0]["id"]
+
+    pdir = store.sandbox_root / "projects" / pid
+    _write(pdir, "report.pdf", "the deliverable")
+    _write(pdir, "scratch.png", "junk")
+
+    await tool_manage_projects(
+        ctx, action="task_update", task_id=tid, status="DONE",
+        result="done", deliverables=["report.pdf"],
+    )
+
+    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert (pdir / "report.pdf").exists()       # registered before sweep
+    assert not (pdir / "scratch.png").exists()  # scratch removed
+
+
+def test_end_to_end_completion_sweeps_workspace(store):
+    # wire the real sweep as the hook, like main.py does
+    store.on_project_done = lambda pid: sweep_project_workspace(store, pid)
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    plan = ProjectPlan(store, pid)
+    tid = plan.add_task("build")
+    _write(pdir, "final.txt", "keep me")
+    _write(pdir, "scratch.log", "junk")
+    store.register_file_artifact(tid, "final.txt")
+
+    plan.update_status(tid, TaskStatus.DONE, result="done")
+
+    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+    assert (pdir / "final.txt").exists()
+    assert not (pdir / "scratch.log").exists()

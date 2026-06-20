@@ -302,10 +302,14 @@ async def test_autoadvance_action_on_tool(context, store):
     # get_available_tools — with our minimal SimpleNamespace context
     # it may succeed or fail; both are OK as long as the advancer
     # runs and the action doesn't crash.
+    # autoadvance now returns a BOUNDED-BATCH shape (advance_many): default
+    # count=1 advances at most one task and reports why it stopped.
     res_json = await t(context, action="autoadvance")
     data = json.loads(res_json)
-    assert "ok" in data
-    assert "summary" in data
+    assert "advanced" in data
+    assert "stop_reason" in data
+    assert data["requested"] == 1
+    assert data["count"] <= 1
 
 
 # --------------------------------------------------------------------- dream pass

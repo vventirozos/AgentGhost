@@ -40,9 +40,45 @@
   <table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>build_project_briefing(store, project_id, max_events=3, max_open_tasks=8) -&gt; str</code></td><td>Render a multi-line project context block — open tasks, <strong>RESEARCH NOTES</strong> (persisted research briefs from <a href="project_research.html">project_research</a>'s metadata index, so the agent knows what it has already researched), recent events, current goal — for prompt injection (line 4).</td></tr>
+      <tr><td><code>build_project_briefing(store, project_id, max_events=3, max_open_tasks=8, max_done_tasks=5) -&gt; str</code></td><td>Render the project's cross-turn working memory for prompt injection (line 4): goal, <strong>DESIGN LEDGER</strong>, next/open tasks, <strong>DONE SO FAR</strong> digest, <strong>RESEARCH NOTES</strong>, recent events. Leads with the <strong>ONE TASK AT A TIME</strong> directive. See below.</td></tr>
     </tbody>
   </table>
+
+  <h2>Project working memory — DESIGN LEDGER &amp; DONE SO FAR (2026-06-20)</h2>
+  <p>The dominant cost on long projects was a fresh turn <em>re-deriving the
+  project's shape</em> — re-listing the sandbox, re-reading files — because the
+  briefing only carried the task tree and the last few events, never <em>what
+  had been built or how it worked</em> (observed live: one "proceed" turn spent
+  ~96 s reconstructing state before doing any work). The briefing now carries
+  two compact, durable layers so the next turn inherits that knowledge instead:</p>
+  <ul>
+    <li><strong>DESIGN LEDGER</strong> — durable facts the agent records (file layout, key function/API names, conventions) via <a href="../tools/projects.html"><code>manage_projects action=ledger ledger="…"</code></a> or a <code>ledger="…"</code> on a DONE <code>task_update</code>. Stored in project metadata, bounded (<code>ProjectStore.LEDGER_MAX_LINES/MAX_CHARS</code>), dedup'd against an identical trailing line, and written WITHOUT logging an event (<code>_write_metadata</code>) so it doesn't spam RECENT EVENTS. The briefing surfaces the last <code>_LEDGER_BRIEFING_LINES</code> (20).</li>
+    <li><strong>DONE SO FAR</strong> — the <code>max_done_tasks</code> most-recently-completed tasks plus the one-line <code>result_summary</code> the agent wrote on completion (the DONE-gate already forces a result). "What exists and where", auto-derived — no new agent behaviour required.</li>
+  </ul>
+  <p>The ONE TASK rule now tells the agent to read these <em>before</em>
+  re-reading files, and to record durable decisions in the ledger as it goes.
+  Covered by <code>tests/test_project_working_memory.py</code>.</p>
+
+  <h2>Project pacing — ONE TASK AT A TIME (2026-06-20)</h2>
+  <p>The project briefing previously opened with a <em>PARALLEL TASK
+  EXECUTION — HARD RULE</em> that told the agent to scan the whole task tree
+  and stack every finishable task into one reply ("project-of-N tasks
+  completes in ~2-3 turns"). On large projects that floods the context window,
+  and it steamrolled any user instruction about <em>how</em> to advance. It is
+  replaced by a <strong>ONE TASK AT A TIME</strong> rule:</p>
+  <ul>
+    <li>Advance exactly the <strong>NEXT TASK</strong>, one per turn — never stack several tasks' work into a single reply.</li>
+    <li>After <code>create</code> / <code>task_decompose</code>, <strong>STOP</strong> and present the plan; do not begin executing.</li>
+    <li>Wait for an explicit user go-ahead (<em>"proceed"</em>, <em>"next task"</em>, <em>"continue"</em>) and honor the pacing/ordering the user asks for.</li>
+    <li>Each go-ahead does one task, closes just that id with <code>task_update … status=DONE</code> (plus its <a href="../core/workspace_cleanup.html"><code>deliverables</code></a>), reports, and stops.</li>
+  </ul>
+  <p>The <code>create</code> and <code>task_decompose</code> actions of
+  <a href="../tools/projects.html"><code>manage_projects</code></a> reinforce
+  this by returning a stop-and-await <code>agent_instruction</code>. The idle
+  autoadvancer (<a href="../core/agent.html">agent.py</a> phase 2.95) already
+  runs a single <code>advance_once</code> tick per cooldown, so autonomous
+  advancement is one-task-at-a-time too. Covered by
+  <code>tests/test_project_pacing.py</code>.</p>
 
   <h2>Tool-orchestration routing rules (SYSTEM_PROMPT)</h2>
   <p>A block of <strong>MANDATORY TRIGGERS</strong> in <code>SYSTEM_PROMPT</code> maps user intents to specific tool calls so the LLM doesn't improvise. Current rules include:</p>

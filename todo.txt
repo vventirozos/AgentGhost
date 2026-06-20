@@ -1,8 +1,7 @@
-1. projects : on a long project task client is left hanging, not cool...
-2. projects : It should advance as directed , not start doing all the tasks at once , because of context
-	window.
-3. general : replies on failure are a mess : 
+The agent replies on failure are a mess, reporting information about all the
+failures and problems it handled during the whole run , see an old reply from the agent : 
 
+"""
 >>> proceed with phase 5.
 
 With 961 MiB RAM and no GPU, Phase 5 needs to be extremely lightweight. Let me build the data pipeline components.
@@ -30,6 +29,10 @@ The bash quoting is the problem — nested parentheses and quotes in `-c` fail. 
 The issue is clear: default `chunk_size=1000000` but we only have 568,532 tokens, so `num_sequences = 568532 // 1000000 = 0`. I need to reduce the default chunk size.
 ---
 **Verifier note:** Truncated mid-sentence; Lacks a clear final result or confirmation; Reads like internal scratchpad rather than a direct answer
->>> retry phase 5, try a simpler approach
+"""
 
-4. clean up screenshots, unused files when done with a task (or project, not sure).
+why does this happen? feel free to reproduce the issue if you think it will
+help you figuring this out. dont change any code yet, just provide
+suggestions on how to make the replies on failures to make sense.
+
+

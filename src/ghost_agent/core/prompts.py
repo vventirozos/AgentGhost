@@ -1,8 +1,14 @@
 # src/ghost_agent/core/prompts.py
 
+# How many trailing lines of the design ledger to surface in the briefing.
+# The ledger itself is bounded by ProjectStore.LEDGER_MAX_LINES; this caps
+# what we inject into the prompt each turn so it stays compact.
+_LEDGER_BRIEFING_LINES = 20
+
 
 def build_project_briefing(store, project_id: str, max_events: int = 3,
-                           max_open_tasks: int = 8) -> str:
+                           max_open_tasks: int = 8,
+                           max_done_tasks: int = 5) -> str:
     """Render a compact project-scope briefing for the system prompt.
 
     The briefing is appended to DYNAMIC SYSTEM STATE when a project is
@@ -10,13 +16,24 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     string when the store or project_id is missing so the caller can
     unconditionally concatenate the result.
 
+    It is the project's cross-turn working memory: alongside the task tree
+    it surfaces the DESIGN LEDGER (durable facts the agent recorded) and a
+    DONE SO FAR digest (recently-completed tasks + the one-line result the
+    agent wrote on completion). Together these let a fresh turn know what
+    exists and how it works WITHOUT re-reading every file — the dominant
+    per-turn cost on long projects.
+
     Shape:
         ### CURRENT PROJECT
         TITLE: …  (KIND · STATUS)
         GOAL: …
+        DESIGN LEDGER:
+          …durable facts…
         NEXT TASK: [id] description
         OPEN TASKS (≤N):
           - [id] description  (STATUS)
+        DONE SO FAR (≤N, most recent first):
+          - [id] description → result summary
         RECENT EVENTS (≤N):
           - ts  type  payload-preview
     """
@@ -46,21 +63,35 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         f"been fulfilled and the work is in flight below. ***"
     )
     lines.append(
-        "*** PARALLEL TASK EXECUTION — HARD RULE: "
-        "DO NOT grind through the task tree one leaf at a time. "
-        "Scan the task list below and identify EVERY task you can "
-        "finish with a single turn's worth of tool calls. Then "
-        "stack ALL of those tool calls as parallel <tool_call> "
-        "blocks in the SAME assistant reply. Example: a 6-task "
-        "decomposition like 'parser / reader / aggregator / CLI / "
-        "generator / tests' should produce ONE turn with 6 stacked "
-        "`file_system write` calls — NOT 6 separate turns. After "
-        "the parallel batch returns, close every finished id in "
-        "ONE call: `manage_projects action=task_update "
-        "task_ids=[\"id_a\",\"id_b\",\"id_c\",...] status=DONE`. "
-        "Back-to-back single-id task_update turns are a BUG: each "
-        "costs 40-60s of pure bookkeeping. Target: project-of-N "
-        "tasks completes in ~2-3 turns, not N+N turns. ***"
+        "*** ONE TASK AT A TIME — HARD RULE: "
+        "Advance this project ONE task per turn — the NEXT TASK shown "
+        "below, and ONLY that one. DO NOT scan ahead and stack several "
+        "tasks' work into a single reply, and DO NOT grind through the "
+        "whole tree in one turn: on a large project that floods the "
+        "context window, which is exactly the failure this rule "
+        "prevents. "
+        "When you have just created or decomposed the plan, STOP and "
+        "present the task list to the user — DO NOT start executing. "
+        "Wait for an explicit go-ahead ('proceed', 'next task', "
+        "'continue') before advancing, and honor any pacing or ordering "
+        "the user asks for. Each go-ahead advances EXACTLY ONE task: do "
+        "its work, close just that id with `manage_projects "
+        "action=task_update task_id=\"<id>\" status=DONE` (plus its "
+        "`deliverables`), report the result, then stop and wait for the "
+        "next direction. "
+        "Before re-reading files to reconstruct state, READ the DESIGN "
+        "LEDGER and DONE SO FAR below — they record what already exists and "
+        "how it works. When you make a durable decision (file layout, a key "
+        "function/API name, a convention) record it in one line via "
+        "`manage_projects action=ledger ledger=\"…\"` (or pass `ledger=\"…\"` "
+        "on the task_update that closes the task) so the next turn inherits "
+        "it instead of re-deriving it. "
+        "BATCH: only if the user explicitly asks for MULTIPLE tasks ('do the "
+        "next 3', 'proceed with all remaining tasks', 'finish the project'), "
+        "DON'T grind them yourself in one turn — call `manage_projects "
+        "action=autoadvance count=<N|\"all\">` to run them as a bounded "
+        "autonomous loop that checkpoints each task and pauses at gates, "
+        "budget, or a failure; then summarize and stop. ***"
     )
     lines.append(
         f"TITLE: {proj['title']}  ({proj['kind']} · {proj['status']})"
@@ -68,6 +99,23 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     goal = (proj.get("goal") or "").strip()
     if goal:
         lines.append(f"GOAL: {goal}")
+
+    # DESIGN LEDGER — the durable, compact working memory the agent records
+    # (file layout, key function/API names, conventions). Surfaced near the
+    # top so the model relies on it instead of re-deriving the project shape
+    # by re-reading files every turn.
+    try:
+        ledger = ((proj.get("metadata") or {}).get("design_ledger") or "").strip()
+    except Exception:
+        ledger = ""
+    if ledger:
+        lines.append("DESIGN LEDGER (durable facts you recorded — trust these; "
+                     "update with `manage_projects action=ledger ledger=\"…\"`):")
+        for ln in ledger.splitlines()[-_LEDGER_BRIEFING_LINES:]:
+            ln = ln.strip()
+            if ln:
+                lines.append(f"  {ln}")
+
     try:
         plan = ProjectPlan(store, project_id)
     except Exception:
@@ -85,8 +133,28 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         if open_nodes:
             lines.append(f"OPEN TASKS ({min(len(open_nodes), max_open_tasks)}):")
             for n in open_nodes[:max_open_tasks]:
-                desc = (n.description or "")[:80]
+                desc = (n.description or "")[:110]
                 lines.append(f"  - [{n.id}] {desc}  ({n.status.value})")
+
+    # DONE SO FAR — recently-completed tasks plus the one-line result the
+    # agent recorded on completion. This is "what's already built and how",
+    # the antidote to a fresh turn re-reading files to reconstruct state.
+    try:
+        done_tasks = store.list_tasks(project_id, status_filter="DONE")
+    except Exception:
+        done_tasks = []
+    if done_tasks:
+        done_tasks = sorted(done_tasks, key=lambda t: t.get("updated_at", 0),
+                            reverse=True)
+        shown = done_tasks[:max_done_tasks]
+        lines.append(
+            f"DONE SO FAR ({len(shown)} of {len(done_tasks)}, most recent first):"
+        )
+        for t in shown:
+            desc = (t.get("description") or "")[:55]
+            res = " ".join((t.get("result_summary") or "").split())
+            res = f" → {res[:170]}" if res else ""
+            lines.append(f"  - [{t.get('id')}] {desc}{res}")
     # Research awareness: surface the project's persisted research briefs so
     # the agent knows what it has already looked into (and where the file
     # lives) on every turn it works the project — instead of re-researching

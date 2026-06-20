@@ -14,8 +14,10 @@
     <h3>Core</h3>
     <a href="planning.html">planning</a>
     <a class="current" href="project_advancer.html">project_advancer</a>
+    <a href="coding_executor.html">coding_executor</a>
     <a href="project_safety.html">project_safety</a>
     <a href="project_research.html">project_research</a>
+    <a href="workspace_cleanup.html">workspace_cleanup</a>
     <a href="../memory/projects.html">memory.projects</a>
   </nav>
 </aside>
@@ -28,10 +30,50 @@
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>classify_task(description) -&gt; "needs_user" | "coding" | "research"</code></td><td>Keyword-driven classifier (line 85).</td></tr>
-      <tr><td><code>async advance_once(context, project_id, tool_runner, llm_classifier) -&gt; AdvanceResult</code></td><td>One full advancement tick — returns the result of running one task (line 126).</td></tr>
-      <tr><td><code>project_dream_pass(store, llm_summarize)</code></td><td>Consolidate accumulated project events into a daily digest (line 314).</td></tr>
+      <tr><td><code>async advance_once(context, project_id, tool_runner, llm_classifier, code_generator) -&gt; AdvanceResult</code></td><td>One advancement tick — claims the next ready leaf, runs one constrained step, persists status+result.</td></tr>
+      <tr><td><code>async advance_many(context, project_id, *, max_tasks, …, stop_on_fail=True) -&gt; AdvanceManyResult</code></td><td>BOUNDED loop of <code>advance_once</code> ticks for the batch case (see below).</td></tr>
+      <tr><td><code>classify_advance_intent(text) -&gt; {mode, count}</code></td><td>Map a user pacing directive to <code>one</code> / <code>n</code> / <code>all</code>.</td></tr>
+      <tr><td><code>default_llm_classifier(context)</code> · <code>default_code_generator(context)</code></td><td>Build the LLM-backed per-task executors (or <code>None</code>); shared by the tool path and the idle autoadvancer.</td></tr>
+      <tr><td><code>project_dream_pass(store, llm_summarize)</code></td><td>Consolidate accumulated project events into a daily digest.</td></tr>
     </tbody>
   </table>
+
+  <h2>Pacing — single turn vs. bounded batch (2026-06-20)</h2>
+  <p>A user saying <em>"proceed" / "next"</em> is handled as a full agent turn
+  (the agent writes files, runs, verifies — highest quality for one task). The
+  batch case — <em>"do the next 3 tasks"</em>, <em>"proceed with all remaining
+  tasks"</em>, <em>"finish the project"</em> — instead routes (via
+  <a href="../tools/projects.html"><code>manage_projects action=autoadvance
+  count=&lt;N|"all"&gt;</code></a>) to <code>advance_many</code>, a bounded loop
+  of <code>advance_once</code> ticks. <code>classify_advance_intent</code> maps
+  the phrasing to a count (ambiguous → 1, the safe default).</p>
+  <p>Why a loop instead of one big turn: each tick claims one leaf, runs one
+  constrained step, and checkpoints status+result to the store, so per-tick
+  context stays bounded no matter how many tasks run — the antidote to one chat
+  turn grinding the whole tree and flooding the context window. The loop stops
+  at the FIRST of: <strong>project_done</strong> · <strong>count_reached</strong>
+  · <strong>needs_user</strong> (a human-gate task) · <strong>budget_or_inactive</strong>
+  (step budget exhausted) · <strong>failed</strong> (a task FAILED, when
+  <code>stop_on_fail</code>) · <strong>hard_cap</strong>
+  (<code>ADVANCE_ALL_HARD_CAP=40</code>, a backstop for an uncapped project).</p>
+  <p><strong>Coding executor (2026-06-20).</strong> A tick's coding path is the
+  real <a href="coding_executor.html"><code>build_coding_task</code></a>:
+  spec&nbsp;→&nbsp;write files&nbsp;→&nbsp;verify, finalized by
+  <code>_finalize_coding</code> (success registers the produced files as
+  deliverables + appends a ledger note + marks DONE; a failed build marks
+  FAILED, which stops the batch loop for the user). This replaced the original
+  single-command path that produced <em>theatrical completion</em> — a leaf
+  marked DONE having written nothing (observed live: "create hello.txt" ran a
+  <code>web_search</code>). The single-command <code>default_code_generator</code>
+  remains only as a fallback when the executor is unavailable/crashes.</p>
+  <p><strong>Classification.</strong> File/build leaves now route to the
+  executor: <code>classify_task</code> recognises file-extension tokens
+  (<code>.py</code>, <code>.html</code>, <code>.txt</code>, …) and build phrases
+  ("create a file", "build the … module"), and a <strong>CODING</strong>-kind
+  project passes <code>default="coding"</code> so an unlabelled leaf builds
+  rather than being web-searched. Covered by
+  <code>tests/test_advance_pacing.py</code> and
+  <code>tests/test_coding_executor.py</code>.</p>
 
   <h2>Classification keywords</h2>
   <ul>

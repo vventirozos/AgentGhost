@@ -90,6 +90,9 @@
     <li><code>{"action":"sleep","ms":500}</code> — when you need an explicit pause and there's no selector to wait on.</li>
   </ul>
 
+  <h3>Project-scoped <code>file://</code> heal (2026-06-20)</h3>
+  <p><code>_resolve_file_url(sandbox_dir, url)</code> rewrites a <code>file://</code> URL to where the file actually lives when a project scopes the sandbox to <code>&lt;root&gt;/projects/&lt;id&gt;/</code>. It resolves the path the same way <a href="file_system.html"><code>_get_safe_path</code></a> does and translates back with <code>_to_container_path</code>, so every route the model invents — <code>file:///workspace/...</code>, <code>file:///sandbox/projects/&lt;id&gt;/...</code>, a bare name — lands on the single correct container path <code>file:///workspace/projects/&lt;id&gt;/&lt;name&gt;</code>. This is what fixed the live <code>net::ERR_FILE_NOT_FOUND</code> loop where a model-built <code>file:///workspace/sandbox/projects/&lt;id&gt;/browser-os.html</code> double-nested and 404'd three times. Applied to <code>navigate</code> and to each <code>goto</code> sub-action of <code>interact</code>. Covered by <code>tests/test_browser_path_scoping.py</code>.</p>
+
   <h3>Stability guard: <code>wait_for_hidden</code> + <code>force</code> + <code>wait_for_selector(state)</code> (2026-04-26)</h3>
   <p>Bare <code>page.click()</code> auto-waits for its TARGET to be actionable, but knows nothing about an unrelated overlay still intercepting clicks. The 2026-04-26 webOS session lost ~70 minutes to this exact shape:</p>
   <pre><code>actions=[

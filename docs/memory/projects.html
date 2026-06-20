@@ -78,6 +78,18 @@
   </ul>
   <p>DONE and ARCHIVED are <em>locked</em> (never auto-undone). FAILED and NEEDS_USER are <em>not</em> locked, so a revised or answered task rolls the project forward to DONE on a later update. Covered by <code>tests/test_project_mgmt_fixes.py</code> and <code>tests/test_audit_bug_fixes.py</code>.</p>
 
+  <h2>Completion hook (workspace cleanup)</h2>
+  <p>On the <em>transition</em> to DONE — and only DONE — the store calls
+  <code>_fire_project_done(project_id)</code>, which invokes the optional
+  <code>on_project_done</code> hook (set in <code>main.py</code> to
+  <a href="../core/workspace_cleanup.html">core.workspace_cleanup</a>'s sweep).
+  It fires from both <code>_maybe_rollup_project_status</code> (auto-rollup) and
+  a manual <code>update_project(status="DONE")</code>, exactly once per
+  transition, and is fully guarded so a cleanup failure never propagates back
+  into the status update. FAILED / NEEDS_USER stay resumable, so they do
+  <em>not</em> fire it. The hook lets a finished project's scratch files be
+  removed automatically while registered deliverables are kept.</p>
+
   <h2>ID canonicalisation</h2>
   <p>
     IDs are generated as lowercase 12-char hex (<code>uuid4().hex[:12]</code>), but an LLM that echoes one back in a <code>manage_projects</code> tool call routinely mangles the case of an opaque hex token — e.g. <code>9b5bd5cd812b</code> → <code>9B5Bd5Cd812B</code> — which used to make the case-sensitive <code>WHERE id = ?</code> lookups miss with <em>"project not found"</em>. Every store method that accepts a <code>project_id</code> / <code>task_id</code> now normalises it via <code>_canon_id</code> (strip + lowercase), and the <code>manage_projects</code> tool canonicalises model-supplied ids at the boundary, so generation and resolution always agree regardless of how the id was transmitted. Covered by <code>tests/test_project_id_canon.py</code>.
@@ -102,7 +114,12 @@
   <h3>Artifacts &amp; events</h3>
   <ul>
     <li><code>add_artifact(task_id, kind, payload) -&gt; str</code></li>
+    <li><code>register_file_artifact(task_id, rel_path) -&gt; str | None</code> — register a deliverable <code>file</code> artifact, deduplicated within the project (re-registering the same path returns the existing id). This is the durable "keep me" marker the <a href="../core/workspace_cleanup.html">workspace cleanup</a> sweep reads.</li>
     <li><code>list_artifacts(project_id=None, task_id=None)</code></li>
+  </ul>
+  <h3>Design ledger (cross-turn working memory)</h3>
+  <ul>
+    <li><code>get_ledger(project_id) -&gt; str</code> / <code>append_ledger(project_id, line) -&gt; str</code> / <code>set_ledger(project_id, text) -&gt; str</code> — the project's durable, compact working memory (file layout, key APIs, conventions) stored in metadata and surfaced in the <a href="../core/prompts.html">briefing</a> every turn. <code>append_ledger</code> collapses whitespace, dedups an identical trailing line, and bounds to <code>LEDGER_MAX_LINES</code> (30) / <code>LEDGER_MAX_CHARS</code> (2400). Written via <code>_write_metadata</code> (no <code>project_updated</code> event) so frequent appends don't spam the event log.</li>
     <li><code>log_event(project_id, task_id, event_type, payload) -&gt; int</code></li>
     <li><code>list_events(project_id, limit, event_type)</code></li>
   </ul>

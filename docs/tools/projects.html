@@ -55,8 +55,50 @@
   <h3>Other</h3>
   <ul>
     <li><code>artifact_add</code> · <code>event_log</code></li>
-    <li><code>advance</code> — calls <a href="../core/project_advancer.html"><code>advance_once()</code></a> for one autoadvance tick.</li>
+    <li><code>ledger</code> — append one durable fact to the project's <strong>design ledger</strong> (<code>ledger="…"</code>), or omit it to read the ledger back. See "Working memory" below.</li>
+    <li><code>autoadvance</code> — run the autonomous advancer. <code>count</code> selects how many tasks: a number (<code>"3"</code>) or <code>"all"</code> to run to completion; default <code>1</code>. Drives <a href="../core/project_advancer.html"><code>advance_many()</code></a>, a bounded loop that checkpoints each task and stops at the first of done / a task needing you / budget / a FAILED task. Returns <code>{advanced, count, requested, stop_reason}</code>.</li>
   </ul>
+
+  <h2>Working memory &amp; decomposition granularity (2026-06-20)</h2>
+  <p>Two changes target the failure where a long, per-turn project felt clunky
+  and lossy (a single "proceed" turn re-deriving state for ~96 s, then thrashing
+  on a 14-task / one-file decomposition):</p>
+  <ul>
+    <li><strong>Design ledger</strong> — <code>action=ledger ledger="single HTML file at browser-os.html; windows are .window divs opened via openApp(id)"</code> records a durable fact (file layout, key API/function name, convention). It is bounded + dedup'd in project metadata and surfaced in the <a href="../core/prompts.html">project briefing</a> every turn, so later turns inherit it instead of re-reading files to rediscover it. A <code>ledger="…"</code> may also ride along on a <code>task_update status=DONE</code> to capture the decision as the task closes. Backed by <code>ProjectStore.get_ledger / append_ledger / set_ledger</code>.</li>
+    <li><strong>Per-file decomposition</strong> — the <code>subtasks</code> description and the tool/<code>create</code> instructions now steer toward tasks that each own a FILE or a bounded function you can build and verify alone (a thin shell + one file per feature), and explicitly warn against N tasks that all edit the same file — that forces whole-file context every turn and doesn't scale.</li>
+  </ul>
+  <p>Together with the <strong>DONE SO FAR</strong> briefing digest (auto-surfacing
+  completed tasks' <code>result_summary</code>), these give the next turn "what
+  exists and how it works" cheaply. Covered by
+  <code>tests/test_project_working_memory.py</code>.</p>
+
+  <h2>Pacing — one task per go-ahead (2026-06-20)</h2>
+  <p>Projects advance <strong>one task at a time, under user direction</strong>,
+  not in an automatic sprint through the whole tree. After <code>create</code>
+  or <code>task_decompose</code>, the tool returns a stop-and-await
+  <code>agent_instruction</code> telling the agent to present the plan and
+  <strong>wait</strong> — do not begin executing. The agent then advances
+  exactly the next task on each explicit user go-ahead ("proceed to next
+  task"), closing just that id with <code>task_update status=DONE</code>. This
+  is the counterpart to the briefing's <a href="../core/prompts.html">ONE TASK
+  AT A TIME</a> directive; it exists because grinding every task in one turn
+  floods the context window on large projects. Covered by
+  <code>tests/test_project_pacing.py</code>.</p>
+  <p><strong>Batch ("proceed with all", 2026-06-20).</strong> When the user
+  explicitly asks for MORE than one task — <em>"do the next 3"</em>,
+  <em>"proceed with all remaining tasks"</em>, <em>"finish the project"</em> —
+  the agent routes to <code>autoadvance count=&lt;N|"all"&gt;</code> instead of
+  grinding them itself. That runs <a href="../core/project_advancer.html"><code>advance_many</code></a>,
+  a <strong>bounded autonomous loop</strong>: each task is a separate
+  checkpointed tick (so context stays bounded however many run), and it pauses
+  at the first of done / a task needing the user / budget / a FAILED task, then
+  reports. This is how "do everything" stays safe on a large project — a loop of
+  bounded ticks, not one context-busting turn. A single "proceed"/"next" still
+  runs as a full agent turn (higher per-task quality). Each coding tick BUILDS
+  for real via <a href="../core/coding_executor.html"><code>build_coding_task</code></a>
+  (write files + verify), failing loudly on a hard task rather than marking
+  shallow work done. Covered by <code>tests/test_advance_pacing.py</code> and
+  <code>tests/test_coding_executor.py</code>.</p>
   <h3>Auto-research</h3>
   <ul>
     <li><code>research</code> — research a topic and persist a summarised brief in the project workspace. Pass <code>topic="…"</code> for a single topic, or omit it (optionally with <code>max_topics</code>) to auto-derive several from the project goal + open tasks. Each brief lands at <code>research/&lt;slug&gt;.md</code>, is indexed in project metadata, and is surfaced under <strong>RESEARCH NOTES</strong> in the project briefing. See <a href="../core/project_research.html">core.project_research</a>.</li>
@@ -73,6 +115,20 @@
   <p><code>task_update status=DONE</code> on a task that builds a <strong>runnable/visual artifact</strong> is <strong>held</strong> when no verification evidence is given (no <code>result</code> and no existing <code>result_summary</code>). The gated ids + an instruction are returned: verify with the browser tool (<code>screenshot</code>, <code>click_center=true</code> for a game), read the <a href="browser.html"><code>RENDER_CHECK</code> / <code>PRE_INTERACTION</code></a> lines, then re-call with a <code>result</code> describing what rendered. This targets the live anti-pattern where the agent wrote <code>index.html</code>, marked every task DONE before testing, and claimed a blank game "works".</p>
   <p><strong>Precision (2026-06-09, after a false-positive).</strong> The matcher (<code>_is_visual_artifact_task</code>) is HIGH-precision and word-boundary anchored. The first cut used broad words and misfired on a <em>philosophy</em> project — a text reflection "…whether the <em>scene</em> is pre-existing or being constructed" matched " scene", and "<em>game</em> theory" matched "game" — gating ordinary research tasks for ~6 wasted turns. The keyword set is now limited to tokens unambiguous in software work (<code>webgl, three.js, canvas, shader, hud, sprite, playable, gameplay, game loop, render loop, minecraft, frontend, …</code>), matched on word boundaries (so "hud" can't fire inside "shudder", nor "3d" inside "add"). <strong>Escape hatch:</strong> the gate message offers two clears — verify (for a real visual artifact) <em>or</em>, for a text/research/markdown task the gate misfired on, simply re-call with a one-line <code>result</code>. The handler also accepts <code>result_summary</code>/<code>summary</code> as aliases for <code>result</code> (the model's natural names), so the bypass works first try. Covered by <code>tests/test_run_failure_fixes.py</code>.</p>
 
+  <h2>Deliverables &amp; end-of-project cleanup</h2>
+  <p>When a project completes (transitions to DONE), its workspace is swept by
+  <a href="../core/workspace_cleanup.html">core.workspace_cleanup</a>: registered
+  <code>file</code> artifacts are kept, everything else (screenshots, helper
+  scripts, temp files) is deleted. So <code>task_update status=DONE</code> takes
+  a <code>deliverables=[...]</code> argument — the project-relative paths the
+  user should keep. Each is registered via
+  <a href="../memory/projects.html"><code>register_file_artifact</code></a>
+  (deduped) the moment the task is marked DONE; a legacy
+  <code>artifact_kind="file"</code>&nbsp;+&nbsp;<code>payload</code> pair is
+  registered the same way. The DONE-gate instruction now reminds the agent to
+  pass <code>deliverables</code> so nothing important is swept. Covered by
+  <code>tests/test_workspace_cleanup.py</code>.</p>
+
   <h2>Per-project sandbox scoping</h2>
   <p>When a project is active (<code>context.current_project_id</code> set on <code>create</code>/<code>switch</code>/<code>resume</code>), file&nbsp;ops and code execution are rooted at <code>&lt;sandbox&gt;/projects/&lt;id&gt;/</code> instead of the sandbox root — so a whole project's scratch space cleans up with a single <code>rm -rf sandbox/projects/&lt;id&gt;</code>. The same path is what <a href="../memory/projects.html"><code>ProjectStore._default_workspace()</code></a> records as a project's <code>workspace_dir</code>.</p>
   <p><b>Single source of truth.</b> All scoping routes through <code>file_system.project_scoped_sandbox(context, stateful)</code> → <code>(host_dir, container_workdir)</code>. The registry's <code>_proj_ws</code> delegates to it, and so does every other file surface, so they can't drift: the tool registry, the <b>ambient sandbox-state listing</b> injected into each turn (<code>core/agent.py</code> — previously listed the root while file ops were scoped, which is what made the model insist "the file is at sandbox root"), the user-attached-image save, the <b><code>/api/upload</code></b> route, <code>knowledge_base</code>'s source-file reads, and the (dormant) Qwen-Agent <code>qwen_bridge</code> runtime.</p>
@@ -81,7 +137,7 @@
     <li><b><code>file_system</code></b> + <b><code>report_pdf</code></b> + <b><code>image_generation</code></b> — <code>sandbox_dir</code> is the scoped host dir. <code>report_pdf</code> and <code>image_generation</code> emit a <em>root-relative</em> download link (<code>/api/download/projects/&lt;id&gt;/…</code>) via the shared <code>file_system.project_download_prefix()</code> helper, because the <code>/api/download/&lt;path&gt;</code> route resolves against the sandbox ROOT.</li>
     <li><b><code>execute</code></b> — also receives <code>container_workdir = /workspace/projects/&lt;id&gt;</code>, threaded down to <code>DockerSandbox.execute(workdir=…)</code>, so a script written via <code>file_system</code> reads back when run by <code>execute</code> (the write-then-read symmetry invariant). The <code>workdir</code> kwarg is passed ONLY when scoping is active, so sandbox managers without the parameter are unaffected.</li>
     <li><b><code>vision_analysis</code></b> — scoped to read images that the scoped <code>execute</code>/<code>image_generation</code> wrote (the <em>generate-plot → analyse</em> loop). As a read-only tool it additionally <b>falls back to the sandbox root</b> if the scoped path misses.</li>
-    <li><b><code>browser</code></b> — scoped too: it runs its in-container runner from <code>/workspace/projects/&lt;id&gt;</code> (via <code>container_workdir</code>), writes screenshots into the scoped dir (container path via <code>_to_container_path</code>), and <b>heals <code>file://</code> URLs</b> — a model-emitted <code>file:///workspace/page.html</code> is rewritten to <code>file:///workspace/projects/&lt;id&gt;/page.html</code> (with a root fallback), so the browser can open files the scoped <code>file_system</code> just wrote. The persistent profile stays shared at <code>/workspace/.browser_profile</code>.</li>
+    <li><b><code>browser</code></b> — scoped too: it runs its in-container runner from <code>/workspace/projects/&lt;id&gt;</code> (via <code>container_workdir</code>), writes screenshots into the scoped dir (container path via <code>_to_container_path</code>), and <b>heals <code>file://</code> URLs</b> — a model-emitted <code>file:///workspace/page.html</code> <em>or</em> the host-root-relative <code>file:///sandbox/projects/&lt;id&gt;/page.html</code> is rewritten to <code>file:///workspace/projects/&lt;id&gt;/page.html</code> (with a root fallback), so the browser can open files the scoped <code>file_system</code> just wrote. The <code>sandbox/projects/&lt;id&gt;/</code> case was a live 404 loop fixed 2026-06-20 (see <a href="file_system.html">file_system path heal</a>). The persistent profile stays shared at <code>/workspace/.browser_profile</code>. The <code>create</code>/<code>switch</code> workspace note now also explicitly tells the model to use BARE names and never prefix with <code>/workspace/</code>, <code>sandbox/</code>, or <code>projects/&lt;id&gt;/</code>.</li>
   </ul>
   <p><b>Consistency across the handoff surface.</b> Because <code>execute</code> must be scoped (to preserve file_system↔execute symmetry), every tool it hands files to is scoped to match: a plot written by <code>execute</code> is found by <code>vision_analysis</code>; an image from <code>image_generation</code> is found by <code>vision_analysis</code> and downloadable. The <code>/api/download</code> route also <b>falls back to the active project dir</b> for a bare filename, so a model-emitted <code>/api/download/plot.png</code> link to a scoped file still resolves.</p>
   <p><b>Switch-race handling.</b> The model often emits a <code>file_system</code> write <em>before</em> the <code>switch</code> tool call in the SAME turn, so the file lands at the root just before scoping turns on; a later <code>execute</code> then runs from the scoped cwd and can't see it. Two mitigations: the <code>create</code>/<code>switch</code>/<code>resume</code> result carries a <code>note</code> telling the model its working directory is now <code>projects/&lt;id&gt;/</code> (reference files by bare name) — <code>create</code> was <em>added</em> to this set on 2026-06-09 after a live run where the model wrote <code>index.html</code> expecting the sandbox root right after creating a project, then burned ~4 turns discovering the write had been project-scoped and "moving" it; and <code>execute</code>'s command path <b>retries once from the sandbox root</b> when a scoped run fails with a file-not-found signature (safe — that error means nothing executed). Net effect: the race recovers silently with zero strikes (verified live: a generate-plot-then-analyse prompt that previously burned 2 strikes now completes clean).</p>

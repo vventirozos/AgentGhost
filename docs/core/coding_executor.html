@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.coding_executor — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="planning.html">planning</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a class="current" href="coding_executor.html">coding_executor</a>
+    <a href="project_safety.html">project_safety</a>
+    <a href="project_research.html">project_research</a>
+    <a href="workspace_cleanup.html">workspace_cleanup</a>
+    <a href="../memory/projects.html">memory.projects</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / coding_executor.py</h1>
+  <p class="subtitle">The real per-task coding executor for autonomous batches: build one leaf for real — write files, verify — instead of marking shallow work done.</p>
+
+  <h2>Why</h2>
+  <p>When <a href="project_advancer.html"><code>advance_many</code></a> runs a
+  batch ("proceed with all remaining tasks"), each coding tick used to generate
+  a SINGLE shell command. That produced <strong>theatrical completion</strong>:
+  a leaf marked DONE having written nothing — observed live, where "create
+  hello.txt" was classified as research, ran a <code>web_search</code>, and was
+  reported complete with no file on disk. This module makes a coding tick
+  actually build.</p>
+
+  <h2>What it does</h2>
+  <p><code>build_coding_task(context, description, *, tool_runner, ledger="")</code>
+  is bounded by design — the task tree already decomposes the work, so this just
+  builds ONE leaf well:</p>
+  <ol>
+    <li><strong>Spec</strong> — one LLM call returns a JSON object: <code>files</code> (each a <code>path</code> + FULL <code>content</code>), an optional <code>verify</code> shell command, a one-line <code>summary</code>, and a one-line <code>ledger</code> fact. The project's <a href="prompts.html">design ledger</a> is fed in so the build stays consistent with what already exists.</li>
+    <li><strong>Write</strong> — each file via the <code>file_system</code> tool (<code>operation="write"</code>), capped at <code>MAX_FILES</code> (8) / <code>MAX_CONTENT_CHARS</code> (60k) per file.</li>
+    <li><strong>Verify</strong> — runs the <code>verify</code> command via <code>execute</code>; a failure (per <code>project_advancer._looks_like_failure</code>) fails the build.</li>
+    <li>Returns a <code>CodingResult</code> (<code>ok</code>, <code>summary</code>, <code>files</code>, <code>ledger_note</code>, <code>detail</code>).</li>
+  </ol>
+
+  <h2>Fail loud, not shallow</h2>
+  <p>If the spec is empty, a write is rejected, or verify fails, the build
+  returns <code>ok=False</code>. <code>advance_once._finalize_coding</code> then
+  marks the task FAILED, which <strong>stops the batch loop</strong> so the user
+  can take the hard task themselves as a full focused turn — the opposite of
+  silently marking it done. On success it registers the produced files as
+  deliverable artifacts (so <a href="workspace_cleanup.html">cleanup</a> keeps
+  them) and appends the ledger note.</p>
+
+  <h2>Wiring</h2>
+  <p>Passed as <code>coding_executor=build_coding_task</code> into
+  <code>advance_once</code> / <code>advance_many</code> from both the
+  <a href="../tools/projects.html"><code>manage_projects autoadvance</code></a>
+  tool path and the idle autoadvancer (<a href="agent.html">agent.py</a> phase
+  2.95). It is NOT an open-ended agent loop — one spec call, N writes, one
+  verify — so per-tick context stays bounded however many tasks the batch runs.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_coding_executor.py</code> — happy path (write + verify),
+  verify-failure, write-rejection, empty spec, no-verify, markdown-fenced JSON,
+  unavailable executor, and the <code>advance_once</code> integration (DONE +
+  artifacts + ledger on success, FAILED on a broken build), plus the
+  classification fix that routes file/build leaves here.</p>
+</main>
+</body>
+</html>

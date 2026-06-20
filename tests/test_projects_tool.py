@@ -77,7 +77,8 @@ async def test_switch_returns_workspace_note(context):
     res = _parse(await tool_manage_projects(context, action="switch", project_id=pid))
     assert res["workspace"] == f"projects/{pid}"
     assert f"projects/{pid}" in res["note"]
-    assert "bare name" in res["note"]
+    # the note steers the model to bare filenames (now "BARE name")
+    assert "bare name" in res["note"].lower()
 
 
 async def test_create_with_same_title_reuses_id_regardless_of_age(context):
@@ -202,8 +203,12 @@ async def test_first_create_does_not_carry_refused(context):
     """Sanity: the very first create call is a success, not a refusal."""
     res = _parse(await tool_manage_projects(context, action="create", title="New"))
     assert "refused" not in res
-    assert "agent_instruction" not in res
     assert res["created"]
+    # A successful create DOES carry an agent_instruction now (the pacing /
+    # per-file decomposition guidance) — but it must be the success guidance,
+    # not the refusal "STOP calling create" message.
+    assert "STOP calling create" not in res.get("agent_instruction", "")
+    assert "task_decompose" in res.get("agent_instruction", "")
 
 
 async def test_switch_changes_active_project(context):
