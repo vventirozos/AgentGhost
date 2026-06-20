@@ -86,7 +86,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "file_system",
-            "description": "Unified file manager. ALWAYS use this to list, read, write. Use operation='search' for instantaneous high-performance ripgrep text searching across the codebase. Use operation='find' to locate files by wildcard name (e.g. '*.py').",
+            "description": "Unified file manager. ALWAYS use this to list, read, write. Use operation='search' for instantaneous high-performance ripgrep text searching across the codebase. Use operation='find' to locate files by wildcard name (e.g. '*.py'). LARGE FILES: do NOT emit a huge file (more than ~500 lines / ~40KB) in a single 'write' — a tool call that big frequently exceeds the JSON arg limit and fails to parse (the content is then lost). Instead write a compact SKELETON first, then grow it with successive operation='replace' edits that insert one section at a time. Build big single-file apps incrementally, not in one mega-write.",
             "parameters": {
                 "type": "object",
                 "properties": {

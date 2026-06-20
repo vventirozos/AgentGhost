@@ -22,7 +22,10 @@ from ghost_agent.core.project_advancer import (
 )
 from ghost_agent.memory.projects import ProjectStore, ProjectStatus
 from ghost_agent.memory.scratchpad import Scratchpad
-from ghost_agent.tools.projects import tool_manage_projects, _parse_advance_count
+from ghost_agent.tools.projects import (
+    tool_manage_projects, _parse_advance_count, _advance_batch_instruction,
+)
+from ghost_agent.core.project_advancer import AdvanceManyResult
 
 
 # --------------------------------------------------------------- intent classify
@@ -51,6 +54,24 @@ def test_classify_advance_intent(text, mode, count):
 def test_single_next_task_is_not_all():
     # "next task" must be ONE, not swept up by the 'tasks?' number regex.
     assert classify_advance_intent("the next task")["count"] == 1
+
+
+def test_batch_instruction_on_failure_says_stop_not_rebuild():
+    # A failed/paused batch must tell the agent to report + hand back to the
+    # user — NOT to keep building manually (that thrashed ~700s live and broke
+    # project scoping).
+    b = AdvanceManyResult([{"status": "DONE"}, {"status": "FAILED"}], "failed", None)
+    instr = _advance_batch_instruction(b, None)
+    assert "STOP" in instr
+    assert "Do NOT keep building" in instr or "do not keep building" in instr.lower()
+    assert "yourself as a focused turn" not in instr  # the old, removed advice
+
+
+def test_batch_instruction_on_completion_is_plain_summary():
+    b = AdvanceManyResult([{"status": "DONE"}, {"status": "DONE"}], "project_done", None)
+    instr = _advance_batch_instruction(b, None)
+    assert "Summarize" in instr
+    assert "Do NOT keep building" not in instr
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -149,7 +170,45 @@ async def test_advance_many_continues_past_failure_when_allowed(monkeypatch):
     ])
     r = await advance_many(ctx, "p", max_tasks=None, stop_on_fail=False)
     assert r.count == 2
-    assert r.stop_reason == "project_done"
+    # advanced both, but one FAILED → reported distinctly from a clean finish
+    assert r.stop_reason == "completed_with_failures"
+
+
+@pytest.mark.asyncio
+async def test_advance_many_circuit_breaker_on_repeated_failures(monkeypatch):
+    # stop_on_fail=False continues past failures, but 3 in a row trips the
+    # circuit breaker (systemic problem) — don't grind through everything.
+    ctx = SimpleNamespace(project_store=_FakeStore(
+        {"t1": "FAILED", "t2": "FAILED", "t3": "FAILED", "t4": "DONE"}))
+    _script(monkeypatch, [
+        AdvanceResult(True, "t1", "coding", "x"),
+        AdvanceResult(True, "t2", "coding", "x"),
+        AdvanceResult(True, "t3", "coding", "x"),
+        AdvanceResult(True, "t4", "coding", "should not run"),
+    ])
+    r = await advance_many(ctx, "p", max_tasks=None, stop_on_fail=False,
+                           max_consecutive_fails=3)
+    assert r.count == 3
+    assert r.stop_reason == "repeated_failures"
+
+
+@pytest.mark.asyncio
+async def test_advance_many_consecutive_counter_resets_on_success(monkeypatch):
+    # fail, succeed, fail, succeed, done → 2 isolated failures, never 3 in a
+    # row → completes with failures (circuit breaker NOT tripped).
+    ctx = SimpleNamespace(project_store=_FakeStore(
+        {"t1": "FAILED", "t2": "DONE", "t3": "FAILED", "t4": "DONE"}))
+    _script(monkeypatch, [
+        AdvanceResult(True, "t1", "coding", "x"),
+        AdvanceResult(True, "t2", "coding", "x"),
+        AdvanceResult(True, "t3", "coding", "x"),
+        AdvanceResult(True, "t4", "coding", "x"),
+        AdvanceResult(True, None, "idle", "done"),
+    ])
+    r = await advance_many(ctx, "p", max_tasks=None, stop_on_fail=False,
+                           max_consecutive_fails=3)
+    assert r.count == 4
+    assert r.stop_reason == "completed_with_failures"
 
 
 @pytest.mark.asyncio

@@ -6,13 +6,23 @@ user actually wanted, and *scratch* — screenshots, helper scripts, temp
 files, ``__pycache__`` — that only mattered while the work was in
 flight. This module keeps the deliverables and deletes the scratch.
 
-The contract is deliberately simple: **registered ``file`` artifacts are
-kept, everything else is deleted.** Anything the agent wants to survive
-cleanup must be registered as a deliverable (see
+The contract: **when deliverables are registered, registered ``file``
+artifacts are kept and everything else is deleted.** Anything the agent
+wants to survive cleanup should be registered as a deliverable (see
 ``ProjectStore.register_file_artifact`` and the ``deliverables=[...]``
 argument of the ``manage_projects`` ``task_update`` action); the research
-subsystem already registers its briefs. Whatever is not registered is,
-by definition, scratch.
+subsystem already registers its briefs.
+
+But registration depends on the agent remembering to do it, and it doesn't
+always — a one-turn single-file build wrote ``index.html``, marked its task
+DONE without ``deliverables=[...]``, and the old "nothing registered ⇒
+everything is scratch" rule wiped the project's only file (observed live).
+So an **empty keep-set is treated as missing registration, not as
+permission to delete the workspace**: the sweep recovers the deliverables by
+keeping (and registering) every non-debris file and deletes only categorical
+debris — bytecode caches, browser scaffolding, swap/backup/dot files (see
+``_is_debris``). A workspace holding nothing but debris still nets an empty
+keep-set, so a lone ``__pycache__`` is still swept.
 
 The sweep is conservative about *where* it operates so a cleanup bug can
 never escape the project's own scratch space:
@@ -78,6 +88,99 @@ def _normalize_rel(payload: str, project_id: str) -> Optional[str]:
     return "/".join(parts)
 
 
+# ── no-registration recovery ────────────────────────────────────────────
+# Transient debris a build leaves behind that is NEVER a deliverable. Used
+# ONLY when a project reaches DONE with an EMPTY keep-set (the agent never
+# registered anything). There the old policy — "nothing registered ⇒
+# everything is scratch ⇒ delete it all" — destroyed the deliverable: a
+# one-turn single-file build wrote index.html, marked the task DONE without
+# `deliverables=[...]`, and the sweep wiped the project's only file (observed
+# live). In that case we delete just this debris and KEEP + register
+# everything else, recovering the deliverable set the agent forgot to mark.
+# Deliberately conservative: anything not obviously debris is kept, because
+# losing a real deliverable is far worse than leaving a stray scratch file.
+_SCRATCH_DIRS = {
+    "__pycache__", ".browser_profile", ".pytest_cache", ".ipynb_checkpoints",
+    ".cache", ".git", ".mypy_cache", ".ruff_cache",
+}
+_SCRATCH_NAMES = {".ds_store", "thumbs.db", ".browser_runner.py"}
+_SCRATCH_SUFFIXES = {".pyc", ".pyo", ".log", ".tmp", ".bak", ".swp", ".swo"}
+_SCRATCH_PREFIXES = ("temp_", "tmp_", "scratch_", "debug_")
+
+
+def _is_debris(rel: str) -> bool:
+    """True for a project-relative path that is categorically transient —
+    bytecode caches, browser scaffolding, editor swap/backup files, dotfiles.
+    Conservative on purpose (see module note): everything else is a candidate
+    deliverable and is kept by the no-registration recovery path."""
+    parts = rel.split("/")
+    if any(p in _SCRATCH_DIRS for p in parts[:-1]):
+        return True
+    name = parts[-1].lower()
+    if name in _SCRATCH_NAMES:
+        return True
+    if name.startswith("."):                      # dotfiles / dot-runners
+        return True
+    if name.startswith(_SCRATCH_PREFIXES):
+        return True
+    dot = name.rfind(".")
+    suffix = name[dot:] if dot > 0 else ""
+    return suffix in _SCRATCH_SUFFIXES
+
+
+def _any_task_id(store, project_id: str) -> Optional[str]:
+    """The most-recent task id for the project, to hang recovered-deliverable
+    artifacts on. ``register_file_artifact`` needs a task; recovery is
+    best-effort, so ``None`` (no tasks) just means we keep without persisting
+    a row — a later sweep re-derives the same keep-set."""
+    try:
+        tasks = store.list_tasks(project_id) or []
+    except Exception:
+        return None
+    if not tasks:
+        return None
+    tasks = sorted(tasks, key=lambda t: t.get("updated_at") or t.get("created_at") or "")
+    return tasks[-1].get("id")
+
+
+def _recover_deliverables(store, project_id: str, root: Path,
+                          *, dry_run: bool = False) -> Set[str]:
+    """Keep-set for a project that registered NOTHING: every non-debris,
+    non-symlink file under the workspace. Registers what it finds (best-effort,
+    skipped on dry_run) so the record becomes truthful and the files survive
+    any future sweep. Symlinks are never recovered — a symlink is scratch and
+    could point outside the tree, so it is left for the normal pass to delete."""
+    keep: Set[str] = set()
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        for fname in filenames:
+            fpath = base / fname
+            try:
+                if fpath.is_symlink():
+                    continue
+                rel = fpath.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if not _is_debris(rel):
+                keep.add(rel)
+    if keep:
+        tid = None if dry_run else _any_task_id(store, project_id)
+        if tid:
+            for rel in sorted(keep):
+                try:
+                    store.register_file_artifact(tid, rel)
+                except Exception:
+                    logger.debug("recovery registration skipped: %s", rel, exc_info=True)
+        pretty_log(
+            "Cleanup",
+            f"project {project_id}: no deliverables were registered — recovered "
+            f"{len(keep)} file(s) from the workspace and kept them (only debris "
+            f"deleted). The build path should register deliverables explicitly.",
+            icon=Icons.WARN, level="WARNING",
+        )
+    return keep
+
+
 def _keep_set(store, project_id: str) -> Optional[Set[str]]:
     """The set of project-relative paths to preserve: every registered
     ``file`` artifact. Returns ``None`` if the artifact list can't be read —
@@ -134,6 +237,16 @@ def sweep_project_workspace(store, project_id: str, *,
     if keep is None:
         summary["status"] = "skipped: artifact read failed"
         return summary
+
+    # An EMPTY keep-set on a finished project means the agent registered no
+    # deliverables — NOT that the whole workspace is scratch. Recover the
+    # deliverable set (keep + register every non-debris file) so the sweep
+    # removes only true debris instead of wiping the build. A workspace that
+    # holds nothing but debris yields an empty keep-set here too, and the
+    # normal pass below then deletes that debris (e.g. a lone __pycache__).
+    if not keep:
+        keep = _recover_deliverables(store, project_id, root, dry_run=dry_run)
+        summary["recovered"] = sorted(keep)
 
     deleted: List[str] = []
     kept: List[str] = []

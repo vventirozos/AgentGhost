@@ -66,6 +66,7 @@
   <ul>
     <li><strong>Design ledger</strong> — <code>action=ledger ledger="single HTML file at browser-os.html; windows are .window divs opened via openApp(id)"</code> records a durable fact (file layout, key API/function name, convention). It is bounded + dedup'd in project metadata and surfaced in the <a href="../core/prompts.html">project briefing</a> every turn, so later turns inherit it instead of re-reading files to rediscover it. A <code>ledger="…"</code> may also ride along on a <code>task_update status=DONE</code> to capture the decision as the task closes. Backed by <code>ProjectStore.get_ledger / append_ledger / set_ledger</code>.</li>
     <li><strong>Per-file decomposition</strong> — the <code>subtasks</code> description and the tool/<code>create</code> instructions now steer toward tasks that each own a FILE or a bounded function you can build and verify alone (a thin shell + one file per feature), and explicitly warn against N tasks that all edit the same file — that forces whole-file context every turn and doesn't scale.</li>
+    <li><strong><code>create</code> honours <code>subtasks</code> (2026-06-20)</strong> — the model routinely calls <code>action=create</code> WITH <code>subtasks</code>, believing create decomposes too. Those used to be silently dropped, leaving the project with ZERO tasks while the model believed they existed — so a later "proceed" found "no plan" and the flow derailed (observed live, twice). <code>create</code> now decomposes the <code>subtasks</code> in the same call (sequential-aware) and returns <code>tasks_created</code>; the success instruction reflects whether tasks already exist or still need <code>task_decompose</code>.</li>
   </ul>
   <p>Together with the <strong>DONE SO FAR</strong> briefing digest (auto-surfacing
   completed tasks' <code>result_summary</code>), these give the next turn "what
@@ -99,6 +100,13 @@
   (write files + verify), failing loudly on a hard task rather than marking
   shallow work done. Covered by <code>tests/test_advance_pacing.py</code> and
   <code>tests/test_coding_executor.py</code>.</p>
+  <p><strong>On a failed/paused batch, STOP and report (2026-06-20).</strong>
+  When the loop stops early (a task FAILED, budget, or needs-user), the result
+  instruction now tells the agent to report exactly which tasks completed vs
+  not and hand back to the user — explicitly NOT to keep building the
+  remaining/failed tasks by hand. That manual fallback is what thrashed for
+  ~700s live and exposed the project-scoping race; re-running
+  <code>autoadvance</code> after a fix is the way to continue.</p>
   <h3>Auto-research</h3>
   <ul>
     <li><code>research</code> — research a topic and persist a summarised brief in the project workspace. Pass <code>topic="…"</code> for a single topic, or omit it (optionally with <code>max_topics</code>) to auto-derive several from the project goal + open tasks. Each brief lands at <code>research/&lt;slug&gt;.md</code>, is indexed in project metadata, and is surfaced under <strong>RESEARCH NOTES</strong> in the project briefing. See <a href="../core/project_research.html">core.project_research</a>.</li>

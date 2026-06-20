@@ -69,6 +69,23 @@ def test_bare_project_prefix_dir_collapses_to_root(tmp_path):
     assert _get_safe_path(sb, f"projects/{PID}") == sb.resolve()
 
 
+@pytest.mark.parametrize("guessed,tail", [
+    ("projects/DeskMiniX3/index.html", "index.html"),   # title-derived slug, NOT the id
+    ("projects/my-cool-app/sub/app.js", "sub/app.js"),
+    ("/workspace/projects/WebDeskV2/index.html", "index.html"),
+])
+def test_guessed_project_slug_collapses_to_active_project(tmp_path, guessed, tail):
+    """A `projects/<slug>/...` path whose slug ISN'T the active id is the model
+    guessing a project dir by name/title (live: it wrote
+    `projects/DeskMiniX3/index.html` the same turn it created the project,
+    spawning an orphan tree the cleanup sweep — keyed on the canonical id —
+    never touched). It must collapse into the ACTIVE project's dir so the file,
+    the store record, and the sweep all agree."""
+    sb = _scoped(tmp_path)
+    got = _get_safe_path(sb, guessed)
+    assert got == (sb / tail).resolve(), f"{guessed} -> {got}"
+
+
 # ----------------------------------------------------------------- guards (no over-strip)
 
 def test_literal_projects_subdir_not_over_stripped(tmp_path):

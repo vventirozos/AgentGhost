@@ -34,14 +34,32 @@
   <strong>DONE</strong>, leaving only the files the user actually wanted.</p>
 
   <h2>The contract</h2>
-  <p><strong>Registered <code>file</code> artifacts are kept; everything else
-  is deleted.</strong> Anything that should survive cleanup must be registered
-  as a deliverable — either explicitly (the
-  <code>deliverables=[...]</code> argument of the <code>manage_projects</code>
-  <code>task_update</code> action, or
+  <p><strong>When deliverables are registered, registered <code>file</code>
+  artifacts are kept and everything else is deleted.</strong> Anything that
+  should survive cleanup should be registered as a deliverable — either
+  explicitly (the <code>deliverables=[...]</code> argument of the
+  <code>manage_projects</code> <code>task_update</code> action, or
   <code>ProjectStore.register_file_artifact</code>) or automatically (the
-  research subsystem registers each brief). Whatever is not registered is, by
-  definition, scratch.</p>
+  research subsystem registers each brief).</p>
+  <p><strong>Empty-keep-set recovery (2026-06-20).</strong> Registration depends
+  on the agent remembering to do it, and it doesn't always: a one-turn
+  single-file build wrote <code>index.html</code>, marked its task DONE
+  <em>without</em> <code>deliverables=[...]</code>, and the old "nothing
+  registered ⇒ everything is scratch" rule wiped the project's only file
+  (observed live — the deliverable was gone before the verifier even loaded it).
+  So an <strong>empty keep-set is now read as missing registration, not as
+  permission to delete the workspace.</strong> The sweep recovers the
+  deliverables (<code>_recover_deliverables</code>): it keeps — and
+  back-registers — every non-debris, non-symlink file, and deletes only
+  categorical debris (<code>_is_debris</code>: bytecode caches,
+  <code>.browser_profile</code>/<code>.browser_runner.py</code> scaffolding,
+  swap/backup files, dotfiles, <code>temp_/tmp_/scratch_/debug_</code> names).
+  Recovery is deliberately conservative — an image or stray file is kept rather
+  than risk-deleted — because losing a real deliverable is far worse than
+  leaving a stray scratch file. A workspace holding nothing but debris still
+  nets an empty keep-set, so a lone <code>__pycache__</code> is still swept. The
+  summary gains a <code>recovered</code> list, and an operator WARNING fires so
+  the missing registration is visible.</p>
 
   <h2>API</h2>
   <table>

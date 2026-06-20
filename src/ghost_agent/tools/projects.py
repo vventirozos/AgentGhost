@@ -368,6 +368,82 @@ def _workspace_note(project_id: str) -> str:
     )
 
 
+# Build-flavoured signals in a project title/goal. A GENERAL project defaults
+# its autoadvance leaves to research (which web-searches build tasks — observed
+# live), so a clearly-software goal should be created as CODING up front.
+_CODING_PROJECT_RE = re.compile(
+    r"\b(build|implement|coding|app|apps|application|website|web ?app|web ?page|"
+    r"webpage|game|games|operating system|cli|command line|api|script|program|"
+    r"dashboard|front ?end|frontend|back ?end|backend|server|library|module|"
+    r"component|html|css|javascript|typescript|python|single[ -]file|browser|"
+    r"interface|parser|compiler|algorithm|webgl|canvas|simulator|emulator)\b",
+    re.I,
+)
+
+
+# A goal asking for ONE cohesive file. Such a deliverable is built best in a
+# single turn (one-shot generation) — splitting it into per-feature tasks that
+# must merge into one file produces global collisions and a broken page
+# (observed live). Detected so create/decompose keep it as one task.
+_SINGLE_FILE_RE = re.compile(
+    r"\b(single[ -]file|one[ -]file|single (html|page|file)|"
+    r"one (html|index\.html|page|html file)|in (a |one )?single (html|file|page)|"
+    r"all[ -]in[ -]one (file|html|page)|self[ -]contained (html|file|page))\b",
+    re.I,
+)
+
+
+def _is_cohesive_single_file(title: str, goal: str) -> bool:
+    return bool(_SINGLE_FILE_RE.search(f"{title or ''} {goal or ''}"))
+
+
+def _feature_key(desc: str) -> str:
+    """A coarse identity for a task — the feature name before the first colon
+    (or the first few words). 'Core Shell: HTML structure…' and 'Core Shell:
+    index.html skeleton…' share the key 'core shell', so they dedup."""
+    d = " ".join((desc or "").strip().lower().split())
+    head = d.split(":", 1)[0]
+    return head[:40] if head else d[:40]
+
+
+def _filter_duplicate_subtasks(store, project_id: str, subtasks):
+    """Drop subtask descriptions whose feature already exists as a non-terminal
+    task, and drop intra-list duplicates. Stops the project piling up duplicate
+    tasks when the model calls create-with-subtasks AND task_decompose, or
+    decomposes twice (observed live — duplicate Core Shell / File Explorer that
+    then failed)."""
+    try:
+        existing = store.list_tasks(project_id)
+    except Exception:
+        existing = []
+    terminal = {"DONE", "FAILED", "BLOCKED", "ARCHIVED"}
+    seen = {_feature_key(t.get("description")) for t in existing
+            if str(t.get("status", "")).upper() not in terminal}
+    out = []
+    for d in (subtasks or []):
+        if not d or not d.strip():
+            continue
+        k = _feature_key(d)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(d)
+    return out
+
+
+def _infer_kind(title: str, goal: str, explicit_kind: str) -> str:
+    """Pick the project kind. An explicit CODING (or any non-GENERAL kind) from
+    the caller wins; otherwise infer CODING from a build-flavoured title/goal
+    so the autoadvancer treats the project's leaves as coding work rather than
+    defaulting them to research."""
+    ek = (explicit_kind or "").strip().upper()
+    if ek and ek != "GENERAL":
+        return ek
+    if _CODING_PROJECT_RE.search(f"{title or ''} {goal or ''}"):
+        return "CODING"
+    return ek or "GENERAL"
+
+
 def _parse_advance_count(count) -> Optional[int]:
     """Coerce a model-supplied `count` for autoadvance into max_tasks:
     a positive int, or ``None`` for "all" (run to completion). Anything
@@ -385,8 +461,13 @@ def _parse_advance_count(count) -> Optional[int]:
 
 _ADVANCE_STOP_BLURB = {
     "project_done": "All tasks are complete — the project is done.",
+    "completed_with_failures": "Advanced every task it could; some FAILED and "
+                               "were skipped (listed below) — retry those.",
     "count_reached": "Advanced the requested number of tasks; more remain.",
     "hard_cap": "Hit the safety cap mid-run — call autoadvance again to continue.",
+    "repeated_failures": "Stopped: several tasks failed in a row — likely a "
+                         "systemic problem (e.g. a broken foundation). Fix it, "
+                         "then re-run autoadvance.",
     "needs_user": "Paused: a task needs your input/decision before continuing.",
     "budget_or_inactive": "Paused: the project's step budget is exhausted "
                           "(raise steps_cap to continue) or it is not ACTIVE.",
@@ -400,11 +481,35 @@ def _advance_batch_instruction(batch, max_tasks) -> str:
     done = sum(1 for a in batch.advanced if (a.get("status") or "") == "DONE")
     failed = sum(1 for a in batch.advanced if (a.get("status") or "") == "FAILED")
     tail = f", {failed} FAILED" if failed else ""
+    failed_ids = [a.get("task_id") for a in batch.advanced
+                  if (a.get("status") or "") == "FAILED" and a.get("task_id")]
+    fail_list = (" Failed task ids: " + ", ".join(failed_ids) + ".") if failed_ids else ""
+    # Don't pull the built artifacts back into THIS turn to inspect/fix them —
+    # on a large build that overflowed the model's context (151K>131K observed
+    # live, after the agent read a 110KB file back and fought it for 30 turns).
+    # Each task already self-verified; report from the summaries and stop.
+    no_reload = ("Do NOT read the full built file(s) back into this turn or try "
+                 "to fix them now — on a large build that overflows the context "
+                 "window. Report from the summaries above.")
+    # These mean "something needs your attention before more progress is
+    # possible" — report and hand back; do NOT manually rebuild (that long
+    # manual build thrashed ~700s and broke project scoping).
+    stopped_early = batch.stop_reason in (
+        "failed", "repeated_failures", "budget_or_inactive", "needs_user")
+    if stopped_early:
+        return (
+            f"Autonomous batch ran {batch.count} task(s) ({done} DONE{tail}). "
+            f"{blurb}{fail_list} STOP now: tell the user EXACTLY which tasks "
+            f"completed and which did not, and ask how to proceed (retry the "
+            f"failed task(s), refine them, or take over). Do NOT keep building "
+            f"the project yourself this turn — re-running autoadvance after a "
+            f"fix continues from where it stopped. {no_reload}"
+        )
     return (
         f"Autonomous batch ran {batch.count} task(s) ({done} DONE{tail}). "
-        f"{blurb} Summarize for the user what was built and STOP — wait for "
-        f"their next direction. (Each task ran as a single constrained step; "
-        f"if a complex task FAILED, do it yourself as a focused turn.)"
+        f"{blurb}{fail_list} Summarize for the user what was built (and any "
+        f"failed tasks they may want to retry) and STOP — wait for their next "
+        f"direction. {no_reload}"
     )
 
 
@@ -868,11 +973,80 @@ async def tool_manage_projects(
                     "briefing": _briefing(store, existing["id"]),
                 })
             pid = store.create_project(
-                title=title, kind=kind or "GENERAL", goal=goal,
+                title=title, kind=_infer_kind(title, goal, kind), goal=goal,
                 metadata=metadata,
             )
             _link_project_in_graph(context, pid, title)
             _set_current(context, pid)
+            # If the model passed `subtasks` to create (it routinely does,
+            # believing create decomposes too), DECOMPOSE them now instead of
+            # silently dropping them. Without this the project was created with
+            # ZERO tasks while the model believed the tasks existed — so a
+            # later "proceed" found "no plan" and the whole flow derailed
+            # (observed live, twice). Top-level fan-out, sequential when asked.
+            created_task_ids: List[str] = []
+            if _is_cohesive_single_file(title, goal):
+                # A cohesive SINGLE FILE is built best in ONE turn (one-shot
+                # generation), NOT split into per-feature tasks that must merge
+                # into one file and collide (duplicate globals → the page threw
+                # on load; observed live). Collapse to ONE build task so the
+                # "proceed" path is a single full agent turn — the path that
+                # worked before the per-turn split.
+                plan = ProjectPlan(store, pid)
+                _desc = ("Build the complete single-file deliverable: "
+                         f"{(goal or title).strip()}")[:400]
+                one = plan.add_task(_desc)
+                created_task_ids = [one]
+                _link_task_in_graph(context, pid, one, _desc)
+                instruction = (
+                    "SINGLE-FILE build: a cohesive single file is built best in "
+                    "ONE focused turn, so this is ONE task — do NOT split it "
+                    "into per-feature tasks (they would have to merge into one "
+                    "file, which collides and breaks). Present this one-task "
+                    "plan and STOP. When the user says proceed, BUILD THE WHOLE "
+                    "FILE YOURSELF in that turn (write it directly, growing it "
+                    "with file_system as needed) — do NOT call autoadvance for "
+                    "it; the autonomous loop builds fragments unfit for a single "
+                    "cohesive file. The project workspace is ALREADY set up: "
+                    "write to the BARE filename (e.g. 'index.html') — do NOT "
+                    "invent or prefix a 'projects/<name>/' directory, and do "
+                    "NOT write the file before this create call has run."
+                )
+            elif subtasks:
+                subtasks = _filter_duplicate_subtasks(store, pid, subtasks)
+                plan = ProjectPlan(store, pid)
+                prev_id = None
+                pairs: List[tuple] = []
+                for desc in subtasks:
+                    if not desc or not desc.strip():
+                        continue
+                    deps = [prev_id] if (sequential and prev_id) else None
+                    tid = plan.add_task(desc.strip(), depends_on=deps)
+                    created_task_ids.append(tid)
+                    pairs.append((tid, desc.strip()))
+                    prev_id = tid
+                for tid, desc in pairs:
+                    _link_task_in_graph(context, pid, tid, desc)
+                instruction = (
+                    f"Project created WITH {len(created_task_ids)} task(s) from "
+                    "your subtasks. Present the plan and STOP — do NOT begin "
+                    "executing. Advance ONE task at a time, only when the user "
+                    "directs you ('proceed to next task'); for a multi-task "
+                    "go-ahead use autoadvance count=<N|all>."
+                )
+            else:
+                instruction = (
+                    "Project created. Break the goal into tasks with "
+                    "task_decompose — make EACH task own a file or a bounded "
+                    "function you can build and verify on its own (e.g. one "
+                    "file per feature behind a thin shell), NOT N tasks that "
+                    "all edit the same file. Then STOP and present the plan. "
+                    "DO NOT begin executing tasks now — advance ONE task at a "
+                    "time, and only when the user directs you (e.g. 'proceed to "
+                    "next task'). As you work, record durable facts (file "
+                    "layout, key APIs) with action=ledger so later turns don't "
+                    "re-derive them."
+                )
             # Tell the model its working directory moved to the project dir —
             # the SAME note switch/resume return. Without it (create used to
             # omit it), the model wrote `index.html` expecting the sandbox
@@ -881,21 +1055,10 @@ async def tool_manage_projects(
             # steers it to bare relative filenames that land in the right
             # place the first time.
             return _ok({"created": pid,
+                        "tasks_created": created_task_ids,
                         "workspace": f"projects/{pid}",
                         "note": _workspace_note(pid),
-                        "agent_instruction": (
-                            "Project created. Break the goal into tasks with "
-                            "task_decompose — make EACH task own a file or a "
-                            "bounded function you can build and verify on its "
-                            "own (e.g. one file per feature behind a thin "
-                            "shell), NOT N tasks that all edit the same file. "
-                            "Then STOP and present the plan. DO NOT begin "
-                            "executing tasks now — advance ONE task at a time, "
-                            "and only when the user directs you (e.g. 'proceed "
-                            "to next task'). As you work, record durable facts "
-                            "(file layout, key APIs) with action=ledger so "
-                            "later turns don't re-derive them."
-                        ),
+                        "agent_instruction": instruction,
                         "briefing": _briefing(store, pid)})
 
         if act == "list":
@@ -1210,6 +1373,33 @@ async def tool_manage_projects(
                 target_id = None  # treat project handle as "top level"
             if target_id and target_id not in plan.tree.nodes:
                 return _err(f"unknown task: {target_id}")
+            # Top-level fan-out: drop subtasks that duplicate an existing
+            # non-terminal task (the model often calls create-with-subtasks
+            # AND decompose, or decomposes twice — observed live: duplicate
+            # Core Shell / File Explorer that then failed).
+            if not target_id:
+                # A cohesive single-file deliverable must NOT be fanned out
+                # into per-feature tasks (they'd merge into one file and
+                # collide). Refuse the split and steer to a one-turn build.
+                _proj = store.get_project(project_id) or {}
+                if (_is_cohesive_single_file(_proj.get("title"), _proj.get("goal"))
+                        and len([d for d in subtasks if d and d.strip()]) > 1):
+                    return _ok({
+                        "created": [],
+                        "refused": True,
+                        "agent_instruction": (
+                            "This is a SINGLE-FILE deliverable — do NOT split it "
+                            "into per-feature tasks (they would have to merge "
+                            "into one file and collide, breaking the page). "
+                            "Build the WHOLE file yourself in ONE turn instead "
+                            "(write it directly with file_system); keep it as a "
+                            "single task."),
+                    })
+                subtasks = _filter_duplicate_subtasks(store, project_id, subtasks)
+                if not subtasks:
+                    return _ok({"created": [], "parent_id": None,
+                                "note": "all subtasks duplicated existing "
+                                        "tasks; nothing added"})
 
             ids: List[str] = []
             pairs: List[tuple] = []  # (task_id, description) for graph linking
@@ -1344,6 +1534,11 @@ async def tool_manage_projects(
                 llm_classifier=default_llm_classifier(context),
                 code_generator=default_code_generator(context),
                 coding_executor=build_coding_task,
+                # Continue past an isolated failed task (apps are usually
+                # independent) and report all failures — a single flaky task
+                # shouldn't halt the whole batch. A circuit breaker still
+                # stops on repeated (systemic) failures.
+                stop_on_fail=False,
             )
             return _ok({
                 "advanced": batch.advanced,
@@ -1406,7 +1601,7 @@ async def tool_manage_projects(
             if not title:
                 return _err("title is required for promotion")
             pid = store.create_project(
-                title=title, kind=kind or "GENERAL", goal=goal,
+                title=title, kind=_infer_kind(title, goal, kind), goal=goal,
                 metadata={"promoted_from_context": True},
             )
             _link_project_in_graph(context, pid, title)

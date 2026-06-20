@@ -93,28 +93,87 @@ def test_sweep_removes_pycache(store):
     assert not (pdir / "__pycache__").exists()
 
 
-def test_sweep_empty_keepset_deletes_all_files_keeps_dir(store):
+def test_sweep_empty_keepset_recovers_files_not_deletes_them(store):
+    """A finished project that registered NO deliverables must NOT have its
+    workspace wiped — the agent simply forgot to register. The sweep recovers
+    every non-debris file (keeps + registers) and deletes only debris. (Live
+    data-loss: a one-turn single-file build's index.html was the only file and
+    got swept because task_update was called without deliverables=.)"""
     pid = store.create_project("P")
     pdir = _proj_dir(store, pid)
-    _write(pdir, "a.txt")
-    _write(pdir, "b.txt")
+    ProjectPlan(store, pid).add_task("t")        # a task to hang artifacts on
+    _write(pdir, "index.html", "<html></html>")
+    _write(pdir, "app.js", "var x=1;")
+    _write(pdir, "screenshot.png", "junk")       # ambiguous -> kept (conservative)
+    _write(pdir, "__pycache__/m.pyc", "bytecode")  # debris -> deleted
+    _write(pdir, ".browser_runner.py", "scaffold")  # debris -> deleted
 
     res = sweep_project_workspace(store, pid)
 
-    assert sorted(res["deleted"]) == ["a.txt", "b.txt"]
+    assert res["status"] == "ok"
+    assert (pdir / "index.html").exists()
+    assert (pdir / "app.js").exists()
+    # recovery is conservative: an image could be a deliverable, so it is kept
+    # rather than risk-deleted when nothing was registered
+    assert (pdir / "screenshot.png").exists()
+    assert not (pdir / "__pycache__").exists()
+    assert not (pdir / ".browser_runner.py").exists()
+    # the deliverables were registered so future reads / sweeps see them
+    payloads = {a["payload"] for a in store.list_artifacts(project_id=pid)
+                if a["kind"] == "file"}
+    assert "index.html" in payloads and "app.js" in payloads
+    assert "index.html" in res["recovered"]
+
+
+def test_sweep_debris_only_workspace_is_emptied(store):
+    """The recovery must not leave debris behind: a workspace that is ALL
+    debris yields an empty recovered keep-set, and the normal pass then
+    deletes it (keeps the dir)."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    _write(pdir, "__pycache__/m.pyc", "bytecode")
+    _write(pdir, "debug_trace.tmp", "junk")
+
+    res = sweep_project_workspace(store, pid)
+
+    assert res["status"] == "ok"
+    assert not (pdir / "__pycache__").exists()
+    assert not (pdir / "debug_trace.tmp").exists()
     assert pdir.exists()
-    assert not any(pdir.iterdir())
+    assert res.get("recovered") == []
 
 
 def test_dry_run_reports_without_deleting(store):
     pid = store.create_project("P")
     pdir = _proj_dir(store, pid)
-    _write(pdir, "junk.txt")
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "keep.txt", "deliverable")
+    _write(pdir, "junk.tmp", "scratch")
+    store.register_file_artifact(tid, "keep.txt")  # non-empty keep-set: allowlist path
 
     res = sweep_project_workspace(store, pid, dry_run=True)
 
-    assert res["deleted"] == ["junk.txt"]
-    assert (pdir / "junk.txt").exists()  # untouched
+    assert res["deleted"] == ["junk.tmp"]
+    assert (pdir / "junk.tmp").exists()  # untouched
+    assert (pdir / "keep.txt").exists()
+
+
+def test_dry_run_recovery_reports_without_registering(store):
+    """Dry-run on an unregistered project reports what it WOULD delete and
+    must not register recovered files (no state mutation on a dry run)."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "index.html", "<html></html>")
+    _write(pdir, "old.tmp", "scratch")
+
+    res = sweep_project_workspace(store, pid, dry_run=True)
+
+    assert res["deleted"] == ["old.tmp"]
+    assert (pdir / "index.html").exists() and (pdir / "old.tmp").exists()
+    assert "index.html" in res["recovered"]
+    # nothing persisted
+    assert store.list_artifacts(project_id=pid) == []
 
 
 # ----------------------------------------------------------------- guards

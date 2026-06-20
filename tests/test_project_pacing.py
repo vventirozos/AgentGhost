@@ -70,6 +70,112 @@ def test_briefing_drops_old_parallel_directive(store):
 # ------------------------------------------------------------- create / decompose
 
 @pytest.mark.asyncio
+async def test_create_with_subtasks_creates_the_tasks(context):
+    """Live bug: the model routinely passes `subtasks` to action=create
+    expecting them to become tasks. They used to be silently dropped — the
+    project had ZERO tasks while the model believed they existed, so a later
+    'proceed' found no plan and the flow derailed (observed twice). create
+    now decomposes them."""
+    store = context.project_store
+    out = json.loads(await tool_manage_projects(
+        context, action="create", title="Mini OS",
+        goal="a multi-module desktop app project",
+        subtasks=["Core shell", "File Explorer", "Snake game"]))
+    pid = out["created"]
+    assert len(out["tasks_created"]) == 3
+    descs = [t["description"] for t in store.list_tasks(pid)]
+    assert descs == ["Core shell", "File Explorer", "Snake game"]
+    # instruction reflects that tasks already exist (don't tell it to decompose)
+    assert "WITH 3 task" in out["agent_instruction"]
+
+
+@pytest.mark.asyncio
+async def test_create_with_sequential_subtasks_chains_them(context):
+    store = context.project_store
+    out = json.loads(await tool_manage_projects(
+        context, action="create", title="Seq", subtasks=["a", "b", "c"],
+        sequential=True))
+    pid = out["created"]
+    ids = out["tasks_created"]
+    assert store.get_task(ids[1])["depends_on"] == [ids[0]]
+    assert store.get_task(ids[2])["depends_on"] == [ids[1]]
+
+
+@pytest.mark.asyncio
+async def test_create_then_decompose_does_not_duplicate_tasks(context):
+    """Live bug: the model calls create-WITH-subtasks AND then task_decompose
+    (or decomposes twice), piling up duplicate tasks (two Core Shells, two
+    File Explorers) that then fail. Decompose now drops subtasks whose feature
+    already exists."""
+    store = context.project_store
+    out = json.loads(await tool_manage_projects(
+        context, action="create", title="OS", goal="a multi-module desktop app",
+        subtasks=["Core Shell: skeleton", "File Explorer: vfs"]))
+    pid = out["created"]
+    assert len(store.list_tasks(pid)) == 2
+    # agent now decomposes again with dup descriptions + one genuinely new task
+    await tool_manage_projects(
+        context, action="task_decompose",
+        subtasks=["Core Shell: HTML structure", "File Explorer: folders",
+                  "Terminal: shell"])
+    descs = [t["description"] for t in store.list_tasks(pid)]
+    assert len(descs) == 3                      # only Terminal added
+    assert sum("core shell" in d.lower() for d in descs) == 1
+    assert sum("file explorer" in d.lower() for d in descs) == 1
+
+
+@pytest.mark.asyncio
+async def test_single_file_goal_collapses_to_one_task(context):
+    """A cohesive single-file deliverable must NOT be split into per-feature
+    tasks (they'd merge into one file and collide — observed live as a page
+    that throws on load). create collapses subtasks to ONE build task and
+    steers to a one-turn build."""
+    store = context.project_store
+    out = json.loads(await tool_manage_projects(
+        context, action="create", title="Browser OS",
+        goal="Create a single-file browser OS with desktop, taskbar, 5 apps",
+        subtasks=["Core Shell", "File Explorer", "Snake", "Terminal"]))
+    pid = out["created"]
+    assert len(out["tasks_created"]) == 1                      # collapsed
+    assert "single-file" in store.list_tasks(pid)[0]["description"].lower()
+    assert "SINGLE-FILE" in out["agent_instruction"]
+    assert "do NOT call autoadvance" in out["agent_instruction"]
+
+
+@pytest.mark.asyncio
+async def test_single_file_project_refuses_decompose_split(context):
+    store = context.project_store
+    await tool_manage_projects(
+        context, action="create", title="OS",
+        goal="a single-file browser OS in one index.html")
+    pid = context.current_project_id
+    before = len(store.list_tasks(pid))
+    dec = json.loads(await tool_manage_projects(
+        context, action="task_decompose", subtasks=["App A", "App B", "App C"]))
+    assert dec.get("refused") is True
+    assert len(store.list_tasks(pid)) == before               # nothing fanned out
+
+
+@pytest.mark.asyncio
+async def test_multi_file_goal_still_decomposes_normally(context):
+    # a NON-single-file build goal must still decompose per-file as before
+    store = context.project_store
+    out = json.loads(await tool_manage_projects(
+        context, action="create", title="CSV tool",
+        goal="build a python CSV stats CLI with tests",
+        subtasks=["src/parser.py: parse", "src/stats.py: compute", "tests/test_stats.py"]))
+    assert len(out["tasks_created"]) == 3                      # not collapsed
+
+
+@pytest.mark.asyncio
+async def test_create_without_subtasks_still_asks_to_decompose(context):
+    out = json.loads(await tool_manage_projects(
+        context, action="create", title="Bare"))
+    assert out["tasks_created"] == []
+    assert "task_decompose" in out["agent_instruction"]
+
+
+@pytest.mark.asyncio
 async def test_create_returns_stop_and_await_instruction(context):
     out = json.loads(
         await tool_manage_projects(context, action="create", title="New Effort")

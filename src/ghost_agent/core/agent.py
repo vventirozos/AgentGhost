@@ -3005,6 +3005,55 @@ class GhostAgent:
     # independently of the turn budget so a repair can't extend a runaway.
     _MAX_VERIFIER_REPAIRS = 1
 
+    # A basename-fallback match must have been written within this window to
+    # count — otherwise WEB-EXEC would "certify" a build by loading a STALE
+    # index.html from an unrelated prior project (observed live: the turn's
+    # deliverable never landed on disk, and the fallback found a 25-min-old
+    # file from another project and reported it clean — a false confirm).
+    _WEB_EXEC_FRESH_WINDOW_S = 900.0
+
+    def _locate_entry_page(self, candidates: list, sbx: Path, root: Path):
+        """Resolve a web entry-page name to an existing host file, or None.
+
+        Searches the scoped sandbox AND the root mount by the EXACT named
+        path first (trusted — the agent named that file and it exists), then
+        falls back to a freshest-wins basename search under the root. The
+        fallback exists because a project-REUSE turn can leave the deliverable
+        in ``<root>/projects/<id>/index.html`` while ``project_scoped_sandbox``
+        reads as un-scoped (the binding gap that made WEB-EXEC silently skip
+        on the live single-file build). It is gated on recency so a stale
+        unrelated artifact can never stand in for a deliverable that didn't
+        actually land this turn — a missing deliverable stays inconclusive.
+        """
+        from ..tools.file_system import _get_safe_path
+        for c in candidates:
+            for base in (sbx, root):
+                try:
+                    p = _get_safe_path(base, c)
+                    if p.exists() and p.is_file():
+                        return p
+                except Exception:
+                    continue
+        matches: list = []
+        for c in candidates:
+            try:
+                matches.extend(m for m in root.rglob(Path(c).name) if m.is_file())
+            except Exception:
+                continue
+        if matches:
+            try:
+                matches.sort(key=lambda m: m.stat().st_mtime, reverse=True)
+            except Exception:
+                pass
+            cutoff = time.time() - self._WEB_EXEC_FRESH_WINDOW_S
+            for m in matches:
+                try:
+                    if m.stat().st_mtime >= cutoff:
+                        return m
+                except Exception:
+                    continue
+        return None
+
     async def _execute_web_artifact(self, written: list):
         """Headless-load the entry page for web files written this turn.
 
@@ -3018,21 +3067,31 @@ class GhostAgent:
         browser = (getattr(self, "available_tools", None) or {}).get("browser")
         if browser is None:
             return None
-        from ..tools.file_system import project_scoped_sandbox
-        sbx = project_scoped_sandbox(self.context)[0]
-        page_rel = next(
-            (f for f in written if f.lower().endswith((".html", ".htm"))), None)
-        if page_rel is None:
-            for f in written:
-                cand = Path(f).parent / "index.html"
-                if (Path(sbx) / cand).exists():
-                    page_rel = str(cand)
-                    break
-        if page_rel is None or not (Path(sbx) / page_rel).exists():
+        from ..tools.file_system import project_scoped_sandbox, _to_container_path
+        sbx = Path(project_scoped_sandbox(self.context)[0])
+        # The bind mount sits at the sandbox ROOT even when file ops are
+        # scoped to <root>/projects/<id>; un-scope so we can find (and build a
+        # container URL for) files written under either layout.
+        root = sbx.parent.parent if sbx.parent.name == "projects" else sbx
+        candidates = [f for f in written if f.lower().endswith((".html", ".htm"))]
+        if not candidates:
+            candidates = [str(Path(f).parent / "index.html") for f in written]
+        host = self._locate_entry_page(candidates, sbx, root)
+        if host is None:
             return None
+        try:
+            page_rel = host.resolve().relative_to(root.resolve()).as_posix()
+        except Exception:
+            page_rel = host.name
+        # ABSOLUTE container URL (triple-slash). A relative `file://index.html`
+        # is parsed as a HOST with an empty path and never loads — that was the
+        # WEB-EXEC reliability bug: the probe "skipped" on every build because
+        # the URL pointed nowhere, so a page that throws on load still got a
+        # text-only CONFIRMED.
+        url = "file://" + _to_container_path(sbx, host)
         res = await browser(
             operation="navigate",
-            url=f"file://{page_rel}",
+            url=url,
             wait_until="domcontentloaded",
         )
         text = str(res)

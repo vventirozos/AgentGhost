@@ -195,6 +195,20 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
             if clean_name.lower() == _pl:
                 clean_name = ""
                 break
+        # Generic guard: any OTHER ``projects/<slug>/`` prefix is the model
+        # guessing a project path by name/title rather than the active id —
+        # e.g. it wrote ``projects/DeskMiniX3/index.html`` (title-derived) the
+        # same turn it created the project. Left literal, that spawns an orphan
+        # ``projects/<title>/`` tree no project record owns: the file, the
+        # store's workspace_dir, and the cleanup sweep then key on three
+        # different ids (observed live — the deliverable survived only because
+        # the sweep looked at the canonical id's empty dir). Collapse it into
+        # the active project's dir so they all agree. (Trade-off: a literal
+        # ``projects/`` SUBDIR inside a project workspace is not addressable
+        # this way — acceptable; the model should not nest one.)
+        _m = re.match(r"(?i)projects/[^/]+/", clean_name)
+        if _m:
+            clean_name = clean_name[_m.end():]
 
     # 2. Resolve to absolute path inside the sandbox root
     target_path = (sandbox_dir / clean_name).resolve()
@@ -209,6 +223,32 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
             raise ValueError(f"Security Error: Path '{filename}' attempts to access outside sandbox.")
 
     return target_path
+
+
+# Sentinel keys the projects tool uses to bind the active project to the
+# conversation that activated it (kept in sync with tools/projects.py). Read
+# here so file scoping can recover the project when the process-global
+# ``current_project_id`` is transiently cleared by a concurrent conversation.
+_PROJECT_BIND_PID = "__current_project__"
+_PROJECT_BIND_CONV = "__current_project_conv__"
+
+
+def _conversation_bound_project(context) -> str:
+    """The project bound to THIS conversation (via the projects-tool scratchpad
+    sentinels), or "" if none / it belongs to another conversation. Used as a
+    fallback when ``current_project_id`` was cleared mid-request."""
+    sp = getattr(context, "scratchpad", None)
+    conv = getattr(context, "conversation_key", None)
+    if sp is None or not conv:
+        return ""
+    try:
+        bound_pid = sp.get(_PROJECT_BIND_PID)
+        bound_conv = sp.get(_PROJECT_BIND_CONV)
+    except Exception:
+        return ""
+    if isinstance(bound_pid, str) and bound_pid and bound_conv == conv:
+        return bound_pid.strip().lower()
+    return ""
 
 
 def project_scoped_sandbox(context, stateful: bool = False):
@@ -233,6 +273,14 @@ def project_scoped_sandbox(context, stateful: bool = False):
     base = Path(sb) if sb is not None else None
     pid = getattr(context, "current_project_id", None)
     pid = pid.strip().lower() if isinstance(pid, str) else ""
+    if not pid and not stateful:
+        # ``current_project_id`` is process-global and can be cleared MID-REQUEST
+        # by a concurrent conversation's reconcile (observed live: a 700s
+        # autoadvance+manual build had its scoping wiped, so the agent's file
+        # writes landed in the sandbox ROOT and it thrashed for minutes). The
+        # per-conversation binding is NOT stomped that way, so re-derive this
+        # conversation's project from it.
+        pid = _conversation_bound_project(context)
     if pid and not stateful and base is not None:
         sub = base / "projects" / pid
         try:
@@ -929,6 +977,103 @@ def _fixture_summary(content: str, ext: str) -> str:
 
 _SYNTAX_CHECK_TIMEOUT_S = 10.0
 
+# <script>…</script> blocks; group(1)=attributes, group(2)=body.
+_HTML_SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.IGNORECASE | re.DOTALL)
+# Inline script types we can syntax-check as classic JS. A `type=module`
+# (import/export, top-level await) or `text/babel` (JSX) block would trip
+# `node --check` with a FALSE positive, so we skip those rather than send
+# the model chasing a non-bug.
+_CHECKABLE_JS_TYPES = {"", "text/javascript", "application/javascript"}
+
+
+def _inline_js_blocks(html: str):
+    """Yield (start_line, source) for each inline, classic-JS <script> block.
+
+    start_line is the 1-based line in the HTML file where the block body
+    begins, so a parser error reported at body-line N maps back to the HTML
+    line the model actually has to edit. External (`src=`) and non-JS-typed
+    blocks are skipped.
+    """
+    blocks = []
+    for m in _HTML_SCRIPT_RE.finditer(html):
+        attrs = (m.group(1) or "").lower()
+        if "src=" in attrs:
+            continue
+        tm = re.search(r'type\s*=\s*["\']?([^"\'\s>]+)', attrs)
+        if tm and tm.group(1) not in _CHECKABLE_JS_TYPES:
+            continue
+        body = m.group(2)
+        if not body.strip():
+            continue
+        start_line = html.count("\n", 0, m.start(2)) + 1
+        blocks.append((start_line, body))
+    return blocks
+
+
+async def _node_check_source(source: str) -> str:
+    """`node --check` a JS source string. Returns node's raw diagnostic
+    (stderr) when it does NOT parse, else "" (also "" when node is absent)."""
+    import shutil
+    import tempfile
+    node = shutil.which("node")
+    if not node:
+        return ""
+    tmp = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8")
+    try:
+        tmp.write(source)
+        tmp.close()
+        proc = await asyncio.create_subprocess_exec(
+            node, "--check", tmp.name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr_b = await asyncio.wait_for(
+                proc.communicate(), timeout=_SYNTAX_CHECK_TIMEOUT_S
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            return ""
+        if proc.returncode == 0:
+            return ""
+        return (stderr_b or b"").decode("utf-8", "replace")
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+def _remap_node_diag(diag: str, start_line: int) -> str:
+    """Turn node's temp-file diagnostic into an HTML-line-anchored message.
+
+    node prints `<tmp>:<lineno>`, the offending source line, a caret, then
+    `SyntaxError: …`. We recover the line, add the block's HTML offset, and
+    keep the source line + message — dropping the module-loader stack noise.
+    """
+    lines = diag.splitlines()
+    nonempty = [ln for ln in lines if ln.strip()]
+    node_line = None
+    if nonempty:
+        m = re.search(r":(\d+)\s*$", nonempty[0])
+        if m:
+            node_line = int(m.group(1))
+    msg = ""
+    for ln in lines:
+        s = ln.strip()
+        if re.match(r"^[\w.]*Error:", s):
+            msg = s
+            break
+    src_line = ""
+    for i, ln in enumerate(lines):
+        if ln.strip() and set(ln.strip()) <= {"^", "~"} and i > 0:
+            src_line = lines[i - 1].strip()
+            break
+    if node_line is not None:
+        head = f"line {start_line + node_line - 1}: {msg or 'SyntaxError'}"
+    else:
+        head = msg or (nonempty[0][:200] if nonempty else "syntax error")
+    return head + (f"\n    {src_line[:160]}" if src_line else "")
+
 
 async def _syntax_feedback(path: Path, filename: str) -> str:
     """Best-effort post-write syntax check. Returns "" when clean or unknown.
@@ -981,6 +1126,17 @@ async def _syntax_feedback(path: Path, filename: str) -> str:
                 # the trailing module-loader noise.
                 lines = (stderr_b or b"").decode("utf-8", "replace").splitlines()
                 err = "\n".join(ln[:200] for ln in lines if ln.strip())[:800]
+        elif ext in ("html", "htm"):
+            # A single-file deliverable hides its JS in inline <script> blocks;
+            # check each so a typo there (e.g. `content='…'` written `content=`)
+            # is named with its HTML line instead of surfacing as a silent
+            # blank page the model can only find by re-reading the whole file.
+            html = await asyncio.to_thread(path.read_text)
+            for start_line, src in _inline_js_blocks(html):
+                diag = await _node_check_source(src)
+                if diag:
+                    err = _remap_node_diag(diag, start_line)
+                    break
     except Exception:
         return ""
     if not err:

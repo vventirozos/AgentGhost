@@ -350,10 +350,20 @@ async def _persist(context, project_id: str, topic: str, search_output: str, *,
     except Exception:
         logger.debug("research index upsert failed", exc_info=True)
     if task_id:
+        # A research brief is a real deliverable in a research/general project,
+        # but in a CODING project it is just working context — registering it
+        # as a `file` artifact made the end-of-project cleanup KEEP a pile of
+        # research/*.md as "deliverables" (observed live). Still written and
+        # indexed (surfaced in the briefing); just not a kept deliverable here.
         try:
-            store.add_artifact(task_id, "file", rel)
+            _kind = (store.get_project(project_id) or {}).get("kind", "")
         except Exception:
-            logger.debug("research artifact add skipped", exc_info=True)
+            _kind = ""
+        if str(_kind).upper() != "CODING":
+            try:
+                store.add_artifact(task_id, "file", rel)
+            except Exception:
+                logger.debug("research artifact add skipped", exc_info=True)
     try:
         store.log_event(project_id, task_id, "research_added",
                         {"topic": topic, "path": rel,

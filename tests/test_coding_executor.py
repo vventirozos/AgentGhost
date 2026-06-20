@@ -181,8 +181,9 @@ async def test_advance_once_uses_coding_executor_and_registers_files(store):
         SimpleNamespace(project_store=store, llm_client=None),
         pid,
         tool_runner=runner,
-        coding_executor=lambda ctx, d, *, tool_runner, ledger: build_coding_task(
-            _ctx(FakeLLM(SPEC_OK)), d, tool_runner=tool_runner, ledger=ledger),
+        coding_executor=lambda ctx, d, **kw: build_coding_task(
+            _ctx(FakeLLM(SPEC_OK)), d, tool_runner=kw["tool_runner"],
+            ledger=kw.get("ledger", ""), existing_files=kw.get("existing_files")),
     )
     assert res.classification == "coding"
     assert store.get_task(tid)["status"] == "DONE"
@@ -202,8 +203,9 @@ async def test_advance_once_failed_build_marks_failed(store):
     res = await advance_once(
         SimpleNamespace(project_store=store, llm_client=None),
         pid, tool_runner=runner,
-        coding_executor=lambda ctx, d, *, tool_runner, ledger: build_coding_task(
-            _ctx(FakeLLM(SPEC_OK)), d, tool_runner=tool_runner, ledger=ledger),
+        coding_executor=lambda ctx, d, **kw: build_coding_task(
+            _ctx(FakeLLM(SPEC_OK)), d, tool_runner=kw["tool_runner"],
+            ledger=kw.get("ledger", ""), existing_files=kw.get("existing_files")),
     )
     assert store.get_task(tid)["status"] == "FAILED"
     assert "failed" in res.summary.lower()

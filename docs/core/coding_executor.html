@@ -39,20 +39,49 @@
   is bounded by design — the task tree already decomposes the work, so this just
   builds ONE leaf well:</p>
   <ol>
-    <li><strong>Spec</strong> — one LLM call returns a JSON object: <code>files</code> (each a <code>path</code> + FULL <code>content</code>), an optional <code>verify</code> shell command, a one-line <code>summary</code>, and a one-line <code>ledger</code> fact. The project's <a href="prompts.html">design ledger</a> is fed in so the build stays consistent with what already exists.</li>
+    <li><strong>Spec</strong> — one LLM call returns a JSON object: <code>files</code> (each a <code>path</code> + FULL <code>content</code>), an optional <code>verify</code> shell command, a one-line <code>summary</code>, and a one-line <code>ledger</code> fact. The project's <a href="prompts.html">design ledger</a> AND its current files (<code>existing_files</code>, gathered by <code>project_advancer._gather_project_files</code>) are fed in, with an instruction to EXTEND those files rather than recreate them — so a single-file app accretes across tasks instead of each task overwriting the last.</li>
     <li><strong>Write</strong> — each file via the <code>file_system</code> tool (<code>operation="write"</code>), capped at <code>MAX_FILES</code> (8) / <code>MAX_CONTENT_CHARS</code> (60k) per file.</li>
     <li><strong>Verify</strong> — runs the <code>verify</code> command via <code>execute</code>; a failure (per <code>project_advancer._looks_like_failure</code>) fails the build.</li>
     <li>Returns a <code>CodingResult</code> (<code>ok</code>, <code>summary</code>, <code>files</code>, <code>ledger_note</code>, <code>detail</code>).</li>
   </ol>
 
+  <h2>Don't clobber prior work (2026-06-20)</h2>
+  <p>A later failure: on a single-file app each task REGENERATED the whole
+  file with <code>write</code> and OVERWROTE the previous task — three tasks
+  "completed" left a 2.7KB shell with neither the File Explorer nor the Snake
+  game, and frontend tasks (no shell <code>verify</code>) had no gate to catch
+  it. Three defences:</p>
+  <ul>
+    <li><strong>Non-regression guard</strong> — a full-content rewrite of an <em>existing</em> file is REFUSED if the new content is materially smaller (<code>&lt;85%</code>) or drops the file's existing structural identifiers (HTML ids, function/class names, CSS selectors). It must be a SUPERSET.</li>
+    <li><strong>Edit, don't clobber</strong> — a file entry may carry <code>edits</code> (<code>[{"find":…,"replace":…}]</code>, <code>{"after":…}</code>, or <code>{"before":"</body>",…}</code>) applied via <code>file_system operation="replace"</code>, so a feature is ADDED to an existing file without re-sending it. A non-matching edit fails the task.</li>
+    <li><strong>Append (the easy incremental primitive, 2026-06-20)</strong> — a file entry may carry <code>"append":"<only the new code>"</code>; the executor writes <code>old + new</code>. It's a strict superset (can never regress), and the model emits ONLY the new snippet. This was added because re-emitting a whole ~8KB file choked the small model on task 2 of a live single-file build — it returned an EMPTY spec twice and the task failed. With <code>append</code>/<code>edits</code> the model only produces the delta. Existing files are now shown to the model as compact head+tail EXCERPTS (not full content), and the prompt steers hard toward <code>append</code>/<code>edits</code> over full <code>content</code>.</li>
+  </ul>
+  <p><strong>No per-task render (correction).</strong> An earlier version
+  headless-rendered each HTML task and failed it on an uncaught JS exception.
+  That was <em>wrong for incremental builds</em>: no intermediate task produces
+  a complete working page — the shell exists before the apps, an app before the
+  next — so rendering each tick failed legitimate in-progress work. Observed
+  live: the Core-shell task built real files (a 799B <code>index.html</code> +
+  <code>script.js</code> + 7.7KB <code>style.css</code>), then a render of the
+  app-less shell "crashed" on a not-yet-defined reference, the retry returned an
+  empty spec, and a good task was marked FAILED. The render gate was removed;
+  the <strong>non-regression guard is the real protection</strong>, and a shell
+  <code>verify</code> still hard-gates runnable code. Whole-app rendering
+  belongs to a final verification task, not to every tick.</p>
+  <p><strong>Retry with feedback.</strong> A refused write or a failed verify
+  is regenerated ONCE with the exact failure reason fed back, then the task
+  fails. Single-file projects (detected from the goal in
+  <code>advance_once</code>) pass <code>single_file=True</code> to strengthen
+  the "grow the one file" steer.</p>
+
   <h2>Fail loud, not shallow</h2>
-  <p>If the spec is empty, a write is rejected, or verify fails, the build
-  returns <code>ok=False</code>. <code>advance_once._finalize_coding</code> then
-  marks the task FAILED, which <strong>stops the batch loop</strong> so the user
-  can take the hard task themselves as a full focused turn — the opposite of
-  silently marking it done. On success it registers the produced files as
-  deliverable artifacts (so <a href="workspace_cleanup.html">cleanup</a> keeps
-  them) and appends the ledger note.</p>
+  <p>If the spec is empty, a write is refused/rejected, or verify fails, the
+  build returns <code>ok=False</code>. <code>advance_once._finalize_coding</code>
+  then marks the task FAILED, which <strong>stops the batch loop</strong> so the
+  user can take the hard task themselves — the opposite of silently marking it
+  done. On success it registers the produced files as deliverable artifacts (so
+  <a href="workspace_cleanup.html">cleanup</a> keeps them) and appends the
+  ledger note. Covered by <code>tests/test_coding_executor_accretion.py</code>.</p>
 
   <h2>Wiring</h2>
   <p>Passed as <code>coding_executor=build_coding_task</code> into

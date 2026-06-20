@@ -7,6 +7,7 @@ out by clicking a dead button. When a turn WRITES web files, the entry
 page must be loaded headless and an uncaught exception must refute the
 answer regardless of how plausible the claim text is.
 """
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -87,6 +88,80 @@ async def test_js_only_edit_loads_sibling_index(tmp_path, monkeypatch):
     agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
     res = await agent._execute_web_artifact(["game.js"])
     assert res is not None and res[0] == "index.html"
+
+
+async def test_navigate_url_is_absolute_container_path(tmp_path, monkeypatch):
+    """Reliability bug: the probe built ``file://index.html`` (relative →
+    parsed as a host → never loads), so WEB-EXEC silently 'skipped' on every
+    build and a throwing page still got a text CONFIRMED. The URL must be an
+    absolute ``file:///workspace/...`` path."""
+    (tmp_path / "index.html").write_text("<html></html>")
+    agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
+    await agent._execute_web_artifact(["index.html"])
+    url = browser.call_args.kwargs["url"]
+    assert url.startswith("file:///workspace/"), url
+    assert url == "file:///workspace/index.html"
+
+
+async def test_navigate_url_scoped_project(tmp_path, monkeypatch):
+    """When the sandbox is project-scoped, the container URL must carry the
+    ``projects/<id>/`` segment (the mount is at the root, not the scope)."""
+    proj = tmp_path / "projects" / "abc123"
+    proj.mkdir(parents=True)
+    (proj / "index.html").write_text("<html></html>")
+    agent, browser = _bare_agent(proj, "SUCCESS: navigated", monkeypatch)
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox",
+        lambda ctx, stateful=False: (proj, "/workspace"),
+    )
+    res = await agent._execute_web_artifact(["index.html"])
+    assert res == ("projects/abc123/index.html", "")
+    assert browser.call_args.kwargs["url"] == \
+        "file:///workspace/projects/abc123/index.html"
+
+
+async def test_binding_gap_finds_deliverable_in_project_subdir(
+        tmp_path, monkeypatch):
+    """Live failure: a project-reuse turn left the deliverable in
+    ``projects/<id>/index.html`` while project_scoped_sandbox read as
+    UN-scoped (root). The old direct-path lookup missed it → 'skipped'. The
+    newest-wins basename fallback must still find and load it."""
+    (tmp_path / "projects" / "reuse99").mkdir(parents=True)
+    (tmp_path / "projects" / "reuse99" / "index.html").write_text("<html></html>")
+    # sandbox reads as the bare root (binding gap)
+    agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox",
+        lambda ctx, stateful=False: (tmp_path, "/workspace"),
+    )
+    res = await agent._execute_web_artifact(["index.html"])
+    assert res is not None and res[0] == "projects/reuse99/index.html"
+    assert browser.call_args.kwargs["url"] == \
+        "file:///workspace/projects/reuse99/index.html"
+
+
+async def test_stale_fallback_file_does_not_certify(tmp_path, monkeypatch):
+    """Live false-confirm: the turn's deliverable (projects/<new>/index.html)
+    never landed on disk, the basename fallback found a 25-min-old index.html
+    from an UNRELATED project, and WEB-EXEC reported it clean. A fallback
+    match older than the freshness window must be rejected → inconclusive."""
+    import os
+    old = tmp_path / "projects" / "old_proj"
+    old.mkdir(parents=True)
+    stale = old / "index.html"
+    stale.write_text("<html></html>")
+    # age it well past the freshness window
+    past = time.time() - 4000
+    os.utime(stale, (past, past))
+    agent, browser = _bare_agent(tmp_path, "SUCCESS: navigated", monkeypatch)
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox",
+        lambda ctx, stateful=False: (tmp_path, "/workspace"),
+    )
+    # the agent "wrote" a file in a project dir that isn't on disk
+    res = await agent._execute_web_artifact(["projects/new_proj/index.html"])
+    assert res is None
+    browser.assert_not_awaited()
 
 
 async def test_no_entry_page_is_inconclusive(tmp_path, monkeypatch):

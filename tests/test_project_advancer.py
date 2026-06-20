@@ -138,10 +138,11 @@ async def test_advance_coding_task_with_generator_runs_execute(context, store):
     assert "print('login flow')" in seen["args"]["command"]
 
 
-async def test_advance_coding_task_without_generator_degrades_to_research(context, store):
-    """Without a code_generator there is no code to run, so a coding task
-    now RESEARCHES the task (web_search) instead of executing an inert
-    comment that marked it DONE having done nothing."""
+async def test_advance_coding_task_without_build_path_fails(context, store):
+    """Without a coding_executor OR a code_generator there is no way to build
+    a coding task. It now FAILS (stopping the batch loop) — it must NOT be
+    web-searched and marked DONE, which is theatrical completion (observed
+    live: app/game tasks web-searched and reported done with no code)."""
     pid = store.create_project("P", kind="CODING")
     tid = store.add_task(pid, "Implement the login flow")
 
@@ -149,13 +150,13 @@ async def test_advance_coding_task_without_generator_degrades_to_research(contex
 
     async def runner(name, args):
         seen["name"] = name
-        seen["args"] = args
         return "ok"
 
     r = await advance_once(context, pid, tool_runner=runner)
     assert r.classification == "coding"
-    assert seen["name"] == "web_search"
-    assert store.get_task(tid)["actual_tool_used"] == "web_search"
+    assert store.get_task(tid)["status"] == "FAILED"
+    # it never reached for a web_search to fake progress
+    assert seen.get("name") != "web_search"
 
 
 async def test_advance_needs_user_marks_task(context, store):

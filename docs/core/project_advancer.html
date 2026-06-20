@@ -66,13 +66,19 @@
   marked DONE having written nothing (observed live: "create hello.txt" ran a
   <code>web_search</code>). The single-command <code>default_code_generator</code>
   remains only as a fallback when the executor is unavailable/crashes.</p>
-  <p><strong>Classification.</strong> File/build leaves now route to the
-  executor: <code>classify_task</code> recognises file-extension tokens
-  (<code>.py</code>, <code>.html</code>, <code>.txt</code>, …) and build phrases
-  ("create a file", "build the … module"), and a <strong>CODING</strong>-kind
-  project passes <code>default="coding"</code> so an unlabelled leaf builds
-  rather than being web-searched. Covered by
-  <code>tests/test_advance_pacing.py</code> and
+  <p><strong>Classification (hardened 2026-06-20 after a live failure).</strong>
+  In a batch over a browser-OS project, 9 of 10 build leaves ("File Explorer
+  app", "Snake game") were classified as <em>research</em> and web-searched,
+  marked DONE with no code — the small LLM classifier reliably mislabels build
+  work as research. Fixes:</p>
+  <ul>
+    <li><strong>CODING projects bypass the LLM classifier</strong> entirely and use the deterministic keyword classifier with <code>default="coding"</code> — a leaf is coding work unless it carries an explicit research/needs_user verb. Only GENERAL projects consult the LLM.</li>
+    <li><strong>Kind is inferred at create time</strong> (<code>tools.projects._infer_kind</code>): a build-flavoured title/goal (build / app / website / game / OS / single-file / …) creates a <strong>CODING</strong> project, so its leaves are treated as coding instead of defaulting to research.</li>
+    <li><strong>No theatrical research.</strong> A coding leaf with no build path (no executor handled it, no command generated) now <strong>FAILS</strong> (stopping the batch loop) instead of being web-searched and marked DONE. And research briefs are no longer registered as deliverables in CODING projects (they were polluting cleanup's "kept deliverables").</li>
+    <li><strong>Cumulative builds.</strong> <code>_gather_project_files</code> feeds the project's current workspace into the executor (<code>existing_files</code>) so a leaf EXTENDS prior files (single-file apps) instead of regenerating and overwriting them.</li>
+  </ul>
+  <p>Covered by <code>tests/test_advance_classification_fixes.py</code>,
+  <code>tests/test_advance_pacing.py</code>, and
   <code>tests/test_coding_executor.py</code>.</p>
 
   <h2>Classification keywords</h2>

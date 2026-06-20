@@ -24,13 +24,68 @@ verify both paths.
 """
 
 import logging
+import os
 import re
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 logger = logging.getLogger("GhostAgent")
+
+
+def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000,
+                          per_file_chars: int = 200_000,
+                          max_files: int = 12) -> Dict[str, str]:
+    """Read the existing text files in a project's workspace so the coding
+    executor can EXTEND them (cumulative / single-file builds) instead of
+    regenerating from scratch and overwriting prior tasks' work.
+
+    The returned content feeds the executor's NON-REGRESSION GUARD (which
+    refuses a write that shrinks/drops an existing file) — so it must reflect
+    the file's real size. Earlier a tight 20 KB budget recorded a grown
+    index.html as an EMPTY name-only marker; the guard then read it as a
+    *new* file and let every later task CLOBBER it (observed live: apps were
+    overwritten and lost). Budget is now generous and a file is NEVER stored
+    as empty — at worst a large prefix, so the guard always sees it exists.
+    The prompt itself only shows a head+tail excerpt, so it stays small.
+    Never raises — returns {} on any problem.
+    """
+    root = getattr(store, "sandbox_root", None)
+    pid = str(project_id or "").strip().lower()
+    if not root or not pid:
+        return {}
+    base = Path(root) / "projects" / pid
+    if not base.is_dir():
+        return {}
+    out: Dict[str, str] = {}
+    total = 0
+    try:
+        for dirpath, _dirs, files in os.walk(base):
+            for fn in sorted(files):
+                rel = (Path(dirpath) / fn).relative_to(base).as_posix()
+                if rel.startswith("research/") or rel.split("/")[-1].startswith("."):
+                    continue
+                p = Path(dirpath) / fn
+                try:
+                    content = p.read_text(errors="replace")
+                except OSError:
+                    continue
+                if len(content) > per_file_chars:
+                    content = content[:per_file_chars]
+                remaining = budget_chars - total
+                if remaining < len(content):
+                    # Budget nearly spent — keep a substantial prefix (NEVER
+                    # empty) so the guard still knows the file is non-trivial.
+                    content = content[:max(4000, remaining)]
+                out[rel] = content
+                total += len(content)
+                if len(out) >= max_files:
+                    return out
+    except OSError:
+        return out
+    return out
 
 
 DEFAULT_STEPS_CAP = 50
@@ -319,10 +374,16 @@ async def advance_once(
     # the entire trigger→replan pipeline was inert.)
     _metacog_set_task(context, nxt.id)
 
-    # A CODING-kind project biases an unlabelled leaf toward coding (so a
-    # build task that hits no keyword reaches the executor, not web_search).
-    _default_bucket = "coding" if (proj.get("kind") == "CODING") else "research"
-    if llm_classifier is None:
+    # Classification. In a CODING project, TRUST the deterministic keyword
+    # classifier (default=coding) and SKIP the LLM — the small model reliably
+    # mislabels a build leaf like "File Explorer app" / "Snake game" as
+    # research, which silently turned 9/10 tasks into web_searches + a
+    # theatrical DONE (observed live). A leaf in a coding project is coding
+    # work unless it carries an explicit research or needs_user verb. Only a
+    # GENERAL project consults the LLM classifier.
+    _proj_kind = (proj.get("kind") or "GENERAL").upper()
+    _default_bucket = "coding" if _proj_kind == "CODING" else "research"
+    if _proj_kind == "CODING" or llm_classifier is None:
         classification = classify_task(nxt.description, default=_default_bucket)
     else:
         try:
@@ -340,6 +401,21 @@ async def advance_once(
         return AdvanceResult(True, nxt.id, "needs_user",
                              "task requires human input")
 
+    # Human-gate postconditions force NEEDS_USER BEFORE any execution: a gated
+    # task (e.g. "Deploy ... [HUMAN_GATE: cto approval]") must never auto-run,
+    # and must not be FAILED for lacking a build path either — it just needs a
+    # human. Checked here so it precedes the coding build / no-build FAIL.
+    from .project_safety import enforce_human_gate
+    _gate_reason = enforce_human_gate(store.get_task(nxt.id) or {})
+    if _gate_reason:
+        plan.update_status(nxt.id, TaskStatus.NEEDS_USER,
+                           result=f"human gate: {_gate_reason}")
+        store.log_event(project_id, nxt.id, "human_gate_triggered",
+                        {"reason": _gate_reason})
+        _increment_budget(store, project_id)
+        return AdvanceResult(True, nxt.id, "needs_user",
+                             f"human gate: {_gate_reason}")
+
     # STRONG coding path: when a coding_executor is wired, BUILD the leaf for
     # real (write files + verify) and finalize from its structured result —
     # the antidote to single-command theatrical completion. Falls through to
@@ -349,10 +425,19 @@ async def advance_once(
             ledger = store.get_ledger(project_id)
         except Exception:
             ledger = ""
+        # Single-file project? The leaf must GROW the one file, not overwrite
+        # it (observed live: each task regenerated index.html, clobbering the
+        # last). Detect from the goal so the executor steers + guards for it.
+        _goal = (proj.get("goal") or "").lower()
+        _single_file = any(s in _goal for s in (
+            "single-file", "single file", "one file", "one html",
+            "one index.html", "in one html", "single html"))
         cres = None
         try:
             cres = await coding_executor(
-                context, nxt.description, tool_runner=tool_runner, ledger=ledger)
+                context, nxt.description, tool_runner=tool_runner, ledger=ledger,
+                existing_files=_gather_project_files(store, project_id),
+                single_file=_single_file)
         except Exception as e:
             logger.warning("coding_executor crashed: %s", e)
         if cres is not None:
@@ -375,13 +460,20 @@ async def advance_once(
         if generated:
             tool_args = {"command": generated}
         else:
-            # No generator wired (or it produced nothing usable): research
-            # the task to gather context rather than executing an inert
-            # comment. The previous behaviour ran a shell COMMENT
-            # ("# Autoadvance stub for: …") which marked the task DONE
-            # having executed nothing — that is now fixed.
-            tool_name = "web_search"
-            tool_args = {"query": nxt.description[:200]}
+            # No way to BUILD this coding leaf (no executor handled it and no
+            # command was generated). Do NOT web_search a build task and mark
+            # it DONE — that is theatrical completion (observed live: app/game
+            # tasks web-searched and reported "done" with no code). FAIL it so
+            # the batch loop stops and the user can take it directly.
+            plan.update_status(
+                nxt.id, TaskStatus.FAILED,
+                failure_reason="coding task has no build path "
+                               "(no executor/generator produced code)")
+            store.log_event(project_id, nxt.id, "autoadvance_failed",
+                            {"reason": "no build path for coding task"})
+            _increment_budget(store, project_id)
+            return AdvanceResult(True, nxt.id, "coding",
+                                 "coding task could not be built")
     else:
         tool_name = "web_search"
         tool_args = {"query": nxt.description[:200]}
@@ -658,29 +750,44 @@ async def advance_many(
     code_generator: Optional[Callable[[str], Awaitable[str]]] = None,
     coding_executor: Optional[Callable[..., Awaitable[Any]]] = None,
     stop_on_fail: bool = True,
+    max_consecutive_fails: int = 3,
     hard_cap: int = ADVANCE_ALL_HARD_CAP,
 ) -> AdvanceManyResult:
     """Advance up to ``max_tasks`` tasks (``None`` == "all") as a BOUNDED
     loop of advance_once ticks, checkpointing to the store between each.
 
-    Stops at the FIRST of: count reached · project done (no ready leaf) ·
-    a human-gate / NEEDS_USER task · budget exhausted · a task FAILED (when
-    ``stop_on_fail``) · the hard iteration cap. Each tick claims one leaf,
-    runs one constrained step, and persists status+result, so per-tick
-    context stays bounded however many tasks run. Returns what advanced and
-    why it stopped — the caller reports that and waits for the next
-    direction.
+    Failure handling:
+      * ``stop_on_fail=True`` (default, safe): the FIRST failed task stops the
+        loop — don't keep building on a broken foundation.
+      * ``stop_on_fail=False`` (the autoadvance batch): SKIP a failed task and
+        continue with the rest (the apps in a project are usually independent,
+        so one flaky task shouldn't halt the whole batch at task 4 of 11 —
+        observed live). A circuit breaker still stops after
+        ``max_consecutive_fails`` failures in a row, which signals a systemic
+        problem (e.g. a broken shell every app builds on). Every failure is
+        recorded and reported.
+
+    Also stops at: count reached · project done (no ready leaf) · a human gate ·
+    budget exhausted · the hard iteration cap. Returns what advanced and why.
     """
     store = getattr(context, "project_store", None)
     advanced: list = []
     if store is None:
         return AdvanceManyResult(advanced, "no_store", max_tasks)
 
+    def _final_reason(default: str) -> str:
+        """When the loop ends naturally, report completion-with-failures
+        distinctly from a clean completion."""
+        if any(a.get("status") == "FAILED" for a in advanced):
+            return "completed_with_failures"
+        return default
+
     # Iteration ceiling: the smaller of the requested count and the hard
     # cap; "all" (None) runs to the hard cap (budget/stop-conditions end it
     # first in practice).
     limit = hard_cap if max_tasks is None else max(1, min(int(max_tasks), hard_cap))
     stop_reason = "count_reached"
+    consecutive_fails = 0
 
     for _ in range(limit):
         res = await advance_once(
@@ -692,15 +799,20 @@ async def advance_many(
         )
         cls = (res.classification or "").lower()
         if cls == "idle":
-            stop_reason = "project_done"
+            # No ready leaf — all tasks terminal, or the rest are blocked by a
+            # failed dependency. Either way the batch is done advancing.
+            stop_reason = _final_reason("project_done")
             break
         if cls == "blocked":
-            # "blocked" covers both budget exhaustion and a non-ACTIVE
-            # project — and a project that JUST rolled to DONE because its
-            # last task completed. Distinguish so we report completion as
-            # completion, not as a budget stall.
+            # budget exhaustion, a non-ACTIVE project, or a project that just
+            # rolled up (DONE if all done; FAILED if any task failed).
             pstatus = (store.get_project(project_id) or {}).get("status")
-            stop_reason = "project_done" if pstatus == "DONE" else "budget_or_inactive"
+            if pstatus == "DONE":
+                stop_reason = "project_done"
+            elif pstatus == "FAILED":
+                stop_reason = _final_reason("project_done")
+            else:
+                stop_reason = "budget_or_inactive"
             break
         # The tick targeted a task — record it with its persisted status.
         status = None
@@ -715,11 +827,20 @@ async def advance_many(
         if cls == "needs_user" or status == "NEEDS_USER":
             stop_reason = "needs_user"
             break
-        if status == "FAILED" and stop_on_fail:
-            stop_reason = "failed"
-            break
+        if status == "FAILED":
+            consecutive_fails += 1
+            if stop_on_fail:
+                stop_reason = "failed"
+                break
+            if consecutive_fails >= max_consecutive_fails:
+                stop_reason = "repeated_failures"
+                break
+            # else: skip this failed task and continue with the rest
+        else:
+            consecutive_fails = 0
     else:
-        stop_reason = "hard_cap" if max_tasks is None else "count_reached"
+        stop_reason = _final_reason(
+            "hard_cap" if max_tasks is None else "count_reached")
 
     return AdvanceManyResult(advanced, stop_reason, max_tasks)
 
