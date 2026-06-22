@@ -14,7 +14,7 @@ from ghost_agent.memory.projects import ProjectStore
 from ghost_agent.memory.scratchpad import Scratchpad
 from ghost_agent.core.project_advancer import (
     advance_once, classify_task, project_dream_pass,
-    AdvanceResult, DEFAULT_STEPS_CAP,
+    AdvanceResult, DEFAULT_STEPS_CAP, _looks_like_failure,
 )
 from ghost_agent.core.planning import ProjectPlan, TaskStatus
 from ghost_agent.tools.projects import tool_manage_projects
@@ -56,6 +56,48 @@ def test_classify_task_buckets(desc, expected):
 
 def test_classify_needs_user_wins_over_coding():
     assert classify_task("Implement and approve the change") == "needs_user"
+
+
+@pytest.mark.parametrize("desc", [
+    # the exact live failure: a research verb hijacked a build leaf to web_search
+    "results analysis: analyze training logs (analyze_results.py) — produce "
+    "metrics summary, loss curves saved as results/report.md",
+    "Summarize findings and write summary.md",
+    "Review the data then generate report.json",
+])
+def test_classify_strong_code_file_beats_research_verb(desc):
+    # An explicit filename to PRODUCE + a build verb must route to coding even
+    # when a research verb appears in the same sentence.
+    assert classify_task(desc) == "coding"
+
+
+def test_classify_needs_user_still_wins_over_strong_code_file():
+    # A human gate outranks the strong-coding signal.
+    assert classify_task("Publish report.md to the site") == "needs_user"
+
+
+def test_classify_research_about_a_file_without_build_verb_stays_research():
+    # No build verb → mentioning a file is not enough to force coding.
+    assert classify_task("Investigate what config.yaml controls") == "research"
+
+
+# --------------------------------------------------------------- failure detect
+
+@pytest.mark.parametrize("out,expected", [
+    # stringified exception tuple (the live web_search failure that slipped
+    # through and let a task be marked DONE on an erroring search)
+    ("('error sending request for url (https://yandex.com/...)', '...')", True),
+    ('["error sending request for url ...", "..."]', True),
+    ("ERROR: something broke", True),
+    ("Traceback (most recent call last):", True),
+    ("", True),
+    (None, True),
+    # legitimate results that merely mention the word error must NOT trip it
+    ("Search results: how to fix an error in Python", False),
+    ("The report describes error handling best practices.", False),
+])
+def test_looks_like_failure(out, expected):
+    assert _looks_like_failure(out) is expected
 
 
 # --------------------------------------------------------------------- advance_once basics

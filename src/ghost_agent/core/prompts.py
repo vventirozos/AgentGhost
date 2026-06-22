@@ -8,7 +8,8 @@ _LEDGER_BRIEFING_LINES = 20
 
 def build_project_briefing(store, project_id: str, max_events: int = 3,
                            max_open_tasks: int = 8,
-                           max_done_tasks: int = 5) -> str:
+                           max_done_tasks: int = 5,
+                           suppress_next_task: bool = False) -> str:
     """Render a compact project-scope briefing for the system prompt.
 
     The briefing is appended to DYNAMIC SYSTEM STATE when a project is
@@ -122,7 +123,17 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         plan = None
     if plan is not None:
         nxt = plan.next_ready_leaf()
-        if nxt:
+        if nxt and suppress_next_task:
+            # A task was already closed this request. Re-advertising the NEXT
+            # TASK here pulls the model into grinding the whole tree on a single
+            # "start task 1" / "proceed" (observed live). Replace the pointer
+            # with a hard stop so the turn wraps up and waits for the user.
+            lines.append(
+                "*** You already completed a task this turn. STOP now: "
+                "summarize what you did and WAIT for the user's next "
+                "go-ahead. Do NOT start the next task — there IS a next task "
+                "but it is the USER's call to begin it. ***")
+        elif nxt:
             lines.append(f"NEXT TASK: [{nxt.id}] {nxt.description}")
         open_statuses = {
             TaskStatus.PENDING, TaskStatus.READY, TaskStatus.IN_PROGRESS,

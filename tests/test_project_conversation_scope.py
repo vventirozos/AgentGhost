@@ -150,6 +150,78 @@ async def test_empty_conversation_key_owns_nothing(context):
     assert context.scratchpad.get("__current_project__") == pid
 
 
+# --------------------------------- explicit user reference overrides mismatch
+
+async def test_user_reference_keeps_foreign_project_active(context):
+    # The chat API ships no stable conversation id, so later turns of the same
+    # human session can fingerprint as a "foreign" conversation. When the user
+    # explicitly names the project, honour that over the mismatch instead of
+    # parking it and looping (observed live: request D7).
+    reconcile_conversation(context, CONV_A)
+    pid = await _create(context, title="PetAI")
+    context.last_user_content = "proceed with task 3 of the PetAI project"
+    reconcile_conversation(context, CONV_B)
+    assert context.current_project_id == pid
+
+
+async def test_user_reference_activates_even_when_none_active(context):
+    reconcile_conversation(context, CONV_A)
+    pid = await _create(context, title="PetAI")
+    context.last_user_content = ""
+    reconcile_conversation(context, CONV_B)          # parked (no reference)
+    assert context.current_project_id is None
+    context.last_user_content = "show me the PetAI project status"
+    reconcile_conversation(context, CONV_B)          # named → re-activated
+    assert context.current_project_id == pid
+
+
+async def test_reference_by_project_id_also_activates(context):
+    reconcile_conversation(context, CONV_A)
+    pid = await _create(context, title="Memory Garden")
+    context.last_user_content = f"advance project {pid}"
+    reconcile_conversation(context, CONV_B)
+    assert context.current_project_id == pid
+
+
+async def test_unrelated_message_still_deactivates_foreign_project(context):
+    reconcile_conversation(context, CONV_A)
+    await _create(context, title="PetAI")
+    context.last_user_content = "what's the weather like today"
+    reconcile_conversation(context, CONV_B)
+    assert context.current_project_id is None
+
+
+async def test_reference_rebinds_so_scoping_survives_midrequest_clear(context, tmp_path):
+    # The bug: a report PDF / file write landed at the SANDBOX ROOT because the
+    # project deactivated (fingerprint mismatch) and current_project_id got
+    # cleared mid-request, so project_scoped_sandbox fell back to root. The
+    # escape-hatch reactivation now RE-BINDS the conversation, so the
+    # _conversation_bound_project fallback keeps scoping to projects/<id>/.
+    from ghost_agent.tools.file_system import (
+        _conversation_bound_project, project_scoped_sandbox,
+    )
+    context.sandbox_dir = tmp_path / "sb"
+    context.workspace_model = None
+
+    reconcile_conversation(context, CONV_A)
+    pid = await _create(context, title="PetAI")
+
+    # A foreign-fingerprint request that REFERENCES the project (e.g. in its
+    # injected Context preamble) reactivates + re-binds it.
+    context.last_user_content = "Context: status of PetAI — now generate the report"
+    reconcile_conversation(context, CONV_B)
+    assert context.current_project_id == pid
+
+    # Simulate a mid-request clear of the process-global pointer.
+    context.current_project_id = None
+    # The binding now belongs to THIS conversation, so the fallback resolves it
+    # and scoping stays under projects/<id>/, NOT the bare sandbox root.
+    assert _conversation_bound_project(context) == pid
+    host, _ = project_scoped_sandbox(context)
+    assert host == context.sandbox_dir / "projects" / pid
+    assert host != context.sandbox_dir            # not the root
+
+
 async def test_exit_clears_both_sentinels(context):
     reconcile_conversation(context, CONV_A)
     await _create(context)

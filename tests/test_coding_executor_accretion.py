@@ -31,7 +31,7 @@ class FakeLLM:
         self.contents = list(contents)
         self.prompts = []
 
-    async def chat_completion(self, payload):
+    async def chat_completion(self, payload, is_background=False, **_kw):
         self.prompts.append(payload["messages"][-1]["content"])
         c = self.contents.pop(0) if len(self.contents) > 1 else self.contents[0]
         return {"choices": [{"message": {"content": c}}]}
@@ -289,6 +289,31 @@ def test_isolate_scripts_leaves_src_and_already_wrapped_alone():
     assert _isolate_scripts(wrapped) == wrapped
 
 
+def test_isolate_scripts_preserves_function_used_by_inline_handler():
+    # A strong model wires onclick="startGame()" to a top-level function; IIFE-
+    # wrapping would scope it away and silently break the button. Leave it.
+    frag = ('<button onclick="startGame()">Play</button>'
+            "<script>function startGame(){return 1}</script>")
+    out = _isolate_scripts(frag)
+    assert "(function(){" not in out          # NOT wrapped
+    assert "function startGame" in out
+
+
+def test_isolate_scripts_preserves_window_exposed_global():
+    # An intentional global export must survive — wrapping it hides it.
+    frag = "<script>window.openSnake = function(){};</script>"
+    out = _isolate_scripts(frag)
+    assert "(function(){" not in out          # NOT wrapped
+    assert "window.openSnake" in out
+
+
+def test_isolate_scripts_still_wraps_self_contained_block():
+    # No handler reference, no global export → still isolated (collision guard).
+    frag = "<script>function helper(){return 2}; helper();</script>"
+    out = _isolate_scripts(frag)
+    assert "(function(){" in out and "})();" in out
+
+
 @pytest.mark.asyncio
 async def test_append_to_html_isolates_so_globals_dont_collide():
     # two apps both define `function initGame` — after append, each is inside
@@ -322,7 +347,7 @@ async def test_single_file_flag_reaches_prompt():
     cap = {}
 
     class LLM:
-        async def chat_completion(self, payload):
+        async def chat_completion(self, payload, is_background=False, **_kw):
             cap["u"] = payload["messages"][-1]["content"]
             return {"choices": [{"message": {"content": "{}"}}]}
 

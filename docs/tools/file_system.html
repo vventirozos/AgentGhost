@@ -115,6 +115,20 @@
   concurrent conversation does <em>not</em> stomp; it only clears the global).
   A binding owned by another conversation is ignored, and stateful kernel
   sessions never scope. Covered by <code>tests/test_project_scope_fallback.py</code>.</p>
+  <p><strong>Re-bind on referenced reactivation (2026-06-22).</strong> The above
+  fallback only works when the binding's conversation matches THIS request's —
+  but the chat API ships no stable conversation id, so a project keeps
+  deactivating across requests and the fallback would still miss, dropping a
+  <code>report_pdf</code> / file write to the bare sandbox ROOT instead of
+  <code>projects/&lt;id&gt;/</code> (observed live: a report PDF and stray project
+  directories at the sandbox root). Now when
+  <a href="projects.html"><code>reconcile_conversation</code></a> reactivates a
+  project because the request <em>references</em> it (title/id in the message or
+  its Context preamble), it also <strong>re-binds the conversation</strong> to
+  this request's key — so the <code>_conversation_bound_project</code> fallback
+  resolves it for the rest of the request even if <code>current_project_id</code>
+  is cleared mid-request. Covered by
+  <code>tests/test_project_conversation_scope.py</code>.</p>
 
   <h2>Post-write syntax check (2026-06-11)</h2>
   <p>Every successful write path — <code>tool_write_file</code> plus all content-landing branches of <code>tool_replace_text</code> (aider blocks, exact, flexible, fuzzy, anchor, and the replace→write auto-promote) — now runs <code>_syntax_feedback(path, filename)</code> on the result and <em>appends</em> any failure to the SUCCESS message:</p>

@@ -281,10 +281,16 @@ class DockerSandbox:
         #                runtime that browsers were broken, re-installed
         #                Chromium (still without deps), re-ran, still
         #                failed, burned ~100 s.
-        #   v2 (now):    .supercharged.v2 — ensures `--with-deps` ran.
+        #   v2:          .supercharged.v2 — ensures `--with-deps` ran.
         #                Images without the v2 marker are treated as
         #                un-provisioned and go through a full install.
-        marker_path = "/root/.supercharged.v2"
+        #   v3 (now):    .supercharged.v3 — preinstalls the CPU PyTorch
+        #                wheel. Without it, every "train a model" project
+        #                hit `ModuleNotFoundError: torch` and ran a ~300 s
+        #                `pip install torch` mid-task (observed live: the
+        #                PetAI training task), often tripping the execute
+        #                timeout. v2 images re-provision to pick torch up.
+        marker_path = "/root/.supercharged.v3"
 
         marker_ok = (self.container.exec_run(f"test -f {marker_path}")[0] == 0)
         chromium_ok = self._chromium_binary_present()
@@ -329,6 +335,30 @@ class DockerSandbox:
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"Python package installation failed: {err_msg}")
+
+            # PyTorch — CPU wheel only (the default GPU wheels pull ~2 GB of
+            # CUDA the sandbox can't use). Preinstalled so "build/train a model"
+            # projects don't `pip install torch` mid-task and trip the execute
+            # timeout (observed live: PetAI's training task hit
+            # ModuleNotFoundError: torch, then a 300 s install). Best-effort and
+            # NON-fatal: a machine that can't reach the torch CDN should still
+            # get a working sandbox (the agent falls back to a runtime install),
+            # so a torch flake must not poison provisioning of everything else.
+            pretty_log("Sandbox PyTorch", "Installing CPU PyTorch (~1m)…", icon=Icons.SANDBOX_BOX)
+            torch_code, torch_out = self.container.exec_run(
+                "pip install --no-cache-dir torch "
+                "--index-url https://download.pytorch.org/whl/cpu",
+                environment=env_vars,
+            )
+            if torch_code != 0:
+                torch_err = (torch_out.decode("utf-8", errors="replace")
+                             if torch_out else "unknown error")
+                pretty_log(
+                    "Sandbox PyTorch",
+                    f"torch preinstall failed (non-fatal — runtime install still "
+                    f"works): {torch_err[:200]}",
+                    level="WARNING", icon=Icons.WARN,
+                )
                 
             # Unconditionally install Chromium inside this first-boot
             # block. The previous gate ran `from playwright.sync_api
@@ -443,7 +473,7 @@ class DockerSandbox:
     # setting (mem_limit from GHOST_SANDBOX_MEM at creation). The old
     # `memory_limit` parameter here was accepted but silently ignored,
     # implying a per-call cap that never applied; removed.
-    def execute(self, cmd: str, timeout: int = 300, workdir: str = None):
+    def execute(self, cmd: str, timeout: int = 600, workdir: str = None):
         try:
             self.ensure_running()
             if not self._is_container_ready():

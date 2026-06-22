@@ -27,6 +27,7 @@ leaf well (a spec call, N writes/edits, one verify), at most twice.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass, field
@@ -36,13 +37,26 @@ logger = logging.getLogger("GhostAgent")
 
 ToolRunner = Callable[[str, Dict[str, Any]], Awaitable[str]]
 
-MAX_FILES = 8
+# 16 (was 8): a single leaf like "scaffold the app" can legitimately emit a
+# dozen+ files in one coherent spec from a capable model; 8 silently dropped the
+# overflow. The task tree still does the coarse decomposition, so this only
+# bounds runaway specs, not normal multi-file work.
+MAX_FILES = 16
 # Upper bound on a written file. Must comfortably exceed a fully-accreted
 # single-file app: with append, the result is old+new, and old can be ~200 KB
 # (the gather cap). A tight 60 KB truncated the growing index.html mid-JS,
 # cutting off </body></html> and breaking the page once the OS got big.
 MAX_CONTENT_CHARS = 400_000
-MAX_ATTEMPTS = 2               # spec attempts (1 retry with feedback)
+# 4 (was 2): one spec call + 3 feedback retries. A capable model often fixes a
+# verify failure on attempt 3-4; the old hard stop at 2 converted a recoverable
+# build into a batch-halting FAILURE. Each retry is fed the exact failure reason.
+MAX_ATTEMPTS = 4
+# A COMPLETELY empty upstream response (content=0 reasoning=0) is contention/
+# infra, not the model failing — feedback retries can't fix it, so cap them
+# separately (with a small backoff) rather than burning all MAX_ATTEMPTS
+# hammering the server instantly (observed live: 8 empty calls in <3s).
+MAX_EMPTY_RETRIES = 2
+_EMPTY_BACKOFF_S = 1.5
 _REGRESS_SHRINK_RATIO = 0.85   # a rewrite below this fraction of the old size regresses
 
 
@@ -126,17 +140,48 @@ _INLINE_SCRIPT_RE = re.compile(
     r"(<script\b(?![^>]*\bsrc\s*=)[^>]*>)(.*?)(</script\s*>)",
     re.IGNORECASE | re.DOTALL)
 
+# An inline event handler (onclick="startGame()", onload="init()") — the names
+# it calls MUST remain at global scope.
+_INLINE_HANDLER_RE = re.compile(r"\bon\w+\s*=\s*[\"']([^\"']*)[\"']", re.IGNORECASE)
+_IDENT_RE = re.compile(r"[A-Za-z_$][\w$]*")
+# A script body that intentionally exposes a global (window.x = …, globalThis.x = …).
+_EXPOSES_GLOBAL_RE = re.compile(r"\b(?:window|globalThis)\s*\.\s*[\w$]+\s*=", re.IGNORECASE)
+
+
+def _declares_name(body: str, name: str) -> bool:
+    """True if ``body`` declares ``name`` at a scope IIFE-wrapping would hide."""
+    n = re.escape(name)
+    return bool(
+        re.search(r"\b(?:function|var|let|const|class)\s+" + n + r"\b", body)
+        or re.search(r"\b" + n + r"\s*=\s*(?:function\b|\(|async\b)", body))
+
 
 def _isolate_scripts(fragment: str) -> str:
     """Wrap each inline <script> body in an IIFE so an APPENDED app block can't
     redeclare another block's top-level identifiers (``function initGame``,
-    ``makeDraggable``, …). Those redeclarations were SyntaxErrors that broke
-    the WHOLE page on load (observed live — the verifier REFUTED the built OS
-    as "throws on load"). Already-wrapped bodies are left alone."""
+    ``makeDraggable``, …) — those redeclarations were SyntaxErrors that broke the
+    WHOLE page on load (observed live — the verifier REFUTED the built OS as
+    "throws on load").
+
+    BUT wrapping is skipped when the body must expose globals, because IIFE-
+    scoping them away SILENTLY breaks the page (observed: a strong model wires
+    ``<button onclick="startGame()">`` to a top-level ``function startGame()``;
+    wrapping hid it and the button did nothing, with no error the model could
+    see). A body is left UNWRAPPED when it (a) assigns to ``window.``/
+    ``globalThis.``, or (b) declares a name referenced by an inline ``on*=``
+    handler in the same fragment. Already-wrapped bodies are left alone too."""
+    needed = set()
+    for m in _INLINE_HANDLER_RE.finditer(fragment):
+        needed.update(_IDENT_RE.findall(m.group(1)))
+
     def _wrap(m):
         open_tag, body, close_tag = m.group(1), m.group(2), m.group(3)
         s = body.strip()
         if not s or s.startswith(("(function", "(()", "(async", "!function")):
+            return m.group(0)
+        if _EXPOSES_GLOBAL_RE.search(body):
+            return m.group(0)
+        if any(_declares_name(body, n) for n in needed):
             return m.group(0)
         return f"{open_tag}\n(function(){{\n{body}\n}})();\n{close_tag}"
     return _INLINE_SCRIPT_RE.sub(_wrap, fragment)
@@ -161,7 +206,7 @@ def _smart_append(old: str, new: str, path: str) -> str:
     return old.rstrip() + "\n\n" + new + "\n"
 
 
-def _file_excerpt(content: str, head: int = 800, tail: int = 400) -> str:
+def _file_excerpt(content: str, head: int = 2000, tail: int = 1000) -> str:
     """A compact head+tail view of a file — enough for the model to see its
     structure and pick insertion anchors, without re-sending the whole thing."""
     content = content or ""
@@ -181,7 +226,11 @@ def _render_existing(existing_files: Optional[Dict[str, str]], single_file: bool
                          f"{_file_excerpt(content)}")
         else:
             parts.append(f"--- {path} (exists; large) ---")
-    body = "\n\n".join(parts)[:12_000]
+    # 40 KB (was 12 KB): with a 65 K-token context window the prompt budget is
+    # large, and an 800/400 excerpt of a grown index.html hid the middle — where
+    # an `edits` find/replace anchor often lives, so the model guessed an anchor
+    # that byte-failed. Give it real structural visibility of the files it grows.
+    body = "\n\n".join(parts)[:40_000]
     lead = (
         "\nEXISTING PROJECT FILES (excerpts) — your task ADDS to these; never "
         "recreate or shrink them. USE `append`: a file entry "
@@ -208,11 +257,40 @@ def _render_existing(existing_files: Optional[Dict[str, str]], single_file: bool
     return lead + body + "\n"
 
 
+def _render_research(research_context: Optional[Dict[str, str]]) -> str:
+    """Render the project's research briefs as READ-ONLY reference: the design
+    decisions the agent researched and saved. Without this the build ignored
+    its own research (observed live: a careful research brief written, then
+    never used). Excerpts only — the model consults, does not reproduce."""
+    if not research_context:
+        return ""
+    parts: List[str] = []
+    for path, excerpt in research_context.items():
+        if excerpt and excerpt.strip():
+            parts.append(f"--- {path} ---\n{excerpt.strip()}")
+    if not parts:
+        return ""
+    body = "\n\n".join(parts)[:8_000]
+    return (
+        "\nPROJECT RESEARCH (reference — design decisions you already "
+        "researched and saved; build CONSISTENTLY with these, do NOT re-derive "
+        "or contradict them; these are NOT files to edit):\n" + body + "\n")
+
+
 async def _generate_build_spec(llm, model: str, description: str, ledger: str, *,
                                existing_files: Optional[Dict[str, str]] = None,
                                single_file: bool = False,
-                               feedback: str = "") -> dict:
-    """Ask the model for a JSON build spec. Returns ``{}`` on any failure."""
+                               feedback: str = "",
+                               research_context: Optional[Dict[str, str]] = None,
+                               is_background: bool = False) -> Tuple[dict, bool]:
+    """Ask the model for a JSON build spec.
+
+    Returns ``(spec, was_empty)``: ``spec`` is ``{}`` on any failure, and
+    ``was_empty`` is True when the upstream returned a COMPLETELY empty
+    completion (no content AND no reasoning). An empty completion is an
+    upstream/infra symptom (contention, a dropped response) — NOT the model
+    failing to produce a spec — so the caller backs off and reports it honestly
+    instead of hammering feedback retries that can't help."""
     sys_hint = (
         "You are building ONE task inside a larger project. Output ONLY a JSON "
         "object — no prose, no markdown fences — with this shape:\n"
@@ -223,14 +301,15 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         '  "content": the FULL file text — for a brand-NEW file ONLY. It must '
         "be COMPLETE and VALID (HTML must include </body></html>); a file that "
         "looks truncated is rejected.\n"
-        '  "append": STRONGLY PREFERRED to add to an EXISTING file — you write '
-        "ONLY the new code (a self-contained <script>/<style>/<div> or "
-        "function). For HTML the system inserts it before </body> for you, so "
-        "you do NOT need an anchor. This is the most reliable way to extend a "
-        "single-file app.\n"
-        '  "edits": [{"find":"EXACT existing text","replace":"…"}] — only when '
-        "you must MODIFY existing code; the find text must byte-match. Avoid "
-        "this for plain additions — use append.\n"
+        '  "append": to ADD new code to an EXISTING file — you write ONLY the '
+        "new code (a self-contained <script>/<style>/<div> or function). For "
+        "HTML the system inserts it before </body>, so you do NOT need an "
+        "anchor. Use this for pure ADDITIONS (a new feature/app/section).\n"
+        '  "edits": [{"find":"EXACT existing text","replace":"…"}] — to MODIFY '
+        "existing code (fix a bug, change a value, refactor, rename); the find "
+        "text must byte-match. Use this for any CHANGE to code that already "
+        "exists — you cannot append your way to a modification.\n"
+        "Pick by INTENT: adding → append; changing existing code → edits.\n"
         "Rules: complete runnable code (no TODOs/stubs); BARE project-relative "
         "paths (no /workspace, sandbox/, projects/<id>/); only the files THIS "
         "task needs; prefer a runnable verify that exercises what you built."
@@ -239,6 +318,7 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     if ledger:
         user += ("\nPROJECT LEDGER (existing files / APIs / conventions — build "
                  f"CONSISTENTLY with these):\n{ledger}\n")
+    user += _render_research(research_context)
     user += _render_existing(existing_files, single_file)
     if feedback:
         user += (f"\nYOUR PREVIOUS ATTEMPT FAILED: {feedback}\n"
@@ -247,23 +327,53 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         "model": model,
         "messages": [{"role": "system", "content": sys_hint},
                      {"role": "user", "content": user}],
-        # 4096 truncated a single-file shell mid-JS (no </html>), which then
-        # broke every later append/edit. Give complete files room.
-        "temperature": 0.3, "max_tokens": 8192, "stream": False,
-    })
-    content = ((resp or {}).get("choices", [{}])[0]
-               .get("message", {}).get("content", "") or "")
+        # 16384 (raised from 8192, itself raised from 4096). The output is a
+        # JSON spec with a COMPLETE file embedded as `content` — a cut mid-string
+        # yields invalid JSON and a truncated file. 8192 (~24-32 KB) was far
+        # below the 400 KB this module permits a file to be, and a reasoning
+        # model spends part of the budget in `reasoning_content` before the JSON
+        # even starts — so a brand-new full file plus a think preamble could
+        # still truncate. Give complete files real room.
+        "temperature": 0.3, "max_tokens": 16384, "stream": False,
+    }, is_background=is_background)
+    msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
+    content = msg.get("content") or ""
+    # Reasoning models (Qwen via llama.cpp) emit their chain-of-thought in a
+    # separate `reasoning_content` field. When the think block consumes the
+    # whole token budget without closing, the parser routes EVERYTHING there
+    # and leaves `content` empty — so the JSON build spec lives entirely in the
+    # reasoning channel. Reading only `content` then logged `len=0` and FAILED
+    # the task with "model produced no file spec" (observed live: 5 coding
+    # leaves in one project killed this way). Fall back to the reasoning
+    # channel, mirroring core/agent.py (~2973) and project_research.py.
+    reasoning = msg.get("reasoning_content") or ""
     from .agent import extract_json_from_text
+
+    def _usable(s) -> bool:
+        return bool(isinstance(s, dict) and isinstance(s.get("files"), list) and s.get("files"))
+
     spec = extract_json_from_text(content, repair_truncated=True) or {}
-    if not (isinstance(spec, dict) and isinstance(spec.get("files"), list) and spec.get("files")):
+    if not _usable(spec) and reasoning:
+        spec = extract_json_from_text(reasoning, repair_truncated=True) or {}
+        if not _usable(spec):
+            # Last resort: scan reasoning + content together (a spec split
+            # across the closing </think> boundary).
+            spec = extract_json_from_text(
+                f"{reasoning}\n{content}", repair_truncated=True) or spec
+    was_empty = not content.strip() and not reasoning.strip()
+    if not _usable(spec):
         # Diagnostic: the model returned no usable file spec. Log a window of
-        # the raw output so we can see WHY (prose? broken JSON-escaped code?
-        # empty?) instead of guessing.
-        raw = content.strip()
+        # the raw output (BOTH channels) so we can see WHY (prose? broken
+        # JSON-escaped code? truncated mid-think? — or a fully EMPTY upstream
+        # response, content=0 reasoning=0, which is contention, not the model).
+        raw = (content or reasoning).strip()
         logger.warning(
-            "coding_executor: no file spec parsed (len=%d). RAW head: %s ||| tail: %s",
-            len(raw), raw[:400].replace("\n", "\\n"), raw[-200:].replace("\n", "\\n"))
-    return spec
+            "coding_executor: no file spec parsed (content=%d reasoning=%d%s). "
+            "RAW head: %s ||| tail: %s",
+            len(content.strip()), len(reasoning.strip()),
+            " — EMPTY upstream response" if was_empty else "",
+            raw[:400].replace("\n", "\\n"), raw[-200:].replace("\n", "\\n"))
+    return spec, was_empty
 
 
 async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list) -> Optional[str]:
@@ -347,7 +457,12 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
     if not isinstance(content, str):
         content = str(content)
     if len(content) > MAX_CONTENT_CHARS:
-        content = content[:MAX_CONTENT_CHARS]
+        # Fail loudly — never silently slice a full file mid-code (it would cut
+        # a function/closing tag and write BROKEN code). Mirrors the append
+        # path's "never truncate" stance; the retry can split into files.
+        return (None, f"{path} content is {len(content)} chars (> "
+                      f"{MAX_CONTENT_CHARS}) — split it across multiple files "
+                      f"instead of emitting one oversized file")
 
     # Truncation guard: an HTML file written via full `content` that has no
     # closing </html> was almost certainly cut off at the token cap (observed:
@@ -409,9 +524,11 @@ async def build_coding_task(
     tool_runner: Optional[ToolRunner],
     ledger: str = "",
     existing_files: Optional[Dict[str, str]] = None,
+    research_context: Optional[Dict[str, str]] = None,
     single_file: bool = False,
     max_files: int = MAX_FILES,
     max_attempts: int = MAX_ATTEMPTS,
+    is_background: bool = False,
     **_ignored,
 ) -> CodingResult:
     """Build one coding leaf: spec → write/edit (non-regressively) → verify,
@@ -420,6 +537,12 @@ async def build_coding_task(
     ``existing_files`` ({path: content}) is the project's CURRENT workspace
     (captured before this task), so a leaf EXTENDS prior files instead of
     overwriting them. ``single_file`` strengthens the "grow one file" steer.
+
+    ``is_background`` routes the spec-generation LLM call through the client's
+    background lane (waits for foreground to clear, capped concurrency). The
+    IDLE autoadvancer sets it so its spec calls defer to a user who starts
+    typing mid-build; the user-initiated ``manage_projects autoadvance`` tool
+    leaves it False — the user is actively waiting on that batch.
     """
     llm = getattr(context, "llm_client", None)
     if llm is None or tool_runner is None:
@@ -430,16 +553,55 @@ async def build_coding_task(
     last = "build failed"
     feedback = ""
     last_written: List[str] = []
+    empty_responses = 0
     for _attempt in range(max(1, max_attempts)):
         try:
-            spec = await _generate_build_spec(
+            spec, was_empty = await _generate_build_spec(
                 llm, model, description, ledger,
-                existing_files=existing, single_file=single_file, feedback=feedback)
+                existing_files=existing, single_file=single_file,
+                feedback=feedback, research_context=research_context,
+                is_background=is_background)
         except Exception as e:  # pragma: no cover - LLM/network variance
             return CodingResult(False, f"build-spec generation failed: {e}")
 
+        # A fully EMPTY upstream response is contention/infra, not a code
+        # problem: feedback can't fix it. Back off briefly and retry, but cap
+        # these separately so we don't burn every attempt hammering the server
+        # (observed live: 8 instant empty calls). Report it honestly on exhaust.
+        if was_empty:
+            empty_responses += 1
+            if empty_responses >= MAX_EMPTY_RETRIES:
+                return CodingResult(
+                    False,
+                    f"LLM returned empty responses ({empty_responses}x) — likely "
+                    "upstream contention/overload, not a code problem; retry later",
+                    files=last_written)
+            await asyncio.sleep(_EMPTY_BACKOFF_S)
+            feedback = ""   # nothing useful to feed back about an empty response
+            continue
+
         files = spec.get("files") if isinstance(spec, dict) else None
         if not isinstance(files, list) or not files:
+            # Empty files + a verify command means "nothing to write — the
+            # deliverable already exists; just check it works". This happens
+            # when a prior interactive turn already built the file and the
+            # autoadvance tick re-picks the task (observed live: the Model
+            # Architecture task FAILED in autoadvance though model.py existed
+            # and ran). Honour the verify instead of failing on no-files.
+            _verify = (spec.get("verify") or "").strip() if isinstance(spec, dict) else ""
+            if _verify:
+                vfail = await _run_verify(tool_runner, spec, [])
+                if not vfail:
+                    summary = (spec.get("summary") if isinstance(spec, dict) else "") \
+                        or "verified existing deliverable (nothing to build)"
+                    ledger_note = (spec.get("ledger") if isinstance(spec, dict) else "") or ""
+                    return CodingResult(True, _short(summary, 300), files=[],
+                                        ledger_note=_short(ledger_note, 200))
+                # Verify failed — fall through with that as the reason so the
+                # retry/feedback path gets the real error, not "no file spec".
+                last = vfail
+                feedback = vfail
+                continue
             msg = "model produced no file spec for the task"
             # Don't let an empty retry overwrite a more informative failure
             # (e.g. a real verify error) from a prior attempt.

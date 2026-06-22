@@ -86,8 +86,18 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # >= 120 chars of inline body OR contains more than one `;` OR
         # contains an import statement — any of those trigger a REDIRECT
         # error telling the model to use file_system write + execute.
-        _inline_py_match = re.match(
-            r'^\s*(?:python3?|bash)\s+-c\s+([\'"])(.*)\1\s*(?:\|.*)?$',
+        #
+        # The `-c` invocation is matched after an OPTIONAL command-separator
+        # prefix (`cd <dir> && …`, `… ; …`) — not only at the very start. The
+        # model almost always works inside a project subdir, so its commands
+        # look like `cd projects/<id>/app && python3 -c "<complex body>"`; an
+        # anchored `^python3 -c` regex never matched that shape, so the guard
+        # was bypassed and the malformed inline body hit the bash-quoting
+        # corridor (observed live: a one-line fix spiralled into ~15 turns of
+        # sed/-c quoting errors before the model fell back to a wrapper script
+        # — which is exactly what this block steers it to do immediately).
+        _inline_py_match = re.search(
+            r'(?:^|&&|\|\||;)\s*(?:python3?|bash)\s+-c\s+([\'"])(.*)\1\s*(?:\|.*)?$',
             command, re.DOTALL,
         )
         if _inline_py_match:
@@ -95,15 +105,37 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             _body_compact = _body.strip()
             _too_long = len(_body_compact) >= 120
             _too_many_stmts = _body_compact.count(";") >= 2
+            # Acquired-skill wrap detection (also a BLOCK trigger below): the LLM
+            # trying to call a skill as a module/file — `from foo import foo` or
+            # `acquired_skills/foo.py`. Acquired skills are top-level tools; this
+            # always redirects, regardless of length/quotes.
+            _skill_pattern = re.search(
+                r'from\s+([a-zA-Z_][\w]*)\s+import\s+\1\b', _body_compact)
+            _subprocess_pattern = re.search(
+                r'acquired_skills/([a-zA-Z_][\w]*)\.py', _body_compact)
+            _candidate_name = (_skill_pattern.group(1) if _skill_pattern
+                               else _subprocess_pattern.group(1) if _subprocess_pattern
+                               else None)
+            # An import ALONE is NOT a reason to block — `python3 -c "import sys;
+            # print(sys.path)"` is an idiomatic, safe probe (the block's own
+            # message used to advertise it as allowed, a self-contradiction). The
+            # real corruption mode is NESTED QUOTES in the inline body getting
+            # mangled by bash escaping, so only treat an import as a block trigger
+            # when the body ALSO mixes both quote types (the f-string-with-quotes
+            # shape that actually breaks). A clean import probe passes through.
+            _nested_quotes = ("'" in _body_compact and '"' in _body_compact)
             _has_import = bool(re.search(r'\b(?:from|import)\s+\w', _body_compact))
-            if _too_long or _too_many_stmts or _has_import:
+            _risky_import = _has_import and _nested_quotes
+            if _too_long or _too_many_stmts or _risky_import or _candidate_name:
                 reason = []
                 if _too_long:
                     reason.append(f"body is {len(_body_compact)} chars (>= 120)")
                 if _too_many_stmts:
                     reason.append(f"{_body_compact.count(';')} semicolons (multi-statement)")
-                if _has_import:
-                    reason.append("contains an import statement")
+                if _risky_import:
+                    reason.append("import + nested quotes (bash-escape corruption risk)")
+                if _candidate_name and not reason:
+                    reason.append("looks like an acquired-skill call wrapped in -c")
                 reason_str = "; ".join(reason)
                 pretty_log(
                     "Inline Script Blocked",
@@ -111,33 +143,11 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     level="WARNING", icon=Icons.SHIELD,
                 )
 
-                # Heuristic: does the blocked body look like a failed
-                # attempt to call an acquired skill? Patterns seen in
-                # the 2026-04-24 EA incident:
-                #
-                #   from greece_top_news import greece_top_news; ...
-                #   python3 acquired_skills/foo.py ...
-                #
-                # Acquired skills are TOP-LEVEL callable tools — the
-                # LLM should just invoke them by name. Append a
-                # targeted hint so the retry goes there directly
-                # instead of falling back to file_system(write) +
-                # execute, which would be a correct but still-wrong
-                # second-best path for this class of request.
+                # Targeted hint when the blocked body looks like a failed attempt
+                # to call an acquired skill (2026-04-24 EA incident). Acquired
+                # skills are TOP-LEVEL callable tools — steer the retry to invoke
+                # by name instead of file_system(write)+execute.
                 _skill_hint = ""
-                _skill_pattern = re.search(
-                    r'from\s+([a-zA-Z_][\w]*)\s+import\s+\1\b',
-                    _body_compact,
-                )
-                _subprocess_pattern = re.search(
-                    r'acquired_skills/([a-zA-Z_][\w]*)\.py',
-                    _body_compact,
-                )
-                _candidate_name = None
-                if _skill_pattern:
-                    _candidate_name = _skill_pattern.group(1)
-                elif _subprocess_pattern:
-                    _candidate_name = _subprocess_pattern.group(1)
                 if _candidate_name:
                     _skill_hint = (
                         f"\n\nHINT: The body looks like an attempt to call "
@@ -202,11 +212,16 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 f"run a script."
             )
 
-        # Execute the command securely using the sandbox manager's built-in execute wrapper
+        # Execute the command securely using the sandbox manager's built-in execute wrapper.
+        # 600s (not 300s): real project work — training a small model, running a
+        # full test suite, installing a package, a multi-stage build — routinely
+        # needs more than five minutes, and a premature kill burned turns
+        # re-running from scratch. The hard kill (-k 5s) still guarantees the
+        # process can't hang the container indefinitely.
         import time as _time
         _t0 = _time.time()
         cmd_str = f"bash -c {shlex.quote(command)}"
-        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=300, **_workdir_kw)
+        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=600, **_workdir_kw)
         # Root fallback for project-scoped commands. When a project is active
         # the command runs from /workspace/projects/<id>, but the model may
         # reference a file that lives at the sandbox ROOT — e.g. one it wrote
@@ -217,7 +232,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # signature, retry once from the root. Safe: "can't open file" means
         # nothing executed, so there are no partial side effects to repeat.
         if exit_code != 0 and _workdir_kw and _looks_like_file_not_found(output):
-            output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=300)
+            output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=600)
         _dt = _time.time() - _t0
 
         # Workspace command-outcome capture: record significant runs so
@@ -284,12 +299,20 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         
     # 2. Hard Sandbox Guard against Native Tool Imports
     # The LLM frequently hallucinates that native JSON tools are importable Python modules.
+    # The list holds distinctive tool names that are never plausible local
+    # module names. The generic ones that collided with legitimate code —
+    # `file_system` (very common module name), `scratchpad`, `recall`, `replan`
+    # — were REMOVED: a strong model importing a local `file_system.py` helper
+    # was getting its valid code hard-blocked. `browser` is KEPT: it's a
+    # prominent native tool the model does hallucinate importing, and a dedicated
+    # guard test pins it (the Pyodide-`browser` false positive is rare in this
+    # sandbox). The rest are unambiguous tool names.
     if ext == "py":
         forbidden_modules = [
-            "knowledge_base", "system_utility", "file_system", "manage_tasks",
+            "knowledge_base", "system_utility", "manage_tasks",
             "postgres_admin", "web_search", "fact_check", "deep_research",
-            "vision_analysis", "delegate_to_swarm", "recall", "scratchpad",
-            "learn_skill", "update_profile", "dream_mode", "replan", "browser"
+            "vision_analysis", "delegate_to_swarm",
+            "learn_skill", "update_profile", "dream_mode", "browser",
         ]
         
         # Check for direct imports or pip installs

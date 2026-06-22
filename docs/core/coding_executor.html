@@ -39,8 +39,8 @@
   is bounded by design — the task tree already decomposes the work, so this just
   builds ONE leaf well:</p>
   <ol>
-    <li><strong>Spec</strong> — one LLM call returns a JSON object: <code>files</code> (each a <code>path</code> + FULL <code>content</code>), an optional <code>verify</code> shell command, a one-line <code>summary</code>, and a one-line <code>ledger</code> fact. The project's <a href="prompts.html">design ledger</a> AND its current files (<code>existing_files</code>, gathered by <code>project_advancer._gather_project_files</code>) are fed in, with an instruction to EXTEND those files rather than recreate them — so a single-file app accretes across tasks instead of each task overwriting the last.</li>
-    <li><strong>Write</strong> — each file via the <code>file_system</code> tool (<code>operation="write"</code>), capped at <code>MAX_FILES</code> (8) / <code>MAX_CONTENT_CHARS</code> (60k) per file.</li>
+    <li><strong>Spec</strong> — one LLM call returns a JSON object: <code>files</code> (each a <code>path</code> + FULL <code>content</code>), an optional <code>verify</code> shell command, a one-line <code>summary</code>, and a one-line <code>ledger</code> fact. The project's <a href="prompts.html">design ledger</a> AND its current files (<code>existing_files</code>, gathered by <code>project_advancer._gather_project_files</code>) are fed in, with an instruction to EXTEND those files rather than recreate them — so a single-file app accretes across tasks instead of each task overwriting the last. The project's <strong>research briefs</strong> (<code>research_context</code>, gathered by <code>project_advancer._gather_research_briefs</code>) are fed in too, as a READ-ONLY <strong>PROJECT RESEARCH</strong> reference block (2026-06-22) — so the build follows the design decisions the agent researched instead of ignoring its own work; these are explicitly framed as "NOT files to edit" and kept out of <code>existing_files</code>.</li>
+    <li><strong>Write</strong> — each file via the <code>file_system</code> tool (<code>operation="write"</code>), capped at <code>MAX_FILES</code> (16) / <code>MAX_CONTENT_CHARS</code> (400k) per file.</li>
     <li><strong>Verify</strong> — runs the <code>verify</code> command via <code>execute</code>; a failure (per <code>project_advancer._looks_like_failure</code>) fails the build.</li>
     <li>Returns a <code>CodingResult</code> (<code>ok</code>, <code>summary</code>, <code>files</code>, <code>ledger_note</code>, <code>detail</code>).</li>
   </ol>
@@ -74,6 +74,90 @@
   <code>advance_once</code>) pass <code>single_file=True</code> to strengthen
   the "grow the one file" steer.</p>
 
+  <h2>Recover the spec from the reasoning channel (2026-06-22)</h2>
+  <p>A live failure mode killed 5 coding leaves in one project: every attempt
+  logged <code>coding_executor: no file spec parsed (len=0)</code> with an EMPTY
+  raw window, and <code>advance_once</code> marked the task FAILED with
+  <em>"model produced no file spec for the task"</em>. The cause was not the
+  model — it was <code>_generate_build_spec</code> reading only
+  <code>message.content</code>. Reasoning models (Qwen via llama.cpp) emit their
+  chain-of-thought in a separate <code>reasoning_content</code> field; when the
+  think block consumes the whole <code>max_tokens</code> budget without closing,
+  the parser routes EVERYTHING — including the JSON build spec — into
+  <code>reasoning_content</code> and leaves <code>content</code> empty. The
+  executor saw <code>""</code> and gave up.</p>
+  <p>The fix mirrors the established pattern in <a href="agent.html">agent.py</a>
+  (~L2973) and <a href="project_research.html">project_research.py</a>: when
+  <code>content</code> yields no usable spec, fall back to
+  <code>reasoning_content</code> (then to the two channels concatenated, for a
+  spec split across the <code>&lt;/think&gt;</code> boundary). A genuinely empty
+  response (upstream contention) still fails — but only after the fallback was
+  tried, and the diagnostic now logs BOTH channel lengths
+  (<code>content=N reasoning=M</code>) instead of a misleading empty window.
+  Covered by <code>test_build_recovers_spec_from_reasoning_content</code> and
+  siblings in <code>tests/test_coding_executor.py</code>.</p>
+
+  <h2>Already-built leaf: empty <code>files</code> + a <code>verify</code> (2026-06-22)</h2>
+  <p>When a task's deliverable was already written by a prior interactive turn,
+  the autoadvance tick re-picks the task and the model — correctly — returns a
+  spec with <code>"files": []</code> and a <code>"verify"</code> command ("nothing
+  to write; just check it runs"). The executor used to reject empty
+  <code>files</code> as "model produced no file spec" and FAIL the task
+  (observed live: the Model Architecture task FAILED in autoadvance though
+  <code>model.py</code> existed and ran). Now an empty file list with a
+  <code>verify</code> RUNS the verify: it passes → the task succeeds (no files
+  written); it fails → the task fails with the real verify error fed back to the
+  retry, not the generic no-spec message. Empty <code>files</code> AND no
+  <code>verify</code> still fails as before. Covered by
+  <code>test_empty_files_with_passing_verify_succeeds</code> and siblings in
+  <code>tests/test_coding_executor.py</code>.</p>
+
+  <h2>Capacity caps raised off the small-model era (2026-06-22)</h2>
+  <p>An audit for leftovers tuned to a weaker model surfaced several caps that
+  were starving or fragmenting code from the current strong model:</p>
+  <ul>
+    <li><strong><code>MAX_ATTEMPTS</code> 2 → 4 and <code>MAX_FILES</code> 8 → 16.</strong> A capable model often fixes a verify failure on attempt 3-4; the hard stop at 2 turned a recoverable build into a batch-halting FAILURE. And a single "scaffold the app" leaf can legitimately emit a dozen+ files, which 8 silently dropped.</li>
+    <li><strong>Append/edits steer rebalanced.</strong> The spec prompt previously pushed <code>append</code> as "STRONGLY PREFERRED" and told the model to "avoid <code>edits</code>" — biasing toward additive-only changes (you cannot append your way to a bug fix or refactor). It now picks by INTENT: <em>adding → append; changing existing code → edits</em>.</li>
+    <li><strong>IIFE auto-wrap made conservative.</strong> <code>_isolate_scripts</code> wrapped EVERY appended inline <code>&lt;script&gt;</code> in an IIFE to prevent cross-block identifier collisions — but that SILENTLY scoped away intentional globals, breaking <code>&lt;button onclick="startGame()"&gt;</code> wired to a top-level <code>function startGame()</code> with no error the model could see. Wrapping is now SKIPPED when the body exposes a global (<code>window.x = …</code>) or declares a name referenced by an inline <code>on*=</code> handler; self-contained blocks are still isolated. Covered by <code>tests/test_coding_executor_accretion.py</code>.</li>
+    <li><strong>Spec <code>max_tokens</code> 8192 → 16384.</strong> This is the
+    one call that emits a COMPLETE file as embedded JSON <code>content</code>; at
+    8192 (~24-32 KB) it was 12× below the 400 KB a file may be, and a reasoning
+    model spends part of the budget in <code>reasoning_content</code> before the
+    JSON starts — so a new full file + think preamble could truncate into invalid
+    JSON.</li>
+    <li><strong>Existing-file excerpt 800/400 → 2000/1000, block cap 12 KB →
+    40 KB.</strong> An 800/400 head+tail of a grown <code>index.html</code> hid
+    the middle, where an <code>edits</code> find/replace anchor often lives, so
+    the model guessed an anchor that byte-failed. With a 65 K-token context the
+    prompt budget easily affords real structural visibility.</li>
+    <li><strong>Oversized full <code>content</code> now FAILS, not silently
+    sliced.</strong> A file over <code>MAX_CONTENT_CHARS</code> used to be
+    <code>content[:cap]</code> — a hard cut mid-code that wrote broken output.
+    It now returns a "split across multiple files" failure, mirroring the
+    append path's "never truncate" stance. Covered by
+    <code>test_oversized_content_fails_loudly_not_silently_truncated</code>.</li>
+    <li><strong>Single-command fallback <code>max_tokens</code> 1024 → 4096</strong>
+    (<code>project_advancer.default_code_generator</code>) — that command "may
+    invoke <code>python3 -c</code>", so it can carry a whole inline program that
+    1024 tokens truncated mid-script.</li>
+  </ul>
+
+  <h2>Empty upstream responses ≠ "no file spec" (2026-06-22)</h2>
+  <p>A fully empty completion (<code>content=0 reasoning=0</code>) is upstream
+  contention/overload, not the model failing to produce a spec — feedback
+  retries can't fix it. Previously each empty response consumed a full
+  feedback-retry, so a 2-task autoadvance hammered the server with 8 instant
+  empty calls and then mislabeled the tasks "model produced no file spec",
+  dumping the agent into a long manual repair. Now <code>_generate_build_spec</code>
+  returns <code>(spec, was_empty)</code>; on an empty response the executor backs
+  off (<code>_EMPTY_BACKOFF_S</code>) and retries, capped at
+  <code>MAX_EMPTY_RETRIES</code> (2) <em>separately</em> from the normal
+  <code>MAX_ATTEMPTS</code>, then fails with an honest <em>"LLM returned empty
+  responses (Nx) — likely upstream contention, not a code problem; retry
+  later"</em>. Covered by
+  <code>test_empty_response_fails_with_honest_contention_message</code> and
+  <code>test_empty_then_valid_recovers_after_backoff</code>.</p>
+
   <h2>Fail loud, not shallow</h2>
   <p>If the spec is empty, a write is refused/rejected, or verify fails, the
   build returns <code>ok=False</code>. <code>advance_once._finalize_coding</code>
@@ -90,6 +174,16 @@
   tool path and the idle autoadvancer (<a href="agent.html">agent.py</a> phase
   2.95). It is NOT an open-ended agent loop — one spec call, N writes, one
   verify — so per-tick context stays bounded however many tasks the batch runs.</p>
+  <p><strong>Background lane (2026-06-22).</strong> <code>build_coding_task</code>
+  takes <code>is_background</code>, threaded into the spec-generation
+  <code>chat_completion</code>. The IDLE autoadvancer sets it <code>True</code>
+  (along with its classifier + code-generator calls) so its ~8K-token spec call
+  goes through the client's background lane — waiting for foreground to clear and
+  capped concurrency — and a user who starts typing mid-build isn't stuck behind
+  it. The user-initiated <code>manage_projects autoadvance</code> tool leaves it
+  <code>False</code> (foreground): the user is actively waiting on that batch.
+  Covered by <code>test_spec_call_is_foreground_by_default</code> /
+  <code>test_spec_call_uses_background_when_requested</code>.</p>
 
   <h2>Tests</h2>
   <p><code>tests/test_coding_executor.py</code> — happy path (write + verify),

@@ -74,6 +74,13 @@ RUN pip install --no-cache-dir \
         psycopg2-binary asyncpg sqlalchemy tabulate sqlglot \
         playwright html2text lxml pysocks
 
+# PyTorch — CPU wheel only (the default GPU wheels pull ~2 GB of unusable
+# CUDA). Preinstalled so "train a model" projects don't `pip install torch`
+# mid-task and trip the execute timeout. Mirrors the runtime install in
+# sandbox/docker.py.
+RUN pip install --no-cache-dir torch \
+        --index-url https://download.pytorch.org/whl/cpu
+
 # --- Playwright browsers + system deps ---
 # `--with-deps` installs the libnss3 / libatk / libdrm / etc. that
 # Chromium's headless_shell links against. Running this step inside
@@ -90,7 +97,7 @@ RUN python3 -m playwright install --with-deps chromium
 # tag (and the corresponding string in docker.py) whenever this
 # Dockerfile's install surface changes in a way that prior images
 # can't be trusted to match.
-RUN touch /root/.supercharged.v2
+RUN touch /root/.supercharged.v3
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

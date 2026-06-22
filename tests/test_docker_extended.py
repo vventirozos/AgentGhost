@@ -47,17 +47,25 @@ async def test_docker_sandbox_installs_dill_and_others():
             # 5. Find the pip install call
             pip_install_call = None
             playwright_install_call = None
+            torch_install_call = None
             for call in calls:
                 args, _ = call
                 cmd = args[0]
                 if "pip install --no-cache-dir" in cmd:
-                    if "pysocks" not in cmd: # Ignore the pysocks bootstrap
-                        pip_install_call = cmd
+                    if "torch" in cmd:
+                        torch_install_call = cmd            # the CPU-torch preinstall
+                    elif "pysocks" not in cmd:              # ignore the pysocks bootstrap
+                        pip_install_call = cmd              # the main data/ML stack
                 elif "playwright install chromium" in cmd:
                     playwright_install_call = cmd
-                        
+
             assert pip_install_call is not None, "Python package installation command was never called"
             assert playwright_install_call is not None, "Playwright browser installation command was never called"
+            # torch is preinstalled (CPU wheel) so projects don't pip-install it
+            # mid-task and trip the execute timeout.
+            assert torch_install_call is not None, "CPU torch preinstall was never called"
+            assert "download.pytorch.org/whl/cpu" in torch_install_call, (
+                "torch must install from the CPU index, not the default GPU wheels")
             
             # 6. Verify required packages are in the install string
             packages = [

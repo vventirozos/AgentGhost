@@ -190,11 +190,14 @@ async def test_inline_c_block_hint_absent_for_unrelated_bodies(tmp_path):
     should stay generic. No phantom skill nudges."""
     from ghost_agent.tools.execute import tool_execute
 
+    # Blocked because it's substantive (>120 chars), NOT because of the import —
+    # and it's not a skill wrap, so the generic message must carry no skill hint.
     body = (
         "import os, json; "
         "print(json.dumps({k: os.environ.get(k) for k in "
-        "['HOME', 'PATH', 'USER', 'SHELL', 'TERM', 'LANG']}))"
+        "['HOME', 'PATH', 'USER', 'SHELL', 'TERM', 'LANG', 'PWD', 'TZ', 'EDITOR']}))"
     )
+    assert len(body) >= 120
     cmd = f'python3 -c "{body}"'
     result = await tool_execute(
         command=cmd,

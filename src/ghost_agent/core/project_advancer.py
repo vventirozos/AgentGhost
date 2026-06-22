@@ -65,7 +65,14 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
         for dirpath, _dirs, files in os.walk(base):
             for fn in sorted(files):
                 rel = (Path(dirpath) / fn).relative_to(base).as_posix()
-                if rel.startswith("research/") or rel.split("/")[-1].startswith("."):
+                parts = rel.split("/")
+                # Research briefs are reference, not build targets — exclude
+                # them from `existing_files` (which steers append/non-regression)
+                # wherever they live (the agent may nest them under a self-named
+                # subdir, e.g. PetAI/research/…, not just at the root). They are
+                # fed to the build separately as read-only context via
+                # `_gather_research_briefs`.
+                if "research" in parts[:-1] or parts[-1].startswith("."):
                     continue
                 p = Path(dirpath) / fn
                 try:
@@ -83,6 +90,55 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
                 total += len(content)
                 if len(out) >= max_files:
                     return out
+    except OSError:
+        return out
+    return out
+
+
+def _gather_research_briefs(store, project_id: str, *, max_briefs: int = 4,
+                            per_brief_chars: int = 1800,
+                            budget_chars: int = 6000) -> Dict[str, str]:
+    """Read the project's ``**/research/*.md`` briefs as READ-ONLY reference for
+    the coding executor — the design decisions the agent researched and saved
+    but that :func:`_gather_project_files` deliberately omits (research is not a
+    build target). Returns ``{path: head_excerpt}`` (head only — a brief is for
+    consulting, not reproducing). Never raises — returns {} on any problem.
+    """
+    root = getattr(store, "sandbox_root", None)
+    pid = str(project_id or "").strip().lower()
+    if not root or not pid:
+        return {}
+    base = Path(root) / "projects" / pid
+    if not base.is_dir():
+        return {}
+    out: Dict[str, str] = {}
+    total = 0
+    try:
+        for dirpath, _dirs, files in os.walk(base):
+            rel_dir = Path(dirpath).relative_to(base).as_posix()
+            if "research" not in [p for p in rel_dir.split("/") if p]:
+                continue
+            for fn in sorted(files):
+                if not fn.lower().endswith(".md") or fn.lower() == "index.md":
+                    continue
+                rel = (Path(dirpath) / fn).relative_to(base).as_posix()
+                try:
+                    content = (Path(dirpath) / fn).read_text(errors="replace")
+                except OSError:
+                    continue
+                excerpt = content[:per_brief_chars].rstrip()
+                if len(content) > per_brief_chars:
+                    excerpt += "\n…(brief truncated — read the full file if needed)"
+                remaining = budget_chars - total
+                if remaining <= 0:
+                    break
+                excerpt = excerpt[:remaining]
+                out[rel] = excerpt
+                total += len(excerpt)
+                if len(out) >= max_briefs:
+                    return out
+            if len(out) >= max_briefs:
+                break
     except OSError:
         return out
     return out
@@ -144,6 +200,22 @@ _NEEDS_USER_KEYWORDS = {
     "delete production", "drop database",
 }
 
+# An explicit source/artifact filename the task must PRODUCE (e.g.
+# "analyze_results.py", "results/report.md"). Paired with a build verb this is
+# an unambiguous coding leaf and must outrank a research verb in the same
+# sentence — otherwise "analyze … (analyze_results.py) … saved as report.md"
+# routes to web_search and is marked DONE having built nothing (theatrical
+# completion observed live on project 33e23d50).
+_STRONG_CODE_FILE_RE = re.compile(
+    r"\b[\w./-]+\.(?:py|js|ts|jsx|tsx|vue|html?|css|json|md|sh|sql|"
+    r"c|cpp|h|hpp|go|rs|rb|java|kt|swift|php|yaml|yml|toml|ipynb)\b",
+    re.I,
+)
+_BUILD_VERBS = (
+    "produce", "build", "create", "write", "implement", "generate",
+    "save", "output", "add", "make", "code", "develop", "script", "render",
+)
+
 
 @dataclass
 class AdvanceResult:
@@ -189,6 +261,13 @@ def classify_task(description: str, default: str = "research") -> str:
     for kw in _NEEDS_USER_KEYWORDS:
         if kw in lower:
             return "needs_user"
+    # Strong coding signal: a concrete filename to PRODUCE + a build verb. This
+    # beats the research check below so a build leaf whose description also
+    # contains a research verb ("analyze", "summarize") is still BUILT, not
+    # web-searched into a phantom DONE. needs_user still wins (checked above) so
+    # "publish report.md" routes to the human, not to a build.
+    if _STRONG_CODE_FILE_RE.search(description) and any(v in lower for v in _BUILD_VERBS):
+        return "coding"
     for kw in _RESEARCH_KEYWORDS:
         if kw in lower:
             return "research"
@@ -437,6 +516,7 @@ async def advance_once(
             cres = await coding_executor(
                 context, nxt.description, tool_runner=tool_runner, ledger=ledger,
                 existing_files=_gather_project_files(store, project_id),
+                research_context=_gather_research_briefs(store, project_id),
                 single_file=_single_file)
         except Exception as e:
             logger.warning("coding_executor crashed: %s", e)
@@ -642,6 +722,14 @@ _INTENT_N = re.compile(
     r"(?:more\s+|next\s+)?tasks?\b",
     re.I,
 )
+# Enumerated tasks: "task 3 and 4", "tasks 3 and 4", "task 3 and task 4",
+# "tasks 3, 4 and 5". Each is a BATCH of >1 task — without this they parsed as
+# a single go-ahead and the one-task-per-turn gate stopped after the first
+# (observed live: "proceed with task 3 and 4" left task 4 half-done).
+_INTENT_AND_TASKS = re.compile(
+    r"\btasks?\s+\d+(?:\s*(?:,|&|and)\s*(?:tasks?\s+)?\d+)+",
+    re.I,
+)
 
 
 @dataclass
@@ -661,7 +749,8 @@ def classify_advance_intent(text: str) -> Dict[str, Any]:
     """Map a user pacing directive to ``{mode, count}``.
 
       * "all"  → count=None   ("proceed with all remaining tasks", "finish the project")
-      * "n"    → count=N>1     ("do the next 3 tasks", "two more tasks")
+      * "n"    → count=N>1     ("do the next 3 tasks", "two more tasks",
+                               "task 3 and 4" → count=2)
       * "one"  → count=1       ("proceed", "next task", or anything ambiguous —
                                the safe default so a vague nudge never runs away)
     """
@@ -670,6 +759,11 @@ def classify_advance_intent(text: str) -> Dict[str, Any]:
         return {"mode": "one", "count": 1}
     if _INTENT_ALL.search(t):
         return {"mode": "all", "count": None}
+    am = _INTENT_AND_TASKS.search(t)
+    if am:
+        nums = re.findall(r"\d+", am.group(0))
+        if len(nums) > 1:
+            return {"mode": "n", "count": len(nums)}
     m = _INTENT_N.search(t)
     if m:
         tok = m.group(1)
@@ -727,7 +821,10 @@ def default_code_generator(context):
                 "Write a SINGLE shell command (you may invoke python3 -c). "
                 "Output ONLY the command — no explanation, no markdown "
                 "fences.\n\nTASK: " + str(description)[:500])}],
-            "temperature": 0.2, "max_tokens": 1024, "stream": False,
+            # 4096 (was 1024): the command "may invoke python3 -c", so it can
+            # carry a whole inline program — 1024 (~3 KB) truncated those mid-
+            # script, leaving an unterminated quote.
+            "temperature": 0.2, "max_tokens": 4096, "stream": False,
         })
         out = ((r or {}).get("choices", [{}])[0]
                .get("message", {}).get("content", "") or "").strip()
@@ -861,9 +958,17 @@ def _looks_like_failure(output: str) -> bool:
     if not s:
         return True
     first = s.splitlines()[0].strip().lower()
+    # Some tool failures surface as a stringified exception tuple, e.g.
+    # "('error sending request for url ...', '...')". The leading "('" hid the
+    # error marker from the prefix check below, so a failed web_search slipped
+    # through and its build/research task was recorded DONE on it (observed
+    # live: project 33e23d50). Strip leading quote/paren/bracket punctuation
+    # before testing the prefix so the marker is visible.
+    first = first.lstrip("('\"[ \t")
     return (
         first.startswith("error:")
         or first.startswith("error ")
+        or first.startswith("error sending")
         or first.startswith("traceback")
         or first == "error"
     )

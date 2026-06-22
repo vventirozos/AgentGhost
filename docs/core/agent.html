@@ -54,13 +54,24 @@
   </table>
 
   <h2>Sampling profiles</h2>
+  <p>Pinned to the Qwen 3.6 35B-A3 model card. Two thinking profiles:</p>
   <table>
     <thead><tr><th>Profile</th><th>Temperature</th><th>top_p</th><th>top_k / extras</th><th>When</th></tr></thead>
     <tbody>
-      <tr><td><code>CODING_SAMPLING_PARAMS</code></td><td>0.6</td><td>0.95</td><td>top_k=20</td><td>"precise" coding turns; tool turns; SQL/regex/algorithm intents.</td></tr>
-      <tr><td><code>GENERAL_SAMPLING_PARAMS</code></td><td>1.0</td><td>—</td><td>presence_penalty=1.5</td><td>Free-form / creative turns.</td></tr>
+      <tr><td><code>CODING_SAMPLING_PARAMS</code></td><td>0.6</td><td>0.95</td><td>top_k=20</td><td>Every coding turn; any tool turn.</td></tr>
+      <tr><td><code>GENERAL_SAMPLING_PARAMS</code></td><td>1.0</td><td>0.95</td><td>top_k=20, presence_penalty=1.5</td><td>Conversational / free-form turns.</td></tr>
     </tbody>
   </table>
+  <p><strong>Coding sub-profiles pinned to the model card (2026-06-22).</strong>
+  The <code>_classify_coding_task</code> → <code>_CODING_TASK_PROFILES</code>
+  (creative / precise / balanced) mechanism stays WIRED for future per-sub-task
+  tuning, but all three profiles are now set to the same model-card coding
+  values (<code>temp=0.6, top_p=0.95, top_k=20</code>). The earlier spread
+  (creative <code>temp=0.8/top_k=40</code>, precise <code>temp=0.3/top_p=0.90/top_k=10</code>)
+  drifted ~half of coding turns off the model-card sampling; collapsing them
+  keeps every coding turn on-spec. Pinned by
+  <code>tests/test_hardcoded_sampling_params.py</code>
+  (<code>test_all_coding_subprofiles_pinned_to_model_card</code>).</p>
 
   <h2>Thinking budgets</h2>
   <p>Set via <code>core/prompts.py</code> and selected per turn:</p>
@@ -73,12 +84,28 @@
 
   <h2>Constants</h2>
   <div class="kv">
-    <dt>MAX_THINKING_CHARS</dt><dd>32 000 (line 242)</dd>
-    <dt>MAX_THINKING_CHARS_EXTENDED</dt><dd>64 000 (line 243)</dd>
+    <dt>MAX_THINKING_CHARS</dt><dd>32 000 — where loop-CHECKING begins (not a kill)</dd>
+    <dt>MAX_THINKING_CHARS_EXTENDED</dt><dd>200 000 (raised from 64 000, 2026-06-22)</dd>
     <dt>DEFAULT_TOOL_TURN_MAX_TOKENS</dt><dd>16 384 (line 262)</dd>
     <dt>MAX_TRUNCATION_CONTINUATIONS</dt><dd>3 — max auto-continuation round-trips for a length-truncated text answer.</dd>
     <dt>_BOOKKEEPING_TOOL_NAMES</dt><dd><code>{"manage_projects","scratchpad",…}</code> excluded from the verifier evidence search.</dd>
   </div>
+
+  <h2>Thinking-loop guards relaxed for a strong model (2026-06-22)</h2>
+  <p>Several reasoning guards were tuned for a weaker model that looped easily,
+  at an explicitly "acceptable false-positive risk." For a capable reasoning
+  model those false positives — guillotining legitimate long derivations —
+  outweigh the benefit, so they were loosened (the genuine-runaway backstops
+  remain):</p>
+  <ul>
+    <li><strong>Hard length-abort 64 K → 200 K chars.</strong> Between 32 K (where loop-checking starts) and 200 K, the stream is aborted ONLY when <code>_detect_thinking_loop</code> actually fires — so a hard algorithm/proof/debug problem that legitimately needs &gt;16 K thinking tokens can finish. 200 K is the pathological-runaway ceiling.</li>
+    <li><strong>Loop detector (300/150/2) → (500/200/3).</strong> Now needs ~600 chars of genuine repetition (3× a 200-char window) before firing, vs the aggressive ~300 chars (2×150) that could trip on reasoning restating a constraint or invariant. The tool-call-collapse probe + the 200 K ceiling stay as fast backstops.</li>
+    <li><strong>Thinking-cap force-stop 2 → 3 events</strong> — one more grounding nudge before aborting the attempt, now that detection is conservative.</li>
+    <li><strong>Cross-turn repetition Jaccard 0.7 → 0.85</strong> — focused iterative work (refining the same function, debugging the same test) opens consecutive turns with ~0.7 vocabulary overlap; only ~0.85+ is a true restart-the-same-derivation loop.</li>
+  </ul>
+  <p>Covered by <code>tests/test_think_enumeration_loop.py</code>,
+  <code>tests/test_cross_turn_repetition.py</code>,
+  <code>tests/test_smart_problem_solving.py</code>.</p>
 
   <h2 id="truncated-answer-continuation">Truncated-answer auto-continuation</h2>
   <p>The streaming consume loop records the last non-null <code>finish_reason</code> seen on the upstream stream. When a <em>text</em> turn (no <code>&lt;tool_call&gt;</code> / <code>&lt;function&gt;</code> in flight) ends with <code>finish_reason == "length"</code>, the answer was cut off at the model's token cap — shipping it would hand the user a mid-sentence reply, which the <a href="verifier.html">Verifier</a> correctly REFUTES (truncated output, and any explicit question left unanswered).</p>

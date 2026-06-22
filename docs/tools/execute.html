@@ -45,7 +45,7 @@
   <h3>1. Bash command (line 32-117)</h3>
   <ul>
     <li>Auto-strips invalid <code>cd /sandbox</code> / <code>cd /home/user</code> prefixes.</li>
-    <li>Blocks substantive inline <code>-c</code> scripts (≥120 chars, 2+ statements, has import) and forces the file+execute pattern.</li>
+    <li>Blocks substantive inline <code>-c</code> scripts (≥120 chars, 2+ statements, has import) and forces the file+execute pattern. <strong>(2026-06-22)</strong> The match now fires after an optional command-separator prefix — <code>cd &lt;dir&gt; &amp;&amp; python3 -c "…"</code>, not only a start-anchored <code>python3 -c</code>. The model almost always works inside a project subdir, so the <code>cd … &amp;&amp;</code> shape was bypassing the guard entirely: the malformed inline body reached <code>bash -c</code> and hit the quoting corridor (<code>syntax error near unexpected token '('</code>), turning a one-line fix into ~15 turns of <code>sed</code>/<code>-c</code> quoting failures before the model fell back to a wrapper script — which is exactly what this block now steers it to on turn 1. Covered by <code>tests/test_inline_c_guard_cd_prefix.py</code>.</li>
     <li><strong>Acquired-skill invocation nudge (2026-04-24).</strong> When the blocked body looks like a failed attempt to call an acquired skill — <code>from X import X</code> where module and symbol names match, or <code>acquired_skills/X.py</code> in a subprocess call — the SYSTEM BLOCK error appends a targeted <code>HINT:</code> pointing at the canonical invocation: <em>"Acquired skills are TOP-LEVEL TOOLS. Invoke it directly as <code>X(...)</code>."</em> This shortcut exists because after the skill-storage relocation (skills live under <code>$GHOST_HOME/system/memory/acquired_skills/</code>, not inside the sandbox), the LLM can no longer see the skill via <code>ls</code> and its first instinct is often to wrap the call in <code>python -c</code> / subprocess. Hint fires only on the narrow patterns above — unrelated inline bodies keep the generic message. Covered by <code>tests/test_acquired_skill_invocation_nudge.py</code>.</li>
     <li>Executes via <code>sandbox_manager.execute(bash -c ...)</code> with 300 s timeout.</li>
   </ul>
@@ -83,6 +83,13 @@ STDOUT/STDERR:
     <li>SQL injection — out of scope (<a href="database.html">database tool</a> uses parameterised queries).</li>
     <li>Inline script block — rejects substantive <code>-c</code> usage.</li>
     <li>Output truncation — head + tail capping.</li>
+  </ul>
+
+  <h2>Import guards relaxed off the small-model era (2026-06-22)</h2>
+  <p>Both import-related guards over-fired on a strong model's legitimate code:</p>
+  <ul>
+    <li><strong>Inline <code>-c</code>: an import is no longer a block trigger by itself.</strong> The real corruption mode is NESTED QUOTES in the inline body mangled by bash escaping, so an import only triggers the block when the body ALSO mixes both quote types. A clean probe like <code>python3 -c "import sys; print(sys.path)"</code> — which the block message itself used to advertise as allowed, a self-contradiction — now passes. The 120-char / 2-semicolon redirect and the acquired-skill-wrap redirect are unchanged.</li>
+    <li><strong>Native-tool import blocklist narrowed.</strong> The generic names <code>file_system</code> (a very common module name), <code>scratchpad</code>, <code>recall</code>, <code>replan</code> were REMOVED — they collide with local modules (a local <code>file_system.py</code> helper was getting hard-blocked). <code>browser</code> is KEPT (a prominent native tool the model does hallucinate importing, with a dedicated guard test). The other unambiguous tool names (<code>knowledge_base</code>, <code>web_search</code>, <code>vision_analysis</code>, …) remain. Covered by <code>tests/test_inline_c_guard_cd_prefix.py</code> and <code>tests/test_acquired_skill_invocation_nudge.py</code>.</li>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>

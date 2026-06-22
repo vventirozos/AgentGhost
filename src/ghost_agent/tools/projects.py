@@ -68,6 +68,32 @@ def _ok(payload: Any) -> str:
         return str(payload)
 
 
+def _no_active_project(store) -> str:
+    """Non-error response for a READ action (get / task_list / task_next) invoked
+    with no resolvable project.
+
+    Returns the project list + a switch hint instead of an ``ERROR:`` string —
+    which the agent loop scores as a failure and burns a STRIKE for. Forgetting
+    to say WHICH project is a recoverable usage slip, not a failure: the model
+    just needs to pick one and ``switch``. Returning the list here also saves
+    the extra ``action=list`` round-trip the model otherwise does to recover
+    (observed live: ``action=get`` struck the model at the very start of a
+    'resume my project' turn, before it listed + switched)."""
+    try:
+        projects = store.list_projects()
+    except Exception:
+        projects = []
+    return _ok({
+        "no_active_project": True,
+        "projects": projects,
+        "agent_instruction": (
+            "No project is active in this conversation — this is NOT an error. "
+            "Pick one from `projects` above and call `manage_projects "
+            "action=switch project_id=\"<id>\"`, then retry your read."
+        ),
+    })
+
+
 _PROJECT_KEY_PREFIX = "proj::"
 _CURRENT_SENTINEL = "__current_project__"
 # Conversation that owns the current project activation. Written next to
@@ -287,6 +313,36 @@ def conversation_fingerprint(messages) -> str:
     return hashlib.sha1(str(first).strip().encode("utf-8", "replace")).hexdigest()
 
 
+def _message_references_project(context, project_id: str) -> bool:
+    """True when THIS request's user message names the given project by id or
+    title. The chat API ships no stable conversation id, so a project bound to
+    one conversation gets parked for every other request whose first-message
+    fingerprint differs — including later turns of the SAME human session once a
+    per-turn 'Context:' preamble changes the first message. When the user
+    explicitly references the project ("proceed with task 3 of the PetAI
+    project"), that intent overrides the fingerprint mismatch. Best-effort;
+    never raises."""
+    msg = str(getattr(context, "last_user_content", "") or "").lower()
+    if not msg:
+        return False
+    pid = str(project_id or "").lower()
+    if pid and (pid in msg or pid[:8] in msg):
+        return True
+    store = getattr(context, "project_store", None)
+    if store is None:
+        return False
+    try:
+        proj = store.get_project(project_id) or {}
+        title = str(proj.get("title") or "").strip().lower()
+        # Require a reasonably distinctive title (≥3 chars) and a whole-word
+        # match so a generic one-word title can't latch onto stray prose.
+        if len(title) >= 3 and re.search(r"\b" + re.escape(title) + r"\b", msg):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def reconcile_conversation(context, conv_key: str):
     """Scope the active project to the conversation that activated it.
 
@@ -317,7 +373,27 @@ def reconcile_conversation(context, conv_key: str):
     if not bound_pid or not isinstance(bound_pid, str):
         return
     owns = bool(conv_key) and bound_conv == conv_key
-    if owns:
+    # Escape hatch: even on a fingerprint mismatch, an explicit user reference
+    # to the project ("the PetAI project") means they want to work on it now —
+    # keep/activate it instead of parking it and forcing a recovery dance that
+    # loops the agent (observed live: request D7 called manage_projects get 3x,
+    # then hit the no-progress loop breaker, then a scrub fallback — all because
+    # the project it was told to advance had just been deactivated).
+    referenced = (not owns) and _message_references_project(context, bound_pid)
+    if owns or referenced:
+        if referenced:
+            # Re-bind the conversation to THIS request's key so the binding
+            # FOLLOWS the active conversation. Without this, `current_project_id`
+            # (process-global) can be cleared mid-request by another reconcile,
+            # and the `_conversation_bound_project` fallback in
+            # `project_scoped_sandbox` would still fail (bound_conv != conv) — so
+            # file_system / report_pdf writes fall back to the sandbox ROOT
+            # instead of projects/<id>/ (observed live: a report PDF and stray
+            # project directories created at the sandbox root).
+            try:
+                sp.set(_CURRENT_CONV_SENTINEL, conv_key or "")
+            except Exception:
+                pass
         if cur != bound_pid:
             context.current_project_id = bound_pid
             _wm = getattr(context, "workspace_model", None)
@@ -328,7 +404,10 @@ def reconcile_conversation(context, conv_key: str):
                     pass
             _hydrate_scratchpad(context, bound_pid)
             pretty_log("Project Scope",
-                       f"Conversation owns project '{bound_pid}' — reactivated",
+                       (f"Conversation owns project '{bound_pid}' — reactivated"
+                        if owns else
+                        f"User referenced project '{bound_pid}' — activated for "
+                        "this request (conversation fingerprint differs)"),
                        icon=Icons.BRAIN_PLAN)
         return
     if cur:
@@ -1069,23 +1148,31 @@ async def tool_manage_projects(
 
         if act == "get":
             if not project_id:
-                return _err("project_id is required for action=get")
-            proj = store.get_project(project_id)
-            if not proj:
+                return _no_active_project(store)
+            # Resolve a title/slug to the real id (e.g. `get petai`) via the
+            # shared resolver so a title isn't a hard "not found".
+            rid, rerr = _resolve_project_ref(store, project_id)
+            if rerr:
+                return _err(rerr)                # ambiguous title
+            if not rid:
                 return _err(f"project not found: {project_id}")
-            return _ok(proj)
+            return _ok(store.get_project(rid))
 
         if act == "switch":
             if not project_id:
                 return _err("project_id is required for action=switch")
-            proj = store.get_project(project_id)
-            if not proj:
+            # Resolve a title/slug to the real id so `switch petai` works
+            # instead of erroring + striking on a recoverable title/id mixup.
+            rid, rerr = _resolve_project_ref(store, project_id)
+            if rerr:
+                return _err(rerr)                # ambiguous title
+            if not rid:
                 return _err(f"project not found: {project_id}")
-            _set_current(context, project_id)
-            return _ok({"switched_to": project_id,
-                        "workspace": f"projects/{project_id}",
-                        "note": _workspace_note(project_id),
-                        "briefing": _briefing(store, project_id)})
+            _set_current(context, rid)
+            return _ok({"switched_to": rid,
+                        "workspace": f"projects/{rid}",
+                        "note": _workspace_note(rid),
+                        "briefing": _briefing(store, rid)})
 
         if act == "exit":
             prev = getattr(context, "current_project_id", None)
@@ -1329,6 +1416,21 @@ async def tool_manage_projects(
                     store.update_task(tid, **extras)
                 updated.append({k: store.get_task(tid).get(k)
                                 for k in ("id", "status", "result_summary")})
+            # A research task often saves its brief with a bare file_system
+            # write (not action=research), which left the file out of the
+            # research index — invisible to the briefing and never re-read
+            # (observed live). Closing any task is a natural "I produced
+            # something" checkpoint: pick up newly-written research/*.md so the
+            # next turn's briefing surfaces it. Best-effort.
+            try:
+                from ..core.project_research import reconcile_research_dir
+                _n = reconcile_research_dir(store, project_id)
+                if _n:
+                    pretty_log("Project Research",
+                               f"Indexed {_n} directly-written research brief(s)",
+                               icon=Icons.BRAIN_PLAN)
+            except Exception:
+                logger.debug("research reconcile skipped", exc_info=True)
             payload: Dict[str, Any] = {"updated": updated,
                                        "count": len(updated)}
             if missing:
@@ -1443,7 +1545,7 @@ async def tool_manage_projects(
 
         if act == "task_next":
             if not project_id:
-                return _err("no active project (pass project_id or switch first)")
+                return _no_active_project(store)
             plan = ProjectPlan(store, project_id)
             nxt = plan.next_ready_leaf()
             if not nxt:
@@ -1453,7 +1555,7 @@ async def tool_manage_projects(
 
         if act == "task_list":
             if not project_id:
-                return _err("no active project (pass project_id or switch first)")
+                return _no_active_project(store)
             tasks = store.list_tasks(project_id, status_filter=status_filter)
             # Slim down by default: a 50-task project with full rows
             # easily clears 100KB and triggers context offloading,

@@ -105,6 +105,34 @@
   (write files + verify), failing loudly on a hard task rather than marking
   shallow work done. Covered by <code>tests/test_advance_pacing.py</code> and
   <code>tests/test_coding_executor.py</code>.</p>
+
+  <h2>switch / get resolve a title → id (2026-06-22)</h2>
+  <p>The model routinely passes a project's <strong>title</strong> where an id
+  is expected (<code>switch petai</code>), which hard-errored with "project not
+  found" and burned a <strong>strike</strong> before the model recovered via
+  <code>list</code>+<code>switch</code>-by-id (observed live). <code>switch</code>
+  and <code>get</code> now run the reference through the shared
+  <code>_resolve_project_ref</code> (id first, then a case-insensitive title
+  match) before erroring, so <code>switch petai</code> resolves to the real id.
+  A genuinely unknown reference still errors (the destructive-action contract is
+  unchanged), and an ambiguous title surfaces the candidate ids instead of
+  silently picking one. Covered by <code>tests/test_projects_tool.py</code>.</p>
+
+  <h2>Read with no active project: guide, don't strike (2026-06-22)</h2>
+  <p>A READ action — <code>get</code> / <code>task_list</code> / <code>task_next</code> —
+  invoked with no resolvable project (none passed, none active) used to return
+  <code>ERROR: project_id is required…</code>. The agent loop scores an
+  <code>ERROR</code>-prefixed tool result as a failure and burns a <strong>strike</strong>
+  — harsh for a recoverable usage slip (the model just forgot to say WHICH
+  project), and it happened at the very start of a "resume my project" turn
+  before the model recovered with <code>list</code>+<code>switch</code> (observed
+  live). These reads now return a non-error <code>{"no_active_project": true,
+  "projects": [...], "agent_instruction": "pick one and switch"}</code> — no
+  strike, and the project list is right there so the model can <code>switch</code>
+  in one step instead of an extra <code>list</code> round-trip.
+  <strong>Mutations</strong> (<code>task_add</code>, <code>research</code>, …)
+  keep the hard error: you must not write to an unspecified project. Covered by
+  <code>tests/test_projects_tool.py</code>.</p>
   <p><strong>On a failed/paused batch, STOP and report (2026-06-20).</strong>
   When the loop stops early (a task FAILED, budget, or needs-user), the result
   instruction now tells the agent to report exactly which tasks completed vs

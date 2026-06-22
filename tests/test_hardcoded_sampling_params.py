@@ -215,6 +215,25 @@ def test_selector_contract(is_tool_turn, is_coding, expected):
     assert get_sampling_params(is_tool_turn, is_coding=is_coding) == expected
 
 
+@pytest.mark.parametrize("query", [
+    "refactor the parser", "write the SQL migration", "design the architecture",
+    "build a snake game", "fix the regex", "brainstorm names", "",
+])
+def test_all_coding_subprofiles_pinned_to_model_card(query):
+    """The creative/precise/balanced sub-profiles stay WIRED but every one is
+    pinned to the model-card coding values (temp=0.6, top_p=0.95, top_k=20) —
+    so NO coding turn drifts off-spec regardless of which keywords it hits."""
+    p = get_sampling_params(True, query, is_coding=True)
+    assert p == CODING_SAMPLING_PARAMS
+    assert p["temperature"] == 0.6 and p["top_p"] == 0.95 and p["top_k"] == 20
+
+
+def test_coding_subprofiles_dict_all_equal_spec():
+    from ghost_agent.core.agent import _CODING_TASK_PROFILES
+    for name, prof in _CODING_TASK_PROFILES.items():
+        assert prof == CODING_SAMPLING_PARAMS, name
+
+
 def test_call_site_routes_tool_turns_to_precise_profile():
     """Source-level pin: the agent's call site must pass a flag derived
     from `turn_is_conversational`, not just a coding-intent boolean.

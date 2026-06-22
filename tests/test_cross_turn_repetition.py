@@ -9,7 +9,9 @@ reasoning, each turn within its own budget.
 
 The cross-turn guard fingerprints the first ~300 chars of each turn's
 <think> block into a word set and compares against the prior turn via
-Jaccard. Two consecutive hits ≥ 0.7 → abort.
+Jaccard. Two consecutive hits ≥ 0.85 → abort. (Raised from 0.7: focused
+iterative work shares ~0.7 opening vocabulary; only ~0.85+ is a true
+restart-the-same-derivation loop.)
 """
 
 import json

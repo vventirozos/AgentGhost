@@ -96,7 +96,7 @@ def test_chromium_binary_present_tolerates_exec_exception():
 # Gate invariants: marker + binary must BOTH be good to skip install
 # ------------------------------------------------------------------
 
-def test_v2_marker_gate_name_pinned():
+def test_v3_marker_gate_name_pinned():
     """The marker path is part of the install contract with
     sandbox/Dockerfile. Pin it here so renaming in one place without
     the other is a loud test failure."""
@@ -106,29 +106,29 @@ def test_v2_marker_gate_name_pinned():
     # hold regardless of which method carries the logic.
     src = inspect.getsource(DockerSandbox.ensure_running) + inspect.getsource(
         DockerSandbox._ensure_running_impl)
-    assert "/root/.supercharged.v2" in src, (
-        "marker path drifted from /root/.supercharged.v2 — update "
+    assert "/root/.supercharged.v3" in src, (
+        "marker path drifted from /root/.supercharged.v3 — update "
         "sandbox/Dockerfile in lockstep"
     )
 
 
 def test_legacy_v1_marker_treated_as_unprovisioned():
     """An image from the pre-v2 era has /root/.supercharged but not
-    /root/.supercharged.v2. The gate must detect this and trigger a
+    /root/.supercharged.v3. The gate must detect this and trigger a
     fresh install. We assert the decision by inspecting which
     exec_run calls the code path would make — a full provisioning
     run goes deep into apt+pip and would need a real container.
     Here we stop at the gate and verify it would fall through."""
     sb = _make_sandbox_stub()
     v2_absent = _exec_run_map({
-        "test -f /root/.supercharged.v2": (1, b""),
+        "test -f /root/.supercharged.v3": (1, b""),
     })
     sb.container.exec_run = MagicMock(side_effect=v2_absent)
     # The `_chromium_binary_present` helper should still be called
     # and return False (no binary since nothing was installed).
     assert sb._chromium_binary_present() is False
-    # Gate decision: test -f .supercharged.v2 → 1 → marker_ok=False
-    code, _ = sb.container.exec_run("test -f /root/.supercharged.v2")
+    # Gate decision: test -f .supercharged.v3 → 1 → marker_ok=False
+    code, _ = sb.container.exec_run("test -f /root/.supercharged.v3")
     assert code != 0
 
 
@@ -138,11 +138,11 @@ def test_marker_present_but_binary_missing_triggers_reinstall():
     checked — marker alone is not enough."""
     sb = _make_sandbox_stub()
     responses = _exec_run_map({
-        "test -f /root/.supercharged.v2": (0, b""),     # marker: ok
+        "test -f /root/.supercharged.v3": (0, b""),     # marker: ok
         "find /root/.cache/ms-playwright": (0, b""),    # no binary path
     })
     sb.container.exec_run = MagicMock(side_effect=responses)
-    marker_ok = (sb.container.exec_run("test -f /root/.supercharged.v2")[0] == 0)
+    marker_ok = (sb.container.exec_run("test -f /root/.supercharged.v3")[0] == 0)
     chromium_ok = sb._chromium_binary_present()
     assert marker_ok is True
     assert chromium_ok is False
@@ -154,13 +154,13 @@ def test_marker_present_but_binary_missing_triggers_reinstall():
 def test_both_marker_and_binary_present_skips_install():
     sb = _make_sandbox_stub()
     responses = _exec_run_map({
-        "test -f /root/.supercharged.v2": (0, b""),
+        "test -f /root/.supercharged.v3": (0, b""),
         "find /root/.cache/ms-playwright": (
             0, b"/root/.cache/ms-playwright/chromium-1234/chrome-linux/headless_shell\n"
         ),
     })
     sb.container.exec_run = MagicMock(side_effect=responses)
-    marker_ok = (sb.container.exec_run("test -f /root/.supercharged.v2")[0] == 0)
+    marker_ok = (sb.container.exec_run("test -f /root/.supercharged.v3")[0] == 0)
     chromium_ok = sb._chromium_binary_present()
     assert marker_ok and chromium_ok
     assert not (not marker_ok or not chromium_ok)
@@ -173,7 +173,7 @@ def test_both_marker_and_binary_present_skips_install():
 def test_post_install_verification_refuses_to_mark_on_missing_binary():
     """After running `playwright install chromium --with-deps` the
     code checks the binary actually exists before setting
-    /root/.supercharged.v2. A hypothetical install that exited 0 but
+    /root/.supercharged.v3. A hypothetical install that exited 0 but
     produced no binary must NOT leave a v2-marked image around."""
     import inspect
     # ensure_running is now a thin locking wrapper; the provisioning body
@@ -207,11 +207,11 @@ def test_dockerfile_uses_with_deps_flag():
     )
 
 
-def test_dockerfile_sets_v2_marker():
+def test_dockerfile_sets_v3_marker():
     """The Dockerfile's final marker must match the runtime gate."""
     from pathlib import Path
     dockerfile = Path(__file__).resolve().parent.parent / "sandbox" / "Dockerfile"
-    assert "/root/.supercharged.v2" in dockerfile.read_text(), (
-        "sandbox/Dockerfile must `touch /root/.supercharged.v2` — the "
+    assert "/root/.supercharged.v3" in dockerfile.read_text(), (
+        "sandbox/Dockerfile must touch /root/.supercharged.v3 — the "
         "runtime gate in docker.py reads this exact path"
     )

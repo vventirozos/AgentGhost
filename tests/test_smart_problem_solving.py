@@ -38,8 +38,11 @@ class TestDifferentiatedStrikes:
 class TestProgressiveThinking:
     def test_base_and_extended_caps_defined(self):
         from ghost_agent.core.agent import MAX_THINKING_CHARS, MAX_THINKING_CHARS_EXTENDED
+        # 32K = where loop-checking begins; 200K = the hard backstop (raised
+        # from 64K so a strong model's long-but-legitimate reasoning isn't
+        # guillotined on raw length — only a DETECTED loop aborts in between).
         assert MAX_THINKING_CHARS == 32000
-        assert MAX_THINKING_CHARS_EXTENDED == 64000
+        assert MAX_THINKING_CHARS_EXTENDED == 200000
         assert MAX_THINKING_CHARS_EXTENDED > MAX_THINKING_CHARS
 
     def test_loop_detection_kills_repetitive_content(self):
@@ -166,13 +169,11 @@ class TestAdaptiveSampling:
         assert _classify_coding_task("") == "balanced"
 
     def test_sampling_params_vary_by_task(self):
-        """Coding sub-classification only kicks in when both flags are set.
-
-        New signature: `get_sampling_params(is_tool_turn, query, is_coding)`.
-        Creative / precise / balanced profiles require ``is_coding=True``.
-        A tool turn WITHOUT coding intent uses the base precise profile
-        (temperature=0.6) — that's the fix for over-eager duplicate
-        setter calls on turns that don't involve code.
+        """Coding sub-classification stays wired but all sub-profiles are now
+        pinned to the model-card coding values (2026-06-22), so every coding
+        turn — creative / precise / balanced — runs at temp 0.6. Only the
+        coding-vs-general split varies. Non-coding tool turns also use the base
+        coding profile (the fix for over-eager duplicate setter calls).
         """
         from ghost_agent.core.agent import get_sampling_params
         creative = get_sampling_params(True, "design a new architecture", is_coding=True)
@@ -181,13 +182,13 @@ class TestAdaptiveSampling:
         general = get_sampling_params(False)
         non_coding_tool = get_sampling_params(True, "update the user profile with the name")
 
-        assert creative["temperature"] > precise["temperature"]
+        # All coding sub-profiles collapse to the same model-card values.
+        assert creative["temperature"] == precise["temperature"] == balanced["temperature"] == 0.6
+        # The coding-vs-general split still holds.
         assert general["temperature"] > creative["temperature"]
-        assert precise["temperature"] < balanced["temperature"]
         # Non-coding tool turn must NOT get the warm conversational profile
         # (that was the bug — `update_profile` calls at temp 1.0 were
-        # re-issued in subsequent turns). Must match the base coding
-        # profile (temp 0.6, presence_penalty 0).
+        # re-issued in subsequent turns). Must match the base coding profile.
         assert non_coding_tool["temperature"] == 0.6
         assert non_coding_tool["presence_penalty"] == 0
         assert non_coding_tool["temperature"] < general["temperature"]

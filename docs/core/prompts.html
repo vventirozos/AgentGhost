@@ -40,7 +40,7 @@
   <table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>build_project_briefing(store, project_id, max_events=3, max_open_tasks=8, max_done_tasks=5) -&gt; str</code></td><td>Render the project's cross-turn working memory for prompt injection (line 4): goal, <strong>DESIGN LEDGER</strong>, next/open tasks, <strong>DONE SO FAR</strong> digest, <strong>RESEARCH NOTES</strong>, recent events. Leads with the <strong>ONE TASK AT A TIME</strong> directive. See below.</td></tr>
+      <tr><td><code>build_project_briefing(store, project_id, max_events=3, max_open_tasks=8, max_done_tasks=5, suppress_next_task=False) -&gt; str</code></td><td>Render the project's cross-turn working memory for prompt injection (line 4): goal, <strong>DESIGN LEDGER</strong>, next/open tasks, <strong>DONE SO FAR</strong> digest, <strong>RESEARCH NOTES</strong>, recent events. Leads with the <strong>ONE TASK AT A TIME</strong> directive. <code>suppress_next_task=True</code> (set by the turn loop once a task closed this request) replaces the <code>NEXT TASK</code> pointer with a hard stop. See below.</td></tr>
     </tbody>
   </table>
 
@@ -79,6 +79,78 @@
   runs a single <code>advance_once</code> tick per cooldown, so autonomous
   advancement is one-task-at-a-time too. Covered by
   <code>tests/test_project_pacing.py</code>.</p>
+
+  <h2>ONE TASK AT A TIME — now ENFORCED, not just prompted (2026-06-22)</h2>
+  <p>The rule above was <em>advisory text only</em> — nothing in the interactive
+  turn loop enforced it. Observed live: <em>"start task 1"</em> ran the model
+  through <strong>8 tasks</strong> in a single request. Two things defeated the
+  prompt: (1) <code>build_project_briefing</code> is rebuilt and re-injected on
+  <strong>every loop iteration</strong>, so the instant a task closed, the
+  briefing re-advertised <code>NEXT TASK: [the next one]</code> — the model read
+  that as its new assignment; (2) the turn only ends when the model volunteers a
+  tool-free answer, and nothing forced it to after a task closed. The model even
+  wrote the correct plan (<em>"mark Task 1 DONE and wait for direction"</em>)
+  then overrode itself on the next iteration.</p>
+  <p>Two code-level teeth, both in <a href="../core/agent.html">agent.py</a>'s
+  turn loop, gated on the user's go-ahead NOT being a batch ask
+  (<code>project_advancer.classify_advance_intent</code> → <code>one</code> vs
+  <code>n</code>/<code>all</code>):</p>
+  <ul>
+    <li><strong>Hard stop on close.</strong> When a tool result shows a task
+    actually closed to DONE (<code>_manage_projects_closed_a_task</code> reads
+    the store read-back <code>{"updated":[{"status":"DONE"}]}</code> — a
+    DONE-gated/held update does NOT count), the loop sets
+    <code>force_final_response</code>, so the turn converges to a summary and
+    waits.</li>
+    <li><strong>Stop re-dangling the next task.</strong> Once a task closed this
+    request, the briefing is rebuilt with <code>suppress_next_task=True</code>:
+    the <code>NEXT TASK</code> pointer is replaced by a hard <em>"you completed a
+    task this turn — STOP and wait"</em> note (open tasks are still listed for
+    awareness). Removes the contextual pull that overrode the rule.</li>
+    <li><strong>Honest stop message (2026-06-22).</strong> A model that still
+    emits a tool_call after the turn was finalized has it stripped by the
+    text-only stream scrubber, which then emits a fallback. When the cause is
+    this gate (a task just closed), <code>_scrub_fallback_message</code> returns
+    <em>"✅ Task complete — say proceed / next to continue…"</em> instead of the
+    generic <em>"I prepared a tool call… please rephrase"</em>, which had
+    misled the user into re-issuing a request that already succeeded; the
+    operator log drops from <code>⚠ Stream Scrub Fallback</code> to an
+    informational <code>One Task / Turn</code> line. The generic message still
+    applies to a genuine planner/model routing mismatch.</li>
+  </ul>
+  <p>Net: <em>"start task 1"</em> / <em>"proceed"</em> / <em>"next"</em> advance
+  exactly one task and stop; <em>"do the next 3"</em> / <em>"finish the
+  project"</em> are batch intents that still run multiple (routed to the
+  <code>autoadvance</code> tool). Covered by
+  <code>tests/test_one_task_per_turn.py</code> and the
+  <code>suppress_next_task</code> cases in
+  <code>tests/test_project_pacing.py</code>.</p>
+
+  <h2>Reliability around "start task N" (2026-06-22)</h2>
+  <p>Two more fixes that made single-go-ahead project flow robust, both observed
+  failing live in one session:</p>
+  <ul>
+    <li><strong>Enumerated batches.</strong> <em>"proceed with task 3 and 4"</em>
+    now parses as a 2-task batch (<a href="project_advancer.html"><code>classify_advance_intent</code></a>),
+    so the one-task gate doesn't stop after task 3 and leave task 4 half-done.</li>
+    <li><strong>Conversation-scope escape hatch.</strong> The chat API ships no
+    stable conversation id, so a project bound to one conversation got parked
+    for later turns whose first-message fingerprint differed — the agent then
+    spun (<code>manage_projects get</code> ×3 → loop breaker → scrub fallback).
+    <code>tools.projects.reconcile_conversation</code> now keeps/activates a
+    project when THIS request's user message names it by title or id
+    (<code>_message_references_project</code>), overriding the mismatch.</li>
+    <li><strong>Host-path scrub.</strong> A recalled memory / scratchpad note /
+    workspace narrative could carry a host-absolute sandbox path
+    (<code>/Users/…/Data/AI/Data/sandbox/projects/&lt;id&gt;/…</code>); the model
+    used it in <code>cd</code> and ENOENT'd inside the container (host ≠
+    <code>/workspace</code>), burning strikes. <code>agent._scrub_host_sandbox_paths</code>
+    rewrites such prefixes to the container <code>/workspace</code> form in the
+    injected DYNAMIC SYSTEM STATE.</li>
+  </ul>
+  <p>Covered by <code>tests/test_one_task_per_turn.py</code>,
+  <code>tests/test_project_conversation_scope.py</code>, and
+  <code>tests/test_sandbox_path_scrub.py</code>.</p>
 
   <h2>Tool-orchestration routing rules (SYSTEM_PROMPT)</h2>
   <p>A block of <strong>MANDATORY TRIGGERS</strong> in <code>SYSTEM_PROMPT</code> maps user intents to specific tool calls so the LLM doesn't improvise. Current rules include:</p>

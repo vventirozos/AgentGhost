@@ -46,6 +46,39 @@ async def test_rejects_unknown_action(context):
     assert res.startswith("ERROR")
 
 
+# ------------------------------------------- read actions with no active project
+#
+# A read with no resolvable project is a recoverable usage slip, not a failure:
+# it must NOT return an ERROR (the agent loop scores that as a strike). It
+# returns the project list + a switch hint instead.
+
+@pytest.mark.parametrize("action", ["get", "task_list", "task_next"])
+async def test_read_with_no_active_project_does_not_error(context, action):
+    context.project_store.create_project("Alpha")
+    context.project_store.create_project("Beta")
+    res = await tool_manage_projects(context, action=action)   # no project_id, none active
+    assert not res.startswith("ERROR")                          # → no strike
+    data = _parse(res)
+    assert data["no_active_project"] is True
+    assert len(data["projects"]) == 2                           # list to pick from
+    assert "switch" in data["agent_instruction"].lower()
+
+
+async def test_read_with_explicit_project_id_still_works(context):
+    pid = context.project_store.create_project("Alpha")
+    res = await tool_manage_projects(context, action="get", project_id=pid)
+    data = _parse(res)
+    assert data.get("id") == pid or data.get("title") == "Alpha"
+
+
+async def test_mutation_with_no_active_project_still_errors(context):
+    # task_add is a mutation — keep the hard error (and its strike); you must
+    # not add a task to an unspecified project.
+    res = await tool_manage_projects(context, action="task_add",
+                                     description="do a thing")
+    assert res.startswith("ERROR")
+
+
 async def test_rejects_when_store_missing(tmp_path):
     ctx = SimpleNamespace(project_store=None, scratchpad=None,
                           current_project_id=None)
@@ -225,6 +258,25 @@ async def test_switch_rejects_unknown_project(context):
     res = await tool_manage_projects(context, action="switch",
                                      project_id="nope")
     assert res.startswith("ERROR")
+
+
+async def test_switch_resolves_a_title_to_its_id(context):
+    # The model often passes the TITLE where an id is expected (`switch petai`).
+    # That must resolve, not error + strike.
+    p = _parse(await tool_manage_projects(context, action="create", title="PetAI"))
+    pid = p["created"]
+    await tool_manage_projects(context, action="exit")
+    res = await tool_manage_projects(context, action="switch", project_id="petai")
+    assert not res.startswith("ERROR")
+    assert _parse(res)["switched_to"] == pid
+    assert context.current_project_id == pid
+
+
+async def test_get_resolves_a_title_to_its_project(context):
+    p = _parse(await tool_manage_projects(context, action="create", title="PetAI"))
+    res = await tool_manage_projects(context, action="get", project_id="PetAI")
+    assert not res.startswith("ERROR")
+    assert _parse(res)["id"] == p["created"]
 
 
 async def test_exit_clears_current_and_scratchpad(context):

@@ -73,14 +73,15 @@ def test_non_coding_tool_turn_uses_base_precise_profile():
 
 
 def test_coding_tool_turn_sub_classifies_creative():
-    # "design" and "brainstorm" both hit _CREATIVE_KEYWORDS; no precise
-    # keywords in the query, so the classifier picks "creative".
+    # The classifier still picks "creative" for these keywords, but the
+    # sub-profiles are now all pinned to the model-card coding values (2026-06-22),
+    # so the temperature is 0.6 regardless of sub-class.
     p = get_sampling_params(
         is_tool_turn=True,
         query="design and brainstorm alternative approaches",
         is_coding=True,
     )
-    assert p["temperature"] == 0.8  # creative profile
+    assert p["temperature"] == 0.6  # model-card coding value (was 0.8)
 
 
 def test_coding_tool_turn_sub_classifies_precise_for_sql():
@@ -89,7 +90,7 @@ def test_coding_tool_turn_sub_classifies_precise_for_sql():
         query="write the exact SQL migration for the users table",
         is_coding=True,
     )
-    assert p["temperature"] == 0.3  # precise profile
+    assert p["temperature"] == 0.6  # model-card coding value (was 0.3)
 
 
 def test_coding_tool_turn_sub_classifies_balanced_for_plain_code():

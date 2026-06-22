@@ -76,10 +76,16 @@ NON_THINKING_REASONING_PARAMS = {
     "presence_penalty": 2.0,
 }
 
-# Adaptive sampling profiles for coding sub-tasks (#5)
+# Adaptive sampling profiles for coding sub-tasks. The classifier + routing
+# stay wired (so per-sub-task tuning is a one-line change away), but all three
+# profiles are pinned to the model-card CODING values (temp=0.6, top_p=0.95,
+# top_k=20) — the recommended sampling for this model. The earlier spread
+# (creative temp=0.8/top_k=40, precise temp=0.3/top_p=0.90/top_k=10) drifted
+# coding turns off the model-card values; collapsing them to the "balanced"
+# baseline keeps every coding turn on-spec while preserving the mechanism.
 _CODING_TASK_PROFILES = {
-    "creative":  {"temperature": 0.8, "top_p": 0.95, "top_k": 40, "min_p": 0, "presence_penalty": 0.3},
-    "precise":   {"temperature": 0.3, "top_p": 0.90, "top_k": 10, "min_p": 0, "presence_penalty": 0},
+    "creative":  {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
+    "precise":   {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
     "balanced":  {"temperature": 0.6, "top_p": 0.95, "top_k": 20, "min_p": 0, "presence_penalty": 0},
 }
 
@@ -552,8 +558,14 @@ def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = F
 # Streaming guards. When the upstream model enters a self-repeating thinking
 # loop (re-deriving the same paragraph hundreds of times), we kill the stream
 # instead of burning context indefinitely.
-MAX_THINKING_CHARS = 32000          # initial cap on a single turn's <think> block
-MAX_THINKING_CHARS_EXTENDED = 64000 # extended cap when model is making progress
+MAX_THINKING_CHARS = 32000          # where loop-CHECKING begins (not a kill)
+# 200K (was 64K): the hard length-abort is a true backstop, not a guillotine.
+# Between 32K and 200K the stream is only aborted when `_detect_thinking_loop`
+# actually fires — so a strong model genuinely working a hard algorithm/proof/
+# debug problem (which can legitimately exceed ~16K thinking tokens) is allowed
+# to finish its derivation, while a real repetition loop is still caught at the
+# 32K check and the 200K ceiling stops any pathological runaway.
+MAX_THINKING_CHARS_EXTENDED = 200000
 
 # Upstream `max_tokens` cap for a single tool-using turn. Without this, the
 # payload sends no max_tokens at all and the server default (often 1024 or
@@ -583,6 +595,90 @@ DEFAULT_TOOL_TURN_MAX_TOKENS = 16384
 # "length" on every continuation (mis-reported finish_reason, runaway) can't
 # loop forever — each continuation is a full upstream round-trip.
 MAX_TRUNCATION_CONTINUATIONS = 3
+
+
+def _manage_projects_closed_a_task(tool_name: str, result_text: str) -> bool:
+    """True iff a ``manage_projects`` call actually closed a task to DONE.
+
+    Used to enforce one-task-per-turn in the interactive loop: a single
+    "start task 1" / "proceed" advances EXACTLY one task and then stops, so the
+    agent doesn't grind the whole project tree in one request (observed live).
+
+    The signal is the store read-back the tool returns — ``{"updated":[{"id":…,
+    "status":"DONE"},…]}`` — NOT the requested status, so a DONE-gated/held
+    update (status stays non-DONE pending verification) correctly does NOT
+    trip the gate. Defensive: any parse problem returns False.
+    """
+    if tool_name != "manage_projects" or not result_text:
+        return False
+    # Cheap pre-check before paying for a JSON parse.
+    if '"status": "DONE"' not in result_text:
+        return False
+    try:
+        payload = json.loads(result_text)
+    except Exception:
+        return False
+    updated = payload.get("updated") if isinstance(payload, dict) else None
+    if not isinstance(updated, list):
+        return False
+    return any(isinstance(u, dict) and str(u.get("status", "")).upper() == "DONE"
+               for u in updated)
+
+
+def _scrub_host_sandbox_paths(text: str, sandbox_root) -> str:
+    """Rewrite any HOST-absolute sandbox path leaking into the model's context
+    to its container-visible ``/workspace`` form.
+
+    A recalled memory, a scratchpad note, or a workspace narrative written in a
+    PRIOR session can carry an absolute host path like
+    ``/Users/x/Data/AI/Data/sandbox/projects/<id>/...``. The model runs shell
+    commands INSIDE the container, where the sandbox root is bind-mounted at
+    ``/workspace`` and that host path does NOT exist — so a ``cd`` to it ENOENTs
+    and burns a strike (observed live 3× in one session: the model kept doing
+    ``cd /Users/.../sandbox/projects/<id>/PetAI``). The container form is valid
+    for both the shell and the file tools (``_get_safe_path`` accepts
+    ``/workspace/...``). Best-effort; returns the text unchanged on any problem.
+    """
+    if not text or not sandbox_root:
+        return text
+    roots = []
+    try:
+        roots.append(str(Path(sandbox_root)))
+        rp = str(Path(sandbox_root).resolve())
+        if rp not in roots:
+            roots.append(rp)
+    except Exception:
+        roots = [str(sandbox_root)]
+    for r in roots:
+        if r and r not in ("/", "") and r in text:
+            text = text.replace(r, "/workspace")
+    return text
+
+
+def _scrub_fallback_message(intended: str, task_closed: bool) -> str:
+    """User-facing text when a text-only turn's tool_call was fully scrubbed.
+
+    Two causes, two messages:
+      * ``task_closed`` — the one-task-per-turn gate finalized the turn after a
+        project task closed; the dropped tool_call was the model trying to start
+        the NEXT task. Say so plainly — telling the user to "rephrase" a request
+        that already succeeded is misleading.
+      * otherwise — a genuine planner/model routing mismatch (the turn was
+        routed text-only but the model still wanted a tool). Keep the generic
+        prepared-a-tool-call guidance.
+    """
+    if task_closed:
+        return (
+            "✅ Task complete. I've stopped here so you stay in control — say "
+            "*proceed* / *next* to continue with the next task, *do the rest* to "
+            "run the remaining tasks, or give new direction."
+        )
+    tool = intended or "the command"
+    msg = "I prepared a tool call but this turn was routed as text-only, so it wasn't executed."
+    if intended:
+        msg += f" (Intended tool: `{intended}`.)"
+    msg += f" Please rephrase your request — for example, `run {tool}` — or try again."
+    return msg
 
 
 def _distill_terminal_tool_summary(tool_name: str, raw: str) -> str:
@@ -683,16 +779,17 @@ def _tool_call_truncated(content: str) -> bool:
     if fn_opens > fn_closes:
         return True
     return False
-THINKING_LOOP_PROBE_EVERY = 300     # run the repetition probe every N chars
-THINKING_LOOP_WINDOW = 150          # length of the n-gram we look for
-THINKING_LOOP_THRESHOLD = 2         # window appearing >= N times = loop
-# Prior settings (500 / 200 / 3) meant the probe needed ~600 chars of
-# actual repetition before it fired. The 2026-04-19 trace 0B showed the
-# model emitting ~10000 chars of "I'll write X. Then Y. Then Z." before
-# the detector aborted — 60+ seconds of wasted decode time. Dropping
-# the threshold to 2×150 fires at ~300 chars (5-10s), which is an
-# acceptable false-positive risk given how distinctive enumeration
-# loops are (the 150-char tail is usually "I'll write X. Then Y.").
+THINKING_LOOP_PROBE_EVERY = 500     # run the repetition probe every N chars
+THINKING_LOOP_WINDOW = 200          # length of the n-gram we look for
+THINKING_LOOP_THRESHOLD = 3         # window appearing >= N times = loop
+# Reverted to the conservative (500/200/3) — needs ~600 chars of genuine
+# repetition before firing. The aggressive (300/150/2) was tuned to kill a
+# weak model's "I'll write X. Then Y. Then Z." enumeration loops fast, at an
+# explicitly "acceptable false-positive risk". A strong model rarely produces
+# those loops, so that false-positive cost (aborting legitimate reasoning that
+# restates a constraint / loop invariant / repeated code pattern) now outweighs
+# the benefit. The tool_call-collapse probe + the 200K char ceiling remain as
+# fast backstops for the genuine runaway case.
 
 # Tool-call generation-collapse detector. In the wild we've seen Qwen
 # emit 8000+ consecutive `<tool_call>` tokens with zero `</tool_call>` /
@@ -2186,7 +2283,7 @@ class GhostAgent:
                                         "Output ONLY the one word.\n\nTASK: "
                                         + str(description)[:500])}],
                                     "temperature": 0.0, "max_tokens": 8, "stream": False,
-                                })
+                                }, is_background=True)
                                 out = ((_r or {}).get("choices", [{}])[0]
                                        .get("message", {}).get("content", "") or "").strip().lower()
                                 for label in ("needs_user", "coding", "research"):
@@ -2205,7 +2302,7 @@ class GhostAgent:
                                     "explanation, no markdown fences.\n\nTASK: "
                                     + str(description)[:500])}],
                                 "temperature": 0.2, "max_tokens": 1024, "stream": False,
-                            })
+                            }, is_background=True)
                             out = ((_r or {}).get("choices", [{}])[0]
                                    .get("message", {}).get("content", "") or "").strip()
                             if out.startswith("```"):
@@ -2214,7 +2311,15 @@ class GhostAgent:
                                     out = out.split("\n", 1)[1]
                             return out.strip()
 
-                        from .coding_executor import build_coding_task as _aa_build
+                        from .coding_executor import build_coding_task as _bct
+
+                        async def _aa_build(*a, **kw):
+                            # IDLE build — defer its spec-generation LLM call to
+                            # the background lane so a user who starts typing
+                            # mid-build isn't stuck behind a 8K-token spec call.
+                            kw.setdefault("is_background", True)
+                            return await _bct(*a, **kw)
+
                         result = await _advance_once(
                             ctx, pid, tool_runner=_aa_tool_runner,
                             llm_classifier=_aa_classify,
@@ -3882,6 +3987,25 @@ class GhostAgent:
                 _request_sys3_prev_justification = ""
                 force_final_response = False
 
+                # --- Interactive "one task per turn" enforcement -------------
+                # The project briefing re-advertises a live NEXT TASK on EVERY
+                # loop iteration, which pulls a small model into grinding the
+                # whole project tree on a single "start task 1" / "proceed"
+                # (observed live: one go-ahead built 8 tasks). The HARD-RULE
+                # prompt text alone can't stop it. So: once a project task is
+                # actually closed DONE this request, suppress the NEXT TASK
+                # pointer and force the turn to wrap up — UNLESS the user asked
+                # for a batch ("do the next 3", "finish the project"), which the
+                # prompt routes to manage_projects autoadvance instead.
+                _proj_task_closed_this_req = False
+                try:
+                    from .project_advancer import classify_advance_intent as _cai
+                    _user_batch_intent = (_cai(
+                        getattr(self.context, "last_user_content", "") or ""
+                    ).get("mode") in ("all", "n"))
+                except Exception:
+                    _user_batch_intent = False
+
                 # --- VERIFIER-GATE AUTO-REPAIR state (bounded) ---
                 # When the verifier REFUTES the final answer (or the turn
                 # finalised on an unverified mutation), inject the critique
@@ -4357,11 +4481,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _proj_store = getattr(self.context, "project_store", None)
                         _proj_id = getattr(self.context, "current_project_id", None)
                         if _proj_store is not None and _proj_id:
-                            _briefing = build_project_briefing(_proj_store, _proj_id)
+                            _briefing = build_project_briefing(
+                                _proj_store, _proj_id,
+                                suppress_next_task=_proj_task_closed_this_req)
                             if _briefing:
                                 dynamic_state += _briefing + "\n"
                     except Exception:
                         logger.debug("project briefing skipped", exc_info=True)
+                    # Re-assert the wrap-up gate every iteration: once a project
+                    # task was closed this request, the turn must converge to a
+                    # final answer (no further tool calls / no next task).
+                    if _proj_task_closed_this_req:
+                        force_final_response = True
                     if has_coding_intent:
                         dynamic_state += f"CURRENT SANDBOX STATE:\n{sandbox_state}\n\n"
                     if use_plan and not turn_is_conversational and 'thought_content' in locals() and thought_content:
@@ -4372,6 +4503,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             force_final_response = True
                         else:
                             dynamic_state += "CRITICAL INSTRUCTION: Execute the tool(s) required for the FOCUS TASK. You MAY emit MULTIPLE <tool_call> blocks in parallel within this turn when they all serve the same FOCUS TASK (e.g. writing several project files, batching knowledge_base inserts). DO NOT HALLUCINATE TOOL OUTPUTS.\n"
+
+                    # Rewrite any leaked HOST-absolute sandbox path (from a
+                    # recalled memory / scratchpad / workspace narrative) to its
+                    # container /workspace form, so the model never builds a
+                    # `cd /Users/.../sandbox/...` that ENOENTs in the container.
+                    dynamic_state = _scrub_host_sandbox_paths(
+                        dynamic_state, getattr(self.context, "sandbox_dir", None))
 
                     # -----------------------------------------------------------------
                     # QWEN-AGENT METHODOLOGY: Bypass Native Tools & Use String Prompts
@@ -4810,13 +4948,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # remaining case: the planner routed the
                                 # turn as text-only but the model still
                                 # emitted a tool_call.
-                                _fallback_text = (
-                                    "I prepared a tool call but this turn was routed as "
-                                    "text-only, so it wasn't executed."
-                                    + (f" (Intended tool: `{_intended}`.)" if _intended else "")
-                                    + " Please rephrase your request — for example, "
-                                    "`run {_intended}` — or try again.".replace("{_intended}", _intended or "the command")
-                                )
+                                # When the turn was finalized BECAUSE a project
+                                # task closed this turn (one-task-per-turn gate),
+                                # the scrubbed tool_call was the model trying to
+                                # barrel into the next task — say that honestly
+                                # rather than telling the user to "rephrase" a
+                                # request that already succeeded.
+                                _fallback_text = _scrub_fallback_message(
+                                    _intended, _proj_task_closed_this_req)
                                 _fallback_chunk = {
                                     "id": f"chatcmpl-{req_id}",
                                     "object": "chat.completion.chunk",
@@ -4829,11 +4968,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     }],
                                 }
                                 yield f"data: {json.dumps(_fallback_chunk)}\n\n".encode('utf-8')
-                                pretty_log(
-                                    "Stream Scrub Fallback",
-                                    f"Scrub consumed entire response (intended={_intended or 'unknown'}); emitted fallback.",
-                                    level="WARNING", icon=Icons.WARN,
-                                )
+                                if _proj_task_closed_this_req:
+                                    # Expected: the one-task gate finalized the
+                                    # turn and dropped the model's attempt to
+                                    # start the next task. Not a problem — log
+                                    # at INFO so it doesn't read as an error.
+                                    pretty_log(
+                                        "One Task / Turn",
+                                        f"Stopped after a task closed; dropped the model's "
+                                        f"next-task {_intended or 'tool'} call — awaiting user go-ahead.",
+                                        level="INFO", icon=Icons.BRAIN_PLAN,
+                                    )
+                                else:
+                                    pretty_log(
+                                        "Stream Scrub Fallback",
+                                        f"Scrub consumed entire response (intended={_intended or 'unknown'}); emitted fallback.",
+                                        level="WARNING", icon=Icons.WARN,
+                                    )
 
                             # Release any held [DONE] sentinel now that
                             # (a) all content chunks have been emitted and
@@ -5372,7 +5523,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _inter = _stream_opening_words & prev_turn_opening_words
                             _uni = _stream_opening_words | prev_turn_opening_words
                             _jac = len(_inter) / len(_uni) if _uni else 0.0
-                            if _jac >= 0.7:
+                            # 0.85 (was 0.7): focused iterative work — refining
+                            # the same function, debugging the same test — opens
+                            # consecutive turns with naturally overlapping (~0.7)
+                            # vocabulary. Only near-identical (~0.85+) openings
+                            # indicate an actual restart-the-same-derivation loop.
+                            if _jac >= 0.85:
                                 cross_turn_repeat_hits += 1
                                 pretty_log(
                                     "Cross-Turn Repetition",
@@ -5421,7 +5577,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # the caller surface the failure. First event
                             # still gets the old retry path so normal
                             # one-off over-thinking is recoverable.
-                            if thinking_cap_events >= 2:
+                            if thinking_cap_events >= 3:
                                 pretty_log(
                                     "Loop Breaker",
                                     f"Thinking cap hit {thinking_cap_events}x in one attempt — aborting.",
@@ -6967,6 +7123,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         for i, result in enumerate(results):
                             fname, tool_id, a_hash, is_mutating, ptarget = tool_call_metadata[i]
                             str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
+
+                            # One-task-per-turn gate: a manage_projects call that
+                            # actually closed a task to DONE ends the interactive
+                            # turn, so a single "start task 1" advances exactly
+                            # one task and stops. Skipped when the user asked for
+                            # a batch ("do the next 3" / "finish the project").
+                            if (not _proj_task_closed_this_req and not _user_batch_intent
+                                    and _manage_projects_closed_a_task(fname, str_res)):
+                                _proj_task_closed_this_req = True
+                                force_final_response = True
+                                logger.info(
+                                    "one-task-per-turn: project task closed DONE "
+                                    "— forcing turn to wrap up and wait for the user")
 
                             # Metacog per-tool outcome (roadmap phase 2.3):
                             # record THIS result's tool keyed on its OWN

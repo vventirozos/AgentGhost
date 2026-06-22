@@ -32,7 +32,7 @@
       <tr><td><code>classify_task(description) -&gt; "needs_user" | "coding" | "research"</code></td><td>Keyword-driven classifier (line 85).</td></tr>
       <tr><td><code>async advance_once(context, project_id, tool_runner, llm_classifier, code_generator) -&gt; AdvanceResult</code></td><td>One advancement tick — claims the next ready leaf, runs one constrained step, persists status+result.</td></tr>
       <tr><td><code>async advance_many(context, project_id, *, max_tasks, …, stop_on_fail=True) -&gt; AdvanceManyResult</code></td><td>BOUNDED loop of <code>advance_once</code> ticks for the batch case (see below).</td></tr>
-      <tr><td><code>classify_advance_intent(text) -&gt; {mode, count}</code></td><td>Map a user pacing directive to <code>one</code> / <code>n</code> / <code>all</code>.</td></tr>
+      <tr><td><code>classify_advance_intent(text) -&gt; {mode, count}</code></td><td>Map a user pacing directive to <code>one</code> / <code>n</code> / <code>all</code>. Recognizes enumerated tasks — <em>"task 3 and 4"</em>, <em>"tasks 3, 4 and 5"</em> → <code>n</code> with <code>count</code>=the number of indices (2026-06-22); without this they parsed as a single go-ahead and the one-task-per-turn gate stopped after the first, leaving the rest half-done.</td></tr>
       <tr><td><code>default_llm_classifier(context)</code> · <code>default_code_generator(context)</code></td><td>Build the LLM-backed per-task executors (or <code>None</code>); shared by the tool path and the idle autoadvancer.</td></tr>
       <tr><td><code>project_dream_pass(store, llm_summarize)</code></td><td>Consolidate accumulated project events into a daily digest.</td></tr>
     </tbody>
@@ -81,6 +81,25 @@
   <code>tests/test_advance_pacing.py</code>, and
   <code>tests/test_coding_executor.py</code>.</p>
 
+  <p><strong>Strong code-file signal beats a research verb (2026-06-22).</strong>
+  A residual hole in the keyword classifier: <code>classify_task</code> checks
+  research keywords BEFORE coding ones, so a build leaf whose description also
+  contained a research verb was still mis-routed. Observed live (project
+  <code>33e23d50</code>): the leaf <em>"analyze training logs
+  (analyze_results.py) — produce metrics summary… saved as
+  results/report.md"</em> hit <code>analyze</code> (research) and was
+  <code>web_search</code>ed into a phantom DONE, never building the script — the
+  model later flagged it as <em>"a phantom task… auto-researched but not
+  actually built."</em> Fix: when a description names a concrete source/artifact
+  file (<code>_STRONG_CODE_FILE_RE</code>: <code>.py .js .html .md .json …</code>)
+  AND carries a build verb (<code>produce · build · create · write · generate ·
+  save · …</code>), classify it <strong>coding</strong> ahead of the research
+  check. <code>needs_user</code> still wins (checked first), so
+  <em>"publish report.md"</em> routes to the human, and a file mentioned without
+  a build verb (<em>"investigate what config.yaml controls"</em>) stays research.
+  Covered by <code>test_classify_strong_code_file_beats_research_verb</code> in
+  <code>tests/test_project_advancer.py</code>.</p>
+
   <h2>Classification keywords</h2>
   <ul>
     <li><strong>needs_user</strong>: <code>decide · approve · sign off · delete production</code>.</li>
@@ -97,7 +116,7 @@
     <li>Pick tool: coding → <code>execute</code> with code from the injected <code>code_generator</code> (or, if none, <strong>degrade to <code>web_search</code></strong> — never the old inert <code>"# Autoadvance stub"</code> comment that marked the task DONE having run nothing); research → <code>web_search</code>.</li>
     <li>Run tool through the injected runner.</li>
     <li>Store result as a project artifact.</li>
-    <li><strong>Stricter completion:</strong> if the tool ran but returned an error or no usable output (<code>_looks_like_failure</code> — empty, or a first line starting <code>ERROR:</code> / <code>Traceback</code>), flip the task to <strong>FAILED</strong> and log <code>autoadvance_failed</code> instead of marking it DONE. The old path recorded DONE on <em>any</em> output, so a failed <code>web_search</code> still counted as progress (theatrical completion). The no-runner classify-only path still marks DONE, as before.</li>
+    <li><strong>Stricter completion:</strong> if the tool ran but returned an error or no usable output (<code>_looks_like_failure</code> — empty, or a first line starting <code>ERROR:</code> / <code>Traceback</code>), flip the task to <strong>FAILED</strong> and log <code>autoadvance_failed</code> instead of marking it DONE. The old path recorded DONE on <em>any</em> output, so a failed <code>web_search</code> still counted as progress (theatrical completion). The no-runner classify-only path still marks DONE, as before. <em>(2026-06-22)</em> <code>_looks_like_failure</code> now strips leading quote/paren/bracket punctuation before the prefix test: a transport failure surfaced as a stringified exception tuple <code>('error sending request for url …', '…')</code>, whose leading <code>('</code> hid the error marker, so an erroring search still marked its task DONE (observed live on project <code>33e23d50</code>). Covered by <code>test_looks_like_failure</code> in <code>tests/test_project_advancer.py</code>.</li>
     <li>Check human-gate postconditions (<a href="project_safety.html">project_safety</a>) → flip to NEEDS_USER if any fire.</li>
     <li><strong>Auto-research persistence (research tasks):</strong> when a research-classified task ran a real <code>web_search</code> and got usable output, that output is turned into a durable, summarised brief in the project workspace (<code>research/&lt;slug&gt;.md</code>) and indexed via <a href="project_research.html">project_research</a> — no second search. The synthesised summary becomes the task's <code>result_summary</code> and the brief path is added to the step event + result. Best-effort: never breaks the tick.</li>
     <li>Detect contradictions with DONE siblings.</li>

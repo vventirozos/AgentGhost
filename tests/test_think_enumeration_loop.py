@@ -24,36 +24,46 @@ from ghost_agent.core.agent import (
 from ghost_agent.core.prompts import THINK_BUDGET_TIGHT
 
 
-# --------------------------------------------------------- tightened thresholds
+# --------------------------------------------------------- conservative thresholds
+#
+# 2026-06-22: the aggressive (300/150/2) tightening was REVERTED to the
+# conservative (500/200/3). It was tuned to kill a weak model's enumeration
+# loops fast at an "acceptable false-positive risk"; a strong model rarely
+# produces those loops, so that false-positive cost (aborting legitimate
+# reasoning that restates a constraint / invariant) now outweighs the benefit.
+# The detector still catches a GENUINE loop (≥3 repeats of a 200-char window),
+# and the tool_call-collapse probe + the 200K-char ceiling remain fast backstops.
 
-def test_window_tightened_post_0b_trace():
-    """Regression: the 0B trace ran for ~600 chars of visible repetition.
-    Post-fix must fire earlier than that."""
-    assert THINKING_LOOP_WINDOW <= 150
-
-
-def test_threshold_tightened_post_0b_trace():
-    assert THINKING_LOOP_THRESHOLD <= 2
-
-
-def test_probe_frequency_tightened():
-    assert THINKING_LOOP_PROBE_EVERY <= 300
+def test_thresholds_are_conservative_for_strong_model():
+    assert THINKING_LOOP_WINDOW == 200
+    assert THINKING_LOOP_THRESHOLD == 3
+    assert THINKING_LOOP_PROBE_EVERY == 500
 
 
 # --------------------------------------------------------- enumeration pattern
 
 def test_enumeration_pattern_trips_detector():
-    """The exact shape from the trace: 'I'll write X. Then Y. Then Z.'
-    repeated. Must be flagged by the detector. Three repeats × 150 chars
-    each is more than enough to trip the new threshold."""
+    """A genuine loop still trips: a >200-char unit repeated 4× (clearly
+    repetitive) must be flagged even under the conservative (200/3) detector."""
     enumeration = (
         "I'll write streaming_reader.py. Then aggregator.py. "
         "Then output_report.py. Then cli.py. Then test_parser.py. "
-        "Then I'll mark the tasks as DONE and move on. "
+        "Then config_loader.py. Then schema_validator.py. "
+        "Then I'll mark the tasks as DONE and move on next. "  # >200 chars/unit
     )
-    # 150 chars × 4 repeats = 600 chars; detector (150/2) should fire
+    assert len(enumeration) > 200
     buf = enumeration * 4
     assert _detect_thinking_loop(buf) is True
+
+
+def test_modestly_repeating_reasoning_is_not_a_loop():
+    """Two passes of similar-but-not-identical reasoning (the false-positive
+    the aggressive 2× threshold caught) is NOT flagged under (200/3)."""
+    a = ("Let me verify the parser handles empty lines, then check the "
+         "aggregator sums per-key counts correctly before writing output. ")
+    b = ("Now let me verify the parser also handles comment lines, then check "
+         "the aggregator orders keys deterministically before writing output. ")
+    assert _detect_thinking_loop(a + b) is False
 
 
 def test_short_nonrepeating_thinking_passes():

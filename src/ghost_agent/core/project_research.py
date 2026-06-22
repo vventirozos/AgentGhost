@@ -149,6 +149,81 @@ def get_research_index(store, project_id: str) -> List[Dict[str, Any]]:
     return list(idx) if isinstance(idx, list) else []
 
 
+def _heading_or_topic(text: str, fallback: str) -> str:
+    """First Markdown heading in the brief (the agent's own title), else a
+    de-slugified fallback. Bounded to keep the index line compact."""
+    for ln in (text or "").splitlines()[:12]:
+        s = ln.strip()
+        if s.startswith("#"):
+            t = s.lstrip("#").strip()
+            # Strip the auto-generator's "Research: " prefix if present.
+            t = re.sub(r"^research:\s*", "", t, flags=re.IGNORECASE)
+            if t:
+                return t[:80]
+    return (fallback or "").replace("-", " ").replace("_", " ").strip()[:80] or "research"
+
+
+def reconcile_research_dir(store, project_id: str) -> int:
+    """Register any ``**/research/*.md`` brief written DIRECTLY (via a plain
+    ``file_system`` write) that isn't already in the metadata index.
+
+    The agent often saves a research brief with a bare ``file_system`` write
+    instead of ``manage_projects action=research`` / the autoadvancer — and
+    those direct writes never reached the index, so the brief was invisible to
+    the briefing and the agent never re-read its own work (observed live:
+    ``PetAI/research/transformer-from-scratch.md`` written once, never used).
+    This scans the project workspace for research briefs anywhere (the agent
+    may nest them under a self-named subdir) and indexes the new ones, keyed by
+    PATH so a brief already indexed by the research tool is not duplicated.
+    Returns the count newly indexed. Best-effort; never raises.
+    """
+    try:
+        root = getattr(store, "sandbox_root", None)
+        pid = str(project_id or "").strip().lower()
+        if not root or not pid:
+            return 0
+        base = Path(root) / "projects" / pid
+        if not base.is_dir():
+            return 0
+        known_paths = {e.get("path") for e in get_research_index(store, project_id)
+                       if isinstance(e, dict)}
+        added = 0
+        import os
+        for dirpath, _dirs, files in os.walk(base):
+            # Only descend interest: a file is a research brief when one of its
+            # parent directories is literally "research".
+            rel_dir = Path(dirpath).relative_to(base).as_posix()
+            parts = [p for p in rel_dir.split("/") if p]
+            if "research" not in parts:
+                continue
+            for fn in sorted(files):
+                if not fn.lower().endswith(".md") or fn.lower() == "index.md":
+                    continue
+                rel = (Path(dirpath) / fn).relative_to(base).as_posix()
+                if rel in known_paths:
+                    continue
+                try:
+                    text = (Path(dirpath) / fn).read_text(errors="replace")
+                except OSError:
+                    continue
+                entry = {
+                    "topic": _heading_or_topic(text, Path(fn).stem),
+                    "slug": _slugify(rel[:-3]),          # path-based → unique
+                    "path": rel,
+                    "ts": (Path(dirpath) / fn).stat().st_mtime,
+                    "summary_preview": _first_line(text)[:160],
+                    "sources_count": 0,
+                    "origin": "direct_write",
+                }
+                _upsert_index(store, project_id, entry)
+                known_paths.add(rel)
+                added += 1
+        return added
+    except Exception:
+        logger.debug("reconcile_research_dir failed", exc_info=True)
+        return 0
+
+
 def _upsert_index(store, project_id: str, entry: Dict[str, Any]) -> None:
     """Insert/replace an index entry by slug, newest last, capped."""
     proj = store.get_project(project_id) or {}

@@ -67,6 +67,31 @@ def test_briefing_drops_old_parallel_directive(store):
     assert "stack ALL" not in briefing
 
 
+def test_briefing_shows_next_task_by_default(store):
+    pid = store.create_project("P", goal="g")
+    plan = ProjectPlan(store, pid)
+    plan.add_task("first task")
+    plan.add_task("second task")
+    briefing = build_project_briefing(store, pid)
+    assert "NEXT TASK:" in briefing
+
+
+def test_briefing_suppresses_next_task_after_a_close(store):
+    # Once a task has been closed this request, the NEXT TASK pointer is
+    # replaced by a hard stop so the model doesn't roll into the next task.
+    pid = store.create_project("P", goal="g")
+    plan = ProjectPlan(store, pid)
+    plan.add_task("first task")
+    plan.add_task("second task")
+    briefing = build_project_briefing(store, pid, suppress_next_task=True)
+    assert "NEXT TASK:" not in briefing
+    assert "completed a task this turn" in briefing
+    assert "STOP" in briefing
+    # the pending tasks are still listed (situational awareness), just not
+    # advertised as the thing to start now
+    assert "OPEN TASKS" in briefing
+
+
 # ------------------------------------------------------------- create / decompose
 
 @pytest.mark.asyncio

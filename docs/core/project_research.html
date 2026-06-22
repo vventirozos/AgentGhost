@@ -57,6 +57,38 @@
   <h2>Awareness</h2>
   <p><a href="prompts.html"><code>build_project_briefing</code></a> reads the metadata index (no file I/O) and appends a <strong>RESEARCH NOTES</strong> section listing recent topics → file paths with a one-line preview, so the agent sees what it has already researched on every turn it works the project — and is told to read a brief with <code>file_system</code> before re-researching it. The <code>manage_projects</code> create/switch/resume briefing dict carries a compact <code>research</code> list too.</p>
 
+  <h2>Directly-written briefs get indexed too (2026-06-22)</h2>
+  <p>The agent frequently saves a research brief with a bare <code>file_system</code>
+  write (during a "Research" task) instead of <code>action=research</code> — and
+  those direct writes never reached <code>metadata.research_index</code>, so the
+  briefing didn't surface them and the agent <em>never re-read its own
+  research</em> (observed live: <code>PetAI/research/transformer-from-scratch.md</code>
+  written once, then ignored while the model rebuilt everything from parametric
+  memory). <code>reconcile_research_dir(store, project_id)</code> walks the
+  project workspace for <code>**/research/*.md</code> briefs anywhere (the agent
+  may nest them under a self-named subdir, not just <code>&lt;workspace&gt;/research/</code>),
+  and indexes any not already present — keyed by <strong>path</strong> so a brief
+  the research tool already indexed isn't duplicated; the <code>topic</code> is
+  taken from the brief's first Markdown heading. It runs after every
+  <a href="../tools/projects.html"><code>manage_projects</code></a>
+  <code>task_update</code> (closing a task is a natural "I produced something"
+  checkpoint), so the next turn's briefing advertises the brief. Entries carry
+  <code>origin: "direct_write"</code>. Covered by
+  <code>tests/test_research_reuse.py</code>.</p>
+
+  <h2>Research reaches the build (2026-06-22)</h2>
+  <p>Awareness alone wasn't enough — the <a href="coding_executor.html">coding
+  executor</a> never saw the research at all: <code>_gather_project_files</code>
+  skipped the whole <code>research/</code> tree, so build tasks rebuilt without
+  the design decisions the agent had researched. Now
+  <code>project_advancer._gather_research_briefs</code> reads the briefs (head
+  excerpts, bounded) and passes them to <code>build_coding_task</code> as
+  <code>research_context</code>, rendered in the spec prompt as <strong>PROJECT
+  RESEARCH (reference — build consistently with these; NOT files to edit)</strong>.
+  <code>_gather_project_files</code> now excludes <code>research/</code>
+  <em>anywhere</em> (not just the root) from the editable file set, so a brief is
+  never mistaken for a build target the model must grow.</p>
+
   <h2>Robustness</h2>
   <p>Every path degrades and never raises into the caller: missing LLM → heuristic summary (the top result titles); missing search runner → sourceless brief; missing workspace → a clean <code>ok=False</code> result. The autoadvance hook is wrapped so a research failure can't break a tick.</p>
   <p>The summariser and topic-proposer issue a <strong>no-think</strong> utility completion (<code>_llm_complete</code>): a plain foreground <code>chat_completion</code> with thinking disabled — the <code>/no_think</code> soft-switch + <code>chat_template_kwargs:{enable_thinking:false}</code> hard-switch + a system nudge, mirroring <a href="dream.html">core.dream</a>. This matters because the upstream runs as a reasoning model under <code>--deep-reason</code>: a utility call with thinking left ON burns the entire token budget inside <code>&lt;think&gt;</code> and returns an <em>empty</em> <code>content</code> (verified live: <code>finish_reason=length</code>, all completion tokens spent on <code>reasoning_content</code>), which silently dropped the summary to the title-list fallback. Responses are still defensively cleaned — <code>_strip_think</code> removes any stray <code>&lt;think&gt;</code> block and <code>_message_text</code> salvages <code>reasoning_content</code> if <code>content</code> is empty. The index <code>summary_preview</code> skips Markdown headings so it reads as a real sentence. Covered by <code>tests/test_project_research.py</code> and <code>tests/test_project_advancer.py</code>.</p>

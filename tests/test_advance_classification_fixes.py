@@ -183,7 +183,7 @@ async def test_build_spec_prompt_instructs_extend_when_files_exist():
     captured = {}
 
     class LLM:
-        async def chat_completion(self, payload):
+        async def chat_completion(self, payload, is_background=False, **_kw):
             captured["user"] = payload["messages"][-1]["content"]
             return {"choices": [{"message": {"content": "{}"}}]}
 
