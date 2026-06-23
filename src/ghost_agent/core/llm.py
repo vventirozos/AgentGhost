@@ -709,7 +709,32 @@ class LLMClient:
                 async with self._main_node_lock:
                     resp = await self.http_client.post("/v1/chat/completions", json=payload, **kwargs)
                 resp.raise_for_status()
-                return resp.json()
+                # A 200 with an empty / non-JSON body crashed here as
+                # `json.JSONDecodeError: Expecting value: line 1 column 1 (char
+                # 0)` → "Upstream Fatal", turning a recoverable state into a hard
+                # failure (observed right after a context overflow: the server
+                # returned 0 bytes while the emergency-prune retry was in flight).
+                # Treat it as a transient upstream glitch: retry once, then raise
+                # a clean, explanatory error instead of a bare decoder traceback.
+                try:
+                    return resp.json()
+                except ValueError as je:   # JSONDecodeError subclasses ValueError
+                    # NB: do not reference `json` here — conditional `import json`
+                    # in the swarm branches above makes the name function-local
+                    # and thus unbound on this (no-swarm) path.
+                    body_len = len(resp.text or "")
+                    if attempt < 1:
+                        pretty_log("Upstream Empty Body",
+                                   f"HTTP {resp.status_code} with non-JSON body ({body_len} B) — retrying",
+                                   level="WARNING", icon=Icons.RETRY)
+                        await asyncio.sleep(2)
+                        continue
+                    raise RuntimeError(
+                        f"Upstream returned an empty/non-JSON response "
+                        f"(HTTP {resp.status_code}, {body_len} bytes) after retry. "
+                        f"This typically follows a context overflow or an upstream "
+                        f"restart; the request did not complete."
+                    ) from je
             except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.ConnectError) as e:
                 if attempt < 1:
                     wait_time = 2

@@ -147,6 +147,11 @@
   </table>
   <p><code>foreground_requests</code> is bracketed at the API layer by <code>routes._mark_foreground(agent, ±1)</code> around both chat handlers (the streaming one spans the whole SSE generator, agent loop + final-answer streaming). The helper only touches a counter that is actually an <code>int</code>, so mocked test apps and partial contexts no-op instead of raising. Self-play's isolated <code>handle_chat</code> runs never pass the API layer, so background cycles cannot deadlock themselves. Covered by <code>tests/test_foreground_yield.py</code>.</p>
 
+  <h2>Empty / non-JSON upstream body — crash-proof decode (2026-06-23)</h2>
+  <p>On the non-streaming path <code>_do_chat_completion</code> returned <code>resp.json()</code> directly. A <strong>200 with an empty body</strong> therefore crashed as <code>json.JSONDecodeError: Expecting value: line&nbsp;1 column&nbsp;1 (char&nbsp;0)</code>, which the generic handler logged as &ldquo;Upstream&nbsp;Fatal&rdquo; and re-raised. Observed live right after a context overflow: while the agent's emergency-prune retry was in flight the upstream returned 0&nbsp;bytes, turning a <em>recoverable</em> state into a hard failure with an opaque message.</p>
+  <p>The decode is now wrapped: an empty/non-JSON body is <strong>retried once</strong> (a transient empty body followed by a good body self-heals), and on a second failure it raises a clean, explanatory <code>RuntimeError</code> (&ldquo;Upstream returned an empty/non-JSON response&nbsp;…&rdquo;) instead of a bare decoder traceback. The handler catches <code>ValueError</code> (which <code>json.JSONDecodeError</code> subclasses) rather than naming <code>json</code> — conditional <code>import json</code> in the swarm branches above makes that name function-local and thus unbound on the no-swarm main path.</p>
+  <p>The caller side is gentler too: when the context-overflow <a href="agent.html">emergency-prune</a> retry fails, the agent now surfaces a calm, actionable message (&ldquo;I hit my context limit&nbsp;… the task and its files are preserved&nbsp;… ask me to retry&rdquo;) instead of a raw <code>CRITICAL:</code> dump. Covered by <code>tests/test_upstream_empty_body.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

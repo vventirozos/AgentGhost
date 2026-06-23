@@ -400,7 +400,49 @@ def _missing_file_message(filename, sandbox_dir) -> str:
     )
 
 
-async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 8192):
+def read_byte_budget(max_context: int) -> int:
+    """Bytes of raw file content allowed into the model's context — used for
+    BOTH the per-file read cap and the per-batch cumulative allowance.
+
+    Sized to a fraction of the window (chars ≈ tokens * 3.5) so raw reads
+    can't crowd out the system prompt, the model's reasoning, the other tool
+    outputs in the turn, and the response itself. The old per-file factor was
+    0.5 (≈70% of the window for a single file); two such reads in one turn
+    overflowed a 131 K window at 136 K tokens. 0.40 leaves headroom and, paired
+    with the cumulative ReadBudget, makes parallel whole-file reads safe."""
+    return max(150000, int(max_context * 3.5 * 0.40))
+
+
+class ReadBudget:
+    """Per-batch cumulative cap on bytes pulled into context by raw file reads.
+
+    A single read may clear the per-file limit yet, combined with other reads
+    dispatched from the SAME assistant message, overflow the model's context
+    window — observed live: two 170+ KB experiment JSONs read in parallel
+    produced a 136 K-token request against a 131 K window, a hard HTTP 400 that
+    then crashed emergency recovery. The budget refuses the read that would
+    breach the batch allowance and steers the model to read_chunked / search /
+    execute instead of silently overflowing.
+
+    Scope is one batch of tool calls (the agent resets it before dispatching
+    each assistant message's tool calls); cross-turn accumulation is handled
+    separately by context compaction, so it deliberately does not persist."""
+    __slots__ = ("limit", "spent")
+
+    def __init__(self, limit_bytes: int):
+        self.limit = max(0, int(limit_bytes))
+        self.spent = 0
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.limit - self.spent)
+
+    def charge(self, n_bytes: int) -> None:
+        self.spent += max(0, int(n_bytes))
+
+
+async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 8192,
+                         read_budget: "ReadBudget | None" = None):
     pretty_log("File Read", filename, icon=Icons.TOOL_FILE_R)
     # GUARD 1: Stop model from trying to read URLs as files. The error
     # surface PRIMES the model's next tool choice, so we lead with `browser`
@@ -430,10 +472,31 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
             return _missing_file_message(filename, sandbox_dir)
 
         file_size = path.stat().st_size
-        max_bytes = max(150000, int(max_context * 3.5 * 0.5))
+        max_bytes = read_byte_budget(max_context)
         if file_size > max_bytes: # dynamic limit for raw reads
             return f"Error: File '{filename}' is too large to read entirely ({file_size / 1024:.1f} KB) into your chat context window. Limit is {max_bytes / 1024:.1f} KB. Note: This limit only applies to 'read'. The 'knowledge_base(action=ingest_document)' tool has NO size limits. Use file_system(operation='read_chunked', filename='{filename}') to read it page-by-page, operation='search' to find specific lines, operation='inspect' to read the first few lines, or write a Python script using the 'execute' tool."
-            
+
+        # Per-BATCH cumulative budget: even when THIS file clears the per-file
+        # cap above, earlier reads dispatched from the SAME assistant message may
+        # have already consumed most of the window. Refuse the read that would
+        # tip the batch over (the FIRST read always proceeds — `spent == 0` —
+        # since the per-file cap already bounds it). This is the guard that
+        # stops parallel whole-file reads from overflowing: each passes alone,
+        # together they don't fit.
+        if (read_budget is not None and read_budget.spent > 0
+                and file_size > read_budget.remaining):
+            return (
+                f"Error: Reading '{filename}' ({file_size / 1024:.1f} KB) now would "
+                f"overflow the context window. {read_budget.spent / 1024:.1f} KB of file "
+                f"data was already read into THIS turn and only "
+                f"{read_budget.remaining / 1024:.1f} KB of the read budget remains. "
+                f"Do NOT read more whole files this turn. Instead: process the data with "
+                f"a Python script via the 'execute' tool (load the file, compute a compact "
+                f"summary, print ~50 lines), or use file_system(operation='read_chunked', "
+                f"filename='{filename}') / operation='search' / operation='inspect' to pull "
+                f"only the parts you actually need."
+            )
+
         # Sniff the first 8 KB for binary signatures BEFORE attempting the
         # full read. If we used `errors='replace'` directly on a binary file
         # we'd return garbled �-laced output to the model; conversely a pure
@@ -455,6 +518,10 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
             return f"Error: '{filename}' appears to be a binary file. You cannot read it as text. If it is an image, use the 'vision_analysis' tool."
         except OSError as oe:
             return f"Error: failed to read '{filename}': {oe}"
+        # Charge the batch budget by what we actually pulled in, so the NEXT
+        # read in this same turn sees a smaller remaining allowance.
+        if read_budget is not None:
+            read_budget.charge(len(content))
         return f"--- {filename} CONTENTS ---\n{content}"
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
@@ -1807,7 +1874,7 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
     except Exception as e: return f"Error reading document: {e}"
 
 # Unified router
-async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, **kwargs):
+async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
     if not operation:
         return "SYSTEM INSTRUCTION: The 'operation' parameter is MANDATORY. You must specify it (e.g., operation='read')."
     # Unified mapping for common parameter hallucinations
@@ -1866,7 +1933,7 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     if not target_path: 
         return f"SYSTEM INSTRUCTION: The 'path' (target filename) is missing for the '{operation}' operation. You MUST specify WHICH file to {operation}."
     
-    if operation == "read": return await tool_read_file(target_path, sandbox_dir, max_context=max_context)
+    if operation == "read": return await tool_read_file(target_path, sandbox_dir, max_context=max_context, read_budget=read_budget)
     elif operation == "read_chunked":
         page = kwargs.get("page", 1)
         chunk_size = kwargs.get("chunk_size", 32000)

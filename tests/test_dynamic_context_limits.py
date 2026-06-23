@@ -61,26 +61,29 @@ def test_get_recent_transcript_dynamic_limit(mock_agent):
 async def test_tool_read_file_dynamic_limit(tmp_path):
     sandbox_dir = tmp_path / "sandbox"
     sandbox_dir.mkdir()
-    
-    # max_bytes = max(150000, int(100000 * 3.5 * 0.5)) = 175000
-    
-    # 1. Test size = 170000 (Should pass)
+
+    # Per-file cap lowered from factor 0.5 to 0.40 (read_byte_budget) so a
+    # single read can't eat ~70% of the window; paired with the per-batch
+    # ReadBudget this prevents parallel whole-file reads from overflowing.
+    # max_bytes = max(150000, int(131072 * 3.5 * 0.40)) = 183500
+
+    # 1. Test size = 170000 (Should pass — under the 183500 cap)
     pass_file = sandbox_dir / "pass.txt"
     with open(pass_file, "w") as f:
         f.write("A" * 170000)
-        
-    result_pass = await tool_read_file("pass.txt", sandbox_dir, max_context=100000)
+
+    result_pass = await tool_read_file("pass.txt", sandbox_dir, max_context=131072)
     assert len(result_pass) == 170000 + len("--- pass.txt CONTENTS ---\n")
     assert "Error" not in result_pass
-    
-    # 2. Test size = 180000 (Should fail)
+
+    # 2. Test size = 190000 (Should fail — over the 183500 cap)
     fail_file = sandbox_dir / "fail.txt"
     with open(fail_file, "w") as f:
-        f.write("B" * 180000)
-        
-    result_fail = await tool_read_file("fail.txt", sandbox_dir, max_context=100000)
+        f.write("B" * 190000)
+
+    result_fail = await tool_read_file("fail.txt", sandbox_dir, max_context=131072)
     assert "Error: File 'fail.txt' is too large to read entirely" in result_fail
-    assert "Limit is 170.9 KB" in result_fail # 175000 / 1024
+    assert "Limit is 179.2 KB" in result_fail # 183500 / 1024
 
 @pytest.mark.asyncio
 async def test_tool_read_document_chunked_dynamic_limit(tmp_path):

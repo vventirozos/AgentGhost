@@ -5651,7 +5651,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 if "choices" in data and len(data["choices"]) > 0:
                                     msg = data["choices"][0]["message"]
                             except Exception as retry_e:
-                                final_ai_content = f"CRITICAL: Context overflow recovery failed: {str(retry_e)}"
+                                # Surface a calm, actionable message instead of a
+                                # raw CRITICAL/traceback. The task state is intact;
+                                # the inputs were just too large to read whole.
+                                logger.error("Context overflow recovery failed: %s", retry_e)
+                                final_ai_content = (
+                                    "I hit my context limit while gathering data for this step — "
+                                    "the inputs were too large to read all at once, and the automatic "
+                                    "recovery didn't complete. Nothing is lost: the task and its files "
+                                    "are preserved. Ask me to retry the step and I'll process the large "
+                                    "files with a script (summarising them) instead of reading them whole."
+                                )
                                 force_stop = True
                                 break
                         else:
@@ -6682,6 +6692,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     f"JSON at the unescape step — leaving them raw",
                                     level="WARNING", icon=Icons.WARN,
                                 )
+
+                    # Reset the per-BATCH read budget before dispatching this
+                    # assistant message's tool calls. Parallel whole-file reads
+                    # were overflowing the window: each cleared the per-file cap,
+                    # but together they didn't fit (observed: two 170+ KB JSONs →
+                    # 136 K tokens vs a 131 K window → HTTP 400). The budget caps
+                    # cumulative raw-read bytes for THIS batch; file_system reads
+                    # charge against it via the registry closure.
+                    try:
+                        from ..tools.file_system import ReadBudget, read_byte_budget
+                        _mc = int(getattr(self.context.args, "max_context", 8192) or 8192)
+                        self.context._read_budget = ReadBudget(read_byte_budget(_mc))
+                    except Exception:
+                        self.context._read_budget = None
 
                     tool_tasks, tool_call_metadata = [], []
                     tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
