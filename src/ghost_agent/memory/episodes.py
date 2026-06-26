@@ -81,8 +81,19 @@ class EpisodicMemory:
     def record_episode(self, trigger: str, context: str = "",
                        actions: List[Dict[str, Any]] = None,
                        outcome: str = "", success: bool = False,
-                       lesson: str = "", cluster_id: str = "") -> int:
-        """Store a new episode. Returns the episode ID."""
+                       lesson: str = "", cluster_id: str = "",
+                       vector_memory=None) -> int:
+        """Store a new episode. Returns the episode ID.
+
+        When *vector_memory* is provided, the episode's trigger (and lesson,
+        if any) is also indexed into the vector store with
+        ``{"type":"episode","episode_id":...}`` metadata so the semantic
+        recall path in :meth:`search_similar` / :meth:`_vector_search` can
+        map vector hits back to episode rows. Episodes evicted by the
+        capacity cap have their vector entries removed too, so the index
+        stays bounded.
+        """
+        evicted_ids: List[int] = []
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute(
@@ -107,19 +118,24 @@ class EpisodicMemory:
                              1 if action.get("success", True) else 0)
                         )
 
-                # Enforce max capacity.
+                # Enforce max capacity. We SELECT the victims before deleting
+                # (rather than DELETE … WHERE id IN (subquery)) so their ids can
+                # be handed to the vector store for orphan removal below.
                 count = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
                 if count > self.MAX_EPISODES:
                     # Prefer deleting oldest non-lesson, unconsolidated episodes.
-                    conn.execute(
-                        '''DELETE FROM episodes WHERE id IN (
-                            SELECT id FROM episodes
-                            WHERE lesson = '' AND consolidated = 0
-                            ORDER BY timestamp ASC
-                            LIMIT ?
-                        )''',
+                    victims = [r[0] for r in conn.execute(
+                        '''SELECT id FROM episodes
+                           WHERE lesson = '' AND consolidated = 0
+                           ORDER BY timestamp ASC LIMIT ?''',
                         (count - self.MAX_EPISODES,)
-                    )
+                    ).fetchall()]
+                    if victims:
+                        conn.execute(
+                            f"DELETE FROM episodes WHERE id IN ({','.join('?' * len(victims))})",
+                            victims,
+                        )
+                        evicted_ids.extend(victims)
                     # Fallback: if lesson-bearing / consolidated rows STILL keep
                     # the table over the cap, delete the oldest of any kind so
                     # the cap is actually enforced. (The old code only deleted
@@ -127,12 +143,16 @@ class EpisodicMemory:
                     # table the cap silently stopped enforcing — unbounded growth.)
                     still = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
                     if still > self.MAX_EPISODES:
-                        conn.execute(
-                            '''DELETE FROM episodes WHERE id IN (
-                                SELECT id FROM episodes ORDER BY timestamp ASC LIMIT ?
-                            )''',
+                        victims2 = [r[0] for r in conn.execute(
+                            "SELECT id FROM episodes ORDER BY timestamp ASC LIMIT ?",
                             (still - self.MAX_EPISODES,)
-                        )
+                        ).fetchall()]
+                        if victims2:
+                            conn.execute(
+                                f"DELETE FROM episodes WHERE id IN ({','.join('?' * len(victims2))})",
+                                victims2,
+                            )
+                            evicted_ids.extend(victims2)
                 # Reap action rows orphaned by ANY delete (the cap-enforcement
                 # deletes above, but also consolidation / external deletes that
                 # never breach the cap). The FK is declared but not enforced (no
@@ -147,7 +167,50 @@ class EpisodicMemory:
                 )
 
                 conn.commit()
+
+        # Vector index maintenance happens OUTSIDE the sqlite lock so the
+        # embedding call (potentially slow) doesn't serialise other writers.
+        if vector_memory is not None:
+            self._ingest_episode_vector(
+                episode_id, trigger, lesson, vector_memory,
+            )
+            for vid in evicted_ids:
+                forget = getattr(vector_memory, "forget_episode", None)
+                if callable(forget):
+                    try:
+                        forget(vid)
+                    except Exception:
+                        pass
         return episode_id
+
+    def _ingest_episode_vector(self, episode_id: int, trigger: str,
+                               lesson: str, vector_memory) -> None:
+        """Index one episode's trigger (+lesson) into the vector store with
+        ``{"type":"episode","episode_id":...}`` metadata. Best-effort — a
+        failure here must never sink the episode write.
+
+        The vector store dedups on the document text (md5), so two episodes
+        with an identical trigger share a single vector entry pointing at the
+        first; this trades a small recall edge case for not flooding the index
+        with near-duplicate embeddings, matching the store's own dedup
+        contract in :meth:`VectorMemory.add`.
+        """
+        add_fn = getattr(vector_memory, "add", None)
+        if not callable(add_fn):
+            return
+        text = (trigger or "").strip()
+        if lesson:
+            text = f"{text} :: {lesson}".strip(" :")
+        if len(text) < 5:
+            return
+        try:
+            add_fn(text, {
+                "type": "episode",
+                "episode_id": int(episode_id),
+                "timestamp": time.time(),
+            })
+        except Exception as exc:
+            logger.debug("episode vector ingest failed (non-critical): %s", exc)
 
     def search_similar(self, trigger: str, limit: int = 5,
                        vector_memory=None) -> List[Dict]:
@@ -196,14 +259,13 @@ class EpisodicMemory:
     def _vector_search(self, trigger: str, limit: int,
                        vector_memory) -> List[Dict]:
         """Semantic search using the vector memory's embedding model."""
-        # Search for episode-type memories in the vector store
-        # Use search_advanced (the real raw-hits API). The previous
-        # `search_raw` attribute existed NOWHERE, so this path was always a
-        # no-op and recall silently fell back to substring matching. NOTE:
-        # activating true semantic recall also needs episodes ingested into
+        # Search for episode-type memories in the vector store via
+        # search_advanced (the real raw-hits API). Episodes are ingested into
         # the vector store with {"type":"episode","episode_id":...} metadata
-        # (a separate ingestion gap); until that's wired this still falls
-        # back — but it now calls a method that actually exists.
+        # by record_episode (when given a vector_memory), so this semantic
+        # path is live; it still falls back to substring matching when no
+        # episode-typed hits come back (e.g. a cold store, or an episode whose
+        # trigger was deduped under another episode's vector entry).
         search_fn = getattr(vector_memory, "search_advanced", None)
         if not callable(search_fn):
             return []

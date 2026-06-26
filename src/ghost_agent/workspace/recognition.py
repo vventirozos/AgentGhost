@@ -44,6 +44,7 @@ def build_workspace_prefix(
     narrative: Optional[str] = None,
     recent_events_n: int = 5,
     file_changes: Optional[list] = None,
+    file_warnings: Optional[list] = None,
     max_chars: int = 2400,
     active_project_id: Optional[str] = None,
 ) -> str:
@@ -77,6 +78,14 @@ def build_workspace_prefix(
         for ch in file_changes[:10]:
             label = f" ({ch.get('label')})" if ch.get("label") else ""
             parts.append(f"  - {ch.get('path')}{label}: {ch.get('change')}")
+
+    # Broken-file flags (feature 2A): a tracked .py I just touched no longer
+    # parses. Surfaced loudly so I fix it before relying on it mid-task.
+    if file_warnings:
+        parts.append("⚠ Files I touched that currently DO NOT PARSE — fix these "
+                     "before relying on them:")
+        for w in file_warnings[:10]:
+            parts.append(f"  - {w.get('path')}: {w.get('error')}")
 
     if state is not None:
         state_block = state.format_as_prefix()

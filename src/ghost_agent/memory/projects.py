@@ -814,6 +814,55 @@ class ProjectStore:
         self._write_metadata(project_id, meta)
         return meta["design_ledger"]
 
+    # The config slot is the project's durable record of settings that shape
+    # how it builds/runs — env vars, key flags, dependency versions, the
+    # model, ports, DB URIs — kept as a small bounded key→value map in
+    # project metadata and surfaced in the briefing every turn. The design
+    # ledger answers "what exists and where"; the config slot answers "under
+    # what settings" — the things a fresh turn would otherwise re-discover by
+    # re-reading requirements.txt / env / argv.
+    CONFIG_MAX_KEYS = 30
+    CONFIG_MAX_VALUE_CHARS = 200
+    CONFIG_MAX_CHARS = 2000
+
+    def get_config(self, project_id: str) -> Dict[str, str]:
+        """Return the project's config map (possibly empty)."""
+        proj = self.get_project(project_id)
+        cfg = ((proj or {}).get("metadata") or {}).get("config") or {}
+        return dict(cfg) if isinstance(cfg, dict) else {}
+
+    def set_config_value(self, project_id: str, key: str, value: str) -> Dict[str, str]:
+        """Upsert one ``key → value`` config entry (bounded, last-write-wins).
+
+        Keys are normalised (trimmed, whitespace-collapsed); an empty value
+        deletes the key. The map is capped at ``CONFIG_MAX_KEYS`` (oldest
+        insertion dropped first) and ``CONFIG_MAX_CHARS`` total. Returns the
+        updated config map."""
+        proj = self.get_project(project_id)
+        if not proj:
+            return {}
+        key = " ".join((key or "").split())
+        if not key:
+            return self.get_config(project_id)
+        meta = dict(proj.get("metadata") or {})
+        cfg = dict(meta.get("config") or {}) if isinstance(meta.get("config"), dict) else {}
+        value = " ".join((value or "").split())[: self.CONFIG_MAX_VALUE_CHARS]
+        if not value:
+            cfg.pop(key, None)
+        else:
+            # Re-insert at the end so the oldest key is dropped first on
+            # overflow (dict preserves insertion order).
+            cfg.pop(key, None)
+            cfg[key] = value
+        # Enforce key count, then total-char budget, dropping oldest first.
+        while len(cfg) > self.CONFIG_MAX_KEYS:
+            cfg.pop(next(iter(cfg)))
+        while cfg and len(json.dumps(cfg)) > self.CONFIG_MAX_CHARS:
+            cfg.pop(next(iter(cfg)))
+        meta["config"] = cfg
+        self._write_metadata(project_id, meta)
+        return cfg
+
     # ------------------------------------------------------------------ events
 
     def log_event(self, project_id: str, task_id: Optional[str], event_type: str,

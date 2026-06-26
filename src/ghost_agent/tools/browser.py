@@ -1398,6 +1398,7 @@ async def tool_browser(
     # (navigate / extract_text / click / interact / screenshot) carry
     # a `parsed['url']` (or `final_url`). Non-fatal — must never break
     # a successful browser turn.
+    _nav_suggestion = ""
     if workspace_model is not None and getattr(workspace_model, "enabled", False):
         try:
             _hit_url = parsed.get("url") or parsed.get("final_url")
@@ -1407,12 +1408,17 @@ async def tool_browser(
                     title=parsed.get("title") or parsed.get("final_title") or "",
                     note=operation,
                 )
+                # Repeated-navigation nudge (feature 2C): if this is the 3rd
+                # visit to the same page, suggest caching / a strategy switch.
+                _nav_suggestion = workspace_model.record_navigation(_hit_url) or ""
         except Exception:  # noqa: BLE001
             pass
 
     # Pretty-print the success result for the LLM. Keep each op's
     # return shape deterministic so downstream prompts can rely on it.
     header = f"--- BROWSER RESULT ---\nSTATUS: OK\nOP: {operation}"
+    if _nav_suggestion:
+        header += f"\nNOTE: {_nav_suggestion}"
     js_diag = _format_js_diagnostics(parsed)
     if operation == "navigate":
         return (

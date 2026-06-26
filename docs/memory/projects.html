@@ -124,6 +124,11 @@
     <li><code>list_events(project_id, limit, event_type)</code></li>
   </ul>
 
+  <h3>Config slot (durable settings) <span class="badge">feature 1B</span></h3>
+  <ul>
+    <li><code>get_config(project_id) -&gt; dict</code> / <code>set_config_value(project_id, key, value) -&gt; dict</code> — the project's durable settings map (env vars, key flags, dependency versions, model, ports, DB URIs), stored as <code>metadata.config</code> and surfaced in the <a href="../core/prompts.html">briefing</a>'s <code>CONFIG</code> section every turn. Where the design ledger answers <q>what exists and where</q>, the config slot answers <q>under what settings</q> — the things a fresh turn would otherwise re-discover from <code>requirements.txt</code> / env / argv. <code>set_config_value</code> normalises the key (trim + whitespace-collapse), treats an empty value as a delete, is last-write-wins, and bounds the map to <code>CONFIG_MAX_KEYS</code> (30) / <code>CONFIG_MAX_VALUE_CHARS</code> (200) / <code>CONFIG_MAX_CHARS</code> (2000), dropping the oldest key first on overflow. Written via <code>_write_metadata</code> (no <code>project_updated</code> event), same as the ledger. Recorded by the agent with <code>manage_projects action=config key="…" value="…"</code> (omit both to read the map back). Covered by <code>tests/test_project_working_memory.py</code>.</li>
+  </ul>
+
   <p>No automatic eviction; archiving via <code>status='ARCHIVED'</code> preserves history. Hard delete cascades via FK ON DELETE CASCADE.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>

@@ -9,7 +9,8 @@ _LEDGER_BRIEFING_LINES = 20
 def build_project_briefing(store, project_id: str, max_events: int = 3,
                            max_open_tasks: int = 8,
                            max_done_tasks: int = 5,
-                           suppress_next_task: bool = False) -> str:
+                           suppress_next_task: bool = False,
+                           graph_memory=None) -> str:
     """Render a compact project-scope briefing for the system prompt.
 
     The briefing is appended to DYNAMIC SYSTEM STATE when a project is
@@ -117,6 +118,24 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             if ln:
                 lines.append(f"  {ln}")
 
+    # CONFIG — the project's durable settings (env vars, key flags, dependency
+    # versions, model, ports, DB URIs). Surfaced so a fresh turn runs/builds
+    # under the right settings instead of re-discovering them from
+    # requirements.txt / env / argv. Recorded via
+    # `manage_projects action=config key="…" value="…"`.
+    try:
+        config = ((proj.get("metadata") or {}).get("config") or {})
+        if not isinstance(config, dict):
+            config = {}
+    except Exception:
+        config = {}
+    if config:
+        lines.append("CONFIG (durable settings you recorded — trust these; "
+                     "update with `manage_projects action=config key=\"…\" "
+                     "value=\"…\"`):")
+        for k, v in config.items():
+            lines.append(f"  {k} = {v}")
+
     try:
         plan = ProjectPlan(store, project_id)
     except Exception:
@@ -200,6 +219,21 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                 items = list(payload.items())[:2]
                 preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in items)
             lines.append(f"  - {e['type']}  {preview}".rstrip())
+
+    # RELATED WORK — other projects that share a library/technique with this
+    # one (feature 3B). Surfaced so a fresh turn reuses prior solutions
+    # instead of re-deriving them. Only when a graph is supplied (the agent
+    # passes context.graph_memory; API/tool callers may omit it).
+    if graph_memory is not None:
+        try:
+            from .project_concepts import find_related_projects, render_related_work
+            related = find_related_projects(graph_memory, store, project_id)
+            block = render_related_work(related)
+            if block:
+                lines.append(block)
+        except Exception:
+            pass
+
     lines.append("")  # trailing blank line
     return "\n".join(lines)
 

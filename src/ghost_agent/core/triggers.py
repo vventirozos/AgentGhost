@@ -36,8 +36,9 @@ import asyncio
 import bisect
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Union
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger("GhostAgent")
 
@@ -220,6 +221,99 @@ class RepetitionCounter:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Pre-flight repeat-failure guard
+# ──────────────────────────────────────────────────────────────────────
+
+class RecentFailureGuard:
+    """Rolling memory of recently-FAILED tool calls, consulted *before*
+    dispatch.
+
+    The offline post-mortem (``reflection/postmortem.py``) mines a
+    ``TranscriptSignature`` that already names the dominant pathology —
+    "the SAME error from the same tool recurred Nx" — but it only runs in
+    the idle watchdog, *after* a failed run has burned its turns. This is
+    the live counterpart: before a tool is dispatched the agent asks
+    "have I already failed this exact action the same way?", and if so the
+    call is blocked and the model is handed the prior error instead of
+    re-running a known failure.
+
+    Keying mirrors the offline detector so the two agree on "the same
+    action": ``(tool, primary-target)`` where the target comes from
+    ``primary_target_from_args`` (path / url / selector / query / …). The
+    error text is normalised to a short lowercased prefix so two failures
+    that differ only in a trailing variable (an offset, a pid) count as the
+    same recurring failure.
+
+    The window is bounded (``window``) and entries age out as new failures
+    push them off the back, so a one-off failure that isn't repeated soon
+    simply falls out of memory and never blocks anything — the guard only
+    fires on a *sustained* identical loop.
+    """
+
+    def __init__(self, *, window: int = 24, repeat_threshold: int = 2):
+        self.window = int(max(2, window))
+        # Number of PRIOR identical (same tool, target, normalised error)
+        # failures that must already be on record before the next attempt
+        # is blocked. Default 2 → the action is allowed to fail twice the
+        # SAME way (proving it isn't transient and wasn't fixed between
+        # attempts) before the third identical re-issue is intercepted.
+        #
+        # Why not 1: keying on (tool, target) alone would block a LEGITIMATE
+        # retry — e.g. re-running `execute` on a script after editing it to
+        # fix the bug (the same pathology the idempotency guard deliberately
+        # exempts `execute`/`file_system.write` for). Requiring the identical
+        # ERROR to recur means a post-fix re-run that now succeeds, or fails a
+        # NEW way, never trips the guard — only a genuine stuck loop does.
+        self.repeat_threshold = int(max(1, repeat_threshold))
+        # Each entry: ((tool, target), normalised-error).
+        self._history: Deque[Tuple[Tuple[str, str], str]] = deque(maxlen=self.window)
+
+    @staticmethod
+    def _norm_err(text: str) -> str:
+        """Normalised prefix of an error string — same shape as the offline
+        ``_error_key`` so the live and offline notions of "the same error"
+        line up."""
+        return (text or "").strip()[:80].lower()
+
+    def record(self, tool: str, target: str, error_text: str) -> None:
+        """Remember one FAILED call. No-op for an empty tool or error (a
+        successful call has no error and must never seed the guard)."""
+        err = self._norm_err(error_text)
+        if not tool or not err:
+            return
+        self._history.append(((tool, target or ""), err))
+
+    def would_repeat(self, tool: str, target: str) -> Optional[str]:
+        """If dispatching ``tool`` against ``target`` would re-run an action
+        that has already failed identically at least ``repeat_threshold``
+        times in the window, return the offending error text (for the
+        corrective message); otherwise ``None``.
+
+        "Identically" = same ``(tool, target)`` AND same normalised error.
+        The most recent error recorded for the key anchors the match, so a
+        target that failed two *different* ways does not trip the guard —
+        only a genuine repeat of one failure does.
+        """
+        if not tool:
+            return None
+        key = (tool, target or "")
+        last_err = None
+        for k, err in reversed(self._history):
+            if k == key:
+                last_err = err
+                break
+        if last_err is None:
+            return None
+        count = sum(1 for k, err in self._history if k == key and err == last_err)
+        if count >= self.repeat_threshold:
+            return last_err
+        return None
+
+    def reset(self) -> None:
+        self._history.clear()
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Replan bridge
 # ──────────────────────────────────────────────────────────────────────
 
@@ -377,6 +471,7 @@ __all__ = [
     "ExecutionAnomaly",
     "ToolRuntimeBudget",
     "RepetitionCounter",
+    "RecentFailureGuard",
     "ReplanBridge",
     "loop_event",
     "resource_event",

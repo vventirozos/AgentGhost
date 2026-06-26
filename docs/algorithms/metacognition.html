@@ -107,10 +107,64 @@
     </tbody>
   </table>
 
+  <h2>Pre-flight repeat-failure guard <span class="badge">feature 1A</span></h2>
+  <p class="subtitle">
+    Live counterpart to the offline post-mortem repeated-error fingerprint
+    — blocks a known-failing action <em>before</em> dispatch instead of
+    mining the loop after the turns are spent.
+  </p>
+  <p>
+    The idle post-mortem (<code>reflection/postmortem.py</code>) computes a
+    <code>TranscriptSignature</code> whose dominant pathology is usually
+    <q>the SAME error from the same tool recurred N&times;</q>. That insight
+    only lands <em>after</em> a failed run has already burned its turns. The
+    pre-flight guard promotes the same notion into the live tool loop:
+    <code>RecentFailureGuard</code> (<code>core/triggers.py</code>) keeps a
+    bounded rolling memory of recently-FAILED calls keyed by
+    <code>(tool, primary&nbsp;target)</code> &mdash; the same
+    <code>primary_target_from_args</code> key the offline read-loop detector
+    and the in-run no-progress loop-breaker use &mdash; with the error text
+    normalised to an 80-char lowercased prefix so two failures that differ
+    only in a trailing variable count as one recurring failure.
+  </p>
+  <p>
+    Before each tool is dispatched (<code>core/agent.py</code>, immediately
+    after the metacog arbiter gate), the loop asks
+    <code>would_repeat(tool, target)</code>. If the same action has already
+    failed the <strong>same way</strong> at least <code>repeat_threshold</code>
+    times in the window, the call is skipped and replaced with a synthetic
+    <code>SYSTEM BLOCK</code> tool message carrying the prior error, telling
+    the model to change approach (or re-issue with an explicit modification
+    if it believes the failure was transient). Every FAILED result is fed
+    back into the guard in the per-call outcome loop.
+  </p>
+  <p>
+    <strong>Default <code>repeat_threshold = 2</code></strong> is
+    deliberate: keying on <code>(tool, target)</code> alone would block a
+    <em>legitimate</em> retry &mdash; e.g. re-running <code>execute</code> on
+    a script after editing it to fix the bug (the exact case the idempotency
+    guard already exempts <code>execute</code>/<code>file_system.write</code>
+    for). Requiring the identical <em>error</em> to recur means a post-fix
+    re-run that now succeeds, or fails a <em>new</em> way, never trips the
+    guard &mdash; only a genuinely stuck loop does. Idempotent setters
+    (<code>update_profile</code>, <code>learn_skill</code>,
+    <code>knowledge_base</code> insert/forget) are exempt entirely, since the
+    idempotency guard above already covers them.
+  </p>
+  <p>
+    The guard is <strong>independent of <code>--enable-metacog</code></strong>:
+    it ships on by default and is governed by its own
+    <code>--enable-preflight-guard</code> / <code>--no-enable-preflight-guard</code>
+    flag. When disabled, the guard object still records failures (cheap) but
+    is never consulted as a hard block. Covered by
+    <code>tests/test_preflight_guard.py</code>.
+  </p>
+
   <h2>CLI flags</h2>
   <table>
     <thead><tr><th>Flag</th><th>Default</th><th>Effect</th></tr></thead>
     <tbody>
+      <tr><td><code>--enable-preflight-guard</code> / <code>--no-…</code></td><td><b>on</b></td><td>Pre-flight repeat-failure guard (independent of the rest of the uplift). Blocks a tool call whose <code>(tool, target)</code> already failed the same way ≥2× in the recent window. Idempotent setters exempt. See the section above.</td></tr>
       <tr><td><code>--enable-metacog</code></td><td>off</td><td>Turn the whole uplift on. Constructs <code>MetacogBundle</code> in lifespan, starts the host telemetry poller, attaches the replan bridge.</td></tr>
       <tr><td><code>--metacog-confidence-threshold</code></td><td><code>0.55</code></td><td>Composite confidence τ below which the dual-solver arbiter is intended to fire.</td></tr>
       <tr><td><code>--metacog-disable-logprobs</code></td><td>off</td><td>Skip the <code>logprobs=true, top_logprobs=5</code> payload extension. Use when the upstream server doesn't honour it (entropy tracker then has nothing to observe).</td></tr>

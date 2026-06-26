@@ -66,6 +66,44 @@ def _template_narrative(
     return "\n".join(lines)
 
 
+def render_changelog(
+    events: Iterable[WorkspaceEvent],
+    *,
+    active_project_id: Optional[str] = None,
+    title: str = "Workspace changelog",
+) -> str:
+    """Roll the activity log into a dated, grouped markdown changelog
+    (feature 2B).
+
+    Events are scoped to ``active_project_id`` (when given), grouped by
+    calendar day (descending), and rendered one bullet per event. Returns
+    '' when there is nothing to report. Pure — no I/O.
+    """
+    active = (active_project_id or "").strip().lower()
+    by_day: dict = {}
+    order: List[str] = []
+    for ev in events:
+        if active and (ev.project_id or "").strip().lower() != active:
+            continue
+        # ISO timestamp → date prefix (YYYY-MM-DD); fall back to the whole
+        # string if it isn't shaped as expected.
+        ts = (ev.timestamp or "").strip()
+        day = ts[:10] if len(ts) >= 10 else (ts or "undated")
+        summary = (ev.summary or "").strip() or ev.kind
+        if day not in by_day:
+            by_day[day] = []
+            order.append(day)
+        by_day[day].append(f"- [{ev.kind}] {summary}")
+    if not order:
+        return ""
+    lines: List[str] = [f"# {title}", ""]
+    for day in sorted(order, reverse=True):
+        lines.append(f"## {day}")
+        lines.extend(by_day[day])
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
 class WorkspaceNarrative:
     """Persistent first-person workspace summary."""
 

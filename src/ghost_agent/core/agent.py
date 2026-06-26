@@ -25,6 +25,7 @@ from .planning import TaskTree, TaskStatus
 # loop-breaker and the post-mortem read-loop detector agree on what
 # "the same target" means.
 from ..reflection.postmortem import primary_target_from_args
+from .triggers import RecentFailureGuard
 from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print
 from ..utils import logging as _glog
 
@@ -1265,6 +1266,14 @@ class GhostAgent:
         self.available_tools = get_available_tools(context)
         self.agent_semaphore = asyncio.Semaphore(10)
         self.memory_semaphore = asyncio.Semaphore(1)
+        # Live pre-flight repeat-failure guard (feature 1A). Always present
+        # and fed; only consulted as a hard pre-dispatch block when the flag
+        # is on (default on). Persists across turns on the long-lived agent
+        # instance, with a bounded window so stale failures age out.
+        self._failure_guard = RecentFailureGuard()
+        self._preflight_guard_enabled = bool(
+            getattr(getattr(context, "args", None), "enable_preflight_guard", True)
+        )
 
     def release_unused_ram(self):
         try:
@@ -3940,6 +3949,34 @@ class GhostAgent:
                         except Exception as e:
                             logger.error(f"MemoryBus hydration failed: {e}")
 
+                # Surface any past belief revision relevant to this turn's
+                # query (feature 1C). The contradiction engine logs every
+                # supersede via ContradictionLog.record (agent.py belief
+                # revision + project_advancer), but explain_belief_change had
+                # no live caller — so the agent could never actually say "I
+                # previously thought X, updated to Y." Inject the explanation
+                # alongside the hydrated memory, query-scoped to the user's
+                # message, so it can. Best-effort.
+                if last_user_content and should_fetch_memory:
+                    _clog = getattr(self.context, "contradiction_log", None)
+                    if _clog is not None:
+                        try:
+                            _belief = await asyncio.to_thread(
+                                _clog.explain_belief_change, last_user_content,
+                            )
+                            if _belief:
+                                fetched_context = (
+                                    f"{fetched_context}\n\n{_belief}".strip()
+                                    if fetched_context else _belief
+                                )
+                                pretty_log(
+                                    "Belief Revision",
+                                    "Surfaced a relevant past belief change",
+                                    icon=Icons.BRAIN_CTX,
+                                )
+                        except Exception as e:
+                            logger.debug("explain_belief_change surfacing failed: %s", e)
+
                 fetched_playbook = ""  # Now dynamically populated inside the loop
 
                 # ============================================================
@@ -4528,7 +4565,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         if _proj_store is not None and _proj_id:
                             _briefing = build_project_briefing(
                                 _proj_store, _proj_id,
-                                suppress_next_task=_proj_task_closed_this_req)
+                                suppress_next_task=_proj_task_closed_this_req,
+                                # Pass the graph so the briefing can surface
+                                # RELATED WORK — other projects sharing tech
+                                # (feature 3B).
+                                graph_memory=getattr(self.context, "graph_memory", None))
                             if _briefing:
                                 dynamic_state += _briefing + "\n"
                     except Exception:
@@ -7110,6 +7151,52 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     )
                                     last_was_failure = True
                                     continue
+
+                            # ── Pre-flight repeat-failure guard (feature 1A) ──
+                            # Before dispatch, ask whether this exact action
+                            # (tool + primary target) already failed the same
+                            # way in the recent window. If so, skip the call and
+                            # hand the model the prior error instead of burning
+                            # another turn re-running a known failure — the live
+                            # counterpart to the offline post-mortem repeated-
+                            # error fingerprint. Idempotent setters are exempt
+                            # (the idempotency guard above already covers them,
+                            # and they carry no error to repeat).
+                            if self._preflight_guard_enabled and not is_idempotent_setter:
+                                _pf_target = primary_target_from_args(t_args)
+                                _pf_err = self._failure_guard.would_repeat(fname, _pf_target)
+                                if _pf_err:
+                                    pretty_log(
+                                        "Pre-Flight Guard",
+                                        f"Blocked repeat {fname}"
+                                        + (f" on {_pf_target}" if _pf_target else "")
+                                        + f" — already failed: {_pf_err}",
+                                        level="WARNING", icon=Icons.STOP,
+                                    )
+                                    _diag = (
+                                        f"SYSTEM BLOCK — pre-flight guard: this exact "
+                                        f"'{fname}' call"
+                                        + (f" on target '{_pf_target}'" if _pf_target else "")
+                                        + f" already failed recently with: \"{_pf_err}\". "
+                                        f"Re-running it unchanged will fail the same way "
+                                        f"and waste the turn. Change your approach — fix "
+                                        f"the underlying cause, use a different tool or "
+                                        f"target, or ask the user. If you are certain the "
+                                        f"failure was transient, re-issue with an explicit "
+                                        f"modification."
+                                    )
+                                    err_msg = {
+                                        "role": "tool",
+                                        "tool_call_id": tool["id"],
+                                        "name": fname,
+                                        "content": _diag,
+                                    }
+                                    messages.append(err_msg)
+                                    tools_run_this_turn.append(
+                                        {**err_msg, "_synthetic": True},
+                                    )
+                                    last_was_failure = True
+                                    continue
                             try:
                                 # Wrap in a timing shim so each tool's wall-clock
                                 # duration lands in tool_durations[idx] (parallel to
@@ -7212,6 +7299,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 "preview": (str_res.replace("Error:", "").strip()[:140]
                                             if _res_is_error else None),
                             })
+
+                            # Feed the pre-flight repeat-failure guard (feature
+                            # 1A): remember FAILED calls keyed by (tool, primary
+                            # target) — ``ptarget`` was computed at dispatch time
+                            # from the same args — so an identical re-issue on a
+                            # later iteration is intercepted before dispatch.
+                            if _res_is_error:
+                                try:
+                                    self._failure_guard.record(fname, ptarget, str_res)
+                                except Exception:
+                                    pass
 
                             # One-task-per-turn gate: a manage_projects call that
                             # actually closed a task to DONE ends the interactive
@@ -9140,6 +9238,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 actions=actions,
                 outcome=str(ai_text or "")[:1000],
                 success=success,
+                # Index the episode into the vector store so the MemoryBus's
+                # episodic tier can recall it semantically, not just by
+                # substring (feature 1C — previously a dormant ingestion gap).
+                vector_memory=getattr(self.context, "memory_system", None),
             )
         except Exception:
             pass

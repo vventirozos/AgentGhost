@@ -167,3 +167,91 @@ async def test_create_instruction_mentions_per_file_and_ledger(context):
     instr = out["agent_instruction"]
     assert "file" in instr.lower()
     assert "ledger" in instr.lower()
+
+
+# --------------------------------------------------------------- config store (1B)
+
+def test_set_config_value_upsert_and_read(store):
+    pid = store.create_project("P")
+    store.set_config_value(pid, "GHOST_MODEL", "qwen-3.6-35b-a3")
+    store.set_config_value(pid, "port", "8000")
+    cfg = store.get_config(pid)
+    assert cfg["GHOST_MODEL"] == "qwen-3.6-35b-a3"
+    assert cfg["port"] == "8000"
+
+
+def test_set_config_value_last_write_wins(store):
+    pid = store.create_project("P")
+    store.set_config_value(pid, "port", "8000")
+    store.set_config_value(pid, "port", "9000")
+    assert store.get_config(pid) == {"port": "9000"}
+
+
+def test_empty_config_value_deletes_key(store):
+    pid = store.create_project("P")
+    store.set_config_value(pid, "port", "8000")
+    store.set_config_value(pid, "port", "")
+    assert "port" not in store.get_config(pid)
+
+
+def test_config_collapses_whitespace_and_bounds_value(store):
+    pid = store.create_project("P")
+    store.set_config_value(pid, "  db  uri ", "postgresql://" + "x" * 500)
+    cfg = store.get_config(pid)
+    assert "db uri" in cfg  # key whitespace-collapsed
+    assert len(cfg["db uri"]) <= store.CONFIG_MAX_VALUE_CHARS
+
+
+def test_config_key_count_is_bounded(store):
+    pid = store.create_project("P")
+    for i in range(store.CONFIG_MAX_KEYS + 10):
+        store.set_config_value(pid, f"key{i}", f"v{i}")
+    cfg = store.get_config(pid)
+    assert len(cfg) == store.CONFIG_MAX_KEYS
+    # Oldest keys dropped first, newest retained.
+    assert f"key{store.CONFIG_MAX_KEYS + 9}" in cfg
+    assert "key0" not in cfg
+
+
+def test_briefing_surfaces_config(store):
+    pid = store.create_project("P", goal="ship it")
+    store.set_config_value(pid, "GHOST_MODEL", "qwen-3.6-35b-a3")
+    b = build_project_briefing(store, pid)
+    assert "CONFIG (" in b
+    assert "GHOST_MODEL = qwen-3.6-35b-a3" in b
+
+
+def test_briefing_omits_config_when_empty(store):
+    pid = store.create_project("P")
+    assert "CONFIG (" not in build_project_briefing(store, pid)
+
+
+# --------------------------------------------------------------- tool: config action (1B)
+
+@pytest.mark.asyncio
+async def test_config_action_set_and_read(context, store):
+    await tool_manage_projects(context, action="create", title="Cfg Proj")
+    out = json.loads(await tool_manage_projects(
+        context, action="config", config_key="port", config_value="8000"))
+    assert out["action_taken"] == "set"
+    assert out["config"]["port"] == "8000"
+    read = json.loads(await tool_manage_projects(context, action="config"))
+    assert read["config"]["port"] == "8000"
+
+
+@pytest.mark.asyncio
+async def test_config_action_delete(context, store):
+    await tool_manage_projects(context, action="create", title="Cfg Proj 2")
+    await tool_manage_projects(
+        context, action="config", config_key="port", config_value="8000")
+    out = json.loads(await tool_manage_projects(
+        context, action="config", config_key="port", config_value=""))
+    assert out["action_taken"] == "deleted"
+    assert "port" not in out["config"]
+
+
+def test_config_action_is_registered():
+    props = MANAGE_PROJECTS_TOOL_DEF["function"]["parameters"]["properties"]
+    enum = props["action"]["enum"]
+    assert "config" in enum
+    assert "config_key" in props and "config_value" in props

@@ -20,6 +20,7 @@ from typing import Awaitable, Callable, List, Optional
 
 from .activity import WorkspaceActivity
 from .narrative import WorkspaceNarrative
+from .reactions import check_changed_python_files
 from .recognition import build_workspace_prefix
 from .schema import (
     CommandOutcome,
@@ -55,6 +56,10 @@ class WorkspaceModel:
         # prefix scopes events to THIS project — preventing a prior
         # project's file:// pulls from bleeding into a new one.
         self.current_project_id: str = ""
+        # Per-session navigation counter (feature 2C): URL → visit count,
+        # used to suggest caching / a strategy switch when the agent keeps
+        # re-fetching the same page. In-memory, bounded, reset each boot.
+        self._nav_counts: dict = {}
         if self.enabled:
             self.activity: Optional[WorkspaceActivity] = WorkspaceActivity(
                 self.root, enabled=True,
@@ -113,11 +118,20 @@ class WorkspaceModel:
                 if not m or m.group(1).lower() == _a:
                     scoped.append(ch)
             file_changes = scoped
+        # React to the (scoped) changes: flag any changed .py file that no
+        # longer parses, so the wake-up prefix warns about it (feature 2A).
+        file_warnings: List[dict] = []
+        if file_changes:
+            try:
+                file_warnings = check_changed_python_files(file_changes)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("react_to_changes failed: %s", e)
         return build_workspace_prefix(
             activity=self.activity,
             state=self.state,
             narrative=narrative_text,
             file_changes=file_changes,
+            file_warnings=file_warnings,
             active_project_id=active or None,
         )
 
@@ -196,6 +210,37 @@ class WorkspaceModel:
         except Exception as e:  # noqa: BLE001
             logger.debug("record_research_artifact skipped: %s", e)
             return None
+
+    def record_navigation(self, url: str, *, threshold: int = 3) -> Optional[str]:
+        """Count visits to ``url`` this session; on EXACTLY the
+        ``threshold``-th identical visit, return a one-line suggestion to
+        cache the result or switch strategy (feature 2C), and record it as a
+        workspace note so it also surfaces in the wake-up prefix. Returns
+        None otherwise. Fires once (at the threshold) to avoid spamming every
+        subsequent re-fetch.
+        """
+        if not self.enabled:
+            return None
+        u = (url or "").strip()
+        if not u:
+            return None
+        n = self._nav_counts.get(u, 0) + 1
+        self._nav_counts[u] = n
+        # Bound the map so a long crawl can't grow it without limit.
+        if len(self._nav_counts) > 512:
+            self._nav_counts.pop(next(iter(self._nav_counts)), None)
+        if n == int(threshold):
+            suggestion = (
+                f"You've navigated to {u} {n} times this session. If you're "
+                f"re-checking the same page for a change or an error, cache "
+                f"the last result or switch strategy instead of re-fetching it."
+            )
+            try:
+                self.note(suggestion, url=u, count=n, repeat=True)
+            except Exception:  # noqa: BLE001
+                pass
+            return suggestion
+        return None
 
     def has_seen_url(self, url: str) -> bool:
         if not self.enabled or self.state is None:
@@ -314,6 +359,12 @@ class WorkspaceModel:
     async def consolidate_narrative(self) -> str:
         if not self.enabled or self.activity is None or self.narrative is None:
             return ""
+        # Roll recent activity into a dated CHANGELOG alongside the prose
+        # narrative (feature 2B). Best-effort — never blocks the narrative.
+        try:
+            self.write_changelog()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("workspace changelog write skipped: %s", e)
         try:
             return await self.narrative.regenerate(
                 activity=self.activity, state=self.state,
@@ -321,6 +372,32 @@ class WorkspaceModel:
         except Exception as e:  # noqa: BLE001
             logger.warning("workspace narrative consolidation failed: %s", e)
             return ""
+
+    def write_changelog(self, *, max_events: int = 200) -> Optional[Path]:
+        """Render recent activity into a per-project CHANGELOG.md under the
+        workspace root and return its path (feature 2B). No-op (None) when
+        disabled, no activity, or nothing to report.
+        """
+        if not self.enabled or self.activity is None:
+            return None
+        from .narrative import render_changelog
+        events = self.activity.recent(limit=max_events)
+        active = self.current_project_id or ""
+        body = render_changelog(events, active_project_id=active or None)
+        if not body:
+            return None
+        # Scope the file per active project so projects don't share one log.
+        name = f"CHANGELOG.{active}.md" if active else "CHANGELOG.md"
+        path = self.root / name
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".md.tmp")
+            tmp.write_text(body, encoding="utf-8")
+            tmp.replace(path)
+            return path
+        except Exception as e:  # noqa: BLE001
+            logger.debug("changelog persist failed: %s", e)
+            return None
 
     # -----------------------------------------------------------------
     # Introspection

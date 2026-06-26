@@ -61,6 +61,7 @@
   <ul>
     <li><code>artifact_add</code> · <code>event_log</code></li>
     <li><code>ledger</code> — append one durable fact to the project's <strong>design ledger</strong> (<code>ledger="…"</code>), or omit it to read the ledger back. See "Working memory" below.</li>
+    <li><code>config</code> <span class="badge">1B</span> — upsert one durable <strong>setting</strong> (<code>config_key="GHOST_MODEL" config_value="qwen-3.6-35b-a3"</code>): env vars, key flags, dependency versions, model, ports, DB URIs. Empty <code>config_value</code> deletes the key; omit both to read the config map back. Bounded + surfaced in the <a href="../core/prompts.html">project briefing</a>'s <code>CONFIG</code> section every turn. Backed by <code>ProjectStore.get_config / set_config_value</code>.</li>
     <li><code>autoadvance</code> — run the autonomous advancer. <code>count</code> selects how many tasks: a number (<code>"3"</code>) or <code>"all"</code> to run to completion; default <code>1</code>. Drives <a href="../core/project_advancer.html"><code>advance_many()</code></a>, a bounded loop that checkpoints each task and stops at the first of done / a task needing you / budget / a FAILED task. Returns <code>{advanced, count, requested, stop_reason}</code>.</li>
   </ul>
 

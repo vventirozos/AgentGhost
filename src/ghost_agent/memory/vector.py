@@ -688,6 +688,19 @@ class VectorMemory:
                 logger.error(f"Search failed: {e}")
                 return ""
 
+    def forget_episode(self, episode_id) -> None:
+        """Remove an episode's vector entry by its ``episode_id`` metadata.
+
+        Called by ``EpisodicMemory`` when it evicts an episode (capacity cap
+        / consolidation) so the vector index — which owns a non-prunable
+        ``type=="episode"`` population (see ``_prune_if_needed``) — does not
+        accumulate orphans pointing at deleted episode rows. Best-effort."""
+        try:
+            with self._get_lock():
+                self.collection.delete(where={"episode_id": int(episode_id)})
+        except Exception as e:
+            logger.debug("forget_episode(%s) failed (non-critical): %s", episode_id, e)
+
     def delete_document_by_name(self, filename: str):
         with self._get_lock():
             self.collection.delete(where={"source": filename})

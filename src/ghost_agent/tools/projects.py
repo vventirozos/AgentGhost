@@ -45,7 +45,7 @@ _ACTIONS = {
     # task-level
     "task_add", "task_update", "task_decompose", "task_next", "task_list",
     # artifacts / events / durable working memory
-    "artifact_add", "event_log", "ledger",
+    "artifact_add", "event_log", "ledger", "config",
     # inbox promotion (suggestion-accepted path)
     "promote_from_context",
     # self-advancing loop
@@ -779,6 +779,25 @@ def _link_task_in_graph(context, project_id: str, task_id: str, description: str
         logger.debug("graph task link skipped", exc_info=True)
 
 
+def _link_concepts_in_graph(context, project_id: str):
+    """Extract the project's libraries/techniques and link them to SHARED
+    canonical nodes in the knowledge graph (feature 3A) so cross-project
+    retrieval can bridge projects that use the same tech. Re-runnable —
+    add_triplets is idempotent (re-adds just bump edge weight). Best-effort.
+    """
+    gm = getattr(context, "graph_memory", None)
+    store = getattr(context, "project_store", None)
+    if gm is None or store is None or not project_id:
+        return
+    try:
+        from ..core.project_concepts import link_project_concepts
+        proj = store.get_project(project_id)
+        if proj:
+            link_project_concepts(gm, proj)
+    except Exception:
+        logger.debug("graph concept link skipped", exc_info=True)
+
+
 def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
     """Compact status snapshot suitable for a resume banner."""
     proj = store.get_project(project_id)
@@ -878,6 +897,8 @@ async def tool_manage_projects(
     deliverables: Optional[List[str]] = None,
     # durable project working memory
     ledger: str = "",
+    config_key: str = "",
+    config_value: str = "",
     # autonomous batch pacing
     count: Any = None,
     # research
@@ -1056,6 +1077,7 @@ async def tool_manage_projects(
                 metadata=metadata,
             )
             _link_project_in_graph(context, pid, title)
+            _link_concepts_in_graph(context, pid)
             _set_current(context, pid)
             # If the model passed `subtasks` to create (it routinely does,
             # believing create decomposes too), DECOMPOSE them now instead of
@@ -1596,8 +1618,27 @@ async def tool_manage_projects(
             note = (ledger or "").strip()
             if note:
                 new = store.append_ledger(project_id, note)
+                # The ledger is a prime source of technique/library mentions —
+                # re-extract concepts so the cross-project map stays current.
+                _link_concepts_in_graph(context, project_id)
                 return _ok({"ledger": new, "action_taken": "appended"})
             return _ok({"ledger": store.get_ledger(project_id)})
+
+        if act == "config":
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            # With `config_key` → upsert one setting (empty `config_value`
+            # deletes it). Without a key → read the current config map back.
+            k = (config_key or "").strip()
+            if k:
+                cfg = store.set_config_value(project_id, k, config_value or "")
+                # Config carries library/version hints — refresh concepts.
+                _link_concepts_in_graph(context, project_id)
+                return _ok({
+                    "config": cfg,
+                    "action_taken": "deleted" if not (config_value or "").strip() else "set",
+                })
+            return _ok({"config": store.get_config(project_id)})
 
         # ---- self-advancing loop ---------------------------------------
 
@@ -1707,6 +1748,7 @@ async def tool_manage_projects(
                 metadata={"promoted_from_context": True},
             )
             _link_project_in_graph(context, pid, title)
+            _link_concepts_in_graph(context, pid)
             plan = ProjectPlan(store, pid)
             root_desc = title if not goal else goal
             root = plan.add_task(root_desc)
@@ -1853,6 +1895,10 @@ MANAGE_PROJECTS_TOOL_DEF = {
                           "description": "action=autoadvance: how many tasks to advance autonomously in a bounded loop — a number (e.g. \"3\") or \"all\" to run to completion. Use this ONLY for an explicit MULTI-task request: 'do the next 3 tasks' → count=\"3\"; 'proceed with all remaining tasks' / 'finish the project' → count=\"all\". A single 'proceed'/'next' you do YOURSELF as one focused full turn — do NOT route that here (autoadvance runs a lighter single-step-per-task executor). The loop checkpoints each task and stops at the first of: done · a task that needs you · budget · a FAILED task."},
                 "ledger": {"type": "string",
                            "description": "action=ledger: ONE durable fact to append to the project's design ledger — file layout, a key function/API name, a convention, where something lives (e.g. 'windows are .window divs, opened via openApp(id), drag via makeDraggable'). The ledger is surfaced in the project briefing every turn, so the next turn inherits these facts instead of re-reading files to rediscover them. Omit `ledger` to read the current ledger back. May also be passed on a task_update status=DONE to record the decision as the task closes."},
+                "config_key": {"type": "string",
+                               "description": "action=config: the name of ONE durable project setting to record — an env var, key flag, dependency version, the model, a port, a DB URI (e.g. 'GHOST_MODEL', 'port', 'torch'). Surfaced in the project briefing every turn so the next turn runs/builds under the right settings instead of re-discovering them from requirements.txt / env / argv. Omit both config_key and config_value to read the current config map back; pass config_key with an empty config_value to delete that setting."},
+                "config_value": {"type": "string",
+                                 "description": "action=config: the value for `config_key` (e.g. 'qwen-3.6-35b-a3', '8000', '2.3.1'). Empty value deletes the key."},
             },
             "required": ["action"],
         },

@@ -64,6 +64,47 @@ k = 60  (rrf_k default)</code></pre>
   <h2>Dedup gate (write side)</h2>
   <p><code>publish_fact</code> uses an LRU of 256 most-recent <code>(event_type, fact_data)</code> MD5 signatures to short-circuit replays. Without it, an LLM that repeats itself across turns would re-write the same triplet to the graph and accumulate weight unnecessarily.</p>
 
+  <h2>Episodic semantic recall <span class="badge">feature 1C</span></h2>
+  <p>
+    The episodic tier stores <em>action sequences with outcomes</em> in
+    <code>episodic_memory.db</code> and is recalled by trigger similarity. Its
+    semantic path (<code>EpisodicMemory._vector_search</code>) maps vector hits
+    tagged <code>type=="episode"</code> back to episode rows &mdash; but for a
+    long time nothing <em>wrote</em> episodes into the vector store with that
+    metadata, so the path found nothing and recall silently fell back to
+    substring matching (missing any past episode that shared no keywords with
+    the query).
+  </p>
+  <p>
+    <code>record_episode</code> now accepts a <code>vector_memory</code> and
+    indexes each episode's trigger (+lesson) via
+    <code>VectorMemory.add</code> with
+    <code>{"type":"episode","episode_id":&hellip;}</code> metadata; the
+    significant-turn writer (<code>GhostAgent._record_episode_safe</code>)
+    passes <code>context.memory_system</code>. The store stays bounded:
+    episodes evicted by the 500-row capacity cap have their vector entries
+    removed via <code>VectorMemory.forget_episode(episode_id)</code>
+    (<code>collection.delete(where={"episode_id":&hellip;})</code>), and the
+    vector store already treats <code>type=="episode"</code> as a
+    non-prunable population owned by the episodic store. Indexing dedups on
+    the document text (md5), matching <code>add</code>'s own contract.
+    Covered by <code>tests/test_episode_vector_recall.py</code>.
+  </p>
+
+  <h2>Belief-revision surfacing <span class="badge">feature 1C</span></h2>
+  <p>
+    The contradiction engine logs every supersede to
+    <code>ContradictionLog</code> (<q>I previously thought X, updated to Y
+    because you said Z</q>), but <code>explain_belief_change(query)</code> had
+    no live caller, so the agent could never actually voice it. Immediately
+    after the <code>MemoryBus.hydrate_context</code> fan-out,
+    <code>GhostAgent</code> now calls
+    <code>explain_belief_change(last_user_content)</code> and, when a recorded
+    revision matches the turn's query, appends a
+    <code>## BELIEF REVISION HISTORY</code> block to the hydrated context.
+    Best-effort and query-scoped; absent a match it injects nothing.
+  </p>
+
   <h2>Learned intent→source weights</h2>
   <p>
     The 3×4 <code>_INTENT_WEIGHTS</code> matrix (graph/vector/skill/episodic per factual/procedural/contextual) is hand-tuned magic. <code>core/rrf_weights.py</code> makes it learnable: <code>fit_intent_weights</code> derives a matrix from <code>(intent, source, success)</code> observations (a source that correlates with successful turns under an intent is up-weighted, clamped to <code>[0.1, 3.0]</code>), and the bus loads a fitted <code>weights.json</code> if one exists under <code>$GHOST_HOME/system/rrf/</code>. <strong>Absent → the hand-tuned defaults stand, byte-for-byte</strong> — the fusion weights sit on the hot path that feeds every turn, so an ungrounded fit must never silently degrade recall (same load-if-present posture as the PRM / router checkpoints). The <code>_reciprocal_rank_fusion</code> classmethod stays back-compatible (the learned matrix is an optional <code>weight_overrides=</code>). Covered by <code>tests/test_rrf_weights.py</code>.

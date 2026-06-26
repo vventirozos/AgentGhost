@@ -52,7 +52,7 @@
   <table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>add_triplets(triplets) -&gt; int</code></td><td>Bulk insert / reinforce. Functional predicates (WORKS_AT, LIVES_IN, DRIVES, …) auto-expire prior values.</td></tr>
+      <tr><td><code>add_triplets(triplets) -&gt; int</code></td><td>Bulk insert / reinforce. Functional predicates (WORKS_AT, LIVES_IN, DRIVES, …) auto-expire prior values. Multi-valued predicates like <code>USES_LIBRARY</code> / <code>USES_TECHNIQUE</code> — the cross-project map (see <a href="../algorithms/cross_project_map.html">Cross-project map</a>) — accumulate instead.</td></tr>
       <tr><td><code>delete_by_target(target)</code></td><td>Substring match deletion.</td></tr>
       <tr><td><code>wipe_all()</code></td><td>Truncate.</td></tr>
       <tr><td><code>get_recent_triplets(limit)</code></td><td>Most recent edges.</td></tr>

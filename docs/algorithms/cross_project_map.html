@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cross-project map — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a href="request_lifecycle.html">Request lifecycle</a>
+    <a href="memory_hydration.html">Memory hydration (RRF)</a>
+    <a class="current" href="cross_project_map.html">Cross-project map</a>
+    <a href="dream_cycle.html">Dream / self-play</a>
+    <a href="skill_acquisition.html">Skill acquisition</a>
+    <a href="circuit_breaker.html">Circuit breaker</a>
+    <a href="selfhood.html">Selfhood (unified self)</a>
+  </nav>
+</aside>
+<main>
+  <h1>Cross-project dependency map <span class="badge">feature 3</span></h1>
+  <p class="subtitle">
+    Collapsing every project's libraries and techniques onto SHARED graph
+    nodes so the agent can reuse what it solved in one project while working
+    on another.
+  </p>
+
+  <h2>The gap it closes</h2>
+  <p>
+    The knowledge graph already received a node per project and per task, but
+    the only edges were <code>project&nbsp;→&nbsp;its&nbsp;own&nbsp;tasks&nbsp;→&nbsp;a
+    truncated description string</code>. So <q>PetAI uses GRU</q> and
+    <q>Genesis uses recurrent nets</q> became two unrelated nodes under two
+    separate project subtrees — they never shared a node, and spreading
+    activation could not connect them. There was no
+    <code>USES_LIBRARY</code> / <code>USES_TECHNIQUE</code> predicate, no
+    cross-project retrieval, and the per-turn briefing was strictly
+    single-project. The agent re-learned in one project what it already knew
+    in another.
+  </p>
+
+  <h2>Concept extraction <span class="badge">3A</span></h2>
+  <p>
+    <code>core/project_concepts.py</code> turns a project's durable text
+    (title, goal, design ledger, config) and its workspace
+    <code>requirements.txt</code> into canonical concept names via a curated
+    lexicon: <code>extract_libraries</code> (alias-collapsing — pytorch→torch,
+    sklearn→scikit-learn — plus a requirements parser) and
+    <code>extract_techniques</code> (recurrent-net, transformer, cnn,
+    reinforcement-learning, diffusion, …). Short/ambiguous tokens
+    (<code>rnn</code>, <code>gru</code>, <code>gan</code>, <code>rl</code>) are
+    matched on word boundaries so they don't fire inside unrelated words.
+  </p>
+  <p>
+    <code>link_project_concepts(graph_memory, project)</code> writes the edges
+    to <strong>shared canonical nodes</strong>:
+  </p>
+  <pre><code>project:&lt;id&gt;  --USES_LIBRARY--&gt;   library:torch
+project:&lt;id&gt;  --USES_TECHNIQUE--&gt; technique:recurrent-net</code></pre>
+  <p>
+    Because <code>GraphMemory.add_triplets</code> lowercases subjects/objects
+    and <code>USES_*</code> are multi-valued (non-functional) predicates, two
+    projects emitting <code>technique:recurrent-net</code> land on the
+    <em>same</em> node — the bridge the old design lacked. Re-adds are
+    idempotent (they only bump edge weight). The agent links concepts at
+    project create and whenever the ledger or config changes
+    (<code>tools/projects.py</code> <code>_link_concepts_in_graph</code>);
+    <code>scripts/backfill_project_concepts.py</code> backfills projects
+    created before the wiring (idempotent; supports <code>--dry-run</code>).
+  </p>
+
+  <h2>Retrieval &amp; briefing <span class="badge">3B</span></h2>
+  <p>
+    <code>find_related_projects(graph_memory, store, project_id)</code> walks
+    the graph's in-memory mirror: the project's concept nodes are its
+    <code>library:*</code>/<code>technique:*</code> successors, and any other
+    <code>project:*</code> predecessor of those nodes is related. Results are
+    ranked by shared-concept count. <code>render_related_work</code> formats
+    them, and <code>build_project_briefing</code> (given the graph) appends a
+    <code>RELATED WORK</code> block every turn a project is active:
+  </p>
+  <pre><code>RELATED WORK (other projects sharing tech — reuse their lessons instead of re-solving):
+  - Genesis [ab12cd · ACTIVE] — shares: torch, recurrent-net</code></pre>
+  <p>
+    The agent passes <code>context.graph_memory</code> at the briefing call
+    site (<code>core/agent.py</code>); API / tool callers may omit it, in
+    which case the block is simply absent (no crash). The section is
+    self-scoped — a project that shares no concepts shows nothing.
+  </p>
+
+  <h2>Scope notes</h2>
+  <ul>
+    <li>Extraction is rule-based by design — cheap, deterministic, good enough
+      to bridge on the obvious shared tech. New surface forms are added to the
+      lexicons as they come up; it is not exhaustive NLP.</li>
+    <li>The standing surfacing is the per-turn <code>RELATED WORK</code> block.
+      A separate "while you were away" digest flag for shared-library adoption
+      was considered and deferred as redundant with the briefing.</li>
+  </ul>
+
+  <h2>Test surface</h2>
+  <ul>
+    <li><code>tests/test_project_concepts.py</code> — extraction, alias
+      collapse, word-boundary matching, triplet shape, graph linking,
+      idempotency, tool wiring.</li>
+    <li><code>tests/test_cross_project_retrieval.py</code> — overlap ranking,
+      self-scoping, RELATED WORK in the briefing, graph-absent fallback.</li>
+  </ul>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>
