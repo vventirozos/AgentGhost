@@ -2910,6 +2910,44 @@ class GhostAgent:
         # All tokens must be in the allowlist.
         return all(tok in cls._STRICT_GREETING_TOKENS for tok in tokens)
 
+    # A token already counts as a "concrete subject" when it is an
+    # id-like blob — a long hex string (project/task ids like
+    # `516217d294cc`) or any alphanumeric token of length >= 6 that
+    # carries at least one digit. Pure prose words never match.
+    _ID_LIKE_RE = re.compile(r"^[0-9a-f]{6,}$", re.IGNORECASE)
+    _MIXED_ID_RE = re.compile(r"^(?=.*\d)[a-z0-9_\-]{6,}$", re.IGNORECASE)
+
+    @classmethod
+    def _has_concrete_reference(cls, text: str) -> bool:
+        """True when a short user message already names a concrete subject,
+        so prepending the previous assistant reply as `Context:` can only
+        contaminate memory retrieval rather than resolve an anaphor.
+
+        The contextual-query-expansion at the call site exists to resolve
+        pronoun follow-ups ("run it then", "why?") against the prior reply.
+        But an imperative that already carries its own subject — backticked
+        names, quoted strings, or id-like blobs (`delete 516217d294cc`) — is
+        self-contained. Prepending a stale reply there is what made a
+        partial-failure `delete` re-answer the *previous* turn's question.
+        Returns True → skip the prepend and search on the raw message.
+        """
+        if not text or not isinstance(text, str):
+            return False
+        # Explicit quoting is an unambiguous "I am naming a specific thing".
+        # (Bare apostrophes are excluded — they are usually contractions
+        # like "what's it doing?", which are genuinely anaphoric. A
+        # single-quoted id is still caught by the id-token scan below, which
+        # strips surrounding quotes before matching.)
+        if "`" in text or '"' in text:
+            return True
+        for raw in text.split():
+            tok = raw.strip("`\"'.,;:!?()[]{}<>")
+            if not tok:
+                continue
+            if cls._ID_LIKE_RE.match(tok) or cls._MIXED_ID_RE.match(tok):
+                return True
+        return False
+
     async def _route_query_expansion(self,
                                      prev_ai_snippet: str,
                                      user_intent: str,
@@ -3867,7 +3905,14 @@ class GhostAgent:
                     # concat shape if the router declines (no worker pool /
                     # error), so the test suite that asserts on the literal
                     # `Context: ... | User intent: ...` shape stays green.
-                    if len(search_query.split()) < 10 and len(messages) >= 2:
+                    # Only resolve anaphors. A short message that already
+                    # names its own subject (ids, quotes, backticks — e.g.
+                    # "delete `516217d294cc`") is self-contained; prepending
+                    # the previous reply there contaminates retrieval and was
+                    # the root cause of partial-failure turns re-answering the
+                    # PRIOR question instead of the current command.
+                    if (len(search_query.split()) < 10 and len(messages) >= 2
+                            and not self._has_concrete_reference(search_query)):
                         prev_ai = next((m.get("content", "") for m in reversed(messages[:-1]) if m.get("role") == "assistant"), "")
                         if isinstance(prev_ai, str) and prev_ai:
                             legacy_expansion = f"Context: {prev_ai[:200].strip()} | User intent: {search_query}"
@@ -7134,6 +7179,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         last_error_res = ""
                         last_error_preview = "Unknown Error"
 
+                        # Per-call outcomes for this turn. A multi-id command
+                        # ("delete A and B") is N separate tool calls; tracking
+                        # each one lets the failure path emit an explicit
+                        # "X succeeded, Y failed" summary instead of collapsing
+                        # a partial failure into a single generic strike.
+                        op_outcomes = []
+
                         # Tracks the worst no-progress signature seen this
                         # turn (the same SUCCEEDING action+target+result
                         # repeating), handled once after the results loop.
@@ -7147,6 +7199,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         for i, result in enumerate(results):
                             fname, tool_id, a_hash, is_mutating, ptarget = tool_call_metadata[i]
                             str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
+
+                            # Record this call's outcome uniformly (before the
+                            # branch chain below) so a partial failure can be
+                            # summarised as "N ok / M failed" rather than
+                            # last-write-wins on last_error_*.
+                            _res_is_error = str_res.startswith((
+                                "Error:", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
+                            op_outcomes.append({
+                                "tool": fname,
+                                "ok": not _res_is_error,
+                                "preview": (str_res.replace("Error:", "").strip()[:140]
+                                            if _res_is_error else None),
+                            })
 
                             # One-task-per-turn gate: a manage_projects call that
                             # actually closed a task to DONE ends the interactive
@@ -7508,8 +7573,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # consecutive-clean-success streak that unfreezes decay.
                             strikes.reset_clean_streak()
                             # Classify the failure to route to the right budget
-                            from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context
+                            from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context, summarize_multi_op_outcomes
                             failure_class, failure_match = classify_tool_failure(last_error_res or last_error_preview)
+                            # Partial-failure summary (empty unless this turn
+                            # mixed successes and failures across >=2 calls).
+                            multi_op_summary = summarize_multi_op_outcomes(op_outcomes)
 
                             if failure_class == FailureClass.RETRYABLE:
                                 transient_failure_count += 1
@@ -7562,7 +7630,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                             from ..tools.file_system import tool_list_files, project_scoped_sandbox
                             sandbox_state = await tool_list_files(project_scoped_sandbox(self.context)[0], self.context.memory_system)
-                            messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {diagnostic_msg}{fallback_hint}\n\n{sandbox_state}"})
+                            messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {multi_op_summary}{diagnostic_msg}{fallback_hint}\n\n{sandbox_state}"})
 
                             total_fail = execution_failure_count + transient_failure_count
                             # System 3 Crisis Pivot — fires at structural strike 4

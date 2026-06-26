@@ -88,6 +88,36 @@ async def test_contextual_query_expansion(mock_context):
         assert "User intent: run it then" in actual_query
 
 @pytest.mark.asyncio
+async def test_self_contained_command_is_not_contaminated(mock_context):
+    """Regression: a short imperative that already names its subject (ids in
+    backticks) must search on the RAW message — NOT get the previous reply
+    prepended. Prepending the prior 'difference between projects' answer is
+    what made a partial-failure delete re-answer the previous question."""
+    agent = GhostAgent(mock_context)
+
+    mock_context.llm_client.chat_completion.return_value = {
+        "choices": [{"message": {"content": "ok", "tool_calls": []}}]
+    }
+
+    messages = [
+        {"role": "user", "content": "what is the difference between the projects"},
+        {"role": "assistant", "content": "Here's the comparison: d410 is research-heavy, e5c3 is experiment-heavy."},
+        {"role": "user", "content": "delete `ecef207c0d4b` and `516217d294cc`"},
+    ]
+
+    with patch("ghost_agent.core.agent.asyncio.to_thread", new_callable=AsyncMock) as mock_to_thread:
+        mock_to_thread.return_value = "Mocked Memory"
+        await agent.handle_chat({"messages": messages, "model": "test"}, MagicMock())
+
+        search_call = next(call for call in mock_to_thread.call_args_list if call.args[0] == mock_context.memory_system.search)
+        actual_query = search_call.args[1]
+
+        # The prior comparison must NOT leak into the delete's search query.
+        assert "Context:" not in actual_query
+        assert "comparison" not in actual_query
+        assert actual_query == "delete `ecef207c0d4b` and `516217d294cc`"
+
+@pytest.mark.asyncio
 async def test_episodic_archival(mock_context):
     """Verify that pruned context triggers an episodic archival into the vector DB."""
     agent = GhostAgent(mock_context)

@@ -133,6 +133,46 @@ def format_failure_context(error_text: str, failure_class: FailureClass, tool_na
         return f"{prefix}ERROR: {error_text[:500]}"
 
 
+def summarize_multi_op_outcomes(op_outcomes) -> str:
+    """Aggregate a turn's per-call results into one explicit summary.
+
+    The agent emits one tool call per id, so "delete A and B" becomes two
+    calls. When one succeeds and one fails, the loop used to book the whole
+    turn as a single undifferentiated failure and inject a generic
+    diagnostic that named only the *last* error — the model never saw a
+    clean "A deleted, B not found" picture and would drift onto stale
+    context. This produces that picture.
+
+    ``op_outcomes`` is a list of dicts ``{"tool": str, "ok": bool,
+    "preview": Optional[str]}``. Returns "" when there is nothing worth
+    aggregating (0–1 ops, or every op the same outcome with a single op),
+    so single-call failures keep their existing terse diagnostic.
+    """
+    if not op_outcomes or len(op_outcomes) < 2:
+        return ""
+    ok_ops = [o for o in op_outcomes if o.get("ok")]
+    failed_ops = [o for o in op_outcomes if not o.get("ok")]
+    # Only worth a summary when the turn was MIXED — a uniform all-fail turn
+    # is served fine by the normal diagnostic.
+    if not ok_ops or not failed_ops:
+        return ""
+    succeeded = "; ".join(o.get("tool", "?") for o in ok_ops)
+    failed = "; ".join(
+        f"{o.get('tool', '?')}: {(o.get('preview') or 'failed').strip()[:140]}"
+        for o in failed_ops
+    )
+    return (
+        f"MULTI-STEP OUTCOME — {len(ok_ops)} of {len(op_outcomes)} call(s) "
+        f"SUCCEEDED, {len(failed_ops)} FAILED.\n"
+        f"  SUCCEEDED: {succeeded}\n"
+        f"  FAILED: {failed}\n"
+        "The successful operations DID take effect — do NOT retry them or "
+        "report them as failed. This live outcome is AUTHORITATIVE over any "
+        "prior context, memory, or system-state hint. Report exactly what "
+        "succeeded and what failed, then stop.\n\n"
+    )
+
+
 # Per-tool fallback hints. Maps a (tool_name, error_pattern_substring) →
 # concrete remediation hint that the agent loop can inject into context as
 # a follow-up nudge after a failure. The mapping is intentionally tiny and
