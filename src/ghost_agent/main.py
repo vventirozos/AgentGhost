@@ -54,7 +54,7 @@ from .tools.registry import TOOL_DEFINITIONS
 print(" - Importing self-improvement pipeline (distill, reflection, router)...", flush=True)
 from .distill import TrajectoryCollector
 from .reflection import Reflector
-from .router import ComplexityClassifier, ComplexityDispatcher
+from .router import ComplexityClassifier, ComplexityDispatcher, bootstrap_router
 from .prm import PRMScorer, PRMTrainer
 from .selfhood import SelfModel
 from .workspace import WorkspaceModel
@@ -945,23 +945,61 @@ async def lifespan(app):
     # load it; otherwise build a disabled dispatcher (acts as an
     # always-escalate wrapper so the request path is unchanged).
     try:
-        clf = None
+        # Where the idle-time router retrain writes/reads the classifier.
+        # Mirrors context._prm_checkpoint_path. When --router-model is unset we
+        # still train and persist here so the router self-improves from logs.
         if args.router_model:
-            clf_path = Path(args.router_model)
-            if clf_path.exists():
-                clf = ComplexityClassifier.load(clf_path)
-                pretty_log(
-                    "Complexity Router",
-                    f"Loaded classifier from {clf_path}",
-                    icon=Icons.BRAIN_PLAN,
+            router_ckpt_path = Path(args.router_model)
+        else:
+            router_ckpt_path = (context.memory_dir.parent / "router" / "checkpoint.json")
+        context._router_checkpoint_path = router_ckpt_path
+
+        clf = None
+        if router_ckpt_path.exists():
+            clf = ComplexityClassifier.load(router_ckpt_path)
+            pretty_log(
+                "Complexity Router",
+                f"Loaded classifier from {router_ckpt_path}",
+                icon=Icons.BRAIN_PLAN,
+            )
+        elif args.router_model:
+            # Explicit --router-model pointed at a missing file: surface it.
+            pretty_log(
+                "Complexity Router",
+                f"--router-model {router_ckpt_path} not found; dispatcher disabled",
+                level="WARNING",
+                icon=Icons.WARN,
+            )
+
+        # Bootstrap-train at startup when no checkpoint exists yet. The router
+        # otherwise only ever gets a model from an IDLE retrain (needs a long-
+        # lived idle process); a busy server or benchmark never idles and would
+        # stay escalate-all forever. One-time train from the existing trajectory
+        # log, gated on enough labeled multi-class data, with a safe fallback to
+        # pass-through. bootstrap_router() never raises — boot can't crash here.
+        if clf is None:
+            traj_collector = getattr(context, "trajectory_collector", None)
+            if traj_collector is not None:
+                boot_clf, boot_report = bootstrap_router(
+                    traj_collector.iter_trajectories(),
+                    save_path=router_ckpt_path,
                 )
-            else:
-                pretty_log(
-                    "Complexity Router",
-                    f"--router-model {clf_path} not found; dispatcher disabled",
-                    level="WARNING",
-                    icon=Icons.WARN,
-                )
+                if boot_clf is not None:
+                    clf = boot_clf
+                    pretty_log(
+                        "Complexity Router",
+                        f"Bootstrap-trained from trajectory log at startup: "
+                        f"{boot_report.summary()} · router now routing",
+                        icon=Icons.BRAIN_PLAN,
+                    )
+                else:
+                    pretty_log(
+                        "Complexity Router",
+                        f"Bootstrap skipped ({boot_report.bail_reason or 'no data'}); "
+                        "dispatcher pass-through until an idle retrain produces a model",
+                        icon=Icons.BRAIN_PLAN,
+                    )
+
         context.complexity_dispatcher = ComplexityDispatcher(
             classifier=clf,
             confidence_threshold=float(args.router_confidence_threshold),
@@ -973,13 +1011,6 @@ async def lifespan(app):
                 "No model loaded — dispatcher pass-through (escalates to full swarm) until the idle retrain produces one",
                 icon=Icons.BRAIN_PLAN,
             )
-        # Where the idle-time router retrain writes/reads the classifier.
-        # Mirrors context._prm_checkpoint_path. When --router-model is unset we
-        # still train and persist here so the router self-improves from logs.
-        if args.router_model:
-            context._router_checkpoint_path = Path(args.router_model)
-        else:
-            context._router_checkpoint_path = (context.memory_dir.parent / "router" / "checkpoint.json")
     except Exception as e:
         pretty_log("Complexity Router Failed", str(e), level="WARNING", icon=Icons.WARN)
         context.complexity_dispatcher = None

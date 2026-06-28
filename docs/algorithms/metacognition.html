@@ -35,7 +35,23 @@
     dual-solver arbitration.
   </p>
 
-  <h2>Status: WIRED + AUTO-ROUTING</h2>
+  <div style="border:2px solid #c0392b;background:#fdecea;padding:10px 14px;margin:12px 0;border-radius:6px">
+    <b>2026-06-28 redesign — the dual-solver arbiter is DISABLED by default.</b>
+    A paired ablation (full cognitive stack vs a stripped baseline) on a hard,
+    objectively-graded suite found the full stack did <b>not</b> beat the baseline
+    (78% vs 80%, McNemar p=1.0) at ~1.8&times; latency, and the arbiter was the
+    dominant latency source: it samples two paraphrased completions, computes
+    their divergence, then <em>discards both candidates</em> and dispatches the
+    original args — paying 2&times; inference for a number that only ever reaches
+    <code>ask_user</code> when both candidates fail. It is now gated off behind the
+    module constant <code>_METACOG_ARBITER_ENABLED = False</code> in
+    <code>core/agent.py</code>. Its intended grounded replacement is a
+    <b>verifier-judged best-of-N</b> that substitutes the winning answer into
+    <code>final_ai_content</code> (see <code>COGNITIVE_LAYER_REDESIGN.md</code>,
+    P0&nbsp;#4) — tracked separately. The rest of the metacog uplift (calibration,
+    competence, telemetry) is unchanged.
+  </div>
+  <h2>Status: WIRED + AUTO-ROUTING (arbiter gate now default-OFF — see box above)</h2>
   <p>
     As of 2026-05-23, the uplift modules are integrated into the live turn loop
     behind the <code>--enable-metacog</code> flag (off by default — legacy

@@ -81,6 +81,52 @@ def _ensure_list(v) -> list:
     return []
 
 
+# Tokens that carry no discriminative signal for trigger matching. Dropping
+# them lets paraphrased triggers ("How do I parse JSON?" vs "parse JSON")
+# collapse to the same normalized key so frequency actually accumulates.
+_TRIGGER_STOPWORDS = frozenset({
+    "a", "an", "the", "to", "of", "for", "and", "or", "in", "on", "at",
+    "is", "are", "be", "do", "does", "did", "how", "what", "why", "when",
+    "i", "my", "me", "we", "you", "it", "its", "with", "that", "this",
+    "can", "should", "would", "could", "please", "need", "want", "get",
+})
+
+
+def _normalize_trigger(s: str, *, sort_tokens: bool = True) -> str:
+    """Normalize a trigger string into a stable match key.
+
+    Lowercase, strip punctuation, collapse whitespace, drop stopwords, and
+    (by default) sort the remaining significant tokens so that semantically
+    equivalent / paraphrased triggers map to the SAME key. This is what makes
+    the frequency counter actually climb: exact-string matching almost never
+    collided on natural-language triggers, so nothing ever graduated.
+
+    `sort_tokens=False` preserves word order — used when we want the token
+    SET (for overlap relevance) rather than a canonical ordered key.
+
+    Backward-compatible: storage is untouched; this only affects how the
+    match KEY is computed.
+    """
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"[^\w\s]", " ", s)          # punctuation -> space
+    tokens = [t for t in s.split() if t]    # collapse whitespace
+    significant = [t for t in tokens if t not in _TRIGGER_STOPWORDS]
+    if not significant:
+        # All-stopword trigger (rare) — fall back to the raw tokens so we
+        # don't collapse every such trigger into the empty key.
+        significant = tokens
+    if sort_tokens:
+        significant = sorted(significant)
+    return " ".join(significant)
+
+
+def _trigger_token_set(s: str) -> set:
+    """Set of significant (stopword-stripped) tokens for overlap scoring."""
+    return set(_normalize_trigger(s, sort_tokens=False).split())
+
+
 def _lesson_is_structured(lesson: dict) -> bool:
     return any(k in lesson for k in _STRUCTURED_KEYS)
 
@@ -475,10 +521,13 @@ class SkillMemory:
 
         with self._get_lock():
             playbook = self._load_playbook()
-        task_lower = (task or "").lower().strip()
+        # Normalized (fuzzy) match key instead of exact lowercased string —
+        # paraphrased triggers ("parse JSON" / "How do I parse JSON?") now
+        # collide so the frequency counter accumulates and graduation can fire.
+        task_key = _normalize_trigger(task or "")
         for idx, p in enumerate(playbook):
-            existing_task = (p.get("task") or p.get("trigger") or "").lower().strip()
-            if existing_task and existing_task == task_lower:
+            existing_key = _normalize_trigger(p.get("task") or p.get("trigger") or "")
+            if existing_key and existing_key == task_key:
                 return {"index": idx, "lesson": p, "source": "json"}
         return None
 
@@ -526,10 +575,10 @@ class SkillMemory:
                         # snapshot, and a concurrent learn_lesson prepends
                         # entries, shifting every index. Trusting the stale
                         # index could merge into an unrelated lesson.
-                        key = (effective_trigger or "").lower().strip()
+                        key = _normalize_trigger(effective_trigger or "")
                         idx = next(
                             (i for i, p in enumerate(playbook)
-                             if (p.get("task") or p.get("trigger") or "").lower().strip() == key),
+                             if _normalize_trigger(p.get("task") or p.get("trigger") or "") == key),
                             None,
                         )
                         if idx is not None:
@@ -779,11 +828,27 @@ class SkillMemory:
 
         return self._update_lesson_fields(_match, _mut)
 
-    def credit_recent_retrievals(self, window_seconds: int = 300) -> int:
-        """Increment `helpful_retrievals` on every lesson that was
-        retrieved in the last `window_seconds`. Designed to be called
-        right after a turn / post-mortem that completed successfully —
-        any lesson surfaced just before counts as contributing.
+    def credit_recent_retrievals(self, window_seconds: int = 300, *,
+                                 query: str = "",
+                                 top_triggers=None,
+                                 min_token_overlap: int = 2) -> int:
+        """Increment `helpful_retrievals` on lessons retrieved in the last
+        `window_seconds` that are ACTUALLY RELEVANT to the succeeding query.
+
+        Designed to be called right after a turn / post-mortem that completed
+        successfully. The old behaviour credited EVERY recently-retrieved
+        lesson, which made `helpful_retrievals` ≈ `retrievals` and turned the
+        utility ranking into noise. Crediting is now discriminative:
+
+          * If `query` is given, a recent lesson is credited only when its
+            trigger/pattern shares at least `min_token_overlap` significant
+            (stopword-stripped) tokens with the query, OR
+          * its normalized trigger is in `top_triggers` — the set of triggers
+            that were the top-ranked retrievals for this query.
+
+        Backward-compatible: when NEITHER `query` NOR `top_triggers` is
+        supplied (legacy callers), we fall back to the original "credit every
+        recent retrieval" behaviour so existing call sites keep working.
 
         Returns the number of lessons credited. Idempotent per window:
         we stamp `last_credited_at` so a second success inside the same
@@ -792,6 +857,29 @@ class SkillMemory:
         if window_seconds <= 0:
             return 0
         cutoff = datetime.now() - timedelta(seconds=window_seconds)
+
+        # Relevance inputs. `discriminate` stays False for legacy callers
+        # (no query / no top_triggers) → original credit-everything behaviour.
+        query_tokens = _trigger_token_set(query) if query else set()
+        top_keys = {_normalize_trigger(t) for t in (top_triggers or []) if t}
+        discriminate = bool(query_tokens) or bool(top_keys)
+
+        def _is_relevant(lesson) -> bool:
+            if not discriminate:
+                return True
+            trig = lesson.get("trigger") or lesson.get("task") or ""
+            if top_keys and _normalize_trigger(trig) in top_keys:
+                return True
+            if query_tokens:
+                lesson_tokens = _trigger_token_set(trig)
+                # widen with anti/correct-pattern tokens so a lesson whose
+                # trigger is terse but whose pattern clearly addresses the
+                # query still counts.
+                lesson_tokens |= _trigger_token_set(lesson.get("correct_pattern") or "")
+                if len(query_tokens & lesson_tokens) >= max(1, min_token_overlap):
+                    return True
+            return False
+
         credited = 0
         with self._get_lock():
             playbook = self._load_playbook()
@@ -806,6 +894,10 @@ class SkillMemory:
                 except Exception:
                     continue
                 if last_dt < cutoff:
+                    continue
+                # Discriminative gate: skip recently-retrieved lessons that
+                # are not actually relevant to the succeeding query.
+                if not _is_relevant(lesson):
                     continue
                 # Idempotency guard: only credit once per retrieval.
                 last_credit = lesson.get("last_credited_at") or ""

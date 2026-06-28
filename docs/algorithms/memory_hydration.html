@@ -41,15 +41,13 @@ k = 60  (rrf_k default)</code></pre>
     </tbody>
   </table>
 
-  <h2>Section budgets</h2>
-  <p>Final markdown is capped at <code>max_chars</code> (default 6000). Per-section share:</p>
+  <h2>Global budget &amp; fused-score ordering</h2>
+  <p>Final markdown is capped at <code>max_chars</code> (default 6000). <strong>The fused RRF ranking now drives inclusion and order.</strong> Items are emitted in <em>descending fused score</em> (interleaved across sources) under a single global budget — source headers are emitted lazily on first sight so a tier's items still cluster under its header. The earlier fixed per-section budget map (<code>_SECTION_BUDGETS</code>, graph 25 % / vector 40 % / skill 20 % / episodic 15 %) was removed: it re-grouped items by source and silently discarded the fused score / intent weights / learned weights, making them cosmetic.</p>
   <ul>
-    <li>graph — 25 %</li>
-    <li>vector — 40 %</li>
-    <li>skill — 20 %</li>
-    <li>episodic — 15 %</li>
+    <li><strong>Per-source cap</strong> <code>_PER_SOURCE_CAP = 6</code> — a count cap (not a char budget) stops one tier monopolising the budget while still honouring fused-score order.</li>
+    <li><strong>Cross-tier relevance floor</strong> <code>_RELEVANCE_FLOOR</code> (default 0.0) — fused scores are normalised to [0,1] against the top item, and anything below the floor is dropped before injection. Default keeps every positively-scored item; raise it to prune low-signal context.</li>
   </ul>
-  <p>Each section truncates independently so a noisy vector store can't crowd out factual graph hits.</p>
+  <p>Companion gates upstream: <code>VectorMemory.search</code> now admits name-memory / summary rows on a <em>relaxed</em> distance threshold (<code>threshold × 1.5</code>) instead of unconditionally, and <code>EpisodicMemory._vector_search</code> derives <code>relevance_score = clamp(1.0 − distance, 0, 1)</code> and drops hits below <code>MIN_VECTOR_RELEVANCE = 0.2</code> (was a flat 1.0 for every hit). Graph seed-term extraction (<code>_extract_query_terms</code>) no longer auto-seeds the literal <code>"user"</code>, which previously returned the user ego-graph every turn regardless of topic. Covered by <code>tests/test_memory_relevance_gating.py</code>.</p>
 
   <h2>Step-by-step</h2>
   <ol>

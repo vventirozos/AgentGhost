@@ -82,7 +82,7 @@
   <p>When a lesson is surfaced, <code>record_retrieval</code> increments the counter and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — so the "is this self-play lesson ever actually used?" question has data to answer.</p>
 
   <h2>Dedup</h2>
-  <p>Vector similarity check (distance &lt; 0.15) or exact task match merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate.</p>
+  <p>Vector similarity check (distance &lt; 0.15) or a <strong>normalized trigger match</strong> merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate. The JSON fallback no longer requires an exact lowercased string: <code>_normalize_trigger()</code> lowercases, strips punctuation, drops stopwords and sorts the remaining significant tokens, so paraphrased triggers (<em>"How do I parse JSON?"</em> ≡ <em>"parse JSON"</em>) collapse onto the same key and <code>frequency</code> actually accumulates toward graduation.</p>
 
   <h2>Listing lessons (user-facing surface)</h2>
   <p><code>list_lessons(scope, source, limit)</code> returns lessons filtered by time window and source, most-recent first. Boundaries use <strong>local wall-clock</strong>:</p>
@@ -102,7 +102,7 @@
       <tr><td><code>learn_lesson(task, mistake, solution, memory_system=None, **structured)</code></td><td>Write lesson with dedup, merge, trim.</td></tr>
       <tr><td><code>list_lessons(scope="all", source="", limit=20) → list</code></td><td>Time-window + source filter; local-time boundaries; most-recent first.</td></tr>
       <tr><td><code>record_retrieval(trigger)</code> / <code>record_helpful_retrieval(trigger)</code></td><td>Hit-rate accounting. <code>record_retrieval</code> emits a debug log with <code>source_challenge_hash</code> for observability.</td></tr>
-      <tr><td><code>credit_recent_retrievals(window_seconds=300)</code></td><td>Bulk credit (idempotent per window).</td></tr>
+      <tr><td><code>credit_recent_retrievals(window_seconds=300, *, query="", top_triggers=None, min_token_overlap=2)</code></td><td>Discriminative bulk credit (idempotent per window). Credits a recently-retrieved lesson only when it is relevant to the succeeding <code>query</code> (≥ <code>min_token_overlap</code> significant-token overlap) or its trigger is in <code>top_triggers</code>. With no <code>query</code>/<code>top_triggers</code> it falls back to the legacy "credit everything" behaviour.</td></tr>
       <tr><td><code>prune_low_utility(min_retrievals=5, max_drop_fraction=0.25)</code></td><td>Drop bottom-quartile.</td></tr>
       <tr><td><code>get_recent_failures(limit) → str</code></td><td>Format for LLM injection.</td></tr>
       <tr><td><code>find_by_trigger(trigger)</code> / <code>mark_verified</code> / <code>remove_by_trigger</code></td><td>Index helpers used by the verification-grounded lesson flow in <a href="../core/dream.html">dream.py</a>.</td></tr>

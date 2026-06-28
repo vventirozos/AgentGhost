@@ -70,7 +70,7 @@ async def test_agent_handle_chat_uses_memory_bus_for_hydration():
     words = graph_call.args[0]
     assert "neo's" in words
     assert "matrix" in words
-    assert "user" in words
+    assert "user" not in words  # "user" is no longer auto-seeded (ego-graph bug)
 
     # The fused Markdown must land in the LLM payload's user message
     llm_payload = ctx.llm_client.chat_completion.call_args.args[0]

@@ -66,7 +66,9 @@ async def test_agent_graph_traversal_integration(mock_agent):
         
         assert "neo's" in extracted_words
         assert "matrix" in extracted_words
-        assert "user" in extracted_words
+        # Redesign #3: graph retrieval no longer auto-seeds the term "user"
+        # (that returned the user ego-graph on every turn regardless of topic).
+        assert "user" not in extracted_words
         
         # Verify it was injected
         # Check SYSTEM prompt passed to the LLM

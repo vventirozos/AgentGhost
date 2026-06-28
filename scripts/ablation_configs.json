@@ -1,0 +1,67 @@
+{
+  "_README": "Boot recipe for the ablation sweep. Each config = the FULL flag set MINUS one cognitive layer. Boot the agent with the listed flags, run `ablation_eval.py run --config <name>`, then move to the next. Reference is 'full'.",
+
+  "_isolation": "Give EVERY config a FRESH, EMPTY GHOST_HOME so memory/selfhood/workspace start blank and don't leak across configs. Use a test port distinct from your production agent, and STOP the production agent first (or use a separate GHOST_SANDBOX_DIR) so Docker/port don't clash. Example per-config boot wrapper:\n  TMP=$(mktemp -d)\n  GHOST_HOME=\"$TMP\" GHOST_SANDBOX_DIR=\"$TMP/sandbox\" \\\n    python -m src.ghost_agent.main --port 8010 --upstream-url http://127.0.0.1:8088 \\\n      --api-key '' <CONFIG FLAGS> &\n  # wait for http://127.0.0.1:8010/api/version, then:\n  GHOST_HOME=\"$TMP\" python scripts/ablation_eval.py run --config <name> --base-url http://127.0.0.1:8010 --repeats 5",
+
+  "_base_flags_common_to_all": ["--port 8010", "--upstream-url http://127.0.0.1:8088", "--api-key ''", "--no-mandatory-tor"],
+  "_note_tor": "Tor is NOT the variable under test; --no-mandatory-tor removes it as a slow/flaky confound for purely-local tasks. Keep it if your tasks need the network — just keep it CONSTANT across all configs.",
+
+  "reference": "full",
+
+  "configs": [
+    {
+      "name": "full",
+      "track": "reference",
+      "flags": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle"],
+      "note": "All cognitive layers ON (mirrors production minus Tor). Everything else is measured against this."
+    },
+    {
+      "name": "full_no_metacog",
+      "track": "A (in-session)",
+      "flags": ["--deep-reason", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle"],
+      "note": "Drops the metacognition uplift (validators, competence, entropy, composite confidence, dual-solver arbiter)."
+    },
+    {
+      "name": "full_no_deepreason",
+      "track": "A (in-session)",
+      "flags": ["--enable-metacog", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle"],
+      "note": "Drops MCTS lookahead + parallel hypothesis testing. Watch the latency delta closely — deep-reason is expensive."
+    },
+    {
+      "name": "full_no_preflight",
+      "track": "A (in-session)",
+      "flags": ["--enable-metacog", "--deep-reason", "--no-enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle"],
+      "note": "Drops the pre-flight repeat-failure guard. Expect to see it only on robustness/loop tasks."
+    },
+    {
+      "name": "full_no_selfmodel",
+      "track": "B (cross-session) — expect ~no in-session effect",
+      "flags": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle", "--no-self-model"],
+      "note": "Selfhood off. On a FRESH GHOST_HOME this should change almost nothing in-session; that is expected, not proof of uselessness. Judge it via Track B."
+    },
+    {
+      "name": "full_no_workspace",
+      "track": "B (cross-session) — expect ~no in-session effect",
+      "flags": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle", "--no-workspace-model"],
+      "note": "Workspace continuity off. Same caveat as selfmodel."
+    },
+    {
+      "name": "full_no_reflection",
+      "track": "B (cross-session) — expect ~no in-session effect",
+      "flags": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle", "--no-reflection"],
+      "note": "Idle self-critique off. Its payoff is on the NEXT session after a failure — Track B territory."
+    },
+    {
+      "name": "full_no_memory",
+      "track": "B (cross-session) — bound",
+      "flags": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard", "--postmortem", "--autoadvance-idle", "--no-memory"],
+      "note": "All persistent stores off (also forces self/workspace off). On a fresh GHOST_HOME this is near-identical to full in-session; the gap appears only across sessions."
+    },
+    {
+      "name": "thin",
+      "track": "floor",
+      "flags": ["--no-self-model", "--no-workspace-model", "--no-reflection", "--no-enable-preflight-guard"],
+      "note": "Cognitive layers stripped to the bone (metacog, deep-reason, postmortem all default-off; reflection/self/workspace/preflight forced off). The floor: full's TOTAL in-session lift over thin is the headline number."
+    }
+  ]
+}

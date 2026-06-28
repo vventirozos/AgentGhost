@@ -401,26 +401,27 @@ class MemoryBus:
 
     # ----------------------------------------------------------- formatting
 
-    # Per-section share of the overall hydration budget. Without this the
-    # formatter assembled the full Markdown then truncated by char count,
-    # so a heavy graph section could silently swallow the high-signal skill
-    # playbook. Budgets sum to 1.0 — graph/vector/skill split.
-    _SECTION_BUDGETS = {"graph": 0.25, "vector": 0.40, "skill": 0.20, "episodic": 0.15}
+    # Cross-tier relevance floor. Applied to the fused RRF score AFTER it is
+    # normalised to [0,1] against the top-ranked item, so the floor is
+    # meaningful regardless of rrf_k / weight magnitudes. Items below the
+    # floor are dropped before injection so zero/low-signal context is never
+    # spliced into a prompt unconditionally. Default 0.0 keeps every scored
+    # item (a positive RRF score is, by construction, a real signal); the
+    # constant exists so it can be tuned UP to prune aggressively without
+    # touching the formatter.
+    _RELEVANCE_FLOOR = 0.0
+
+    # Per-source cap on emitted items. The primary ordering / inclusion is by
+    # fused score under one global char budget (below), but this cap stops a
+    # single tier (e.g. a heavy graph ego-dump) from monopolising the budget
+    # when its fused scores happen to cluster at the top.
+    _PER_SOURCE_CAP = 6
 
     @staticmethod
     def _format_markdown(fused: List[Tuple[Dict[str, Any], float]],
                          max_chars: int = 6000) -> str:
         if not fused:
             return ""
-
-        # Group by source for human-readable sectioning, but preserve the
-        # RRF ordering inside each section so the highest-fused items lead.
-        order = ["graph", "vector", "skill", "episodic"]
-        sections: Dict[str, List[Tuple[str, float]]] = {s: [] for s in order}
-        for item, score in fused:
-            src = item["source"]
-            if src in sections:
-                sections[src].append((item["text"], score))
 
         headers = {
             "graph": "### TOPOLOGICAL KNOWLEDGE GRAPH:",
@@ -429,37 +430,63 @@ class MemoryBus:
             "episodic": "### PAST EPISODES:",
         }
 
+        # Normalise fused scores to [0,1] against the top-ranked item so the
+        # cross-tier relevance floor is comparable across queries, then keep
+        # only items at/above the floor. This is the single gate that stops
+        # no-signal context being injected unconditionally.
+        top = max((s for _it, s in fused), default=0.0)
+        norm = top if top > 0 else 1.0
+        gated = [(item, score) for item, score in fused
+                 if (score / norm) >= MemoryBus._RELEVANCE_FLOOR]
+        if not gated:
+            return ""
+
+        # Emit STRICTLY in descending fused-score order (interleaved across
+        # sources) under ONE global char budget. The previous implementation
+        # re-grouped by source with fixed per-tier budgets, which discarded
+        # the fused ranking entirely (intent / learned weights became
+        # cosmetic). Source headers are emitted lazily on first sight, so a
+        # source's items still cluster under its header while overall
+        # inclusion order follows the fused ranking.
+        per_source_count: Dict[str, int] = {}
+        emitted_headers: set = set()
         lines: List[str] = []
-        for src in order:
-            if not sections[src]:
+        used = 0
+        for item, _score in gated:  # already sorted desc by RRF
+            src = item.get("source", "vector")
+            text = item.get("text", "")
+            if not text:
                 continue
-            lines.append(headers[src])
-            section_budget = max(200, int(max_chars * MemoryBus._SECTION_BUDGETS.get(src, 0.33)))
-            used = 0
-            included = 0
-            for text, _score in sections[src]:
-                remaining = section_budget - used
-                if remaining <= 0:
-                    lines.append(f"[... +{len(sections[src]) - included} more {src} items truncated for budget]")
-                    break
-                if len(text) > remaining:
-                    if included == 0:
-                        # First (and possibly only) item is bigger than the
-                        # whole section budget — truncate it in place rather
-                        # than letting it crowd out other sections.
-                        lines.append(text[:remaining].rstrip() + " [...]")
-                        used += remaining
-                        included += 1
-                        if len(sections[src]) > 1:
-                            lines.append(f"[... +{len(sections[src]) - included} more {src} items truncated for budget]")
-                        break
-                    else:
-                        lines.append(f"[... +{len(sections[src]) - included} more {src} items truncated for budget]")
-                        break
-                lines.append(text)
-                used += len(text) + 1
-                included += 1
-            lines.append("")
+            if per_source_count.get(src, 0) >= MemoryBus._PER_SOURCE_CAP:
+                continue
+            header = headers.get(src)
+            header_cost = 0
+            if header is not None and src not in emitted_headers:
+                header_cost = len(header) + 1
+            remaining = max_chars - used
+            if remaining <= 0:
+                break
+            cost = len(text) + 1 + header_cost
+            if cost > remaining:
+                # Nothing emitted yet — truncate the single highest-ranked
+                # item in place rather than returning empty context;
+                # otherwise stop, since lower-ranked items can't fit either.
+                if used == 0:
+                    if header is not None and src not in emitted_headers:
+                        lines.append(header)
+                        emitted_headers.add(src)
+                        used += len(header) + 1
+                    remaining = max_chars - used
+                    lines.append(text[:max(0, remaining)].rstrip() + " [...]")
+                    used = max_chars
+                break
+            if header is not None and src not in emitted_headers:
+                lines.append(header)
+                emitted_headers.add(src)
+                used += len(header) + 1
+            lines.append(text)
+            used += len(text) + 1
+            per_source_count[src] = per_source_count.get(src, 0) + 1
 
         out = "\n".join(lines).strip()
         if len(out) > max_chars:
@@ -477,7 +504,12 @@ class MemoryBus:
         words = list({w for w in raw if len(w) > 3 and w not in _STOPWORDS})
         words.sort(key=len, reverse=True)
         words = words[:25]
-        words.append("user")
+        if not words:
+            # Trivial query produced no meaningful terms. Fall back to the
+            # raw tokens as-is rather than seeding "user" — the old "user"
+            # seed made graph retrieval return the user ego-graph on every
+            # turn regardless of topic.
+            return [w for w in raw if w][:25]
         return words
 
     # ============================================================ PUBLISH

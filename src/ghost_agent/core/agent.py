@@ -53,6 +53,55 @@ GENERAL_SAMPLING_PARAMS = {
     "min_p": 0,
     "presence_penalty": 1.5,
 }
+# FACTUAL / DETERMINISTIC answer turn — a non-tool turn whose query has a single
+# correct answer (math, counting, lookup, "what is X"). The conversational
+# profile (temp=1.0, presence_penalty=1.5) is actively harmful here: high temp
+# injects answer variance and presence_penalty=1.5 *discourages re-using the
+# exact tokens that ARE the answer* (the number / name). Near-greedy with no
+# presence penalty samples toward correctness. See `_is_factual_query`.
+FACTUAL_SAMPLING_PARAMS = {
+    "temperature": 0.2,
+    "top_p": 0.9,
+    "top_k": 20,
+    "min_p": 0,
+    "presence_penalty": 0,
+}
+
+# ---------------------------------------------------------------------------
+# Cognitive-layer toggles (2026-06 redesign — see COGNITIVE_LAYER_REDESIGN.md).
+# A paired ablation showed the full cognitive stack did NOT beat a stripped
+# baseline on a hard graded suite (78% vs 80%, p=1.0) at ~1.8x latency. The
+# offending pieces were "advisory, not load-bearing" injections and ungrounded
+# search. These flags DEFAULT-OFF the pieces that cost latency without changing
+# outcomes; the grounded paths (post-failure hypothesis testing, verifier-judged
+# best-of-N, signature-keyed lesson recall) are wired live below.
+#
+#  * MCTS turn-start hint: an MCTS "next action" injected as a prompt block
+#    ending "a strong hint, not a mandate — deviate if needed" → the model
+#    regenerates freely and ignores it, while the search costs ~4 LLM round
+#    trips (the 390s blowups). Ungrounded (scores the model's self-prediction
+#    of un-executed actions). OFF until it has an execution-grounded value fn.
+_MCTS_TURNSTART_ENABLED = False
+#  * Selfhood wake-up prefix: first-person narrative/mood prose spliced into the
+#    system prompt every turn. Injects no facts/tools/constraints — cosmetic
+#    voice that only adds tokens/latency. OFF on the request path.
+_SELFHOOD_PREFIX_ENABLED = False
+#  * Grounded hypothesis testing: on the post-failure replan path, don't just
+#    LIST candidate root causes — run each hypothesis's minimal test in the
+#    sandbox and keep only those consistent with the evidence. This gives
+#    deep-reason a value function grounded in real execution (the one mechanism
+#    that can convert a failure into a success). ON by default (no-op without
+#    --deep-reason, which is what wires context.hypothesis_tester).
+_HYPOTHESIS_GROUNDING_ENABLED = True
+#  * Metacog dual-solver arbiter: on a low-confidence shell/sql turn it samples
+#    TWO paraphrased completions, computes their cosine divergence, then throws
+#    both candidates away and dispatches the ORIGINAL args — paying 2x inference
+#    for a number that gates a near-unreachable `ask_user` pause. Net-negative
+#    (the dominant latency source; zero answer changes). OFF. The intended
+#    grounded replacement is a verifier-judged best-of-N that SUBSTITUTES the
+#    winning answer (see COGNITIVE_LAYER_REDESIGN.md P0#4) — a finalize-path
+#    feature, tracked separately.
+_METACOG_ARBITER_ENABLED = False
 
 # NON-THINKING MODE — model skips the `<think>` block entirely. Used
 # for tasks where reasoning doesn't help and would just burn tokens:
@@ -527,6 +576,50 @@ def render_think_budget_guidance(budget: str) -> str:
     return THINK_BUDGET_TIGHT
 
 
+# Social / open-ended openers that should KEEP the warm conversational profile
+# even though they ask a question (no single correct answer).
+_CHITCHAT_MARKERS = (
+    "how are you", "who are you", "what's up", "whats up", "tell me about yourself",
+    "tell me a", "write a poem", "write a story", "what do you think",
+    "your opinion", "how do you feel", "let's chat", "lets chat", "good morning",
+    "good evening", "thank you", "thanks",
+)
+# Strong signals that the query expects ONE deterministic answer.
+_FACTUAL_MARKERS = (
+    "how many", "how much", "how long", "what is the", "what's the", "what are the",
+    "compute", "calculate", "evaluate", "solve", "sum of", "product of", "count",
+    "number of", "value of", "result of", "how do i", "what year", "what day",
+    "which", "convert", "factorial", "prime", "divisible", "average", "median",
+    "percentage", "square root", "list the", "define ",
+)
+
+
+def _is_factual_query(query: str) -> bool:
+    """Heuristic: does this non-tool query have a single correct/deterministic
+    answer (math, counting, lookup) rather than open-ended chit-chat?
+
+    Conservative toward FACTUAL: a genuine question routes to near-greedy
+    sampling; only clearly social/creative openers stay on the warm profile.
+    """
+    q = (query or "").strip().lower()
+    if not q:
+        return False
+    if any(m in q for m in _CHITCHAT_MARKERS):
+        return False
+    if any(m in q for m in _FACTUAL_MARKERS):
+        return True
+    # a digit present alongside a question usually means a computed answer
+    if any(ch.isdigit() for ch in q) and ("?" in q or q.split()[0] in (
+            "what", "how", "which", "when", "calculate", "compute", "find")):
+        return True
+    # short interrogative that isn't a social opener → treat as factual
+    if q.endswith("?") and len(q.split()) <= 24 and q.split()[0] in (
+            "what", "which", "when", "who", "where", "is", "are", "does", "do",
+            "can", "how"):
+        return True
+    return False
+
+
 def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = False) -> dict:
     """Return the sampling profile for the current turn.
 
@@ -548,6 +641,11 @@ def get_sampling_params(is_tool_turn: bool, query: str = "", is_coding: bool = F
     removes that variance without costing conversational warmth.
     """
     if not is_tool_turn:
+        # A non-tool turn is NOT automatically chit-chat. If the query has a
+        # single deterministic answer, sample near-greedy with no presence
+        # penalty — temp=1.0/pp=1.5 samples AWAY from the correct tokens.
+        if _is_factual_query(query):
+            return dict(FACTUAL_SAMPLING_PARAMS)
         return dict(GENERAL_SAMPLING_PARAMS)
     if is_coding:
         profile = _classify_coding_task(query)
@@ -2001,6 +2099,38 @@ class GhostAgent:
                                                     confidence=_vr.updated_confidence,
                                                 )
                                                 _graduated += 1
+                                                # Also mint the proven sequence
+                                                # as a composed-skill MACRO so a
+                                                # graduated skill becomes a
+                                                # dispatchable unit, not just
+                                                # prose (redesign #8). Status
+                                                # "proposed": auto-activation
+                                                # needs per-step runtime arg
+                                                # templates the name-only
+                                                # candidate doesn't carry yet, so
+                                                # we surface it for activation
+                                                # rather than risk a param-less
+                                                # active tool. Best-effort.
+                                                try:
+                                                    from ..tools.composed_skills import _registry_from_context
+                                                    _reg = _registry_from_context(ctx)
+                                                    _seq = getattr(_cand, 'tool_sequence', ()) or ()
+                                                    if _reg is not None and _seq:
+                                                        _steps = [
+                                                            {"tool": _t, "description": "", "params": {}}
+                                                            for _t in _seq
+                                                        ]
+                                                        _reg.compile_from_pattern(
+                                                            getattr(_cand, 'name', 'skill') or 'skill',
+                                                            _steps,
+                                                            f"Proven {len(_seq)}-step sequence graduated "
+                                                            f"from {getattr(_cand, 'support', 0)} successful runs",
+                                                            status="proposed",
+                                                            execution_mode="sequential",
+                                                        )
+                                                except Exception as _ce:
+                                                    logger.debug(
+                                                        "composed-macro mint skipped: %s", _ce)
                                         except Exception as _ve:
                                             logger.debug(
                                                 "skill graduation skipped for "
@@ -3643,7 +3773,9 @@ class GhostAgent:
                 try:
                     from ..selfhood import SelfModel as _SelfModel
                     self_model = getattr(self.context, 'self_model', None)
-                    if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
+                    if (_SELFHOOD_PREFIX_ENABLED
+                            and isinstance(self_model, _SelfModel)
+                            and getattr(self_model, 'enabled', False)):
                         # Pass the current request as `query` so the
                         # wake-up prefix surfaces RELEVANT past experiences
                         # (recall keyed to what's being asked now), not
@@ -3676,9 +3808,15 @@ class GhostAgent:
                             workspace_model.current_project_id = _active_pid
                         except Exception:
                             pass
-                        ws_prefix = workspace_model.build_wakeup_prefix(active_project_id=_active_pid)
-                        if isinstance(ws_prefix, str) and ws_prefix:
-                            continuity_blocks.append(ws_prefix)
+                        # Gate the workspace wake-up prefix on an ACTIVE project:
+                        # with no project context the prose adds tokens but no
+                        # task signal. The useful behaviour-shaping bits (file
+                        # parse-warnings, re-fetch nudge) only exist inside real
+                        # project work, which always carries an active pid.
+                        if _active_pid:
+                            ws_prefix = workspace_model.build_wakeup_prefix(active_project_id=_active_pid)
+                            if isinstance(ws_prefix, str) and ws_prefix:
+                                continuity_blocks.append(ws_prefix)
                 except Exception as e:
                     logger.debug(f"workspace wake-up prefix skipped: {type(e).__name__}: {e}")
 
@@ -3746,7 +3884,8 @@ class GhostAgent:
                     _rd = body.get("_router_decision") or {}
                     _is_hard = (_rd.get("label") == "hard"
                                 and not _rd.get("escalated"))
-                    if (_mcts is not None and _is_hard and last_user_content
+                    if (_MCTS_TURNSTART_ENABLED and _mcts is not None and _is_hard
+                            and last_user_content
                             and not self._is_strict_trivial_chat(lc)):
                         from ..tools.registry import TOOL_DEFINITIONS as _MCTS_TD
                         _tool_names = [
@@ -3934,14 +4073,17 @@ class GhostAgent:
                     bus = self._get_memory_bus()
                     if bus is not None:
                         try:
-                            # Pass llm_client + a char budget so RAG-Fusion's
-                            # query-decomposition actually runs (it was always
-                            # None → heuristic-only) and complex queries can
-                            # scale past the 6k default (cap 12k chars).
+                            # Pass llm_client so RAG-Fusion's query-decomposition
+                            # runs. Budget reduced 12k→4k: the review found up to
+                            # 12k chars of mostly-irrelevant memory was crowding
+                            # the actual task. With fused-score ordering + per-tier
+                            # relevance gating now governing inclusion (see bus.py),
+                            # a tighter budget surfaces the relevant items and drops
+                            # the noise instead of padding to a fixed section quota.
                             fetched_context = await bus.hydrate_context(
                                 search_query,
                                 llm_client=getattr(self.context, "llm_client", None),
-                                context_budget=12000,
+                                context_budget=4000,
                             )
                             if fetched_context:
                                 fetched_context = fetched_context.replace("\r", "")
@@ -7085,7 +7227,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # just awaits the decision and acts on it.
                             _mc_gate = getattr(self.context, "metacog", None)
                             _gate_decision = None
-                            if _mc_gate is not None and getattr(_mc_gate, "enabled", False):
+                            if (_METACOG_ARBITER_ENABLED and _mc_gate is not None
+                                    and getattr(_mc_gate, "enabled", False)):
                                 try:
                                     _gate_decision = await _mc_gate.arbitrate_tool_calls(
                                         messages=messages, tool_name=fname,
@@ -9507,14 +9650,51 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         context=sandbox_state,
                         error_output=error_context,
                     )
-                    if hypotheses:
-                        top = sorted(hypotheses, key=lambda h: h.confidence, reverse=True)[:3]
-                        hypotheses_hint = "### CANDIDATE ROOT CAUSES (from parallel hypothesis gen):\n" + "\n".join(
-                            f"- [conf {h.confidence:.0%}] {h.description}" for h in top
-                        ) + "\n\n"
+                    # GROUNDED ELIMINATION: instead of listing un-tested guesses,
+                    # run each hypothesis's minimal test in the sandbox and keep
+                    # only those consistent with the evidence. This is the change
+                    # that turns deep-reason from an ignorable text hint into a
+                    # value function grounded in execution.
+                    tested = False
+                    _sm = getattr(self.context, "sandbox_manager", None)
+                    if (hypotheses and _HYPOTHESIS_GROUNDING_ENABLED
+                            and _sm is not None):
+                        async def _hyp_executor(tool_name, action_str):
+                            try:
+                                _out, _code = await asyncio.to_thread(
+                                    _sm.execute, action_str, 30)
+                                return f"[exit {_code}]\n{_out}"
+                            except Exception as _ex:
+                                return f"executor error: {_ex}"
+                        try:
+                            hypotheses = await asyncio.wait_for(
+                                tester.test_hypotheses_parallel(
+                                    hypotheses[:3], _hyp_executor),
+                                timeout=120.0,
+                            )
+                            # LLM adjudication over the real test evidence.
+                            await tester.evaluate_results(task_context, hypotheses)
+                            tested = True
+                        except Exception as _ex:
+                            logger.debug(f"Hypothesis grounding skipped: {_ex}")
+                    surviving = tester.get_surviving(hypotheses) if tested else []
+                    ranked = surviving if surviving else hypotheses
+                    if ranked:
+                        top = sorted(ranked, key=lambda h: h.confidence, reverse=True)[:3]
+                        _label = ("tested in sandbox — survivors" if tested
+                                  else "candidate")
+                        hypotheses_hint = (
+                            f"### ROOT-CAUSE HYPOTHESES ({_label}):\n" + "\n".join(
+                                f"- [conf {h.confidence:.0%}] {h.description}"
+                                + (f"\n    evidence: {str(h.result)[:200]}"
+                                   if tested and getattr(h, "result", "") else "")
+                                for h in top
+                            ) + "\n\n"
+                        )
                         pretty_log(
                             "Deep Reason",
-                            f"Generated {len(hypotheses)} hypotheses; top-3 informing strategy gen",
+                            f"{'Tested' if tested else 'Generated'} {len(hypotheses)} "
+                            f"hypotheses; {len(top)} informing strategy gen",
                             icon=Icons.BRAIN_THINK,
                         )
                 except Exception as e:

@@ -37,6 +37,13 @@ class EpisodicMemory:
     MAX_EPISODES = 500
     MAX_ACTIONS_PER_EPISODE = 20
 
+    # Minimum distance-derived relevance an episode vector hit must clear to be
+    # returned. Previously every vector hit was stamped relevance_score = 1.0
+    # regardless of distance, so semantically unrelated episodes were injected
+    # as if they were perfect matches. relevance = clamp(1.0 - distance, 0, 1);
+    # hits below this floor are dropped. Tunable.
+    MIN_VECTOR_RELEVANCE = 0.2
+
     def __init__(self, memory_dir: Path):
         self.db_path = memory_dir / "episodic_memory.db"
         self._lock = threading.RLock()
@@ -277,24 +284,48 @@ class EpisodicMemory:
             return []
         # search_advanced doesn't filter by type — keep episode hits only.
         hits = [h for h in hits if (h.get("metadata") or {}).get("type") == "episode"]
-        # Map vector hits back to episode records
-        episode_ids = []
+        # Map vector hits back to episode records, keeping each hit's distance
+        # (search_advanced exposes it as "score" — lower is closer). We retain
+        # the BEST (smallest) distance per episode if it appears more than once.
+        ep_dist: Dict[int, float] = {}
+        ordered_ids: List[int] = []
         for hit in hits:
             meta = hit.get("metadata", {})
             ep_id = meta.get("episode_id")
-            if ep_id is not None:
-                try:
-                    episode_ids.append(int(ep_id))
-                except (ValueError, TypeError):
-                    pass
-        if not episode_ids:
+            if ep_id is None:
+                continue
+            try:
+                ep_id = int(ep_id)
+            except (ValueError, TypeError):
+                continue
+            try:
+                dist = float(hit.get("score"))
+            except (TypeError, ValueError):
+                dist = 1.0
+            if ep_id not in ep_dist:
+                ordered_ids.append(ep_id)
+                ep_dist[ep_id] = dist
+            else:
+                ep_dist[ep_id] = min(ep_dist[ep_id], dist)
+        if not ordered_ids:
             return []
         results = []
-        for ep_id in episode_ids[:limit]:
+        for ep_id in ordered_ids:
+            # Distance-derived relevance instead of a flat 1.0. Drop hits below
+            # the floor so semantically irrelevant episodes aren't injected.
+            relevance = 1.0 - ep_dist[ep_id]
+            if relevance < 0.0:
+                relevance = 0.0
+            elif relevance > 1.0:
+                relevance = 1.0
+            if relevance < self.MIN_VECTOR_RELEVANCE:
+                continue
             ep = self.get_episode(ep_id)
             if ep:
-                ep["relevance_score"] = 1.0  # Vector matches are high relevance
+                ep["relevance_score"] = relevance
                 results.append(ep)
+            if len(results) >= limit:
+                break
         return results
 
     def search_by_outcome(self, success: bool, limit: int = 10) -> List[Dict]:

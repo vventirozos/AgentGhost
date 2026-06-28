@@ -160,11 +160,15 @@ class TestEpisodicInRRF:
             weights = MemoryBus._INTENT_WEIGHTS[intent]
             assert "episodic" in weights
 
-    def test_section_budget_includes_episodic(self):
+    def test_episodic_tier_is_formatted(self):
+        # The fixed per-section _SECTION_BUDGETS map was removed in favour of
+        # fused-score ordering under one global budget. Episodic must still be a
+        # recognised tier that gets its own section header when present.
         from ghost_agent.core.bus import MemoryBus
-        assert "episodic" in MemoryBus._SECTION_BUDGETS
-        total = sum(MemoryBus._SECTION_BUDGETS.values())
-        assert abs(total - 1.0) < 0.01
+        fused = [({"source": "episodic", "text": "past episode recall"}, 0.7)]
+        out = MemoryBus._format_markdown(fused, max_chars=6000)
+        assert "PAST EPISODES" in out
+        assert "past episode recall" in out
 
 
 # ============================================================

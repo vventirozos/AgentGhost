@@ -579,7 +579,17 @@ class VectorMemory:
                             else:
                                 threshold = 0.65 if m_type == 'manual' else 0.55
 
-                        if dist < threshold or is_name_memory or is_summary:
+                        # Name-memory and summary rows used to be injected
+                        # UNCONDITIONALLY (`or is_name_memory or is_summary`),
+                        # ignoring distance entirely. Gate them on distance too,
+                        # but with a RELAXED threshold so identity/summary
+                        # context is still favoured without being forced in
+                        # when it's semantically irrelevant.
+                        relaxed_threshold = threshold * 1.5
+                        include = dist < threshold
+                        if not include and (is_name_memory or is_summary):
+                            include = dist < relaxed_threshold
+                        if include:
                             priority_score = 1
 
                             if is_name_memory: priority_score = -20

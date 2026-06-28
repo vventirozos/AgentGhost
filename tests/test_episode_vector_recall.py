@@ -81,7 +81,9 @@ def test_search_similar_uses_vector_path(tmp_path):
                                 limit=5, vector_memory=vec)
     assert results, "expected the vector path to surface the episode"
     assert results[0]["id"] == ep_id
-    assert results[0]["relevance_score"] == 1.0
+    # relevance is now distance-derived (1.0 - dist), not a flat 1.0.
+    # FakeVector.search_advanced returns score/dist=0.1 -> relevance 0.9.
+    assert results[0]["relevance_score"] == pytest.approx(0.9)
 
 
 def test_no_vector_memory_is_a_noop(tmp_path):

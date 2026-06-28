@@ -92,17 +92,17 @@ def test_extract_query_terms_filters_stopwords_and_short_tokens():
     assert "neo's" in words
     assert "matrix" in words
     assert "tell" in words           # 4 chars, kept
-    assert "user" in words           # always appended
+    assert "user" not in words        # no longer auto-seeded (was ego-graph bug)
     assert "the" not in words        # 3 chars, dropped
     assert "about" not in words      # stopword
 
 
-def test_extract_query_terms_caps_and_appends_user():
+def test_extract_query_terms_caps_and_does_not_append_user():
     long_query = " ".join([f"word{i}" for i in range(40)])
     words = MemoryBus._extract_query_terms(long_query)
-    # 25 cap + the appended 'user' sentinel = 26 max.
-    assert len(words) == 26
-    assert words[-1] == "user"
+    # 25-term cap, with NO appended 'user' sentinel.
+    assert len(words) == 25
+    assert "user" not in words
 
 
 # =========================================================== hydrate_context

@@ -139,5 +139,8 @@ class TestSystem3HypothesisPrelude:
                 "task", "error", "sandbox", "test-model",
             )
             gen_call_msg = fake_llm.chat_completion.call_args_list[0][0][0]["messages"][1]["content"]
-            assert "CANDIDATE ROOT CAUSES" in gen_call_msg
+            # Redesign #6: hint header is now "ROOT-CAUSE HYPOTHESES (candidate)"
+            # when no sandbox grounding ran (this test has no sandbox_manager),
+            # or "(tested in sandbox — survivors)" when it did.
+            assert "ROOT-CAUSE HYPOTHESES" in gen_call_msg
             assert "missing env var" in gen_call_msg
