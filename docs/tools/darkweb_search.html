@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tools.darkweb_search — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Tools</h3>
+    <a href="registry.html">registry</a>
+    <a href="execute.html">execute</a>
+    <a href="browser.html">browser</a>
+    <a href="file_system.html">file_system</a>
+    <a href="search.html">search</a>
+    <a class="current" href="darkweb_search.html">darkweb_search</a>
+    <a href="database.html">database</a>
+    <a href="memory_tools.html">memory tools</a>
+    <a href="system.html">system</a>
+    <a href="introspect.html">introspect</a>
+    <a href="workspace.html">workspace</a>
+    <a href="workspace_track.html">workspace_track</a>
+    <a href="vision.html">vision</a>
+    <a href="image_gen.html">image_gen</a>
+    <a href="swarm.html">swarm</a>
+    <a href="tasks.html">tasks</a>
+    <a href="projects.html">projects</a>
+    <a href="qwen_bridge.html">qwen_bridge</a>
+    <a href="acquired_skills.html">acquired_skills</a>
+    <a href="composed_skills.html">composed_skills</a>
+    <a href="tool_failure.html">tool_failure</a>
+    <a href="fallback_chains.html">fallback_chains</a>
+  </nav>
+</aside>
+<main>
+  <h1>tools / darkweb_search.py</h1>
+  <p class="subtitle">Discovery of Tor hidden services (<code>.onion</code>) via dedicated <strong>onion search engines</strong>, with per-attempt circuit rotation, cross-engine corroboration ranking, and an optional deep-read research mode.</p>
+
+  <h2>Why a separate tool</h2>
+  <p>
+    The clearnet search tool (<a href="search.html"><code>search.py</code></a>) queries scraper backends — DuckDuckGo, Brave, Mojeek — that <strong>do not index Tor hidden services</strong>. Discovering <code>.onion</code> content requires querying <em>dedicated onion search engines</em> (Ahmia, Torch, Haystak, …) and parsing their result pages. The transport is the same Tor SOCKS proxy the rest of the agent already uses; what is new is the engine set and the result parsing.
+  </p>
+
+  <h2>Tools</h2>
+  <table>
+    <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
+    <tbody>
+      <tr><td><code>darkweb_search</code></td><td>Fan a query across the onion-engine set over Tor, parse the <code>.onion</code> result links/titles/snippets, de-dup by onion host, rank by cross-engine corroboration, and return a ranked list. List-only — pair with <code>browser</code> / <code>darkweb_research</code> to actually read a result.</td></tr>
+      <tr><td><code>darkweb_research</code></td><td>The dark-web analogue of <code>deep_research</code>: runs <code>darkweb_search</code>, then fetches the top onion pages over Tor and distils each via the worker LLM into a synthesised report.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Onion-engine registry (<code>_ONION_ENGINES</code>)</h2>
+  <p>
+    Onion search-engine endpoints rotate and die far more often than clearnet ones, so the set is <strong>config-driven</strong> and intentionally <strong>wide</strong> — breadth plus circuit rotation wins, the same philosophy as <code>search.py</code>'s <code>_TOR_BACKENDS</code>. The built-in default is:
+  </p>
+  <ul>
+    <li><code>ahmia</code> — the clearnet mirror <code>ahmia.fi</code> (still fetched over Tor); indexes onion services and filters known-abuse material at the index level.</li>
+    <li><code>ahmia-onion</code> — Ahmia's own <code>.onion</code> endpoint. Listed alongside the clearnet mirror on purpose: the two have <em>independent</em> reachability, so one is often up when the other is blocked.</li>
+    <li><code>torch</code>, <code>haystak</code> — broad unfiltered onion indexes, for reach.</li>
+  </ul>
+  <p>
+    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search.
+  </p>
+
+  <h2>Circuit rotation + timeouts (reused from search.py)</h2>
+  <p>
+    Onion <em>search engine</em> reachability is exit-node dependent in exactly the same way clearnet search is, so the same per-attempt circuit rotation applies: <code>_proxy_for_attempt</code> (imported from <code>search.py</code>) folds the attempt index into the SOCKS <code>username:password</code>, and Tor's <code>IsolateSOCKSAuth</code> hands each attempt a different exit node. Each engine is tried up to 2 times, each on a fresh circuit, and all engines are queried <strong>concurrently</strong>.
+  </p>
+  <p>
+    <strong>Timeouts are deliberately higher than clearnet search.</strong> Onion round-trips are materially slower: <code>_ONION_TIMEOUT = 30&nbsp;s</code> per engine request (vs. <code>search.py</code>'s <code>_DDGS_TOR_TIMEOUT = 18&nbsp;s</code>), and <code>_ONION_PAGE_TIMEOUT = 35&nbsp;s</code> for each onion page fetch in the research phase. These clear a healthy onion service while still letting dead endpoints fail fast on connect error. Like the clearnet timeout, they are empirically tunable.
+  </p>
+
+  <h2><code>socks5h</code> — mandatory for .onion</h2>
+  <p>
+    <code>_normalize_tor_proxy</code> forces the proxy to <code>socks5h://</code> form (note the <em>h</em>), which routes DNS resolution <strong>through</strong> the proxy. This is mandatory: <code>.onion</code> has no clearnet DNS, so a plain <code>socks5://</code> proxy (local resolution) would fail to resolve every hidden service. The SSRF guard shared by the fetch helpers treats a DNS-resolution failure as <em>allow</em>, so <code>.onion</code> hosts pass it cleanly.
+  </p>
+
+  <h2>Result parsing &amp; ranking</h2>
+  <p>
+    Each engine renders results differently, so <code>_parse_onion_results</code> is deliberately tolerant: it walks anchors to harvest <code>(onion-url, title)</code> pairs with a nearby snippet, unwraps Ahmia-style <code>redirect_url=</code> wrappers, then does a regex sweep of the whole document to catch onion URLs that appeared as plain text. Addresses are matched as base32 v3 (56 chars) or legacy v2 (16 chars). Results are de-duped by onion host, and ranked so that onions surfaced by <strong>more than one engine</strong> sort first — cross-engine corroboration is the only cheap relevance signal available for unindexed hidden services.
+  </p>
+
+  <h2>Raw-HTML fetch vs. text fetch</h2>
+  <p>
+    The search phase needs the <strong>raw result HTML</strong> to parse out links, so it uses a dedicated <code>_fetch_raw_html</code> (curl_cffi with TLS impersonation, falling back to httpx) rather than <code>helper_fetch_url_content</code> — which strips all tags to plain text and would destroy the links. The <em>research</em> phase, which only wants page text, <strong>does</strong> reuse <code>helper_fetch_url_content</code>.
+  </p>
+
+  <h2>Anonymous mode</h2>
+  <p>
+    Under <code>--anonymous</code>, the same stylometric egress scrubbing as clearnet search applies: <code>darkweb_search</code> uses the deterministic <code>scrub_query</code> plus a per-query SOCKS identity tag; <code>darkweb_research</code> uses the stronger LLM-based <code>neutralize_query</code>. Tor anonymises the network; this anonymises the <em>content</em> fingerprint of the query before it leaves the box.
+  </p>
+
+  <h2>Safety posture</h2>
+  <p>
+    Hidden services are unverified and frequently malicious. The tools never auto-execute or auto-download anything — <code>darkweb_search</code> returns links only, and <code>darkweb_research</code> returns extracted text with an explicit instruction to treat all claims as unverified and corroborate before relying on them. Every reached onion host is logged to the operator's live stream via <code>pretty_log</code> with a distinct 🧅 icon.
+  </p>
+
+  <h2>Tests</h2>
+  <p>
+    Parsing (anchors, redirect unwrapping, plain-text sweep, de-dup), cross-engine corroboration ranking, the actionable zero-results error, anonymous-mode scrubbing, the <code>GHOST_ONION_ENGINES</code> override + malformed fallback, <code>socks5h</code> normalisation, result caching, and the full research deep-read path are covered by <code>tests/test_darkweb_search.py</code>.
+  </p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

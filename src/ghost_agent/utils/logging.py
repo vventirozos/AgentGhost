@@ -172,6 +172,7 @@ class Icons:
     TOOL_FILE_I  = "👀"
     TOOL_DOWN    = "⬇️"
     TOOL_BROWSER = "🌎"   # headless browser automation (distinct from shell 🐚)
+    TOOL_DARKWEB = "🧅"   # dark-web (.onion) search over Tor (onion = 🧅, distinct from clearnet 🌐)
     IMAGE_GEN    = "🎨"
     REPORT_PDF   = "📄"
     NODE_WORKER  = "⚙️"   # background / edge worker-node compute
