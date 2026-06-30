@@ -138,7 +138,7 @@ class RoutingTask:
 
 
 class LLMClient:
-    def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, swarm_nodes: Optional[list] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None):
+    def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, swarm_nodes: Optional[list] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None, critic_nodes: Optional[list] = None):
         self.upstream_url = upstream_url
         limits = httpx.Limits(max_keepalive_connections=3, max_connections=15, keepalive_expiry=30.0)
 
@@ -278,6 +278,33 @@ class LLMClient:
                     "model": node["model"]
                 })
 
+        # Dedicated CRITIC pool. A separate node pool (typically a slower,
+        # off-host model — e.g. a 9B on a spare Mac Mini) reserved for the
+        # self-evaluation verifier. Kept distinct from `worker_clients` on
+        # purpose: the worker pool is for fast, latency-sensitive cognitive
+        # chores (routing, query expansion, arg validation) that must NOT
+        # queue behind a slow critic. Routing the verifier here also keeps
+        # its calls off the foreground inference slot, so a verdict never
+        # competes with the Studio's main model for the KV-cache.
+        self.critic_clients = []
+        self._critic_index = 0
+        if critic_nodes:
+            for node in critic_nodes:
+                client = httpx.AsyncClient(
+                    base_url=node["url"],
+                    timeout=1200.0,
+                    limits=limits,
+                    proxy=get_proxy(node["url"]),
+                    trust_env=False,
+                    follow_redirects=True,
+                    http2=False
+                )
+                self.critic_clients.append({
+                    "client": client,
+                    "url": node["url"],
+                    "model": node["model"]
+                })
+
     # ====================================================================
     # ARCHITECTURAL OPTIMISATION #2: TWO-TIER MODEL ROUTING
     # --------------------------------------------------------------------
@@ -342,6 +369,8 @@ class LLMClient:
         for node in getattr(self, 'coding_clients', []):
             await node["client"].aclose()
         for node in getattr(self, 'image_gen_clients', []):
+            await node["client"].aclose()
+        for node in getattr(self, 'critic_clients', []):
             await node["client"].aclose()
 
     def get_swarm_node(self, target_model: Optional[str] = None) -> Optional[Dict[str, Any]]:
@@ -431,6 +460,33 @@ class LLMClient:
                 return node
         return coding_clients[0]
 
+    def get_critic_node(self, target_model: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Round-robin pick from the critic pool, skipping tripped nodes.
+
+        Mirrors `get_coding_node`. Returns None when no critic pool is
+        configured so callers fall back to their existing path (worker
+        route → foreground) without special-casing.
+        """
+        critic_clients = getattr(self, 'critic_clients', [])
+        if not critic_clients:
+            return None
+
+        if target_model:
+            target_lower = target_model.lower()
+            for node in critic_clients:
+                if target_lower in node["model"].lower() and self.circuit_breaker.is_available(node["url"]):
+                    return node
+
+        if not hasattr(self, '_critic_index'):
+            self._critic_index = 0
+
+        for _ in range(len(critic_clients)):
+            node = critic_clients[self._critic_index]
+            self._critic_index = (self._critic_index + 1) % len(critic_clients)
+            if self.circuit_breaker.is_available(node["url"]):
+                return node
+        return critic_clients[0]
+
     def get_image_gen_node(self, target_model: Optional[str] = None) -> Optional[Dict[str, Any]]:
         image_gen_clients = getattr(self, 'image_gen_clients', [])
         if not image_gen_clients:
@@ -480,7 +536,7 @@ class LLMClient:
                 else:
                     raise Exception(f"Image generation failed after 3 attempts: {str(e)}")
 
-    async def _do_chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def _do_chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
         """
         Sends a chat completion request to the upstream LLM with robust retry logic.
         """
@@ -599,6 +655,55 @@ class LLMClient:
                         continue
 
                 pretty_log("Worker Compute Failed", "All worker nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
+
+        elif use_critic and getattr(self, 'critic_clients', None):
+            target_model = payload.get("model")
+            tried_nodes = []
+
+            node = self.get_critic_node(target_model)
+
+            if node:
+                for _ in range(len(self.critic_clients)):
+                    if not node:
+                        break
+
+                    if node in tried_nodes:
+                        target_model = None
+                        node = self.get_critic_node(target_model)
+
+                    loop_breaker = 0
+                    while node in tried_nodes and loop_breaker < len(self.critic_clients):
+                        node = self.get_critic_node(None)
+                        loop_breaker += 1
+
+                    if node in tried_nodes:
+                        break
+
+                    tried_nodes.append(node)
+
+                    pretty_log("Critic Compute", f"Routing verification to Critic Node ({node['model']})", level="INFO", icon=Icons.VERIFIER_LAB)
+                    try:
+                        import copy as _copy, json
+                        node_payload = _copy.deepcopy(payload)
+                        node_payload["model"] = node["model"]
+
+                        body_bytes = json.dumps(node_payload, ensure_ascii=True).encode('utf-8')
+
+                        kwargs = {}
+                        if timeout is not None:
+                            kwargs["timeout"] = timeout
+                        resp = await node["client"].post("/v1/chat/completions", content=body_bytes, headers={"Content-Type": "application/json", "Connection": "close"}, **kwargs)
+                        resp.raise_for_status()
+                        self.circuit_breaker.record_success(node["url"])
+                        return resp.json()
+                    except Exception as e:
+                        self.circuit_breaker.record_failure(node["url"])
+                        pretty_log("Critic Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
+                        target_model = None
+                        node = self.get_critic_node(target_model)
+                        continue
+
+                pretty_log("Critic Compute Failed", "All critic nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
 
         elif use_coding and getattr(self, 'coding_clients', None):
             target_model = payload.get("model")
@@ -788,19 +893,19 @@ class LLMClient:
             await asyncio.sleep(1.0)
             waited += 1.0
 
-    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, is_background: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
         if is_background:
             # Wait for foreground to clear (see _wait_for_foreground_clear
             # for the two-signal policy), then acquire a semaphore slot
             # (allows up to 3 concurrent background tasks).
             await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
-                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, timeout)
+                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout)
         else:
             async with self._foreground_lock:
                 self.foreground_tasks += 1
             try:
-                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, timeout)
+                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout)
             finally:
                 async with self._foreground_lock:
                     self.foreground_tasks -= 1

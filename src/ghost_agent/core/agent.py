@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import logging
+import os
 import random
 import time
 import uuid
@@ -1361,6 +1362,12 @@ class GhostAgent:
     def __init__(self, context: GhostContext):
         self.context = context
         self.disabled_tools = set()
+        # Corrections queued by a previous turn's async verdict (GHOST_CRITIC_ASYNC),
+        # surfaced at the top of the next turn. See _record_late_verdict /
+        # _consume_pending_corrections.
+        self._pending_corrections = []
+        self._correction_active_this_turn = False
+        self._active_correction = ""
         self.available_tools = get_available_tools(context)
         self.agent_semaphore = asyncio.Semaphore(10)
         self.memory_semaphore = asyncio.Semaphore(1)
@@ -3535,6 +3542,304 @@ class GhostAgent:
             )
         return v_result, last_tool
 
+    @staticmethod
+    def _compose_injection(req_messages, stable_injection, dynamic_state, pin):
+        """Place the per-turn stable + volatile context into ``req_messages``.
+
+        Returns the (mutated) list. The per-turn injection has two parts:
+        a large STABLE block (tool schemas + persona + playbook + hydrated
+        memory + continuity — byte-identical across the turns of one
+        request) and a small VOLATILE ``dynamic_state`` (timestamp /
+        sandbox state / plan focus — changes every turn).
+
+        ``pin=False`` (legacy): the whole injection rides the LAST message.
+        That message is a *different* one each turn (turn 1: the query;
+        turn 2: the tool result), so the stable block re-prefills every
+        turn — only the system slot caches.
+
+        ``pin=True``: the stable block is pinned to the FIRST user message
+        — a position that never moves as the loop appends assistant/tool
+        turns — so the upstream KV-cache reuses it on turns 2+. Only the
+        volatile block rides the (moving) last message. On turn 1 the two
+        coincide, so the volatile block is appended AFTER the instruction,
+        keeping the ``[stable + instruction]`` prefix byte-identical on
+        later turns. Native tool defs still travel in the payload ``tools``
+        field, so tool-calling does not depend on the text block's position.
+        """
+        if not pin:
+            transient_injection = f"{stable_injection}\n\n{dynamic_state.strip()}"
+            if req_messages and req_messages[-1]["role"] == "user":
+                original_msg = req_messages[-1]["content"]
+                req_messages[-1]["content"] = (
+                    f"<system_state_update>\n{transient_injection}\n(CRITICAL: This is "
+                    "internal system state. Do NOT acknowledge or comment on this block in "
+                    "your thoughts. Focus entirely on the user instruction.)\n"
+                    f"</system_state_update>\n\n[USER INSTRUCTION]\n{original_msg}"
+                )
+            else:
+                req_messages.append({
+                    "role": "user",
+                    "content": f"<system_state_update>\n{transient_injection}\n</system_state_update>",
+                })
+            return req_messages
+
+        stable_block = (
+            f"<session_context>\n{stable_injection}\n"
+            "(CRITICAL: internal system state — do NOT acknowledge or comment on this "
+            "block; focus entirely on the user instruction.)\n</session_context>"
+        )
+        volatile_block = (
+            f"<system_state_update>\n{dynamic_state.strip()}\n"
+            "(CRITICAL: This is internal system state. Do NOT acknowledge or comment on "
+            "this block in your thoughts. Focus entirely on the user instruction.)\n"
+            "</system_state_update>"
+        )
+        first_user_idx = next(
+            (i for i, m in enumerate(req_messages) if m.get("role") == "user"), None,
+        )
+        if first_user_idx is None:
+            ins = 1 if req_messages else 0
+            req_messages.insert(ins, {"role": "user", "content": stable_block})
+            first_user_idx = ins
+        else:
+            req_messages[first_user_idx]["content"] = (
+                f"{stable_block}\n\n[USER INSTRUCTION]\n{req_messages[first_user_idx]['content']}"
+            )
+        last_idx = len(req_messages) - 1
+        if last_idx == first_user_idx:
+            # Turn 1 (the query is the only message). Do NOT fold volatile into
+            # the pinned message — that would make turn 1's first message differ
+            # from the clean [stable + instruction + query] that every later turn
+            # presents, so turn 2 couldn't reuse the cached prefix. Emit volatile
+            # as its own trailing message instead, keeping the pinned message
+            # byte-identical from turn 1 onward.
+            req_messages.append({"role": "user", "content": volatile_block})
+        elif req_messages[last_idx]["role"] == "user":
+            req_messages[last_idx]["content"] = (
+                f"{volatile_block}\n\n{req_messages[last_idx]['content']}"
+            )
+        else:
+            req_messages.append({"role": "user", "content": volatile_block})
+        return req_messages
+
+    def _critic_async_enabled(self) -> bool:
+        """When ``GHOST_CRITIC_ASYNC=1`` the verifier never sits on the
+        critical path: the in-loop repair-before-ship is skipped and the
+        verdict runs purely AFTER the response ships — it logs, scrubs any
+        poisoned lesson the turn wrote, and (on a high-confidence REFUTED)
+        queues a correction surfaced at the top of the NEXT turn. Trades
+        before-ship repair of the rare wrong answer for not paying the
+        slow, off-host verdict latency on every turn.
+        """
+        return os.getenv("GHOST_CRITIC_ASYNC", "0").strip().lower() not in ("0", "false", "no")
+
+    def _critic_gate_timeout(self) -> float:
+        """Resolve the post-response verifier-gate budget, in seconds.
+
+        Returns ``inf`` (block until the verdict lands — the historical
+        behaviour) when no dedicated critic pool is configured, so legacy
+        deployments are untouched. When ``--critic-nodes`` IS set, the
+        verdict runs on a slower off-host model; default to ``0`` (pure
+        async — ship the response immediately, never wait on the critic)
+        so the 9B never serialises behind the answer. ``GHOST_CRITIC_GATE_TIMEOUT``
+        overrides either way: set a positive value to wait that long for
+        an inline verdict before releasing, ``0`` for pure async.
+        """
+        # Async mode forces pure-async regardless of any other setting.
+        if self._critic_async_enabled():
+            return 0.0
+        raw = os.getenv("GHOST_CRITIC_GATE_TIMEOUT")
+        if raw is not None and raw.strip() != "":
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pretty_log(
+                    "Verifier",
+                    f"GHOST_CRITIC_GATE_TIMEOUT={raw!r} is not a number — ignoring",
+                    icon=Icons.WARN, level="WARNING",
+                )
+        verifier = getattr(self.context, "verifier", None)
+        llm = getattr(verifier, "llm_client", None) if verifier else None
+        return 0.0 if getattr(llm, "critic_clients", None) else float("inf")
+
+    async def _compute_verifier_verdict_gated(
+        self, *, tools_run_this_turn, messages, final_ai_content,
+        last_user_content, lc, trajectory_id,
+    ):
+        """Non-blocking front door to ``_compute_verifier_verdict``.
+
+        The verdict LLM call runs on the dedicated critic pool (the
+        spare-box judge model when ``--critic-nodes`` is set), which is
+        slower than the foreground model. To keep it from serialising
+        behind the user's response, the verdict runs as a background task
+        and the gate waits at most ``_critic_gate_timeout()`` seconds:
+
+        * verdict lands in time → drives the response exactly as the old
+          inline gate did (note / backfill / lesson-retraction);
+        * verdict misses the budget → the response ships unverified (the
+          existing ``v_result is None`` path) and the verdict finishes in
+          the background, still scrubbing any poisoned lesson THIS turn
+          produced (the safety-critical side effect) via a done-callback.
+
+        With no critic pool the timeout is ``inf`` and this degrades to a
+        plain ``await`` — byte-for-byte the legacy behaviour.
+        """
+        last_tool = _find_substantive_tool_for_verifier(tools_run_this_turn)
+        gate = self._critic_gate_timeout()
+
+        # Fast path / legacy: block for the verdict (no critic pool, or an
+        # operator-set infinite budget). No task-spawn overhead.
+        if gate == float("inf"):
+            return await self._compute_verifier_verdict(
+                tools_run_this_turn=tools_run_this_turn,
+                messages=messages,
+                final_ai_content=final_ai_content,
+                last_user_content=last_user_content,
+                lc=lc,
+            )
+
+        task = _glog.spawn_task(self._compute_verifier_verdict(
+            tools_run_this_turn=tools_run_this_turn,
+            messages=messages,
+            final_ai_content=final_ai_content,
+            last_user_content=last_user_content,
+            lc=lc,
+        ))
+
+        if gate > 0:
+            # asyncio.wait does NOT cancel on timeout — the task keeps
+            # running in the background when it overruns the budget.
+            done, _pending = await asyncio.wait({task}, timeout=gate)
+            if task in done:
+                try:
+                    return task.result()
+                except Exception as exc:
+                    logger.debug("gated verifier verdict failed: %s", exc)
+                    return None, last_tool
+            pretty_log(
+                "Verifier",
+                f"critic still running after {gate:.0f}s — releasing response "
+                "unverified; verdict will finish in the background",
+                icon=Icons.WARN, level="WARNING",
+            )
+
+        # Pure async (gate == 0) or budget overrun: hand the still-running
+        # task to the late handler and release the response now.
+        self._attach_late_verdict_handler(task, trajectory_id)
+        return None, last_tool
+
+    def _attach_late_verdict_handler(self, task, trajectory_id):
+        """Apply the safety-critical side effects of a verdict that lands
+        AFTER its response already shipped.
+
+        The response can't be amended at this point, so the auditor note
+        and confidence backfill are forgone (logged for the operator).
+        The one effect that must still happen is lesson retraction: a
+        high-confidence REFUTED means any lesson THIS turn wrote is
+        suspect, and the next user query must not retrieve it. Retraction
+        is keyed by ``trajectory_id`` and idempotent, so running it a beat
+        late is safe.
+        """
+        def _on_done(t):
+            try:
+                v_result, _lt = t.result()
+            except Exception:
+                return
+            self._record_late_verdict(v_result, trajectory_id)
+
+        task.add_done_callback(_on_done)
+
+    def _record_late_verdict(self, v_result, trajectory_id):
+        """Apply the side effects of a verdict that lands AFTER its
+        response shipped. Extracted from the done-callback so it is
+        unit-testable. On a high-confidence REFUTED: log it, scrub any
+        poisoned lesson the turn wrote, and — in async mode — queue a
+        correction to surface on the next turn. Otherwise just log.
+        """
+        if not v_result:
+            return
+        try:
+            from .verifier import VerifyVerdict
+        except Exception:
+            return
+        if (v_result.verdict == VerifyVerdict.REFUTED
+                and v_result.confidence >= 0.7):
+            issues_str = (
+                "; ".join(v_result.issues[:3])
+                if v_result.issues else v_result.reasoning
+            ) or "the previous answer was not supported by the evidence"
+            pretty_log(
+                "Verifier",
+                f"LATE REFUTED ({v_result.confidence:.0%}): "
+                f"{issues_str[:120]} — response already sent; "
+                "scrubbing this turn's lessons",
+                icon=Icons.WARN, level="WARNING",
+            )
+            _sm = getattr(self.context, "skill_memory", None)
+            if _sm is not None and trajectory_id:
+                _glog.spawn_task(asyncio.to_thread(
+                    _sm.retract_lessons_from_trajectory,
+                    trajectory_id,
+                    memory_system=getattr(
+                        self.context, "memory_system", None
+                    ),
+                ))
+            # Async mode: stash a correction to surface on the next turn,
+            # since the response is already out and can't be repaired.
+            if self._critic_async_enabled():
+                if not isinstance(getattr(self, "_pending_corrections", None), list):
+                    self._pending_corrections = []
+                self._pending_corrections.append(issues_str[:300])
+                pretty_log(
+                    "Verifier",
+                    "queued a correction to surface on the next message",
+                    icon=Icons.IDEA,
+                )
+        else:
+            pretty_log(
+                "Verifier",
+                f"LATE {v_result.verdict.value} "
+                f"({v_result.confidence:.0%}) — informational; "
+                "response already sent",
+                icon=Icons.VERIFIER_LAB,
+            )
+
+    def _consume_pending_corrections(self, messages):
+        """Stage any correction queued by a previous turn's async verdict so
+        it is DETERMINISTICALLY prepended to this turn's reply.
+
+        Earlier this injected a system note asking the model to open with the
+        correction — but the model reliably ignored it (it judged an unrelated
+        correction irrelevant to the new question, and the trivial-chat fast
+        path dropped it entirely). So the banner is now prepended to the
+        response text directly (see ``_take_active_correction``), and a turn
+        flag skips the trivial fast path (which returns via its own route and
+        would bypass the prepend). Returns ``messages`` unchanged.
+        """
+        corrections = getattr(self, "_pending_corrections", None)
+        self._correction_active_this_turn = bool(corrections)
+        self._active_correction = ""
+        if not corrections:
+            return messages
+        self._pending_corrections = []
+        note = "; ".join(corrections)
+        self._active_correction = (
+            f"⚠️ **Correction to my previous answer:** {note}\n\n---\n\n"
+        )
+        pretty_log(
+            "Verifier",
+            f"surfacing {len(corrections)} deferred correction(s) from a prior turn",
+            icon=Icons.IDEA,
+        )
+        return messages
+
+    def _take_active_correction(self) -> str:
+        """Return the staged correction banner and clear it (one-shot, so it
+        prepends to exactly one reply). Empty string when none is staged."""
+        banner = getattr(self, "_active_correction", "") or ""
+        self._active_correction = ""
+        return banner
+
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
@@ -3581,6 +3886,11 @@ class GhostAgent:
                     messages = [m for m in messages if m.get("role") == "system"] + messages[-500:]
                 for m in messages:
                     if isinstance(m.get("content"), str): m["content"] = m["content"].replace("\r", "")
+
+                # Async-critic deferred correction: if a prior turn's
+                # post-response verdict refuted that answer, surface the
+                # correction at the top of THIS turn (no-op otherwise).
+                messages = self._consume_pending_corrections(messages)
 
                 last_user_content_raw = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
                 if isinstance(last_user_content_raw, list):
@@ -4024,7 +4334,9 @@ class GhostAgent:
                 # broad: it fires on any 5-word conversational message and
                 # would intercept legitimate tool-bearing requests.
                 # ============================================================
-                if is_trivial_greeting and last_user_content and self._is_strict_trivial_chat(lc):
+                if (is_trivial_greeting and last_user_content
+                        and self._is_strict_trivial_chat(lc)
+                        and not getattr(self, "_correction_active_this_turn", False)):
                     fast_result = await self._handle_trivial_chat(
                         last_user_content=last_user_content,
                         messages=messages,
@@ -4699,7 +5011,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "  ✗  cd /home/user && python3 …   (FAILS)\n"
                             "  ✗  cd /sandbox && …              (FAILS)\n\n"
                         )
-                    dynamic_state += f"### DYNAMIC SYSTEM STATE\nCURRENT TIME: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (Day: {datetime.datetime.now().strftime('%A')})\n\nSCRAPBOOK:\n{scratch_data}\n\n"
+                    # Minute precision (not seconds): a second-precision
+                    # timestamp changes on every turn of the same request,
+                    # busting the upstream prefix KV-cache for everything that
+                    # follows this block. The model never needs sub-minute
+                    # resolution; minute precision keeps the block byte-stable
+                    # across the turns of a single request so the cache holds.
+                    dynamic_state += f"### DYNAMIC SYSTEM STATE\nCURRENT TIME: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} (Day: {datetime.datetime.now().strftime('%A')})\n\nSCRAPBOOK:\n{scratch_data}\n\n"
                     try:
                         from .prompts import build_project_briefing
                         _proj_store = getattr(self.context, "project_store", None)
@@ -4813,14 +5131,39 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # system slot). The system slot itself stays byte-stable
                     # across turns to maximise upstream KV-cache hits.
                     _continuity_tail = f"\n\n{continuity_text}" if continuity_text else ""
-                    transient_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{dynamic_state.strip()}{_continuity_tail}"
+                    # Cache-aware ordering: STABLE blocks first (tool schemas,
+                    # persona, playbook, hydrated memory, per-request continuity
+                    # — all byte-identical across the turns of one request),
+                    # VOLATILE `dynamic_state` LAST (timestamp / sandbox state /
+                    # plan focus change every turn). The upstream prefix KV-cache
+                    # holds up to the first differing byte, so pushing the only
+                    # per-turn-varying block to the end maximises the cached
+                    # region — turns 2+ re-prefill just dynamic_state + the user
+                    # instruction instead of the whole (large) injection.
+                    _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{_continuity_tail}"
+                    # Measurement hook: a stable hash across a request's turns
+                    # means the prefix is cacheable; a changing hash points at a
+                    # remaining buster. Cheap (one sha1 of already-built text).
+                    try:
+                        _sp_hash = hashlib.sha1(_stable_injection.encode("utf-8", "ignore")).hexdigest()[:8]
+                        pretty_log(
+                            "Prefill Cache",
+                            f"stable-prefix h={_sp_hash} len={len(_stable_injection)} · "
+                            f"volatile dyn_state len={len(dynamic_state)}",
+                            icon=Icons.BRAIN_CTX,
+                        )
+                    except Exception:
+                        pass
 
-                    # Prepend transient state to the LAST message to preserve KV Cache and prevent burying user input
-                    if req_messages and req_messages[-1]["role"] == "user":
-                        original_msg = req_messages[-1]["content"]
-                        req_messages[-1]["content"] = f"<system_state_update>\n{transient_injection}\n(CRITICAL: This is internal system state. Do NOT acknowledge or comment on this block in your thoughts. Focus entirely on the user instruction.)\n</system_state_update>\n\n[USER INSTRUCTION]\n{original_msg}"
-                    else:
-                        req_messages.append({"role": "user", "content": f"<system_state_update>\n{transient_injection}\n</system_state_update>"})
+                    # GHOST_PIN_TOOL_SCHEMAS (opt-in, default off): pin the
+                    # byte-stable block to a FIXED position so the upstream
+                    # KV-cache reuses it across every turn of this request (see
+                    # `_compose_injection`). Default off so it's an explicit,
+                    # reversible A/B — flip on to test the latency win.
+                    _pin_stable = os.getenv("GHOST_PIN_TOOL_SCHEMAS", "0").strip().lower() not in ("0", "false", "no")
+                    req_messages = self._compose_injection(
+                        req_messages, _stable_injection, dynamic_state, _pin_stable,
+                    )
 
                     # Precise sampling for any tool-using turn; warm/creative
                     # sampling only for conversational turns (greetings,
@@ -4926,7 +5269,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         stream_model = model
 
                         # NEW: Capture accumulated intermediate text (like image tags from previous turns)
-                        stream_prefix = final_ai_content.strip() + "\n\n" if final_ai_content.strip() else ""
+                        # Prepend any deferred async-verdict correction (banner)
+                        # so it leads the stream even when there's no other
+                        # intermediate text to flush.
+                        _corr_banner = self._take_active_correction()
+                        _body_prefix = final_ai_content.strip() + "\n\n" if final_ai_content.strip() else ""
+                        stream_prefix = _corr_banner + _body_prefix
 
                         async def stream_wrapper():
                             full_content = ""
@@ -6788,7 +7136,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # are never "repaired".
                         if (repair_round < self._MAX_VERIFIER_REPAIRS
                                 and not force_stop
-                                and execution_failure_count == 0):
+                                and execution_failure_count == 0
+                                and not self._critic_async_enabled()):
+                            # Async mode skips this whole block: no blocking
+                            # in-loop verdict and no repair-before-ship. The
+                            # post-loop gate (pure-async) then runs the verdict
+                            # off the critical path and queues a next-turn
+                            # correction if it refutes.
+                            #
                             # Defensive like the post-loop gate: a verifier
                             # error (or a misconfigured/non-async verifier in
                             # tests) must NEVER crash or block finalisation —
@@ -8131,8 +8486,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _pp_show_to_user = getattr(self.context.args, 'perfect_it', False) is True
                     pretty_log(
                         "Perfect It Protocol",
-                        "Generating proactive optimization..."
-                        + ("" if _pp_show_to_user else " (deferred off the response path)"),
+                        "Generating an optimization suggestion to append to the reply..."
+                        if _pp_show_to_user else
+                        "Generating an optimization suggestion in the background "
+                        "(internal learning — not shown to the user)...",
                         icon=Icons.IDEA,
                     )
                     # Heartbeat: end-of-turn post-processing is outside the
@@ -8289,12 +8646,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     if _verdict_is_fresh and _verifier_verdict_cache is not None:
                         v_result, last_tool = _verifier_verdict_cache
                     else:
-                        v_result, last_tool = await self._compute_verifier_verdict(
+                        # Non-blocking gate: with a dedicated --critic-nodes
+                        # pool the (slower) verdict runs in the background and
+                        # the response ships without waiting on it; without
+                        # one this awaits inline exactly as before. `messages`
+                        # is snapshotted because the background verdict task
+                        # iterates it while the turn keeps mutating the live
+                        # list.
+                        v_result, last_tool = await self._compute_verifier_verdict_gated(
                             tools_run_this_turn=tools_run_this_turn,
-                            messages=messages,
+                            messages=list(messages),
                             final_ai_content=final_ai_content,
                             last_user_content=last_user_content,
                             lc=lc,
+                            trajectory_id=current_trajectory_id,
                         )
                     from .verifier import VerifyVerdict
                     # Consumption guard mirrors the original gate exactly: only
@@ -8405,13 +8770,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         final_ai_content = f"{final_ai_content}{note}"
                                     pretty_log(
                                         "Verifier",
-                                        "unavailable — finalised on UNVERIFIED write "
+                                        "finalised on an UNVERIFIED file write (never "
+                                        "run/rendered) — flagged INCOMPLETE "
                                         "(outcome=failed)",
                                         icon=Icons.WARN, level="WARNING",
                                     )
+                                elif self._critic_async_enabled():
+                                    # Async mode: the verdict was deliberately
+                                    # deferred, not missing — it's running on the
+                                    # critic node now and will land as LATE …
+                                    pretty_log(
+                                        "Verifier",
+                                        "verdict deferred — verifying asynchronously "
+                                        "after the reply (off the critical path)",
+                                        icon=Icons.VERIFIER_LAB,
+                                    )
                                 else:
                                     pretty_log(
-                                        "Verifier", "unavailable — gate skipped",
+                                        "Verifier",
+                                        "no verdict produced — gate skipped",
                                         icon=Icons.WARN, level="WARNING",
                                     )
                 except Exception as e:
@@ -8912,6 +9289,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             type(e).__name__, e,
                         )
 
+                # Deterministically prepend any deferred async-verdict
+                # correction staged at turn start (GHOST_CRITIC_ASYNC).
+                final_ai_content = self._take_active_correction() + (final_ai_content or "")
                 return final_ai_content, created_time, req_id
 
         finally:

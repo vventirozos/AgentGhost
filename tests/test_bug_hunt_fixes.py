@@ -592,7 +592,9 @@ def test_perfect_it_is_deferred_when_flag_off():
     directive is NOT appended to the live `messages`, and heartbeats keep
     the watchdog from waking the hippocampus mid-request."""
     src = (SRC / "core" / "agent.py").read_text()
-    assert "deferred off the response path" in src
+    # When the flag is off the suggestion is generated in the background
+    # (log wording reflects the deferral).
+    assert "in the background" in src
     block = src.split("Perfect It Protocol")[1].split("VERIFIER GATE")[0]
     assert "_pending_background_tasks" in block
     assert "add_done_callback" in block

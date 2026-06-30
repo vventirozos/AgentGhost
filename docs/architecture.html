@@ -395,6 +395,10 @@
     <li>Verifier / uncertainty modules optionally adjudicate before the final SSE chunk reaches the client.</li>
   </ol>
 
+  <p><strong>Prompt prefix caching.</strong> Per-turn latency is dominated by <em>prefill</em> of the context, not generation (probe: tiny prompt ~0.1s; ~17k-token context ~15.8s cold but ~2.7s when the upstream KV-cache is warm). To keep that cache warm across the turns of one request, the per-turn injection is ordered STABLE-first / VOLATILE-last: tool schemas, persona, playbook, hydrated memory and per-request continuity (all byte-identical across turns) precede the <code>dynamic_state</code> block, which is the only per-turn-varying content (sandbox state, plan focus, and a <em>minute</em>-precision timestamp — second precision would change every turn and bust the cache). A <code>Prefill Cache</code> log line emits a hash of the stable prefix each turn; a constant hash across a request means the prefix is cacheable.</p>
+
+  <p><strong>Verifier placement.</strong> The self-evaluation verifier runs its LLM call on the worker pool by default, or on a dedicated <code>--critic-nodes</code> pool when one is configured — a separate, typically slower off-host model (e.g. a 9B on a spare Mac Mini) reserved for adjudication. Routing it there keeps the verdict off the foreground inference slot, so it never competes with the main model for the KV-cache. With a critic pool the post-response gate is <strong>non-blocking</strong>: the verdict is computed in the background while the answer ships immediately; a late high-confidence <code>REFUTED</code> can't amend the sent response but still retracts any lesson that turn produced. Tune the inline wait with <code>GHOST_CRITIC_GATE_TIMEOUT</code> (see the <a href="cli_reference.html#critic-gate">CLI reference</a>).</p>
+
   <h2>Repository layout</h2>
 <pre><code>Agent/
 ├── src/ghost_agent/

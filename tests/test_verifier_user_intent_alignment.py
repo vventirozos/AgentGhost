@@ -60,6 +60,22 @@ def test_prompt_includes_constraint_satisfaction_rubric():
            "different question than the one asked" in rendered.lower()
 
 
+def test_prompt_includes_result_deliverable_exception():
+    """When the user asks to "write/run a script ... and tell me the
+    integer", the deliverable is the RESULT, not the source. The prompt
+    must carry the exception so a correct result without a code fence is
+    not REFUTED on the fence alone (the over-eager-repair regression)."""
+    rendered = _VERIFY_CODE_PROMPT.format(
+        intent="write a script to compute 15! and tell me the integer",
+        code="y", output="z", response="r",
+    )
+    low = rendered.lower()
+    assert "exception" in low
+    assert "method, not the deliverable" in low
+    # The disambiguating guidance must be explicit.
+    assert "prefer confirmed" in low
+
+
 def test_prompt_requires_both_for_confirmed():
     """A CONFIRMED verdict must require BOTH output soundness AND
     response alignment. If either fails, REFUTED."""

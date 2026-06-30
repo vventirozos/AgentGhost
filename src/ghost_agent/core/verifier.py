@@ -15,12 +15,37 @@ import base64
 import json
 import logging
 import mimetypes
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("GhostAgent")
+
+# Bounded wall-clock for a single critic-pool verdict call. The critic
+# model is deliberately off-host and may be slow (e.g. a 9B on a spare
+# box); this cap ensures an unreachable or stalled node falls through to
+# the worker/direct fallback instead of blocking the turn. Override with
+# GHOST_CRITIC_CALL_TIMEOUT (seconds).
+try:
+    _CRITIC_CALL_TIMEOUT = float(os.getenv("GHOST_CRITIC_CALL_TIMEOUT", "120") or 120)
+except ValueError:
+    _CRITIC_CALL_TIMEOUT = 120.0
+
+# The verdict is a tiny JSON object — it does NOT need a reasoning model's
+# <think> prelude, and that prelude is the dominant latency on an off-host
+# 9B (observed ~37s of pure thinking before the JSON appeared). Disable it
+# the way the rest of the codebase does for utility calls
+# (project_research.py / dream.py): the `/no_think` soft-switch + the
+# `enable_thinking=False` hard-switch, with a small token cap since there
+# is no prelude to budget for. Override with GHOST_CRITIC_NO_THINK=0 to
+# restore a thinking verdict, GHOST_CRITIC_MAX_TOKENS to tune the cap.
+_CRITIC_NO_THINK = os.getenv("GHOST_CRITIC_NO_THINK", "1").strip().lower() not in ("0", "false", "no")
+try:
+    _CRITIC_MAX_TOKENS = int(os.getenv("GHOST_CRITIC_MAX_TOKENS", "512") or 512)
+except ValueError:
+    _CRITIC_MAX_TOKENS = 512
 
 # Hard cap per image fed to the visual verifier. The vision node rasterises
 # and base64-encodes every image into the prompt; an oversized screenshot
@@ -108,6 +133,7 @@ Check, in order:
 Common failure shapes to flag:
 - User asks for code/snippet/command → agent returns a result or summary instead of the snippet
 - User asks for code AND the agent's RESPONSE does not contain a fenced code block — REFUTED regardless of what the tool output says. "The script ran correctly and prints 1 to 10" is NOT a substitute for the script itself; the user cannot paste a confirmation message into their editor. If `intent` contains verbs like give/show/write/draft + nouns like script/code/function/snippet/query/command, the response MUST include the source in a code fence.
+  EXCEPTION — the code is the METHOD, not the deliverable: when the user's wording makes a RESULT the thing they want (e.g. "write a script to compute X and tell me the integer", "run code to find the value", "calculate/compute X", "what does this output"), and the RESPONSE states that result correctly, a missing code fence is NOT grounds for REFUTED. "write/run a script" there describes how to get the answer, not a demand to see the source. Only require the code fence when the code itself is the deliverable — the user asked to see/show/give the code with no result requested. When in doubt and the requested result is present and correct, prefer CONFIRMED over REFUTING on a missing fence alone.
 - User asks "how do I X" → agent does X and reports the answer instead of explaining the method
 - User asks for a specific format → agent ignores the format
 - Tool output is a sandbox-internal artefact the user can't actually use
@@ -193,6 +219,57 @@ class Verifier:
             "max_tokens": 2048,
             "stream": False,
         }
+
+        # Dedicated critic pool takes precedence when configured
+        # (--critic-nodes). It keeps the verdict off the foreground
+        # inference slot AND off the worker pool, so a slow judge model
+        # on a spare box never queues ahead of the fast routing/validation
+        # chores the worker pool serves. Falls through to the worker route
+        # / direct call below if the pool is absent, offline, or returns
+        # an unparseable verdict.
+        #
+        # NOT is_background: the critic runs on its OWN node, so it never
+        # contends for the main upstream's single inference slot — the
+        # whole reason is_background exists (park behind the live user
+        # request) does not apply. Worse, the verifier is invoked FROM
+        # inside a user request (the in-loop auto-repair verdict), so an
+        # is_background call would wait on `_wait_for_foreground_clear`
+        # for THIS request to finish — a self-deadlock that hangs the turn
+        # for the full 600s ceiling. A bounded timeout keeps a stalled or
+        # unreachable critic node from blocking the turn: on timeout the
+        # call raises and we fall through to the worker/direct path.
+        if getattr(self.llm_client, "critic_clients", None):
+            # Build a critic-specific payload: thinking off + a small token
+            # cap so the verdict is just the JSON, not a multi-second
+            # <think> essay. Kept separate from `payload` so the worker /
+            # direct fallbacks below still get the original (thinking)
+            # request for whatever model backs them.
+            if _CRITIC_NO_THINK:
+                critic_payload = {
+                    "messages": [
+                        {"role": "user", "content": prompt + "\n\n/no_think"}
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": _CRITIC_MAX_TOKENS,
+                    "stream": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+            else:
+                critic_payload = payload
+            try:
+                result = await self.llm_client.chat_completion(
+                    critic_payload, use_critic=True, timeout=_CRITIC_CALL_TIMEOUT,
+                )
+                text = (
+                    result.get("choices", [{}])[0]
+                    .get("message", {})
+                    .get("content", "")
+                )
+                parsed = self._parse_json(text)
+                if parsed:
+                    return parsed
+            except Exception as exc:
+                logger.debug("Verifier critic-pool call failed: %s", exc)
 
         # Try routing to worker pool first (cheaper, different perspective).
         # `LLMClient.route()` returns the extracted content string, NOT a

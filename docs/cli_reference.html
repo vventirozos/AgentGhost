@@ -116,10 +116,25 @@
     <thead><tr><th>Flag</th><th>Used for</th><th>Selector</th></tr></thead>
     <tbody>
       <tr><td><code>--swarm-nodes</code></td><td>Parallel inference / planning fan-out</td><td><code>chat_completion(use_swarm=True)</code></td></tr>
-      <tr><td><code>--worker-nodes</code></td><td>Cheap classifier / verifier sub-tasks</td><td><code>route(task=...)</code> dispatch</td></tr>
+      <tr><td><code>--worker-nodes</code></td><td>Cheap classifier sub-tasks (routing, query expansion, arg validation); also the verifier fallback when <code>--critic-nodes</code> is not set</td><td><code>route(task=...)</code> dispatch</td></tr>
       <tr><td><code>--visual-nodes</code></td><td>Multimodal vision (PDF + image)</td><td><code>chat_completion(use_vision=True)</code></td></tr>
       <tr><td><code>--coding-nodes</code></td><td>Code generation specialists</td><td><code>chat_completion(use_coding=True)</code></td></tr>
       <tr><td><code>--image-gen-nodes</code></td><td>SDXL image generation</td><td><code>generate_image()</code></td></tr>
+      <tr><td><code>--critic-nodes</code></td><td>Self-evaluation verifier on a dedicated (often slower, off-host) judge model — e.g. a spare Mac Mini running a 9B. Kept off the worker pool so a slow verdict never blocks fast routing chores, and off the foreground slot so it never competes with the main model for the KV-cache.</td><td><code>chat_completion(use_critic=True)</code></td></tr>
+    </tbody>
+  </table>
+
+  <h2 id="critic-gate">Non-blocking verifier gate</h2>
+  <p>The self-evaluation verifier normally runs <em>after</em> the answer is assembled and the turn blocks on its verdict. When <code>--critic-nodes</code> is set the verdict runs on that pool (a slower off-host model), so the gate goes <strong>non-blocking</strong>: the verdict is spawned as a background task and the response ships without waiting on it. A high-confidence <code>REFUTED</code> that lands late can no longer amend the (already-sent) response, but still scrubs any lesson that turn produced, so the next query can't retrieve a poisoned lesson.</p>
+  <table>
+    <thead><tr><th>Env var</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_CRITIC_GATE_TIMEOUT</code></td><td>Seconds the gate waits inline for the verdict before releasing the response. <code>0</code> = pure async (never wait); a positive value gates inline up to that budget then falls through to async; unset defaults to <code>0</code> when <code>--critic-nodes</code> is configured and to "block forever" (legacy behaviour) when it is not.</td></tr>
+      <tr><td><code>GHOST_CRITIC_NO_THINK</code></td><td>Default <code>1</code>. The verdict is a tiny JSON object, so the critic call disables the model's <code>&lt;think&gt;</code> prelude (the dominant latency on an off-host judge model — observed ~37s of pure thinking) via the <code>/no_think</code> soft-switch + <code>enable_thinking=False</code> hard-switch. Set <code>0</code> to restore a full reasoning verdict (slower, possibly more accurate on stylistic constraint checks).</td></tr>
+      <tr><td><code>GHOST_CRITIC_MAX_TOKENS</code></td><td>Default <code>512</code>. Token cap for the critic verdict. Small because there is no <code>&lt;think&gt;</code> prelude to budget for; raise it only if you re-enable thinking.</td></tr>
+      <tr><td><code>GHOST_CRITIC_CALL_TIMEOUT</code></td><td>Default <code>120</code>. Hard wall-clock cap (seconds) on a single critic-pool call; on timeout the verdict falls through to the worker/direct fallback instead of blocking the turn.</td></tr>
+      <tr><td><code>GHOST_CRITIC_ASYNC</code></td><td>Default <code>0</code> (off). When <code>1</code>, the verifier never sits on the critical path: the in-loop repair-before-ship is skipped and the verdict runs purely <em>after</em> the response ships. A high-confidence REFUTED then scrubs the turn's lessons and queues a correction surfaced at the top of the <em>next</em> turn ("⚠️ Correction to my previous answer…"). Trades before-ship repair of the rare wrong answer for not paying the slow off-host verdict latency (~58s) on every turn. With this on, keep the accurate thinking verdict (<code>GHOST_CRITIC_NO_THINK=0</code>) — its latency no longer hurts.</td></tr>
+      <tr><td><code>GHOST_PIN_TOOL_SCHEMAS</code></td><td>Default <code>0</code> (off). When <code>1</code>, pins the byte-stable per-turn block (tool schemas + persona + playbook + hydrated memory + continuity) to the first user message — a fixed position — so the upstream KV-cache reuses it across the turns of one request instead of re-prefilling the ~23k-char block every turn (~15s). Only the volatile <code>dynamic_state</code> rides the moving last message. Native tool defs still travel in the payload <code>tools</code> field, so tool-calling is unaffected. Opt-in / reversible A/B for the per-turn prefill latency.</td></tr>
     </tbody>
   </table>
 

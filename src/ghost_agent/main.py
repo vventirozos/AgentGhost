@@ -113,6 +113,7 @@ def parse_args():
     parser.add_argument("--visual-nodes", default=None, help="Comma-separated list of url|model nodes for vision models")
     parser.add_argument("--coding-nodes", default=None, help="Comma-separated list of url|model nodes for code generation")
     parser.add_argument("--image-gen-nodes", default=None, help="Comma-separated list of url|model nodes for image generation")
+    parser.add_argument("--critic-nodes", default=None, help="Comma-separated list of url|model nodes for the self-evaluation verifier (e.g. a spare off-host box running a small judge model). When set, verifier LLM calls run on this pool instead of competing with the foreground model, and the post-response gate becomes non-blocking — the response ships without waiting on the (slower) critic, which still scrubs poisoned lessons when it lands. Tune the optional inline wait with GHOST_CRITIC_GATE_TIMEOUT (seconds; 0 = pure async, the default when this is set).")
     parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
     parser.add_argument("--daemon", "-d", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -257,6 +258,16 @@ def parse_args():
                 image_gen_nodes_list.append({"url": url, "model": model})
     args.image_gen_nodes_parsed = image_gen_nodes_list
 
+    critic_nodes_list = []
+    if args.critic_nodes:
+        for node_str in args.critic_nodes.split(","):
+            parts = node_str.split("|")
+            url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
+            model = parts[1].strip() if len(parts) > 1 else "default"
+            if url:
+                critic_nodes_list.append({"url": url, "model": model})
+    args.critic_nodes_parsed = critic_nodes_list
+
     if args.upstream_url:
         args.upstream_url = args.upstream_url.replace("http:://", "http://").replace("https:://", "https://")
     return args
@@ -299,7 +310,7 @@ async def lifespan(app):
             icon=Icons.SHIELD,
         )
 
-    context.llm_client = LLMClient(args.upstream_url, context.tor_proxy, args.swarm_nodes_parsed, args.worker_nodes_parsed, getattr(args, 'visual_nodes_parsed', None), getattr(args, 'coding_nodes_parsed', None), getattr(args, 'image_gen_nodes_parsed', None))
+    context.llm_client = LLMClient(args.upstream_url, context.tor_proxy, args.swarm_nodes_parsed, args.worker_nodes_parsed, getattr(args, 'visual_nodes_parsed', None), getattr(args, 'coding_nodes_parsed', None), getattr(args, 'image_gen_nodes_parsed', None), getattr(args, 'critic_nodes_parsed', None))
     
     pretty_log("System Boot", "Initializing components", icon=Icons.BOOT_AWAKE)
 
