@@ -46,6 +46,10 @@
   <h2>Merge semantics</h2>
   <p>Scalar → scalar: replace if different, else promote both to a list. Lists are deduped and order-preserved.</p>
 
+  <h2>Forgetting values (not just keys)</h2>
+  <p>The profile is injected into the system prompt every turn via <code>get_context_string()</code>, so it is the <em>authoritative</em> source the model answers from — vector and graph stores are secondary. This made one deletion bug user-visible: pets / interests / assets are stored as <strong>values</strong> (e.g. <code>assets.pets = ["Hanzo the dog", "Mortimer the iguana"]</code>), but <code>unified_forget</code>'s profile sweep only matched <strong>keys</strong>. <code>forget('mortimer')</code> therefore never reached the row — it kept being injected, so the model kept "remembering" the deleted pet even after reporting success. The merge semantics above compounded it: a "Mortimer is gone" interaction <em>appended</em> a soft-delete tombstone string (<code>"Mortimer the iguana (removed)"</code>) rather than deleting anything.</p>
+  <p><code>prune_value(category, key, target)</code> closes this: it removes every list item (or a matching scalar) whose text <em>mentions</em> the target, collapsing a surviving singleton list back to a scalar and dropping the key — and the category — when nothing remains. Matching is <strong>token/word-boundary aware</strong> so <code>forget('age')</code> does not strip a value of <code>'language'</code>, while <code>forget('mortimer')</code> still matches <code>'Mortimer the iguana (removed)'</code>. <code>unified_forget</code> now runs this value sweep after its key sweep (see <a href="../tools/memory_tools.html">memory tools</a>).</p>
+
   <h2>Robustness — <code>profile_update</code> shape</h2>
   <p>The smart-memory consolidation prompt asks the LLM to return <code>profile_update</code> as an object (<code>{category, key, value}</code>). The model occasionally ignores this and emits a bare string instead. The agent now coerces any non-dict <code>profile_update</code> to <code>None</code> at parse time: such a fact is still stored as a normal <code>auto</code> vector memory but skips the <code>identity</code> / <code>profile_memory.update</code> path entirely. This prevents the previous crash — <code>'str' object has no attribute 'get'</code> — which fired (and was swallowed) when a high-score string slipped into the identity branch.</p>
 
@@ -55,7 +59,8 @@
     <tbody>
       <tr><td><code>load() / save(data)</code></td><td>Whole-file read / write.</td></tr>
       <tr><td><code>update(category, key, value) -&gt; str</code></td><td>Merge-semantic update; returns sync message describing canonical mapping.</td></tr>
-      <tr><td><code>delete(category, key) -&gt; str</code></td><td>Remove key; status string.</td></tr>
+      <tr><td><code>delete(category, key) -&gt; str</code></td><td>Remove a whole key; status string.</td></tr>
+      <tr><td><code>prune_value(category, key, target) -&gt; str</code></td><td>Remove list items / a scalar that <em>mention</em> <code>target</code> (token-boundary match); drops the key/category when emptied. Lets <code>forget</code> reach entities stored as values.</td></tr>
       <tr><td><code>get_context_string() -&gt; str</code></td><td>Format for LLM injection.</td></tr>
     </tbody>
   </table>

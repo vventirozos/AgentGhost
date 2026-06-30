@@ -196,6 +196,52 @@ class GraphMemory:
                 self._remove_edge(s, p, o)
         return deleted
 
+    #: Generic hub nodes that link to nearly everything; expanding a
+    #: `forget` to these would wipe unrelated knowledge, so they are never
+    #: returned as connected entities.
+    _ENTITY_EXPANSION_STOPLIST = {
+        "user", "me", "i", "you", "it", "this", "that", "they", "them",
+        "he", "she", "we", "thing", "things",
+    }
+
+    def get_connected_entities(self, target: str, limit: int = 8) -> List[str]:
+        """Return distinct entity names directly (1 hop) connected to any node
+        whose name contains ``target``.
+
+        Lets ``forget`` expand an entity wipe to its tightly-coupled
+        neighbours: forgetting ``mortimer`` surfaces ``iguana`` (from a
+        ``mortimer IS_A iguana`` edge) so the alias tombstone goes too.
+        Generic hub nodes (``user``, pronouns) are filtered out so the
+        expansion can't snowball into unrelated memory.
+        """
+        if not target or len(target.strip()) < 3:
+            return []
+        t = target.lower().strip()
+        like = f"%{t}%"
+        with self._lock:
+            with sqlite3.connect(self.db_path) as conn:
+                rows = conn.execute(
+                    '''SELECT subject, object FROM triplets
+                       WHERE subject LIKE ? OR object LIKE ?''',
+                    (like, like)
+                ).fetchall()
+        out: List[str] = []
+        seen = set()
+        for s, o in rows:
+            for node in (s, o):
+                n = (node or "").lower().strip()
+                # Skip the target's own variants, hub nodes, and tiny tokens.
+                if not n or len(n) < 3 or t in n or n in t:
+                    continue
+                if n in self._ENTITY_EXPANSION_STOPLIST:
+                    continue
+                if n not in seen:
+                    seen.add(n)
+                    out.append(n)
+                    if len(out) >= limit:
+                        return out
+        return out
+
     def wipe_all(self):
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:

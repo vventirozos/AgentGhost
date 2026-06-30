@@ -69,7 +69,10 @@ async def test_tool_unified_forget_integration(tmp_path, mock_memory_system, moc
         # Verify 2: Vector swept
         assert mock_memory_system.delete_document_by_name.call_count == 1
         assert mock_memory_system.collection.delete.call_count == 1 # Found semantic chunk
-        assert "Sweep: Forgot derived fact" in report
+        # The fixture doc literally contains "target", so it now trips the
+        # literal-mention override (more accurate than the old distance-only
+        # "derived" label). Accept either phrasing.
+        assert "Sweep: Forgot" in report
         
         # Verify 3: Profile swept on key match (not value match)
         mock_profile_memory.delete.assert_called_once_with("preferences", "target_color")

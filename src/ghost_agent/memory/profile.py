@@ -150,6 +150,88 @@ class ProfileMemory:
 
             return f"Profile key not found: {cat}.{k}"
 
+    def prune_value(self, category: str, key: str, target: str) -> str:
+        """Remove every list item (or a matching scalar) under
+        ``category.key`` that *mentions* ``target``, persisting the result.
+
+        This is the value-level counterpart to :meth:`delete` (which can
+        only remove a whole key). It exists because pets / interests / assets
+        are stored as VALUES inside a list — e.g.
+        ``assets.pets = ["Hanzo the dog", "Mortimer the iguana (removed)"]`` —
+        so ``forget('mortimer')`` previously had no way to reach them and the
+        stale entry kept being injected into the system prompt every turn.
+
+        Matching is token/word-boundary aware: ``forget('age')`` will NOT
+        strip a value of ``"language"``, but ``forget('mortimer')`` DOES match
+        ``"Mortimer the iguana (removed)"`` (even the soft-delete tombstone).
+        Multi-word targets fall back to substring (tokens can't span spaces).
+
+        Deletes the key when nothing survives, and the category when it
+        becomes empty. Returns a human-readable report line.
+        """
+        import re
+        with self._lock:
+            data = self.load()
+            cat = str(category).strip().lower()
+            k = str(key).strip().lower()
+
+            # Same canonicalisation table as update()/delete() so the value
+            # sweep lands on the row the writer actually created.
+            mapping = {
+                "wife": ("relationships", "wife"),
+                "husband": ("relationships", "husband"),
+                "son": ("relationships", "son"),
+                "daughter": ("relationships", "daughter"),
+                "car": ("assets", "car"),
+                "vehicle": ("assets", "car"),
+                "science": ("interests", "science"),
+                "interest": ("interests", "general"),
+            }
+            if k in mapping:
+                cat, k = mapping[k]
+
+            if cat not in data or k not in data[cat]:
+                return f"Profile key not found: {cat}.{k}"
+
+            target_lc = str(target).strip().lower()
+            if not target_lc:
+                return "Profile: empty target, nothing pruned."
+
+            def _mentions(val) -> bool:
+                v = str(val).lower()
+                if " " in target_lc:
+                    return target_lc in v
+                return target_lc in re.split(r"[^a-z0-9]+", v)
+
+            existing = data[cat][k]
+
+            if isinstance(existing, list):
+                removed = [it for it in existing if _mentions(it)]
+                if not removed:
+                    return f"No matching value under {cat}.{k}"
+                kept = [it for it in existing if not _mentions(it)]
+                if kept:
+                    # Collapse a singleton list back to a scalar for tidiness
+                    # (mirrors how update() promotes scalar→list only when >1).
+                    data[cat][k] = kept if len(kept) > 1 else kept[0]
+                    self.save(data)
+                    return f"Pruned {len(removed)} value(s) from {cat}.{k}: {removed}"
+                # Nothing survived → drop the key (and category if now empty).
+                del data[cat][k]
+                if not data[cat]:
+                    del data[cat]
+                self.save(data)
+                return f"Removed {cat}.{k} (all values matched '{target_lc}')"
+
+            # Scalar value.
+            if _mentions(existing):
+                del data[cat][k]
+                if not data[cat]:
+                    del data[cat]
+                self.save(data)
+                return f"Removed {cat}.{k}"
+            return f"No matching value under {cat}.{k}"
+
     def get_context_string(self) -> str:
         # Load is thread-safe now
         data = self.load()

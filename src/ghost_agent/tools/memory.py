@@ -33,6 +33,25 @@ def _is_within_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _value_mentions_target(value, target_lc: str) -> bool:
+    """True iff a profile VALUE string references ``target``.
+
+    Token/word-boundary aware so ``forget('age')`` does NOT match the value
+    ``'language'`` (the exact regression the key-only sweep was guarding
+    against), while ``forget('mortimer')`` DOES match
+    ``'Mortimer the iguana (removed)'``. Multi-word targets fall back to a
+    plain substring test (token membership can't span spaces).
+    """
+    import re
+    v = str(value).lower()
+    t = str(target_lc).strip()
+    if not t:
+        return False
+    if " " in t:
+        return t in v
+    return t in re.split(r"[^a-z0-9]+", v)
+
+
 class _NullCM:
     """No-op context manager used as a fallback when a lock helper is
     missing (e.g. tests with a MagicMock memory_system). Lets shared
@@ -417,6 +436,23 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         clean_target = clean_target[8:]
     clean_target_lc = clean_target.lower()
 
+    # --- ENTITY-AWARE EXPANSION ---
+    # Pull the target's direct graph neighbours so the wipe also reaches
+    # ALIAS tombstones: forgetting 'mortimer' should also clear facts stored
+    # under 'iguana' (from a `mortimer IS_A iguana` edge). Computed up-front,
+    # BEFORE the graph delete in step 4 severs those very edges. Hub nodes
+    # (user/pronouns) are filtered inside get_connected_entities so the
+    # expansion can't snowball. Vector/profile expansion is LITERAL-mention
+    # only (no semantic fuzz) so it stays precise.
+    expanded_targets: list = []
+    if graph_memory is not None:
+        try:
+            expanded_targets = await asyncio.to_thread(graph_memory.get_connected_entities, target)
+        except Exception:
+            expanded_targets = []
+    if not isinstance(expanded_targets, list):
+        expanded_targets = []
+
     # 1. Disk Cleanup — recursive walk + safe-path validation.
     # Previous version only looked at the top-level directory, only deleted
     # the FIRST match, and used unbounded substring matching. We now walk
@@ -488,9 +524,11 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         # --- SEMANTIC SWEEP (For loose facts and smart_memory "auto" facts) ---
         # Run query + delete UNDER the vector lock so we don't race with
         # background ingest / smart_memory writes.
+        sweep_target_lc = str(target).strip().lower()
+
         def _semantic_sweep():
             with memory_system._get_lock() if hasattr(memory_system, "_get_lock") else _NullCM():
-                cand = memory_system.collection.query(query_texts=[target], n_results=10)
+                cand = memory_system.collection.query(query_texts=[target], n_results=20)
                 deleted_local = 0
                 hits = []
                 if cand.get('ids'):
@@ -500,10 +538,20 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         meta = cand['metadatas'][0][i] or {}
                         m_type = meta.get('type', 'auto')
                         semantic_threshold = 0.8 if m_type == 'auto' else 0.6
-                        if dist < semantic_threshold:
+                        # LITERAL-MENTION OVERRIDE: the distance threshold
+                        # silently missed facts that name the target outright
+                        # — e.g. forgetting 'iguana' left "user previously had
+                        # an iguana that was removed" in place because its L2
+                        # distance to the bare word exceeded the bar. When the
+                        # user explicitly names an entity, any stored fact that
+                        # mentions it (word-boundary) is fair game regardless
+                        # of distance.
+                        literal = _value_mentions_target(doc_text, sweep_target_lc)
+                        if literal or dist < semantic_threshold:
                             memory_system.collection.delete(ids=[mem_id])
                             deleted_local += 1
-                            hits.append(f"✅ Sweep: Forgot derived fact: '{doc_text[:40]}...'")
+                            tag = "literal" if literal else "derived"
+                            hits.append(f"✅ Sweep: Forgot {tag} fact: '{doc_text[:40]}...'")
                 return deleted_local, hits
 
         deleted_count, hits = await asyncio.to_thread(_semantic_sweep)
@@ -546,11 +594,44 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                             or target_lc in parts):
                         substr_hits.append((cat, k))
             chosen_profile_hits = exact_hits or substr_hits
+            handled: set = set()
             for cat, k in chosen_profile_hits:
                 profile_memory.delete(cat, k)
                 report.append(f"✅ Profile: Removed {cat}.{k}")
+                handled.add((cat, k))
                 found_key = True
-            
+
+            # --- VALUE SWEEP ---------------------------------------------
+            # The key-only sweep above misses the common case where the
+            # forgotten entity is stored as a VALUE, e.g.
+            #   assets.pets = ["Hanzo the dog", "Mortimer the iguana"]
+            # Here the key is "pets" — nothing matches `target="mortimer"`,
+            # so the row (which is injected into the system prompt every
+            # turn via get_context_string) survived forever and the model
+            # kept "remembering" the deleted pet. We now also match VALUES,
+            # with word-boundary logic (see `_value_mentions_target`) so the
+            # destructive greedy-substring behaviour the key-only rule was
+            # guarding against does NOT come back. Reload so the dict
+            # reflects the key deletions just performed.
+            data = profile_memory.load()
+            for cat, subdata in list(data.items()):
+                if not isinstance(subdata, dict):
+                    continue
+                for k, v in list(subdata.items()):
+                    if (cat, k) in handled:
+                        continue
+                    if isinstance(v, list):
+                        if any(_value_mentions_target(item, target_lc) for item in v):
+                            res = profile_memory.prune_value(cat, k, target)
+                            report.append(f"✅ Profile: {res}")
+                            handled.add((cat, k))
+                            found_key = True
+                    elif _value_mentions_target(v, target_lc):
+                        profile_memory.delete(cat, k)
+                        report.append(f"✅ Profile: Removed {cat}.{k} (value match)")
+                        handled.add((cat, k))
+                        found_key = True
+
             if not found_key and " " not in target:
                  # usage: forget category key
                  pass
@@ -563,6 +644,60 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
             if deleted_edges > 0:
                 report.append(f"✅ Graph: Severed {deleted_edges} topological edges related to '{target}'.")
         except Exception as e: report.append(f"⚠️ Graph Error: {e}")
+
+    # 5. Entity-aware secondary sweep over the target's graph neighbours.
+    # LITERAL-mention only across vector + profile + graph so we excise the
+    # alias tombstones ('iguana') without semantic over-reach.
+    for extra in expanded_targets:
+        extra_lc = str(extra).strip().lower()
+        if len(extra_lc) < 3:
+            continue
+        # Vector: delete facts that literally name the related entity.
+        try:
+            def _literal_sweep(_t=extra):
+                with memory_system._get_lock() if hasattr(memory_system, "_get_lock") else _NullCM():
+                    cand = memory_system.collection.query(query_texts=[_t], n_results=20)
+                    n = 0
+                    if cand.get('ids'):
+                        for i in range(len(cand['ids'][0])):
+                            doc_text = cand['documents'][0][i]
+                            mem_id = cand['ids'][0][i]
+                            if _value_mentions_target(doc_text, str(_t).strip().lower()):
+                                memory_system.collection.delete(ids=[mem_id])
+                                n += 1
+                    return n
+            n_vec = await asyncio.to_thread(_literal_sweep)
+            if n_vec:
+                report.append(f"✅ Vector: Wiped {n_vec} fact(s) mentioning related entity '{extra}'.")
+        except Exception as e:
+            report.append(f"⚠️ Vector (expansion) Error: {e}")
+
+        # Graph: sever the neighbour's own edges too.
+        if graph_memory:
+            try:
+                d_extra = await asyncio.to_thread(graph_memory.delete_by_target, extra)
+                if d_extra and d_extra > 0:
+                    report.append(f"✅ Graph: Severed {d_extra} edge(s) for related entity '{extra}'.")
+            except Exception:
+                pass
+
+        # Profile: value-prune the neighbour token across all entries.
+        if profile_memory:
+            try:
+                data2 = profile_memory.load()
+                for cat, subdata in list(data2.items()):
+                    if not isinstance(subdata, dict):
+                        continue
+                    for k, v in list(subdata.items()):
+                        if isinstance(v, list):
+                            if any(_value_mentions_target(it, extra_lc) for it in v):
+                                res = profile_memory.prune_value(cat, k, extra)
+                                report.append(f"✅ Profile: {res} (related '{extra}')")
+                        elif _value_mentions_target(v, extra_lc):
+                            profile_memory.delete(cat, k)
+                            report.append(f"✅ Profile: Removed {cat}.{k} (related '{extra}')")
+            except Exception:
+                pass
 
     return "\n".join(report) if report else f"No matching memory found for '{target}'."
 

@@ -2726,13 +2726,32 @@ class GhostAgent:
                     profile_up = None
 
                 # --- UNCONDITIONAL KNOWLEDGE GRAPH INGESTION ---
+                from ..utils.helpers import is_removal_or_negation_text, is_removal_triplet
                 graph_triplets = result_json.get("graph_triplets", [])
+                # Drop removal / past-ownership triplets (e.g. user
+                # PREVIOUSLY_OWNED iguana). Ingesting these re-creates the
+                # tombstone the user just asked to forget; a removal must
+                # delete edges, never add one.
+                if graph_triplets:
+                    kept_triplets = [t for t in graph_triplets if not is_removal_triplet(t)]
+                    dropped = len(graph_triplets) - len(kept_triplets)
+                    if dropped:
+                        pretty_log("Graph Tombstone Skip", f"Dropped {dropped} removal/past-ownership triplet(s)", icon=Icons.STOP)
+                    graph_triplets = kept_triplets
                 if getattr(self.context, 'graph_memory', None) and graph_triplets:
                     added = await asyncio.to_thread(self.context.graph_memory.add_triplets, graph_triplets)
                     if added and added > 0:
                         pretty_log("Graph Updated", f"Mapped {added} topological edges", icon=Icons.MEM_SAVE)
 
                 if fact is None: fact = ""
+                # A removal / non-ownership fact ("user previously had an
+                # iguana that was removed") must NOT be stored: consolidating
+                # it manufactures a self-perpetuating tombstone that survives
+                # every `forget`. Bail before the fact is embedded. (The
+                # graph triplets above were already filtered.)
+                if is_removal_or_negation_text(fact):
+                    pretty_log("Auto Memory Skip", f"Discarded removal/negation tombstone: {fact}", icon=Icons.STOP)
+                    return
                 fact_lc = fact.lower()
                 is_personal = any(w in fact_lc for w in ["user", "me", "my ", " i ", "identity", "preference", "like"])
                 is_technical = any(w in fact_lc for w in ["file", "path", "code", "error", "script", "project", "repo", "build", "library", "version"])
@@ -8837,7 +8856,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # contract in CLAUDE.md ("Memory writes are gated
                         # on --smart-memory / --no-memory"). The streaming
                         # producer has the same gate; both must agree.
-                        if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
+                        if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0 and not forget_was_called:
 
                             await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
                             await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)

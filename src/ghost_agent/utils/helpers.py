@@ -227,6 +227,66 @@ async def helper_fetch_url_content(url: str) -> str:
             
     return f"Error fetching {url} after 3 retries."
 
+# --------------------------------------------------------------------------
+# Removal / negation detection
+# --------------------------------------------------------------------------
+# Phrases that mark a fact as a REMOVAL or NON-OWNERSHIP statement rather than
+# a positive thing to remember. Consolidation must NOT store these: doing so
+# manufactures self-perpetuating tombstones — e.g. asking "what pets do I
+# own?" makes the model answer "you previously had an iguana that was
+# removed", which then gets consolidated back into a fresh "user previously
+# had an iguana" fact, keeping the deleted entity alive forever. A removal
+# should DELETE knowledge, never insert a new memory about the deletion.
+_REMOVAL_NEGATION_PHRASES = (
+    "no longer", "previously had", "previously owned", "used to have",
+    "used to own", "was removed", "were removed", "has been removed",
+    "have been removed", "had been removed", "removed from", "deleted from",
+    "does not own", "doesn't own", "do not own", "don't own",
+    "does not have", "doesn't have", "do not have", "don't have",
+    "did not have", "didn't have", "never had", "never owned",
+    "no longer has", "no longer have", "no longer owns", "no longer own",
+    "got rid of", "is gone", "are gone", "is no more",
+    "not own", "not have an", "not have a",
+    # Parenthetical tombstone markers an earlier soft-delete left behind,
+    # e.g. "Mortimer the iguana (removed)".
+    "(removed)", "[removed]", "(deleted)", "[deleted]", "(former)",
+)
+
+#: Graph-predicate fragments that encode the same removal/past-tense
+#: semantics. Predicates are uppercase verbs (e.g. ``PREVIOUSLY_OWNED``,
+#: ``NO_LONGER_HAS``, ``REMOVED``) — matched case-insensitively as substrings.
+_REMOVAL_PREDICATE_FRAGMENTS = (
+    "PREVIOUSLY", "FORMER", "REMOVED", "NO_LONGER", "NOLONGER",
+    "NOT_", "NEVER", "DELETED", "USED_TO", "PAST_",
+)
+
+
+def is_removal_or_negation_text(text) -> bool:
+    """True iff ``text`` reads as a removal / non-ownership statement.
+
+    Used to stop the memory consolidator from re-storing "X was removed"
+    tombstones (see `_REMOVAL_NEGATION_PHRASES`)."""
+    if not text:
+        return False
+    t = " ".join(str(text).lower().split())
+    return any(p in t for p in _REMOVAL_NEGATION_PHRASES)
+
+
+def is_removal_triplet(triplet) -> bool:
+    """True iff a graph triplet encodes removal / past-ownership and so must
+    not be ingested. Checks the predicate for tombstone verbs and the
+    subject/object text for removal phrasing."""
+    if not isinstance(triplet, dict):
+        return False
+    pred = str(triplet.get("predicate", "")).upper()
+    if any(frag in pred for frag in _REMOVAL_PREDICATE_FRAGMENTS):
+        return True
+    for field in ("subject", "object"):
+        if is_removal_or_negation_text(triplet.get(field, "")):
+            return True
+    return False
+
+
 def get_utc_timestamp():
     """Returns strict ISO8601 UTC timestamp for Go/iOS clients.
 
