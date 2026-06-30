@@ -826,6 +826,15 @@ def _distill_terminal_tool_summary(tool_name: str, raw: str) -> str:
         r"\n*SYSTEM:\s*[A-Z_ ]+?(DONE|FINISHED|STAND BY)\.?\s*$",
         "", cleaned, flags=re.IGNORECASE,
     ).strip()
+    # dream_mode's footer is two clauses joined by a period
+    # ("SESSION FINISHED. STAND BY."). The single-keyword pattern above
+    # can't span it — the period isn't in its [A-Z_ ] class — so strip the
+    # combined form explicitly. (Pre-existing: the model-driven dream bypass
+    # leaked this footer too; cleaned up alongside the deterministic path.)
+    cleaned = re.sub(
+        r"\n*SYSTEM:\s*SESSION\s+FINISHED\.?\s*STAND BY\.?\s*$",
+        "", cleaned, flags=re.IGNORECASE,
+    ).strip()
 
     status_m = re.search(r"^Status:\s*(.+)$", cleaned, re.MULTILINE)
     cluster_m = re.search(r"^Cluster:\s*(\S+)", cleaned, re.MULTILINE)
@@ -855,6 +864,119 @@ def _distill_terminal_tool_summary(tool_name: str, raw: str) -> str:
 
     # Unrecognised shape — show the cleaned raw, capped.
     return cleaned[:400] + ("..." if len(cleaned) > 400 else "")
+
+
+# Phrases that, when they DOMINATE a short user message, mean "run ONE
+# self-play cycle now". Deliberately tighter than tools.memory's
+# `_SELF_PLAY_INTENT_PHRASES` (which also matches loop/continuous asks):
+# the deterministic dispatch below only ever forces the single-cycle
+# `self_play` tool, never the background `self_play_loop`.
+_SELF_PLAY_COMMAND_PHRASES = (
+    "self play",
+    "self-play",
+    "selfplay",
+    "practice cycle",
+    "practice round",
+    "practice session",
+    "training cycle",
+)
+# If any of these appear, the user wants the CONTINUOUS loop (or some other
+# tool) — defer to the model instead of forcing a single cycle. "again" is
+# NOT here: "self play again" is still a single cycle.
+_SELF_PLAY_LOOP_MARKERS = (
+    "loop",
+    "keep ",
+    "until stopped",
+    "until i stop",
+    "continuous",
+    "continuously",
+    "again and again",
+    "over and over",
+    "nonstop",
+    "non-stop",
+)
+
+
+def _is_single_self_play_command(text: str) -> bool:
+    """True when `text` is *predominantly* an explicit single-cycle
+    self-play command (e.g. "self play", "self play again", "run self-play").
+
+    This gates a deterministic, pre-LLM dispatch of the `self_play` tool.
+    Without it, a bare "self play" runs the tool only on the FIRST ask and
+    is silently replayed thereafter: the terminal-tool bypass persists the
+    cycle's summary as a PLAIN-TEXT assistant turn (no tool_call), and the
+    memory bus re-hydrates it as ``Context: Self-play complete…`` — so on
+    the next identical ask the model's in-context example says the right
+    response to "self play" is to reprint that text. It imitates the text
+    and never re-fires the cycle (observed: identical 126-char reply,
+    ``tool=-`` in the metacog trace).
+
+    Conservative by construction: requires a command phrase, rejects
+    loop/continuous markers (those route to `self_play_loop`, the model's
+    call), and caps length so a long project message that merely *mentions*
+    self-play in passing is left to the model — only a short, command-
+    dominant message is force-dispatched.
+    """
+    if not text:
+        return False
+    lc = " ".join(str(text).lower().split())
+    if not any(p in lc for p in _SELF_PLAY_COMMAND_PHRASES):
+        return False
+    if any(m in lc for m in _SELF_PLAY_LOOP_MARKERS):
+        return False
+    # Command-dominant: a short message that IS the command, not a paragraph
+    # that happens to contain it. 6 words covers "do another self play cycle
+    # please" while rejecting prose.
+    return len(lc.split()) <= 6
+
+
+# Phrases that, when they DOMINATE a short user message, mean "run a memory-
+# consolidation (dream) cycle now". `dream_mode` is the other terminal tool
+# subject to the same replay bug as `self_play` (its summary is persisted as
+# a plain-text turn and re-hydrated). Deliberately multi-word / unambiguous:
+# bare "sleep"/"rest"/"dream" are avoided because they substring-match prose
+# ("interesting" contains "rest", "daydream" contains "dream").
+_DREAM_COMMAND_PHRASES = (
+    "dream mode",
+    "go to sleep",
+    "time to sleep",
+    "get some sleep",
+    "consolidate memories",
+    "consolidate your memories",
+    "consolidate memory",
+    "consolidate your memory",
+    "memory consolidation",
+)
+
+
+def _is_dream_command(text: str) -> bool:
+    """True when `text` is *predominantly* an explicit memory-consolidation
+    (dream) command (e.g. "dream mode", "go to sleep", "consolidate
+    memories"). Same deterministic-dispatch rationale as
+    `_is_single_self_play_command`. `dream_mode` has no continuous-loop
+    variant, so there are no loop markers to exclude — just a command phrase
+    and a length cap so a prose mention is left to the model."""
+    if not text:
+        return False
+    lc = " ".join(str(text).lower().split())
+    if not any(p in lc for p in _DREAM_COMMAND_PHRASES):
+        return False
+    return len(lc.split()) <= 6
+
+
+def _explicit_terminal_command(text: str):
+    """Return the terminal tool name (``"self_play"`` | ``"dream_mode"``) the
+    message is an unambiguous, command-dominant request for, or ``None``.
+
+    Single source of truth for the pre-LLM deterministic dispatch in
+    ``handle_chat``: both terminal tools share the replay bug (their summary
+    is persisted as a plain-text turn with no tool_call and re-hydrated by
+    the memory bus), so both are force-dispatched the same way."""
+    if _is_single_self_play_command(text):
+        return "self_play"
+    if _is_dream_command(text):
+        return "dream_mode"
+    return None
 
 
 def _tool_call_truncated(content: str) -> bool:
@@ -4656,6 +4778,84 @@ class GhostAgent:
 
                     if turn > 2: was_complex_task = True
                     if force_stop: break
+
+                    # --- DETERMINISTIC TERMINAL-TOOL DISPATCH (turn 0) -------
+                    # A bare "self play" / "self play again" (and likewise
+                    # "dream mode" / "go to sleep") used to run the cycle only
+                    # on the FIRST ask; every repeat replayed the previous
+                    # turn's text summary instead of re-firing. Root cause: the
+                    # direct-from-tool-summary bypass below persists the cycle
+                    # result as a PLAIN-TEXT assistant turn with NO tool_call,
+                    # and the memory bus re-hydrates it as "Context: Self-play
+                    # complete…", so the model's only in-context example says
+                    # the right response to "self play" is to reprint that text
+                    # — which it does (identical 126-char reply, tool=- in
+                    # metacog), never re-running.
+                    #
+                    # Fix: when the message is unambiguously a single-cycle
+                    # terminal command (self_play or dream_mode), dispatch the
+                    # tool deterministically here and bypass the LLM turn
+                    # entirely — the model's indecision can no longer swallow
+                    # the request. We also append a real assistant tool_call +
+                    # tool result to history so the in-context example shows a
+                    # TOOL invocation, not bare text; any future model-driven
+                    # turn (longer phrasings that skip this fast path) then
+                    # imitates the tool, not the summary. Breaking the
+                    # `for turn` loop falls straight through to the post-loop
+                    # metacog/calibration finalisation, so the reading still
+                    # records (domain=memory, tool=<name>) exactly as the
+                    # model-driven path did. The `selfplay` budget guard
+                    # prevents any recursion from a self-play solver sub-agent
+                    # (whose challenge text would not match the command gate
+                    # anyway — belt and suspenders).
+                    _det_tool = (
+                        _explicit_terminal_command(last_user_content)
+                        if (turn == 0 and not force_stop
+                            and getattr(self, "thinking_budget_override", None) != "selfplay")
+                        else None
+                    )
+                    if _det_tool is not None and _det_tool in self.available_tools:
+                        pretty_log(
+                            "Terminal Tool",
+                            f"Explicit '{_det_tool}' command — dispatching deterministically (bypassing LLM turn).",
+                            icon=Icons.STOP,
+                        )
+                        try:
+                            _det_raw = str(await self.available_tools[_det_tool]() or "").strip()
+                        except Exception as _det_exc:
+                            logger.error(f"Deterministic {_det_tool} dispatch failed: {_det_exc}")
+                            _det_raw = ""
+                        # Record as a genuine tool_call + result so subsequent
+                        # turns imitate the tool, not the text summary.
+                        _det_call_id = f"det_{_det_tool}_{turn}"
+                        messages.append({
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": _det_call_id,
+                                "type": "function",
+                                "function": {"name": _det_tool, "arguments": "{}"},
+                            }],
+                        })
+                        _det_tool_msg = {
+                            "role": "tool",
+                            "tool_call_id": _det_call_id,
+                            "name": _det_tool,
+                            "content": _det_raw,
+                        }
+                        messages.append(_det_tool_msg)
+                        tools_run_this_turn.append(dict(_det_tool_msg))
+                        _det_body = _distill_terminal_tool_summary(_det_tool, _det_raw)
+                        _det_prefix = {
+                            "self_play": "Self-play complete.",
+                            "dream_mode": "Dream cycle complete.",
+                        }.get(_det_tool, f"`{_det_tool}` complete.")
+                        final_ai_content = (
+                            f"{_det_prefix}\n\n{_det_body}"
+                            if _det_body else _det_prefix
+                        )
+                        force_stop = True
+                        break
 
                     # --- CHECKPOINT & RESUME ---
                     # At turn milestones, save a structured progress summary

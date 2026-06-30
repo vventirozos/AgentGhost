@@ -185,19 +185,17 @@ async def test_inline_c_block_nudges_on_acquired_skills_file_path(tmp_path):
 
 @pytest.mark.asyncio
 async def test_inline_c_block_hint_absent_for_unrelated_bodies(tmp_path):
-    """Negative: when the blocked body is NOT a skill-wrap (just a
-    long one-liner doing something unrelated), the SYSTEM BLOCK error
-    should stay generic. No phantom skill nudges."""
+    """Negative: when a body BLOCKS for a non-skill reason (here: unescaped
+    nested delimiter quotes — the genuine corruption shape), the SYSTEM BLOCK
+    error stays generic. No phantom skill nudges."""
     from ghost_agent.tools.execute import tool_execute
 
-    # Blocked because it's substantive (>120 chars), NOT because of the import —
-    # and it's not a skill wrap, so the generic message must carry no skill hint.
+    # Multi-statement (trigger) + an unescaped inner `"` inside the `"…"` body
+    # → blocks (can't safely auto-run), and it's not a skill wrap → no hint.
     body = (
-        "import os, json; "
-        "print(json.dumps({k: os.environ.get(k) for k in "
-        "['HOME', 'PATH', 'USER', 'SHELL', 'TERM', 'LANG', 'PWD', 'TZ', 'EDITOR']}))"
+        'import os; label = "the "active" directory"; '
+        'print(label, os.getcwd(), os.listdir("."))'
     )
-    assert len(body) >= 120
     cmd = f'python3 -c "{body}"'
     result = await tool_execute(
         command=cmd,
@@ -211,11 +209,14 @@ async def test_inline_c_block_hint_absent_for_unrelated_bodies(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_inline_c_block_hint_not_on_asymmetric_from_import(tmp_path):
-    """Negative: `from X import Y` where X != Y is NOT a skill-wrap
-    (it's a normal stdlib/third-party import). Hint must NOT fire."""
+async def test_inline_c_asymmetric_from_import_auto_converts_no_hint(tmp_path):
+    """`from X import Y` where X != Y is NOT a skill-wrap (it's a normal
+    stdlib/third-party import). Quote-safe, so it AUTO-CONVERTS and runs — no
+    block, and certainly no phantom skill hint."""
     from ghost_agent.tools.execute import tool_execute
 
+    mgr = MagicMock()
+    mgr.execute = MagicMock(return_value=("ok", 0))
     body = (
         "from urllib.request import urlopen; "
         "from html.parser import HTMLParser; "
@@ -225,7 +226,8 @@ async def test_inline_c_block_hint_not_on_asymmetric_from_import(tmp_path):
     result = await tool_execute(
         command=cmd,
         sandbox_dir=tmp_path,
-        sandbox_manager=MagicMock(),
+        sandbox_manager=mgr,
     )
-    assert "SYSTEM BLOCK" in result
+    assert "SYSTEM BLOCK" not in result
     assert "HINT:" not in result
+    assert "base64 -d" in mgr.execute.call_args[0][0]

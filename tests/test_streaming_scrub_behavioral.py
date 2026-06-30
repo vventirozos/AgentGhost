@@ -1,20 +1,24 @@
 """End-to-end behavioral test for the streaming-scrub + empty-output
 fallback.
 
-The user's reproduction was:
-  1. /clear, type `self play` → clean text summary (works)
-  2. Type `self play` again → **empty reply** (bug)
-
-Earlier fixes wired a scrub that strips `<tool_call>` / `<function>`
-XML from the stream when `is_final_generation` is true. But when the
-entire upstream response is pure XML (no prose), the scrub produces
-an empty stream and the user sees nothing.
+The scrub strips `<tool_call>` / `<function>` XML from the stream when
+`is_final_generation` is true (the model hallucinated a tool call on a
+text-only turn). But when the entire upstream response is pure XML (no
+prose), the scrub produces an empty stream and the user would see
+nothing.
 
 The fix was a fallback SSE chunk that emits an actionable message when
 the scrub consumed everything. This test drives `handle_chat` end-to-
 end with a planner mock forcing `force_final_response=True` and an
 upstream stream that emits pure `<tool_call>` XML — and asserts the
 client receives a non-empty, informative message.
+
+NB: the original repro used a repeated `self play` to reach this path.
+That specific input is now handled deterministically BEFORE the LLM
+turn (see `_explicit_terminal_command` / the turn-0 dispatch in
+`agent.py`, and `tests/test_self_play_deterministic_dispatch.py`), so
+this test uses a neutral user message — the scrub remains the general
+safety net for any final-generation turn that hallucinates a tool call.
 """
 
 import asyncio
@@ -64,8 +68,8 @@ async def test_empty_scrub_output_produces_fallback(monkeypatch):
     async def fake_stream(*args, **kwargs):
         # The upstream stream (only called when is_final_generation +
         # stream_response) emits pure tool_call XML, no prose. This is
-        # the pathological shape the user hit on their second `self
-        # play` invocation.
+        # the pathological shape a final-generation turn hits when the
+        # model hallucinates a lone tool call instead of answering.
         for t in [
             '<tool_call>\n',
             '<function name="self_play">\n',
@@ -86,7 +90,14 @@ async def test_empty_scrub_output_produces_fallback(monkeypatch):
 
     agent = GhostAgent(ctx)
     body = {
-        "messages": [{"role": "user", "content": "self play"}],
+        # Must (a) NOT be an explicit terminal command, or the turn-0
+        # deterministic dispatch would intercept it, and (b) be
+        # non-conversational (contain an action verb like "summarize") so
+        # the planner runs and forces the final-generation streaming path
+        # this test exercises. "self play" (the original repro input) hit
+        # this path because "play" is an action verb — but it now routes
+        # through deterministic dispatch instead.
+        "messages": [{"role": "user", "content": "summarize my recent activity"}],
         "model": "test",
         "stream": True,
     }

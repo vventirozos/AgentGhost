@@ -63,9 +63,30 @@ async def test_cd_prefixed_clean_import_probe_is_allowed(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_cd_prefixed_import_with_nested_quotes_is_blocked(tmp_path):
-    # import + BOTH quote types = the bash-escape corruption shape → blocked.
+async def test_cd_prefixed_escaped_nested_quotes_auto_converts(tmp_path):
+    # PROPERLY-ESCAPED nested quotes (`\"`) are NOT corruption — bash hands
+    # python a valid `json.loads('{"a": 1}')`. The precise unescaped-delimiter
+    # check lets this auto-convert to a file run instead of over-blocking it
+    # (the old import+both-quote-types heuristic rejected it spuriously).
+    mgr = MagicMock()
+    mgr.execute = MagicMock(return_value=("ok", 0))
     cmd = (r'''cd app && python3 -c "import json; print(json.loads('{\"a\": 1}'))"''')
+    result = await tool_execute(command=cmd, sandbox_dir=tmp_path,
+                                sandbox_manager=mgr)
+    assert "SYSTEM BLOCK" not in result
+    # It ran as a base64-transported file, not inline -c.
+    ran = mgr.execute.call_args[0][0]
+    assert "base64 -d" in ran and "_ghost_inline_" in ran
+
+
+@pytest.mark.asyncio
+async def test_unescaped_nested_quotes_still_blocked(tmp_path):
+    # BARE inner delimiter quote = the genuine bash-split corruption shape:
+    # `"x = "literal""` — bash closes the string early. Must still BLOCK.
+    cmd = (
+        'cd app && python3 -c "import os; '
+        'label = "the current dir"; print(label, os.getcwd())"'
+    )
     result = await tool_execute(command=cmd, sandbox_dir=tmp_path,
                                 sandbox_manager=MagicMock())
     assert "SYSTEM BLOCK" in result

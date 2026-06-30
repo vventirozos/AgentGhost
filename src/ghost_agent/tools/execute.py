@@ -5,6 +5,7 @@ import sys
 import re
 import logging
 import uuid
+import base64
 import datetime
 import ast
 import json
@@ -77,38 +78,49 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             )
             command = _stripped
 
-        # Tool-level enforcement of the WRITE-THEN-EXECUTE rule. Four
-        # rounds of prompt-side warnings still saw the model emit
-        # `python3 -c "from X import Y; print(Y('... \"GET /foo\" ...'))"`
-        # shapes where nested quotes corrupt the f-string via bash escape.
-        # Reject any inline `python -c`, `python3 -c`, or `bash -c` body
-        # that's substantive enough to deserve a proper file. Threshold:
-        # >= 120 chars of inline body OR contains more than one `;` OR
-        # contains an import statement — any of those trigger a REDIRECT
-        # error telling the model to use file_system write + execute.
+        # Inline `-c` handling. Inline `python -c "<body>"` / `bash -c
+        # "<body>"` is a recurring failure source: bash quote-escaping mangles
+        # f-strings / nested quotes (observed live: a one-line fix spiralled
+        # into ~15 turns of sed/-c quoting errors), and the model otherwise
+        # crams whole scripts into one `-c`.
+        #
+        # We USED to REJECT every substantive inline body (>= 120 chars, >1
+        # `;`, or import+nested-quotes) and force the model to re-emit as
+        # file_system(write)+execute. That cost a turn EACH and fired on
+        # perfectly well-formed scripts — a multi-statement one-liner or a long
+        # body would run fine, yet got bounced. So now we split the action:
+        #
+        #   * AUTO-CONVERT a well-formed body into an in-sandbox file run. The
+        #     body is extracted with `shlex` (POSIX word-splitting — byte-
+        #     identical to what bash would hand the interpreter) and shipped
+        #     into the container via base64, so bash quoting can't corrupt it.
+        #     This is the CWD-Auto-fix philosophy applied one block down.
+        #   * BLOCK only the two shapes a redirect genuinely helps: an
+        #     acquired-skill call wrapped in `-c` (steer to the skill name),
+        #     and a body bash can't even parse / a piped-or-redirected inline
+        #     form we can't safely rewrite — re-emitting cleanly is the fix.
         #
         # The `-c` invocation is matched after an OPTIONAL command-separator
-        # prefix (`cd <dir> && …`, `… ; …`) — not only at the very start. The
-        # model almost always works inside a project subdir, so its commands
-        # look like `cd projects/<id>/app && python3 -c "<complex body>"`; an
-        # anchored `^python3 -c` regex never matched that shape, so the guard
-        # was bypassed and the malformed inline body hit the bash-quoting
-        # corridor (observed live: a one-line fix spiralled into ~15 turns of
-        # sed/-c quoting errors before the model fell back to a wrapper script
-        # — which is exactly what this block steers it to do immediately).
+        # prefix (`cd <dir> && …`, `… ; …`) because the model almost always
+        # works inside a project subdir (`cd projects/<id>/app && python3 -c
+        # "<body>"`). True one-liners (short, single-statement, no import)
+        # never enter this block and still run inline.
         _inline_py_match = re.search(
-            r'(?:^|&&|\|\||;)\s*(?:python3?|bash)\s+-c\s+([\'"])(.*)\1\s*(?:\|.*)?$',
+            r'(?P<sep>^|&&|\|\||;)\s*'
+            r'(?P<interp>python3?|bash)\s+-c\s+'
+            r'(?P<q>[\'"])(?P<body>.*)(?P=q)'
+            r'(?P<post>\s*(?:\|.*)?)$',
             command, re.DOTALL,
         )
         if _inline_py_match:
-            _body = _inline_py_match.group(2)
+            _body = _inline_py_match.group("body")
             _body_compact = _body.strip()
             _too_long = len(_body_compact) >= 120
             _too_many_stmts = _body_compact.count(";") >= 2
-            # Acquired-skill wrap detection (also a BLOCK trigger below): the LLM
-            # trying to call a skill as a module/file — `from foo import foo` or
-            # `acquired_skills/foo.py`. Acquired skills are top-level tools; this
-            # always redirects, regardless of length/quotes.
+            # Acquired-skill wrap detection: the LLM trying to call a skill as a
+            # module/file — `from foo import foo` or `acquired_skills/foo.py`.
+            # Acquired skills are top-level tools; this ALWAYS blocks (with a
+            # skill-name hint), never auto-converts, regardless of length.
             _skill_pattern = re.search(
                 r'from\s+([a-zA-Z_][\w]*)\s+import\s+\1\b', _body_compact)
             _subprocess_pattern = re.search(
@@ -116,16 +128,11 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             _candidate_name = (_skill_pattern.group(1) if _skill_pattern
                                else _subprocess_pattern.group(1) if _subprocess_pattern
                                else None)
-            # An import ALONE is NOT a reason to block — `python3 -c "import sys;
-            # print(sys.path)"` is an idiomatic, safe probe (the block's own
-            # message used to advertise it as allowed, a self-contradiction). The
-            # real corruption mode is NESTED QUOTES in the inline body getting
-            # mangled by bash escaping, so only treat an import as a block trigger
-            # when the body ALSO mixes both quote types (the f-string-with-quotes
-            # shape that actually breaks). A clean import probe passes through.
             _nested_quotes = ("'" in _body_compact and '"' in _body_compact)
             _has_import = bool(re.search(r'\b(?:from|import)\s+\w', _body_compact))
             _risky_import = _has_import and _nested_quotes
+            # Only intervene when the body is substantive enough to deserve a
+            # file; otherwise fall through and run it inline.
             if _too_long or _too_many_stmts or _risky_import or _candidate_name:
                 reason = []
                 if _too_long:
@@ -137,43 +144,111 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 if _candidate_name and not reason:
                     reason.append("looks like an acquired-skill call wrapped in -c")
                 reason_str = "; ".join(reason)
-                pretty_log(
-                    "Inline Script Blocked",
-                    f"Rejected inline `-c` body ({reason_str})",
-                    level="WARNING", icon=Icons.SHIELD,
+
+                # Decide whether the body is SAFE to auto-run as a file.
+                #
+                # The corruption mode is an UNESCAPED copy of the outer
+                # delimiter quote inside the body: bash splits the string there
+                # (close + reopen), silently changing the body's meaning — e.g.
+                # `-c "x = "literal""` turns the string literal into bare words.
+                # If the captured body contains the delimiter quote NOT preceded
+                # by a backslash, we cannot trust the inline form, so we BLOCK
+                # and let the model re-emit cleanly. A properly ESCAPED `\"` is
+                # fine (shlex unescapes it correctly), as is any body that never
+                # embeds its delimiter. A skill wrap is never auto-run either.
+                _delim = _inline_py_match.group("q")
+                _quote_safe = (
+                    not _candidate_name
+                    and len(re.findall(r'(?<!\\)' + re.escape(_delim), _body)) == 0
                 )
 
-                # Targeted hint when the blocked body looks like a failed attempt
-                # to call an acquired skill (2026-04-24 EA incident). Acquired
-                # skills are TOP-LEVEL callable tools — steer the retry to invoke
-                # by name instead of file_system(write)+execute.
-                _skill_hint = ""
-                if _candidate_name:
-                    _skill_hint = (
-                        f"\n\nHINT: The body looks like an attempt to call "
-                        f"the `{_candidate_name}` skill as a module / file. "
-                        f"Acquired skills are TOP-LEVEL TOOLS. Invoke it "
-                        f"directly as `{_candidate_name}(...)` — the same way "
-                        f"you'd call a built-in like `web_search`. Don't "
-                        f"import it, don't run its .py file, don't write a "
-                        f"wrapper script."
+                # Extract the body exactly as bash would unquote it. A
+                # ValueError from shlex means the quotes are unbalanced — the
+                # body is genuinely corrupt, so we cannot safely auto-run it. We
+                # also require the `-c` body to be the LAST token (no trailing
+                # pipe/redirect we'd have to faithfully reconstruct); anything
+                # fancier falls back to BLOCK.
+                _bash_body = None
+                _body_is_last = False
+                if _quote_safe:
+                    try:
+                        _toks = shlex.split(command)
+                    except ValueError:
+                        _toks = None
+                    if _toks:
+                        for _i, _t in enumerate(_toks):
+                            if (_t in ("python", "python3", "bash")
+                                    and _i + 1 < len(_toks)
+                                    and _toks[_i + 1] == "-c"
+                                    and _i + 2 < len(_toks)):
+                                _bash_body = _toks[_i + 2]
+                                _body_is_last = (_i + 3 == len(_toks))
+                                break
+
+                if _bash_body is not None and _body_is_last:
+                    # --- AUTO-CONVERT → in-sandbox file run -------------------
+                    _interp = _inline_py_match.group("interp")
+                    _ext = "sh" if _interp == "bash" else "py"
+                    _path = f"/tmp/_ghost_inline_{uuid.uuid4().hex[:8]}.{_ext}"
+                    _b64 = base64.b64encode(_bash_body.encode("utf-8")).decode("ascii")
+                    _prefix = command[:_inline_py_match.start()]
+                    _sep = _inline_py_match.group("sep")
+                    # `cd proj && python3 /tmp/x.py` — cd (if any) is preserved
+                    # so the script's relative paths resolve like the inline
+                    # form did; the file is written to an absolute /tmp path so
+                    # the write itself is cwd-independent.
+                    _run = f"{_prefix}{_sep} {_interp} {_path}".strip()
+                    command = (
+                        f"printf %s {shlex.quote(_b64)} | base64 -d > {_path} "
+                        f"&& {_run}"
+                    )
+                    pretty_log(
+                        "Inline Script Auto-fixed",
+                        f"Converted inline `-c` body → {_path} via base64 "
+                        f"({reason_str}); running as a file to dodge bash "
+                        f"quote corruption.",
+                        icon=Icons.SHIELD,
+                    )
+                    # fall through to execution with the rewritten command
+                else:
+                    # --- BLOCK (skill-wrap, or a body we can't safely run) ----
+                    pretty_log(
+                        "Inline Script Blocked",
+                        f"Rejected inline `-c` body ({reason_str})",
+                        level="WARNING", icon=Icons.SHIELD,
                     )
 
-                return _format_error(
-                    f"SYSTEM BLOCK: Inline `python -c '...'` / `bash -c '...'` "
-                    f"scripts are restricted. Trigger: {reason_str}. Bash "
-                    f"quote-escape corrupts f-strings and imported-symbol "
-                    f"calls — this is the pattern that caused the previous "
-                    f"run's SyntaxError. USE THIS PATTERN INSTEAD (both "
-                    f"tool_calls can be stacked in the SAME turn):\n\n"
-                    f"  1. file_system(operation=\"write\", path=\"probe.py\", "
-                    f"content=...)\n"
-                    f"  2. execute(filename=\"probe.py\")\n\n"
-                    f"For TRUE one-liners (<120 chars, single statement, no "
-                    f"imports) like `python3 -c \"import sys; print(sys.path)\"` "
-                    f"the inline form is still allowed."
-                    f"{_skill_hint}"
-                )
+                    # Targeted hint when the blocked body looks like a failed
+                    # attempt to call an acquired skill (2026-04-24 EA
+                    # incident). Acquired skills are TOP-LEVEL callable tools —
+                    # steer the retry to invoke by name, not write+execute.
+                    _skill_hint = ""
+                    if _candidate_name:
+                        _skill_hint = (
+                            f"\n\nHINT: The body looks like an attempt to call "
+                            f"the `{_candidate_name}` skill as a module / file. "
+                            f"Acquired skills are TOP-LEVEL TOOLS. Invoke it "
+                            f"directly as `{_candidate_name}(...)` — the same way "
+                            f"you'd call a built-in like `web_search`. Don't "
+                            f"import it, don't run its .py file, don't write a "
+                            f"wrapper script."
+                        )
+
+                    return _format_error(
+                        f"SYSTEM BLOCK: this inline `python -c '...'` / `bash -c "
+                        f"'...'` form was rejected. Trigger: {reason_str}. Bash "
+                        f"quote-escape corrupts f-strings and imported-symbol "
+                        f"calls — this is the pattern that caused the previous "
+                        f"run's SyntaxError. USE THIS PATTERN INSTEAD (both "
+                        f"tool_calls can be stacked in the SAME turn):\n\n"
+                        f"  1. file_system(operation=\"write\", path=\"probe.py\", "
+                        f"content=...)\n"
+                        f"  2. execute(filename=\"probe.py\")\n\n"
+                        f"For TRUE one-liners (<120 chars, single statement, no "
+                        f"imports) like `python3 -c \"import sys; print(sys.path)\"` "
+                        f"the inline form is still allowed."
+                        f"{_skill_hint}"
+                    )
 
         pretty_log("Shell Command", command, icon=Icons.TOOL_SHELL)
 
@@ -257,7 +332,6 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
 
     is_ephemeral = False
     if content and not filename and not command:
-        import uuid
         filename = f".ephemeral_{uuid.uuid4().hex[:8]}.py"
         is_ephemeral = True
     if not filename and not command:

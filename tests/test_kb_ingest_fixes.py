@@ -274,39 +274,16 @@ async def test_unified_forget_disk_prefers_exact_over_substring(tmp_path):
 
 
 # =====================================================================
-# KB-8 — profile sweep is key-only, not value-match
+# KB-8 — profile sweep key matching (exact preferred over substring)
+#
+# NB: an earlier test here asserted the sweep was KEY-ONLY (a value
+# mentioning the target must never be deleted). That invariant was
+# intentionally superseded by the VALUE SWEEP in
+# `tools/memory.py:tool_unified_forget` (`_value_mentions_target`), which
+# removes a forgotten entity even when it lives in a VALUE (e.g. a pet
+# stored in `assets.pets`). The stale key-only test was removed rather
+# than reverting that feature. See memory:kb-forget-value-sweep-test-conflict.
 # =====================================================================
-
-
-@pytest.mark.asyncio
-async def test_unified_forget_profile_sweep_does_not_match_values(tmp_path):
-    """The destructive bug: target='python' wiping any profile entry whose
-    VALUE mentioned python. Now matches keys only."""
-    sandbox = tmp_path / "sandbox"
-    sandbox.mkdir()
-    profile = MagicMock()
-    profile.load.return_value = {
-        "preferences": {
-            "favourite_language": "python",  # value mentions python — must NOT be deleted
-            "editor": "vscode",
-        },
-        "skills": {"python_advanced": "yes"},  # key contains python — should be deleted
-    }
-    mem = MagicMock()
-    mem.get_library.return_value = []
-    mem.collection.query.return_value = {
-        "ids": [[]], "distances": [[]], "documents": [[]], "metadatas": [[]]
-    }
-    mem._get_lock = MagicMock()
-    mem._get_lock.return_value.__enter__ = MagicMock(return_value=None)
-    mem._get_lock.return_value.__exit__ = MagicMock(return_value=False)
-
-    await tool_unified_forget("python", sandbox, mem, profile_memory=profile)
-    delete_calls = [c.args for c in profile.delete.call_args_list]
-    # ONLY the python_advanced key should be touched.
-    assert ("skills", "python_advanced") in delete_calls
-    assert ("preferences", "favourite_language") not in delete_calls
-    assert ("preferences", "editor") not in delete_calls
 
 
 @pytest.mark.asyncio
