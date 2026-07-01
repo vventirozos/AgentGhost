@@ -107,6 +107,19 @@ _ONION_TIMEOUT = 30
 # content pages are slower still than the search engines; give them room.
 _ONION_PAGE_TIMEOUT = 35.0
 
+# Overall wall-clock deadline for a SINGLE engine (both attempts combined).
+# Because engines are queried concurrently, the whole search can only finish
+# once the SLOWEST engine returns — so a dead or hung engine that burns its
+# per-attempt timeout twice (~2x _ONION_TIMEOUT) would dominate the gather and
+# inflate every call's latency (the failure mode that motivated dropping the
+# dead `haystak` default). This hard-caps any one engine's contribution to the
+# gather regardless of the engine set, so curation is a tuning aid, not the
+# only thing standing between a newly-dead engine and a slow tool. Sized to
+# allow ONE full attempt (a slow-but-alive onion engine legitimately needs up
+# to _ONION_TIMEOUT) plus a short window for a fast second circuit; a slow
+# first attempt simply forfeits most of the retry.
+_ONION_ENGINE_DEADLINE = _ONION_TIMEOUT + 8
+
 
 def _load_engines() -> List[Dict[str, str]]:
     """Return the active onion-engine set, honouring the GHOST_ONION_ENGINES
@@ -263,31 +276,49 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
 
 
 async def _query_engine(engine: Dict[str, str], query: str, tor_proxy: str) -> List[Dict[str, str]]:
-    """Query one onion engine with per-attempt circuit rotation. Returns its
-    parsed results (possibly empty); never raises."""
-    url = engine["url"].format(q=quote_plus(query))
-    for attempt in range(2):
-        proxy = _proxy_for_attempt(tor_proxy, f"{engine['name']}:{query}", attempt)
-        try:
-            status, body = await _fetch_raw_html(url, proxy, _ONION_TIMEOUT)
-            if status == 200 and body:
-                parsed = _parse_onion_results(body)
-                if parsed:
-                    pretty_log(
-                        "Darkweb Engine",
-                        f"{engine['name']}: {len(parsed)} onion result(s)",
-                        icon=Icons.TOOL_DARKWEB,
-                    )
-                    return parsed
-        except Exception as e:  # noqa: BLE001
-            pretty_log(
-                "Darkweb Engine Error",
-                f"{engine['name']}: {e}",
-                level="WARNING",
-                icon=Icons.WARN,
-            )
-        await asyncio.sleep(0.5)
-    return []
+    """Query one onion engine with per-attempt circuit rotation, under an
+    overall wall-clock deadline (`_ONION_ENGINE_DEADLINE`) so one slow or dead
+    engine can't dominate the concurrent gather. Returns its parsed results
+    (possibly empty); never raises."""
+
+    async def _attempts() -> List[Dict[str, str]]:
+        url = engine["url"].format(q=quote_plus(query))
+        for attempt in range(2):
+            proxy = _proxy_for_attempt(tor_proxy, f"{engine['name']}:{query}", attempt)
+            try:
+                status, body = await _fetch_raw_html(url, proxy, _ONION_TIMEOUT)
+                if status == 200 and body:
+                    parsed = _parse_onion_results(body)
+                    if parsed:
+                        pretty_log(
+                            "Darkweb Engine",
+                            f"{engine['name']}: {len(parsed)} onion result(s)",
+                            icon=Icons.TOOL_DARKWEB,
+                        )
+                        return parsed
+            except Exception as e:  # noqa: BLE001
+                pretty_log(
+                    "Darkweb Engine Error",
+                    f"{engine['name']}: {e}",
+                    level="WARNING",
+                    icon=Icons.WARN,
+                )
+            await asyncio.sleep(0.5)
+        return []
+
+    try:
+        return await asyncio.wait_for(_attempts(), timeout=_ONION_ENGINE_DEADLINE)
+    except asyncio.TimeoutError:
+        # The underlying fetch runs in a worker thread (curl_cffi/httpx has
+        # its own timeout), so it isn't force-killed here — but cancelling the
+        # await lets the gather proceed without waiting on this engine.
+        pretty_log(
+            "Darkweb Engine Error",
+            f"{engine['name']}: exceeded {_ONION_ENGINE_DEADLINE:.0f}s deadline — skipped",
+            level="WARNING",
+            icon=Icons.WARN,
+        )
+        return []
 
 
 def _apply_anonymous_scrub(query: str, tor_proxy: Optional[str]) -> Tuple[str, Optional[str]]:

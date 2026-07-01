@@ -136,6 +136,29 @@ async def test_search_merges_and_ranks_by_corroboration():
 
 
 @pytest.mark.asyncio
+async def test_slow_engine_bounded_by_deadline(monkeypatch):
+    """A slow/hung engine can't dominate the concurrent gather: it is skipped
+    at the per-engine deadline while fast engines' results still come through."""
+    import asyncio as _asyncio
+
+    monkeypatch.setattr(dw, "_ONION_ENGINE_DEADLINE", 0.3)
+    slow_html = f'<a href="http://{V3_A}.onion/">Slow</a>'
+    fast_html = f'<a href="http://{V3_B}.onion/">Fast</a>'
+
+    async def _stub(url, proxy, timeout):
+        if "ahmia.fi" in url:          # make the ahmia clearnet engine hang
+            await _asyncio.sleep(1.0)
+            return 200, slow_html
+        return 200, fast_html          # torch / ahmia-onion respond instantly
+
+    with patch.object(dw, "_fetch_raw_html", side_effect=_stub):
+        out = await tool_darkweb_search("x", tor_proxy="socks5://127.0.0.1:9050")
+
+    assert V3_B in out          # fast engines' results returned
+    assert V3_A not in out      # slow engine was deadline-skipped, not awaited
+
+
+@pytest.mark.asyncio
 async def test_search_zero_results_returns_actionable_error():
     stub = _fetch_stub({})  # every engine reached but empty
     with patch.object(dw, "_fetch_raw_html", side_effect=stub):

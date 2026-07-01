@@ -77,6 +77,9 @@
   <p>
     <strong>Timeouts are deliberately higher than clearnet search.</strong> Onion round-trips are materially slower: <code>_ONION_TIMEOUT = 30&nbsp;s</code> per engine request (vs. <code>search.py</code>'s <code>_DDGS_TOR_TIMEOUT = 18&nbsp;s</code>), and <code>_ONION_PAGE_TIMEOUT = 35&nbsp;s</code> for each onion page fetch in the research phase. These clear a healthy onion service while still letting dead endpoints fail fast on connect error. Like the clearnet timeout, they are empirically tunable.
   </p>
+  <p>
+    <strong>Per-engine deadline (dead-engine hardening).</strong> Unlike <code>search.py</code> — which hands its whole backend set to <code>ddgs</code> in a <em>single</em> call bounded by one shared timeout — this tool fans the engines out itself with <code>asyncio.gather</code>, so the search can only finish once the <em>slowest</em> engine returns. A dead or hung engine that burns its per-attempt timeout twice (~2&times;<code>_ONION_TIMEOUT</code>) would therefore dominate the gather and inflate <em>every</em> call's latency. To bound this structurally (not just by curating the engine list), each engine runs under an overall <code>_ONION_ENGINE_DEADLINE = _ONION_TIMEOUT + 8&nbsp;s</code> via <code>asyncio.wait_for</code>: it allows one full attempt (a slow-but-alive engine legitimately needs up to <code>_ONION_TIMEOUT</code>) plus a short window for a fast second circuit, then skips the engine so the gather proceeds. The underlying fetch runs in a worker thread with its own curl/httpx timeout, so it is not force-killed — cancelling the await just releases the gather. This makes engine curation a tuning aid rather than the only thing standing between a newly-dead engine and a slow tool. Covered by <code>tests/test_darkweb_search.py::test_slow_engine_bounded_by_deadline</code>.
+  </p>
 
   <h2><code>socks5h</code> — mandatory for .onion</h2>
   <p>
