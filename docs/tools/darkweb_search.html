@@ -67,7 +67,7 @@
     <strong>On dead endpoints:</strong> <code>haystak</code> was in the initial default set but was dropped after live functional testing — its v3 endpoint failed on <strong>every</strong> attempt across many rotated Tor circuits (SOCKS5 connect / timeout), i.e. the hidden service is down rather than exit-node blocked, and its retry could burn a full <code>_ONION_TIMEOUT</code> and inflate the tail latency of the whole (concurrent) call. It — or any replacement onion engine — can be re-added via <code>GHOST_ONION_ENGINES</code> once a live endpoint is known. This is the expected maintenance mode for onion engines, which rotate and die far more often than clearnet ones.
   </p>
   <p>
-    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search.
+    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search, and an individual entry whose URL carries a stray placeholder other than <code>{q}</code> (which would raise a <code>KeyError</code> in <code>.format</code> on every query and be silently skipped) is <strong>rejected at load with a warning</strong> instead.
   </p>
 
   <h2>Circuit rotation + timeouts (reused from search.py)</h2>

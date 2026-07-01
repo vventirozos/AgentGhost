@@ -224,6 +224,75 @@ class TestChatBodyParsing:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# /api/chat — message content validation
+# ──────────────────────────────────────────────────────────────────────
+
+class TestContentValidation:
+    """A message with no usable content must be rejected at the boundary,
+    not fabricated into a reply by the agent (e.g. a user turn with
+    content=null previously produced a greeting instead of a 422)."""
+
+    def _post(self, messages):
+        app, agent = _make_test_app()
+        # Fail loudly if a rejected request ever reaches the handler.
+        async def _should_not_run(body, bg, request_id=None):
+            raise AssertionError("handler ran on an invalid request")
+        agent.handle_chat = _should_not_run
+        with TestClient(app) as c:
+            return c.post(
+                "/api/chat",
+                headers={"X-Ghost-Key": "test-key"},
+                json={"messages": messages, "stream": False},
+            )
+
+    def test_user_null_content_rejected(self):
+        r = self._post([{"role": "user", "content": None}])
+        assert r.status_code == 422
+        assert r.json()["error"]["type"] == "InvalidRequestShape"
+
+    def test_user_empty_content_rejected(self):
+        r = self._post([{"role": "user", "content": "   "}])
+        assert r.status_code == 422
+
+    def test_nonstring_content_rejected(self):
+        r = self._post([{"role": "user", "content": 42}])
+        assert r.status_code == 422
+
+    def test_assistant_null_content_with_tool_calls_allowed(self):
+        # Valid OpenAI tool-calling shape: assistant content=null + tool_calls,
+        # followed by a real user turn. Must NOT be rejected by content checks.
+        app, agent = _make_test_app()
+        with TestClient(app) as c:
+            r = c.post(
+                "/api/chat",
+                headers={"X-Ghost-Key": "test-key"},
+                json={"messages": [
+                    {"role": "user", "content": "run it"},
+                    {"role": "assistant", "content": None,
+                     "tool_calls": [{"id": "t1", "function": {"name": "x", "arguments": "{}"}}]},
+                    {"role": "tool", "content": "result", "tool_call_id": "t1"},
+                    {"role": "user", "content": "and now?"},
+                ], "stream": False},
+            )
+            assert r.status_code not in (400, 422)
+
+    def test_multimodal_list_content_allowed(self):
+        r = self._post_ok([
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+        ])
+        assert r.status_code not in (400, 422)
+
+    def _post_ok(self, messages):
+        app, _ = _make_test_app()
+        with TestClient(app) as c:
+            return c.post(
+                "/api/chat",
+                headers={"X-Ghost-Key": "test-key"},
+                json={"messages": messages, "stream": False},
+            )
+
+
+# ──────────────────────────────────────────────────────────────────────
 # /api/show — basic shape
 # ──────────────────────────────────────────────────────────────────────
 

@@ -130,11 +130,26 @@ def _load_engines() -> List[Dict[str, str]]:
         return list(_DEFAULT_ONION_ENGINES)
     try:
         parsed = json.loads(raw)
-        engines = [
-            {"name": str(e["name"]), "url": str(e["url"])}
-            for e in parsed
-            if isinstance(e, dict) and e.get("name") and "{q}" in str(e.get("url", ""))
-        ]
+        engines = []
+        for e in parsed:
+            if not (isinstance(e, dict) and e.get("name")):
+                continue
+            url = str(e.get("url", ""))
+            if "{q}" not in url:
+                continue
+            # Reject stray format placeholders: url.format(q=...) would raise
+            # KeyError at query time and the engine would be silently skipped
+            # on every search. Surface the config error at load instead.
+            residue = url.replace("{q}", "")
+            if "{" in residue or "}" in residue:
+                pretty_log(
+                    "Darkweb Config",
+                    f"engine {e.get('name')!r} URL has an invalid placeholder "
+                    "(only {q} is allowed); skipping it.",
+                    level="WARNING", icon=Icons.WARN,
+                )
+                continue
+            engines.append({"name": str(e["name"]), "url": url})
         return engines or list(_DEFAULT_ONION_ENGINES)
     except Exception:
         pretty_log(

@@ -103,6 +103,20 @@ def test_engine_override_and_malformed_fallback(monkeypatch):
     assert any(e["name"] == "ahmia" for e in engines)
 
 
+def test_engine_override_rejects_stray_placeholder(monkeypatch):
+    """A URL with a placeholder other than {q} (which would KeyError in
+    .format at query time) is dropped at load, not silently skipped later."""
+    monkeypatch.setenv(
+        "GHOST_ONION_ENGINES",
+        json.dumps([
+            {"name": "ok", "url": "http://ok.onion/?q={q}"},
+            {"name": "broken", "url": "http://bad.onion/?q={q}&x={stray}"},
+        ]),
+    )
+    names = [e["name"] for e in _load_engines()]
+    assert names == ["ok"]  # broken entry rejected, not passed through
+
+
 # --------------------------------------------------------------------------
 # Search fan-out
 # --------------------------------------------------------------------------

@@ -253,6 +253,45 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 status_code=422,
             )
 
+        # Content shape. `null`/absent content is valid ONLY on an assistant
+        # message that carries tool_calls (the standard tool-calling turn).
+        # Everywhere else a message with no usable content used to slip
+        # through to the agent, which then fabricates a reply from nothing
+        # (e.g. a `user` turn with content=null produced a greeting instead
+        # of a 422). Reject null / wrong-typed / empty-user content here.
+        content = m.get("content")
+        if content is None:
+            if not (role == "assistant" and m.get("tool_calls")):
+                return JSONResponse(
+                    {"error": {
+                        "message": (
+                            f"messages[{i}].content is required (null is allowed "
+                            "only on an assistant message with tool_calls)"
+                        ),
+                        "type": "InvalidRequestShape",
+                    }},
+                    status_code=422,
+                )
+        elif not isinstance(content, (str, list)):
+            return JSONResponse(
+                {"error": {
+                    "message": (
+                        f"messages[{i}].content must be a string or list, got "
+                        f"{type(content).__name__}"
+                    ),
+                    "type": "InvalidRequestShape",
+                }},
+                status_code=422,
+            )
+        elif role == "user" and isinstance(content, str) and not content.strip():
+            return JSONResponse(
+                {"error": {
+                    "message": f"messages[{i}].content is empty; a user message must carry content",
+                    "type": "InvalidRequestShape",
+                }},
+                status_code=422,
+            )
+
     # `model` is optional in many clients (Ollama leaves it implicit).
     # If supplied AND it doesn't match the configured model, return 404
     # rather than silently rerouting to the upstream. We don't 404 a
