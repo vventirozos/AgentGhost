@@ -1480,6 +1480,18 @@ class GhostContext:
         # cross-turn — set at the confidence-compute site.
         self._calib_pending = None
 
+# Async-critic deferred-correction bounds (see _record_late_verdict /
+# _consume_pending_corrections). The agent is a process-wide singleton, so
+# these keep a late REFUTED verdict from one conversation leaking into an
+# unrelated one and from accumulating without bound:
+#   * MAX — hard cap on queued corrections (newest win) so a busy multi-
+#     conversation process can't pile up a runaway banner chain.
+#   * TTL — a correction that its OWN conversation never returns to consume is
+#     dropped after this many seconds instead of lingering forever.
+_CORRECTION_MAX = 3
+_CORRECTION_TTL = 900.0  # seconds
+
+
 class GhostAgent:
     def __init__(self, context: GhostContext):
         self.context = context
@@ -3865,11 +3877,44 @@ class GhostAgent:
             )
 
         # Pure async (gate == 0) or budget overrun: hand the still-running
-        # task to the late handler and release the response now.
-        self._attach_late_verdict_handler(task, trajectory_id)
+        # task to the late handler and release the response now. Capture the
+        # conversation fingerprint NOW (while its messages are in scope) so a
+        # late correction can only surface back in the SAME conversation.
+        self._attach_late_verdict_handler(
+            task, trajectory_id, self._conversation_fingerprint(messages),
+        )
         return None, last_tool
 
-    def _attach_late_verdict_handler(self, task, trajectory_id):
+    def _conversation_fingerprint(self, messages) -> str:
+        """A stable-per-conversation, distinct-across-conversations tag.
+
+        Derived from the FIRST user message, which the client resends on
+        every turn of the same conversation (so it's constant across that
+        conversation's turns) yet differs between conversations. Used to
+        keep a deferred correction from one conversation from surfacing in
+        an unrelated one on the shared singleton agent. Returns ``""`` when
+        it can't be computed — treated downstream as "don't surface",
+        i.e. fail safe (drop) rather than risk cross-posting.
+        """
+        try:
+            first_user = next(
+                (m.get("content") for m in messages
+                 if isinstance(m, dict) and m.get("role") == "user"),
+                "",
+            )
+            if isinstance(first_user, list):
+                first_user = " ".join(
+                    i.get("text", "") for i in first_user
+                    if isinstance(i, dict) and i.get("type") == "text"
+                )
+            import hashlib
+            return hashlib.sha1(
+                str(first_user)[:2000].encode("utf-8", "ignore")
+            ).hexdigest()[:16]
+        except Exception:
+            return ""
+
+    def _attach_late_verdict_handler(self, task, trajectory_id, conv_fp=""):
         """Apply the safety-critical side effects of a verdict that lands
         AFTER its response already shipped.
 
@@ -3879,18 +3924,19 @@ class GhostAgent:
         high-confidence REFUTED means any lesson THIS turn wrote is
         suspect, and the next user query must not retrieve it. Retraction
         is keyed by ``trajectory_id`` and idempotent, so running it a beat
-        late is safe.
+        late is safe. ``conv_fp`` tags any queued correction with the
+        conversation it belongs to, so it only surfaces back there.
         """
         def _on_done(t):
             try:
                 v_result, _lt = t.result()
             except Exception:
                 return
-            self._record_late_verdict(v_result, trajectory_id)
+            self._record_late_verdict(v_result, trajectory_id, conv_fp)
 
         task.add_done_callback(_on_done)
 
-    def _record_late_verdict(self, v_result, trajectory_id):
+    def _record_late_verdict(self, v_result, trajectory_id, conv_fp=""):
         """Apply the side effects of a verdict that lands AFTER its
         response shipped. Extracted from the done-callback so it is
         unit-testable. On a high-confidence REFUTED: log it, scrub any
@@ -3925,15 +3971,25 @@ class GhostAgent:
                         self.context, "memory_system", None
                     ),
                 ))
-            # Async mode: stash a correction to surface on the next turn,
-            # since the response is already out and can't be repaired.
+            # Async mode: stash a correction to surface on the next turn OF
+            # THE SAME CONVERSATION, since the response is already out and
+            # can't be repaired. Tagged with the conversation fingerprint and
+            # a monotonic timestamp (for scoping + TTL), and the queue is
+            # capped so a busy multi-conversation process can't accumulate an
+            # unbounded banner chain.
             if self._critic_async_enabled():
                 if not isinstance(getattr(self, "_pending_corrections", None), list):
                     self._pending_corrections = []
-                self._pending_corrections.append(issues_str[:300])
+                self._pending_corrections.append({
+                    "note": issues_str[:300],
+                    "conv": conv_fp or "",
+                    "ts": time.monotonic(),
+                })
+                if len(self._pending_corrections) > _CORRECTION_MAX:
+                    self._pending_corrections = self._pending_corrections[-_CORRECTION_MAX:]
                 pretty_log(
                     "Verifier",
-                    "queued a correction to surface on the next message",
+                    "queued a correction to surface on the next message of this conversation",
                     icon=Icons.IDEA,
                 )
         else:
@@ -3958,18 +4014,47 @@ class GhostAgent:
         would bypass the prepend). Returns ``messages`` unchanged.
         """
         corrections = getattr(self, "_pending_corrections", None)
-        self._correction_active_this_turn = bool(corrections)
         self._active_correction = ""
         if not corrections:
+            self._correction_active_this_turn = False
             return messages
-        self._pending_corrections = []
-        note = "; ".join(corrections)
+
+        now = time.monotonic()
+        current_fp = self._conversation_fingerprint(messages)
+        surface = []   # notes belonging to THIS conversation → prepend now
+        kept = []      # other conversations' corrections → still fresh, hold
+        for c in corrections:
+            # Back-compat: a bare string is an untagged/legacy correction —
+            # surface it unconditionally (only reachable via direct injection;
+            # production always enqueues a tagged dict).
+            if isinstance(c, str):
+                surface.append(c)
+                continue
+            if not isinstance(c, dict):
+                continue
+            if (now - c.get("ts", now)) > _CORRECTION_TTL:
+                continue  # expired → drop (its conversation never came back)
+            conv = c.get("conv", "")
+            if not conv or (current_fp and conv == current_fp):
+                surface.append(c.get("note", ""))
+            else:
+                kept.append(c)  # a different conversation — leave it queued
+
+        # Hold non-matching (still-fresh) corrections for their own
+        # conversation, bounded by the cap; drop everything else.
+        self._pending_corrections = kept[-_CORRECTION_MAX:]
+        self._correction_active_this_turn = bool(surface)
+        if not surface:
+            return messages
+
+        note = "; ".join(n for n in surface if n)
         self._active_correction = (
             f"⚠️ **Correction to my previous answer:** {note}\n\n---\n\n"
         )
         pretty_log(
             "Verifier",
-            f"surfacing {len(corrections)} deferred correction(s) from a prior turn",
+            f"surfacing {len(surface)} deferred correction(s) from a prior turn "
+            "of this conversation",
             icon=Icons.IDEA,
         )
         return messages

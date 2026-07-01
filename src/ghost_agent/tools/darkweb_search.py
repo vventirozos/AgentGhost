@@ -86,10 +86,14 @@ _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
         "name": "torch",
         "url": "http://torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd.onion/search?query={q}",
     },
-    {
-        "name": "haystak",
-        "url": "http://haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid.onion/?q={q}",
-    },
+    # NOTE: haystak was dropped from the DEFAULT set after live functional
+    # testing (2026-06/07): its v3 endpoint failed 0/8 across many rotated
+    # circuits (SOCKS5 connect / timeout), i.e. the hidden service itself is
+    # down, not an exit-node block — and its retry could burn a full
+    # `_ONION_TIMEOUT` on the 2nd attempt, inflating the tail latency of the
+    # whole (concurrent) call. Re-add it, or any replacement onion engine,
+    # via the GHOST_ONION_ENGINES env override once a live endpoint is known:
+    #   http://haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid.onion/?q={q}
 ]
 
 # Per-request timeout. Onion search engines are slow — a healthy round trip

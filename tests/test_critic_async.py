@@ -113,7 +113,7 @@ def test_late_refuted_queues_correction_in_async(agent, monkeypatch):
             trajectory_id="traj-1",
         )
     assert agent._pending_corrections
-    assert "wrong number" in agent._pending_corrections[0]
+    assert "wrong number" in agent._pending_corrections[0]["note"]
 
 
 def test_late_refuted_does_not_queue_when_not_async(agent, monkeypatch):
@@ -233,7 +233,7 @@ async def test_async_mode_ships_unrepaired_and_queues_correction(agent, monkeypa
         if agent._pending_corrections:
             break
     assert agent._pending_corrections, "async verdict should have queued a correction"
-    assert "wrong number" in agent._pending_corrections[0]
+    assert "wrong number" in agent._pending_corrections[0]["note"]
     assert vmock.await_count == 1  # exactly one verdict, off the critical path
 
 
@@ -276,3 +276,102 @@ async def test_sync_mode_still_repairs(agent, monkeypatch):
     assert "42" in result
     assert "The answer is 7." not in result
     assert agent._pending_corrections == []  # sync mode never queues
+
+
+# --------------------------------------------------------------------------
+# Conversation scoping + TTL + cap (the shared-singleton pollution fix)
+# --------------------------------------------------------------------------
+
+def _queue(agent, note, conv, ts=None):
+    """Directly enqueue a tagged correction as _record_late_verdict would."""
+    import time as _t
+    if not isinstance(getattr(agent, "_pending_corrections", None), list):
+        agent._pending_corrections = []
+    agent._pending_corrections.append(
+        {"note": note, "conv": conv, "ts": ts if ts is not None else _t.monotonic()}
+    )
+
+
+def _msgs(first_user):
+    return [{"role": "system", "content": "SYS"}, {"role": "user", "content": first_user}]
+
+
+def test_record_late_verdict_tags_conversation(agent, monkeypatch):
+    """A late REFUTED verdict stores a conversation-tagged, timestamped dict."""
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    agent.context.skill_memory = MagicMock()
+    agent._pending_corrections = []
+    with patch("ghost_agent.core.agent.pretty_log"), \
+         patch("ghost_agent.core.agent._glog.spawn_task"):
+        agent._record_late_verdict(
+            _verdict(VerifyVerdict.REFUTED, conf=0.9, issues=["bad claim"]),
+            trajectory_id="t", conv_fp="CONV_A",
+        )
+    entry = agent._pending_corrections[0]
+    assert entry["note"] == "bad claim"
+    assert entry["conv"] == "CONV_A"
+    assert isinstance(entry["ts"], float)
+
+
+def test_correction_surfaces_only_in_originating_conversation(agent):
+    """The core fix: a correction tagged for conversation A surfaces on A's
+    next turn but NOT on an unrelated conversation B's turn (it stays queued)."""
+    fp_a = agent._conversation_fingerprint(_msgs("first question in A"))
+    _queue(agent, "A's answer was wrong", fp_a)
+
+    # A DIFFERENT conversation must NOT see it, and it must remain queued.
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._consume_pending_corrections(_msgs("unrelated question in B"))
+    assert agent._take_active_correction() == ""
+    assert agent._correction_active_this_turn is False
+    assert len(agent._pending_corrections) == 1  # held for conversation A
+
+    # A's own next turn surfaces it and clears it.
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._consume_pending_corrections(_msgs("first question in A"))
+    banner = agent._take_active_correction()
+    assert "A's answer was wrong" in banner
+    assert agent._pending_corrections == []
+
+
+def test_correction_expires_after_ttl(agent):
+    """A correction whose conversation never returns is dropped after the TTL
+    rather than lingering — even when its own conversation finally shows up."""
+    from ghost_agent.core.agent import _CORRECTION_TTL
+    import time as _t
+    fp = agent._conversation_fingerprint(_msgs("stale conversation"))
+    _queue(agent, "too old to matter", fp, ts=_t.monotonic() - _CORRECTION_TTL - 5)
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._consume_pending_corrections(_msgs("stale conversation"))
+    assert agent._take_active_correction() == ""
+    assert agent._pending_corrections == []  # expired → dropped
+
+
+def test_correction_queue_is_capped(agent, monkeypatch):
+    """Queueing more than _CORRECTION_MAX corrections keeps only the newest."""
+    from ghost_agent.core.agent import _CORRECTION_MAX
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    agent.context.skill_memory = MagicMock()
+    agent._pending_corrections = []
+    with patch("ghost_agent.core.agent.pretty_log"), \
+         patch("ghost_agent.core.agent._glog.spawn_task"):
+        for i in range(_CORRECTION_MAX + 3):
+            agent._record_late_verdict(
+                _verdict(VerifyVerdict.REFUTED, conf=0.9, issues=[f"issue {i}"]),
+                trajectory_id="t", conv_fp="CONV",
+            )
+    assert len(agent._pending_corrections) == _CORRECTION_MAX
+    # The newest survive; the oldest are evicted.
+    notes = [c["note"] for c in agent._pending_corrections]
+    assert notes[-1] == f"issue {_CORRECTION_MAX + 2}"
+    assert "issue 0" not in notes
+
+
+def test_untagged_string_correction_still_surfaces(agent):
+    """Back-compat: a bare-string correction (direct injection / legacy) is
+    unscoped and surfaces regardless of conversation."""
+    agent._pending_corrections = ["legacy untagged note"]
+    with patch("ghost_agent.core.agent.pretty_log"):
+        agent._consume_pending_corrections(_msgs("any conversation"))
+    assert "legacy untagged note" in agent._take_active_correction()
+    assert agent._pending_corrections == []
