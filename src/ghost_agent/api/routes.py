@@ -594,6 +594,32 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.post("/api/memory/correct", dependencies=[Security(verify_api_key)])
+async def memory_correct(request: Request):
+    """Surgically rewrite ONE vector-memory fragment's text.
+
+    The safe path for fixing a poisoned auto-memory: Chroma's persist dir
+    must only ever be touched by the process that owns it (a second
+    PersistentClient risks HNSW corruption), so the correction runs
+    in-process via VectorMemory.correct_fragment. Body:
+    {"match": <exact text or unique substring>, "replacement": <new text>}.
+    """
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        return JSONResponse({"error": f"Invalid JSON: {e}"}, 400)
+    match = str(body.get("match") or "")
+    replacement = str(body.get("replacement") or "")
+    memory = getattr(getattr(agent, "context", None), "memory_system", None)
+    if memory is None or not hasattr(memory, "correct_fragment"):
+        return JSONResponse({"error": "memory system unavailable"}, 503)
+    ok, detail = memory.correct_fragment(match, replacement)
+    if not ok:
+        return JSONResponse({"ok": False, "error": detail}, 409)
+    return {"ok": True, **detail}
+
+
 @router.post("/api/upload", dependencies=[Security(verify_api_key)])
 async def upload_file(request: Request, file: UploadFile = File(...)):
     agent = get_agent(request)

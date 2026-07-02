@@ -40,7 +40,11 @@ def _write(base, rel, content="x"):
 
 # ----------------------------------------------------------------- sweep core
 
-def test_sweep_keeps_registered_deletes_rest(store):
+def test_sweep_keeps_registered_recovers_sources_deletes_media(store):
+    """Partial keep-set (chess incident, 2026-07-02): registration proves
+    what IS a deliverable, never what isn't. Unregistered SOURCE files are
+    recovered (kept + registered); unregistered media/binary scratch is
+    what actually gets swept."""
     pid = store.create_project("P")
     pdir = _proj_dir(store, pid)
     plan = ProjectPlan(store, pid)
@@ -48,8 +52,8 @@ def test_sweep_keeps_registered_deletes_rest(store):
 
     _write(pdir, "report.pdf", "deliverable")
     _write(pdir, "screenshot.png", "junk")
-    _write(pdir, "helper.py", "scratch")
-    _write(pdir, "sub/notes.txt", "scratch")
+    _write(pdir, "helper.py", "source — recovered, not scratch")
+    _write(pdir, "sub/notes.txt", "source — recovered, not scratch")
 
     store.register_file_artifact(tid, "report.pdf")
 
@@ -58,13 +62,120 @@ def test_sweep_keeps_registered_deletes_rest(store):
     assert res["status"] == "ok"
     assert (pdir / "report.pdf").exists()
     assert not (pdir / "screenshot.png").exists()
-    assert not (pdir / "helper.py").exists()
-    assert not (pdir / "sub" / "notes.txt").exists()
-    # the now-empty subdir is pruned, the project dir itself survives
-    assert not (pdir / "sub").exists()
+    # source files survive a partial keep-set and are now registered
+    assert (pdir / "helper.py").exists()
+    assert (pdir / "sub" / "notes.txt").exists()
+    assert (pdir / "sub").exists()
     assert pdir.exists()
-    assert set(res["deleted"]) == {"screenshot.png", "helper.py", "sub/notes.txt"}
-    assert res["kept"] == ["report.pdf"]
+    assert set(res["deleted"]) == {"screenshot.png"}
+    assert set(res["recovered"]) == {"helper.py", "sub/notes.txt"}
+    assert set(res["kept"]) == {"report.pdf", "helper.py", "sub/notes.txt"}
+    payloads = {a["payload"] for a in store.list_artifacts(project_id=pid)
+                if a["kind"] == "file"}
+    assert {"helper.py", "sub/notes.txt"} <= payloads
+
+
+def test_partial_keepset_chess_scenario_build_survives(store):
+    """Regression for the live incident: a 4-file web game with ONE file
+    registered lost index.html and two JS modules to the sweep. All source
+    files must survive; screenshots and caches must not."""
+    pid = store.create_project("Chess Game")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("build the game")
+
+    _write(pdir, "chess/index.html", "<html>")
+    _write(pdir, "chess/js/chess-engine.js", "engine")
+    _write(pdir, "chess/js/game-state.js", "state")
+    _write(pdir, "chess/js/main.js", "loop")
+    _write(pdir, "chess/board_rendered.png", "screenshot")
+    _write(pdir, "chess/__pycache__/x.pyc", "bytecode")
+    store.register_file_artifact(tid, "chess/js/game-state.js")
+
+    res = sweep_project_workspace(store, pid)
+
+    for kept in ("chess/index.html", "chess/js/chess-engine.js",
+                 "chess/js/game-state.js", "chess/js/main.js"):
+        assert (pdir / kept).exists(), kept
+    assert not (pdir / "chess" / "board_rendered.png").exists()
+    assert not (pdir / "chess" / "__pycache__").exists()
+    assert set(res["recovered"]) == {"chess/index.html",
+                                     "chess/js/chess-engine.js",
+                                     "chess/js/main.js"}
+
+
+def test_partial_keepset_recovery_registers_for_next_sweep(store):
+    """Recovered sources are registered, so a second sweep keeps them via
+    the normal keep-set with no recovery pass needed (idempotence)."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "kept.md", "registered")
+    _write(pdir, "forgotten.js", "recovered")
+    store.register_file_artifact(tid, "kept.md")
+
+    first = sweep_project_workspace(store, pid)
+    assert first["recovered"] == ["forgotten.js"]
+
+    second = sweep_project_workspace(store, pid)
+    assert "recovered" not in second
+    assert set(second["kept"]) == {"kept.md", "forgotten.js"}
+    assert (pdir / "forgotten.js").exists()
+
+
+def test_partial_keepset_debris_named_sources_still_swept(store):
+    """The debris classifier outranks the source classifier: temp_-prefixed
+    scripts, .log files, and dotfiles are deleted even under partial keep."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "real.py", "keep")
+    _write(pdir, "temp_probe.py", "debris")
+    _write(pdir, "run.log", "debris")
+    _write(pdir, ".hidden.js", "debris")
+    store.register_file_artifact(tid, "real.py")
+
+    res = sweep_project_workspace(store, pid)
+
+    assert (pdir / "real.py").exists()
+    assert not (pdir / "temp_probe.py").exists()
+    assert not (pdir / "run.log").exists()
+    assert not (pdir / ".hidden.js").exists()
+    assert "recovered" not in res
+
+
+def test_partial_keepset_registered_media_kept_unregistered_deleted(store):
+    """Media stays protected only by registration under a partial keep-set —
+    the empty-keep-set recovery (which keeps ambiguous media) is unchanged."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "logo.png", "deliverable")
+    _write(pdir, "shot1.png", "scratch")
+    store.register_file_artifact(tid, "logo.png")
+
+    sweep_project_workspace(store, pid)
+
+    assert (pdir / "logo.png").exists()
+    assert not (pdir / "shot1.png").exists()
+
+
+def test_partial_keepset_dry_run_reports_without_touching(store):
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "kept.md", "registered")
+    _write(pdir, "forgotten.js", "would recover")
+    _write(pdir, "shot.png", "would delete")
+    store.register_file_artifact(tid, "kept.md")
+
+    res = sweep_project_workspace(store, pid, dry_run=True)
+
+    assert res["recovered"] == ["forgotten.js"]
+    assert res["deleted"] == ["shot.png"]
+    assert (pdir / "shot.png").exists()          # nothing touched
+    payloads = {a["payload"] for a in store.list_artifacts(project_id=pid)
+                if a["kind"] == "file"}
+    assert "forgotten.js" not in payloads        # no registration on dry_run
 
 
 def test_sweep_keeps_nested_deliverable_and_its_dir(store):

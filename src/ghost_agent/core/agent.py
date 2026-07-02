@@ -29,6 +29,7 @@ from ..reflection.postmortem import primary_target_from_args
 from .triggers import RecentFailureGuard
 from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print
 from ..utils import logging as _glog
+from ..utils.constraints import extract_constraints, render_constraint_block
 
 # Sampling parameters for the current upstream model
 # (HauhauCS/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive). The model
@@ -3544,6 +3545,25 @@ class GhostAgent:
             return page_rel, ""
         return page_rel, text[text.index(marker):][:1200]
 
+    def _active_constraint_note(self, limit: int = 5) -> str:
+        """Explicit user constraints stored on the active project, rendered
+        as a short prefix for the verifier's request view. Empty string when
+        no project is active or the project carries no constraints."""
+        try:
+            store = getattr(self.context, "project_store", None)
+            pid = getattr(self.context, "current_project_id", None)
+            if store is None or not pid:
+                return ""
+            proj = store.get_project(pid) or {}
+            cons = [str(c) for c in
+                    ((proj.get("metadata") or {}).get("constraints") or [])]
+            if not cons:
+                return ""
+            return ("ACTIVE PROJECT CONSTRAINTS (user-mandated, MUST hold): "
+                    + " | ".join(cons[:limit]) + " || USER REQUEST: ")
+        except Exception:
+            return ""
+
     async def _compute_verifier_verdict(
         self, *, tools_run_this_turn, messages, final_ai_content,
         last_user_content, lc,
@@ -3572,6 +3592,16 @@ class GhostAgent:
                 or not final_ai_content
                 or self._is_strict_trivial_chat(lc)):
             return None, last_tool
+        # Replay the active project's explicit user constraints into the
+        # verifier's view of the request. The current message is often just
+        # "proceed" — the binding clauses ("don't come up with some random
+        # AI") live on the project record from an EARLIER message, and the
+        # verifier prompt treats constraint satisfaction as its
+        # highest-priority check, so they must ride along here. Prepended,
+        # not appended: the call sites truncate context to 1000 chars and a
+        # tail-note would be the first thing cut.
+        constraint_note = self._active_constraint_note()
+        request_view = constraint_note + (last_user_content or "")
         v_result = None
         tool_output = str(last_tool.get("content", ""))[:4000]
         tool_name = str(last_tool.get("name", ""))[:80]
@@ -3581,20 +3611,20 @@ class GhostAgent:
                 v_result = await verifier.verify_code_output(
                     code=code_text,
                     output=tool_output,
-                    intent=last_user_content or "",
+                    intent=request_view,
                     response=final_ai_content or "",
                 )
             else:
                 v_result = await verifier.verify_claim(
                     claim=final_ai_content[:2000],
                     evidence=tool_output,
-                    context=(last_user_content or "")[:1000],
+                    context=request_view[:1000],
                 )
         else:
             v_result = await verifier.verify_claim(
                 claim=final_ai_content[:2000],
                 evidence=tool_output,
-                context=(last_user_content or "")[:1000],
+                context=request_view[:1000],
             )
         # Visual ground-truth override (unchanged from the inline gate).
         try:
@@ -4130,6 +4160,18 @@ class GhostAgent:
                 # `context.last_user_content`. Set BEFORE any tool
                 # dispatch path can run in this turn.
                 self.context.last_user_content = last_user_content
+                # Extract the request's explicit constraints ONCE, up front.
+                # `_request_constraint_block` is re-rendered into the dynamic
+                # state every turn of this request, and the first successful
+                # file write triggers a one-shot constraint-check steer
+                # (`_constraint_steer_pending`). Deterministic (no LLM);
+                # empty for the vast majority of messages.
+                _request_constraints = extract_constraints(last_user_content)
+                _request_constraint_block = render_constraint_block(
+                    _request_constraints,
+                    header="EXPLICIT USER CONSTRAINTS (CURRENT REQUEST)",
+                )
+                _constraint_steer_pending = bool(_request_constraints)
                 # Discard any confidence reading left over from a PREVIOUS
                 # streaming turn: its stream wrapper sets `_calib_pending`
                 # while the client drains the SSE stream, i.e. AFTER
@@ -5338,6 +5380,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 dynamic_state += _briefing + "\n"
                     except Exception:
                         logger.debug("project briefing skipped", exc_info=True)
+                    # EXPLICIT CONSTRAINTS OF THE CURRENT REQUEST — surfaced
+                    # BEFORE the model plans anything, project or not. The
+                    # project briefing covers constraints stored on the
+                    # project record; this block covers the message the user
+                    # just sent (which is where a correction like "don't come
+                    # up with some random AI, YOU will play against me"
+                    # first appears). Deterministic extraction, no LLM call.
+                    if _request_constraint_block:
+                        dynamic_state += _request_constraint_block + "\n\n"
                     # Re-assert the wrap-up gate every iteration: once a project
                     # task was closed this request, the turn must converge to a
                     # final answer (no further tool calls / no next task).
@@ -8125,6 +8176,46 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 logger.info(
                                     "one-task-per-turn: project task closed DONE "
                                     "— forcing turn to wrap up and wait for the user")
+
+                            # One-shot constraint check after the FIRST
+                            # successful artifact write of a constrained
+                            # request. The chess incident showed the
+                            # constraint is dropped DURING generation (a
+                            # 183s monolith started seconds after the model
+                            # read "don't come up with some random AI"), so
+                            # the steer lands right after the write — the
+                            # earliest moment the model can still re-open
+                            # the file and fix a violation cheaply.
+                            if (_constraint_steer_pending and not _res_is_error
+                                    and fname == "file_system" and is_mutating):
+                                _constraint_steer_pending = False
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "SYSTEM ALERT (constraint check): you "
+                                        "just wrote an artifact, and this "
+                                        "request carries EXPLICIT USER "
+                                        "CONSTRAINTS:\n"
+                                        + "\n".join(f"- {c}" for c in
+                                                    _request_constraints)
+                                        + "\nBefore replying or marking "
+                                        "anything done: re-read what you "
+                                        "wrote and verify NONE of these are "
+                                        "violated. A coded stand-in for a "
+                                        "role the user assigned to YOU "
+                                        "(e.g. an embedded AI opponent when "
+                                        "the user said YOU will play) is a "
+                                        "violation — fix the artifact NOW "
+                                        "if so, then continue."
+                                    ),
+                                })
+                                pretty_log(
+                                    "Constraint Check",
+                                    f"steer injected after first write "
+                                    f"({len(_request_constraints)} active "
+                                    f"constraint(s))",
+                                    icon=Icons.CONSTRAINT,
+                                )
 
                             # Metacog per-tool outcome (roadmap phase 2.3):
                             # record THIS result's tool keyed on its OWN

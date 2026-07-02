@@ -201,6 +201,8 @@ class Icons:
     BUG          = "🐛"
     SHIELD       = "🛡️"
     CUT          = "✂️"
+    CONSTRAINT   = "⛓️"   # explicit-user-constraint capture/steer/gate (NOT 🛡️ — that's tor fail-closed)
+    GAME_MOVE    = "♟️"   # participant-mode game turn (/api/game/move)
 
     # --- Custom Modes ---
     MODE_GHOST   = "🫥"

@@ -90,6 +90,15 @@ time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
   <h2>Concurrency</h2>
   <p><code>threading.RLock</code> guards Chroma mutations + library writes. Library JSON written via temp + <code>os.replace</code> for crash safety.</p>
 
+  <h2><code>correct_fragment(match, replacement)</code> — surgical text fix (2026-07-02)</h2>
+  <p>Built for correcting a <em>poisoned auto-memory</em>: the hippocampus consolidated the chess request as <em>"single-file, turn-based chess game…"</em> — "single-file" was the agent's own distortion, and the stored fragment would bias every future retry. There was no update-text API (ids are <code>md5(text)</code>, so text changes mean a new id), and the Chroma persist dir must never be opened by a second process (the HNSW segment files are mmap'd without cross-process locking), so the fix runs <b>in-process</b>, exposed as <code>POST /api/memory/correct</code>.</p>
+  <ul>
+    <li><code>match</code> is tried as the EXACT stored text (direct id lookup) first, then as a case-insensitive substring over all non-<code>document</code> fragments (full <code>collection.get</code> scan — deterministic, unlike a semantic query which can land on a neighbor).</li>
+    <li>Ambiguous (&gt;1 hit) or empty matches are REFUSED with previews rather than guessed at; the fuzzy multi-store <code>forget</code> sweep stays the wrong tool for this job.</li>
+    <li>Delete-then-add under the instance lock, preserving the original metadata (an <code>auto</code> memory stays <code>auto</code>, timestamp kept). 📝 <code>Memory Correct</code> log line.</li>
+  </ul>
+  <p>Covered by <code>tests/test_game_move_api.py::TestCorrectFragmentUnit</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

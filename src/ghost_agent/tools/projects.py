@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional
 
 from ..memory.projects import ProjectStore, ProjectKind, ProjectStatus
 from ..core.planning import ProjectPlan, TaskStatus, DependencyType
+from ..utils.constraints import extract_constraints
 from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
@@ -886,6 +887,7 @@ async def tool_manage_projects(
     dependency_type: str = "ALL",
     alternatives: Optional[List[str]] = None,
     postconditions: Optional[List[str]] = None,
+    constraints: Optional[List[str]] = None,
     depends_on: Optional[List[str]] = None,
     sequential: bool = False,
     result: str = "",
@@ -940,6 +942,7 @@ async def tool_manage_projects(
     subtasks = _coerce_str_list(subtasks)
     alternatives = _coerce_str_list(alternatives)
     postconditions = _coerce_str_list(postconditions)
+    constraints = _coerce_str_list(constraints)
     depends_on = _coerce_str_list(depends_on)
     topics = _coerce_str_list(topics)
     task_ids = _coerce_str_list(task_ids)
@@ -980,6 +983,24 @@ async def tool_manage_projects(
         if act == "create":
             if not title:
                 return _err("title is required for action=create")
+            # Capture the user's explicit constraints at the moment of
+            # creation — both the ones the model passed and the ones we can
+            # extract deterministically from the triggering message
+            # (negations, "YOU will ..." role assertions, CAPS emphasis).
+            # They persist in project metadata, are re-rendered into every
+            # briefing, and gate the DONE transition. This is the fix for
+            # the chess-game failure where "don't come up with some random
+            # AI" survived less than 4s of reasoning.
+            req_constraints = list(constraints or [])
+            for clause in extract_constraints(
+                    getattr(context, "last_user_content", "") or ""):
+                if clause.lower() not in {c.lower() for c in req_constraints}:
+                    req_constraints.append(clause)
+            if req_constraints:
+                pretty_log("Constraints",
+                           f"captured {len(req_constraints)} on create: "
+                           f"{req_constraints[0][:70]}…",
+                           icon=Icons.CONSTRAINT)
             normalized = title.strip().lower()
             now = time.time()
             for existing in store.list_projects():
@@ -1016,6 +1037,19 @@ async def tool_manage_projects(
                 existing_meta = dict(existing.get("metadata") or {})
                 retry_count = int(existing_meta.get("duplicate_create_retries", 0)) + 1
                 existing_meta["duplicate_create_retries"] = retry_count
+                # A re-issued create that carries NEW explicit constraints is
+                # a CORRECTION, not a duplicate: the user restated the request
+                # because the existing decomposition missed something (chess
+                # incident: the pending "AI opponent" task was treated as
+                # "matches exactly what the user wants" after the user had
+                # explicitly excluded it). Merge the fresh constraints into
+                # the project so briefings/DONE-gates see them.
+                prior_constraints = [str(c) for c in
+                                     (existing_meta.get("constraints") or [])]
+                fresh = [c for c in req_constraints
+                         if c.lower() not in {p.lower() for p in prior_constraints}]
+                if fresh:
+                    existing_meta["constraints"] = prior_constraints + fresh
                 try:
                     store.update_project(existing["id"], metadata=existing_meta)
                 except Exception:
@@ -1058,6 +1092,18 @@ async def tool_manage_projects(
                         f"same name, archive the existing one first "
                         f"(action=archive)."
                     )
+                if fresh:
+                    instruction = (
+                        "CORRECTION DETECTED: the user re-issued this request "
+                        "with explicit constraints the existing plan may "
+                        "violate: " + " | ".join(fresh) + ". Do NOT treat the "
+                        "pending tasks as 'matching what the user wants' — "
+                        "they were decomposed BEFORE this correction. FIRST "
+                        "re-read each pending task description against these "
+                        "constraints and revise any that conflict "
+                        "(task_update with description=...), THEN proceed. "
+                        + instruction
+                    )
                 return _ok({
                     "refused": True,
                     "action_taken": "reused_existing_project",
@@ -1072,9 +1118,28 @@ async def tool_manage_projects(
                     "note": instruction,
                     "briefing": _briefing(store, existing["id"]),
                 })
+            # Delete-then-recreate is a rejection signal: the user threw the
+            # previous attempt away and is re-asking, usually with added
+            # emphasis. Surface it so the model re-plans from the CURRENT
+            # message instead of replaying the decomposition it remembers.
+            tombstone = None
+            try:
+                tombstone = store.find_deleted_similar(title)
+            except Exception:
+                pass
+            if tombstone:
+                pretty_log("Correction Detect",
+                           f"recreate of recently-deleted "
+                           f"'{tombstone.get('title')}' — re-planning from "
+                           f"current message", icon=Icons.CONSTRAINT)
+            create_meta = dict(metadata or {})
+            if req_constraints:
+                create_meta["constraints"] = req_constraints
+            if tombstone:
+                create_meta["correction_of"] = tombstone.get("id")
             pid = store.create_project(
                 title=title, kind=_infer_kind(title, goal, kind), goal=goal,
-                metadata=metadata,
+                metadata=create_meta,
             )
             _link_project_in_graph(context, pid, title)
             _link_concepts_in_graph(context, pid)
@@ -1096,7 +1161,7 @@ async def tool_manage_projects(
                 plan = ProjectPlan(store, pid)
                 _desc = ("Build the complete single-file deliverable: "
                          f"{(goal or title).strip()}")[:400]
-                one = plan.add_task(_desc)
+                one = plan.add_task(_desc, constraints=req_constraints or None)
                 created_task_ids = [one]
                 _link_task_in_graph(context, pid, one, _desc)
                 instruction = (
@@ -1122,7 +1187,8 @@ async def tool_manage_projects(
                     if not desc or not desc.strip():
                         continue
                     deps = [prev_id] if (sequential and prev_id) else None
-                    tid = plan.add_task(desc.strip(), depends_on=deps)
+                    tid = plan.add_task(desc.strip(), depends_on=deps,
+                                        constraints=req_constraints or None)
                     created_task_ids.append(tid)
                     pairs.append((tid, desc.strip()))
                     prev_id = tid
@@ -1155,9 +1221,27 @@ async def tool_manage_projects(
             # been project-scoped and "moving" it (observed live). The note
             # steers it to bare relative filenames that land in the right
             # place the first time.
+            if tombstone:
+                _ago = max(0, int(time.time() - float(
+                    tombstone.get("deleted_at") or 0)))
+                instruction = (
+                    f"CORRECTION CONTEXT: the user DELETED a similar project "
+                    f"('{tombstone.get('title')}', {_ago // 60} min ago) before "
+                    f"re-asking. Deleting a build is a rejection of the "
+                    f"previous approach — plan from the CURRENT message only; "
+                    f"do NOT reuse the remembered decomposition or deliverable "
+                    f"shape from the deleted attempt. " + instruction
+                )
+            if req_constraints:
+                instruction = (
+                    "EXPLICIT USER CONSTRAINTS captured on this project (they "
+                    "gate task completion): "
+                    + " | ".join(req_constraints) + ". " + instruction
+                )
             return _ok({"created": pid,
                         "tasks_created": created_task_ids,
                         "workspace": f"projects/{pid}",
+                        "constraints": req_constraints,
                         "note": _workspace_note(pid),
                         "agent_instruction": instruction,
                         "briefing": _briefing(store, pid)})
@@ -1340,6 +1424,7 @@ async def tool_manage_projects(
                 description=description, parent_id=parent_id,
                 dependency_type=dep,
                 alternatives=alternatives, postconditions=postconditions,
+                constraints=constraints,
                 depends_on=depends_on,
             )
             _link_task_in_graph(context, project_id, tid, description)
@@ -1379,9 +1464,25 @@ async def tool_manage_projects(
                 st_enum = None
 
             plan = ProjectPlan(store, project_id)
+            # Explicit user constraints active for this project: the
+            # project-level set (captured at create/correction time) plus
+            # whatever each task carries. A DONE transition with active
+            # constraints demands result evidence that ADDRESSES them —
+            # "written" is not "honors what the user forbade".
+            proj_constraints: List[str] = []
+            try:
+                _proj = store.get_project(project_id) or {}
+                proj_constraints = [
+                    str(c) for c in
+                    ((_proj.get("metadata") or {}).get("constraints") or [])
+                ]
+            except Exception:
+                pass
             updated: List[Dict[str, Any]] = []
             missing: List[str] = []
             gated: List[str] = []
+            gated_constraints: List[str] = []
+            active_constraints: List[str] = []
             for tid in target_ids:
                 if tid not in plan.tree.nodes:
                     missing.append(tid)
@@ -1396,6 +1497,23 @@ async def tool_manage_projects(
                         and not (plan.tree.nodes[tid].result_summary or "").strip()
                         and _is_visual_artifact_task(plan.tree.nodes[tid].description)):
                     gated.append(tid)
+                    continue
+                # Constraint DONE-gate: same evidence requirement when the
+                # task or project carries explicit user constraints. The
+                # gate is deliberately evidence-based, not judgement-based —
+                # judging WHETHER the evidence honors the constraints is the
+                # verifier's job (it receives the constraints in context).
+                task_constraints = [
+                    str(c) for c in
+                    (plan.tree.nodes[tid].constraints or [])
+                ] + proj_constraints
+                if (st_enum == TaskStatus.DONE and task_constraints
+                        and not (result or "").strip()
+                        and not (plan.tree.nodes[tid].result_summary or "").strip()):
+                    gated_constraints.append(tid)
+                    for c in task_constraints:
+                        if c not in active_constraints:
+                            active_constraints.append(c)
                     continue
                 # Register deliverables BEFORE flipping the task to DONE.
                 # update_status can roll the whole project to DONE on this
@@ -1434,6 +1552,8 @@ async def tool_manage_projects(
                     extras["alternatives"] = alternatives
                 if postconditions is not None:
                     extras["postconditions"] = postconditions
+                if constraints is not None:
+                    extras["constraints"] = constraints
                 if extras:
                     store.update_task(tid, **extras)
                 updated.append({k: store.get_task(tid).get(k)
@@ -1457,6 +1577,22 @@ async def tool_manage_projects(
                                        "count": len(updated)}
             if missing:
                 payload["missing"] = missing
+            if gated_constraints:
+                payload["gated_constraints"] = gated_constraints
+                payload["constraints"] = active_constraints
+                payload["agent_instruction_constraints"] = (
+                    f"Held {len(gated_constraints)} task(s) at non-DONE: the "
+                    f"user attached EXPLICIT CONSTRAINTS and you provided no "
+                    f"result evidence. Re-read the deliverable, confirm each "
+                    f"constraint holds, then re-call task_update with a "
+                    f"`result` that states — per constraint — HOW the work "
+                    f"honors it. Constraints: "
+                    + " | ".join(active_constraints)
+                    + ". If the deliverable violates one (e.g. it contains a "
+                    f"coded stand-in for something the user said YOU must do "
+                    f"at runtime), FIX THE DELIVERABLE FIRST — do not word "
+                    f"the result around the violation."
+                )
             if gated:
                 payload["gated_unverified"] = gated
                 payload["agent_instruction"] = (
@@ -1552,11 +1688,29 @@ async def tool_manage_projects(
                         prev_id = tid
             except ValueError as e:
                 return _err(str(e))
+            # Stamp explicit constraints onto every subtask created in this
+            # call — both the ones passed by the model and the ones the
+            # triggering message carries. plan.decompose doesn't thread
+            # them, so persist post-hoc (same store row, one UPDATE each).
+            decompose_constraints = list(constraints or [])
+            for clause in extract_constraints(
+                    getattr(context, "last_user_content", "") or ""):
+                if clause.lower() not in {c.lower()
+                                          for c in decompose_constraints}:
+                    decompose_constraints.append(clause)
+            if decompose_constraints:
+                for tid in ids:
+                    try:
+                        store.update_task(tid, constraints=decompose_constraints)
+                    except Exception:
+                        logger.debug("constraint stamp skipped for %s", tid,
+                                     exc_info=True)
             for tid, desc in pairs:
                 _link_task_in_graph(context, project_id, tid, desc)
             return _ok({"created": ids,
                         "parent_id": target_id,
                         "sequential": bool(sequential),
+                        "constraints": decompose_constraints,
                         "agent_instruction": (
                             f"Plan created with {len(ids)} task(s). STOP here: "
                             "present this task list to the user and wait for "
@@ -1867,6 +2021,8 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "dependency_type": {"type": "string", "enum": ["ALL", "ANY", "BEST"]},
                 "alternatives": {"type": "array", "items": {"type": "string"}},
                 "postconditions": {"type": "array", "items": {"type": "string"}},
+                "constraints": {"type": "array", "items": {"type": "string"},
+                                "description": "EXPLICIT user requirements/prohibitions quoted from their message, verbatim or near-verbatim (e.g. \"don't come up with some random AI\", \"YOU will play against me\", \"no external libraries\"). Pass on create/task_add/task_decompose/task_update. They are re-shown every turn in the briefing and GATE task completion: a task with constraints cannot go DONE without result evidence addressing them. Negations and role assignments (what the user said YOU must do) belong here, never paraphrased away."},
                 "depends_on": {"type": "array", "items": {"type": "string"},
                                "description": "task_add: ids of sibling tasks that must be DONE before THIS task becomes eligible to run (a prerequisite edge, distinct from parent/child). Use it to order peer tasks; omit for independent tasks."},
                 "sequential": {"type": "boolean",

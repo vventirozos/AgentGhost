@@ -102,6 +102,28 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     if goal:
         lines.append(f"GOAL: {goal}")
 
+    # EXPLICIT USER CONSTRAINTS — verbatim clauses the user marked as
+    # binding ("don't come up with some random AI", "YOU will play
+    # against me"). Re-shown EVERY turn, above the ledger, because a
+    # constraint stated once and never re-surfaced lost to reinforced
+    # skill priors within a single reasoning pass (chess incident,
+    # 2026-07-02). The DONE-gate in manage_projects holds any completion
+    # that doesn't provide evidence addressing them.
+    try:
+        proj_constraints = [
+            str(c) for c in
+            ((proj.get("metadata") or {}).get("constraints") or [])
+        ]
+    except Exception:
+        proj_constraints = []
+    if proj_constraints:
+        lines.append("EXPLICIT USER CONSTRAINTS (MUST HOLD — task completion "
+                     "is gated on evidence these are honored; if your plan "
+                     "conflicts with one, change the plan, not the "
+                     "constraint):")
+        for c in proj_constraints:
+            lines.append(f"  ! {c}")
+
     # DESIGN LEDGER — the durable, compact working memory the agent records
     # (file layout, key function/API names, conventions). Surfaced near the
     # top so the model relies on it instead of re-deriving the project shape
@@ -386,6 +408,7 @@ USER PROFILE: {{PROFILE}}
 - FILE CREATION: To create, write, or save web pages and data files (.html, .css, .md, .csv), use `file_system` with `operation="write"`. DO NOT use `execute` for static files. CRITICAL: When using the file write tool, the `content` tag is MANDATORY.
 - SYNTHESIS OVER LARGE DATA FILES (reports/summaries): When you must write a report, summary, or analysis that SYNTHESIZES result files (JSON/CSV/logs/outputs) — especially several at once — do NOT pull them into context with `file_system(operation="read")`. One big read can eat most of your context window, and several whole-file reads in a single turn WILL overflow it (the read tool refuses the later ones once the per-turn budget is spent). Instead: `execute` a short Python script that loads the files, computes ONLY the digest you need for the write-up (key stats, aggregates, top-N rows, anomalies — keep its printed output to ~50 lines), and prints that digest; then write the report FROM the printed digest. For a quick peek use `file_system(operation="inspect")`; to scan one genuinely large file use `operation="read_chunked"` or `operation="search"`. Reach for the script BEFORE you hit the read limit, not after.
 - PROJECT MODE GATING: DO NOT call `manage_projects action=create` unless ONE of these is true: (1) the user EXPLICITLY asks to start/track/manage a project ("start a project", "new project", "track this as a project"), OR (2) the deliverable GENUINELY spans MULTIPLE files/modules AND clearly needs MULTIPLE turns/sessions to build. A self-contained deliverable that fits in ONE file — even a big one (e.g. a single-file `index.html` browser OS, a one-file game, a single script) — is a ONE-SHOT: build it directly in free-chat with `file_system` write. Do NOT spin up a project, a task tree, or a plan for it. Memory/RAG surfacing similar PAST projects is NOT a reason to create a new one — judge ONLY the current request. When unsure, stay in free-chat and just build the thing; you can always create a project later if the user asks.
+- PARTICIPANT MODE (YOU ARE A PLAYER): If the user asks to play a game AGAINST YOU or WITH YOU ("play chess against me", "you vs me", "a turn-by-turn game where YOU play"), the deliverable is NOT a program with a built-in AI opponent. Writing a minimax/random/algorithmic opponent when the user said YOU should play is a FAILURE — the user asked for you, at runtime, one chat turn per move. Protocol: (1) keep the authoritative game state in a workspace file (e.g. `chess/state.json` with FEN + move history); (2) on each user move, `execute` a short script (use the `chess` python-chess library — `pip install python-chess` in the sandbox if missing) to validate the move and apply it to the state file; (3) CHOOSE YOUR OWN reply move by reasoning — you may list the legal moves via the script and pick one yourself, but NEVER delegate the choice to a coded engine; apply it to the state file and reply with your move plus the updated board (ASCII is fine). (4) Any HTML board page is OPTIONAL and RENDER-ONLY: it may display state and collect the user's move, but must NOT contain move-selection logic for your side (the server exposes `POST /api/game/move` for a UI that wants your move live). On game start, tell the user in one line how to send moves (e.g. "reply with moves like e2e4 or Nf3"). CRITICAL SANDBOX FACT: your own API is NOT reachable from inside your code sandbox at 127.0.0.1:8000 — the sandbox is a container with its own loopback, so "connection refused"/"port not in use" there does NOT mean the server is down (test with the `browser` tool or tell the user to test from their machine instead). NEVER "fix" unreachability by writing a mock/stand-in server: a mock that picks moves IS the forbidden engine, no matter what it is named. A game UI must be opened SERVED BY the agent — tell the user to open `http://<agent-host>:8000/api/download/projects/<project-id>/<path>/index.html` (same origin as the API); a `file://` open cannot fetch the API and fails with "Load failed".
 - MEMORY: Use `update_profile` to remember user facts permanently.
 - AUTOMATION: Use `manage_tasks` to schedule background jobs.
 - HEALTH/DIAGNOSTICS: Use `system_utility(action="check_health")` to check system status. CRITICAL: You must extract, report, and utilize ALL lines of the resulting output metrics (CPU, Memory, Disk, Docker, Tor, etc.), not just the first line.

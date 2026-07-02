@@ -718,6 +718,71 @@ class VectorMemory:
         self._update_library_index(filename, "remove")
         return True, "Deleted"
 
+    def correct_fragment(self, match: str, replacement: str):
+        """Surgically rewrite ONE stored fragment's text, in-process.
+
+        Built for correcting a poisoned auto-memory (e.g. the consolidated
+        chess note that said "single-file" when the user never did) without
+        opening a second PersistentClient against the live Chroma dir —
+        cross-process access risks HNSW corruption, so the fix has to run
+        inside the owning process (exposed via POST /api/memory/correct).
+
+        ``match`` is tried as the EXACT stored text first (ids are
+        md5(text)), then as a case-insensitive substring over all non-
+        document fragments. Refuses ambiguous matches rather than guessing.
+        The replacement keeps the original metadata (type/timestamp), so an
+        ``auto`` memory stays ``auto``. Returns (ok, detail_dict_or_error).
+        """
+        if not (match or "").strip():
+            return False, "match must be non-empty"
+        if len((replacement or "").strip()) < 5:
+            return False, "replacement must be at least 5 chars"
+        try:
+            with self._get_lock():
+                old_id = hashlib.md5(match.encode("utf-8")).hexdigest()
+                got = self.collection.get(
+                    ids=[old_id], include=["documents", "metadatas"])
+                if got and got.get("ids"):
+                    old_doc = got["documents"][0]
+                    old_meta = dict((got.get("metadatas") or [{}])[0] or {})
+                else:
+                    # Substring scan. The store is small (hundreds of
+                    # fragments), a full get is cheap and deterministic —
+                    # unlike a semantic query, which can land on a neighbor.
+                    all_rows = self.collection.get(
+                        include=["documents", "metadatas"])
+                    needle = match.lower()
+                    hits = [
+                        (i, d, m) for i, d, m in zip(
+                            all_rows.get("ids") or [],
+                            all_rows.get("documents") or [],
+                            all_rows.get("metadatas") or [])
+                        if needle in (d or "").lower()
+                        and (m or {}).get("type") != "document"
+                    ]
+                    if not hits:
+                        return False, "no stored fragment matches"
+                    if len(hits) > 1:
+                        previews = [d[:80] for _, d, _ in hits[:5]]
+                        return False, (f"{len(hits)} fragments match — be more "
+                                       f"specific. Matches: {previews}")
+                    old_id, old_doc, old_meta = hits[0]
+                    old_meta = dict(old_meta or {})
+                new_id = hashlib.md5(replacement.encode("utf-8")).hexdigest()
+                if new_id != old_id:
+                    self.collection.delete(ids=[old_id])
+                    self.collection.add(documents=[replacement],
+                                        metadatas=[old_meta or {"type": "auto"}],
+                                        ids=[new_id])
+            pretty_log("Memory Correct",
+                       f"'{(old_doc or '')[:60]}…' → '{replacement[:60]}…'",
+                       icon=Icons.MEM_SAVE)
+            return True, {"old_id": old_id, "new_id": new_id,
+                          "old_text": old_doc, "new_text": replacement}
+        except Exception as e:
+            logger.warning("correct_fragment failed: %s", e, exc_info=True)
+            return False, f"Error: {e}"
+
     def delete_by_query(self, query: str):
         try:
             with self._get_lock():

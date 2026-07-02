@@ -131,6 +131,13 @@
 
   <p>No automatic eviction; archiving via <code>status='ARCHIVED'</code> preserves history. Hard delete cascades via FK ON DELETE CASCADE.</p>
 
+  <h2>Constraints column + deletion tombstones (2026-07-02)</h2>
+  <ul>
+    <li><b><code>tasks.constraints_json</code></b> — explicit user constraints a task must honor (verbatim clauses like <em>"don't come up with some random AI"</em>). Unlike <code>postconditions</code> (which describe the success state), constraints are standing prohibitions/requirements: re-rendered into the briefing every turn, replayed to the verifier, and gating <code>task_update → DONE</code> (see <a href="../tools/projects.html">tools.projects</a>). Additive migration in <code>_migrate</code>; plumbed through <code>add_task</code> / <code>update_task</code> / <code>_row_to_task</code> / <code>TaskNode</code> / <code>ProjectPlan</code>. Project-level constraints live in <code>metadata.constraints</code> (no schema change).</li>
+    <li><b><code>deleted_projects</code> table</b> — a tombstone (<code>id, title, kind, goal, created_at, deleted_at</code>) written inside <code>delete_project(hard=True)</code> BEFORE the row is removed, because the FK cascade otherwise erases every trace that the project existed. <code>find_deleted_similar(title, within_secs=86400)</code> matches a new title against recent tombstones (stopword-insensitive token Jaccard ≥ 0.5) so <code>create</code> can detect the delete-then-recreate correction pattern. Soft delete (archive) writes no tombstone.</li>
+  </ul>
+  <p>Covered by <code>tests/test_project_constraints.py</code> and <code>tests/test_correction_detection.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

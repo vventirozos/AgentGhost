@@ -13,6 +13,7 @@ dream consolidator without cross-imports.
 
 import json
 import logging
+import re
 import shutil
 import sqlite3
 import threading
@@ -23,6 +24,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("GhostAgent")
+
+# Words that carry no identity when comparing project titles ("Chess Game
+# project" vs "chess game") — used by find_deleted_similar.
+_TITLE_STOPWORDS = {"a", "an", "the", "project", "new", "my", "our", "game"}
 
 
 class ProjectKind(str, Enum):
@@ -67,6 +72,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     dependency_type TEXT NOT NULL DEFAULT 'ALL',
     alternatives_json TEXT NOT NULL DEFAULT '[]',
     postconditions_json TEXT NOT NULL DEFAULT '[]',
+    constraints_json TEXT NOT NULL DEFAULT '[]',
     depends_on_json TEXT NOT NULL DEFAULT '[]',
     result_summary TEXT NOT NULL DEFAULT '',
     failure_reason TEXT NOT NULL DEFAULT '',
@@ -110,6 +116,17 @@ CREATE TABLE IF NOT EXISTS project_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_project ON project_events(project_id, ts);
+
+CREATE TABLE IF NOT EXISTS deleted_projects (
+    id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'GENERAL',
+    goal TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    deleted_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_deleted_projects_ts ON deleted_projects(deleted_at);
 """
 
 
@@ -215,6 +232,7 @@ class ProjectStore:
         wanted = {
             "tasks": [
                 ("depends_on_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("constraints_json", "TEXT NOT NULL DEFAULT '[]'"),
             ],
         }
         for table, columns in wanted.items():
@@ -364,6 +382,20 @@ class ProjectStore:
             ws_str = str(self.sandbox_root / "projects" / project_id)
 
         with self._lock, self._connect() as conn:
+            # Tombstone BEFORE the row goes: the FK cascade wipes tasks,
+            # artifacts and events, so this separate table is the only
+            # durable record that the project ever existed. create_project
+            # consults it to detect the delete-then-recreate correction
+            # pattern (user rejects a build, deletes it, re-asks with
+            # added constraints).
+            if proj:
+                conn.execute(
+                    "INSERT INTO deleted_projects(id, title, kind, goal, "
+                    "created_at, deleted_at) VALUES (?,?,?,?,?,?)",
+                    (project_id, proj.get("title") or "",
+                     proj.get("kind") or "GENERAL", proj.get("goal") or "",
+                     float(proj.get("created_at") or 0.0), _now()),
+                )
             cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
             conn.commit()
             deleted = cur.rowcount > 0
@@ -383,6 +415,35 @@ class ProjectStore:
             except Exception as e:
                 logger.warning("Could not remove workspace for %s: %s", project_id, e)
         return deleted
+
+    def find_deleted_similar(self, title: str,
+                             within_secs: float = 86400.0) -> Optional[Dict[str, Any]]:
+        """Most recent tombstone whose title resembles ``title``.
+
+        Similarity is token overlap (Jaccard >= 0.5) on lowercased word
+        sets — enough to match "Chess Game" against "chess game project"
+        without a model call. Returns the tombstone dict (id, title, kind,
+        goal, created_at, deleted_at) or None.
+        """
+        want = {w for w in re.findall(r"[a-z0-9]+", (title or "").lower())
+                if w not in _TITLE_STOPWORDS}
+        if not want:
+            return None
+        cutoff = _now() - max(0.0, within_secs)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM deleted_projects WHERE deleted_at >= ? "
+                "ORDER BY deleted_at DESC LIMIT 50", (cutoff,),
+            ).fetchall()
+        for row in rows:
+            have = {w for w in re.findall(r"[a-z0-9]+", (row["title"] or "").lower())
+                    if w not in _TITLE_STOPWORDS}
+            if not have:
+                continue
+            overlap = len(want & have) / max(1, len(want | have))
+            if overlap >= 0.5:
+                return dict(row)
+        return None
 
     def _row_to_project(self, row: sqlite3.Row) -> Dict[str, Any]:
         d = dict(row)
@@ -421,6 +482,7 @@ class ProjectStore:
                  dependency_type: str = "ALL",
                  alternatives: Optional[List[str]] = None,
                  postconditions: Optional[List[str]] = None,
+                 constraints: Optional[List[str]] = None,
                  depends_on: Optional[List[str]] = None,
                  estimated_cost: float = 0.0,
                  position: Optional[int] = None) -> str:
@@ -456,14 +518,14 @@ class ProjectStore:
             conn.execute(
                 "INSERT INTO tasks(id, project_id, parent_id, description, status, "
                 "dependency_type, alternatives_json, postconditions_json, "
-                "depends_on_json, "
+                "constraints_json, depends_on_json, "
                 "result_summary, failure_reason, revision_count, actual_tool_used, "
                 "estimated_cost, actual_cost, depth, position, created_at, updated_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (task_id, project_id, parent_id, description.strip(),
                  status.upper(), dependency_type.upper(),
                  json.dumps(alternatives or []), json.dumps(postconditions or []),
-                 json.dumps(depends_on_canon),
+                 json.dumps(constraints or []), json.dumps(depends_on_canon),
                  "", "", 0, None, estimated_cost, 0.0, depth, position, now, now),
             )
             conn.execute(
@@ -506,7 +568,7 @@ class ProjectStore:
         if not fields:
             return False
         allowed = {"description", "status", "dependency_type", "alternatives",
-                   "postconditions", "depends_on", "result_summary",
+                   "postconditions", "constraints", "depends_on", "result_summary",
                    "failure_reason", "revision_count", "actual_tool_used",
                    "estimated_cost", "actual_cost", "parent_id", "position"}
         sets = []
@@ -519,7 +581,7 @@ class ProjectStore:
                 values.append(json.dumps(
                     [_canon_id(d) for d in (val or []) if _canon_id(d)]
                 ))
-            elif key in ("alternatives", "postconditions"):
+            elif key in ("alternatives", "postconditions", "constraints"):
                 sets.append(f"{key}_json = ?")
                 values.append(json.dumps(val or []))
             elif key == "status":
@@ -674,6 +736,10 @@ class ProjectStore:
             d["postconditions"] = json.loads(d.pop("postconditions_json") or "[]")
         except Exception:
             d["postconditions"] = []
+        try:
+            d["constraints"] = json.loads(d.pop("constraints_json") or "[]")
+        except Exception:
+            d["constraints"] = []
         try:
             d["depends_on"] = json.loads(d.pop("depends_on_json") or "[]")
         except Exception:

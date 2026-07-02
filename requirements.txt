@@ -40,6 +40,10 @@ qwen-agent>=0.0.30
 # prebuilt wheel with libsndfile bundled. Linux: also needs the
 # system `libsndfile1` package (apt-get install libsndfile1).
 soundfile>=0.12.0
+# Chess move legality + FEN handling for the participant-mode game endpoint
+# (api: POST /v1/game/move) — the agent plays the user itself; python-chess
+# only validates/applies moves, it never chooses them.
+python-chess>=1.999
 slack-bolt>=1.27.0
 slack-sdk>=3.21.0
 tabulate>=0.10.0

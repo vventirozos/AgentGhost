@@ -241,6 +241,15 @@
   </ul>
   <p>Related ground-truth gate: the verifier's <a href="verifier.html">web-artifact execution check</a> refutes a finishing turn whose freshly written page throws on load. Covered by <code>tests/test_repro_first_nudge.py</code>.</p>
 
+  <h2>Explicit-constraint surfacing + post-write steer (2026-07-02)</h2>
+  <p>From the chess-game incident: the model read <em>"don't come up with some random AI, YOU will play against me"</em>, acknowledged it in thinking, and had rationalised it away within four seconds — the constraint appeared once, in turn 1, and nothing ever re-showed it. Three hooks in <code>handle_chat</code>, all driven by the deterministic extractor in <code>utils/constraints.py</code>:</p>
+  <ul>
+    <li><b>Request-start extraction.</b> Right after <code>context.last_user_content</code> is set, <code>extract_constraints()</code> runs once; any hits are rendered as an <code>EXPLICIT USER CONSTRAINTS (CURRENT REQUEST)</code> block into the DYNAMIC SYSTEM STATE of <em>every turn</em> of the request (works with or without an active project; project-stored constraints additionally arrive via the briefing).</li>
+    <li><b>One-shot post-write steer.</b> After the FIRST successful <code>file_system</code> mutation of a constrained request, a <code>SYSTEM ALERT (constraint check)</code> user-message is injected (same mechanism as the strike/no-progress steers): re-read what you wrote, verify no constraint is violated — a coded stand-in for a role the user assigned to YOU counts as a violation — fix now. This lands at the earliest moment a violation is still cheap to fix (the chess monolith was generated in one 183 s turn; the constraint died during generation). ⛓️ <code>Constraint Check</code> log line; steer fires at most once per request.</li>
+    <li><b>Verifier replay.</b> <code>_active_constraint_note()</code> prepends the active project's stored constraints to the request view passed to <code>verify_claim</code>/<code>verify_code_output</code> (prepended, not appended — the call sites truncate context to 1000 chars). The current message is often just "proceed"; the binding clauses live on the project record from an earlier message. Constraint satisfaction is already the verifier prompt's highest-priority rule, so a violation now REFUTES the final answer and triggers the existing auto-repair loop.</li>
+  </ul>
+  <p>Covered by <code>tests/test_constraints_extraction.py</code> and <code>tests/test_project_constraints.py::TestActiveConstraintNote</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

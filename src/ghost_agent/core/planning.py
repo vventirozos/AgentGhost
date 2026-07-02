@@ -43,6 +43,12 @@ class TaskNode:
     dependency_type: DependencyType = DependencyType.ALL
     alternatives: List[str] = field(default_factory=list)  # fallback task IDs
     postconditions: List[str] = field(default_factory=list)  # validation descriptions
+    # Explicit user constraints this task must honor (verbatim clauses
+    # from the request, e.g. "don't come up with some random AI"). Unlike
+    # postconditions (which describe the SUCCESS state), constraints are
+    # standing prohibitions/requirements re-shown to the model each turn
+    # and replayed to the verifier at DONE time.
+    constraints: List[str] = field(default_factory=list)
     # Sibling-DAG prerequisites: task IDs that must be DONE before this
     # task becomes eligible for execution. Distinct from parent/child
     # rollup (dependency_type) — this orders *peers*. An empty list means
@@ -67,6 +73,7 @@ class TaskTree:
                  dependency_type: DependencyType = DependencyType.ALL,
                  alternatives: Optional[List[str]] = None,
                  postconditions: Optional[List[str]] = None,
+                 constraints: Optional[List[str]] = None,
                  depends_on: Optional[List[str]] = None) -> str:
         node_id = str(uuid.uuid4())[:8]
         # Guard against (astronomically unlikely) collisions
@@ -76,6 +83,7 @@ class TaskTree:
             id=node_id, description=description, status=status,
             parent_id=parent_id, dependency_type=dependency_type,
             alternatives=alternatives or [], postconditions=postconditions or [],
+            constraints=constraints or [],
             depends_on=depends_on or [],
         )
         self.nodes[node_id] = node
@@ -622,6 +630,7 @@ class ProjectPlan:
                 dependency_type=dep,
                 alternatives=list(row.get("alternatives") or []),
                 postconditions=list(row.get("postconditions") or []),
+                constraints=list(row.get("constraints") or []),
                 depends_on=list(row.get("depends_on") or []),
                 estimated_cost=float(row["estimated_cost"] or 0.0),
                 actual_cost=float(row["actual_cost"] or 0.0),
@@ -643,12 +652,14 @@ class ProjectPlan:
                  dependency_type: DependencyType = DependencyType.ALL,
                  alternatives: Optional[List[str]] = None,
                  postconditions: Optional[List[str]] = None,
+                 constraints: Optional[List[str]] = None,
                  depends_on: Optional[List[str]] = None,
                  estimated_cost: float = 0.0) -> str:
         task_id = self.store.add_task(
             self.project_id, description, parent_id=parent_id,
             status=status.value, dependency_type=dependency_type.value,
             alternatives=alternatives, postconditions=postconditions,
+            constraints=constraints,
             depends_on=depends_on,
             estimated_cost=estimated_cost,
         )
@@ -658,6 +669,7 @@ class ProjectPlan:
             dependency_type=dependency_type,
             alternatives=list(alternatives or []),
             postconditions=list(postconditions or []),
+            constraints=list(constraints or []),
             depends_on=list(depends_on or []),
             estimated_cost=estimated_cost,
         )

@@ -181,6 +181,17 @@
   </ul>
   <p>When <a href="../memory/frontier.html">FrontierTracker</a> reports all clusters saturated, the dream loop additionally injects a <strong>CURRICULUM DIVERSITY REQUIREMENT</strong> block telling the generator to pick from <code>{concurrency, algo, regex_parse, sql, bash}</code> and forbidding another data-analysis / CSV-groupby shape.</p>
 
+  <h2>PARTICIPANT MODE — "you play against me" (2026-07-02)</h2>
+  <p>Observed live: asked for a chess game <em>"where YOU will play against me — don't come up with some random AI"</em>, the agent built a single-file HTML page with an embedded minimax engine. The only deliverable pattern it knew for "game" was <em>artifact with an AI inside</em> (the <code>PROJECT MODE GATING</code> rule even lists "a one-file game" as its canonical one-shot example); nothing framed the agent itself as a runtime participant, so "the AI opponent will be me" rationalised into "I'll code a small engine". The <code>TOOL ORCHESTRATION</code> section now has a <code>PARTICIPANT MODE (YOU ARE A PLAYER)</code> trigger, directly under <code>PROJECT MODE GATING</code>:</p>
+  <ul>
+    <li>Coding a minimax/random/any algorithmic opponent when the user said YOU should play is named a <b>FAILURE</b>, in those words.</li>
+    <li>The prescribed shape: authoritative game state in a workspace file (<code>chess/state.json</code>, FEN + history) · validate each user move with python-chess via <code>execute</code> (<code>pip install python-chess</code> in the sandbox if missing) · the agent CHOOSES its own reply move by reasoning, one chat turn per move — it may list legal moves programmatically but never delegates the choice.</li>
+    <li>An HTML board is optional and <b>render-only</b>: it may display state and collect the user's move; move-selection for the agent's side happens at runtime. A UI that wants live agent moves calls <code>POST /api/game/move</code> (see <a href="../api/routes.html">api.routes</a>).</li>
+    <li><b>Sandbox-loopback clause (added after a second live violation, 2026-07-02 evening):</b> diagnosing the user's "Could not reach API (Load failed)" from <em>inside the code sandbox</em>, the agent probed <code>127.0.0.1:8000</code> (the <em>container's</em> loopback, not the host's), concluded no server existed, and wrote its own <code>api_server.py</code> — with <code>random.choice(legal_moves)</code>, the exact forbidden engine, reframed as a "mock". The rule now states: the agent's own API is NOT reachable from inside the sandbox at <code>127.0.0.1:8000</code>; unreachability there is never evidence the server is down; a mock that picks moves IS the forbidden engine regardless of name; and game UIs must be opened <em>served by the agent</em> (<code>/api/download/projects/&lt;id&gt;/…/index.html</code>, same origin as the API) — a <code>file://</code> open cannot fetch the API.</li>
+  </ul>
+  <h3>Briefing: EXPLICIT USER CONSTRAINTS section</h3>
+  <p><code>build_project_briefing</code> renders the project's <code>metadata.constraints</code> (captured by <a href="../tools/projects.html">manage_projects</a>) as an <code>EXPLICIT USER CONSTRAINTS (MUST HOLD…)</code> block above the design ledger, every turn — a constraint stated once and never re-surfaced lost to reinforced skill priors within a single reasoning pass. Covered by <code>tests/test_project_constraints.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

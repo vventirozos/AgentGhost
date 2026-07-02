@@ -24,6 +24,18 @@ debris — bytecode caches, browser scaffolding, swap/backup/dot files (see
 ``_is_debris``). A workspace holding nothing but debris still nets an empty
 keep-set, so a lone ``__pycache__`` is still swept.
 
+A **partial keep-set is just as untrustworthy** (chess incident,
+2026-07-02): the agent registered one of the four files it built, the
+old rule took that sparse set at face value, and the sweep deleted the
+game's ``index.html`` and two of its three JS modules at the moment of
+completion. Registration is evidence of what IS a deliverable, never
+proof of what ISN'T. So when the keep-set is non-empty, the sweep still
+recovers (keeps + registers) every unregistered **source/document** file
+(``_is_source_like`` — code, markup, docs, config, data-as-text), and
+deletes only debris and unregistered media/binary scratch (screenshots
+being the classic case). Losing a stray kept file is cheap; losing the
+build is not.
+
 The sweep is conservative about *where* it operates so a cleanup bug can
 never escape the project's own scratch space:
 
@@ -128,6 +140,33 @@ def _is_debris(rel: str) -> bool:
     return suffix in _SCRATCH_SUFFIXES
 
 
+# Files that read as SOURCE or DOCUMENT — the shape of a build's actual
+# substance. Used by the partial-keep-set recovery: an unregistered file of
+# one of these kinds is treated as a forgotten deliverable, not as scratch.
+# Media/binary files (e.g. .png screenshots) deliberately stay OUT of this
+# set: they are the sweep's primary cleanup target, and a media deliverable
+# is protected by registering it (or by the empty-keep-set recovery, which
+# keeps everything non-debris when there is no registration signal at all).
+_SOURCE_SUFFIXES = {
+    ".html", ".htm", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx",
+    ".css", ".scss", ".py", ".rb", ".go", ".rs", ".java", ".c", ".h",
+    ".cpp", ".hpp", ".sh", ".bash", ".zsh", ".sql", ".md", ".rst",
+    ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
+    ".csv", ".tsv", ".xml", ".svg",
+}
+_SOURCE_NAMES = {"makefile", "dockerfile", "readme", "license", "notice"}
+
+
+def _is_source_like(rel: str) -> bool:
+    """True when a project-relative path looks like source/documentation —
+    a candidate deliverable the agent plausibly forgot to register."""
+    name = rel.split("/")[-1].lower()
+    if name in _SOURCE_NAMES:
+        return True
+    dot = name.rfind(".")
+    return dot > 0 and name[dot:] in _SOURCE_SUFFIXES
+
+
 def _any_task_id(store, project_id: str) -> Optional[str]:
     """The most-recent task id for the project, to hang recovered-deliverable
     artifacts on. ``register_file_artifact`` needs a task; recovery is
@@ -181,6 +220,55 @@ def _recover_deliverables(store, project_id: str, root: Path,
     return keep
 
 
+def _recover_unregistered_sources(store, project_id: str, root: Path,
+                                  keep: Set[str],
+                                  *, dry_run: bool = False) -> Set[str]:
+    """Partial-registration recovery (chess incident, 2026-07-02): the set of
+    unregistered, non-debris, non-symlink SOURCE files under the workspace.
+
+    A non-empty keep-set proves the agent engaged with registration, not
+    that it finished the job — one registered file out of four built ones
+    let the old sweep delete the build at the moment of completion.
+    Source/document files are what builds are made of, so an unregistered
+    one is treated as a forgotten deliverable: kept, and registered
+    (best-effort, skipped on dry_run) so the record becomes truthful and a
+    later sweep keeps it through the normal keep-set. Unregistered media/
+    binary files stay deletable — they are the scratch (screenshots,
+    renders) this sweep exists to remove."""
+    found: Set[str] = set()
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        for fname in filenames:
+            fpath = base / fname
+            try:
+                if fpath.is_symlink():
+                    continue
+                rel = fpath.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if rel in keep or _is_debris(rel) or not _is_source_like(rel):
+                continue
+            found.add(rel)
+    if found:
+        tid = None if dry_run else _any_task_id(store, project_id)
+        if tid:
+            for rel in sorted(found):
+                try:
+                    store.register_file_artifact(tid, rel)
+                except Exception:
+                    logger.debug("partial-recovery registration skipped: %s",
+                                 rel, exc_info=True)
+        pretty_log(
+            "Cleanup",
+            f"project {project_id}: keep-set was PARTIAL — recovered "
+            f"{len(found)} unregistered source file(s) and kept them "
+            f"(registered as deliverables). Close tasks with "
+            f"deliverables=[...] so recovery isn't needed.",
+            icon=Icons.WARN, level="WARNING",
+        )
+    return found
+
+
 def _keep_set(store, project_id: str) -> Optional[Set[str]]:
     """The set of project-relative paths to preserve: every registered
     ``file`` artifact. Returns ``None`` if the artifact list can't be read —
@@ -206,11 +294,15 @@ def _keep_set(store, project_id: str) -> Optional[Set[str]]:
 
 def sweep_project_workspace(store, project_id: str, *,
                             dry_run: bool = False) -> Dict[str, Any]:
-    """Delete every file under the project's workspace that is not a
-    registered ``file`` artifact, then prune the directories left empty.
+    """Sweep a finished project's workspace: keep registered ``file``
+    artifacts plus recovered deliverables (see the module note — every
+    non-debris file when nothing was registered; every unregistered source
+    file when registration was partial), delete the rest, then prune the
+    directories left empty.
 
     Returns a summary dict — ``{project_id, status, deleted, kept,
-    dirs_removed, freed_bytes}`` — and never raises. ``status`` is ``"ok"``
+    dirs_removed, freed_bytes}`` (plus ``recovered`` when a recovery pass
+    kept unregistered files) — and never raises. ``status`` is ``"ok"``
     on a real sweep, or ``"skipped: <reason>"`` when there is nothing safe
     to do (no sandbox root, missing dir, unreadable keep-set). With
     ``dry_run=True`` it reports what it *would* delete without touching disk.
@@ -247,6 +339,15 @@ def sweep_project_workspace(store, project_id: str, *,
     if not keep:
         keep = _recover_deliverables(store, project_id, root, dry_run=dry_run)
         summary["recovered"] = sorted(keep)
+    else:
+        # A PARTIAL keep-set is evidence of what IS a deliverable, never
+        # proof of what isn't: recover unregistered source files instead of
+        # deleting the build (media/binary scratch stays deletable).
+        recovered = _recover_unregistered_sources(
+            store, project_id, root, keep, dry_run=dry_run)
+        if recovered:
+            keep = keep | recovered
+            summary["recovered"] = sorted(recovered)
 
     deleted: List[str] = []
     kept: List[str] = []

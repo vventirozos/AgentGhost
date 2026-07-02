@@ -88,11 +88,48 @@
   Because every completion path ends at <code>store.update_task</code> →
   rollup, one store-level hook covers them all.</p>
 
+  <h2>Partial keep-set recovery (2026-07-02)</h2>
+  <p>Observed live (the chess-game build): the agent built four files but
+  registered only one (<code>js/game-state.js</code>) as a deliverable. The
+  old rule — "keep registered, delete everything else" — took that sparse
+  keep-set at face value and deleted <code>index.html</code> and two of the
+  three JS modules <em>at the moment the project completed</em>. The empty-keep-set
+  recovery never fired because the keep-set wasn't empty; one registered
+  file made the sweep destructive. (The build was reconstructed byte-faithfully
+  by replaying the trajectory JSONL's recorded <code>file_system</code>
+  writes/replaces — the trajectory log stores full <code>content</code> /
+  <code>replace_with</code> payloads plus result text with anchored line ranges.)</p>
+  <p>The contract now treats registration as <b>evidence of what IS a
+  deliverable, never proof of what isn't</b>:</p>
+  <ul>
+    <li><b>Registered</b> file artifacts — always kept (unchanged).</li>
+    <li><b>Empty keep-set</b> — unchanged: <code>_recover_deliverables</code> keeps
+    + registers every non-debris file, including ambiguous media.</li>
+    <li><b>Non-empty (partial) keep-set</b> — new: <code>_recover_unregistered_sources</code>
+    keeps + registers every unregistered <em>source/document</em> file
+    (<code>_is_source_like</code>: code, markup, docs, config, text data —
+    <code>.html .js .py .md .json …</code> plus <code>Makefile</code>/<code>README</code>-style
+    names). Unregistered <em>media/binary</em> files (screenshots, renders) stay
+    deletable — they are the scratch the sweep exists to remove; a media
+    deliverable is protected by registering it. The debris classifier outranks
+    the source classifier (<code>temp_*.py</code>, <code>*.log</code>, dotfiles
+    still go). Recovery registers what it keeps, so the record becomes truthful
+    and the next sweep needs no recovery pass. Operator-visible as a ⚠️
+    <code>Cleanup … keep-set was PARTIAL</code> warning; <code>summary["recovered"]</code>
+    lists the saved files.</li>
+  </ul>
+  <p>Rationale for source-vs-media asymmetry: losing a stray kept file is
+  cheap; losing the build is catastrophic and non-obvious (it happens at the
+  success moment, when nobody is watching for damage).</p>
+
   <h2>Tests</h2>
   <p><code>tests/test_workspace_cleanup.py</code> — keep/delete split, nested
   deliverables, <code>__pycache__</code> removal, dry-run, the three skip
-  guards, symlink non-escape, path normalization, dedup registration, and the
-  end-to-end "complete a project → workspace swept" flow.</p>
+  guards, symlink non-escape, path normalization, dedup registration, the
+  end-to-end "complete a project → workspace swept" flow, and the
+  partial-keep-set recovery suite (chess-scenario regression, idempotent
+  re-registration, debris-outranks-source, registered-vs-unregistered media,
+  dry-run no-registration).</p>
 </main>
 </body>
 </html>
