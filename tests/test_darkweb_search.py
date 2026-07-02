@@ -29,9 +29,16 @@ from ghost_agent.tools.darkweb_search import (
     _load_engines,
 )
 
-V3_A = "juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd"
-V3_B = "torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd"
-V3_C = "haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid"
+# Sample .onion hosts used as fake RESULTS. Deliberately NOT any configured
+# engine's own onion address — those are now filtered out of results as
+# nav/self-links, so reusing an engine host here would (correctly) vanish.
+V3_A = "a" * 56
+V3_B = "b" * 56
+V3_C = "c" * 56
+
+# The real onion host of the built-in `torch` engine — used only to prove the
+# self-link filter drops an engine's own address from its result page.
+TORCH_ENGINE_HOST = "torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd"
 
 
 @pytest.fixture(autouse=True)
@@ -223,7 +230,9 @@ async def test_research_searches_then_fetches_and_distils():
     )
 
     with patch.object(dw, "_fetch_raw_html", side_effect=stub):
-        with patch.object(dw, "helper_fetch_url_content", new_callable=AsyncMock) as mfetch:
+        # Research reads pages via `_fetch_onion_text` (proxy-honouring, no Tor
+        # restart), NOT the shared `helper_fetch_url_content`.
+        with patch.object(dw, "_fetch_onion_text", new_callable=AsyncMock) as mfetch:
             mfetch.return_value = "Raw onion page body text."
             out = await tool_darkweb_research(
                 "target topic", tor_proxy="socks5://127.0.0.1:9050", llm_client=llm
@@ -270,3 +279,147 @@ def test_runner_dict_wires_darkweb_tools():
     assert "darkweb_research" in tools
     assert callable(tools["darkweb_search"])
     assert callable(tools["darkweb_research"])
+
+
+# --------------------------------------------------------------------------
+# Corroboration ranking: shared-index endpoints are not independent sources
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_ahmia_endpoints_not_double_counted():
+    """A hit reached over BOTH Ahmia transports (same index) must NOT outrank a
+    hit corroborated by two INDEPENDENT indexes. Under the old engine-name
+    counting X (ahmia+ahmia-onion) tied Y (ahmia+torch) and won on discovery
+    order; index-based counting gives Y 2 vs X 1, so Y ranks first."""
+    X = "d" * 56  # only in Ahmia (reached over both its transports)
+    Y = "e" * 56  # in Ahmia AND Torch -> genuinely corroborated
+    ahmia_html = f'<a href="http://{X}.onion/">X first</a><a href="http://{Y}.onion/">Y second</a>'
+    ahmia_onion_html = f'<a href="http://{X}.onion/">X only</a>'
+    torch_html = f'<a href="http://{Y}.onion/">Y</a>'
+    stub = _fetch_stub(
+        {"ahmia.fi": ahmia_html, "juhanurmi": ahmia_onion_html, "torchdeed": torch_html}
+    )
+
+    with patch.object(dw, "_fetch_raw_html", side_effect=stub):
+        out = await tool_darkweb_search("q", tor_proxy="socks5://127.0.0.1:9050")
+
+    assert out.index(Y) < out.index(X)
+
+
+@pytest.mark.asyncio
+async def test_engine_self_links_filtered_from_results():
+    """An engine's own onion address appearing in its page chrome (nav/footer)
+    must not surface as a bogus result."""
+    real = "f" * 56
+    torch_html = (
+        f'<a href="http://{TORCH_ENGINE_HOST}.onion/">Torch Home</a>'
+        f'<a href="http://{real}.onion/">Real Result</a>'
+    )
+    stub = _fetch_stub({"torchdeed": torch_html})  # only torch returns anything
+
+    with patch.object(dw, "_fetch_raw_html", side_effect=stub):
+        out = await tool_darkweb_search("q", tor_proxy="socks5://127.0.0.1:9050")
+
+    assert real in out
+    assert TORCH_ENGINE_HOST not in out  # engine self-link filtered out
+
+
+# --------------------------------------------------------------------------
+# Untrusted-body size cap
+# --------------------------------------------------------------------------
+def test_cap_body_truncates_oversized_text():
+    from ghost_agent.tools.darkweb_search import _cap_body, _MAX_ONION_BODY_BYTES
+
+    big = "x" * (_MAX_ONION_BODY_BYTES + 100)
+    status, body = _cap_body(200, "text/html", None, big)
+    assert status == 200
+    assert len(body) == _MAX_ONION_BODY_BYTES
+
+
+def test_cap_body_refuses_declared_oversize():
+    from ghost_agent.tools.darkweb_search import _cap_body, _MAX_ONION_BODY_BYTES
+
+    status, body = _cap_body(200, "text/html", str(_MAX_ONION_BODY_BYTES + 1), "small")
+    assert body == ""
+
+
+def test_cap_body_refuses_binary():
+    from ghost_agent.tools.darkweb_search import _cap_body
+
+    assert _cap_body(200, "application/pdf", None, "%PDF-1.7")[1] == ""
+    assert _cap_body(200, "application/octet-stream", None, "\x00\x01")[1] == ""
+
+
+def test_cap_body_passes_small_html():
+    from ghost_agent.tools.darkweb_search import _cap_body
+
+    assert _cap_body(200, "text/html; charset=utf-8", "42", "<html>ok</html>") == (
+        200,
+        "<html>ok</html>",
+    )
+
+
+# --------------------------------------------------------------------------
+# Research: proxy honoured, cached, context-window-bounded
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_research_fetch_receives_socks5h_proxy():
+    """The onion PAGE fetch honours the passed proxy (normalised to socks5h),
+    rather than discarding it the way helper_fetch_url_content would."""
+    html = f'<a href="http://{V3_A}.onion/">Target</a>'
+    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "torchdeed": html})
+
+    with patch.object(dw, "_fetch_raw_html", side_effect=stub):
+        with patch.object(dw, "_fetch_onion_text", new_callable=AsyncMock, return_value="body") as mfetch:
+            await tool_darkweb_research("proxy topic", tor_proxy="socks5://127.0.0.1:9050")
+
+    assert mfetch.await_count >= 1
+    proxy_arg = mfetch.await_args_list[0].args[1]
+    assert proxy_arg.startswith("socks5h://")
+
+
+@pytest.mark.asyncio
+async def test_research_uses_cache():
+    html = f'<a href="http://{V3_A}.onion/">Target</a>'
+    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "torchdeed": html})
+    llm = MagicMock()
+    llm.chat_completion = AsyncMock(
+        return_value={"choices": [{"message": {"content": "Fact."}}]}
+    )
+
+    with patch.object(dw, "_fetch_raw_html", side_effect=stub):
+        with patch.object(dw, "_fetch_onion_text", new_callable=AsyncMock, return_value="body") as mfetch:
+            await tool_darkweb_research("cached topic", tor_proxy="socks5://127.0.0.1:9050", llm_client=llm)
+            first = mfetch.call_count
+            out2 = await tool_darkweb_research("cached topic", tor_proxy="socks5://127.0.0.1:9050", llm_client=llm)
+
+    assert first >= 1
+    assert mfetch.call_count == first  # 2nd identical research served from cache
+    assert "DARK-WEB RESEARCH RESULT" in out2
+
+
+@pytest.mark.asyncio
+async def test_small_max_context_bounds_extract():
+    """A tiny worker context window shrinks the per-source extract well below
+    the 40k-char default, so the distill call can't overflow it."""
+    html = f'<a href="http://{V3_A}.onion/">Target</a>'
+    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "torchdeed": html})
+    huge = "Z" * 200000
+
+    captured = {}
+
+    async def _cc(payload, **kw):
+        captured["content"] = payload["messages"][0]["content"]
+        return {"choices": [{"message": {"content": "ok"}}]}
+
+    llm = MagicMock()
+    llm.chat_completion = AsyncMock(side_effect=_cc)
+
+    with patch.object(dw, "_fetch_raw_html", side_effect=stub):
+        with patch.object(dw, "_fetch_onion_text", new_callable=AsyncMock, return_value=huge):
+            await tool_darkweb_research(
+                "ctx topic", tor_proxy="socks5://127.0.0.1:9050", llm_client=llm, max_context=2048
+            )
+
+    # Tiny 2048-token window -> 4096-char floor, far below the 40k default.
+    assert "Z" in captured["content"]
+    assert captured["content"].count("Z") <= 4096

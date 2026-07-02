@@ -60,14 +60,14 @@
   </p>
   <ul>
     <li><code>ahmia</code> — the clearnet mirror <code>ahmia.fi</code> (still fetched over Tor); indexes onion services and filters known-abuse material at the index level.</li>
-    <li><code>ahmia-onion</code> — Ahmia's own <code>.onion</code> endpoint. Listed alongside the clearnet mirror on purpose: the two have <em>independent</em> reachability, so one is often up when the other is blocked.</li>
+    <li><code>ahmia-onion</code> — Ahmia's own <code>.onion</code> endpoint. Listed alongside the clearnet mirror on purpose: the two have <em>independent</em> reachability, so one is often up when the other is blocked. They serve the <em>same</em> search index, though, so both carry <code>index:&nbsp;"ahmia"</code> — reaching Ahmia over two transports must not be mistaken for independent corroboration (see ranking below).</li>
     <li><code>torch</code> — a broad unfiltered onion index, for reach.</li>
   </ul>
   <p>
     <strong>On dead endpoints:</strong> <code>haystak</code> was in the initial default set but was dropped after live functional testing — its v3 endpoint failed on <strong>every</strong> attempt across many rotated Tor circuits (SOCKS5 connect / timeout), i.e. the hidden service is down rather than exit-node blocked, and its retry could burn a full <code>_ONION_TIMEOUT</code> and inflate the tail latency of the whole (concurrent) call. It — or any replacement onion engine — can be re-added via <code>GHOST_ONION_ENGINES</code> once a live endpoint is known. This is the expected maintenance mode for onion engines, which rotate and die far more often than clearnet ones.
   </p>
   <p>
-    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search, and an individual entry whose URL carries a stray placeholder other than <code>{q}</code> (which would raise a <code>KeyError</code> in <code>.format</code> on every query and be silently skipped) is <strong>rejected at load with a warning</strong> instead.
+    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"[,"index"]}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). The optional <code>index</code> marks endpoints that share one underlying search index so they count once in corroboration ranking; omitted, it defaults to the entry's own <code>name</code> (treated as an independent index). A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search, and an individual entry whose URL carries a stray placeholder other than <code>{q}</code> (which would raise a <code>KeyError</code> in <code>.format</code> on every query and be silently skipped) is <strong>rejected at load with a warning</strong> instead.
   </p>
 
   <h2>Circuit rotation + timeouts (reused from search.py)</h2>
@@ -88,17 +88,34 @@
 
   <h2>Result parsing &amp; ranking</h2>
   <p>
-    Each engine renders results differently, so <code>_parse_onion_results</code> is deliberately tolerant: it walks anchors to harvest <code>(onion-url, title)</code> pairs with a nearby snippet, unwraps Ahmia-style <code>redirect_url=</code> wrappers, then does a regex sweep of the whole document to catch onion URLs that appeared as plain text. Addresses are matched as base32 v3 (56 chars) or legacy v2 (16 chars). Results are de-duped by onion host, and ranked so that onions surfaced by <strong>more than one engine</strong> sort first — cross-engine corroboration is the only cheap relevance signal available for unindexed hidden services.
+    Each engine renders results differently, so <code>_parse_onion_results</code> is deliberately tolerant: it walks anchors to harvest <code>(onion-url, title)</code> pairs with a nearby snippet, unwraps Ahmia-style <code>redirect_url=</code> wrappers, then does a regex sweep of the whole document to catch onion URLs that appeared as plain text. Addresses are matched as base32 v3 (56 chars) or legacy v2 (16 chars). Results are de-duped by onion host.
+  </p>
+  <p>
+    <strong>Self-link filtering.</strong> A tolerant whole-page harvest also picks up the nav/footer/sidebar links every engine page carries — including the engine's <em>own</em> onion address and those of sibling engines. Those are excluded (<code>_engine_onion_hosts</code>) so an engine's home link can't masquerade as a result and, worse, ride the corroboration ranking to the top.
+  </p>
+  <p>
+    <strong>Corroboration by independent index, not by endpoint.</strong> Onions surfaced by <strong>more than one independent index</strong> sort first — cross-engine corroboration is the only cheap relevance signal available for unindexed hidden services. Crucially the count is over distinct <code>index</code> tags, not engine names: Ahmia's clearnet and onion endpoints share <code>index:&nbsp;"ahmia"</code>, so a hit reached over both Ahmia transports counts as <em>one</em> source, not two. Counting endpoints instead would have let any Ahmia-only result outrank a genuinely Ahmia-plus-Torch-corroborated one — turning "corroboration" into "is it in Ahmia."
   </p>
 
   <h2>Raw-HTML fetch vs. text fetch</h2>
   <p>
-    The search phase needs the <strong>raw result HTML</strong> to parse out links, so it uses a dedicated <code>_fetch_raw_html</code> (curl_cffi with TLS impersonation, falling back to httpx) rather than <code>helper_fetch_url_content</code> — which strips all tags to plain text and would destroy the links. The <em>research</em> phase, which only wants page text, <strong>does</strong> reuse <code>helper_fetch_url_content</code>.
+    The search phase needs the <strong>raw result HTML</strong> to parse out links, so it uses a dedicated <code>_fetch_raw_html</code> (curl_cffi with TLS impersonation, falling back to httpx). The <em>research</em> phase wants page <em>text</em>, so it wraps the same fetch in <code>_fetch_onion_text</code>, which strips tags after the fact. It deliberately does <strong>not</strong> reuse the shared <code>helper_fetch_url_content</code>, for two reasons: (1) that helper ignores the passed proxy and reads <code>TOR_PROXY</code> from the environment, silently discarding both a caller-supplied proxy and the per-query anonymity identity tag; and (2) on any fetch error or <code>503</code> it calls <code>request_new_tor_identity</code>, which does a global <code>NEWNYM</code> or — if the control port is closed — a <code>tor</code> service restart. Since onion fetches fail often and research fans them out concurrently, that would re-circuit or restart Tor mid-run and sabotage the sibling fetches. <code>_fetch_onion_text</code> keeps the shared SSRF guard but honours the passed proxy and never re-circuits.
+  </p>
+  <p>
+    <strong>Untrusted-body cap.</strong> Onion engines are adversarial by this tool's own posture, so <code>_fetch_raw_html</code> caps every response at <code>_MAX_ONION_BODY_BYTES</code> (5&nbsp;MB): it refuses binary content-types and bodies whose declared <code>Content-Length</code> exceeds the ceiling, and truncates the decoded text as a backstop against a server that lied about its size or streamed chunked (mirroring the cap <code>helper_fetch_url_content</code> enforces on clearnet). Without it a hostile engine could stream a multi-GB body straight into memory and then into BeautifulSoup plus a full-document regex sweep.
+  </p>
+  <p>
+    <strong>Dedicated fetch pool.</strong> The blocking fetch runs on a bounded <code>_ONION_EXECUTOR</code> rather than the default thread pool. When the per-engine deadline fires, <code>asyncio.wait_for</code> cancels the <em>await</em> but cannot kill the worker thread — it runs on until curl's own timeout. Isolating those threads means a lingering post-deadline fetch can queue behind the pool but can never exhaust the process-wide executor the rest of the agent depends on.
   </p>
 
   <h2>Anonymous mode</h2>
   <p>
-    Under <code>--anonymous</code>, the same stylometric egress scrubbing as clearnet search applies: <code>darkweb_search</code> uses the deterministic <code>scrub_query</code> plus a per-query SOCKS identity tag; <code>darkweb_research</code> uses the stronger LLM-based <code>neutralize_query</code>. Tor anonymises the network; this anonymises the <em>content</em> fingerprint of the query before it leaves the box.
+    Under <code>--anonymous</code>, the same stylometric egress scrubbing as clearnet search applies: <code>darkweb_search</code> uses the deterministic <code>scrub_query</code> plus a per-query SOCKS identity tag; <code>darkweb_research</code> uses the stronger LLM-based <code>neutralize_query</code>. Tor anonymises the network; this anonymises the <em>content</em> fingerprint of the query before it leaves the box. Because the research deep-read now fetches onion pages through the caller's proxy (via <code>_fetch_onion_text</code>) rather than the environment default, the per-query identity tag actually reaches the page fetches too, instead of being discarded at the transport boundary.
+  </p>
+
+  <h2>Deep-read sizing &amp; caching</h2>
+  <p>
+    The per-source extract in <code>darkweb_research</code> is sized to the worker model's context window (<code>max_context</code>) rather than a fixed 40k chars: it reserves room for the prompt scaffold plus <code>max_tokens</code> and shrinks the source slice accordingly (≈4 chars/token, with a 4k-char floor and the 40k ceiling), so a small-context worker can't overflow on the distill call. The synthesised report is cached under an <code>onion-research::</code> key (distinct from the list search's <code>onion::</code>), so a repeated identical research request is served from cache instead of re-fetching every onion over Tor.
   </p>
 
   <h2>Safety posture</h2>
@@ -108,7 +125,7 @@
 
   <h2>Tests</h2>
   <p>
-    Parsing (anchors, redirect unwrapping, plain-text sweep, de-dup), cross-engine corroboration ranking, the actionable zero-results error, anonymous-mode scrubbing, the <code>GHOST_ONION_ENGINES</code> override + malformed fallback, <code>socks5h</code> normalisation, result caching, and the full research deep-read path are covered by <code>tests/test_darkweb_search.py</code>.
+    Parsing (anchors, redirect unwrapping, plain-text sweep, de-dup), independent-index corroboration ranking (the two Ahmia endpoints are <em>not</em> double-counted), engine self-link filtering, the per-engine deadline, the untrusted-body size cap (<code>_cap_body</code>: binary refusal, declared-oversize refusal, truncation), the actionable zero-results error, anonymous-mode scrubbing, the <code>GHOST_ONION_ENGINES</code> override + malformed fallback + stray-placeholder rejection, <code>socks5h</code> normalisation, result caching, the research deep-read path honouring the passed proxy, research caching, and <code>max_context</code>-bounded extraction are covered by <code>tests/test_darkweb_search.py</code>.
   </p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
