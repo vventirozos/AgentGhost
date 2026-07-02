@@ -16,6 +16,12 @@ from ..utils.sanitizer import sanitize_code
 from .file_system import _get_safe_path
 
 
+# Commands for which exit code 1 means "no matches found" — a successful
+# query with an empty result — rather than a failure. grep & friends signal
+# genuine errors (bad regex, unreadable file) with exit 2 + stderr output.
+_EXIT1_MEANS_NO_MATCH = {"grep", "egrep", "fgrep", "zgrep", "rg", "pgrep"}
+
+
 def _looks_like_file_not_found(out) -> bool:
     """Heuristic: did a command fail because the target file wasn't where it
     looked? Used to trigger the project-scoped → root cwd retry. Matches the
@@ -197,7 +203,21 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     # so the script's relative paths resolve like the inline
                     # form did; the file is written to an absolute /tmp path so
                     # the write itself is cwd-independent.
-                    _run = f"{_prefix}{_sep} {_interp} {_path}".strip()
+                    #
+                    # For Python, `python -c "<body>"` puts the CWD on sys.path
+                    # ('' as sys.path[0]); running the converted file from /tmp
+                    # puts /tmp there instead, so a body that imports a module
+                    # sitting in the working directory breaks with
+                    # ModuleNotFoundError (observed live, 2026-07 chess trace:
+                    # `from chess_engine import Board` failed only BECAUSE of
+                    # this conversion). Prepend the runtime CWD to PYTHONPATH
+                    # to keep the inline form's import semantics.
+                    if _ext == "py":
+                        _invoke = ('PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}" '
+                                   f"{_interp} {_path}")
+                    else:
+                        _invoke = f"{_interp} {_path}"
+                    _run = f"{_prefix}{_sep} {_invoke}".strip()
                     command = (
                         f"printf %s {shlex.quote(_b64)} | base64 -d > {_path} "
                         f"&& {_run}"
@@ -307,7 +327,41 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # signature, retry once from the root. Safe: "can't open file" means
         # nothing executed, so there are no partial side effects to repeat.
         if exit_code != 0 and _workdir_kw and _looks_like_file_not_found(output):
-            output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=600)
+            # Absolute-path variant first: when the command names files under
+            # `/workspace/...` a workdir change can't help (absolute paths are
+            # cwd-independent) — but the model almost always means the ACTIVE
+            # PROJECT's copy: file_system heals `/workspace/game.py` into the
+            # project dir, so the file the model just wrote/read really lives
+            # at /workspace/projects/<id>/game.py. Left alone, this asymmetry
+            # produced a 10+ turn ENOENT loop (2026-07 chess trace: `cd
+            # /workspace && python3 game.py`, `python3 /workspace/game.py`).
+            # Retry once with `/workspace` remapped to the scoped workdir.
+            # Safe: file-not-found means nothing executed. Skipped when the
+            # command already targets the scoped dir explicitly.
+            _remapped = None
+            if (container_workdir and container_workdir != "/workspace"
+                    and container_workdir not in command
+                    and re.search(r"/workspace(?![\w-])", command)):
+                _remapped = re.sub(r"/workspace(?![\w-])", container_workdir, command)
+            if _remapped is not None:
+                pretty_log(
+                    "Project Path Remap",
+                    f"File not found under /workspace — retrying with paths "
+                    f"remapped to {container_workdir}. Original: {command[:80]}",
+                    level="WARNING", icon=Icons.SHIELD,
+                )
+                _re_out, _re_code = await asyncio.to_thread(
+                    sandbox_manager.execute,
+                    f"bash -c {shlex.quote(_remapped)}", timeout=600, **_workdir_kw)
+                if _re_code == 0 or not _looks_like_file_not_found(_re_out):
+                    output, exit_code = _re_out, _re_code
+                    if exit_code == 0:
+                        output = (output or "") + (
+                            f"\n[SYSTEM NOTE: paths under /workspace were remapped to "
+                            f"{container_workdir} (the active project's workspace). "
+                            f"Reference project files by BARE relative path instead.]")
+            else:
+                output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=600)
         _dt = _time.time() - _t0
 
         # Workspace command-outcome capture: record significant runs so
@@ -324,6 +378,37 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     )
             except Exception:  # noqa: BLE001
                 pass
+
+        # Match-style commands (grep family, pgrep) exit 1 to mean "no
+        # matches" — a perfectly successful query with an empty result, not a
+        # failure. Reporting it as `EXIT CODE: 1` made the agent loop count it
+        # as an execution strike ("[SYSTEM ERROR]: Process failed (Exit 1)
+        # with no output", observed live 2026-07: a grep proving a fix had
+        # landed was scored as a failure). Normalize to a success-shaped
+        # result that says what the exit code actually meant. Only fires on
+        # exit EXACTLY 1 with NO output — grep signals real errors with exit 2
+        # and prints to stderr. NB: the docker sandbox layer substitutes
+        # "[SYSTEM ERROR]: Process failed (Exit N) with no output." for empty
+        # output before we see it, so that sentinel counts as no output too.
+        _out_stripped = (output or "").strip()
+        _no_output = (not _out_stripped
+                      or _out_stripped == f"[SYSTEM ERROR]: Process failed (Exit {exit_code}) with no output.")
+        if exit_code == 1 and _no_output:
+            _tail_seg = re.split(r"&&|\|\||;|\|", command)[-1].strip()
+            try:
+                _tail_toks = shlex.split(_tail_seg)
+            except ValueError:
+                _tail_toks = _tail_seg.split()
+            while _tail_toks and re.fullmatch(r"[A-Za-z_]\w*=.*", _tail_toks[0]):
+                _tail_toks = _tail_toks[1:]
+            _tail_head = Path(_tail_toks[0]).name if _tail_toks else ""
+            if _tail_head in _EXIT1_MEANS_NO_MATCH:
+                return (
+                    "--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\n"
+                    f"(no matches — `{_tail_head}` exited 1, which for this command "
+                    "means the pattern/target was NOT FOUND, not that the command "
+                    "failed.)"
+                )
 
         if exit_code != 0:
             return _format_error(output or f"Process failed (Exit {exit_code}) with no output.")
@@ -404,11 +489,23 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     # 3. Final Trim
     clean_content = content.strip()
     
-    # Extract rel_path early for wrapper filename generation
+    # Extract rel_path early for wrapper filename generation.
+    # Derived from the HEALED host path so the container-side run targets the
+    # SAME file the write below lands on. The old hand-rolled strip
+    # (lstrip("/") + drop a "sandbox/" prefix) had diverged from
+    # _get_safe_path's healing on both sides: filename="/workspace/game.py"
+    # wrote <proj>/game.py but ran `python3 -u workspace/game.py` → an ENOENT
+    # loop (2026-07 chess trace), and "sandbox/foo.py" wrote
+    # <sandbox>/sandbox/foo.py but ran "foo.py" (a stale or missing file).
     if not filename: return _format_error("Error: filename is required.")
-    rel_path = str(filename).lstrip("/")
-    if rel_path.startswith("sandbox/"):
-        rel_path = rel_path[8:]
+    if isinstance(host_path, Path):
+        try:
+            rel_path = host_path.relative_to(Path(sandbox_dir).resolve()).as_posix()
+        except (TypeError, ValueError, OSError):
+            rel_path = str(filename).lstrip("/")
+    else:
+        # _get_safe_path was stubbed (unit tests) — legacy derivation.
+        rel_path = str(filename).lstrip("/")
 
     # 4. Stateful Execution Wrapper (Jupyter Kernel)
     exec_content = clean_content

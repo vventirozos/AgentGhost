@@ -97,7 +97,12 @@ async def test_cd_prefix_is_preserved(tmp_path):
     await tool_execute(command=f'cd projects/abc/app && python3 -c "{body}"',
                        sandbox_dir=tmp_path, sandbox_manager=mgr)
     ran = _ran_command(mgr)
-    assert "cd projects/abc/app && python3 /tmp/_ghost_inline_" in ran
+    # cd prefix preserved; a PYTHONPATH="$PWD..." prefix now sits between the
+    # `&&` and the interpreter so the converted file keeps `-c`'s
+    # cwd-on-sys.path import semantics.
+    assert re.search(
+        r'cd projects/abc/app && PYTHONPATH="\$PWD[^"]*" python3 /tmp/_ghost_inline_\w+\.py',
+        ran)
 
 
 @pytest.mark.asyncio
