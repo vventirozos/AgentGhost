@@ -278,7 +278,11 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s', datefmt='%H:%M:%S'
     )
 
-    os.makedirs(os.path.dirname(log_file), exist_ok=True)
+    # A bare filename has no dirname and os.makedirs("") raises even with
+    # exist_ok=True — only create the directory when there is one.
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
     fh = logging.FileHandler(log_file)
     fh.setLevel(logging.DEBUG)
     fh.setFormatter(formatter)

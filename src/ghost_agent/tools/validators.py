@@ -99,17 +99,48 @@ def validate_shell(cmd: str) -> Tuple[bool, str]:
 # SQL validator
 # ──────────────────────────────────────────────────────────────────────
 
+# A (possibly schema-qualified, possibly quoted) table reference:
+#   users | public.users | "users" | "public"."users" | `users`
+# Using a bare `\w+` here silently exempted schema-qualified and quoted
+# targets from the destructive-statement guards below (DELETE FROM
+# public.users with no WHERE passed validation).
+_SQL_TABLE = (
+    r'(?:"[^"]+"|`[^`]+`|\w+)'
+    r'(?:\s*\.\s*(?:"[^"]+"|`[^`]+`|\w+))*'
+)
+
 # Statement keywords that we treat as DESTRUCTIVE and require an explicit
 # WHERE clause (or, for DROP/TRUNCATE, an explicit confirmation flag).
 _SQL_UNGUARDED_DELETE = re.compile(
-    r"^\s*delete\s+from\s+\w+\s*(?:returning|;|\s*$)", re.IGNORECASE)
+    r"^\s*delete\s+from\s+" + _SQL_TABLE + r"\s*(?:returning\b|;|\s*$)",
+    re.IGNORECASE)
 _SQL_UNGUARDED_UPDATE = re.compile(
-    r"^\s*update\s+\w+\s+set\s+[^;]*?(?:;|\s*$)", re.IGNORECASE)
+    r"^\s*update\s+" + _SQL_TABLE + r"\s+set\s+[^;]*?(?:;|\s*$)", re.IGNORECASE)
 _SQL_DROP = re.compile(r"^\s*drop\s+(?:table|schema|database|view|index)\b",
                        re.IGNORECASE)
 _SQL_TRUNCATE = re.compile(r"^\s*truncate\b", re.IGNORECASE)
 # Lightweight statement-shape checks — catch unbalanced quotes/parens.
 _SQL_SINGLE_QUOTE = "'"
+# Single-quoted string literal (handles '' escapes) — stripped before the
+# structural checks so punctuation/keywords INSIDE a literal don't skew
+# paren balance or the WHERE-presence test.
+_SQL_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
+_SQL_INNER_PARENS = re.compile(r"\([^()]*\)")
+
+
+def _strip_sql_strings(s: str) -> str:
+    return _SQL_STRING_LITERAL.sub("", s)
+
+
+def _strip_sql_parens(s: str) -> str:
+    """Remove balanced parenthesised groups (subqueries, expressions),
+    innermost-first, so a WHERE that lives only inside a subquery does not
+    count as the statement's own WHERE clause."""
+    prev = None
+    while prev != s:
+        prev = s
+        s = _SQL_INNER_PARENS.sub(" ", s)
+    return s
 
 
 def validate_sql(stmt: str, confirm: bool = False) -> Tuple[bool, str]:
@@ -133,15 +164,22 @@ def validate_sql(stmt: str, confirm: bool = False) -> Tuple[bool, str]:
         # Allow doubled single-quotes (SQL escape) by stripping them first
         if s.replace("''", "").count(_SQL_SINGLE_QUOTE) % 2 != 0:
             return False, "unbalanced single quotes"
-    if s.count("(") != s.count(")"):
+    # Count parens OUTSIDE string literals — a valid `WHERE note = 'a)'`
+    # must not be rejected as unbalanced.
+    s_nostr = _strip_sql_strings(s)
+    if s_nostr.count("(") != s_nostr.count(")"):
         return False, "unbalanced parentheses"
 
     # Destructive-statement guard.
     if _SQL_UNGUARDED_DELETE.match(s):
         return False, "DELETE without WHERE clause"
     if _SQL_UNGUARDED_UPDATE.match(s):
-        # Only block when there is no WHERE anywhere in the statement.
-        if not re.search(r"\bwhere\b", s, re.IGNORECASE):
+        # Only block when there is no WHERE at the STATEMENT level. Strip
+        # string literals and subquery parens first so neither a WHERE
+        # inside a string ('no where here') nor one inside a subquery
+        # (SET x=(SELECT ... WHERE ...)) is mistaken for the outer WHERE.
+        outer = _strip_sql_parens(_strip_sql_strings(s))
+        if not re.search(r"\bwhere\b", outer, re.IGNORECASE):
             return False, "UPDATE without WHERE clause"
     if not confirm:
         if _SQL_DROP.match(s):

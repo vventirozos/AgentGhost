@@ -52,7 +52,14 @@ _FATAL_PATTERNS = [
     re.compile(r"MANDATORY", re.IGNORECASE),
     re.compile(r"invalid.?(arg|param|schema)", re.IGNORECASE),
     re.compile(r"authentication.?(failed|required|error)", re.IGNORECASE),
-    re.compile(r"401|403", re.IGNORECASE),
+    # HTTP auth failures. Match the reason phrase, or a status code with an
+    # explicit http/status context — NOT a bare "401"/"403", which as an
+    # unanchored substring matched byte counts ("40301"), line numbers
+    # ("line 403"), and ids, misclassifying self-correctable diagnostics as
+    # PERMANENT "do not retry" errors. (The 502/503/504 pattern above is
+    # already word-boundaried; this brings 401/403 in line.)
+    re.compile(r"\b(?:401\s+unauthorized|403\s+forbidden)\b", re.IGNORECASE),
+    re.compile(r"\b(?:https?|status)\b.{0,8}?\b(?:401|403)\b", re.IGNORECASE),
 ]
 
 _DIAGNOSTIC_PATTERNS = [

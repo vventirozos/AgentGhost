@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Iterable, List, Optional
 
 from .activity import WorkspaceActivity
-from .schema import WorkspaceEvent
+from .schema import WorkspaceEvent, derive_event_project_id
 from .state import WorkspaceStateThread
 
 logger = logging.getLogger("GhostWorkspace")
@@ -83,8 +83,15 @@ def render_changelog(
     by_day: dict = {}
     order: List[str] = []
     for ev in events:
-        if active and (ev.project_id or "").strip().lower() != active:
-            continue
+        if active:
+            # Match the wake-up-prefix scoping (filter_events_for_project):
+            # keep project-agnostic events AND events whose project can be
+            # DERIVED from a projects/<id>/ path — not only the explicit
+            # project_id stamp. The bare stamp check dropped legacy events
+            # and every project-agnostic note from the changelog.
+            owner = derive_event_project_id(ev)
+            if owner and owner != active:
+                continue
         # ISO timestamp → date prefix (YYYY-MM-DD); fall back to the whole
         # string if it isn't shaped as expected.
         ts = (ev.timestamp or "").strip()
@@ -96,8 +103,14 @@ def render_changelog(
         by_day[day].append(f"- [{ev.kind}] {summary}")
     if not order:
         return ""
+    # Real dates newest-first; the "undated" bucket last (a descending
+    # string sort otherwise floats "undated" above every real date since
+    # 'u' > '2').
+    real_days = sorted((d for d in order if d != "undated"), reverse=True)
+    if "undated" in order:
+        real_days.append("undated")
     lines: List[str] = [f"# {title}", ""]
-    for day in sorted(order, reverse=True):
+    for day in real_days:
         lines.append(f"## {day}")
         lines.extend(by_day[day])
         lines.append("")

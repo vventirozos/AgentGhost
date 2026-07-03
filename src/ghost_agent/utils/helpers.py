@@ -134,7 +134,21 @@ def socks_url_with_identity(tor_proxy: Optional[str], identity: str) -> Optional
     except Exception:
         return tor_proxy
 
-async def helper_fetch_url_content(url: str) -> str:
+async def helper_fetch_url_content(
+    url: str, *, proxy_override: Optional[str] = None, renew_identity: bool = True,
+) -> str:
+    """Fetch and text-extract a URL over Tor.
+
+    ``proxy_override`` — use this SOCKS proxy instead of the env default. The
+    deep-research fetch passes its per-query identity-tagged proxy so the
+    fetch rides the same isolated circuit as the search, instead of the bare
+    env proxy (which dropped the per-query circuit isolation).
+
+    ``renew_identity=False`` — do NOT fire a global Tor NEWNYM on 503 / error.
+    A global identity renewal from one fetch re-circuits Tor for every
+    concurrently-running sibling fetch (deep_research runs several at once),
+    sabotaging them; callers that fan out should pass False.
+    """
     # --- URL VALIDATION (shared SSRF guard) ---
     # Reject non-http(s) schemes and any host that is/resolves to an
     # internal address, so an LLM tool call can't fetch `file:///etc/passwd`,
@@ -144,7 +158,7 @@ async def helper_fetch_url_content(url: str) -> str:
         return f"Error: {_ssrf}"
 
     # 1. Setup Tor Proxy
-    proxy_url = os.getenv("TOR_PROXY", "socks5://127.0.0.1:9050")
+    proxy_url = proxy_override or os.getenv("TOR_PROXY", "socks5://127.0.0.1:9050")
     if proxy_url and proxy_url.startswith("socks5://"):
         proxy_url = proxy_url.replace("socks5://", "socks5h://")
 
@@ -171,7 +185,11 @@ async def helper_fetch_url_content(url: str) -> str:
                     resp = await client.get(url, headers=headers)
 
             content_type = resp.headers.get("content-type", "").lower()
-            if "application/pdf" in content_type or "application/octet-stream" in content_type or url.lower().endswith((".pdf", ".zip")):
+            # Check the URL *path*, not the raw URL — "/report.pdf?dl=1"
+            # must still trip the binary short-circuit.
+            from urllib.parse import urlparse
+            url_path = urlparse(url).path.lower()
+            if "application/pdf" in content_type or "application/octet-stream" in content_type or url_path.endswith((".pdf", ".zip")):
                 return "Error: URL points to a binary file. To read PDFs, download them using file_system and ingest them using knowledge_base."
 
             # Enforce Content-Length cap before reading the body if the
@@ -199,7 +217,7 @@ async def helper_fetch_url_content(url: str) -> str:
                 # rotation for 503, which often signals the exit node
                 # itself is being rate-limited or filtered.
                 if status_code == 503 and proxy_url:
-                    if attempt < 2:
+                    if attempt < 2 and renew_identity:
                         await asyncio.to_thread(request_new_tor_identity)
                         await asyncio.sleep(5)
                         continue
@@ -219,7 +237,7 @@ async def helper_fetch_url_content(url: str) -> str:
             return await asyncio.to_thread(_parse_html, text)
             
         except Exception as e:
-            if attempt < 2 and proxy_url:
+            if attempt < 2 and proxy_url and renew_identity:
                 await asyncio.to_thread(request_new_tor_identity)
                 await asyncio.sleep(5)
                 continue

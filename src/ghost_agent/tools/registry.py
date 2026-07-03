@@ -572,24 +572,37 @@ def get_active_tool_definitions(context, query: str = None):
                 legacy_sandbox_dir=context.sandbox_dir,
             )
 
-            # Semantic RAG Retrieval if query provided
+            # Semantic RAG Retrieval if query provided. A query FAILURE must
+            # degrade to "advertise all active skills" (target_skill_names
+            # stays None), NOT abort the whole advertising block — otherwise
+            # a transient vector-store hiccup silently hides every acquired
+            # skill from the schema the model sees while they stay
+            # dispatchable (invisible-but-callable drift).
             target_skill_names = None
             if query:
-                results = context.memory_system.collection.query(
-                    query_texts=[query],
-                    n_results=15,
-                    where={"type": "acquired_skill"}
-                )
-                if results and results.get("metadatas") and results["metadatas"][0]:
-                    raw_names = [m.get("name") for m in results["metadatas"][0] if m.get("name")]
-                    
-                    if raw_names:
-                        active_skills = manager.get_all_skills()
-                        target_skill_names = [n for n in raw_names if n in active_skills and active_skills[n].get("status") == "active"]
-                        
-                        if target_skill_names:
-                            logger.info(f"Semantic Toolkit Router injected {len(target_skill_names)} acquired skills.")
-                            pretty_log("Semantic Routing", f"Loaded {len(target_skill_names)} skills.", icon=Icons.BRAIN_ROUTE)
+                try:
+                    results = context.memory_system.collection.query(
+                        query_texts=[query],
+                        n_results=15,
+                        where={"type": "acquired_skill"}
+                    )
+                    if results and results.get("metadatas") and results["metadatas"][0]:
+                        raw_names = [m.get("name") for m in results["metadatas"][0] if m.get("name")]
+
+                        if raw_names:
+                            active_skills = manager.get_all_skills()
+                            target_skill_names = [n for n in raw_names if n in active_skills and active_skills[n].get("status") == "active"]
+
+                            if target_skill_names:
+                                logger.info(f"Semantic Toolkit Router injected {len(target_skill_names)} acquired skills.")
+                                pretty_log("Semantic Routing", f"Loaded {len(target_skill_names)} skills.", icon=Icons.BRAIN_ROUTE)
+                except Exception as rag_err:
+                    logger.warning(
+                        "Acquired-skill semantic routing failed (%s: %s); "
+                        "advertising all active skills instead.",
+                        type(rag_err).__name__, rag_err,
+                    )
+                    target_skill_names = None
             
             _existing_names = {t.get("function", {}).get("name") for t in active_tools}
             for skill_name, skill_info in manager.get_all_skills().items():
@@ -701,6 +714,22 @@ def get_available_tools(context):
             **kwargs,
         )
 
+    async def _run_browser(**kwargs):
+        # Unpack the project-scoped pair from ONE _proj_ws() call. Calling it
+        # twice (host_dir=_proj_ws()[0], workdir=_proj_ws()[1]) could read a
+        # different current_project_id per call if a concurrent conversation
+        # cleared it mid-request — desyncing the host dir from the container
+        # workdir, exactly what the single-call unpack prevents.
+        host_dir, workdir = _proj_ws()
+        return await tool_browser(
+            sandbox_dir=host_dir,
+            container_workdir=workdir,
+            sandbox_manager=context.sandbox_manager,
+            tor_proxy=context.tor_proxy,
+            workspace_model=getattr(context, "workspace_model", None),
+            **kwargs,
+        )
+
     async def _replan(reason, **kwargs): return f"Strategy Reset Triggered. Reason: {reason}\nSYSTEM: The planner will see this and should update the TaskTree accordingly."
 
     # Escape hatch for the agent when it has PROVEN a task cannot be
@@ -727,7 +756,7 @@ def get_available_tools(context):
         "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "recall": lambda **kwargs: tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs),
         "execute": _run_execute,
-        "browser": lambda **kwargs: tool_browser(sandbox_dir=_proj_ws()[0], container_workdir=_proj_ws()[1], sandbox_manager=context.sandbox_manager, tor_proxy=context.tor_proxy, workspace_model=getattr(context, "workspace_model", None), **kwargs),
+        "browser": _run_browser,
         "learn_skill": lambda **kwargs: tool_learn_skill(skill_memory=context.skill_memory, memory_system=context.memory_system, memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "self_state": lambda **kwargs: tool_self_state(self_model=getattr(context, "self_model", None), **kwargs),
         "introspect": lambda **kwargs: tool_introspect(self_model=getattr(context, "self_model", None), **kwargs),
@@ -757,11 +786,12 @@ def get_available_tools(context):
         "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs),
         "manage_composed_skills": lambda **kwargs: tool_manage_composed_skills(
             context=context,
-            # Include the dynamically-appended tools (vision_analysis,
-            # image_generation) so a composed-skill step that uses them
-            # doesn't get a false "not a recognised built-in" warning.
-            known_tools=({t.get("function", {}).get("name") for t in TOOL_DEFINITIONS}
-                         | {"vision_analysis", "image_generation"}),
+            # Derive the known-tool set at CALL time from the fully-populated
+            # dispatch table, so it includes the dynamically-appended tools
+            # (vision_analysis, image_generation) AND acquired skills — a
+            # composed-skill step that calls an acquired skill otherwise got
+            # a spurious "not a recognised built-in" warning.
+            known_tools=(set(tools.keys()) | {"vision_analysis", "image_generation"}),
             **kwargs,
         ),
     }

@@ -1386,7 +1386,7 @@ def _maybe_retrain_router(context) -> None:
         )
 
 
-async def tool_self_play_loop(context, max_cycles: int = 0, model: str = ""):
+async def tool_self_play_loop(context, max_cycles: int = 0, model: str = "", **kwargs):
     """Start a background continuous self-play loop. Idempotent: if one is
     already running, returns a status line instead of launching a second.
     """
@@ -1469,7 +1469,7 @@ async def tool_stop_self_play(context):
 _VALID_LESSON_SCOPES = {"today", "week", "all", "self_play_only"}
 
 
-async def tool_list_lessons(context, scope: str = "today", limit: int = 20):
+async def tool_list_lessons(context, scope: str = "today", limit: int = 20, **kwargs):
     """Surface the lessons currently in the skill playbook for the user.
 
     `scope`:

@@ -32,7 +32,12 @@ def _narrative_is_cross_project(narrative: str, active_project_id: str) -> bool:
         return False
     active = active_project_id.strip().lower()
     for m in _PROJECTS_PATH_RE.finditer(narrative or ""):
-        if m.group(1).lower() != active:
+        found = m.group(1).lower()
+        # Prefix-tolerant: an LLM-rewritten path may truncate or extend the
+        # hex id (projects/991e52be… vs the full 991e52bce912). Only when
+        # NEITHER is a prefix of the other is it genuinely another project.
+        # Exact-match here dropped correct narratives on every turn.
+        if not (found.startswith(active) or active.startswith(found)):
             return True
     return False
 
@@ -128,7 +133,10 @@ def strip_workspace_prefix(text: str) -> str:
     if not text or WORKSPACE_PREFIX_OPEN not in text:
         return text
     start = text.index(WORKSPACE_PREFIX_OPEN)
-    end_marker = text.find(WORKSPACE_PREFIX_CLOSE)
+    # Search for CLOSE from AFTER the OPEN marker. Searching from 0 could
+    # match a stray/earlier CLOSE, yielding end < start and duplicating the
+    # block instead of removing it.
+    end_marker = text.find(WORKSPACE_PREFIX_CLOSE, start)
     if end_marker == -1:
         return text
     end = end_marker + len(WORKSPACE_PREFIX_CLOSE)

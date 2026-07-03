@@ -267,17 +267,24 @@ def test_browser_file_url_root_fallback_when_scoped(tmp_path):
 
 
 def test_registry_browser_scoped(tmp_path, monkeypatch):
+    import asyncio
     import ghost_agent.tools.registry as reg
     cap = {}
-    monkeypatch.setattr(reg, "tool_browser",
-                        lambda **kw: cap.update(sandbox_dir=kw.get("sandbox_dir"),
-                                                container_workdir=kw.get("container_workdir")))
+
+    # browser now dispatches through the async _run_browser helper (which
+    # unpacks the project-scoped pair from a SINGLE _proj_ws() call), so the
+    # mock must be async and the dispatch awaited — same shape as execute.
+    async def _fake_browser(**kw):
+        cap.update(sandbox_dir=kw.get("sandbox_dir"),
+                   container_workdir=kw.get("container_workdir"))
+
+    monkeypatch.setattr(reg, "tool_browser", _fake_browser)
     ctx = _ctx(tmp_path)
     ctx.current_project_id = PID
     ctx.tor_proxy = None
     ctx.sandbox_manager = MagicMock()
     tools = get_available_tools(ctx)
-    tools["browser"](operation="navigate", url="file:///workspace/x.html")
+    asyncio.run(tools["browser"](operation="navigate", url="file:///workspace/x.html"))
     assert cap["sandbox_dir"] == tmp_path / "projects" / PID
     assert cap["container_workdir"] == f"/workspace/projects/{PID}"
 

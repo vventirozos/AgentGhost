@@ -685,11 +685,15 @@ async def tool_darkweb_research(
                 try:
                     summary_data = await llm_client.chat_completion(payload, use_worker=True)
                     pretty_log("Worker Compute", f"Distilling facts from {short_url}", icon=Icons.TOOL_DEEP)
-                    preview = "[EDGE EXTRACTED FACTS]:\n" + summary_data["choices"][0]["message"].get("content", "").strip()
+                    preview = "[EDGE EXTRACTED FACTS]:\n" + (summary_data["choices"][0]["message"].get("content") or "").strip()
                 except Exception:
-                    preview = text[:fallback_limit] + "\n[...truncated...]\n"
+                    # Clean the raw-text fallback: unscrubbed surrogates/control
+                    # chars from an onion page can crash the downstream C++ JSON
+                    # parser (what _clean_for_cpp prevents). safe_text is already
+                    # cleaned; the fallback used raw `text`.
+                    preview = _clean_for_cpp(text[:fallback_limit]) + "\n[...truncated...]\n"
             else:
-                preview = text[:fallback_limit] + "\n[...truncated...]\n"
+                preview = _clean_for_cpp(text[:fallback_limit]) + "\n[...truncated...]\n"
             return f"### SOURCE: {url}\n{preview}\n"
 
     async def _bounded(url: str) -> str:
@@ -718,5 +722,16 @@ async def tool_darkweb_research(
         "SYSTEM INSTRUCTION: Analyze the text above. These are UNVERIFIED hidden "
         "services — treat claims with suspicion and corroborate before relying on them."
     )
-    _cache_put(cache_key, result)
+    # Only cache when at least one source actually produced content — otherwise
+    # an all-errors run (every onion down/timed out this attempt) would be
+    # served back for 300s instead of re-attempting the fetches next time.
+    def _source_succeeded(block: str) -> bool:
+        # block is "### SOURCE: <url>\n<preview>\n"; the preview begins with
+        # "Error:" only when the fetch/timeout failed.
+        parts = block.split("\n", 1)
+        preview = parts[1].strip() if len(parts) > 1 else ""
+        return bool(preview) and not preview.startswith("Error:")
+
+    if any(_source_succeeded(c) for c in valid_contents):
+        _cache_put(cache_key, result)
     return result

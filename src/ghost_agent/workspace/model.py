@@ -153,11 +153,26 @@ class WorkspaceModel:
         if not self.enabled or self.activity is None:
             return None
         try:
+            # record_task_outcome is called when the task FINISHES, so
+            # "now" is the finish time. Stamp finished_at explicitly and
+            # back-date fired_at by the duration — otherwise fired_at
+            # (which defaults to record time) wrongly reads as the finish
+            # time and finished_at stayed empty forever.
+            import datetime as _dt
+            dur = float(duration_seconds or 0.0)
+            finished_dt = _dt.datetime.now(_dt.timezone.utc)
+            fired_dt = finished_dt - _dt.timedelta(seconds=max(dur, 0.0))
+
+            def _iso(dt):
+                return dt.replace(tzinfo=None).isoformat() + "Z"
+
             t = TaskOutcome(
                 job_id=str(job_id or ""),
                 task_name=str(task_name or ""),
                 outcome=str(outcome or "unknown"),
-                duration_seconds=float(duration_seconds or 0.0),
+                duration_seconds=dur,
+                fired_at=_iso(fired_dt),
+                finished_at=_iso(finished_dt),
                 summary=str(summary or "")[:600],
                 error=str(error or "")[:400],
             )
@@ -191,8 +206,12 @@ class WorkspaceModel:
         if not (url or "").strip():
             return None
         try:
-            already_seen = not self.state.mark_url_seen(url)
-            if already_seen:
+            # Dedup gate first, but only COMMIT the URL to the seen-set
+            # after the activity append succeeds. Marking seen before the
+            # append (the old order) meant that if the append failed the
+            # artifact was lost AND every retry was silently deduped until
+            # FIFO eviction 5000 URLs later.
+            if self.state.has_seen_url(url):
                 return None  # silent dedup
             art = ResearchArtifact(
                 url=str(url),
@@ -200,12 +219,15 @@ class WorkspaceModel:
                 source=str(source or ""),
                 note=str(note or "")[:200],
             )
-            self.activity.append(WorkspaceEvent(
+            written = self.activity.append(WorkspaceEvent(
                 kind="research",
                 payload=art.to_dict(),
                 summary=f"pulled {url}"[:200],
                 project_id=self.current_project_id,
             ))
+            if written is None:
+                return None  # append failed → don't poison the dedup set
+            self.state.mark_url_seen(url)
             return art
         except Exception as e:  # noqa: BLE001
             logger.debug("record_research_artifact skipped: %s", e)
@@ -224,11 +246,19 @@ class WorkspaceModel:
         u = (url or "").strip()
         if not u:
             return None
-        n = self._nav_counts.get(u, 0) + 1
+        # pop+reinsert moves u to the end (most-recently-touched), so the
+        # bound below evicts by RECENCY. Plain `get`+set kept insertion
+        # order, so a hot URL touched early could be evicted mid-crawl and
+        # have its counter reset — breaking the fire-once-at-threshold
+        # contract.
+        n = self._nav_counts.pop(u, 0) + 1
         self._nav_counts[u] = n
-        # Bound the map so a long crawl can't grow it without limit.
+        # Bound the map so a long crawl can't grow it without limit. Evict
+        # the least-recently-touched entry (front); never the current one.
         if len(self._nav_counts) > 512:
-            self._nav_counts.pop(next(iter(self._nav_counts)), None)
+            oldest = next(iter(self._nav_counts))
+            if oldest != u:
+                self._nav_counts.pop(oldest, None)
         if n == int(threshold):
             suggestion = (
                 f"You've navigated to {u} {n} times this session. If you're "
@@ -420,5 +450,8 @@ class WorkspaceModel:
             ),
             "last_session_at": (
                 self.state.state.last_session_at if self.state else ""
+            ),
+            "prior_session_at": (
+                self.state.state.prior_session_at if self.state else ""
             ),
         }

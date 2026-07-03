@@ -178,7 +178,9 @@ async def tool_workspace(
     **kwargs,
 ) -> str:
     """Read-only workspace introspection. Never raises."""
-    raw_action = (action or "summary").strip().lower()
+    # str() so a non-string action (a malformed tool call) can't raise
+    # AttributeError on .strip() and escape the never-raises contract.
+    raw_action = str(action or "summary").strip().lower()
     if raw_action not in _VALID_ACTIONS:
         return (
             "SYSTEM ERROR: 'action' must be one of "

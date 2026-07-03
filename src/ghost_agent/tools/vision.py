@@ -11,11 +11,14 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
         return "SYSTEM ERROR: The 'action' and 'target' parameters are MANDATORY."
     pretty_log("Vision AI", f"{action} -> {target[:30]}", icon=Icons.TOOL_DEEP)
     
-    if str(target).startswith("/api/download/"):
-        target = str(target).replace("/api/download/", "")
-    
-    if str(target).startswith("/sandbox/"):
-        target = str(target).replace("/sandbox/", "/")
+    # Strip these ONLY as a leading prefix — str.replace() would also clobber
+    # the substring mid-path (e.g. "assets/sandbox/logo.png").
+    _t = str(target)
+    if _t.startswith("/api/download/"):
+        _t = _t[len("/api/download/"):]
+    if _t.startswith("/sandbox/"):
+        _t = _t[len("/sandbox"):]  # keep the leading slash: /sandbox/x → /x
+    target = _t
 
     # Fallback to native multimodal execution if no dedicated vision clients are configured
 
@@ -34,13 +37,29 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
             if proxy_url and proxy_url.startswith("socks5://"):
                 proxy_url = proxy_url.replace("socks5://", "socks5h://")
 
+            # Same 50 MB ceiling as the local-file branch — STREAM with a byte
+            # cap so a multi-GB URL can't OOM the host before the cap is seen
+            # (resp.content buffers the whole body regardless of size).
+            MAX_VISION_BYTES = 50 * 1024 * 1024
             async with httpx.AsyncClient(proxy=proxy_url, follow_redirects=True, timeout=60.0) as client:
-                resp = await client.get(target)
-                resp.raise_for_status()
-                file_bytes = resp.content
-                content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].lower()
+                async with client.stream("GET", target) as resp:
+                    resp.raise_for_status()
+                    _cl = resp.headers.get("content-length")
+                    if _cl and int(_cl) > MAX_VISION_BYTES:
+                        return f"Error: '{target}' is {int(_cl)//(1024*1024)} MB; vision refuses files >{MAX_VISION_BYTES//(1024*1024)} MB to avoid host OOM."
+                    _buf = bytearray()
+                    async for _chunk in resp.aiter_bytes():
+                        _buf.extend(_chunk)
+                        if len(_buf) > MAX_VISION_BYTES:
+                            return f"Error: '{target}' exceeds the {MAX_VISION_BYTES//(1024*1024)} MB vision cap (server omitted/exceeded Content-Length)."
+                    file_bytes = bytes(_buf)
+                    content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].lower()
                 is_pdf = content_type == "application/pdf" or target.lower().split('?')[0].endswith('.pdf')
                 if not is_pdf:
+                    # Don't forward a non-image 200 (HTML error/login page) as an
+                    # "image" — the vision model would just hallucinate over it.
+                    if not content_type.startswith("image/"):
+                        return f"Error: '{target}' returned content-type '{content_type}', not an image or PDF."
                     b64_images.append((content_type, base64.b64encode(file_bytes).decode("utf-8")))
         else:
             path = _get_safe_path(sandbox_dir, target)
@@ -126,7 +145,10 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
         }
         
         resp_data = await llm_client.chat_completion(payload, use_vision=True)
-        return "VISION ANALYSIS RESULT:\n" + resp_data["choices"][0]["message"].get("content", "")
+        # `.get("content", "")` returns None when the key exists with a null
+        # value (some OpenAI-compatible servers do that) → the concat below
+        # would TypeError and a SUCCESS gets reported as an error. Coerce.
+        return "VISION ANALYSIS RESULT:\n" + (resp_data["choices"][0]["message"].get("content") or "")
         
     except Exception as e:
         pretty_log("Vision Error", str(e), level="ERROR", icon=Icons.FAIL)

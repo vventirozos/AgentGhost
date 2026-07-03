@@ -59,6 +59,17 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     if command:
         if not sandbox_manager: return _format_error("Error: Sandbox manager not initialized.")
 
+        # `command` takes precedence and returns below; a filename/content
+        # supplied in the SAME call would be silently dropped (never written
+        # or run). Warn so the model doesn't assume its file was created.
+        if filename or content:
+            pretty_log(
+                "Execute Ambiguous Args",
+                f"Both `command` and file/content given; running `command` and "
+                f"IGNORING filename={filename!r}. Issue a separate call to write/run a file.",
+                level="WARNING", icon=Icons.WARN,
+            )
+
         # Auto-strip `cd /<nonexistent> && ` prefixes. Qwen 3.6 has a very
         # strong prior for starting shell commands with `cd /sandbox`,
         # `cd /home/user`, `cd /root`, etc. — none of those paths exist in
@@ -364,21 +375,6 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=600)
         _dt = _time.time() - _t0
 
-        # Workspace command-outcome capture: record significant runs so
-        # the user can later ask "what commands did I run yesterday?" or
-        # "did that pipeline ever finish?". Significance gate: failed
-        # commands always, or successful runs that took >5s. Skip noise.
-        if workspace_model is not None and getattr(workspace_model, "enabled", False):
-            try:
-                if exit_code != 0 or _dt >= 5.0:
-                    workspace_model.record_command_outcome(
-                        command=command, exit_code=int(exit_code),
-                        duration_seconds=float(_dt),
-                        note=("failed" if exit_code != 0 else "long-running"),
-                    )
-            except Exception:  # noqa: BLE001
-                pass
-
         # Match-style commands (grep family, pgrep) exit 1 to mean "no
         # matches" — a perfectly successful query with an empty result, not a
         # failure. Reporting it as `EXIT CODE: 1` made the agent loop count it
@@ -390,9 +386,13 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # and prints to stderr. NB: the docker sandbox layer substitutes
         # "[SYSTEM ERROR]: Process failed (Exit N) with no output." for empty
         # output before we see it, so that sentinel counts as no output too.
+        #
+        # Computed BEFORE the telemetry write below so a successful empty
+        # grep isn't logged to workspace history as a failed command.
         _out_stripped = (output or "").strip()
         _no_output = (not _out_stripped
                       or _out_stripped == f"[SYSTEM ERROR]: Process failed (Exit {exit_code}) with no output.")
+        _grep_no_match = False
         if exit_code == 1 and _no_output:
             _tail_seg = re.split(r"&&|\|\||;|\|", command)[-1].strip()
             try:
@@ -402,13 +402,32 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             while _tail_toks and re.fullmatch(r"[A-Za-z_]\w*=.*", _tail_toks[0]):
                 _tail_toks = _tail_toks[1:]
             _tail_head = Path(_tail_toks[0]).name if _tail_toks else ""
-            if _tail_head in _EXIT1_MEANS_NO_MATCH:
-                return (
-                    "--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\n"
-                    f"(no matches — `{_tail_head}` exited 1, which for this command "
-                    "means the pattern/target was NOT FOUND, not that the command "
-                    "failed.)"
-                )
+            _grep_no_match = _tail_head in _EXIT1_MEANS_NO_MATCH
+
+        # Workspace command-outcome capture: record significant runs so
+        # the user can later ask "what commands did I run yesterday?" or
+        # "did that pipeline ever finish?". Significance gate: failed
+        # commands always, or successful runs that took >5s. Skip noise.
+        # A grep-no-match counts as a SUCCESS (exit 0) for this purpose.
+        _eff_exit = 0 if _grep_no_match else exit_code
+        if workspace_model is not None and getattr(workspace_model, "enabled", False):
+            try:
+                if _eff_exit != 0 or _dt >= 5.0:
+                    workspace_model.record_command_outcome(
+                        command=command, exit_code=int(_eff_exit),
+                        duration_seconds=float(_dt),
+                        note=("failed" if _eff_exit != 0 else "long-running"),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        if _grep_no_match:
+            return (
+                "--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\n"
+                f"(no matches — `{_tail_head}` exited 1, which for this command "
+                "means the pattern/target was NOT FOUND, not that the command "
+                "failed.)"
+            )
 
         if exit_code != 0:
             return _format_error(output or f"Process failed (Exit {exit_code}) with no output.")
@@ -439,7 +458,14 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     if not content:
         if not host_path.exists():
             return _format_error(f"SYSTEM ERROR: File '{filename}' does not exist. You must provide 'content' to create it.")
-        content = await asyncio.to_thread(host_path.read_text)
+        # Read existing source UTF-8-tolerantly: the main call path has no
+        # try/except around tool_execute, so a raw UnicodeDecodeError here
+        # would propagate out of the tool instead of a formatted error.
+        try:
+            content = await asyncio.to_thread(
+                lambda: host_path.read_text(encoding="utf-8", errors="replace"))
+        except OSError as _read_err:
+            return _format_error(f"SYSTEM ERROR: could not read '{filename}': {_read_err}")
         is_new_code = False
 
     # 1. Holistic Sanitization

@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -32,6 +33,18 @@ STATE_FILENAME = "state.json"
 # stale URLs.
 MAX_TRACKED_FILES = 200
 MAX_SEEN_URLS = 5000
+
+
+def _normalise_path(path: str) -> str:
+    """Expand ``~`` and make absolute so a tracked path is stat-able and
+    stable. A bare ``~/notes.md`` is never a real file to ``os.stat`` (it
+    would be reported deleted forever); a relative path silently watched
+    ``<server-cwd>/…`` and drifted if the CWD changed. Normalising once at
+    track time also makes dedup meaningful."""
+    p = (path or "").strip()
+    if not p:
+        return ""
+    return os.path.abspath(os.path.expanduser(p))
 
 
 def _normalise_url(url: str) -> str:
@@ -101,22 +114,42 @@ class WorkspaceStateThread:
     # Persistence
     # -----------------------------------------------------------------
 
+    def _preserve_corrupt(self, reason: str) -> None:
+        """Move an unreadable state file aside so the next flush can't
+        overwrite (and permanently destroy) recoverable data. Same
+        discipline as memory/frontier's corrupt-file sidecar."""
+        try:
+            sidecar = self.path.with_suffix(f".json.corrupt-{int(time.time())}")
+            self.path.replace(sidecar)
+            logger.warning(
+                "workspace state %s; preserved corrupt file at %s, starting empty",
+                reason, sidecar,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "workspace state %s; could not preserve corrupt file (%s), "
+                "starting empty", reason, e,
+            )
+
     def _read_or_empty(self) -> WorkspaceState:
         if not self.path.exists():
             return WorkspaceState()
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
+        except OSError as e:
+            # Can't even read it (permissions, transient IO) — do NOT move
+            # it aside; leave it for a future boot that can read it.
             logger.warning(
                 "workspace state read failed (%s); starting empty", e,
             )
             return WorkspaceState()
+        except json.JSONDecodeError as e:
+            self._preserve_corrupt(f"JSON decode failed ({e})")
+            return WorkspaceState()
         try:
             return WorkspaceState.from_dict(data)
         except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "workspace state schema mismatch (%s); starting empty", e,
-            )
+            self._preserve_corrupt(f"schema mismatch ({e})")
             return WorkspaceState()
 
     def _flush(self) -> None:
@@ -160,7 +193,7 @@ class WorkspaceStateThread:
     def track_file(
         self, path: str, *, label: str = "",
     ) -> Optional[TrackedFile]:
-        path = (path or "").strip()
+        path = _normalise_path(path)
         if not path:
             return None
         with self._lock:
@@ -177,7 +210,9 @@ class WorkspaceStateThread:
             return tf
 
     def untrack_file(self, path: str) -> bool:
-        path = (path or "").strip()
+        # Normalise the same way track_file does so untracking by the
+        # original argument still matches the stored (absolute) path.
+        path = _normalise_path(path)
         if not path:
             return False
         with self._lock:
@@ -206,6 +241,14 @@ class WorkspaceStateThread:
 
     def touch_session(self) -> None:
         with self._lock:
+            # Roll the previous session's timestamp into prior_session_at
+            # BEFORE overwriting last_session_at with "now". Otherwise the
+            # cross-session "last touched on …" line always shows this
+            # boot's time (the field is stamped at boot, before any
+            # consumer reads it). Only capture on the first touch so a
+            # mid-session re-touch can't clobber the genuine prior value.
+            if self._state.last_session_at and not self._state.prior_session_at:
+                self._state.prior_session_at = self._state.last_session_at
             self._state.last_session_at = _utcnow_iso()
             self._flush()
 
@@ -259,12 +302,15 @@ class WorkspaceStateThread:
         Empty when nothing worth surfacing — a wake-up prefix that says
         only "I'm tracking 0 files" is noise."""
         tracked = self.tracked_files()
-        if not (tracked or self._state.last_session_at):
+        # Prefer the genuine prior-session timestamp; fall back to
+        # last_session_at for a first-ever boot with no prior.
+        last_touched = self._state.prior_session_at or self._state.last_session_at
+        if not (tracked or last_touched):
             return ""
         lines: List[str] = []
-        if self._state.last_session_at:
+        if last_touched:
             lines.append(
-                f"My workspace was last touched on {self._state.last_session_at}.",
+                f"My workspace was last touched on {last_touched}.",
             )
         if tracked:
             lines.append(f"I am watching {len(tracked)} file(s):")

@@ -11,6 +11,33 @@ from typing import Optional, Tuple, List
 # inputs in addition to the de-ambiguated regexes below).
 _MAX_FENCE_SCAN = 200_000
 
+# Opening fence for the tolerant fallback scan: ``` + optional spaces +
+# optional language tag + at most one separator (space or newline). All
+# three runs are greedy and none of them can match a backtick, so this
+# prefix alone matches in linear time with no backtracking.
+_LOOSE_FENCE_OPEN = re.compile(r'```[ \t]*[a-zA-Z0-9_.+-]*[ \t\n]?')
+
+
+def _loose_fence_bodies(text: str) -> List[str]:
+    """Bodies of loosely-fenced ``` blocks, found in linear time.
+
+    Equivalent to ``re.findall(r'```<prefix>(.*?)```', text, re.DOTALL)``
+    but immune to the quadratic backtracking that lazy-body pattern hits
+    when an opening fence has no closing fence (see comment at use site).
+    """
+    bodies: List[str] = []
+    pos = 0
+    while True:
+        m = _LOOSE_FENCE_OPEN.search(text, pos)
+        if m is None:
+            break
+        close = text.find('```', m.end())
+        if close == -1:
+            break
+        bodies.append(text[m.end():close])
+        pos = close + 3
+    return bodies
+
 
 def extract_code_from_markdown(text: str, filename: str = "") -> str:
     """
@@ -44,26 +71,22 @@ def extract_code_from_markdown(text: str, filename: str = "") -> str:
     primary_pattern = re.compile(r'```(?:\w+)?\n(.*?)\n```', re.DOTALL)
     matches = primary_pattern.findall(text)
 
-    # Secondary, looser pattern as a tolerant fallback (handles fences with
+    # Secondary, looser pass as a tolerant fallback (handles fences with
     # trailing spaces, missing language tag, or content on the same line as
     # the opening fence). Combine candidates from both passes; the LONGEST
-    # match wins, regardless of which pattern produced it.
+    # match wins, regardless of which pass produced it.
     #
-    # The opening-fence prefix is written as three DISJOINT runs —
-    # `[ \t]*` (spaces) / `[a-zA-Z0-9_.+-]*` (language tag) / `[ \t\n]?`
-    # (one optional separator) — rather than the old
-    # `[ \t]*(?:[ \t]*\n|[ \t]+)?` alternation. That alternation made the
-    # prefix ambiguous over a run of spaces and, when the input had NO
-    # closing fence, drove catastrophic backtracking: a ~3KB crafted block
-    # hung the worker for tens of seconds (a DoS reachable from any code
-    # the model was asked to write or execute). Disjoint runs cannot
-    # backtrack against each other, so matching is linear.
-    secondary_pattern = re.compile(
-        r'```[ \t]*[a-zA-Z0-9_.+-]*[ \t\n]?(.*?)```',
-        re.DOTALL | re.IGNORECASE,
-    )
+    # This pass is deliberately NOT a single regex. The obvious pattern —
+    # opening-fence prefix + lazy `(.*?)` body + closing ``` — is quadratic
+    # whenever an opening fence has no closing fence after it: the space
+    # run after ``` can be split between the prefix's `[ \t]*` and the
+    # DOTALL body, and on overall failure the engine retries every split
+    # (measured: 16K trailing spaces ≈ 1.2s, ~minutes at the 200KB cap —
+    # a DoS reachable from any code the model writes). Instead we match
+    # only the opening prefix (greedy, unambiguous, linear) and locate the
+    # closing fence with str.find — same semantics, O(n) total.
     if len(text) <= _MAX_FENCE_SCAN:
-        matches.extend(secondary_pattern.findall(text))
+        matches.extend(_loose_fence_bodies(text))
 
     if matches:
         # Guard against mangling raw-code files that contain fenced
@@ -175,6 +198,17 @@ def fix_python_syntax(code: str) -> str:
     Attempts to fix common Python syntax errors using a targeted AST-driven healing loop,
     falling back to regex and tokenization checks for edge cases.
     """
+    # Already-valid code passes through untouched. The brute-force strips
+    # below can mutate VALID string literals — the stutter regex turns
+    # `msg = "Ready?Set?Go?Now"` into `msg = "Ready"` — and because the
+    # mangled result still parses, downstream verification cannot catch
+    # it: the corruption is committed to disk and executed silently.
+    try:
+        ast.parse(code)
+        return code
+    except SyntaxError:
+        pass
+
     # 0. Brute-force cleanup
     code = re.sub(r'(\?[\w,]{1,3}){3,}', '', code) # Stuttering
     code = re.sub(r'(\?){3,}$', '', code) # Trailing ? sequence

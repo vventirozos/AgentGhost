@@ -609,7 +609,7 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         f"sandbox) so those paths will not resolve."
     )
 
-async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, action: str = None, skill_name: str = None):
+async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, action: str = None, skill_name: str = None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
     storage_base = Path(memory_dir) if memory_dir is not None else Path(sandbox_dir)

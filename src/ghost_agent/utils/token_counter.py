@@ -1,6 +1,7 @@
 import hashlib
 import logging
 import os
+import threading
 from pathlib import Path
 from transformers import AutoTokenizer
 from functools import lru_cache
@@ -132,6 +133,10 @@ def load_tokenizer(local_tokenizer_path: Path):
 # We cap entries at 1024 and drop the oldest on overflow.
 _SHORT_TOKEN_CACHE: dict = {}
 _SHORT_TOKEN_CACHE_MAX = 1024
+# estimate_tokens is called from the event-loop thread and from work run
+# under asyncio.to_thread; the eviction path iterates the dict, so an
+# unlocked concurrent insert can raise "dict changed size during iteration".
+_SHORT_TOKEN_CACHE_LOCK = threading.Lock()
 
 
 def _short_cache_key(text: str) -> tuple:
@@ -169,20 +174,23 @@ def estimate_tokens(text: str) -> int:
         return _encoder_count(text)
 
     key = _short_cache_key(text)
-    cached = _SHORT_TOKEN_CACHE.get(key)
+    with _SHORT_TOKEN_CACHE_LOCK:
+        cached = _SHORT_TOKEN_CACHE.get(key)
     if cached is not None:
         return cached
 
+    # Encode outside the lock — it is the expensive part.
     count = _encoder_count(text)
-    if len(_SHORT_TOKEN_CACHE) >= _SHORT_TOKEN_CACHE_MAX:
-        # Dict preserves insertion order — drop the oldest entry. Cheaper
-        # than wiring a full LRU and good enough for a 1024-entry cap.
-        try:
-            oldest = next(iter(_SHORT_TOKEN_CACHE))
-            _SHORT_TOKEN_CACHE.pop(oldest, None)
-        except StopIteration:
-            pass
-    _SHORT_TOKEN_CACHE[key] = count
+    with _SHORT_TOKEN_CACHE_LOCK:
+        if len(_SHORT_TOKEN_CACHE) >= _SHORT_TOKEN_CACHE_MAX:
+            # Dict preserves insertion order — drop the oldest entry. Cheaper
+            # than wiring a full LRU and good enough for a 1024-entry cap.
+            try:
+                oldest = next(iter(_SHORT_TOKEN_CACHE))
+                _SHORT_TOKEN_CACHE.pop(oldest, None)
+            except StopIteration:
+                pass
+        _SHORT_TOKEN_CACHE[key] = count
     return count
 
 

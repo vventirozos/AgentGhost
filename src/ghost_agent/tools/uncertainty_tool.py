@@ -26,7 +26,6 @@ _VALID_ACTIONS = frozenset({"unknown", "assumption", "list"})
 
 def _render(tracker) -> str:
     lines = []
-    crit = tracker.get_critical_unknowns(min_impact=3)
     unresolved = [u for u in tracker.unknowns if not u.resolved]
     if unresolved:
         lines.append("Unknowns this turn:")

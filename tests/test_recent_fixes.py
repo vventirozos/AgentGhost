@@ -90,21 +90,25 @@ async def test_execute_stubbornness_large_file():
         mock_path.read_text.assert_not_called()
 
 @pytest.mark.asyncio
-async def test_schedule_task_deterministic_and_interval_fallback():
+async def test_schedule_task_deterministic_and_interval_rejects_malformed():
     import apscheduler
     mock_scheduler = MagicMock()
-    
+
     with patch("ghost_agent.tools.tasks.run_proactive_task_fn", new=MagicMock()):
         # Test valid interval
         await tool_schedule_task("test_job", "prompt", "interval: 30", mock_scheduler, None)
         call_args = mock_scheduler.add_job.call_args
         assert call_args[1]["seconds"] == 30
-        
+
         job_id_1 = call_args[1]["id"]
         assert "task_" in job_id_1
         assert len(job_id_1.split("_")) == 2 # task_hash
-        
-        # Test hallucinated interval fallback
-        await tool_schedule_task("test_job_2", "prompt", "interval: 30 minutes", mock_scheduler, None)
-        call_args = mock_scheduler.add_job.call_args
-        assert call_args[1]["seconds"] == 60 # Defaulted to 60 because "30 minutes" throws ValueError
+
+        # A malformed interval ("30 minutes" isn't an int) is now REJECTED
+        # with an explicit error, NOT silently scheduled every 60s while
+        # reporting success (the old behaviour was the bug — see BUGHUNT
+        # unit 4). The scheduler must not have been called again.
+        mock_scheduler.add_job.reset_mock()
+        out = await tool_schedule_task("test_job_2", "prompt", "interval: 30 minutes", mock_scheduler, None)
+        assert "malformed interval" in out
+        mock_scheduler.add_job.assert_not_called()

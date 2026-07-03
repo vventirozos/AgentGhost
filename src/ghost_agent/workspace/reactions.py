@@ -49,7 +49,14 @@ def check_changed_python_files(file_changes: List[Dict[str, Any]]) -> List[Dict[
                 continue
             if p.stat().st_size > _PARSE_MAX_BYTES:
                 continue
-            src = p.read_text(errors="ignore")
+            # utf-8-sig strips a BOM (ast.parse rejects U+FEFF even though
+            # the real import machinery strips it — a valid file must not
+            # be flagged broken). errors="replace" (not "ignore") keeps
+            # invalid bytes visible as U+FFFD so a file the interpreter
+            # would REFUSE doesn't silently pass the check; "ignore" also
+            # depended on the process locale via read_text's default
+            # encoding, mangling non-ASCII source under LC_ALL=C.
+            src = p.read_bytes().decode("utf-8-sig", errors="replace")
         except Exception:
             continue
         try:

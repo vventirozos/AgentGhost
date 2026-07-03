@@ -137,6 +137,8 @@ async def tool_self_state(
             return f"Recorded open question [{q.id[:8]}]: {q.text}"
 
         if action == "resolve_question":
+            if not (text or "").strip():
+                return "SYSTEM ERROR: 'text' (an id or question text to match) is required for resolve_question."
             q = _find_open_question(state, text)
             if q is None:
                 return (
@@ -158,6 +160,8 @@ async def tool_self_state(
             return f"Recorded unfinished thread [{t.id[:8]}]: {t.descriptor}"
 
         if action == "close_unfinished":
+            if not (text or "").strip():
+                return "SYSTEM ERROR: 'text' (an id or thread descriptor to match) is required for close_unfinished."
             t = _find_unfinished(state, text)
             if t is None:
                 return (

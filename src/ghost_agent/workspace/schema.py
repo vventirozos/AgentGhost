@@ -218,6 +218,11 @@ class WorkspaceState:
     schema_version: str = SCHEMA_VERSION
     tracked_files: List[TrackedFile] = field(default_factory=list)
     last_session_at: str = ""
+    # When the workspace was touched BEFORE the current boot. touch_session
+    # rolls last_session_at into this at startup so the cross-session
+    # "last touched on …" line survives (last_session_at itself becomes the
+    # current boot time immediately at boot).
+    prior_session_at: str = ""
     # Set of URLs the agent has already pulled — kept on the state
     # thread (rather than re-scanning the activity log every dedup
     # call) so research dedup is O(1).
@@ -240,6 +245,7 @@ class WorkspaceState:
                 for tf in self.tracked_files
             ],
             "last_session_at": self.last_session_at,
+            "prior_session_at": self.prior_session_at,
             "seen_urls": list(self.seen_urls),
         }
 
@@ -247,18 +253,27 @@ class WorkspaceState:
     def from_dict(cls, d: Dict[str, Any]) -> "WorkspaceState":
         tfs: List[TrackedFile] = []
         for raw in (d.get("tracked_files") or []):
-            snap_raw = raw.get("last_snapshot")
-            snap = FileSnapshot.from_dict(snap_raw) if isinstance(snap_raw, dict) else None
-            tfs.append(TrackedFile(
-                path=str(raw.get("path") or ""),
-                label=str(raw.get("label") or ""),
-                added_at=str(raw.get("added_at") or _utcnow_iso()),
-                last_seen_at=str(raw.get("last_seen_at") or ""),
-                last_snapshot=snap,
-            ))
+            # Skip a malformed entry rather than letting it throw and
+            # discard the WHOLE state (tracked files + seen_urls +
+            # timestamps) — one bad row must not wipe everything.
+            if not isinstance(raw, dict):
+                continue
+            try:
+                snap_raw = raw.get("last_snapshot")
+                snap = FileSnapshot.from_dict(snap_raw) if isinstance(snap_raw, dict) else None
+                tfs.append(TrackedFile(
+                    path=str(raw.get("path") or ""),
+                    label=str(raw.get("label") or ""),
+                    added_at=str(raw.get("added_at") or _utcnow_iso()),
+                    last_seen_at=str(raw.get("last_seen_at") or ""),
+                    last_snapshot=snap,
+                ))
+            except Exception:
+                continue
         return cls(
             schema_version=str(d.get("schema_version") or SCHEMA_VERSION),
             tracked_files=tfs,
             last_session_at=str(d.get("last_session_at") or ""),
+            prior_session_at=str(d.get("prior_session_at") or ""),
             seen_urls=[str(u) for u in (d.get("seen_urls") or []) if u],
         )

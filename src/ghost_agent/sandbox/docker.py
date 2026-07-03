@@ -11,6 +11,21 @@ CONTAINER_NAME = "ghost-agent-sandbox"
 CONTAINER_WORKDIR = "/workspace"
 
 class DockerSandbox:
+    # Per-container-generation state, reset whenever a container is
+    # (re)created. Class-level defaults so test stubs built via __new__
+    # inherit them.
+    #   _env_verified — the marker+chromium checks passed once for the
+    #     current generation; skip re-probing them on every command.
+    #   _tor_attempted — the in-container tor spawn was already attempted
+    #     for this generation (under host networking it can never bind,
+    #     the host tor owns :9050 — retrying per command is pure waste).
+    #   _provision_backoff_until — after a failed provision, no reinstall
+    #     before this wall-clock time; prevents a failing mirror from
+    #     triggering a fresh multi-minute install on every command.
+    _env_verified = False
+    _tor_attempted = False
+    _provision_backoff_until = 0.0
+
     def __init__(self, host_workspace: Path, tor_proxy: str = None):
         import hashlib
         short_hash = hashlib.md5(str(host_workspace.absolute()).encode()).hexdigest()[:8]
@@ -62,56 +77,71 @@ class DockerSandbox:
         pretty_log("Sandbox Init", f"Mounting {self.host_workspace} -> {CONTAINER_WORKDIR}", icon=Icons.SANDBOX_BOX)
 
     def get_stats(self):
-        if not self.container: return None
-        try: return self.container.stats(stream=False)
+        # Snapshot the handle: a concurrent ensure_running() reprovision can
+        # reassign self.container between the None-check and the call.
+        container = self.container
+        if not container: return None
+        try: return container.stats(stream=False)
         except: return None
 
     def _is_container_ready(self):
+        """False = not ready. A transient daemon/API hiccup gets ONE retry
+        before we conclude not-ready: a false negative here is destructive
+        (ensure_running force-removes the container and reprovisions from
+        scratch, killing any in-flight work), so a healthy container must
+        not be nuked over a momentary API error. NotFound is definitive —
+        the container really is gone — and gets no retry."""
         try:
-            self.container.reload()
-            if self.container.status != "running":
-                return False
-
-            # Verify the volume mount is still valid (not a deleted host inode)
-            import uuid
-            test_file = f".mount_sync_{uuid.uuid4().hex}"
-            test_path = self.host_workspace / test_file
-
+            return self._probe_container_ready()
+        except self.NotFound:
+            return False
+        except Exception:
+            time.sleep(0.5)
             try:
-                # Write to host
-                test_path.touch(exist_ok=True)
-
-                # We specifically MUST use workdir=CONTAINER_WORKDIR.
-                # If the host directory inode was deleted + recreated,
-                # running any command with workdir set to the bind mount
-                # will immediately return exit code 128 (OCI breakout)
-                exec_kwargs = {
-                    "workdir": CONTAINER_WORKDIR,
-                    "demux": True
-                }
-                exit_code, _ = self.container.exec_run(f"stat {test_file}", **exec_kwargs)
-                if exit_code != 0:
-                    return False
-            finally:
-                if test_path.exists():
-                    test_path.unlink()
-
-            # Final liveness probe: a tiny `echo OK` confirms the container
-            # is responding to exec_run, not just sitting in `running` state
-            # with a hung kernel. Any non-zero / non-"OK" output → fail-fast.
-            try:
-                code, out = self.container.exec_run("echo OK", workdir=CONTAINER_WORKDIR)
-                if code != 0:
-                    return False
-                if out is not None and isinstance(out, (bytes, bytearray)):
-                    if b"OK" not in out:
-                        return False
+                return self._probe_container_ready()
             except Exception:
                 return False
 
-            return True
-        except:
+    def _probe_container_ready(self):
+        self.container.reload()
+        if self.container.status != "running":
             return False
+
+        # Verify the volume mount is still valid (not a deleted host inode)
+        import uuid
+        test_file = f".mount_sync_{uuid.uuid4().hex}"
+        test_path = self.host_workspace / test_file
+
+        try:
+            # Write to host
+            test_path.touch(exist_ok=True)
+
+            # We specifically MUST use workdir=CONTAINER_WORKDIR.
+            # If the host directory inode was deleted + recreated,
+            # running any command with workdir set to the bind mount
+            # will immediately return exit code 128 (OCI breakout)
+            exec_kwargs = {
+                "workdir": CONTAINER_WORKDIR,
+                "demux": True
+            }
+            exit_code, _ = self.container.exec_run(f"stat {test_file}", **exec_kwargs)
+            if exit_code != 0:
+                return False
+        finally:
+            if test_path.exists():
+                test_path.unlink()
+
+        # Final liveness probe: a tiny `echo OK` confirms the container
+        # is responding to exec_run, not just sitting in `running` state
+        # with a hung kernel. Any non-zero / non-"OK" output → fail-fast.
+        code, out = self.container.exec_run("echo OK", workdir=CONTAINER_WORKDIR)
+        if code != 0:
+            return False
+        if out is not None and isinstance(out, (bytes, bytearray)):
+            if b"OK" not in out:
+                return False
+
+        return True
 
     def ensure_running(self):
         # Hold the lock for the WHOLE check+provision. The actual command
@@ -140,8 +170,18 @@ class DockerSandbox:
                 try:
                     old = self.client.containers.get(self.container_name)
                     old.remove(force=True)
-                    time.sleep(1) 
+                    time.sleep(1)
                 except self.NotFound: pass
+
+                # If the host workspace dir vanished, recreate it OURSELVES.
+                # Otherwise the docker daemon auto-creates the bind-mount
+                # source as root-owned, after which the host-side readiness
+                # touch fails with PermissionError on every future command
+                # (an unrecoverable recreate loop). Best-effort.
+                try:
+                    Path(self.host_workspace).mkdir(parents=True, exist_ok=True)
+                except Exception as mkdir_err:
+                    logger.debug(f"Sandbox workspace mkdir skipped: {mkdir_err}")
 
                 import sys
                 is_linux = sys.platform.startswith("linux")
@@ -199,13 +239,20 @@ class DockerSandbox:
                     if not is_mac:
                         run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
 
-                # Check for cached environment image for instant boot
+                # Check for cached environment image for instant boot.
+                # NB: never mutate self.image — it must stay the pullable
+                # base image. Pinning the cached tag on self.image meant
+                # that if the cache was later deleted (docker rmi), the
+                # fallback tried to pull "ghost-agent-base:latest" from
+                # Docker Hub (404) instead of the real base image,
+                # bricking the sandbox until process restart.
+                boot_image = self.image
                 try:
                     self.client.images.get("ghost-agent-base:latest")
-                    self.image = "ghost-agent-base:latest"
-                    run_kwargs["image"] = self.image
+                    boot_image = "ghost-agent-base:latest"
                 except self.docker_lib.errors.ImageNotFound:
                     pass
+                run_kwargs["image"] = boot_image
 
                 # Skip the network round-trip when the image is already
                 # present locally. Only on `ImageNotFound` do we pay for a
@@ -215,11 +262,11 @@ class DockerSandbox:
                 # a more actionable error if the image is genuinely
                 # unusable.
                 try:
-                    self.client.images.get(self.image)
+                    self.client.images.get(boot_image)
                 except self.docker_lib.errors.ImageNotFound:
-                    pretty_log("Sandbox Image", f"Pulling required Docker image: {self.image}", icon=Icons.TOOL_DOWN)
+                    pretty_log("Sandbox Image", f"Pulling required Docker image: {boot_image}", icon=Icons.TOOL_DOWN)
                     try:
-                        self.client.images.pull(self.image)
+                        self.client.images.pull(boot_image)
                     except Exception as pull_err:
                         logger.warning(
                             f"Sandbox image pull failed ({type(pull_err).__name__}: {pull_err}); "
@@ -240,8 +287,12 @@ class DockerSandbox:
                     cpu_quota = int(os.environ.get("GHOST_SANDBOX_CPU_QUOTA", "200000"))
                 except ValueError:
                     cpu_quota = 200000
-                run_kwargs["cpu_period"] = 100000
-                run_kwargs["cpu_quota"] = cpu_quota
+                # <= 0 means "no CPU cap" (mirroring GHOST_SANDBOX_PIDS=0).
+                # Passing 0 through was rejected by the daemon ("CPU cfs
+                # quota cannot be less than 1ms"), bricking creation.
+                if cpu_quota > 0:
+                    run_kwargs["cpu_period"] = 100000
+                    run_kwargs["cpu_quota"] = cpu_quota
 
                 try:
                     self.container = self.client.containers.run(**run_kwargs)
@@ -255,11 +306,24 @@ class DockerSandbox:
                         self.container = self.client.containers.get(self.container_name)
                     else:
                         raise
-                
+
+                # New container generation → environment and tor state of
+                # the previous generation no longer apply.
+                self._env_verified = False
+                self._tor_attempted = False
+
                 for _ in range(10):
                     if self._is_container_ready(): break
                     time.sleep(1)
-                
+                else:
+                    # Previously this fell through silently and provisioning
+                    # proceeded against a container that never became ready,
+                    # surfacing as confusing install failures downstream.
+                    raise Exception(
+                        f"Container {self.container_name} did not become "
+                        f"ready within 10s of creation"
+                    )
+
             except Exception as e:
                 pretty_log("Sandbox Error", f"Failed to start: {e}", level="ERROR", icon=Icons.FAIL)
                 raise e
@@ -292,10 +356,30 @@ class DockerSandbox:
         #                timeout. v2 images re-provision to pick torch up.
         marker_path = "/root/.supercharged.v3"
 
-        marker_ok = (self.container.exec_run(f"test -f {marker_path}")[0] == 0)
-        chromium_ok = self._chromium_binary_present()
+        # The marker/chromium probes are two docker execs; running them
+        # before EVERY command added latency for nothing. Verify once per
+        # container generation (the flag is reset when a container is
+        # created). Trade-off: if someone deletes chromium inside a live
+        # container, detection now happens on the next recreate, not the
+        # next command — provision-time gating (the v2 lesson) is intact.
+        if self._env_verified:
+            marker_ok = chromium_ok = True
+        else:
+            marker_ok = (self.container.exec_run(f"test -f {marker_path}")[0] == 0)
+            chromium_ok = self._chromium_binary_present()
         if not marker_ok or not chromium_ok:
+            if time.time() < self._provision_backoff_until:
+                raise Exception(
+                    "Sandbox provisioning failed recently; retrying in "
+                    f"{int(self._provision_backoff_until - time.time())}s "
+                    "(backoff prevents reinstall storms against a failing mirror)."
+                )
             did_work = True
+            # Pessimistic backoff: set BEFORE the installs, cleared on
+            # success. If any install below raises, the next command won't
+            # immediately re-run a multi-minute failing install while
+            # holding the provision lock.
+            self._provision_backoff_until = time.time() + 300.0
             if marker_ok and not chromium_ok:
                 # The cached image claims to be provisioned but the
                 # Chromium binary isn't actually on disk — the exact
@@ -308,23 +392,29 @@ class DockerSandbox:
                     icon=Icons.WARN,
                 )
             pretty_log("Sandbox Provision", "Installing deep-learning stack (~60s)…", icon=Icons.SANDBOX_BOX)
-            
-            apt_cmd = "sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3'"
+
+            # Every install below is wrapped in the in-container `timeout`
+            # binary (coreutils ships in slim-bookworm): these exec_runs
+            # block a worker thread WHILE HOLDING self._lock, so an
+            # unbounded mirror/CDN stall would wedge every concurrent tool
+            # call in the agent. The caps are generous — they exist to
+            # bound a stall, not to race a slow link.
+            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3'"
             code, out = self.container.exec_run(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"System package installation failed: {err_msg}")
-                
+
             self.container.exec_run("sh -c 'echo \"ALL ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'")
-            
+
             if self.tor_proxy:
-                code, out = self.container.exec_run("pip install --no-cache-dir pysocks requests")
+                code, out = self.container.exec_run("timeout 600 pip install --no-cache-dir pysocks requests")
                 if code != 0:
                     err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                     raise Exception(f"PySocks bootstrap failed: {err_msg}")
-            
+
             install_cmd = (
-                "pip install --no-cache-dir "
+                "timeout 1800 pip install --no-cache-dir "
                 "numpy pandas scipy matplotlib seaborn plotly "
                 "scikit-learn yfinance beautifulsoup4 networkx requests "
                 "pylint black mypy bandit dill ipykernel jupyter_client "
@@ -346,7 +436,7 @@ class DockerSandbox:
             # so a torch flake must not poison provisioning of everything else.
             pretty_log("Sandbox PyTorch", "Installing CPU PyTorch (~1m)…", icon=Icons.SANDBOX_BOX)
             torch_code, torch_out = self.container.exec_run(
-                "pip install --no-cache-dir torch "
+                "timeout 1800 pip install --no-cache-dir torch "
                 "--index-url https://download.pytorch.org/whl/cpu",
                 environment=env_vars,
             )
@@ -379,7 +469,7 @@ class DockerSandbox:
             # the cache), `playwright install` short-circuits in ~1 s.
             pretty_log("Sandbox Chromium", "Installing headless Chromium (~2m)…", icon=Icons.TOOL_DOWN)
             pw_code, pw_out = self.container.exec_run(
-                "python3 -m playwright install chromium --with-deps",
+                "timeout 1800 python3 -m playwright install chromium --with-deps",
                 environment=env_vars,
             )
             if pw_code != 0:
@@ -410,26 +500,55 @@ class DockerSandbox:
             # cycle doesn't leave stale state around.
             self.container.exec_run("rm -f /root/.supercharged")
 
-            # Cache the fully installed environment for instant future startups
-            if self.image != "ghost-agent-base:latest":
-                try:
-                    pretty_log("Sandbox Cache", "Committing fast-boot image cache…", icon=Icons.SANDBOX_BOX)
-                    self.container.commit(repository="ghost-agent-base", tag="latest")
-                except Exception as e:
-                    logger.warning(f"Failed to commit sandbox image cache: {e}")
+            # Cache the fully installed environment for instant future
+            # startups. Committed UNCONDITIONALLY after a successful
+            # provision: the old `if self.image != "ghost-agent-base"`
+            # guard meant a container booted from a STALE cached image
+            # (e.g. v2-era, forcing the full reinstall above) never wrote
+            # the freshened image back — so every future recreation paid
+            # the full multi-minute provision again, forever.
+            try:
+                pretty_log("Sandbox Cache", "Committing fast-boot image cache…", icon=Icons.SANDBOX_BOX)
+                self.container.commit(repository="ghost-agent-base", tag="latest")
+            except Exception as e:
+                logger.warning(f"Failed to commit sandbox image cache: {e}")
 
-        # Ensure Tor is installed and running inside the container for isolated browser proxying
-        if self.tor_proxy:
+            # Provision succeeded — lift the failure backoff.
+            self._provision_backoff_until = 0.0
+
+        self._env_verified = True
+
+        # Ensure Tor is installed and running inside the container for
+        # isolated browser proxying. Attempted once per container
+        # generation: under host networking (the Linux default) an
+        # in-container tor can NEVER bind :9050 (the host tor owns it in
+        # the shared netns), so re-attempting the doomed spawn on every
+        # command just added latency and flooded the log with
+        # per-command "Environment Ready" lines.
+        if self.tor_proxy and not self._tor_attempted:
+            self._tor_attempted = True
             exit_code, _ = self.container.exec_run("test -f /usr/bin/tor")
             if exit_code != 0:
                 did_work = True
                 pretty_log("Sandbox Tor", "Installing isolated Tor daemon…", icon=Icons.TOOL_DOWN)
-                self.container.exec_run("sh -c 'apt-get update && apt-get install -y tor'", user="root")
+                self.container.exec_run("timeout 900 sh -c 'apt-get update && apt-get install -y tor'", user="root")
 
             code, _ = self.container.exec_run("pgrep -x tor")
             if code != 0:
                 did_work = True
                 self.container.exec_run("su - debian-tor -s /bin/sh -c 'tor --RunAsDaemon 1'", user="root")
+                # Verify it actually came up; under host networking this is
+                # EXPECTED to fail (host tor owns the port) — say so once
+                # instead of silently retrying forever.
+                time.sleep(0.5)
+                code, _ = self.container.exec_run("pgrep -x tor")
+                if code != 0:
+                    pretty_log(
+                        "Sandbox Tor",
+                        "In-container Tor did not start (expected under host "
+                        "networking, where the host Tor already serves :9050).",
+                        level="WARNING", icon=Icons.WARN,
+                    )
 
         # Only announce readiness when this call actually had to bring the
         # environment up. Silent on the steady-state common path.
@@ -475,13 +594,13 @@ class DockerSandbox:
     # implying a per-call cap that never applied; removed.
     def execute(self, cmd: str, timeout: int = 600, workdir: str = None):
         try:
+            # ensure_running() either just probed readiness (steady path)
+            # or raised (provision path) — re-probing here doubled the
+            # exec/host-IO overhead of EVERY command for no benefit. If
+            # the container dies in the tiny gap before exec_run below,
+            # the normal error path surfaces it.
             self.ensure_running()
-            if not self._is_container_ready():
-                pretty_log("Sandbox Not Ready", "container refused to start",
-                           icon=Icons.STOP, level="ERROR")
-                return "Error: Container refused to start.", 1
- 
- 
+
             # Add -k 5s to ensure processes are killed if they ignore SIGTERM
             cmd_string = f"timeout -k 5s {timeout}s {cmd}"
             pretty_log("Sandbox Exec", f"Command: {cmd_string}", icon=Icons.TOOL_SHELL)

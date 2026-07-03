@@ -249,7 +249,7 @@ async def test_publish_fact_concurrent_fanout(bus, mocks):
 
     async def tracking(func, *args, **kwargs):
         started.append(func)
-        await asyncio.sleep(0.03)
+        await asyncio.sleep(0.05)
         return func(*args, **kwargs)
 
     with patch("ghost_agent.core.bus.asyncio.to_thread", side_effect=tracking):
@@ -263,7 +263,11 @@ async def test_publish_fact_concurrent_fanout(bus, mocks):
         })
         elapsed = time.monotonic() - t0
     assert len(started) == 4
-    assert elapsed < 0.10  # Sequential would be ≈120ms.
+    # Concurrent ≈ 50ms (one shared sleep); sequential would be ≈200ms
+    # (4 × 50ms). The 150ms bound leaves a generous overhead budget so the
+    # test doesn't flake under full-suite CPU / thread-pool contention while
+    # still clearly distinguishing concurrent from sequential fan-out.
+    assert elapsed < 0.15
 
 
 @pytest.mark.asyncio

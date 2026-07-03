@@ -406,7 +406,11 @@ async def tool_check_health(context=None):
 async def tool_system_utility(action: str = None, tor_proxy: str = None, profile_memory=None, location: str = None, context=None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
-    action = action.strip("\"'")
+    # Normalise like the other action-dispatch tools: strip quotes AND
+    # surrounding whitespace, then lowercase. Previously only quotes were
+    # stripped, so "Check_Health" / "check_weather " fell through to the
+    # unknown-action branch and a valid diagnostic silently didn't run.
+    action = str(action).strip().strip("\"'").strip().lower()
     if action == "check_weather":
         return await tool_get_weather(tor_proxy, profile_memory, location)
     elif action == "check_health":

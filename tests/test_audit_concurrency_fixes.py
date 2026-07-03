@@ -13,7 +13,9 @@
 """
 
 import asyncio
+import tempfile
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -114,13 +116,16 @@ async def test_concurrent_advance_does_not_double_claim_leaf(tmp_path):
 # docker — ensure_running locks, and adopts on a 409 name conflict
 # =================================================================
 
-def _docker_stub():
+def _docker_stub(workspace=None):
     sb = DockerSandbox.__new__(DockerSandbox)
     sb.container = None
     sb.client = MagicMock()
     sb.image = "python:3.11-slim-bookworm"
     sb.container_name = "ghost-agent-sandbox-deadbeef"
-    sb.host_workspace = MagicMock()
+    # A real path: ensure_running mkdir()s the host workspace (root-owned
+    # bind-mount defense), and Path(MagicMock()) materialises a junk
+    # ./MagicMock directory in the repo.
+    sb.host_workspace = workspace if workspace is not None else Path(tempfile.mkdtemp(prefix="ghost-sb-test-"))
     sb.tor_proxy = None
     sb.docker_lib = MagicMock()
     sb._lock = threading.Lock()

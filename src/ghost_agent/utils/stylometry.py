@@ -40,20 +40,32 @@ logger = logging.getLogger("GhostAgent")
 # Assistant-directed request frames + first-person/politeness openers that
 # fingerprint an individual author but carry no search intent. "how to" /
 # "what is" are deliberately NOT here — those are universal search idioms,
-# not personal style. Longest-first matching is enforced at use site.
+# not personal style. Bare "search" / "lookup" are deliberately NOT here
+# either: they lead real content phrases ("search algorithms in python",
+# "lookup table sql") and stripping them violates the never-drop-a-content-
+# keyword contract; only the unambiguous framed forms ("search for",
+# "look up") are stripped. Longest-first matching is enforced at use site.
 _REQUEST_PREFIXES = (
     "can you please tell me about", "can you please tell me", "can you tell me about",
     "can you tell me", "can you please", "could you please", "can you", "could you",
     "would you please", "would you", "i want to know about", "i want to know",
     "i want to", "i need to know", "i need to", "i need", "i'd like to know",
     "i'd like to", "i would like to know", "i would like to", "i'm looking for",
-    "im looking for", "i am looking for", "looking for", "search for", "search",
-    "find me", "look up", "lookup", "tell me about", "tell me", "show me",
+    "im looking for", "i am looking for", "looking for", "search for",
+    "find me", "look up", "tell me about", "tell me", "show me",
     "give me", "help me", "please", "kindly",
 )
 
-# Standalone politeness tokens removed anywhere in the query.
-_POLITE_TOKENS = {"please", "kindly", "thanks", "thank", "pls", "plz", "thx"}
+# Standalone politeness tokens removed anywhere in the query. Gratitude
+# tokens ("thank", "thanks", "thx") are NOT here — leading/interior they
+# are usually content ("thank you card template", "thanks in spanish");
+# they are only politeness when trailing, handled by the regex below.
+_POLITE_TOKENS = {"please", "kindly", "pls", "plz"}
+
+# Trailing gratitude run: "… thanks", "… thank you", "… thx thanks".
+_TRAILING_GRATITUDE_RE = re.compile(
+    r"(?:\s+(?:thank\s+you|thanks|thank|thx))+\s*$", re.IGNORECASE
+)
 
 
 def scrub_query(text: Optional[str]) -> str:
@@ -89,6 +101,9 @@ def scrub_query(text: Optional[str]) -> str:
     # Remove standalone politeness tokens (strip surrounding light punct).
     toks = [t for t in s.split() if t.strip(",.;:!?") not in _POLITE_TOKENS]
     s = re.sub(r"\s+", " ", " ".join(toks)).strip()
+    # Trailing gratitude is politeness; leading/interior gratitude is
+    # content ("thank you card template") and must survive.
+    s = _TRAILING_GRATITUDE_RE.sub("", s).strip()
 
     return s or original.lower()
 

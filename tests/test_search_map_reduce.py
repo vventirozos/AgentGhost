@@ -26,23 +26,28 @@ async def test_deep_research_map_reduce_online(mock_ddgs, mock_fetch):
         "choices": [{"message": {"content": "Extracted facts."}}]
     })
     
+    # Large max_context so the per-source extract uses the full 40k-char
+    # ceiling (the extract now scales with max_context instead of a hardcoded
+    # 40k; a small worker context shrinks it, which is the fix).
     result = await tool_deep_research(
-        query="test", 
-        anonymous=False, 
-        tor_proxy="", 
-        llm_client=llm_client, 
-        model_name="Test-Model"
+        query="test",
+        anonymous=False,
+        tor_proxy="",
+        llm_client=llm_client,
+        model_name="Test-Model",
+        max_context=32768,
     )
-    
-    # Check that LLM was called to summarize the 15k chars
+
+    # Check that LLM was called to summarize the source text
     assert llm_client.chat_completion.call_count == 1
     call_args = llm_client.chat_completion.call_args[0][0]
-    
+
     assert call_args["model"] == "Test-Model"
     assert call_args["max_tokens"] == 2048
-    
-    # The source text should be truncated to 15000 in the prompt
-    assert len(call_args["messages"][0]["content"]) > 40000
+
+    # The 50k-char source is truncated to the ~40k ceiling at this context.
+    content_len = len(call_args["messages"][0]["content"])
+    assert 40000 < content_len < 41000
     
     # The result should contain the edge extracted facts label
     assert "[EDGE EXTRACTED FACTS]:" in result

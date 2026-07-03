@@ -26,7 +26,7 @@
     <thead><tr><th>Class</th><th>Patterns (regex)</th><th>Agent action</th></tr></thead>
     <tbody>
       <tr><td><strong>RETRYABLE</strong></td><td>timeout · rate-limit · connection reset · 502/503/504</td><td>Retry with exponential backoff up to <code>MAX_RETRIES = 3</code>.</td></tr>
-      <tr><td><strong>FATAL</strong></td><td>permission denied · access denied · tool not found · MANDATORY · invalid param · auth error · 401/403</td><td>Mark FAILED; trigger replan; do not retry.</td></tr>
+      <tr><td><strong>FATAL</strong></td><td>permission denied · access denied · tool not found · MANDATORY · invalid param · auth error · HTTP 401/403 (reason phrase or an <code>http</code>/<code>status</code> context — <strong>not</strong> a bare <code>403</code> substring, which used to misclassify byte counts / line numbers as fatal)</td><td>Mark FAILED; trigger replan; do not retry.</td></tr>
       <tr><td><strong>DIAGNOSTIC</strong></td><td>AssertionError · RuntimeError · SyntaxError · Traceback · FileNotFoundError · ImportError · EXIT CODE: [1-9]</td><td>Inject the full error into context for LLM self-correction.</td></tr>
       <tr><td><strong>UNKNOWN</strong></td><td>none of the above</td><td>Inject a short error notice.</td></tr>
     </tbody>

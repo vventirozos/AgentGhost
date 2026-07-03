@@ -65,14 +65,18 @@ class HostSnapshot:
 
         Used by call sites that just want a "is the host okay right now"
         check without a full ``HostSignal`` subscription. The thresholds
-        here mirror the defaults on ``HostTelemetry`` so behaviour is
-        consistent between the two access patterns.
+        reference the ``HostTelemetry`` defaults at call time so the two
+        access patterns cannot drift (instance-level custom thresholds are
+        still invisible from a bare snapshot — documented limitation).
         """
-        if math.isfinite(self.cpu_percent) and self.cpu_percent >= 85.0:
+        t = HostTelemetry  # defined below; resolved at call time
+        if math.isfinite(self.cpu_percent) and self.cpu_percent >= t.DEFAULT_CPU_HIGH:
             return False
-        if math.isfinite(self.mem_percent) and self.mem_percent >= 85.0:
+        if math.isfinite(self.mem_percent) and self.mem_percent >= t.DEFAULT_MEM_HIGH:
             return False
-        if math.isfinite(self.mem_available_mb) and self.mem_available_mb < 800.0:
+        if math.isfinite(self.mem_available_mb) and self.mem_available_mb < t.DEFAULT_MEM_FLOOR_MB:
+            return False
+        if math.isfinite(self.disk_percent) and self.disk_percent >= t.DEFAULT_DISK_HIGH:
             return False
         return True
 

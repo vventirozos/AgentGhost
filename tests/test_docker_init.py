@@ -58,7 +58,9 @@ def test_docker_init_installs_packages(tmp_path):
             cmd_arg = call[0][0]
             if hasattr(cmd_arg, '__contains__') and "apt-get update" in cmd_arg:
                 apt_call_found = True
-                assert cmd_arg.startswith("sh -c 'apt-get update && apt-get install -y")
+                # `timeout NNN` bounds the install (it blocks a worker
+                # thread while holding the provision lock).
+                assert cmd_arg.startswith("timeout 900 sh -c 'apt-get update && apt-get install -y")
         
         assert apt_call_found, "The apt-get update && install command was not found in exec_run calls"
 

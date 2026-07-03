@@ -113,10 +113,17 @@ def is_allowed_host(host: str, allow: Iterable[str] = ()) -> bool:
         if h in _LOCAL_HOST_NAMES:
             return True
         return any(h.endswith(sfx) for sfx in _LOCAL_HOST_SUFFIXES)
+    # Multicast is link/LAN discovery traffic (mDNS, SSDP), never a unicast
+    # public egress — and it cannot route via Tor anyway (Tor is TCP-only).
+    # Must be checked BEFORE is_global: CPython reports 224.0.0.0/4 and
+    # ff00::/8 as is_global=True because they sit outside the IANA
+    # private-use registries, which would wrongly fail-close LAN discovery.
+    if ip.is_multicast:
+        return True
     # Globally-routable == public Internet == must have gone via Tor.
     if ip.is_global:
         return False
-    # loopback / private (RFC1918) / link-local / multicast / reserved /
+    # loopback / private (RFC1918) / link-local / reserved /
     # unspecified (0.0.0.0) are all local-or-LAN → allowed.
     return True
 

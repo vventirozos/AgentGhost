@@ -45,8 +45,9 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
     if not prompt:
         # Extreme fallback: If they hallucinated `<parameter name="imagination_prompt">`, grab the longest string passed
         longest_str = ""
+        _skip = {"steps", "mode", "size", "dimensions", "width", "height"}
         for k, v in kwargs.items():
-            if k not in ["steps", "mode"] and isinstance(v, str) and len(v) > len(longest_str):
+            if k not in _skip and isinstance(v, str) and len(v) > len(longest_str):
                 longest_str = v
 
         if len(longest_str) > 5:
@@ -63,7 +64,16 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
     # `size="512x512"`, `dimensions=[w, h]`, or separate `width`/
     # `height`. Snap to the nearest SDXL bucket so output isn't a
     # stretched mess. If nothing usable was supplied, default to 1024².
-    raw_w, raw_h = width, height
+    def _as_int(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    # Coerce the direct width/height first: a hallucinated "1024px" / "large"
+    # is truthy but not int-able, and _snap_to_sdxl_bucket's int() ran OUTSIDE
+    # the try below → an uncaught ValueError escaped the tool.
+    raw_w, raw_h = _as_int(width), _as_int(height)
     if not (raw_w and raw_h):
         size_str = kwargs.get("size") or kwargs.get("dimensions")
         if isinstance(size_str, str) and "x" in size_str.lower():
@@ -73,10 +83,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             except (ValueError, AttributeError):
                 pass
         elif isinstance(size_str, (list, tuple)) and len(size_str) == 2:
-            try:
-                raw_w, raw_h = int(size_str[0]), int(size_str[1])
-            except (ValueError, TypeError):
-                pass
+            raw_w, raw_h = _as_int(size_str[0]), _as_int(size_str[1])
     if not (raw_w and raw_h):
         raw_w, raw_h = 1024, 1024
     (final_w, final_h), snapped = _snap_to_sdxl_bucket(raw_w, raw_h)
@@ -94,8 +101,20 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
                    "width": final_w, "height": final_h}
         resp_data = await llm_client.generate_image(payload)
 
-        b64_str = resp_data["data"][0]["b64_json"]
-        image_bytes = base64.b64decode(b64_str)
+        b64_str = (resp_data.get("data") or [{}])[0].get("b64_json") or ""
+        # A backend content-filter refusal can return HTTP 200 with an empty
+        # b64 → a 0-byte PNG that we'd otherwise report as SUCCESS with a dead
+        # download link. And a full "data:image/png;base64,<...>" URI would
+        # b64-decode to garbage (default validate=False silently drops the
+        # prefix chars) → corrupt image. Strip a data-URI prefix and reject
+        # empty output.
+        if b64_str.startswith("data:"):
+            b64_str = b64_str.split(",", 1)[-1]
+        image_bytes = base64.b64decode(b64_str) if b64_str else b""
+        if not image_bytes:
+            return ("ERROR: image generation returned no image data (the backend "
+                    "may have refused the prompt via a content filter). Try a "
+                    "different prompt or check the image node.")
 
         filename = f"gen_{uuid.uuid4().hex[:8]}.png"
         file_path = sandbox_dir / filename

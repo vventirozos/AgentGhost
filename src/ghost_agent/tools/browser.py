@@ -68,6 +68,15 @@ _BROWSER_PROFILE_LOCK = asyncio.Lock()
 _MAX_TEXT_CHARS = 64 * 1024  # ~16k tokens — more than enough for LLM reasoning
 
 
+def _safe_int(v, default: int) -> int:
+    """int() an LLM-supplied value without letting a non-numeric string
+    (e.g. timeout_ms="30s") raise out of the tool."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _runner_script() -> str:
     """Return the Playwright runner source.
 
@@ -191,8 +200,13 @@ def _chromium_args(proxy):
         EXCLUDE for the parsed proxy host. (Verified: with only
         `EXCLUDE localhost` a socks5://127.0.0.1 proxy fails; adding
         `EXCLUDE 127.0.0.1` makes it return 200.)
-    --disable-webrtc: WebRTC can expose the real host IP via STUN
-        even when HTTP traffic is proxied. Flat-disable for Tor paths.
+    WebRTC hardening: `--webrtc-ip-handling-policy=disable_non_proxied_udp`
+        stops the browser from gathering host UDP/STUN candidates that would
+        expose the real IP even when HTTP is proxied. We do NOT disable
+        `WebRtcHideLocalIpsWithMdns` — that feature (on by default) REPLACES
+        local interface IPs with mDNS hostnames in ICE candidates, so keeping
+        it on hides local IPs from page JS. (The prior code disabled it, which
+        was backwards — it exposed 192.168.x.x to a page.)
     """
     args = ["--no-sandbox", "--disable-dev-shm-usage"]
     if proxy:
@@ -209,7 +223,10 @@ def _chromium_args(proxy):
         if phost and phost != "localhost":
             excludes.append("EXCLUDE " + phost)
         args.append("--host-resolver-rules=MAP * ~NOTFOUND , " + " , ".join(excludes))
-        args.append("--disable-features=WebRtcHideLocalIpsWithMdns")
+        # Restrictive WebRTC policy: no non-proxied UDP → no host candidate
+        # leak. (Do NOT add --disable-features=WebRtcHideLocalIpsWithMdns; that
+        # turns OFF the local-IP-hiding feature.)
+        args.append("--force-webrtc-ip-handling-policy=disable_non_proxied_udp")
         args.append("--webrtc-ip-handling-policy=disable_non_proxied_udp")
     return args
 
@@ -1077,21 +1094,37 @@ def _parse_runner_output(stdout: str) -> tuple[bool, object]:
 _VALID_OPS = {"navigate", "extract_text", "click", "screenshot", "close", "interact"}
 
 
-def _browser_blocked_url(u: Optional[str]) -> Optional[str]:
+# Schemes the browser is allowed to navigate. file:// renders self-play
+# fixtures; about:/data: are inert. Everything else (chrome://, view-source:,
+# ftp://, gopher://, …) is refused rather than allowed-by-default.
+_BROWSER_ALLOWED_SCHEMES = frozenset({"http", "https", "file", "about", "data"})
+
+
+def _browser_blocked_url(u: Optional[str], *, anonymous: bool = False) -> Optional[str]:
     """SSRF guard for the browser: block http(s) navigation to internal /
     loopback / link-local / metadata hosts (which the host-network sandbox
     can otherwise reach), while ALLOWING file:// (self-play fixtures render
-    as file:// pages) and about:/data:. Returns a refusal reason or None."""
+    as file:// pages) and about:/data:. Returns a refusal reason or None.
+
+    ``anonymous`` — in Tor mode we must NOT resolve the hostname on the host
+    (getaddrinfo would leak the DNS query for the site we're about to visit,
+    defeating the browser's DNS-over-SOCKS hardening). Tor can't route to an
+    internal address anyway, so skipping resolution loses no protection there;
+    literal-IP internal targets are still blocked without resolving."""
     if not u:
         return None
     from urllib.parse import urlparse
     try:
         scheme = (urlparse(str(u)).scheme or "").lower()
     except Exception:
-        return None
+        # Fail CLOSED: an unparseable URL is refused, not allowed. (A security
+        # guard should not fail open.)
+        return f"refused unparseable URL: {u!r}"
+    if scheme not in _BROWSER_ALLOWED_SCHEMES:
+        return f"refused disallowed scheme {scheme!r} (only http/https/file/about/data)."
     if scheme in ("http", "https"):
         from ..utils.helpers import url_ssrf_reason
-        return url_ssrf_reason(u)
+        return url_ssrf_reason(u, resolve=not anonymous)
     return None
 
 
@@ -1214,6 +1247,14 @@ async def tool_browser(
     out_path = out_path or kwargs.get("path") or kwargs.get("filename")
     actions = actions or kwargs.get("steps") or kwargs.get("sequence")
 
+    # Coerce LLM-supplied numerics up front (JSON args aren't type-enforced):
+    # a non-numeric timeout_ms/max_chars would otherwise raise ValueError out
+    # of the tool. max_chars is also CLAMPED so a huge value can't flood the
+    # model context with a whole page (the _MAX_TEXT_CHARS ceiling was dead).
+    timeout_ms = _safe_int(timeout_ms, 30000)
+    if max_chars is not None:
+        max_chars = max(256, min(_safe_int(max_chars, _MAX_TEXT_CHARS), _MAX_TEXT_CHARS))
+
     def _err(msg: str, hint: str = None) -> str:
         out = f"--- BROWSER RESULT ---\nSTATUS: ERROR\n{msg}"
         if hint:
@@ -1229,13 +1270,15 @@ async def tool_browser(
         return _err("Sandbox is not initialised — cannot run browser.")
 
     # SSRF guard: refuse http(s) navigation to internal/metadata hosts.
-    # (file:// fixtures and about:/data: are allowed.)
-    _b = _browser_blocked_url(url)
+    # (file:// fixtures and about:/data: are allowed.) In Tor mode we skip
+    # host-side DNS resolution so the guard itself can't leak the DNS query.
+    _anon = bool(tor_proxy)
+    _b = _browser_blocked_url(url, anonymous=_anon)
     if _b:
         return _err(f"Refused navigation: {_b}")
     for _a in (actions or []):
         if isinstance(_a, dict) and _a.get("action") == "goto":
-            _b = _browser_blocked_url(_a.get("url"))
+            _b = _browser_blocked_url(_a.get("url"), anonymous=_anon)
             if _b:
                 return _err(f"Refused goto: {_b}")
 
@@ -1288,6 +1331,10 @@ async def tool_browser(
                     f"actions[{idx}] must be a dict, got {type(step).__name__}"
                 )
             new_step = dict(step)
+            # Clamp a per-step max_chars the same way as the top-level one so
+            # one interact step can't dump a whole page into context.
+            if "max_chars" in new_step:
+                new_step["max_chars"] = max(256, min(_safe_int(new_step.get("max_chars"), _MAX_TEXT_CHARS), _MAX_TEXT_CHARS))
             if new_step.get("action") == "screenshot":
                 sub_target = new_step.get("out_path") or f"screenshot_{idx}.png"
                 try:

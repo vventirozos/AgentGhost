@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional
 
@@ -22,6 +23,14 @@ from .schema import WorkspaceEvent
 logger = logging.getLogger("GhostWorkspace")
 
 ACTIVITY_FILENAME = "activity.jsonl"
+
+# Compaction bounds. The log is append-only and read in full by
+# recent()/count()/kinds() on the per-turn prompt-assembly path, so an
+# uncapped file makes every turn slower forever. When the file exceeds
+# _COMPACT_MAX_BYTES on append, it is rewritten in place keeping the
+# newest _COMPACT_KEEP_LINES events.
+_COMPACT_MAX_BYTES = 2 * 1024 * 1024
+_COMPACT_KEEP_LINES = 2000
 
 
 class WorkspaceActivity:
@@ -47,33 +56,61 @@ class WorkspaceActivity:
                     f.write(event.to_jsonl())
                     f.write("\n")
                     f.flush()
+                self._maybe_compact_locked()
             return self.path
         except Exception as e:  # noqa: BLE001
             logger.warning("workspace activity append failed: %s", e)
             return None
 
+    def _maybe_compact_locked(self) -> None:
+        """Rewrite the log keeping only the newest events once it grows
+        past the byte cap. Caller must hold ``self._lock``. Best-effort —
+        a failed compaction must never fail the append that triggered it."""
+        try:
+            if self.path.stat().st_size <= _COMPACT_MAX_BYTES:
+                return
+            with self.path.open("r", encoding="utf-8") as f:
+                tail = deque(f, maxlen=_COMPACT_KEEP_LINES)
+            tmp = self.path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                f.writelines(tail)
+            tmp.replace(self.path)
+            logger.info(
+                "workspace activity log compacted to newest %d events",
+                len(tail),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("workspace activity compaction failed: %s", e)
+
     def iter_events(self) -> Iterator[WorkspaceEvent]:
         """Yield all events, oldest first. Robust to mid-file
-        corruption (skips malformed lines)."""
-        if not self.path.exists():
-            return
+        corruption (skips malformed lines).
+
+        The raw lines are read under the lock; parsing and yielding
+        happen OUTSIDE it. Holding a non-reentrant lock across ``yield``
+        meant an abandoned generator kept the lock until GC, and a
+        consumer that appended mid-iteration deadlocked."""
         try:
             with self._lock:
+                if not self.path.exists():
+                    return
                 with self.path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        s = line.strip()
-                        if not s:
-                            continue
-                        try:
-                            d = json.loads(s)
-                        except json.JSONDecodeError:
-                            continue
-                        try:
-                            yield WorkspaceEvent.from_dict(d)
-                        except Exception:  # noqa: BLE001
-                            continue
+                    lines = f.readlines()
         except OSError as e:
             logger.warning("workspace activity read failed: %s", e)
+            return
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                d = json.loads(s)
+            except json.JSONDecodeError:
+                continue
+            try:
+                yield WorkspaceEvent.from_dict(d)
+            except Exception:  # noqa: BLE001
+                continue
 
     def recent(
         self, limit: int = 10, *, kind: Optional[str] = None,
@@ -81,12 +118,14 @@ class WorkspaceActivity:
         """Tail of the activity log, optionally filtered by ``kind``."""
         if limit <= 0:
             return []
-        items: List[WorkspaceEvent] = []
+        # deque(maxlen=) keeps memory at O(limit) instead of
+        # materialising every event in the file just to slice the tail.
+        items: deque = deque(maxlen=limit)
         for ev in self.iter_events():
             if kind and ev.kind != kind:
                 continue
             items.append(ev)
-        return items[-limit:]
+        return list(items)
 
     def count(self, *, kind: Optional[str] = None) -> int:
         n = 0

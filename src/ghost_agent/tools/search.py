@@ -428,7 +428,13 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
 
     async def _fetch_with_timeout(url):
         try:
-            return await asyncio.wait_for(helper_fetch_url_content(url), timeout=15.0)
+            # Honour THIS research turn's (per-query identity) proxy, and don't
+            # fire a global Tor NEWNYM on 503/error — several of these fetches
+            # run concurrently and a global re-circuit would sabotage the siblings.
+            return await asyncio.wait_for(
+                helper_fetch_url_content(url, proxy_override=tor_proxy, renew_identity=False),
+                timeout=15.0,
+            )
         except asyncio.TimeoutError:
             return f"Error: Fetch of {url} timed out after 15s"
         except Exception as e:
@@ -440,14 +446,19 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
             short_url = (url[:35] + "..") if len(url) > 35 else url
             pretty_log("Parsing Data", url, icon=Icons.TOOL_FILE_R)
             text = await _fetch_with_timeout(url)
-            
-            # 1. Hard cap the reading limit to ~15k chars (~4k tokens) to prevent context overflow on the worker node
-            url_char_limit = 40000 
-            fallback_limit = 10000
-            
+
+            # 1. Size the per-source extract to the worker's context window
+            # (~4 chars/token, reserving room for the prompt + max_tokens) so a
+            # small-context worker can't overflow on the distill call — was a
+            # hardcoded 40k that ignored max_context. Mirrors darkweb_research.
+            reserve_tokens = 2048 + 512
+            usable_tokens = max(1024, int(max_context) - reserve_tokens)
+            url_char_limit = max(4000, min(40000, usable_tokens * 4))
+            fallback_limit = min(10000, url_char_limit)
+
             # 2. Sanitize text to remove surrogate unicode characters and raw control characters that crash C++ JSON parsers
             safe_text = _clean_for_cpp(text[:url_char_limit])
-            
+
             if llm_client:
                 payload = {
                     "model": model_name,
@@ -458,11 +469,16 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
                 try:
                     summary_data = await llm_client.chat_completion(payload, use_worker=True)
                     pretty_log("Worker Compute", f"Distilling facts from {short_url}", icon=Icons.TOOL_DEEP)
-                    preview = "[EDGE EXTRACTED FACTS]:\n" + summary_data["choices"][0]["message"].get("content", "").strip()
+                    preview = "[EDGE EXTRACTED FACTS]:\n" + (summary_data["choices"][0]["message"].get("content") or "").strip()
                 except Exception:
-                    preview = text[:fallback_limit] + "\n[...truncated...]\n"
+                    # Clean the raw-text fallback too: unscrubbed surrogates /
+                    # control chars in a fetched page can crash the downstream
+                    # C++ JSON/grammar parser (the exact thing _clean_for_cpp
+                    # exists to prevent). safe_text is already cleaned; the
+                    # fallback used raw `text`.
+                    preview = _clean_for_cpp(text[:fallback_limit]) + "\n[...truncated...]\n"
             else:
-                preview = text[:fallback_limit] + "\n[...truncated...]\n"
+                preview = _clean_for_cpp(text[:fallback_limit]) + "\n[...truncated...]\n"
             return f"### SOURCE: {url}\n{preview}\n"
 
     async def _bounded(url):
@@ -494,7 +510,7 @@ async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] 
     pretty_log("Fact Check", query_text[:50] + "..", icon=Icons.TOOL_DEEP)  # type: ignore
     
     allowed_names = ["deep_research"]
-    restricted_tools = [t for t in tool_definitions if t["function"]["name"] in allowed_names]
+    restricted_tools = [t for t in (tool_definitions or []) if t["function"]["name"] in allowed_names]
     
     messages = [
         {"role": "system", "content": "### ROLE: DEEP FORENSIC VERIFIER\nVerify this claim with deep_research."},

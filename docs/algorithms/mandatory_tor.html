@@ -29,7 +29,7 @@
 
   <h2>The policy</h2>
   <p>
-    When <code>--mandatory-tor</code> is set, a process-wide guard monkeypatches the outbound socket primitives (<code>connect</code> / <code>connect_ex</code> / <code>sendto</code> / <code>sendmsg</code>) and raises <code>MandatoryTorError</code> on any connection to a <strong>globally-routable (public) address</strong>. Allowed: loopback, RFC1918 private / LAN, link-local, multicast/reserved, and the configured SOCKS endpoint.
+    When <code>--mandatory-tor</code> is set, a process-wide guard monkeypatches the outbound socket primitives (<code>connect</code> / <code>connect_ex</code> / <code>sendto</code> / <code>sendmsg</code>) and raises <code>MandatoryTorError</code> on any connection to a <strong>globally-routable (public) address</strong>. Allowed: loopback, RFC1918 private / LAN, link-local, multicast/reserved, and the configured SOCKS endpoint. Multicast is checked explicitly <em>before</em> the global-routability test: CPython reports <code>224.0.0.0/4</code> / <code>ff00::/8</code> as <code>is_global=True</code>, which would otherwise wrongly fail-close mDNS/SSDP LAN discovery (fixed 2026-07-03).
   </p>
   <p>Why that is exactly right and not over-broad:</p>
   <ul>

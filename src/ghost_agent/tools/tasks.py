@@ -30,11 +30,24 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
         
         if cron_expression.startswith("interval:"):
             parts = cron_expression.split(":")
+            raw = parts[1].strip() if len(parts) > 1 else ""
             try:
-                secs = int(parts[1].strip()) if len(parts) > 1 else 60
+                secs = int(raw)
             except ValueError:
-                secs = 60
-            
+                # Reject rather than silently run every 60s while reporting
+                # SUCCESS with the original (wrong) expression — the agent
+                # would believe "interval:5m" fires every 5 minutes when it
+                # actually fired every minute.
+                return (
+                    f"Error: malformed interval schedule '{cron_expression}'. "
+                    "Use 'interval:SECONDS' with an integer, e.g. 'interval:300' "
+                    "for every 5 minutes."
+                )
+            if secs <= 0:
+                return (
+                    f"Error: interval must be a positive number of seconds, got {secs}."
+                )
+
             scheduler.add_job(
                 run_proactive_task_fn, 
                 'interval', 
@@ -56,10 +69,18 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
                 replace_existing=True
             )
             
+        # The job is already scheduled at this point. A failure to write the
+        # bookkeeping memory entry must NOT be reported as a scheduling
+        # failure (the task WOULD still fire) — isolate it so the outcome we
+        # return matches the real scheduler state.
         memory_entry = f"Scheduled task '{task_name}' is running with ID {job_id} on schedule {cron_expression}."
         if memory_system:
-            await asyncio.to_thread(memory_system.add, memory_entry, {"type": "manual", "task_id": job_id})
-            
+            try:
+                await asyncio.to_thread(memory_system.add, memory_entry, {"type": "manual", "task_id": job_id})
+            except Exception as mem_err:
+                pretty_log("Schedule Memory", f"note write failed (task still scheduled): {mem_err}",
+                           level="WARNING", icon=Icons.WARN)
+
         return f"SUCCESS: Task '{task_name}' scheduled (ID: {job_id})."
     except Exception as e:
         pretty_log("Schedule Error", str(e), level="ERROR")
@@ -113,9 +134,13 @@ async def tool_list_tasks(scheduler):
 async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
+    # Normalise like the sibling tools (self_state, introspect, uncertainty):
+    # the dispatcher passes arg VALUES through raw, so "Create"/" list " would
+    # otherwise fall through to "unknown action" and silently no-op.
+    action = action.strip().lower()
     if not scheduler:
         return "Error: Background task scheduling is disabled or not available in this context."
-    
+
     if action == "create":
         if not (task_name and cron_expression and prompt):
                 return "Error: 'create' requires task_name, cron_expression, and prompt."

@@ -35,7 +35,8 @@ async def tool_workspace_track(
     workspace_model=None,
     **kwargs,
 ) -> str:
-    raw_action = (action or "").strip().lower()
+    # str() so a non-string action can't raise AttributeError on .strip().
+    raw_action = str(action or "").strip().lower()
     if raw_action not in _VALID_ACTIONS:
         return (
             "SYSTEM ERROR: 'action' is mandatory and must be one of "

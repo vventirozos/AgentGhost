@@ -86,10 +86,18 @@ def _looks_like_binary(head: bytes) -> bool:
     return (suspicious / len(head)) > 0.05
 
 
-def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
+def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True) -> Path:
     """
     Safely resolve a path relative to the sandbox root, preventing
     traversal attacks.
+
+    ``allow_root=False`` additionally REJECTS a path that resolves to the
+    sandbox/project root itself. Reads/lists of the root are fine, but a
+    DESTRUCTIVE op (delete / rename-move / copy-source) must never target
+    it: ``.``, ``/``, ``workspace``, ``/workspace``, an empty string, and
+    (when project-scoped) ``projects/<active-id>`` all collapse to the
+    root here, so without this guard ``file_system(operation='delete',
+    path='/workspace')`` would ``rmtree`` the entire workspace.
 
     Prior behavior stripped a leading ``sandbox/`` prefix to "heal"
     agent hallucinations. That silently broke the invariant that a
@@ -214,13 +222,26 @@ def _get_safe_path(sandbox_dir: Path, filename: str) -> Path:
     target_path = (sandbox_dir / clean_name).resolve()
 
     # 3. Ensure it's still inside sandbox (Robust Pathlib Check)
+    _sb_resolved = sandbox_dir.resolve()
     try:
-        if not target_path.is_relative_to(sandbox_dir.resolve()):
+        if not target_path.is_relative_to(_sb_resolved):
             raise ValueError(f"Security Error: Path '{filename}' attempts to access outside sandbox.")
     except AttributeError:
-        # Fallback for Python < 3.9
-        if not str(target_path.resolve()).startswith(str(sandbox_dir.resolve())):
+        # Fallback for Python < 3.9. Compare against the root WITH a trailing
+        # separator so a sibling dir ("/sandbox-evil") can't prefix-match
+        # "/sandbox" (the classic str.startswith containment bug).
+        _sb_str = str(_sb_resolved)
+        _t_str = str(target_path.resolve())
+        if _t_str != _sb_str and not _t_str.startswith(_sb_str + os.sep):
             raise ValueError(f"Security Error: Path '{filename}' attempts to access outside sandbox.")
+
+    # 4. Destructive ops must not target the root itself.
+    if not allow_root and target_path == _sb_resolved:
+        raise ValueError(
+            f"Security Error: refusing to run a destructive operation on the "
+            f"sandbox/project root ('{filename}'). Target a specific file or "
+            f"subdirectory instead."
+        )
 
     return target_path
 
@@ -618,22 +639,35 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 import tempfile
                 def _streaming_replace():
                     replaced = 0
-                    with open(path, 'r', encoding='utf-8', errors='replace') as f_in:
-                        with tempfile.NamedTemporaryFile(mode='w', dir=path.parent,
-                                                        suffix='.tmp', delete=False,
-                                                        encoding='utf-8') as f_out:
-                            tmp_path = Path(f_out.name)
-                            for line in f_in:
-                                if old_text in line:
-                                    line = line.replace(old_text, new_text)
-                                    replaced += 1
-                                f_out.write(line)
-                    if replaced > 0:
-                        import os
-                        os.replace(tmp_path, path)
-                    else:
-                        tmp_path.unlink(missing_ok=True)
-                    return replaced
+                    tmp_path = None
+                    try:
+                        # errors="replace" for the same tolerance as the
+                        # non-streaming path above (bad-byte write-back is a
+                        # deferred finding, not fixed here).
+                        with open(path, 'r', encoding='utf-8', errors='replace') as f_in:
+                            with tempfile.NamedTemporaryFile(mode='w', dir=path.parent,
+                                                            suffix='.tmp', delete=False,
+                                                            encoding='utf-8') as f_out:
+                                tmp_path = Path(f_out.name)
+                                for line in f_in:
+                                    if old_text in line:
+                                        line = line.replace(old_text, new_text)
+                                        replaced += 1
+                                    f_out.write(line)
+                        if replaced > 0:
+                            import os
+                            os.replace(tmp_path, path)
+                            tmp_path = None  # consumed by the rename
+                        return replaced
+                    finally:
+                        # Drop the temp file if it wasn't consumed by the
+                        # rename (no matches, or an exception mid-stream) —
+                        # otherwise failed/no-op replaces leak .tmp orphans.
+                        if tmp_path is not None:
+                            try:
+                                tmp_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
                 replaced = await asyncio.to_thread(_streaming_replace)
                 if replaced > 0:
                     return f"SUCCESS: Streaming replace applied to '{filename}' ({replaced} line(s) modified)."
@@ -642,6 +676,12 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 return f"Error: Streaming replace failed: {e}"
 
         try:
+            # NOTE: errors="replace" is deliberately tolerant so a mostly-text
+            # file with a few stray bad bytes can still be edited. The known
+            # downside (untouched bad bytes are persisted as U+FFFD on
+            # write-back) is tracked as a deferred finding in BUGHUNT.md; the
+            # correct fix is a surrogateescape round-trip through the shared
+            # write path, which is out of scope for this pass.
             file_content = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
         except (UnicodeDecodeError, LookupError):
             return f"Error: '{filename}' appears to be a binary file and cannot be text-replaced."
@@ -705,7 +745,10 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         matches = re.findall(flexible_old, file_content)
         if len(matches) == 1:
             reindented = _reindent_replacement(file_content, matches[0], str(new_text))
-            new_file_content = file_content.replace(matches[0], reindented)
+            # Replace only the FIRST occurrence (count=1), matching the
+            # exact/fuzzy/anchor/aider paths — an unbounded replace would
+            # clobber every later copy of an identical block.
+            new_file_content = file_content.replace(matches[0], reindented, 1)
             return await _write_replace_guarded(
                 path, file_content, new_file_content, filename,
                 f"SUCCESS: Flexible match found and replaced in '{filename}'.")
@@ -1339,14 +1382,19 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
             f"Re-read the file, then emit a TIGHT single-line SEARCH/REPLACE "
             f"for the surgical edit. Do NOT rewrite the whole file."
         )
-    await asyncio.to_thread(path.write_text, new_content)
+    await asyncio.to_thread(path.write_text, new_content, encoding="utf-8")
     return success_msg + await _syntax_feedback(path, filename)
 
 
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
     pretty_log("File Write", filename, icon=Icons.TOOL_FILE_W)
     try:
-        if content is None or str(content).strip().lower() == "none" or str(content).strip() == "":
+        # Reject a missing/empty payload, or the LITERAL Python None the LLM
+        # sometimes emits as a string. Do NOT reject a legitimate file whose
+        # content is the word "none"/"None" or is only whitespace — match the
+        # bare token exactly, not any content that lowercases to "none".
+        _c_str = "" if content is None else str(content)
+        if content is None or _c_str.strip() == "" or _c_str.strip() == "None":
             return f"Error: The 'content' you provided for '{filename}' is empty or 'None'. You MUST provide the actual text to write. If you intended to use data from a previous tool, ensure that tool succeeded and produced output."
 
         # Auto-serialize if the LLM sends a JSON object/list instead of a string
@@ -1370,7 +1418,11 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
 
         # SELF-HEALING: Auto-create parent directories
         path.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(path.write_text, content)
+        # Always UTF-8: without an explicit encoding, write_text uses the
+        # process locale (comma-decimal Greek Macs, LANG unset), which both
+        # mojibakes non-ASCII content and — on UnicodeEncodeError — leaves
+        # the file truncated (open('w') truncates before the failing encode).
+        await asyncio.to_thread(path.write_text, content, encoding="utf-8")
         # Report the resolved sandbox-relative path so scripts running
         # in the container (cwd=/workspace) know exactly where to find
         # it — e.g. if the model wrote "sandbox/foo.txt" and we honored
@@ -1660,7 +1712,7 @@ async def tool_inspect_file(filename: str, sandbox_dir: Path, lines: int = 10):
             return _missing_file_message(filename, sandbox_dir)
         def _read_peek():
             content = []
-            with open(path, 'r', errors='ignore') as f:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
                 for _ in range(lines):
                     line = f.readline()
                     if not line: break
@@ -1682,8 +1734,8 @@ async def tool_copy_file(src_name: str, dest_name: str, sandbox_dir: Path):
     pretty_log("File Copy", f"{src_name} -> {dest_name}", icon=Icons.TOOL_FILE_W)
     import shutil
     try:
-        src_path = _get_safe_path(sandbox_dir, src_name)
-        dest_path = _get_safe_path(sandbox_dir, dest_name)
+        src_path = _get_safe_path(sandbox_dir, src_name, allow_root=False)
+        dest_path = _get_safe_path(sandbox_dir, dest_name, allow_root=False)
         if not src_path.exists():
             return f"Error: '{src_name}' not found."
         if dest_path.exists():
@@ -1707,8 +1759,8 @@ async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
     pretty_log("File Rename", f"{old_name} -> {new_name}", icon=Icons.TOOL_FILE_W)
     import shutil
     try:
-        old_path = _get_safe_path(sandbox_dir, old_name)
-        new_path = _get_safe_path(sandbox_dir, new_name)
+        old_path = _get_safe_path(sandbox_dir, old_name, allow_root=False)
+        new_path = _get_safe_path(sandbox_dir, new_name, allow_root=False)
         if not old_path.exists(): return f"Error: '{old_name}' not found."
         new_path.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.move, str(old_path), str(new_path))
@@ -1720,7 +1772,7 @@ async def tool_delete_file(filename: str, sandbox_dir: Path):
     pretty_log("File Delete", filename, icon=Icons.TOOL_FILE_W)
     import shutil
     try:
-        path = _get_safe_path(sandbox_dir, filename)
+        path = _get_safe_path(sandbox_dir, filename, allow_root=False)
         if not path.exists(): return f"Error: '{filename}' not found."
         if path.is_dir():
             await asyncio.to_thread(shutil.rmtree, path)
