@@ -253,8 +253,13 @@ class GraphMemory:
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
+                # Only CURRENT facts (valid_until IS NULL) — otherwise a
+                # superseded/expired triplet ("bob WORKS_AT google", later
+                # replaced by "meta") is returned alongside the live one and,
+                # if surfaced into context, contradicts the current fact.
                 cursor = conn.execute(
-                    'SELECT subject, predicate, object FROM triplets ORDER BY timestamp DESC LIMIT ?',
+                    'SELECT subject, predicate, object FROM triplets '
+                    'WHERE valid_until IS NULL ORDER BY timestamp DESC LIMIT ?',
                     (limit,)
                 )
                 return [dict(row) for row in cursor.fetchall()]

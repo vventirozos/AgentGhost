@@ -184,7 +184,10 @@ async def test_swarm_returns_warning_when_no_nodes_configured():
         llm_client=llm, model_name="x", scratchpad=scratchpad,
         tasks=[{"instruction": "i", "input_data": "d", "output_key": "k"}],
     )
-    assert "WARNING" in result
+    # "Error:" prefix (was "SYSTEM WARNING") so the agent loop registers a
+    # failure and the delegate_to_swarm fallback hint fires.
+    assert result.startswith("Error")
+    assert "not configured" in result
     assert "Swarm" in result
 
 

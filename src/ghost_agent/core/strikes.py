@@ -178,6 +178,11 @@ class StrikeLedger:
             and self.consecutive_clean_successes >= self.UNFREEZE_AFTER_CLEAN_SUCCESSES
         ):
             self.persistent_failure_seen = False
+            # Reset the streak on unfreeze — otherwise the counter keeps
+            # climbing, and a LATER re-freeze would be unfrozen by a SINGLE
+            # clean success (counter already ≥ threshold) rather than requiring
+            # a fresh run of clean successes.
+            self.consecutive_clean_successes = 0
             return True
         return False
 

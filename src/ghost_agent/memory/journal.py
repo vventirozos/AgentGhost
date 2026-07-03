@@ -58,7 +58,12 @@ class MemoryJournal:
             if not content.strip():
                 return []
             try:
-                return json.loads(content)
+                data = json.loads(content)
+                # A valid-JSON-but-wrong-TYPE file (dict/scalar) would break
+                # append()/pop_all() (which expect a list). Treat as corrupt.
+                if not isinstance(data, list):
+                    raise ValueError(f"journal is a {type(data).__name__}, expected list")
+                return data
             except Exception:
                 # Corruption: PRESERVE the raw bytes in a timestamped
                 # sidecar BEFORE any subsequent _save() overwrites them,

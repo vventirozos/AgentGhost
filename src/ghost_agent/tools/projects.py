@@ -946,7 +946,24 @@ async def tool_manage_projects(
     depends_on = _coerce_str_list(depends_on)
     topics = _coerce_str_list(topics)
     task_ids = _coerce_str_list(task_ids)
+    # Canonicalize each id in the BULK path the same way the singular task_id
+    # is (line ~933) — otherwise an LLM-case-mangled id in task_ids is judged
+    # "missing" against the lowercase tree keys and silently skipped.
+    if task_ids:
+        task_ids = [_canon_pid(t) for t in task_ids]
     deliverables = _coerce_str_list(deliverables)
+
+    # `metadata` is an object param the model often stringifies as JSON — parse
+    # it so downstream `dict(metadata)` / `metadata.get(...)` don't raise on a str.
+    if isinstance(metadata, str):
+        _m = metadata.strip()
+        if _m[:1] in ("{", "["):
+            try:
+                metadata = json.loads(_m)
+            except (ValueError, TypeError):
+                metadata = None
+        else:
+            metadata = None
 
     # `result` is the canonical name for a task's completion summary, but the
     # model very naturally reaches for `result_summary` / `summary` — and when
@@ -974,8 +991,17 @@ async def tool_manage_projects(
 
     # Resolve an implicit project_id from context.current_project_id so
     # the LLM doesn't have to pass it on every call while in project mode.
+    # BUT: never let the auto-fill shadow an EXPLICIT title for a title-
+    # resolvable action — auto-filling `current` there made
+    # `delete title="chess"` (with any project active) resolve to and HARD-
+    # DELETE the ACTIVE project instead of "chess", because _resolve_project_ref
+    # short-circuits on a valid project_id and ignores the title.
+    # NB: "update" is NOT here — its `title` arg is a RENAME value, not a
+    # lookup key, so auto-filling `current` for a rename is correct.
+    _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch"}
     if project_id is None and act not in {"create", "list", "promote_from_context"}:
-        project_id = getattr(context, "current_project_id", None)
+        if not (title and act in _TITLE_RESOLVABLE):
+            project_id = getattr(context, "current_project_id", None)
 
     try:
         # ---- project lifecycle ------------------------------------------
@@ -1288,6 +1314,14 @@ async def tool_manage_projects(
         if act == "update":
             if not project_id:
                 return _err("project_id is required for action=update")
+            # project_id may be a title/stale id — resolve it so an update
+            # doesn't silently match 0 rows and report success.
+            _uid, _uerr = _resolve_project_ref(store, project_id, "")
+            if _uerr:
+                return _err(_uerr)
+            if not _uid:
+                return _err(f"project not found: {project_id!r} — nothing was updated.")
+            project_id = _uid
             fields: Dict[str, Any] = {}
             if title:
                 fields["title"] = title
@@ -1302,6 +1336,8 @@ async def tool_manage_projects(
             if not fields:
                 return _err("no updatable fields provided")
             ok = store.update_project(project_id, **fields)
+            if not ok:
+                return _err(f"update matched no rows for {project_id} — nothing was changed.")
             return _ok({"updated": ok, "fields": list(fields.keys())})
 
         if act == "delete":
@@ -1366,6 +1402,12 @@ async def tool_manage_projects(
             proj = store.get_project(project_id)
             if not proj:
                 return _err(f"project not found: {project_id}")
+            # Flip an ARCHIVED project back to ACTIVE — otherwise autoadvance
+            # refuses it ("not ACTIVE") and the duplicate-create guard still
+            # treats it as terminal, contradicting the "archive is reversible"
+            # contract.
+            if str(proj.get("status", "")).upper() == "ARCHIVED":
+                store.update_project(project_id, status="ACTIVE")
             _set_current(context, project_id)
             store.log_event(project_id, None, "project_resumed", {})
             _b = _briefing(store, project_id)

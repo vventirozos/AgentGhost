@@ -358,14 +358,22 @@ class Verifier:
         """
         if not data:
             return None
-        verdict_str = data.get("verdict", "UNCERTAIN").upper()
+        # A non-string verdict (null / list) or non-numeric confidence ("high",
+        # null) would otherwise raise out of the verifier (callers don't wrap
+        # this) — degrade to UNCERTAIN, and CLAMP confidence to [0,1] (the model
+        # sometimes emits 95 meaning 95%).
+        verdict_str = str(data.get("verdict") or "UNCERTAIN").upper()
         try:
             verdict = VerifyVerdict(verdict_str)
         except ValueError:
             verdict = VerifyVerdict.UNCERTAIN
+        try:
+            conf = float(data.get("confidence", 0.5))
+        except (TypeError, ValueError):
+            conf = 0.5
         return VerifyResult(
             verdict=verdict,
-            confidence=float(data.get("confidence", 0.5)),
+            confidence=max(0.0, min(1.0, conf)),
             reasoning=data.get("reasoning", ""),
             issues=data.get("issues", []),
         )

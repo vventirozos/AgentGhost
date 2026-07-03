@@ -34,7 +34,10 @@ class ContradictionLog:
 
     def _load(self) -> list:
         try:
-            return json.loads(self.file_path.read_text())
+            data = json.loads(self.file_path.read_text())
+            # Wrong-type (dict/scalar) would break record()/get_recent which
+            # expect a list — treat as empty.
+            return data if isinstance(data, list) else []
         except Exception:
             return []
 

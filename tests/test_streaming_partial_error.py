@@ -101,14 +101,19 @@ def test_error_before_any_content_emits_both_error_event_and_content_chunk():
 
     assert len(error_events) == 1, f"expected one error event, got {events}"
     err = json.loads(error_events[0])
-    assert "upstream unreachable" in err["error"]["message"]
+    # The message is now OPAQUE (an error_id) — the raw str(e) leaked upstream
+    # URLs / paths / Python internals to the client. The raw exception text
+    # must NOT appear; a correlation id must.
+    assert "upstream unreachable" not in err["error"]["message"]
+    assert "error_id" in err["error"]["message"]
 
-    # Pre-stream: visible content chunk SHOULD be emitted (clients
-    # without event-listeners need to see something).
+    # Pre-stream: visible content chunk SHOULD still be emitted (clients
+    # without event-listeners need to see something), also opaque now.
     visible = [c for c in content_events if c != "[DONE]"]
     assert len(visible) == 1
     payload = json.loads(visible[0])
-    assert "CRITICAL SERVER ERROR" in payload["choices"][0]["delta"]["content"]
+    _content = payload["choices"][0]["delta"]["content"]
+    assert "error_id" in _content and "upstream unreachable" not in _content
 
 
 def test_error_after_partial_content_does_not_double_render():
@@ -133,7 +138,17 @@ def test_error_after_partial_content_does_not_double_render():
     error_events = [d for ev, d in events if ev == "error"]
     assert len(error_events) == 1, "the error SSE frame must still fire"
     err = json.loads(error_events[0])
-    assert "ConnectionResetError" in err["error"]["type"]
+    # Type is now the opaque "InternalError" (the concrete exception class
+    # leaked internals); the message carries a correlation id, not str(e).
+    assert err["error"]["type"] == "InternalError"
+    assert "mid-stream connection drop" not in err["error"]["message"]
+    # Mid-stream: the two REAL content chunks already shipped, but NO extra
+    # error-content chunk is appended (no double render). So the real content
+    # is present and none of it carries the error text/id.
+    content_events = [d for ev, d in events if ev == "message"]
+    visible = [c for c in content_events if c != "[DONE]"]
+    assert len(visible) == 2  # the two real chunks
+    assert not any("error_id" in c or "connection drop" in c for c in visible)
 
     # Real content was streamed before the failure; the visible
     # error-as-delta-content chunk must NOT appear.

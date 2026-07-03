@@ -138,14 +138,27 @@ def _sections_from_files(sandbox_dir: Path, files: Any) -> tuple[list[dict], lis
         from .file_system import _get_safe_path
     except Exception:
         _get_safe_path = None
+    _MAX_SOURCE_FILE_BYTES = 25 * 1024 * 1024  # 25 MB per source file
+    _sb_root = Path(sandbox_dir).resolve()
     for p in paths:
         try:
             if _get_safe_path is not None:
                 fp = _get_safe_path(Path(sandbox_dir), p)
             else:
+                # Fallback containment check: without _get_safe_path (a
+                # near-dead path — file_system essentially always imports),
+                # still refuse a path that escapes the sandbox root.
                 fp = (Path(sandbox_dir) / str(p).lstrip("/")).resolve()
+                if fp != _sb_root and not str(fp).startswith(str(_sb_root) + "/"):
+                    missing.append(p)
+                    continue
             if not fp.exists() or not fp.is_file():
                 missing.append(p)
+                continue
+            # Reject an oversized file BEFORE read_text pulls it all into
+            # memory (the total-chars cap downstream can't help post-read).
+            if fp.stat().st_size > _MAX_SOURCE_FILE_BYTES:
+                missing.append(f"{p} (too large, >{_MAX_SOURCE_FILE_BYTES // (1024*1024)} MB)")
                 continue
             text = fp.read_text(encoding="utf-8", errors="replace")
         except Exception:
@@ -188,6 +201,11 @@ def _normalise_sections(sections: Any, body: Any, content: Any) -> list[dict]:
                 sections = parsed
             elif isinstance(parsed, dict):
                 sections = [parsed]
+
+    # A native dict (single section) arrives directly under a JSON transport —
+    # wrap it so it isn't rejected as "missing" when the string form is handled.
+    if isinstance(sections, dict):
+        sections = [sections]
 
     if isinstance(sections, list) and sections:
         out = []
@@ -258,11 +276,12 @@ def _build_html(title: str, subtitle: str, author: str, sections: list[dict]) ->
     return "".join(parts)
 
 
-def _render_to_pdf(full_html: str, out_path: Path) -> int:
+def _render_to_pdf(full_html: str, out_path: Path) -> "tuple[int, bool]":
     """Render ``full_html`` into a multi-page A4 PDF at ``out_path``.
 
     Uses ``fitz.Story`` + ``fitz.DocumentWriter`` to flow arbitrary
-    HTML across as many pages as needed. Returns the page count.
+    HTML across as many pages as needed. Returns ``(page_count, truncated)``
+    where ``truncated`` is True when the 200-page safety cap cut content off.
     Raises on a hard render failure — the caller wraps the exception
     into a SYSTEM ERROR string for the LLM."""
     import fitz  # PyMuPDF
@@ -274,6 +293,7 @@ def _render_to_pdf(full_html: str, out_path: Path) -> int:
     writer = fitz.DocumentWriter(str(out_path))
     pages = 0
     more = True
+    truncated = False
     try:
         while more:
             dev = writer.begin_page(mediabox)
@@ -282,10 +302,11 @@ def _render_to_pdf(full_html: str, out_path: Path) -> int:
             writer.end_page()
             pages += 1
             if pages > 200:            # safety cap
+                truncated = more  # content remained → the PDF is cut short
                 break
     finally:
         writer.close()
-    return pages
+    return pages, truncated
 
 
 _SAFE_FILENAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -421,7 +442,7 @@ async def tool_generate_pdf(
 
     full_html = _build_html(title, subtitle, author, secs)
     try:
-        pages = await asyncio.to_thread(_render_to_pdf, full_html, out_path)
+        pages, _pdf_truncated = await asyncio.to_thread(_render_to_pdf, full_html, out_path)
     except ImportError as e:
         return (
             f"SYSTEM ERROR: PDF engine unavailable ({e}). PyMuPDF (fitz) is "
@@ -437,10 +458,20 @@ async def tool_generate_pdf(
             pass
         return f"SYSTEM ERROR: PDF render failed: {type(e).__name__}: {e}"
 
-    size_kb = out_path.stat().st_size / 1024
+    # stat() is outside the render try/except — guard it so a "successful"
+    # render that produced no file surfaces a clean error, not a raw crash.
+    try:
+        size_kb = out_path.stat().st_size / 1024
+    except OSError as e:
+        return f"SYSTEM ERROR: PDF render reported success but the file is missing ({e})."
     _miss_note = (
         f"\n\n(Note: {len(file_missing)} source file(s) could not be read and "
         f"were skipped: {file_missing}.)" if file_missing else ""
+    )
+    _trunc_note = (
+        "\n\n⚠️ The document exceeded the 200-page safety cap and was TRUNCATED — "
+        "content is missing. Split it into multiple reports or shorten the input."
+        if _pdf_truncated else ""
     )
     return (
         f"SUCCESS: PDF report generated ({pages} page(s), {size_kb:.1f} KB). "
@@ -448,5 +479,5 @@ async def tool_generate_pdf(
         "to the user by including this exact markdown so the file is "
         f"offered for download:\n\n"
         f"[📄 {title} (PDF)](/api/download/{download_rel})"
-        f"{_miss_note}"
+        f"{_miss_note}{_trunc_note}"
     )

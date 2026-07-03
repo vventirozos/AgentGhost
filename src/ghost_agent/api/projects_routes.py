@@ -192,6 +192,9 @@ async def list_events(pid: str, request: Request,
     store = _store(request)
     if not store.get_project(pid):
         raise HTTPException(404, "project not found")
+    # Clamp: a negative limit means "no limit" in SQLite (unbounded response)
+    # and a huge value floods memory/context.
+    limit = max(1, min(int(limit), 1000))
     return {"events": store.list_events(pid, limit=limit, event_type=type)}
 
 

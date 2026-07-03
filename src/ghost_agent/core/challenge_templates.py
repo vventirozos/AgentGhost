@@ -304,7 +304,11 @@ with open("data.csv", "r") as f:
             continue
         totals[row["category"]] += v
 
-expected = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+# Sort by the ROUNDED (displayed) total, not the raw float — otherwise two
+# groups that print the same 2-decimal value but differ in float noise are
+# ordered by that invisible difference, and a solver that sorts by the printed
+# value produces a different (correct) line order that gets marked FAILED.
+expected = sorted(totals.items(), key=lambda kv: (-round(kv[1], 2), kv[0]))
 expected_lines = [f"{cat}: {total:.2f}" for cat, total in expected]
 
 result = subprocess.run(

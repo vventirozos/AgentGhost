@@ -236,8 +236,11 @@ class TaskTree:
                 self._check_parent_completion(parent.parent_id, visited)
 
         elif parent.dependency_type == DependencyType.BEST:
-            # All children must be terminal (DONE or FAILED), then pick best
-            terminal = {TaskStatus.DONE, TaskStatus.FAILED}
+            # All children must be terminal, then pick best. BLOCKED counts as
+            # terminal — a BEST child whose own subtree failed (no alternatives)
+            # is BLOCKED, and excluding it left a BEST parent unresolvable
+            # forever even when a SIBLING child finished DONE.
+            terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.BLOCKED}
             if child_statuses and all(s in terminal for s in child_statuses):
                 done_children = [
                     self.nodes[cid] for cid in parent.children
@@ -285,11 +288,22 @@ class TaskTree:
                         # the parent would hang forever even after the
                         # alternative succeeds. The nodes stay in
                         # self.nodes for history; they just stop counting.
-                        parent.children = [
+                        _unlinked = [
                             cid for cid in parent.children
-                            if cid not in self.nodes
-                            or self.nodes[cid].status not in failed_statuses
+                            if cid in self.nodes
+                            and self.nodes[cid].status in failed_statuses
                         ]
+                        parent.children = [
+                            cid for cid in parent.children if cid not in _unlinked
+                        ]
+                        # Also clear the unlinked child's parent_id. The store
+                        # persists ONLY parent_id and rebuilds `children` from it
+                        # on reload, so a failed child left pointing at the parent
+                        # re-links after any restart → the ALL parent becomes
+                        # unsatisfiable again (FAILED child back in the rollup),
+                        # defeating alternative recovery across sessions.
+                        for _cid in _unlinked:
+                            self.nodes[_cid].parent_id = None
                         # Integrate the alternative into the parent's children
                         # so completion/failure cascading sees it.
                         if alt_id not in parent.children:
@@ -310,11 +324,13 @@ class TaskTree:
             # Otherwise, some children are still running — don't block yet
 
         elif parent.dependency_type == DependencyType.BEST:
-            # Don't block until all children are terminal
-            terminal = {TaskStatus.DONE, TaskStatus.FAILED}
+            # Don't block until all children are terminal. BLOCKED counts as
+            # terminal (a child whose subtree failed) — otherwise a BEST parent
+            # with a BLOCKED child never resolves even when a sibling is DONE.
+            terminal = {TaskStatus.DONE, TaskStatus.FAILED, TaskStatus.BLOCKED}
             if child_statuses and all(s in terminal for s in child_statuses):
-                # If all failed, parent fails
-                if all(s == TaskStatus.FAILED for s in child_statuses):
+                # If all failed/blocked, parent fails
+                if all(s in {TaskStatus.FAILED, TaskStatus.BLOCKED} for s in child_statuses):
                     parent.status = TaskStatus.FAILED
                     parent.failure_reason = "All BEST-dependency children failed"
                     self._check_parent_failure(parent.parent_id, visited)
@@ -764,12 +780,20 @@ class ProjectPlan:
 
         def ancestor_blocked(node: TaskNode) -> bool:
             cur = node
+            # visited-set guard: a parent_id cycle (A→B→A — the store
+            # explicitly treats these as reachable) would otherwise spin this
+            # loop forever and hang next_ready_leaf. Every other traversal in
+            # this file already guards against cycles; this one didn't.
+            seen = {cur.id}
             while cur.parent_id:
                 parent = self.tree.nodes.get(cur.parent_id)
                 if not parent:
                     return False
                 if parent.status in blocking:
                     return True
+                if parent.id in seen:
+                    return False  # cycle — stop rather than loop
+                seen.add(parent.id)
                 cur = parent
             return False
 

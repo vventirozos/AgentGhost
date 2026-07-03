@@ -16,16 +16,36 @@ class ProfileMemory:
         _default = {"root": {"name": "User"}, "relationships": {}, "interests": {}, "assets": {}}
         with self._lock:
             try:
-                return json.loads(self.file_path.read_text())
+                data = json.loads(self.file_path.read_text(encoding="utf-8"))
+                # A valid-JSON-but-wrong-TYPE file (e.g. a list or a scalar)
+                # would break every caller (data[cat] = {}). Treat it as corrupt.
+                if not isinstance(data, dict):
+                    raise ValueError(f"profile is a {type(data).__name__}, expected object")
+                return data
             except FileNotFoundError:
                 return dict(_default)
             except Exception as e:
-                # A corrupt profile would otherwise silently revert the
-                # user's identity to the default — and the next save() would
-                # overwrite the real file. Surface it on the monitored stream.
-                pretty_log("Profile Corrupt",
-                           f"{type(e).__name__}: {e}; reverting to default identity",
-                           icon=Icons.USER_ID, level="WARNING")
+                # A corrupt profile would otherwise silently revert the user's
+                # identity to the default — and the next save() would OVERWRITE
+                # the real file, destroying the facts (and any forensic copy).
+                # Preserve the bad file as a timestamped sidecar first (same
+                # discipline as journal.py / frontier.py).
+                try:
+                    import time as _time
+                    sidecar = self.file_path.with_suffix(f".corrupt-{int(_time.time())}.json")
+                    if self.file_path.exists():
+                        os.replace(self.file_path, sidecar)
+                        pretty_log("Profile Corrupt",
+                                   f"{type(e).__name__}: {e}; preserved at {sidecar.name}, "
+                                   "reverting to default identity",
+                                   icon=Icons.USER_ID, level="WARNING")
+                    else:
+                        pretty_log("Profile Corrupt", f"{type(e).__name__}: {e}",
+                                   icon=Icons.USER_ID, level="WARNING")
+                except Exception:
+                    pretty_log("Profile Corrupt",
+                               f"{type(e).__name__}: {e}; could not preserve, reverting to default",
+                               icon=Icons.USER_ID, level="WARNING")
                 return dict(_default)
 
     def save(self, data: Dict[str, Any]):

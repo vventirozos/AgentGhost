@@ -43,8 +43,6 @@ def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
     """
     if not tor_proxy:
         return None
-    if "127.0.0.1" in url or "localhost" in url:
-        return None
     try:
         import urllib.parse
         import ipaddress
@@ -53,15 +51,21 @@ def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
         if not url.startswith("http://") and not url.startswith("https://"):
             url = "http://" + url
 
-        hostname = urllib.parse.urlparse(url).hostname
+        # Check the parsed HOSTNAME, not a substring of the whole URL — the
+        # old `"localhost" in url` shortcut bypassed Tor for a PUBLIC host like
+        # `http://localhost.attacker.example/` (real-IP leak).
+        hostname = (urllib.parse.urlparse(url).hostname or "").lower()
         if hostname:
-            if hostname.endswith(".local"):
-                return None
-            ip = ipaddress.ip_address(hostname)
-            if not ip.is_global:
-                return None
-    except ValueError:
-        # Non-IP hostname (or unparseable): fall through and route via Tor.
+            if hostname == "localhost" or hostname.endswith(".local"):
+                return None  # local name → bypass Tor (can't route via exit anyway)
+            try:
+                ip = ipaddress.ip_address(hostname)
+                if not ip.is_global:
+                    return None  # loopback / private / link-local → bypass Tor
+            except ValueError:
+                # Non-IP public hostname: route via Tor.
+                pass
+    except Exception:
         pass
     return tor_proxy.replace("socks5://", "socks5h://")
 
@@ -377,15 +381,25 @@ class LLMClient:
         if not getattr(self, 'swarm_clients', []):
             return None
 
+        # Consult the circuit breaker on the target-model match too — the
+        # ONLY thing get_swarm_node was missing vs the vision/worker/coding
+        # selectors. Without it a dead swarm node stayed in round-robin
+        # rotation forever, eating a full 300 s timeout on every cycle. (The
+        # round-robin fallback when a target_model isn't matched is deliberate
+        # best-effort — same as the sibling selectors.)
         if target_model:
             target_lower = target_model.lower()
             for node in self.swarm_clients:
-                if target_lower in node["model"].lower():
+                if target_lower in node["model"].lower() and self.circuit_breaker.is_available(node["url"]):
                     return node
 
-        node = self.swarm_clients[self._swarm_index]
-        self._swarm_index = (self._swarm_index + 1) % len(self.swarm_clients)
-        return node
+        for _ in range(len(self.swarm_clients)):
+            node = self.swarm_clients[self._swarm_index]
+            self._swarm_index = (self._swarm_index + 1) % len(self.swarm_clients)
+            if self.circuit_breaker.is_available(node["url"]):
+                return node
+        # All nodes tripped — return the current one anyway (call fails, cooldown extends).
+        return self.swarm_clients[self._swarm_index]
 
     def get_vision_node(self, target_model: Optional[str] = None) -> Optional[Dict[str, Any]]:
         vision_clients = getattr(self, 'vision_clients', [])
@@ -525,11 +539,18 @@ class LLMClient:
                 pretty_log("Image Compute", f"Routing to Image Node ({node['model']})", level="INFO", icon=Icons.IMAGE_GEN)
                 resp = await node["client"].post("/v1/images/generations", json=payload)
                 resp.raise_for_status()
+                # Record breaker success/failure like every other node path —
+                # without it the image-gen breaker never trips, so
+                # get_image_gen_node's is_available() filtering was dead code
+                # and a dead image node stayed selected across every request.
+                if node.get("url"):
+                    self.circuit_breaker.record_success(node["url"])
                 return resp.json()
             except Exception as e:
+                if node.get("url"):
+                    self.circuit_breaker.record_failure(node["url"])
                 if attempt < 2:
                     pretty_log("Image Node Retry", f"Attempt {attempt+1} failed: {type(e).__name__}: {e}", level="WARNING", icon=Icons.WARN)
-                    #pretty_log("Image Node Retry", f"Attempt {attempt+1} failed: {type(e).__name__}, retrying...", level="WARNING", icon=Icons.WARN)
                     await asyncio.sleep(2 ** attempt)
                     # Try to get next node if possible
                     node = self.get_image_gen_node()

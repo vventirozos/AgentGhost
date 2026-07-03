@@ -2634,6 +2634,13 @@ Return ONLY a JSON object with:
             isolated_context.profile_memory = None
             isolated_context.scheduler = None
             isolated_context.journal = None  # Prevent fake post-mortems from leaking to the real Hippocampus
+            # Same reason: the synthetic solver's handle_chat turns must NOT be
+            # appended to the production trajectory log — those fake trajectories
+            # were otherwise mined for auto-macros and consumed by the Reflector/
+            # PRM, poisoning the learning signal with self-play noise. Null the
+            # collector (and the episodic store, defense-in-depth) on the isolate.
+            isolated_context.trajectory_collector = None
+            isolated_context.episodic_memory = None
             isolated_context.memory_system = ReadOnlyVectorMemory(self.context.memory_system)
             isolated_context.skill_memory = ReadOnlySkillMemory(self.context.skill_memory)
             isolated_context.graph_memory = ReadOnlyGraphMemory(getattr(self.context, 'graph_memory', None))
@@ -3610,6 +3617,21 @@ Return ONLY a JSON object with:
                         f"pattern_len={len(fix)} conf={conf_val:.2f}",
                         icon=Icons.TOOL_DEEP,
                     )
+                    # Fill an EMPTY domains list from the challenge's cluster
+                    # BEFORE the generalization guard runs — the extractor is
+                    # told an empty list is acceptable, but the guard rejects
+                    # "domains empty", and the old cluster-key fill ran only
+                    # AFTER the guard (inside `if lesson_is_viable`), so it was
+                    # dead: a complete lesson with a valid cluster_key was
+                    # silently dropped.
+                    if lesson_is_viable and not (learned_lesson.get("domains") or []):
+                        _fill = []
+                        if journal_source and challenge_domains:
+                            _fill = list(challenge_domains)
+                        elif cluster_key:
+                            _fill = [cluster_key]
+                        if _fill:
+                            learned_lesson["domains"] = _fill
                     if lesson_is_viable:
                         guard_ok, guard_reason = self._generalization_guard(
                             learned_lesson,

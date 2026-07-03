@@ -69,15 +69,27 @@ class MemoryBus:
 
     @staticmethod
     def _fact_signature(event_type: str, fact_data: Dict[str, Any]) -> str:
-        """Stable hash of the event type + fact payload, used for dedup."""
+        """Stable hash of the event type + fact payload, used for dedup.
+
+        Excludes ``metadata.timestamp`` — a fresh microsecond value on every
+        call that otherwise makes every publish's signature unique, so the
+        dedup LRU never fired (the exact 9x-repeat loop it exists to stop
+        published all 9 times). Dedup must key on the fact CONTENT, not the
+        write time."""
+        stable = fact_data
+        if isinstance(fact_data, dict) and isinstance(fact_data.get("metadata"), dict):
+            stable = dict(fact_data)
+            stable["metadata"] = {
+                k: v for k, v in fact_data["metadata"].items() if k != "timestamp"
+            }
         try:
             blob = json.dumps(
-                {"event_type": event_type, "fact": fact_data},
+                {"event_type": event_type, "fact": stable},
                 sort_keys=True,
                 default=str,
             )
         except Exception:
-            blob = f"{event_type}:{repr(fact_data)}"
+            blob = f"{event_type}:{repr(stable)}"
         return hashlib.md5(blob.encode("utf-8")).hexdigest()
 
     def _seen_recently(self, sig: str) -> bool:
@@ -151,13 +163,18 @@ class MemoryBus:
         if not query or not str(query).strip():
             return ""
 
-        # Adaptive budget: scale based on query complexity
+        # Adaptive budget: scale UP for complex queries — but never BELOW the
+        # 6000 default. Flooring at the default is what makes this adaptive:
+        # the sole prod caller passes context_budget=4000, so `min(4000, 12000)`
+        # gave complex queries 4000 chars while simple ones kept 6000 — the
+        # exact inversion the docstring says it prevents ("complex research
+        # tasks starved"). max(context_budget, 6000) fixes the direction.
         if context_budget > 0:
             query_words = len(query.split())
             if query_words > 30:
-                max_chars = min(context_budget, 12000)
+                max_chars = min(max(context_budget, 6000), 12000)
             elif query_words > 15:
-                max_chars = min(context_budget, 9000)
+                max_chars = min(max(context_budget, 6000), 9000)
             # else: keep default 6000
 
         # RAG-Fusion: decompose into sub-queries for broader coverage
@@ -382,7 +399,11 @@ class MemoryBus:
         wmap = weight_overrides or cls._INTENT_WEIGHTS
         weights = wmap.get(intent, wmap.get("contextual", cls._INTENT_WEIGHTS["contextual"]))
         # Map source names to their weights. Sources: vector, graph, skill
-        _source_order = ["vector", "graph", "skill"]
+        # Positional fallback for a source-less ranked list. hydrate_context
+        # passes FOUR lists (vector, graph, skill, episodic) — the 3-entry
+        # order left index 3 (episodic) falling back to "vector", weighting it
+        # wrong if an episodic item ever lacked its "source" key.
+        _source_order = ["vector", "graph", "skill", "episodic"]
 
         scores: Dict[Tuple[str, str], float] = {}
         index: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -530,6 +551,13 @@ class MemoryBus:
         swallowed so a single failing subsystem can't break a publish.
         """
         results: Dict[str, Any] = {}
+
+        # Guard a None/non-dict payload up front — otherwise the first fan-out
+        # coroutine's fact_data.get(...) raises AttributeError, which
+        # gather(return_exceptions=True) swallows, so the caller can't tell the
+        # write was dropped.
+        if not isinstance(fact_data, dict):
+            return {"error": f"publish_fact requires a dict payload, got {type(fact_data).__name__}"}
 
         # --- DEDUP: refuse duplicate publishes within an LRU window. The
         # production loop bug fired the same update_profile event 9× in

@@ -119,6 +119,13 @@ _SCRATCH_NAMES = {".ds_store", "thumbs.db", ".browser_runner.py"}
 _SCRATCH_SUFFIXES = {".pyc", ".pyo", ".log", ".tmp", ".bak", ".swp", ".swo"}
 _SCRATCH_PREFIXES = ("temp_", "tmp_", "scratch_", "debug_")
 
+# Dotfiles that are legitimate project deliverables/config — NOT debris.
+_KEEP_DOTFILES = frozenset({
+    ".htaccess", ".env", ".env.example", ".gitignore", ".gitattributes",
+    ".dockerignore", ".editorconfig", ".npmrc", ".nvmrc", ".babelrc",
+    ".eslintrc", ".prettierrc", ".flaskenv",
+})
+
 
 def _is_debris(rel: str) -> bool:
     """True for a project-relative path that is categorically transient —
@@ -131,7 +138,10 @@ def _is_debris(rel: str) -> bool:
     name = parts[-1].lower()
     if name in _SCRATCH_NAMES:
         return True
-    if name.startswith("."):                      # dotfiles / dot-runners
+    # Dotfiles are debris EXCEPT well-known config/deliverable dotfiles — a web
+    # build's `.htaccess`, a `.env`, or a `.gitignore` are real deliverables and
+    # were being deleted by the no-registration recovery path.
+    if name.startswith(".") and name not in _KEEP_DOTFILES:
         return True
     if name.startswith(_SCRATCH_PREFIXES):
         return True

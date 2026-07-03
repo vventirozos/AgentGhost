@@ -87,14 +87,19 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
     if default_uri and _supplied_conn and _supplied_conn != default_uri:
         try:
             from urllib.parse import urlparse
-            _sup_host = (urlparse(_supplied_conn).hostname or "").lower()
-            _def_host = (urlparse(default_uri).hostname or "").lower()
+            _sup, _def = urlparse(_supplied_conn), urlparse(default_uri)
         except Exception:
             return "Error: could not parse the supplied connection_string."
-        if _sup_host != _def_host:
+        # Compare host + port + dbname, not just host: a same-host override
+        # with a different port/database would otherwise connect to a
+        # DIFFERENT Postgres instance/database, escaping the intended scope.
+        _sup_key = ((_sup.hostname or "").lower(), _sup.port or 5432, (_sup.path or "").lstrip("/"))
+        _def_key = ((_def.hostname or "").lower(), _def.port or 5432, (_def.path or "").lstrip("/"))
+        if _sup_key != _def_key:
             return (
-                f"Error: refused connection to host {_sup_host!r}; only the "
-                f"configured database host {_def_host!r} is allowed. Omit "
+                f"Error: refused connection to {_sup_key[0]}:{_sup_key[1]}/{_sup_key[2]!r}; "
+                f"only the configured database "
+                f"{_def_key[0]}:{_def_key[1]}/{_def_key[2]!r} is allowed. Omit "
                 f"connection_string to use the default."
             )
 
@@ -201,6 +206,18 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
                 if not rows: return "Query executed successfully. No rows returned."
                 truncated = len(rows) > 300
                 output = tabulate(rows[:300], headers="keys", tablefmt="pipe")
+                # Byte cap: the 300-ROW limit gives no protection against a
+                # single huge cell (e.g. SELECT repeat('x', 1e8)) — the whole
+                # value would materialise into the model context / host memory.
+                _MAX_OUTPUT_CHARS = 200_000
+                if len(output) > _MAX_OUTPUT_CHARS:
+                    output = (
+                        output[:_MAX_OUTPUT_CHARS]
+                        + f"\n\n[... result truncated at {_MAX_OUTPUT_CHARS} chars "
+                        "(a cell or the row set was very large). Narrow the "
+                        "SELECT columns or add a LIMIT.]"
+                    )
+                    return output
                 if truncated:
                     # We can't cheaply get the true total without
                     # `SELECT COUNT(*)` reissue against an arbitrary
@@ -218,7 +235,7 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
                 return output
             return "Query executed successfully. No rows returned."
         else:
-            return f"Unknown action: {action}"
+            return f"Error: Unknown action: {action}"
 
     # psycopg2's connection-level exception types. Resolved defensively:
     # under test doubles these attributes may not be real exception

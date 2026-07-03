@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -74,6 +75,28 @@ def _cap_step_result(result_str: str, limit: int = MAX_STEP_RESULT_CHARS) -> str
         f"…[truncated {dropped} chars — this step's full output exceeded the "
         f"{limit}-char per-step cap; re-run this step's tool standalone to get "
         f"the complete result]"
+    )
+
+
+def _step_result_ok(result_str: str) -> bool:
+    """Classify a step's RESULT as success/failure.
+
+    Tools in this codebase RETURN error strings (``"[error] …"``,
+    ``"Error: …"``, ``"[SYSTEM ERROR] …"``, ``"SYSTEM BLOCK …"``) rather than
+    raising, so a macro that only checks "did the executor raise" records an
+    all-failed run as a success (inflating success_rate and telling the LLM the
+    macro worked). Mirror the acquired-skill result gate: inspect the string.
+    """
+    s = str(result_str or "").lstrip()
+    if not s:
+        return True  # empty output is not an error
+    if "[SYSTEM ERROR]" in s or "SYSTEM BLOCK" in s or "Critical Tool Error" in s:
+        return False
+    m = re.search(r"EXIT CODE:\s*(\d+)", s)
+    if m:
+        return m.group(1) == "0"
+    return not s.startswith(
+        ("[error]", "Error", "ERROR", "SYSTEM ERROR", "Traceback")
     )
 
 
@@ -152,6 +175,7 @@ class ComposedSkillRegistry:
     def __init__(self, storage_dir: Optional[Path] = None):
         self.storage_dir = storage_dir
         self.skills: Dict[str, ComposedSkill] = {}
+        self._save_lock = threading.Lock()
         if storage_dir:
             self._load()
 
@@ -166,7 +190,13 @@ class ComposedSkillRegistry:
         try:
             with open(path, "r") as f:
                 data = json.load(f)
-            for name, skill_data in data.items():
+        except Exception as exc:
+            logger.warning("Failed to load composed skills: %s", exc)
+            return
+        # Per-entry try so ONE malformed macro doesn't drop every macro
+        # defined after it (single outer try aborted the whole load).
+        for name, skill_data in (data or {}).items():
+            try:
                 steps = [
                     SkillStep(**{k: v for k, v in s.items() if k in SkillStep.__dataclass_fields__})
                     for s in skill_data.get("steps", [])
@@ -189,25 +219,33 @@ class ComposedSkillRegistry:
                     last_used=skill_data.get("last_used", 0),
                     created_at=skill_data.get("created_at", time.time()),
                 )
-        except Exception as exc:
-            logger.warning("Failed to load composed skills: %s", exc)
+            except Exception as exc:
+                logger.warning("Skipping malformed composed skill %r: %s", name, exc)
 
     def save(self):
-        """Persist composed skills to disk."""
+        """Persist composed skills to disk. Atomic (temp + os.replace) under a
+        lock so a concurrent dream-cycle register / a macro's record_usage save
+        can't interleave and truncate/corrupt the registry file."""
         if not self.storage_dir:
             return
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         path = self._registry_path()
         try:
             data = {name: skill.to_dict() for name, skill in self.skills.items()}
-            with open(path, "w") as f:
-                json.dump(data, f, indent=2, default=str)
+            with self._save_lock:
+                tmp = path.with_suffix(".json.tmp")
+                with open(tmp, "w") as f:
+                    json.dump(data, f, indent=2, default=str)
+                os.replace(tmp, path)
         except Exception as exc:
             logger.warning("Failed to save composed skills: %s", exc)
 
     def register(self, skill: ComposedSkill) -> bool:
         """Register a new composed skill."""
-        if len(self.skills) >= self.MAX_SKILLS:
+        # Only evict when ADDING a genuinely new name — re-registering an
+        # existing macro doesn't grow the count, so it must not evict a
+        # bystander.
+        if skill.name not in self.skills and len(self.skills) >= self.MAX_SKILLS:
             # Evict proposed (unapproved) drafts before any active macro,
             # then by lowest usage — so a flood of auto-proposals can never
             # push out a macro the user actually approved or uses.
@@ -329,7 +367,10 @@ class ComposedSkillRegistry:
         resolved_args = {}
         for k, v in step.param_template.items():
             if isinstance(v, str) and v.startswith("$"):
-                resolved_args[k] = params.get(v[1:], v)
+                # Resolve $var against runtime params. An UNresolved template
+                # must become "" (a missing value), not the literal "$var" —
+                # otherwise the step tool receives e.g. location="$city".
+                resolved_args[k] = params.get(v[1:], "")
             else:
                 resolved_args[k] = v
         return resolved_args
@@ -373,22 +414,44 @@ class ComposedSkillRegistry:
 
         active_steps = list(skill.steps)
         step_idx = 0
+        # Bound total step executions so a self-referential branch (hand-
+        # authored/loaded branches JSON) can't loop forever issuing tool calls.
+        _MAX_STEP_EXECUTIONS = 64
+        _executions = 0
 
         while step_idx < len(active_steps):
+            if _executions >= _MAX_STEP_EXECUTIONS:
+                results.append({
+                    "step": "(aborted)", "tool": "-",
+                    "error": f"step-execution cap ({_MAX_STEP_EXECUTIONS}) hit — "
+                             "possible branch loop.",
+                    "success": False,
+                })
+                success = False
+                break
+            _executions += 1
             step = active_steps[step_idx]
             resolved_args = self._resolve_args(step, params)
 
             try:
                 result = await executor(step.tool_name, resolved_args)
                 result_str = str(result)
+                # Classify from the RESULT (tools return error strings, not raises).
+                step_ok = _step_result_ok(result_str)
                 results.append({
                     "step": step.description,
                     "tool": step.tool_name,
                     "result": _cap_step_result(result_str),
-                    "success": True,
+                    "success": step_ok,
                 })
+                if not step_ok:
+                    if not step.optional:
+                        success = False
+                        break
+                    step_idx += 1
+                    continue
 
-                # Check branch condition
+                # Check branch condition (only on a genuinely successful step)
                 if step.branch_condition and step.branch_condition.lower() in result_str.lower():
                     branch_steps = skill.branches.get(step.branch_target, [])
                     if branch_steps:
@@ -432,11 +495,14 @@ class ComposedSkillRegistry:
             resolved_args = self._resolve_args(step, params)
             try:
                 result = await executor(step.tool_name, resolved_args)
+                result_str = str(result)
+                # Classify from the RESULT — tools return error strings.
                 return {
                     "step": step.description,
                     "tool": step.tool_name,
-                    "result": _cap_step_result(str(result)),
-                    "success": True,
+                    "result": _cap_step_result(result_str),
+                    "success": _step_result_ok(result_str),
+                    "optional": step.optional,
                 }
             except Exception as exc:
                 return {
@@ -673,7 +739,7 @@ async def tool_manage_composed_skills(context=None, action: str = None,
     if reg is None:
         return ("SYSTEM ERROR: composed-skill storage is unavailable "
                 "(no sandbox/memory dir on the active context).")
-    action = action.strip().lower()
+    action = str(action).strip().lower()  # str() so a non-string can't raise
 
     if action == "list":
         if not reg.skills:
@@ -737,9 +803,15 @@ async def tool_manage_composed_skills(context=None, action: str = None,
             name = _validate_composed_name(name)
         except ValueError as ve:
             return f"Error: {ve}"
+        # Reject a name that shadows a built-in / acquired tool: the runner
+        # wiring skips such a macro (the built-in wins), so persisting it and
+        # telling the model "it's now a TOP-LEVEL TOOL" is a lie.
+        if known_tools and name in known_tools:
+            return (f"Error: '{name}' is already a built-in/acquired tool; a "
+                    "composed skill can't shadow it. Choose a different name.")
         if not isinstance(steps, list) or not steps:
             return "Error: 'steps' must be a non-empty list of step objects."
-        mode = (mode or "parallel").strip().lower()
+        mode = str(mode or "parallel").strip().lower()
         if mode not in ("parallel", "sequential"):
             return "Error: 'mode' must be 'parallel' or 'sequential'."
 

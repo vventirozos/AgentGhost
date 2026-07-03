@@ -187,12 +187,10 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     if filename.startswith("#") or filename.lower().startswith("title:") or (" " in filename and "." not in filename):
         return f"Error: You passed the document CONTENT or TITLE ('{filename[:30]}...'). You MUST pass the FILENAME (e.g. 'romeo_source.txt')."
 
-    # OS limit usually 255, we use 240 to be safe
+    # OS limit usually 255, we use 240 to be safe. (The old `> 2000` branch
+    # below this was dead — `> 240` always returns first — and had a typo.)
     if len(filename) > 240:
-        return f"Error: Filename is tool long ({len(filename)} chars). Max length is 240 characters. Did you accidentally pass the content?"
-
-    if len(filename) > 2000:
-        return "Error: Path is too long."
+        return f"Error: Filename is too long ({len(filename)} chars). Max length is 240 characters. Did you accidentally pass the content?"
 
     pretty_log("Ingesting Data", filename, icon=Icons.MEM_INGEST)
     if not memory_system: return "Error: Memory system is disabled."
@@ -322,7 +320,11 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     # Stream the file in chunks rather than `f.read()` so we
                     # can enforce the text-size cap without materialising the
                     # whole file in memory first.
-                    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    # utf-8-sig strips a BOM (a leading U+FEFF would otherwise
+                    # pollute the first chunk/embedding); errors="replace" keeps
+                    # a non-UTF-8 file's mangling visible rather than silently
+                    # dropped by errors="ignore".
+                    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
                         while running_len < MAX_INGEST_TEXT_CHARS:
                             chunk = f.read(min(65536, MAX_INGEST_TEXT_CHARS - running_len))
                             if not chunk:
@@ -347,8 +349,13 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
 
     pretty_log("KB Embed", f"{len(chunks)} fragments", icon=Icons.MEM_EMBED)
     try:
-        # Offload ingestion to vector system logic (which now handles enrichment and batching)
-        await asyncio.to_thread(memory_system.ingest_document, filename, chunks)
+        # Offload ingestion to vector system logic (which now handles enrichment and batching).
+        # ingest_document RETURNS (ok, msg) — it swallows internal Chroma/embedding
+        # failures and returns (False, err) rather than raising, so a failed ingest
+        # must be caught HERE or the tool falsely reports SUCCESS with nothing stored.
+        _ingest_res = await asyncio.to_thread(memory_system.ingest_document, filename, chunks)
+        if isinstance(_ingest_res, tuple) and _ingest_res and not _ingest_res[0]:
+            return f"Embedding Error: {_ingest_res[1] if len(_ingest_res) > 1 else 'ingest failed'}"
         preview = full_text[:300].replace("\n", " ") + "..."
     except Exception as e: return f"Embedding Error: {e}"
 
@@ -514,9 +521,17 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         # being passed without parens, leaving the method un-invoked).
         all_sources = set(await asyncio.to_thread(lambda: memory_system.get_library()))
         
-        # Look for a fuzzy match in filenames
+        # Look for a fuzzy match in filenames. Guard against over-deletion:
+        # a 1-2 char stem ("a") as a bare substring matched nearly EVERY
+        # document (mass wipe), and the reverse `source in target_stem`
+        # direction was nonsensical. Match the disk sweep's discipline —
+        # require >=3 chars for substring matching (against the basename),
+        # and for a shorter stem only an EXACT filename-stem match.
         target_stem = Path(target).stem.lower()
-        fuzzy_matches = [s for s in all_sources if target_stem in s.lower() or s.lower() in target_stem]
+        if len(target_stem) >= 3:
+            fuzzy_matches = [s for s in all_sources if target_stem in Path(s).name.lower()]
+        else:
+            fuzzy_matches = [s for s in all_sources if Path(s).stem.lower() == target_stem]
         for match in fuzzy_matches:
             await asyncio.to_thread(memory_system.delete_document_by_name, match)
             report.append(f"✅ Vector: Wiped document '{match}'.")
@@ -710,11 +725,22 @@ async def tool_scratchpad(action: str = None, scratchpad: Scratchpad = None, key
     pretty_log(log_title, log_content, icon=icon)
     if not scratchpad:
         return "Error: Scratchpad memory is not initialized."
+    action = str(action).strip().lower()
     if action == "set":
+        # A key is required — set(None, ...) stores under key None and the
+        # SQLite error is swallowed, reporting a no-op as success.
+        if not key:
+            return "SYSTEM ERROR: 'key' is required for scratchpad set."
         return scratchpad.set(key, value)
     elif action == "get":
+        if not key:
+            return "SYSTEM ERROR: 'key' is required for scratchpad get."
         val = scratchpad.get(key)
-        return f"{key} = {val}" if val else f"Error: '{key}' not found."
+        # Distinguish "stored a falsy value (0/''/False)" from "missing" —
+        # `if val` reported a legit 0/""/[] as not-found.
+        if val is None:
+            return f"Error: '{key}' not found."
+        return f"{key} = {val}"
     elif action == "list":
         return scratchpad.list_all()
     elif action == "clear":

@@ -196,7 +196,10 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     except Exception:
         done_tasks = []
     if done_tasks:
-        done_tasks = sorted(done_tasks, key=lambda t: t.get("updated_at", 0),
+        # `t.get("updated_at", 0)` still yields None when the key is present
+        # with a null value → sorted() raises TypeError (None < int) and breaks
+        # the WHOLE system-prompt build for the turn. Coerce null to 0.
+        done_tasks = sorted(done_tasks, key=lambda t: (t.get("updated_at") or 0),
                             reverse=True)
         shown = done_tasks[:max_done_tasks]
         lines.append(

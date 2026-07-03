@@ -30,17 +30,25 @@ def _clamp(value, default: int) -> int:
     return min(n, _MAX_LIMIT)
 
 
+def _sev_str(rep) -> str:
+    # severity may be None on a corrupt/hand-edited JSONL record; f"{None:.2f}"
+    # raises TypeError, which (inside the outer try) hid the ENTIRE queue.
+    try:
+        return f"{float(rep.severity):.2f}"
+    except (TypeError, ValueError):
+        return "?.??"
+
+
 def _fmt_short(rep) -> str:
-    sev = f"{rep.severity:.2f}"
     title = rep.title or "(untitled)"
-    return f"  [{rep.status}] {rep.category} · sev {sev} · {rep.id[:8]} — {title}"
+    return f"  [{rep.status}] {rep.category} · sev {_sev_str(rep)} · {rep.id[:8]} — {title}"
 
 
 def _fmt_full(rep) -> str:
     lines = [
         f"Defect {rep.id[:12]} [{rep.status}]",
         f"  category : {rep.category}",
-        f"  severity : {rep.severity:.2f}",
+        f"  severity : {_sev_str(rep)}",
         f"  title    : {rep.title or '(untitled)'}",
         f"  evidence : {rep.evidence}",
         f"  root cause: {rep.root_cause}",
@@ -85,7 +93,7 @@ async def tool_postmortem(
             "--postmortem to file defect reports on bad runs."
         )
 
-    act = (action or "pending").strip().lower()
+    act = str(action or "pending").strip().lower()  # str() so a non-string can't raise
     if act not in _VALID_ACTIONS:
         return f"Unknown action '{action}'. Valid: {', '.join(sorted(_VALID_ACTIONS))}."
 

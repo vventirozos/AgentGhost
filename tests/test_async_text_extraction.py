@@ -78,8 +78,9 @@ async def test_tool_gain_knowledge_async_extraction_text(tmp_path):
         # Run tool
         await tool_gain_knowledge(filename, sandbox_dir, mock_memory)
         
-        # Verify open was used
-        mock_file_open.assert_called_with(file_path, "r", encoding="utf-8", errors="ignore")
+        # Verify open was used (utf-8-sig strips a BOM; errors="replace" keeps
+        # non-UTF-8 mangling visible rather than silently dropped).
+        mock_file_open.assert_called_with(file_path, "r", encoding="utf-8-sig", errors="replace")
         
         # Verify to_thread was called
         assert mock_to_thread.call_count >= 2

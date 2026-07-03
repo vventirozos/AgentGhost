@@ -4,6 +4,21 @@ import json
 import threading
 from typing import Dict, Any, Optional
 
+
+def _coerce_params(params) -> dict:
+    """Normalise qwen-agent's `params` (a JSON string or a dict) into a dict
+    without raising: a non-str/non-dict or malformed JSON string yields {} so
+    the bridge returns a clean tool error rather than an uncaught exception."""
+    if isinstance(params, dict):
+        return params
+    if isinstance(params, str):
+        try:
+            parsed = json.loads(params)
+            return parsed if isinstance(parsed, dict) else {}
+        except (ValueError, TypeError):
+            return {}
+    return {}
+
 try:
     from qwen_agent.tools.base import BaseTool, register_tool
 except ModuleNotFoundError as _qwen_import_err:  # pragma: no cover — defensive
@@ -177,8 +192,7 @@ class GhostFileSystem(BaseTool):
     ]
 
     def call(self, params: str | dict, **kwargs) -> str | list | dict:
-        if isinstance(params, str):
-            params = json.loads(params)
+        params = _coerce_params(params)
 
         # Named/known params extracted explicitly so they always reach the
         # native handler under the canonical name (defends against the
@@ -270,8 +284,7 @@ class GhostExecute(BaseTool):
     ]
 
     def call(self, params: str | dict, **kwargs) -> str | list | dict:
-        if isinstance(params, str):
-            params = json.loads(params)
+        params = _coerce_params(params)
 
         command = params.get('command')
         filename = params.get('filename')
@@ -329,8 +342,7 @@ class GhostKnowledgeBase(BaseTool):
     ]
 
     def call(self, params: str | dict, **kwargs) -> str | list | dict:
-        if isinstance(params, str):
-            params = json.loads(params)
+        params = _coerce_params(params)
 
         action = params.get('action')
         content = params.get('content')

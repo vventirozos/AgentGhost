@@ -26,6 +26,7 @@ def _make_agent_with_tracker(tmp_path, idle_seconds=4000):
 
     ctx.llm_client = MagicMock()
     ctx.llm_client.foreground_tasks = 0
+    ctx.llm_client.foreground_requests = 0  # HARD LOCK also gates on this now
 
     ctx.memory_system = MagicMock()
     ctx.memory_system.collection.get.return_value = {"ids": []}

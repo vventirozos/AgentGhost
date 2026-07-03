@@ -28,7 +28,11 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
     payload = {
         "messages": [
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"INSTRUCTION:\n{instruction}\n\nINPUT DATA:\n{input_data[:20000]}"}
+            # str() so a non-string input_data (a JSON number/object that
+            # passed the truthiness check) doesn't TypeError on the slice —
+            # in fire-and-forget mode that exception is never retrieved and
+            # the output_key would silently never be written.
+            {"role": "user", "content": f"INSTRUCTION:\n{instruction}\n\nINPUT DATA:\n{str(input_data)[:20000]}"}
         ],
         "temperature": 0.0,
         "max_tokens": 2048
@@ -48,7 +52,7 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
             node = llm_client.get_swarm_node(target_model)
         if not node:
             scratchpad.set(output_key, "SYSTEM ALERT: Swarm execution failed. No cluster nodes available.")
-            return
+            return False
 
         client = node["client"]
         model_name = node["model"]
@@ -58,7 +62,10 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
             resp = await client.post("/v1/chat/completions", json=payload, timeout=300.0)
             resp.raise_for_status()
             data = resp.json()
-            result_text = data["choices"][0]["message"].get("content", "").strip()
+            # `.get("content", "")` returns None when the key is present but
+            # null (some nodes emit that) → None.strip() would raise and the
+            # task would falsely retry as if the node were down.
+            result_text = (data["choices"][0]["message"].get("content") or "").strip()
 
             # Record success with circuit breaker if available
             cb = getattr(llm_client, 'circuit_breaker', None)
@@ -70,7 +77,7 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
                 pretty_log("Swarm Task", f"Completed '{output_key}' on node {model_name} (after {attempt} retries)", icon=Icons.OK)
             else:
                 pretty_log("Swarm Task", f"Completed '{output_key}' on node {model_name}", icon=Icons.OK)
-            return
+            return True
 
         except Exception as e:
             last_error = e
@@ -87,6 +94,7 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
                 pretty_log("Swarm Task Failed", f"All {MAX_RETRIES + 1} attempts failed: {e}", level="WARNING", icon=Icons.WARN)
 
     scratchpad.set(output_key, f"SYSTEM ALERT: Swarm execution failed after {MAX_RETRIES + 1} attempts ({last_error}). The edge node is offline. You must process this data yourself synchronously.")
+    return False
 
 async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks: list = None, instruction: str = None, input_data: str = None, output_key: str = None, worker_persona: str = None, await_results: bool = False, **kwargs):
     """Dispatch tasks to the background swarm.
@@ -106,7 +114,11 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
         return "Error: Scratchpad memory is not initialized."
 
     if getattr(llm_client, 'swarm_clients', None) is None or len(llm_client.swarm_clients) == 0:
-        return "SYSTEM WARNING: The Swarm Cluster is not configured (no --swarm-nodes provided). Do not use this tool anymore. You MUST process this task synchronously in your main context."
+        # "Error:" prefix (not "SYSTEM WARNING") so the agent loop's failure
+        # classifier registers this as a failure and the delegate_to_swarm
+        # fallback-hint fires — a "SYSTEM WARNING" prefix was treated as
+        # SUCCESS, so the model got no strike and no "process synchronously" hint.
+        return "Error: The Swarm Cluster is not configured (no --swarm-nodes provided). Do not use this tool anymore. You MUST process this task synchronously in your main context."
 
     if tasks is None:
         tasks = []
@@ -131,6 +143,13 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
     dispatched_tasks: list[asyncio.Task] = []
     dispatched_keys: list[str] = []
     for task_def in tasks:
+        # A non-dict task (e.g. the model passed tasks=["do X"]) would raise
+        # AttributeError on .get and crash the whole dispatch — skip it.
+        if not isinstance(task_def, dict):
+            pretty_log("Swarm Skip", f"Skipping non-object task: {task_def!r}", level="WARNING", icon=Icons.WARN)
+            skipped += 1
+            invalid.append(f"non-object task {task_def!r}")
+            continue
         t_instruction = task_def.get("instruction")
         t_input_data = task_def.get("input_data")
         t_output_key = task_def.get("output_key")
@@ -192,29 +211,40 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
         dispatched += 1
 
     if dispatched == 0:
+        # "Error:" prefix so the agent loop registers a failure (not a silent
+        # success) and the fallback hint fires.
         return (
-            f"SYSTEM WARNING: 0 of {len(tasks)} task(s) dispatched to the Swarm "
+            f"Error: 0 of {len(tasks)} task(s) dispatched to the Swarm "
             f"(reasons: {', '.join(invalid) if invalid else 'unknown'}). "
             f"You MUST process this synchronously — do not wait on the SCRAPBOOK."
         )
 
     # If the caller asked us to block, gather and report aggregated results.
+    # _swarm_worker returns True on success, False on failure (it never
+    # raises and writes a SCRAPBOOK alert on failure), so a False result is a
+    # real per-task FAILURE — not the "OK" it used to be reported as.
     if await_results and dispatched_tasks:
         gathered = await asyncio.gather(*dispatched_tasks, return_exceptions=True)
         result_lines = []
+        n_ok = 0
         for tid, res in zip(dispatched_keys, gathered):
             if isinstance(res, BaseException):
                 result_lines.append(f"  {tid}: ERROR {type(res).__name__}: {res}")
+            elif res is False:
+                result_lines.append(f"  {tid}: FAILED (a SYSTEM ALERT was written to its SCRAPBOOK key — process it yourself)")
             else:
+                n_ok += 1
                 result_lines.append(f"  {tid}: OK")
+        n_fail = dispatched - n_ok
         body = "\n".join(result_lines) if result_lines else "(no results)"
-        prefix = (
-            f"SUCCESS: {dispatched}/{len(tasks)} task(s) completed (await_results=True)."
-        )
-        if skipped > 0:
+        if n_fail == 0 and skipped == 0:
+            prefix = f"SUCCESS: {n_ok}/{len(tasks)} task(s) completed (await_results=True)."
+        else:
             prefix = (
-                f"PARTIAL: {dispatched}/{len(tasks)} task(s) completed; "
-                f"{skipped} skipped ({', '.join(invalid)})."
+                f"PARTIAL: {n_ok}/{len(tasks)} task(s) completed"
+                + (f", {n_fail} FAILED" if n_fail else "")
+                + (f", {skipped} skipped ({', '.join(invalid)})" if skipped else "")
+                + "."
             )
         return f"{prefix}\nTask IDs:\n{body}\nResults written to SCRAPBOOK at the requested output_key(s)."
 

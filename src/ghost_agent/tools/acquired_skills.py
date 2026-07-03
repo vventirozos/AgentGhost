@@ -218,7 +218,7 @@ class AcquiredSkillManager:
             except Exception:
                 return {}
 
-    def save_skill(self, name: str, description: str, parameters_schema: dict, python_code: str):
+    def save_skill(self, name: str, description: str, parameters_schema: dict, python_code: str) -> bool:
         try:
             # Hard-fail on traversal-shaped or separator-bearing names
             # BEFORE any write. See `_validate_skill_name` for the
@@ -232,7 +232,7 @@ class AcquiredSkillManager:
                     f"Unsafe skill name: {name!r}. Must be an identifier.",
                     level="WARNING", icon=Icons.SHIELD,
                 )
-                return
+                return False
 
             import hashlib as _hashlib
             import json as _json
@@ -252,8 +252,13 @@ class AcquiredSkillManager:
                 logger.error(
                     f"Skill path {skill_path} escapes skills_dir {skills_dir_resolved}; refusing write"
                 )
-                return
-            skill_path.write_text(python_code, encoding="utf-8")
+                return False
+            # Atomic write (temp + os.replace): a concurrent runner reading the
+            # canonical file during an overwrite must not see a partial file.
+            import os as _os
+            _tmp = skill_path.with_suffix(".py.tmp")
+            _tmp.write_text(python_code, encoding="utf-8")
+            _os.replace(_tmp, skill_path)
 
             # 2. Add/Update the JSON registry
             with self._lock:
@@ -284,9 +289,11 @@ class AcquiredSkillManager:
                 
             logger.info(f"Successfully saved acquired skill: {name}")
             pretty_log("SKILL ACQUIRED", f"Permanently learned new tool: {name}", icon=Icons.MEM_SAVE)
-                
+            return True
+
         except Exception as e:
             logger.error(f"Failed to save acquired skill {name}: {e}")
+            return False
 
     def get_all_skills(self) -> dict:
         """Reads and returns the active registry."""
@@ -359,6 +366,7 @@ class AcquiredSkillManager:
             retired_dir.mkdir(parents=True, exist_ok=True)
 
             for name in to_retire:
+                _fail_n = registry.get(name, {}).get("failure_count", "?")
                 # Move the code file to retired/
                 skill_path = self.skills_dir / f"{name}.py"
                 if skill_path.exists():
@@ -382,7 +390,7 @@ class AcquiredSkillManager:
                 retired_names.append(name)
                 pretty_log(
                     "Skill Retired",
-                    f"Auto-retired degraded skill '{name}' (failures={to_retire})",
+                    f"Auto-retired degraded skill '{name}' (failures={_fail_n})",
                     level="WARNING", icon="🗄️"
                 )
                 logger.info(f"Auto-retired skill '{name}'")
@@ -590,7 +598,14 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     # rather than the raw LLM input, so the canonical .py file on
     # disk always parses. Future loaders that read the skill back
     # don't re-run the sanitizer.
-    mgr.save_skill(name, description, schema_dict, normalized_code)
+    # save_skill returns False when the name was rejected or the write failed;
+    # don't report a LIVE tool the model then can't actually call.
+    if not mgr.save_skill(name, description, schema_dict, normalized_code):
+        return (
+            f"SYSTEM ERROR: skill '{name}' passed its test run but could NOT be "
+            "persisted (unsafe name or a storage error). It is NOT available as a "
+            "tool. Check the name is a plain identifier and retry."
+        )
 
     # Pair with `_RequestState.invalidate_tool_defs()` — the agent loop
     # drops its cached schema list immediately after this tool returns,
@@ -612,8 +627,20 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
 async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, memory_system=None, action: str = None, skill_name: str = None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
+    action = str(action).strip().lower()
     storage_base = Path(memory_dir) if memory_dir is not None else Path(sandbox_dir)
     mgr = AcquiredSkillManager(storage_base, memory_system, legacy_sandbox_dir=sandbox_dir)
+    # Close the degraded-skill retirement loop: a skill that failed 3× is
+    # flagged "degraded" but then excluded from advertising/dispatch, so
+    # log_telemetry can never fire for it again and nothing else called
+    # retire_degraded_skills — degraded skills lingered in the list forever.
+    # Sweep them here whenever the agent manages skills. Best-effort.
+    try:
+        _retired = mgr.retire_degraded_skills()
+        if _retired:
+            logger.info("Retired %d degraded skill(s): %s", len(_retired), _retired)
+    except Exception as _re:
+        logger.debug("retire_degraded_skills skipped: %s", _re)
     if action == "list":
         skills = mgr.get_all_skills()
         if not skills:

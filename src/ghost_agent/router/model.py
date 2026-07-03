@@ -355,6 +355,21 @@ class ComplexityClassifier:
         clf.bias_ = float(raw["bias"])
         names = tuple(raw.get("feature_names") or FEATURE_NAMES)
         clf.feature_names_ = names
+        # Validate the persisted feature schema against the CURRENT one. Only
+        # the schema string was checked before, so a checkpoint written under
+        # a reordered/renamed feature set (same length) loaded clean and
+        # predict_proba dotted old-order weights against new-order feature
+        # vectors → silently wrong routing. A length mismatch would instead
+        # raise deep inside np.dot at serve time. Fail loud here so the boot
+        # loader falls back to the safe escalate-all dispatcher and retrains.
+        if names != tuple(FEATURE_NAMES) or clf.weights_.shape[0] != len(FEATURE_NAMES):
+            raise ValueError(
+                f"router checkpoint at {p} was trained on a different feature "
+                f"schema (checkpoint has {len(names)} features "
+                f"{'in a different order ' if len(names) == len(FEATURE_NAMES) else ''}"
+                f"vs current {len(FEATURE_NAMES)}) — refusing to load a "
+                "misaligned model; it will be retrained."
+            )
         if raw.get("report"):
             clf.report_ = TrainingReport(**raw["report"])
         # Reject a persisted NaN/inf checkpoint (e.g. one written by a

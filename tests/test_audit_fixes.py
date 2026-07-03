@@ -190,6 +190,7 @@ async def test_biological_watchdog_dream_cooldown_blocks_back_to_back():
     ctx.args.use_planning = False
     ctx.llm_client = MagicMock()
     ctx.llm_client.foreground_tasks = 0
+    ctx.llm_client.foreground_requests = 0  # HARD LOCK also gates on this now
     ctx.profile_memory = MagicMock()
     ctx.scratchpad = MagicMock()
     ctx.skill_memory = None

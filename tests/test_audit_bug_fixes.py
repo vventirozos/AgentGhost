@@ -369,8 +369,9 @@ async def test_bug9_pdf_uses_requested_filename(tmp_path, monkeypatch):
     from ghost_agent.tools import report_pdf
 
     # Stub the renderer so the test doesn't depend on PyMuPDF.
+    # _render_to_pdf now returns (pages, truncated).
     monkeypatch.setattr(report_pdf, "_render_to_pdf",
-                        lambda html, out_path: (out_path.write_bytes(b"%PDF-1.7\n"), 1)[1])
+                        lambda html, out_path: (out_path.write_bytes(b"%PDF-1.7\n"), (1, False))[1])
 
     result = await report_pdf.tool_generate_pdf(
         title="Test",
@@ -387,7 +388,7 @@ async def test_bug9_pdf_rejects_unsafe_filename(tmp_path, monkeypatch):
     from ghost_agent.tools import report_pdf
 
     monkeypatch.setattr(report_pdf, "_render_to_pdf",
-                        lambda html, out_path: 1)
+                        lambda html, out_path: (1, False))
 
     result = await report_pdf.tool_generate_pdf(
         title="T",

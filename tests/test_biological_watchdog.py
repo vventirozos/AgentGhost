@@ -11,6 +11,7 @@ from ghost_agent.core.agent import GhostAgent, GhostContext
 
 def _make_agent(idle_seconds: int = 0,
                 foreground_tasks: int = 0,
+                foreground_requests: int = 0,
                 with_journal: bool = False,
                 journal_items: int = 0,
                 memory_ids: int = 0):
@@ -25,6 +26,10 @@ def _make_agent(idle_seconds: int = 0,
 
     ctx.llm_client = MagicMock()
     ctx.llm_client.foreground_tasks = foreground_tasks
+    # The HARD LOCK now defers on an in-flight user REQUEST too, not just an
+    # in-flight LLM call. A bare MagicMock would auto-return a truthy
+    # foreground_requests and trip the gate — set it explicitly.
+    ctx.llm_client.foreground_requests = foreground_requests
 
     ctx.memory_system = MagicMock()
     ctx.memory_system.collection.get.return_value = {

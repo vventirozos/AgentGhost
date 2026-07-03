@@ -71,7 +71,9 @@ async def test_tool_delegate_to_swarm_safeguard_missing_cluster():
     mock_llm.swarm_clients = [] # No swarm clients!
     
     result = await tool_delegate_to_swarm(mock_llm, "test-model", MagicMock(), tasks=[{"instruction": "x", "input_data": "y", "output_key": "z"}])
-    assert "SYSTEM WARNING: The Swarm Cluster is not configured" in result
+    # "Error:" prefix (was "SYSTEM WARNING") so the loop treats it as a failure.
+    assert result.startswith("Error")
+    assert "The Swarm Cluster is not configured" in result
 
 
 @pytest.mark.asyncio

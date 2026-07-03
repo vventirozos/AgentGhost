@@ -20,6 +20,16 @@ logger = logging.getLogger("GhostAgent")
 
 router = APIRouter()
 
+
+def _log_internal_error(context_label: str) -> str:
+    """Log the current exception under a short correlation id and return the
+    id. The wire response gets only the id — never the raw exception text —
+    so a malformed-input repro can't reveal internal paths / URLs / Python
+    error internals to the client."""
+    eid = uuid.uuid4().hex[:8]
+    logger.error("[err_id=%s] internal error in %s", eid, context_label, exc_info=True)
+    return eid
+
 API_KEY_NAME = "X-Ghost-Key"
 api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
 
@@ -46,8 +56,13 @@ async def verify_api_key(request: Request, api_key: str = Security(api_key_heade
     configured = agent.context.args.api_key
     if configured:
         # Constant-time comparison to avoid a timing side-channel that
-        # could let an attacker recover the key byte-by-byte.
-        if not api_key or not secrets.compare_digest(str(api_key), str(configured)):
+        # could let an attacker recover the key byte-by-byte. Compare as
+        # BYTES: compare_digest raises TypeError on a non-ASCII str, which
+        # would surface as a 500 (and a logged traceback) instead of a clean
+        # 403 for an attacker-controlled header value.
+        _supplied = str(api_key or "").encode("utf-8", "ignore")
+        _expected = str(configured).encode("utf-8", "ignore")
+        if not api_key or not secrets.compare_digest(_supplied, _expected):
             # Surface auth failures on the monitored stream (brute-force /
             # misconfigured client). Never log the key bytes.
             pretty_log("Auth Rejected", f"path={request.url.path}",
@@ -153,8 +168,9 @@ async def api_generate(request: Request):
         resp.raise_for_status()
         llm_resp = resp.json()
         content = llm_resp["choices"][0]["message"]["content"]
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, 500)
+    except Exception:
+        _eid = _log_internal_error("api_generate")
+        return JSONResponse({"error": f"internal error (error_id={_eid})"}, 500)
 
     if stream:
          async def generator():
@@ -352,11 +368,12 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                         content_started = True
                         yield chunk
             except Exception as e:
-                logger.error(f"Streaming error in chat_proxy: {type(e).__name__}: {e}", exc_info=True)
-                # Always emit the SSE `event: error` frame so clients
-                # can detect the failure programmatically.
-                err_msg = f"CRITICAL SERVER ERROR: {str(e)}"
-                error_event = {"error": {"message": err_msg, "type": type(e).__name__}}
+                # Opaque error id on the wire (matches the non-streaming path) —
+                # the raw str(e) leaked upstream URLs / file paths / Python
+                # internals to the client on the DEFAULT (streaming) chat path.
+                _eid = _log_internal_error("chat_proxy (streaming)")
+                err_msg = f"internal server error (error_id={_eid})"
+                error_event = {"error": {"message": err_msg, "type": "InternalError"}}
                 yield f"event: error\ndata: {json.dumps(error_event)}\n\n".encode('utf-8')
                 # Only emit a content chunk for visual display when
                 # NO content has streamed yet — otherwise it gets
@@ -548,10 +565,35 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
     agent = get_agent(request)
     sandbox_dir = agent.context.sandbox_dir.resolve()
     zip_bytes = await _read_capped(file)
-    
+    # Uncompressed-output ceiling — the 100 MB _read_capped bound is on the
+    # COMPRESSED input; without this a ~100 MB zip-of-zeroes inflates to tens
+    # of GB and OOMs the process / fills the disk (decompression bomb).
+    _MAX_UNCOMPRESSED = 500 * 1024 * 1024
+
     try:
         with zipfile.ZipFile(io.BytesIO(zip_bytes), "r") as zip_ref:
-            # 1. Clear sandbox safely (Preserve permanent skills)
+            # VALIDATE FIRST, wipe second. Previously the sandbox was cleared
+            # before session.json was parsed, so a malformed session.json (or
+            # any mid-extraction error) destroyed the workspace with no
+            # rollback. Do all fallible parsing/size-checking up front.
+            total_uncompressed = sum(max(0, zi.file_size) for zi in zip_ref.infolist())
+            if total_uncompressed > _MAX_UNCOMPRESSED:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"Archive inflates to {total_uncompressed // (1024*1024)} MB; "
+                           f"cap is {_MAX_UNCOMPRESSED // (1024*1024)} MB.",
+                )
+            session_data = None
+            for zip_info in zip_ref.infolist():
+                if zip_info.filename == "session.json":
+                    try:
+                        session_data = json.loads(zip_ref.read(zip_info.filename).decode("utf-8"))
+                    except (ValueError, UnicodeDecodeError):
+                        raise HTTPException(status_code=400, detail="session.json is not valid JSON")
+                    break
+
+            # 1. Clear sandbox safely (Preserve permanent skills) — only AFTER
+            # the archive validated above.
             for item in sandbox_dir.iterdir():
                 if item.name == "acquired_skills":
                     continue
@@ -559,40 +601,45 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
                     shutil.rmtree(item, ignore_errors=True)
                 else:
                     item.unlink(missing_ok=True)
-            
-            # 2. Extract state and files
+
+            # 2. Restore session state.
             chat_history = []
-            for zip_info in zip_ref.infolist():
-                if zip_info.filename == "session.json":
-                    session_data = json.loads(zip_ref.read(zip_info.filename).decode("utf-8"))
-                    chat_history = session_data.get("chat_history", [])
-                    scratchpad_data = session_data.get("scratchpad", {})
-                    
-                    if getattr(agent.context, 'scratchpad', None):
-                        agent.context.scratchpad.clear()
+            if session_data is not None:
+                chat_history = session_data.get("chat_history", [])
+                scratchpad_data = session_data.get("scratchpad", {})
+                if getattr(agent.context, 'scratchpad', None):
+                    agent.context.scratchpad.clear()
+                    if isinstance(scratchpad_data, dict):
                         for k, v in scratchpad_data.items():
                             agent.context.scratchpad.set(k, v)
-                elif zip_info.filename.startswith("sandbox/"):
-                    rel_path = zip_info.filename[len("sandbox/"):]
-                    if not rel_path:
-                        continue
-                    extracted_path = (sandbox_dir / rel_path).resolve()
-                    # Security constraint: Prevent zip-slip traversal attacks
-                    # (relative_to-based; rejects sibling-dir prefix escapes).
-                    if not _is_within(sandbox_dir, extracted_path):
-                        continue
-                    
-                    if zip_info.is_dir():
-                        extracted_path.mkdir(parents=True, exist_ok=True)
-                    else:
-                        extracted_path.parent.mkdir(parents=True, exist_ok=True)
-                        extracted_path.write_bytes(zip_ref.read(zip_info.filename))
-                        
+
+            # 3. Extract files.
+            for zip_info in zip_ref.infolist():
+                if not zip_info.filename.startswith("sandbox/"):
+                    continue
+                rel_path = zip_info.filename[len("sandbox/"):]
+                if not rel_path:
+                    continue
+                extracted_path = (sandbox_dir / rel_path).resolve()
+                # Prevent zip-slip traversal (relative_to-based; rejects
+                # sibling-dir prefix escapes).
+                if not _is_within(sandbox_dir, extracted_path):
+                    continue
+                if zip_info.is_dir():
+                    extracted_path.mkdir(parents=True, exist_ok=True)
+                else:
+                    extracted_path.parent.mkdir(parents=True, exist_ok=True)
+                    extracted_path.write_bytes(zip_ref.read(zip_info.filename))
+
         return {"status": "success", "chat_history": chat_history}
+    except HTTPException:
+        raise
     except zipfile.BadZipFile:
         raise HTTPException(status_code=400, detail="Invalid zip file format")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        # Don't leak internal exception text to the client.
+        _eid = _log_internal_error("workspace/load")
+        raise HTTPException(status_code=500, detail=f"Workspace load failed (error id {_eid}).")
 
 @router.post("/api/memory/correct", dependencies=[Security(verify_api_key)])
 async def memory_correct(request: Request):

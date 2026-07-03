@@ -957,6 +957,18 @@ def _looks_like_failure(output: str) -> bool:
     s = str(output).strip()
     if not s:
         return True
+    # The `execute` tool signals failure with a BANNER, not an error-prefixed
+    # first line: "--- EXECUTION RESULT ---\nEXIT CODE: 1\n...". Only checking
+    # the first line classified a failed build/verify command as a SUCCESS and
+    # marked its task DONE with a broken deliverable (the "theatrical
+    # completion" this subsystem exists to prevent). Detect a non-zero EXIT
+    # CODE and the [SYSTEM ERROR] sentinel anywhere in the result.
+    import re as _re
+    _m = _re.search(r"EXIT CODE:\s*(\d+)", s)
+    if _m:
+        return _m.group(1) != "0"
+    if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
+        return True
     first = s.splitlines()[0].strip().lower()
     # Some tool failures surface as a stringified exception tuple, e.g.
     # "('error sending request for url ...', '...')". The leading "('" hid the

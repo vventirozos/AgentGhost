@@ -393,7 +393,7 @@ class TestBiologicalHookCooldownAnchor_C3:
         ctx = MagicMock()
         ctx.memory_system = MagicMock()
         ctx.memory_system.collection.get = MagicMock(return_value={"ids": []})
-        ctx.llm_client = MagicMock(foreground_tasks=0)
+        ctx.llm_client = MagicMock(foreground_tasks=0, foreground_requests=0)
         ctx.frontier_tracker = FrontierTracker(tmp_path)
         ctx.last_activity_time = datetime.datetime.now() - datetime.timedelta(hours=2)
         ctx.args = MagicMock(model="default")

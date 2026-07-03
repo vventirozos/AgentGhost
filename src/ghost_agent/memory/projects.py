@@ -705,6 +705,10 @@ class ProjectStore:
             if not row:
                 return False
             project_id = row["project_id"]
+            # `visited` guards against a parent_id CYCLE (e.g. A→B→A, or a
+            # self-parent) — without it the BFS re-appends the same ids
+            # forever and `to_delete` grows without bound (hang/OOM).
+            visited = {task_id}
             to_delete = [task_id]
             frontier = [task_id]
             while frontier:
@@ -714,8 +718,12 @@ class ProjectStore:
                         "SELECT id FROM tasks WHERE parent_id = ?", (tid,)
                     ).fetchall()
                     for cr in child_rows:
-                        to_delete.append(cr["id"])
-                        nxt.append(cr["id"])
+                        cid = cr["id"]
+                        if cid in visited:
+                            continue
+                        visited.add(cid)
+                        to_delete.append(cid)
+                        nxt.append(cid)
                 frontier = nxt
             conn.executemany(
                 "DELETE FROM tasks WHERE id = ?",

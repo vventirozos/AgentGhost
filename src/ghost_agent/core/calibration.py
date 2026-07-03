@@ -438,6 +438,13 @@ def _best_threshold(pairs: List[Tuple[float, float]]) -> float:
         if j > best_j or (abs(j - best_j) < 1e-9 and tau > best_tau):
             best_j = j
             best_tau = tau
+    # Documented fallback (was missing): if no threshold beats the trivial
+    # classifier (Youden J <= 0 — the composite is uncorrelated with outcome,
+    # i.e. the miscalibrated case this exists to catch), the loop would pick a
+    # DEGENERATE rail (τ=1.0 via the higher-tie-break → "below" ALWAYS True, or
+    # τ=0.0 → always False). Return the neutral 0.5 instead.
+    if best_j <= 1e-9:
+        return 0.5
     return _clamp01(best_tau)
 
 

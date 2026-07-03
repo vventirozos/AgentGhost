@@ -1283,21 +1283,39 @@ def extract_json_from_text(text: str, repair_truncated: bool = False) -> dict:
     silent extraction failures in production logs.
     """
     import re, json, ast
+    # Contract: return {} on EVERY failure mode. A non-str input (e.g. a
+    # backend that returned `content: null`) must not raise out of the
+    # re.sub below, which runs before the try/except guard.
+    if not isinstance(text, str):
+        return {}
     # Qwen Syntax Healing: Fix {"name"="tool"...} or {"name"= "tool"...} hallucinations.
     # Also heal `"key"=` → `"key":` for ANY field, not just `name` (the previous
     # version only fixed the `name` field).
     text = re.sub(r'(?<=[{,\s])"([\w_]+)"\s*=\s*', r'"\1": ', text)
+
+    # Match a quoted string literal OR a bare JSON keyword. Strings are the
+    # first alternative, so a `true`/`false`/`null` INSIDE a string is
+    # consumed as part of the string match and never rewritten — the old
+    # `\btrue\b` sweep corrupted keyword-like words inside value strings
+    # despite the comment claiming otherwise.
+    _JSON_KW_RE = re.compile(
+        r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\b(?P<kw>true|false|null)\b'''
+    )
+    _KW_MAP = {"true": "True", "false": "False", "null": "None"}
+
+    def _kw_sub(m):
+        kw = m.group("kw")
+        return _KW_MAP[kw] if kw is not None else m.group(0)
 
     def _parse(t):
         try:
             return json.loads(t, strict=False)
         except json.JSONDecodeError:
             try:
-                # AST Fallback for models that output Python dicts instead of strict JSON
-                # Only replace standalone JSON keywords, not substrings inside strings
-                pt = re.sub(r'\btrue\b', 'True', t)
-                pt = re.sub(r'\bfalse\b', 'False', pt)
-                pt = re.sub(r'\bnull\b', 'None', pt)
+                # AST Fallback for models that output Python dicts instead of
+                # strict JSON. Only the standalone keywords are rewritten;
+                # occurrences inside string literals are left intact.
+                pt = _JSON_KW_RE.sub(_kw_sub, t)
                 res = ast.literal_eval(pt)
                 if isinstance(res, dict): return res
             except Exception as e:
@@ -1954,8 +1972,18 @@ class GhostAgent:
         if not getattr(ctx, 'memory_system', None):
             return
 
-        # HARD LOCK: never interrupt an active LLM generation
-        if getattr(getattr(ctx, 'llm_client', None), 'foreground_tasks', 0) > 0:
+        # HARD LOCK: never interrupt an active LLM generation OR a user
+        # request that is merely paused between its LLM calls.
+        # `foreground_tasks` counts only an in-flight LLM call and momentarily
+        # drops to 0 in the gaps of a live turn; `foreground_requests` spans
+        # the whole request lifecycle (see llm.py and
+        # `_wait_for_foreground_clear`, which waits on BOTH). Gating on tasks
+        # alone let a tick start in that gap — and the synchronous CPU phases
+        # below (skills-auto extract, PRM/router train) would then stall the
+        # event loop mid-request.
+        _lc = getattr(ctx, 'llm_client', None)
+        if (getattr(_lc, 'foreground_tasks', 0) > 0
+                or getattr(_lc, 'foreground_requests', 0) > 0):
             return
 
         # Lazily install per-phase cooldown anchors on the agent instance.
@@ -2031,11 +2059,18 @@ class GhostAgent:
         if 600 < idle_secs <= 3600:
             since_last_dream = (datetime.datetime.now() - self._last_dream_at).total_seconds()
             if since_last_dream >= self._DREAM_COOLDOWN:
-                res = await asyncio.to_thread(
-                    ctx.memory_system.collection.get,
-                    where={"type": "auto"},
-                    limit=5
-                )
+                try:
+                    res = await asyncio.to_thread(
+                        ctx.memory_system.collection.get,
+                        where={"type": "auto"},
+                        limit=5
+                    )
+                except Exception as _cgx:
+                    # A ChromaDB error / locked store must only skip the dream
+                    # eligibility check, not abort the whole tick (which would
+                    # starve phases 2.5–3 for this idle session).
+                    logger.debug("dream eligibility get() failed: %s", _cgx)
+                    res = None
                 if res and len(res.get('ids', [])) >= 3:
                     if random.random() < 0.5:
                         from .dream import Dreamer
@@ -2211,11 +2246,21 @@ class GhostAgent:
                         from ..skills_auto import (
                             extract_candidates, consolidate, verify_candidate,
                         )
-                        trajs = list(traj_collector.iter_trajectories())
+                        # Offload the O(corpus) sync work to a thread: on a
+                        # large trajectory log the iterate + extract + consolidate
+                        # pipeline stalls the event loop for seconds otherwise
+                        # (matching the to_thread pattern phases 2.7c/2.95 use).
+                        trajs = await asyncio.to_thread(
+                            lambda: list(traj_collector.iter_trajectories())
+                        )
                         if trajs:
-                            candidates, report = extract_candidates(trajs, min_support=2)
+                            candidates, report = await asyncio.to_thread(
+                                extract_candidates, trajs, min_support=2
+                            )
                             if candidates:
-                                consolidated, _ = consolidate(candidates)
+                                consolidated, _ = await asyncio.to_thread(
+                                    consolidate, candidates
+                                )
                                 # Graduation (proposal item #9): verify each
                                 # consolidated candidate and persist the ones
                                 # that clear the bar into the durable
@@ -2355,7 +2400,8 @@ class GhostAgent:
                             if base_mem is not None:
                                 save_path = base_mem.parent / "prm" / "checkpoint.json"
                         trainer = PRMTrainer()
-                        report = trainer.run(
+                        report = await asyncio.to_thread(
+                            trainer.run,
                             trajectories=traj_collector.iter_trajectories(),
                             save_path=save_path,
                         )
@@ -2412,7 +2458,8 @@ class GhostAgent:
                             if base_mem is not None:
                                 save_path = base_mem.parent / "router" / "checkpoint.json"
                         trainer = RouterTrainer()
-                        report = trainer.run(
+                        report = await asyncio.to_thread(
+                            trainer.run,
                             trajectories=traj_collector.iter_trajectories(),
                             save_path=save_path,
                         )
@@ -3847,7 +3894,7 @@ class GhostAgent:
 
     async def _compute_verifier_verdict_gated(
         self, *, tools_run_this_turn, messages, final_ai_content,
-        last_user_content, lc, trajectory_id,
+        last_user_content, lc, trajectory_id, conv_fp=None,
     ):
         """Non-blocking front door to ``_compute_verifier_verdict``.
 
@@ -3911,7 +3958,9 @@ class GhostAgent:
         # conversation fingerprint NOW (while its messages are in scope) so a
         # late correction can only surface back in the SAME conversation.
         self._attach_late_verdict_handler(
-            task, trajectory_id, self._conversation_fingerprint(messages),
+            task, trajectory_id,
+            conv_fp if conv_fp is not None
+            else self._conversation_fingerprint(messages),
         )
         return None, last_tool
 
@@ -4031,7 +4080,7 @@ class GhostAgent:
                 icon=Icons.VERIFIER_LAB,
             )
 
-    def _consume_pending_corrections(self, messages):
+    def _consume_pending_corrections(self, messages, conv_fp=None):
         """Stage any correction queued by a previous turn's async verdict so
         it is DETERMINISTICALLY prepended to this turn's reply.
 
@@ -4050,7 +4099,10 @@ class GhostAgent:
             return messages
 
         now = time.monotonic()
-        current_fp = self._conversation_fingerprint(messages)
+        current_fp = (
+            conv_fp if conv_fp is not None
+            else self._conversation_fingerprint(messages)
+        )
         surface = []   # notes belonging to THIS conversation → prepend now
         kept = []      # other conversations' corrections → still fresh, hold
         for c in corrections:
@@ -4065,7 +4117,13 @@ class GhostAgent:
             if (now - c.get("ts", now)) > _CORRECTION_TTL:
                 continue  # expired → drop (its conversation never came back)
             conv = c.get("conv", "")
-            if not conv or (current_fp and conv == current_fp):
+            # A dict correction with an EMPTY conv can't be safely targeted;
+            # per _conversation_fingerprint's own contract (empty → fail-safe
+            # DROP rather than risk cross-posting) it must NOT wildcard-surface
+            # into an unrelated conversation. Require a real match on both
+            # sides. (Bare-string legacy corrections still surface
+            # unconditionally — handled by the isinstance(c, str) path above.)
+            if current_fp and conv and conv == current_fp:
                 surface.append(c.get("note", ""))
             else:
                 kept.append(c)  # a different conversation — leave it queued
@@ -4143,10 +4201,20 @@ class GhostAgent:
                 for m in messages:
                     if isinstance(m.get("content"), str): m["content"] = m["content"].replace("\r", "")
 
+                # Stable per-conversation tag, computed ONCE from the client's
+                # full (un-pruned) history. Both the async-correction consume
+                # below and the late-verdict record deep in the loop use THIS
+                # value, so they agree on the same opener. The record side used
+                # to recompute the fingerprint from the token-pruned loop
+                # `messages`, which diverged from the un-pruned consume side in
+                # long sessions → queued corrections never matched and were
+                # silently dropped.
+                _stable_conv_fp = self._conversation_fingerprint(messages)
+
                 # Async-critic deferred correction: if a prior turn's
                 # post-response verdict refuted that answer, surface the
                 # correction at the top of THIS turn (no-op otherwise).
-                messages = self._consume_pending_corrections(messages)
+                messages = self._consume_pending_corrections(messages, conv_fp=_stable_conv_fp)
 
                 last_user_content_raw = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
                 if isinstance(last_user_content_raw, list):
@@ -6508,7 +6576,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # the caller surface the failure. First event
                             # still gets the old retry path so normal
                             # one-off over-thinking is recoverable.
-                            if thinking_cap_events >= 3:
+                            if thinking_cap_events >= 2:
                                 pretty_log(
                                     "Loop Breaker",
                                     f"Thinking cap hit {thinking_cap_events}x in one attempt — aborting.",
@@ -8226,11 +8294,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _mc = getattr(self.context, "metacog", None)
                             if _mc is not None and getattr(_mc, "enabled", False) and fname:
                                 _lstr = str_res.lstrip()
+                                # Any NON-ZERO exit code is a failure, not just
+                                # 1/2. The old substring check recorded codes
+                                # 3-9 and multi-digit (127, 130, ...) as
+                                # competence SUCCESS, poisoning the per-domain
+                                # profile. Reuse the same regex the execute
+                                # result-classification path below already uses.
+                                _mc_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
                                 _tool_failed = isinstance(result, Exception) or (
                                     _lstr.startswith(("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
                                     or "Traceback" in str_res
-                                    or "EXIT CODE: 1" in str_res
-                                    or "EXIT CODE: 2" in str_res
+                                    or (_mc_exit is not None and int(_mc_exit.group(1)) != 0)
                                 )
                                 _dur = tool_durations[i] if i < len(tool_durations) else None
                                 _bus = getattr(_mc, "bus", None)
@@ -8320,11 +8394,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # call fails with a known error pattern, append a
                             # concrete remediation hint so the LLM has an
                             # actionable next step instead of blindly retrying.
+                            _hint_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
                             if (str_res.lstrip().startswith("Error")
                                     or "Traceback" in str_res
                                     or "SYSTEM ERROR" in str_res
-                                    or "EXIT CODE: 1" in str_res
-                                    or "EXIT CODE: 2" in str_res):
+                                    or (_hint_exit is not None and int(_hint_exit.group(1)) != 0)):
                                 try:
                                     from ..tools.tool_failure import get_fallback_hint
                                     hint = get_fallback_hint(fname, str_res)
@@ -9055,6 +9129,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             last_user_content=last_user_content,
                             lc=lc,
                             trajectory_id=current_trajectory_id,
+                            conv_fp=_stable_conv_fp,
                         )
                     from .verifier import VerifyVerdict
                     # Consumption guard mirrors the original gate exactly: only

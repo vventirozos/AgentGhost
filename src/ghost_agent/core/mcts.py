@@ -363,9 +363,22 @@ class MCTSReasoner:
                         .get("content", "")
                     )
                 data = self._parse_json(text)
-                progress = float(data.get("progress", 0.5))
-                cost = float(data.get("cost", 0.5))
-                risk = float(data.get("risk", 0.5))
+
+                def _unit(v, default=0.5):
+                    # Clamp an LLM-supplied metric to [0,1]; a NaN/out-of-range
+                    # value would otherwise corrupt the ranking sort (NaN
+                    # comparisons make the "best" pick undefined).
+                    try:
+                        f = float(v)
+                    except (TypeError, ValueError):
+                        return default
+                    if f != f:  # NaN
+                        return default
+                    return max(0.0, min(1.0, f))
+
+                progress = _unit(data.get("progress", 0.5))
+                cost = _unit(data.get("cost", 0.5))
+                risk = _unit(data.get("risk", 0.5))
                 # Composite score: maximize progress, minimize cost and risk
                 candidate.score = progress * 0.6 + (1 - cost) * 0.15 + (1 - risk) * 0.25
                 candidate.simulated_outcome = data.get("predicted_outcome", "")

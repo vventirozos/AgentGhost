@@ -609,11 +609,48 @@ class SkillMemory:
                             )
                             return
                 else:
-                    pretty_log(
-                        "SKILL DEDUP",
-                        f"Skipped near-duplicate lesson (dist={duplicate.get('distance', 0):.3f}): {effective_trigger[:30]}...",
-                        icon="🔄",
-                    )
+                    # Vector-dedup path. Previously this just returned, so a
+                    # near-exact re-learn (which ALWAYS hits the vector store
+                    # first) never bumped `frequency` — and graduation needs
+                    # frequency>=5, so lessons never graduated. Bump the
+                    # matching playbook entry (and upgrade verified/confidence)
+                    # just like the JSON-dedup branch does.
+                    with self._get_lock():
+                        playbook = self._load_playbook()
+                        key = _normalize_trigger(effective_trigger or "")
+                        idx = next(
+                            (i for i, p in enumerate(playbook)
+                             if _normalize_trigger(p.get("task") or p.get("trigger") or "") == key),
+                            None,
+                        )
+                        if idx is not None:
+                            existing = _normalize_lesson(playbook[idx])
+                            existing["frequency"] = int(existing.get("frequency") or 1) + 1
+                            if len(effective_correct) > len(existing.get("solution") or ""):
+                                existing["solution"] = effective_correct
+                                existing["correct_pattern"] = effective_correct
+                                existing["code_example"] = _extract_code_block(effective_correct)
+                            if verified and not existing.get("verified"):
+                                existing["verified"] = True
+                                existing["confidence"] = max(
+                                    float(existing.get("confidence") or 0.5),
+                                    min(1.0, float(confidence or 0.5) + 0.2),
+                                )
+                            existing["timestamp"] = _now_iso()
+                            playbook[idx] = existing
+                            self._save_playbook_unlocked(playbook)
+                            pretty_log(
+                                "SKILL REINFORCED",
+                                f"Vector-dedup: bumped lesson freq={existing['frequency']}: {effective_trigger[:30]}...",
+                                icon="🔄",
+                            )
+                        else:
+                            pretty_log(
+                                "SKILL DEDUP",
+                                f"Skipped near-duplicate (dist={duplicate.get('distance', 0):.3f}, "
+                                f"no JSON twin to bump): {effective_trigger[:30]}...",
+                                icon="🔄",
+                            )
                     return
 
             new_lesson = build_lesson(

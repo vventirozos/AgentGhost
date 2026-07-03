@@ -117,11 +117,18 @@ class HypothesisTester:
 
         hypotheses = []
         for h in data.get("hypotheses", []):
+            # Coerce confidence defensively — a non-numeric value (the model
+            # sometimes emits "high") must not raise and discard EVERY
+            # otherwise-valid hypothesis in the list.
+            try:
+                conf = float(h.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                conf = 0.5
             hypotheses.append(Hypothesis(
                 description=h.get("description", ""),
                 test_action=h.get("test_action", ""),
                 test_tool=h.get("test_tool", "execute"),
-                confidence=float(h.get("confidence", 0.5)),
+                confidence=max(0.0, min(1.0, conf)),
             ))
         return hypotheses
 
