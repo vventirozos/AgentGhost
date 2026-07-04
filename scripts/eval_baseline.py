@@ -27,9 +27,12 @@ sys.path.insert(0, str(_REPO_ROOT / "src"))
 from ghost_agent.eval import (  # noqa: E402
     EvalSuite,
     load_default_suite,
+    load_offline_suite,
+    load_capability_suite,
     freeze_baseline,
-    load_baseline,
+    load_baseline_provenance,
     compare_to_baseline,
+    baseline_trust_warnings,
     no_external_network,
 )
 from ghost_agent.eval.tasks import load_post_learning_suite  # noqa: E402
@@ -107,8 +110,8 @@ async def main() -> int:
         parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
         parser.add_argument("--timeout", type=float, default=300.0,
                             help="Per-task wall-clock in seconds. Applied both to the HTTP client and to EvalSuite.per_task_timeout_s. Default 300s — template tasks that trigger multi-turn tool use need more than the 60s default.")
-        parser.add_argument("--suite", choices=("default", "post_learning"), default="default",
-                            help="Which task bank to run. 'default' is the mixed regression+curated+template suite; 'post_learning' targets the file-parsing lesson the reflector has been producing so a compare-to-baseline shows whether the lesson is influencing agent behaviour.")
+        parser.add_argument("--suite", choices=("default", "capability", "offline", "post_learning"), default="default",
+                            help="Which task bank to run. 'capability' = regression+capability+curated (http-scorable, no Docker — use this for a clean live-agent baseline); 'default' adds the challenge-template bank (needs a sandbox-verdict runner or they score unverified); 'offline' = invariant probes only; 'post_learning' targets the reflector's file-parsing lesson.")
 
     p_freeze = sub.add_parser("freeze", help="freeze a new baseline")
     p_freeze.add_argument("--output", type=Path, default=None)
@@ -120,12 +123,34 @@ async def main() -> int:
     p_compare.add_argument("--baseline", type=Path, default=None)
     _runner_flags(p_compare)
 
+    # The offline invariant gate needs NO runner/agent — regression probes
+    # are the whole test. Exits non-zero on any failing invariant.
+    sub.add_parser("gate", help="run the offline invariant gate (no agent needed)")
+
     args = parser.parse_args()
+
+    # ── gate: offline invariant suite, no runner ──────────────────────
+    if args.command == "gate":
+        suite = EvalSuite("ghost-offline-gate", load_offline_suite())
+        result = await suite.run(runner=None, per_task_timeout_s=30.0)
+        n = result.summary.get("n", 0)
+        n_pass = sum(1 for r in result.results if r.passed)
+        print(f"offline invariant gate: {n_pass}/{n} probes passed")
+        fails = [r for r in result.results if not r.passed]
+        for r in fails:
+            print(f"  ✗ {r.task_id}: {r.failure_reason}", file=sys.stderr)
+        return 0 if not fails else 1
 
     suite_name = getattr(args, "suite", "default")
     if suite_name == "post_learning":
         tasks = load_post_learning_suite()
         suite = EvalSuite("ghost-post-learning", tasks)
+    elif suite_name == "offline":
+        tasks = load_offline_suite()
+        suite = EvalSuite("ghost-offline", tasks)
+    elif suite_name == "capability":
+        tasks = load_capability_suite()
+        suite = EvalSuite("ghost-capability", tasks)
     else:
         tasks = load_default_suite()
         suite = EvalSuite("ghost-default", tasks)
@@ -143,15 +168,29 @@ async def main() -> int:
     else:
         runner = _stub_runner
 
+    provenance = {
+        "runner": runner_kind,
+        "model": getattr(args, "model", ""),
+        "suite": suite_name,
+        "trustworthy": runner_kind != "stub",
+    }
+
     if args.command == "freeze":
         out = args.output or _default_baseline_path()
         cm = (no_external_network() if not args.no_network_guard
               else _null_context())
         with cm:
             result = await suite.run(runner=runner, per_task_timeout_s=timeout_s)
-        p = freeze_baseline(result, out)
+        p = freeze_baseline(result, out, provenance=provenance)
         print(f"frozen baseline → {p}")
         print(f"pass_rate={result.summary.get('pass_rate'):.3f}  n={result.summary.get('n')}")
+        if runner_kind == "stub":
+            print(
+                "\n⚠  WARNING: this baseline was frozen with the STUB runner. It is a "
+                "PIPELINE CHECK ONLY, not a capability baseline. Re-run with "
+                "`--runner http` against a live agent before trusting it as a gate.",
+                file=sys.stderr,
+            )
         return 0
 
     if args.command == "compare":
@@ -162,6 +201,11 @@ async def main() -> int:
         with no_external_network():
             result = await suite.run(runner=runner, per_task_timeout_s=timeout_s)
         diff = compare_to_baseline(Path(base_path), result)
+        # Footgun guard: surface any reason this comparison is NOT a
+        # trustworthy capability verdict (a stub on either side, a missing
+        # baseline provenance, a model/suite mismatch).
+        trust_warnings = baseline_trust_warnings(
+            load_baseline_provenance(base_path), provenance)
         print(f"pass_rate_delta={diff['pass_rate_delta']:+.3f}")
         print(f"regressions: {len(diff['regressions'])}")
         for r in diff["regressions"]:
@@ -169,6 +213,12 @@ async def main() -> int:
         print(f"improvements: {len(diff['improvements'])}")
         for i in diff["improvements"]:
             print(f"  + {i['path']} pass_rate {i['baseline']:.3f} → {i['current']:.3f} ({i['delta']:+.3f})")
+        if trust_warnings:
+            print("\n⚠  NOT A TRUSTWORTHY CAPABILITY COMPARISON:", file=sys.stderr)
+            for w in trust_warnings:
+                print(f"   - {w}", file=sys.stderr)
+            # A stub-involved compare must never read as a clean green gate.
+            return 2
         return 0 if not diff["regressions"] else 1
 
     return 2

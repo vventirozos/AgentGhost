@@ -30,7 +30,7 @@ the agent's first action — all without any weight update.
 | Module | Purpose | Wires into |
 |---|---|---|
 | `ghost_agent._env` | Telemetry hardening (single source of truth) | `main.py` import + `probe:telemetry_disabled` |
-| `ghost_agent.eval` | Offline outcome eval harness + network egress guard | CLI `scripts/eval_baseline.py` (`--suite {default,post_learning} --timeout N`) |
+| `ghost_agent.eval` | Trust-aware eval harness (offline invariant gate + online capability baseline) + network egress guard | CLI `scripts/eval_baseline.py` (`gate` \| `freeze`/`compare --suite {default,offline,post_learning} --runner {stub,http}`) |
 | `ghost_agent.distill` | Trajectory JSONL logs + N-sample self-consistency | `$GHOST_HOME/system/trajectories/` |
 | `ghost_agent.router` | Hand-crafted features → numpy logistic regression → dispatch | `core/agent.py::handle_chat` (body\["_router_decision"\]) |
 | `ghost_agent.optim` | DSPy/GEPA prompt optimisation (scope-gated) | Tunes planning / tool-selection / reflection prompts |
@@ -103,10 +103,28 @@ the agent's first action — all without any weight update.
             │
             ▼
      eval/suite.run → SuiteResult → diff vs baseline.json
-       (--suite default        → regression + curated + template bank)
+       (--suite default        → regression + capability + curated + template)
        (--suite post_learning  → 5 file-read-shape prompts that score
                                  "discover before reading" behaviour)
 ```
+
+## One outcome, one source of truth
+
+Every turn produces a single quality verdict via
+`distill.outcome_heuristics.resolve_turn_outcome(current, verifier,
+execution_failed)`, applied in `_record_turn_trajectory` before the trajectory
+is appended. Priority (strongest first): a **structural** execution failure
+(non-zero exit / tool error) is ground truth → FAILED; a **verifier**-REFUTED
+verdict (conf ≥ 0.7) → FAILED; an existing FAILED (shape heuristics) is never
+upgraded away; a verifier-SUPPORTED verdict → PASSED; otherwise UNKNOWN.
+
+This matters because the outcome is what the whole spine keys off: the Reflector
+only reflects on FAILED trajectories, and the PRM only trains on
+PASSED/FAILED. Before consolidation the verifier verdict reached calibration and
+the selfhood model but **not** the corpus, so a verifier-caught wrong answer
+stayed UNKNOWN and silently never became a lesson or a training negative. The
+`probe:outcome_consolidation` invariant in the offline gate locks the priority
+order in place.
 
 ## Privacy guarantees (strict local-only)
 
@@ -137,11 +155,50 @@ the agent's first action — all without any weight update.
 
 ## Running the eval
 
+The eval has **two tiers**, and it is now trust-aware — a "green" can no
+longer be silently meaningless (the old stub-vs-stub compare footgun).
+
+### Tier 1 — the offline invariant gate (no agent, no Docker)
+
 ```bash
-# Default suite (mixed regression + curated + template bank) against
-# a running Ghost Agent on 127.0.0.1:8000:
+# Runs in-process in seconds. Regression probes only: cooldown ordering,
+# telemetry-off, AND the learning-loop input-integrity + security invariants
+# (outcome-labelling exit codes, trajectory schema-drift tolerance, PRM
+# junk-outcome skip, browser SSRF guard wired, redaction of special-char
+# passwords). Exit 0 iff every invariant holds; use it as the CI gate and
+# as a self-audit the agent can run on itself.
+python -m scripts.eval_baseline gate
+```
+
+### Tier 2 — the online capability baseline (needs a live agent)
+
+This is the number that answers *"is the agent getting better?"* — it MUST be
+frozen with `--runner http` against a live agent. A baseline frozen with the
+stub is marked untrusted and any compare that involves the stub exits `2`
+("NOT A TRUSTWORTHY CAPABILITY COMPARISON"), never a clean `0`.
+
+Use **`--suite capability`** for the live baseline: regression invariants + an
+8-task capability set (factual recall, multi-step arithmetic, code tracing,
+instruction/format following, structured JSON) + curated probes, all validated
+on the agent's *text* reply — so it's fully scorable over plain http with no
+Docker.
+
+> **Do NOT freeze `--suite default` over http as your capability number.** The
+> default suite also pulls in the challenge-**template** (coding) tasks, and the
+> plain http runner can't run their in-sandbox shell-script validator — so they
+> score unverified→fail and drag the pass-rate down. First live run of the
+> default suite measured 0.679, but that was 19/20 on scorable tasks with 8
+> templates counted as un-measured fails. Measuring **coding** capability needs
+> a sandbox-verdict runner (the runner must run the challenge setup + the
+> agent's solution + the shell-script validator and return `passed`); until
+> that exists, use `--suite capability`.
+
+```bash
+# Freeze the capability baseline against a running Ghost on 127.0.0.1:8000.
+# Provenance (runner/model/suite) is recorded so a later compare can detect a
+# stub or a model/suite mismatch.
 python -m scripts.eval_baseline freeze \
-    --suite default \
+    --suite capability \
     --runner http --base-url http://127.0.0.1:8000 \
     --api-key "$GHOST_API_KEY" \
     --model qwen-3.6-35b-a3 \
@@ -160,20 +217,30 @@ python -m scripts.eval_baseline freeze \
     --timeout 300 \
     --output "$GHOST_HOME/system/eval/post_learning.json"
 
-# Compare a later run to the frozen baseline:
+# Compare a later run to the frozen baseline (after a change / new lessons):
 python -m scripts.eval_baseline compare \
     --suite default \
     --runner http --base-url http://127.0.0.1:8000 \
+    --model qwen-3.6-35b-a3 \
     --timeout 300 \
     --baseline "$GHOST_HOME/system/eval/baseline.json"
-# Exit code 0 on no regressions, 1 on any top-level pass_rate drop.
+# Exit 0 = no regressions; 1 = a top-level pass_rate drop; 2 = the compare is
+# NOT trustworthy (stub involved, or a model/suite mismatch vs the baseline).
 ```
+
+**Using it as the self-improvement gate.** This is the intended workflow for
+recommendation-1 ("make success measurable"): freeze a capability baseline
+once, then before any self-improvement change is allowed to affect production
+(a promoted lesson, a tuned prompt, a PRM update) run `compare` on held-out
+tasks and require a non-regression (exit 0). A mechanism that can't beat — or
+at least hold — the baseline hasn't earned the right to change behaviour.
 
 Flag notes:
 
 * **`--runner stub`** — the default; echoes prompts and makes
   non-regression tasks fail. Exists so CI can exercise the pipeline
-  without a live upstream.
+  without a live upstream. A stub-frozen baseline is marked untrusted and a
+  stub compare exits `2`, so it can never masquerade as a real gate.
 * **`--runner http`** — POSTs to a running agent over loopback.
   The network guard permits only `127.0.0.1` / `localhost`, so this
   is the only shape of real-agent eval that stays privacy-safe.
@@ -188,6 +255,43 @@ Flag notes:
   discovery signal (`list / find / search / locate / verify /
   workspace` keywords); failing means it blindly fabricated a result
   without verifying the file exists.
+
+## A/B: prove the reflection loop actually lifts capability
+
+The loop is wired and its closure is verified in-process
+(`tests/test_reflection_loop_closure.py`: a FAILED trajectory becomes a lesson
+in SkillMemory), and the dedup set now persists across restarts so it keeps
+progressing through the failure backlog. What that test canNOT show is whether
+the produced lessons make the agent *better* — that is mediated by the model
+and needs a live A/B. Concrete protocol:
+
+```bash
+# 0. Start the agent with an EMPTY playbook (fresh $GHOST_HOME or cleared
+#    skills_playbook.json). This is the "pre-learning" agent.
+
+# 1. Freeze the pre-learning baseline on the behaviour-sensitive suite:
+python -m scripts.eval_baseline freeze --suite post_learning --runner http \
+    --base-url http://127.0.0.1:8000 --api-key "$GHOST_API_KEY" \
+    --model qwen-3.6-35b-a3 --timeout 300 \
+    --output "$GHOST_HOME/system/eval/pre_learning.json"
+
+# 2. Let the agent ACCUMULATE lessons: run real sessions that fail the
+#    discover-first behaviour, or leave it idle so the biological watchdog's
+#    reflection phase reflects the logged failures into the playbook. Confirm
+#    lessons landed: `jq '.|length' $GHOST_HOME/.../skills_playbook.json`.
+
+# 3. Compare the SAME agent (now with lessons) to the pre-learning baseline:
+python -m scripts.eval_baseline compare --suite post_learning --runner http \
+    --base-url http://127.0.0.1:8000 --api-key "$GHOST_API_KEY" \
+    --model qwen-3.6-35b-a3 --timeout 300 \
+    --baseline "$GHOST_HOME/system/eval/pre_learning.json"
+```
+
+A positive `pass_rate_delta` (with no trust warnings — same model/suite, http
+on both sides) is the evidence that reflection lessons are changing behaviour
+in the intended direction. A flat or negative delta means the loop is running
+but NOT helping — which is exactly the thing worth knowing before investing
+more in it, and the reason the whole spine now hangs off this measurable gate.
 
 ## Wiring the reflection phase
 

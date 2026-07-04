@@ -25,10 +25,18 @@ from .tasks import (
     CuratedRequestTask,
     RegressionProbeTask,
     load_default_suite,
+    load_offline_suite,
+    load_capability_suite,
     load_post_learning_suite,
 )
 from .suite import EvalSuite, RunnerCallable
-from .baseline import freeze_baseline, load_baseline, compare_to_baseline
+from .baseline import (
+    freeze_baseline,
+    load_baseline,
+    load_baseline_provenance,
+    compare_to_baseline,
+    baseline_trust_warnings,
+)
 from .network_guard import no_external_network, NetworkEgressError
 
 __all__ = [
@@ -40,12 +48,16 @@ __all__ = [
     "CuratedRequestTask",
     "RegressionProbeTask",
     "load_default_suite",
+    "load_offline_suite",
+    "load_capability_suite",
     "load_post_learning_suite",
     "EvalSuite",
     "RunnerCallable",
     "freeze_baseline",
     "load_baseline",
+    "load_baseline_provenance",
     "compare_to_baseline",
+    "baseline_trust_warnings",
     "no_external_network",
     "NetworkEgressError",
 ]

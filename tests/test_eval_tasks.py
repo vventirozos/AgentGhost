@@ -131,7 +131,8 @@ def test_load_default_suite_contains_each_category():
 
 
 def test_load_default_suite_toggle_flags():
-    tasks = load_default_suite(include_templates=False, include_curated=False)
+    tasks = load_default_suite(
+        include_templates=False, include_curated=False, include_capability=False)
     cats = {t.category for t in tasks}
     assert cats == {"regression"}
 

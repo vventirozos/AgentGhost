@@ -2127,10 +2127,10 @@ class GhostAgent:
                     # pattern the dream phase uses above.
                     self._last_reflection_at = datetime.datetime.now()
                     try:
-                        already = getattr(ctx, '_reflected_trajectory_ids', None)
-                        if already is None:
-                            already = set()
-                            ctx._reflected_trajectory_ids = already
+                        # Loaded from disk once so restarts don't re-reflect
+                        # the oldest failures (the loop progresses through the
+                        # backlog instead of redoing work every boot).
+                        already = self._get_reflected_ids()
                         # Prefer the composite sink when main.py wires
                         # one — it writes the reflection to JSONL AND
                         # to SkillMemory, closing the "failure → lesson
@@ -2143,6 +2143,9 @@ class GhostAgent:
                             sink=_sink,
                             already_reflected=already,
                         )
+                        # Persist the advanced dedup set so the progress
+                        # survives the next restart.
+                        self._persist_reflected_ids()
                         pretty_log(
                             "Biological Hook",
                             f"Reflection complete: {report.summary()}",
@@ -9717,6 +9720,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         model=model,
                         trajectory_id=current_trajectory_id,
                         user_request=last_user_content,
+                        # Consolidate the corpus outcome with the same signals
+                        # calibration + selfhood use (was heuristics-only here).
+                        verifier=(verifier_backfill[0] if verifier_backfill else None),
+                        execution_failed=(execution_failure_count > 0),
                     )
                 except Exception as e:
                     # Debug-level: a turn-logging failure must never be
@@ -9859,6 +9866,63 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             logger.debug(
                 "PRM online update failed: %s: %s", type(e).__name__, e,
             )
+
+    def _reflected_ids_path(self):
+        md = getattr(self.context, "memory_dir", None)
+        if md is None:
+            return None
+        try:
+            from pathlib import Path as _Path
+            return _Path(str(md)) / "reflected_ids.json"
+        except Exception:
+            return None
+
+    def _get_reflected_ids(self) -> set:
+        """The set of already-reflected trajectory ids, loaded ONCE from disk.
+
+        Persisting this across restarts is what lets the Reflector progress
+        through the failure backlog instead of re-reflecting the oldest
+        failures every boot (wasting idle-LLM calls and, under frequent
+        restarts, never reaching recent failures)."""
+        already = getattr(self.context, "_reflected_trajectory_ids", None)
+        if already is not None:
+            return already
+        already = set()
+        p = self._reflected_ids_path()
+        if p is not None:
+            try:
+                if p.exists():
+                    import json as _json
+                    data = _json.loads(p.read_text())
+                    if isinstance(data, list):
+                        already = set(str(x) for x in data)
+            except Exception as e:
+                logger.debug("reflected-ids load failed: %s", e)
+                already = set()
+        self.context._reflected_trajectory_ids = already
+        return already
+
+    def _persist_reflected_ids(self, cap: int = 10000) -> None:
+        """Atomically save the reflected-id set (bounded so it can't grow
+        without limit). Best-effort — a persist failure never breaks a turn."""
+        already = getattr(self.context, "_reflected_trajectory_ids", None)
+        if already is None:
+            return
+        p = self._reflected_ids_path()
+        if p is None:
+            return
+        try:
+            ids = list(already)
+            if len(ids) > cap:
+                ids = ids[-cap:]
+                self.context._reflected_trajectory_ids = set(ids)
+            import json as _json
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".json.tmp")
+            tmp.write_text(_json.dumps(ids))
+            tmp.replace(p)
+        except Exception as e:
+            logger.debug("reflected-ids persist failed: %s", e)
 
     def _maybe_promote_prior_turn_via_user_correction(
         self,
@@ -10088,10 +10152,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         if reflector is None:
             return
         sink = getattr(ctx, "reflection_sink", None) or collector.append
-        already = getattr(ctx, "_reflected_trajectory_ids", None)
-        if already is None:
-            already = set()
-            ctx._reflected_trajectory_ids = already
+        already = self._get_reflected_ids()
 
         try:
             loop = asyncio.get_running_loop()
@@ -10105,6 +10166,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     already_reflected=already,
                 )
             )
+            # Persist the dedup set once this fire-and-forget reflection
+            # finishes mutating it, so a post-turn reflection isn't lost on a
+            # restart before the next watchdog reflection.
+            task.add_done_callback(lambda _t: self._persist_reflected_ids())
         except Exception as e:
             logger.debug(
                 "post-turn reflect_one schedule failed: %s: %s",
@@ -10293,6 +10358,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         model: str,
         trajectory_id: str = "",
         user_request: str = "",
+        verifier: Optional[str] = None,
+        execution_failed: bool = False,
     ) -> None:
         """Build and persist a Trajectory for the turn that just finished.
 
@@ -10430,6 +10497,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 "outcome heuristics skipped: %s: %s",
                 type(e).__name__, e,
             )
+        # Outcome consolidation (single source of truth): fold the verifier
+        # verdict and structural-failure signal into the trajectory outcome so
+        # the corpus that feeds the Reflector / PRM / skills matches what
+        # calibration + selfhood already act on. Without this a verifier-caught
+        # wrong answer stayed UNKNOWN here and never became a lesson.
+        try:
+            from ..distill.outcome_heuristics import resolve_turn_outcome
+            _resolved = resolve_turn_outcome(
+                current=traj.outcome, verifier=verifier,
+                execution_failed=bool(execution_failed),
+            )
+            if _resolved != traj.outcome:
+                if not traj.failure_reason and _resolved == Outcome.FAILED.value:
+                    traj.failure_reason = (
+                        "verifier refuted" if verifier == "failed" else "structural failure"
+                    )
+                traj.outcome = _resolved
+        except Exception as e:
+            logger.debug("outcome consolidation skipped: %s: %s", type(e).__name__, e)
         collector.append(traj)
         # Stage-1 self-improvement: cache the just-recorded trajectory
         # keyed by its response fingerprint so the NEXT user message's

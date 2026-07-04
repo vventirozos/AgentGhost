@@ -73,8 +73,12 @@ regression tests; docs updated; full suite green on that session's date.
   clockwork desktop client parses SSE with `aiter_text` on non-line-aligned chunks (token misframing →
   silent drops; use aiter_lines), ships a placeholder `X-Ghost-Key: YOUR_KEY_HERE` (401s against a
   key-enforcing server), and leaks the camera/QTimer on WM-close. (med/low — peripheral)
-- **scripts best-effort measurement/robustness (unit 28)** — `eval_baseline`'s default `--runner stub`
-  makes `compare` an unconditional green gate (CI footgun); `ablation_eval` globs a fixed report dir and
+- **scripts best-effort measurement/robustness (unit 28)** — `eval_baseline` stub footgun RESOLVED
+  2026-07-04: baselines now carry `_provenance` (runner/model/suite), a stub freeze warns + marks
+  itself untrusted, and a stub-involved `compare` exits 2 ("NOT A TRUSTWORTHY CAPABILITY
+  COMPARISON") instead of a silent green 0; added a `gate` subcommand (offline invariant suite, no
+  agent) and an 8-task capability set. Pinned in tests/test_eval_gate.py. STILL DEFERRED:
+  `ablation_eval` globs a fixed report dir and
   folds stale/foreign-model result JSONs into the verdict table, and treats each (task,repeat) as
   independent in its Wilson CIs (over-narrow); `selfhood_functional_test` Section C/G do non-atomic
   read-modify-writes on the LIVE selfhood store the agent also writes (lost-update window) and Section D
@@ -96,12 +100,14 @@ regression tests; docs updated; full suite green on that session's date.
   trains "success everywhere"; and several step features (steps_so_far, failures_so_far, tool_used/
   failed_this_turn) are always 0 at the only live scoring site (turn start) but vary at train, so
   deployed discrimination is weaker than train_accuracy implies. (med/low — needs a training-signal redesign)
-- **reflection selection oldest-first + non-persistent dedup (unit 20)** — `Reflector.run` takes the
-  FIRST `max_failures` reflectable in iteration order (oldest-first), contradicting the "recent"
-  contract; and `_reflected_trajectory_ids` is in-memory only, so restarts re-reflect the oldest
-  failures. Also: `_truncate` head-keeps `tc.error`/`failure_reason`, dropping the tail exception of a
-  traceback from the reflection prompt; a diagnosis containing "plan:" is truncated at that word.
-  Fix needs a recency window + persisted dedup. (med/low)
+- **reflection selection oldest-first + non-persistent dedup (unit 20)** — non-persistent dedup
+  RESOLVED 2026-07-04 (post-hunt step 3): `_reflected_trajectory_ids` now persists to
+  `<memory_dir>/reflected_ids.json` (load-once + atomic save after each reflection, bounded at
+  10k), so restarts no longer re-reflect the oldest failures — the loop progresses through the
+  backlog. Pinned in tests/test_reflection_loop_closure.py. STILL DEFERRED (lower value now that
+  progress persists): `Reflector.run` is still oldest-first within a tick (a recency window would
+  reach fresh failures faster); `_truncate` head-keeps `tc.error`/`failure_reason` (drops the tail
+  exception of a traceback); a diagnosis containing "plan:" is truncated at that word. (low)
 - **distill user_correction / outcome-heuristic false positives (unit 22)** — an affirming follow-up
   reusing the prior request's content words ("actually the sort works great, thanks") can trip the
   correction classifier (Signal A "actually" AND Jaccard≥0.4) → promotes a GOOD turn to FAILED and
@@ -277,8 +283,11 @@ regression tests; docs updated; full suite green on that session's date.
   local threading of these fields. (med / structural)
 - **agent.py lower-severity (unit 18, deferred)** — conversation fingerprint collides across
   distinct conversations with identical opener text (no stable client conversation id available);
-  verifier-REFUTED verdict lowers self_model but NOT the trajectory-collector outcome (stays
-  UNKNOWN → Reflector/PRM never learn from it — arguably intentional given verifier noise);
+  ~~verifier-REFUTED verdict lowers self_model but NOT the trajectory-collector outcome~~ RESOLVED
+  2026-07-04 by outcome-signal consolidation (post-hunt step 2): `resolve_turn_outcome` folds the
+  verifier verdict + structural failure into the corpus outcome in `_record_turn_trajectory`, so a
+  verifier-caught wrong answer now becomes a lesson / PRM negative (guarded by the
+  `probe:outcome_consolidation` gate). Still deferred:
   `--prm-online-update` holdout slice contains the just-trained sample (leak); `_record_episode_safe`
   success heuristics mislabel benign "error"/"failed" prose; trajectory tool-result pairing collides
   on id-less duplicate tool names; `func_name` split()[0] IndexError on an empty function name
@@ -354,6 +363,55 @@ regression tests; docs updated; full suite green on that session's date.
 ## Session log
 
 (newest first)
+
+### 2026-07-04 — post-hunt strategy step 3: close the reflection loop
+- The reflection loop (FAILED traj → Reflector → lesson → SkillMemory → retrieved next similar
+  turn) was already wired; step 3 made it EFFECTIVE + proved closure, and packaged the live A/B.
+- Fix: persist the reflection dedup set (`_reflected_trajectory_ids`) to
+  `<memory_dir>/reflected_ids.json` (load-once + atomic save after each reflection, bounded 10k).
+  Was in-memory only → every restart re-reflected the OLDEST failures and, under frequent restarts,
+  never reached recent ones. Now the loop progresses through the backlog. Resolves the persistent-
+  dedup half of the unit-20 deferred finding.
+- Verified in-process (capability lift needs a live agent): tests/test_reflection_loop_closure.py
+  (5) — a FAILED trajectory becomes a lesson in SkillMemory (mock critique, real SkillMemory), and
+  the dedup set survives a "restart". Documented the live A/B protocol (pre-learning baseline →
+  accumulate lessons → compare on post_learning suite) in docs/self_improvement.md.
+- Steps 1-3 done: measurement (gate) + de-noised signal (consolidated outcome) + one closed,
+  measurable loop. The remaining "prove the lift" step is the user's to run against the live agent.
+
+### 2026-07-04 — post-hunt strategy step 2: consolidate the outcome signal
+- The ~5 "was this turn good?" signals disagreed; the worst gap: the verifier verdict reached
+  calibration + selfhood but NOT the trajectory corpus (Reflector/PRM/skills), so a verifier-caught
+  wrong answer stayed UNKNOWN and never became a lesson or a PRM negative.
+- Added `distill.outcome_heuristics.resolve_turn_outcome(current, verifier, execution_failed)` — the
+  single priority-ordered combiner (structural failure > verifier-refuted > existing-FAILED >
+  verifier-passed > keep). Wired it into `_record_turn_trajectory` (threaded verifier_backfill +
+  execution_failure_count from finalize) so the CORPUS outcome now matches calibration + selfhood.
+- Guarded by a new offline-gate invariant (`probe:outcome_consolidation`; gate now 10/10) and
+  tests/test_outcome_consolidation.py (11 — pure priority + integration: a verifier-refuted turn is
+  written FAILED, a clean chat stays UNKNOWN). Resolves the unit-18 deferred R5-F4.
+- Next (step 3): close ONE learning loop end-to-end (reflection lessons or PRM) and prove it lifts
+  the capability number on the step-1 gate — now that its input signal is de-noised.
+
+### 2026-07-04 — post-hunt strategy step 1: trustworthy eval gate ("make success measurable")
+- After the sweep, started executing the strategic recommendations. Step 1 = give the agent a
+  real, trustworthy measure of whether it's improving (prereq for closing any learning loop).
+- Built on the existing eval harness (whose metric bugs unit 23 fixed): (1) an offline invariant
+  GATE — `python -m scripts.eval_baseline gate` — regression probes only, no agent/Docker, runs
+  in-process; added 5 strategic probes guarding learning-loop input integrity + the browser SSRF
+  guard (outcome-labelling exit codes, trajectory schema-drift tolerance, PRM junk-outcome skip,
+  SSRF interceptor wired, redaction). Runs here: 9/9 pass.
+- (2) Closed the eval_baseline STUB FOOTGUN (a deferred finding): baselines now carry provenance,
+  a stub freeze warns + marks untrusted, a stub-involved compare exits 2 not a silent green.
+- (3) Added an 8-task capability set (factual/arithmetic/code-trace/format/JSON) validated on the
+  agent's TEXT reply, so a real capability baseline is obtainable without Docker. Documented the
+  self-improvement gate workflow in docs/self_improvement.md.
+- Tests: tests/test_eval_gate.py (12) — verify the measurement itself (capability tasks pass a
+  correct runner + fail a broken one, pass-rate tracks partial correctness, provenance round-trips,
+  stub footgun flagged). The ONLINE capability baseline still needs the user's live agent (one
+  documented command).
+- Next (step 2): consolidate the ~5 disagreeing "was this turn good?" signals into one grounded
+  outcome, then (step 3) close ONE learning loop end-to-end and prove it on this gate.
 
 ### 2026-07-04 — deferred backlog #1: browser SSRF (HIGH) — CORE RESOLVED
 - Highest-impact deferred finding. Sandbox is host-networked, host-side guard only vetted the

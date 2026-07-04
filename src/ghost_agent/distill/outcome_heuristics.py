@@ -255,3 +255,42 @@ def apply_chat_outcome_heuristics(traj: Trajectory) -> bool:
     if not traj.failure_reason:
         traj.failure_reason = verdict.reason
     return True
+
+
+def resolve_turn_outcome(
+    *,
+    current: str,
+    verifier: Optional[str] = None,
+    execution_failed: bool = False,
+) -> str:
+    """Combine a turn's quality signals into ONE outcome — the single source
+    of truth for the trajectory corpus, calibration, and selfhood.
+
+    Historically these signals diverged: calibration and the selfhood model
+    were made verifier-aware, but the trajectory corpus (which feeds the
+    Reflector, PRM, and skills-auto) saw only the shape heuristics above. So a
+    verifier-caught wrong answer stayed ``UNKNOWN`` in the corpus and never
+    became a lesson or a PRM negative. This unifies them.
+
+    Priority, strongest first:
+      1. a STRUCTURAL execution failure (non-zero exit / tool error) is ground
+         truth  → FAILED;
+      2. a REFUTED verifier verdict (already thresholded at conf ≥ 0.7 by the
+         caller)                                                     → FAILED;
+      3. an existing FAILED (from the shape heuristics or a prior signal) is
+         never upgraded away                                         → FAILED;
+      4. a SUPPORTED verifier verdict                                → PASSED;
+      5. otherwise keep ``current`` (UNKNOWN for a signal-free chat turn).
+
+    ``verifier`` is the ``verifier_backfill`` tag: ``"passed"`` | ``"failed"``
+    | ``None``. ``current`` is the outcome already on the trajectory (after the
+    shape heuristics ran).
+    """
+    cur = current or Outcome.UNKNOWN.value
+    if execution_failed or verifier == "failed":
+        return Outcome.FAILED.value
+    if cur == Outcome.FAILED.value:
+        return Outcome.FAILED.value
+    if verifier == "passed":
+        return Outcome.PASSED.value
+    return cur

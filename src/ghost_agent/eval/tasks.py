@@ -243,6 +243,95 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
         missing = [m for m in expected if not hasattr(FrontierTracker, m)]
         return (not missing, f"missing FrontierTracker methods: {missing}" if missing else "")
 
+    # ── Learning-loop input-integrity invariants ──────────────────────
+    # These guard the data that FEEDS the self-improvement loops (outcome
+    # labelling, trajectory corpus, PRM training). A regression here is
+    # silent — the loops keep running on corrupted signal — so it belongs
+    # in the always-on gate, not just pytest.
+
+    def probe_outcome_heuristic_exit_codes(_ctx) -> Tuple[bool, str]:
+        try:
+            from ..distill.outcome_heuristics import _looks_like_tool_error
+        except Exception as e:
+            return False, f"cannot import outcome_heuristics: {e}"
+        # A non-zero exit code (any, not just 1/2) must read as a failure,
+        # else a genuinely-stuck run trains the loops as a success.
+        if not _looks_like_tool_error("stdout...\nEXIT CODE: 127\n"):
+            return False, "non-zero exit code 127 not detected as tool error"
+        if _looks_like_tool_error("EXIT CODE: 0\nall good"):
+            return False, "exit code 0 wrongly detected as tool error"
+        return True, ""
+
+    def probe_trajectory_schema_drift(_ctx) -> Tuple[bool, str]:
+        try:
+            from ..distill.schema import Trajectory
+        except Exception as e:
+            return False, f"cannot import Trajectory: {e}"
+        # A record from a NEWER schema (an added field) must still load, or
+        # a version skew silently drops EVERY such record from the corpus.
+        try:
+            t = Trajectory.from_dict({
+                "user_request": "hi", "outcome": "passed",
+                "a_future_field": 1, "tool_calls": [{"name": "x", "future": 2}],
+            })
+        except Exception as e:
+            return False, f"drift record rejected: {e}"
+        if t.user_request != "hi" or t.outcome != "passed":
+            return False, "drift record loaded but lost known fields"
+        return True, ""
+
+    def probe_prm_skips_junk_outcomes(_ctx) -> Tuple[bool, str]:
+        try:
+            from ..prm.labels import derive_step_labels
+            from ..distill.schema import Trajectory, ToolCall
+        except Exception as e:
+            return False, f"cannot import prm.labels: {e}"
+        junk = Trajectory(user_request="q", outcome="error",
+                          tool_calls=[ToolCall(name="a"), ToolCall(name="b")])
+        if derive_step_labels(junk) != []:
+            return False, "junk outcome 'error' produced PRM labels (should skip)"
+        return True, ""
+
+    def probe_browser_ssrf_guard_wired(_ctx) -> Tuple[bool, str]:
+        try:
+            from ..tools import browser
+            src = browser._runner_script()
+        except Exception as e:
+            return False, f"cannot load browser runner: {e}"
+        if "await _install_ssrf_guard(ctx)" not in src:
+            return False, "browser runner missing the SSRF request interceptor"
+        return True, ""
+
+    def probe_redact_conn_uri(_ctx) -> Tuple[bool, str]:
+        try:
+            from ..distill.redact import redact_text
+        except Exception as e:
+            return False, f"cannot import redact: {e}"
+        out = redact_text("mongodb://admin:aB/cD3f@host:27017/db")
+        if "aB/cD3f" in out:
+            return False, "conn-uri password with '/' leaked past redaction"
+        return True, ""
+
+    def probe_outcome_consolidation(_ctx) -> Tuple[bool, str]:
+        # The trajectory corpus outcome must fold in the SAME signals
+        # calibration + selfhood use (verifier verdict + structural failure),
+        # so a verifier-caught wrong answer becomes a lesson / PRM negative
+        # instead of silently staying UNKNOWN.
+        try:
+            from ..distill.outcome_heuristics import resolve_turn_outcome
+            from ..distill.schema import Outcome
+        except Exception as e:
+            return False, f"cannot import resolve_turn_outcome: {e}"
+        F, P, U = Outcome.FAILED.value, Outcome.PASSED.value, Outcome.UNKNOWN.value
+        checks = [
+            (resolve_turn_outcome(current=U, verifier="failed") == F, "verifier-refuted → FAILED"),
+            (resolve_turn_outcome(current=U, execution_failed=True) == F, "structural → FAILED"),
+            (resolve_turn_outcome(current=F, verifier="passed") == F, "FAILED not upgraded away"),
+            (resolve_turn_outcome(current=U, verifier="passed") == P, "verifier-passed → PASSED"),
+        ]
+        bad = [msg for ok, msg in checks if not ok]
+        return (not bad, "outcome consolidation wrong: " + "; ".join(bad) if bad else "")
+
     return [
         RegressionProbeTask(
             task_id="probe:cooldown_constants",
@@ -268,6 +357,42 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
             prompt="FrontierTracker exposes expected API",
             validator=probe_frontier_tracker_api,
         ),
+        RegressionProbeTask(
+            task_id="probe:outcome_heuristic_exit_codes",
+            category="regression",
+            prompt="outcome labelling flags any non-zero exit code",
+            validator=probe_outcome_heuristic_exit_codes,
+        ),
+        RegressionProbeTask(
+            task_id="probe:trajectory_schema_drift",
+            category="regression",
+            prompt="trajectory corpus tolerates a newer-schema field",
+            validator=probe_trajectory_schema_drift,
+        ),
+        RegressionProbeTask(
+            task_id="probe:prm_skips_junk_outcomes",
+            category="regression",
+            prompt="PRM skips non-PASSED/FAILED outcomes (no false negatives)",
+            validator=probe_prm_skips_junk_outcomes,
+        ),
+        RegressionProbeTask(
+            task_id="probe:browser_ssrf_guard_wired",
+            category="regression",
+            prompt="browser runner installs the SSRF request interceptor",
+            validator=probe_browser_ssrf_guard_wired,
+        ),
+        RegressionProbeTask(
+            task_id="probe:redact_conn_uri",
+            category="regression",
+            prompt="redaction catches connection-URI passwords with special chars",
+            validator=probe_redact_conn_uri,
+        ),
+        RegressionProbeTask(
+            task_id="probe:outcome_consolidation",
+            category="regression",
+            prompt="trajectory outcome folds in verifier + structural signals",
+            validator=probe_outcome_consolidation,
+        ),
     ]
 
 
@@ -282,8 +407,15 @@ def _load_curated_tasks() -> List[CuratedRequestTask]:
         CuratedRequestTask(
             task_id="curated:hello",
             category="curated",
-            prompt="Say hello in one sentence.",
-            validator=["hello", "hi", "hey"],
+            # Word-boundary + a fair greeting set: a personalized "Good
+            # morning, <name>!" is a correct greeting, so the old literal
+            # ["hello","hi","hey"] substring list was validator noise (and
+            # "hi" as a substring also false-matched "this"/"which").
+            prompt="Greet the user in one friendly sentence.",
+            validator=_word_match(
+                "hello", "hi", "hey", "greetings", "welcome", "howdy",
+                "morning", "afternoon", "evening",
+            ),
         ),
         CuratedRequestTask(
             task_id="curated:arithmetic",
@@ -390,6 +522,127 @@ def _load_post_learning_tasks() -> List[CuratedRequestTask]:
     ]
 
 
+def _word_match(*answers: str) -> Validator:
+    """Validator: pass if ANY answer appears as a whole word (case-insensitive).
+    Word-boundary so "7" doesn't match inside "1972" and "no" doesn't match
+    inside "another"."""
+    pats = [re.compile(r"(?<![\w-])" + re.escape(a) + r"(?![\w-])", re.IGNORECASE)
+            for a in answers]
+
+    def _v(out: str, _ctx) -> Tuple[bool, str]:
+        text = str(out or "")
+        if any(p.search(text) for p in pats):
+            return True, ""
+        return False, f"expected one of {list(answers)} as a word in the reply"
+    return _v
+
+
+def _json_field_is(key: str, value: Any) -> Validator:
+    """Validator: the reply contains a JSON object with key==value."""
+    def _v(out: str, _ctx) -> Tuple[bool, str]:
+        import json as _json
+        text = str(out or "")
+        # Extract the first {...} block (models wrap JSON in prose/fences).
+        start, end = text.find("{"), text.rfind("}")
+        if start == -1 or end <= start:
+            return False, "no JSON object in reply"
+        try:
+            obj = _json.loads(text[start:end + 1])
+        except Exception:
+            return False, "reply's JSON did not parse"
+        if not isinstance(obj, dict) or obj.get(key) != value:
+            return False, f"expected JSON {key}={value!r}, got {obj.get(key)!r}"
+        return True, ""
+    return _v
+
+
+def _load_capability_tasks() -> List[CuratedRequestTask]:
+    """Deterministic, text-validated CAPABILITY tasks across the agent's real
+    job categories: factual recall, multi-step arithmetic, code tracing,
+    instruction/format following, and structured output. A competent agent
+    passes ~all; a broken one fails. These validate the agent's TEXT reply,
+    so they run against a live agent WITHOUT the Docker sandbox — giving a
+    reproducible capability number for the baseline gate.
+
+    Kept deliberately unambiguous (single correct token / parseable JSON) so
+    the metric reflects capability, not validator noise."""
+    return [
+        CuratedRequestTask(
+            task_id="cap:factual_capital",
+            category="capability",
+            prompt="What is the capital of France? Answer in one word.",
+            validator=_word_match("paris"),
+        ),
+        CuratedRequestTask(
+            task_id="cap:arithmetic_multistep",
+            category="capability",
+            prompt="Compute (17 * 3) + 5. Reply with just the number.",
+            validator=_word_match("56"),
+        ),
+        CuratedRequestTask(
+            task_id="cap:code_trace_len",
+            category="capability",
+            prompt="What does this Python print: print(len('hello'))? Reply with just the number.",
+            validator=_word_match("5"),
+        ),
+        CuratedRequestTask(
+            task_id="cap:count_week",
+            category="capability",
+            prompt="How many days are in a week? Reply with just the number.",
+            validator=_word_match("7", "seven"),
+        ),
+        CuratedRequestTask(
+            task_id="cap:primality",
+            category="capability",
+            prompt="Is 17 a prime number? Answer yes or no.",
+            validator=_word_match("yes"),
+        ),
+        CuratedRequestTask(
+            task_id="cap:instruction_one_word",
+            category="capability",
+            prompt="Answer in exactly one word: what color is a clear daytime sky?",
+            validator=_word_match("blue"),
+        ),
+        CuratedRequestTask(
+            task_id="cap:format_json",
+            category="capability",
+            prompt='Output a JSON object with a single key "answer" whose value is the integer 42. Output only the JSON.',
+            validator=_json_field_is("answer", 42),
+        ),
+        CuratedRequestTask(
+            task_id="cap:sequence_next",
+            category="capability",
+            prompt="What is the next number in the sequence 2, 4, 8, 16, ...? Reply with just the number.",
+            validator=_word_match("32"),
+        ),
+    ]
+
+
+def load_capability_suite() -> List[EvalTask]:
+    """The http-scorable CAPABILITY baseline: regression invariants + capability
+    + curated tasks, but NO challenge templates.
+
+    Template (coding) tasks need the Docker sandbox to run their shell-script
+    validator and return a ``passed`` verdict; the plain http runner can't, so
+    they always score unverified→fail and drag the pass-rate down without
+    measuring anything. Freeze THIS suite for a clean, trustworthy capability
+    number against a live agent; measuring coding capability needs a
+    sandbox-verdict runner (see docs/self_improvement.md)."""
+    return load_default_suite(include_templates=False)
+
+
+def load_offline_suite() -> List[EvalTask]:
+    """The AGENT-FREE invariant gate: regression probes only.
+
+    Runs entirely in-process (no live agent, no Docker, no model) — so it is
+    the fast CI gate and the self-audit the agent can run on itself. Every
+    probe is a load-bearing invariant (cooldown ordering, telemetry-off,
+    learning-loop input integrity, the browser SSRF guard). Expectation is
+    100% pass; any failure is a real regression.
+    """
+    return list(_load_regression_probes())
+
+
 def load_post_learning_suite() -> List[EvalTask]:
     """Small suite of file-read-shape prompts where "discover before
     reading" is the success criterion. Used to verify Stage-1
@@ -407,6 +660,7 @@ def load_default_suite(
     include_templates: bool = True,
     include_regression: bool = True,
     include_curated: bool = True,
+    include_capability: bool = True,
     n_per_cluster: int = 1,
     tiers: Tuple[str, ...] = ("basic",),
 ) -> List[EvalTask]:
@@ -419,6 +673,8 @@ def load_default_suite(
     tasks: List[EvalTask] = []
     if include_regression:
         tasks.extend(_load_regression_probes())
+    if include_capability:
+        tasks.extend(_load_capability_tasks())
     if include_curated:
         tasks.extend(_load_curated_tasks())
     if include_templates:
