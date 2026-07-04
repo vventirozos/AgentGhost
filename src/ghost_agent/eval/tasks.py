@@ -72,6 +72,13 @@ class ChallengeTemplateTask(EvalTask):
 
     def validate(self, output: Any, ctx: Any = None) -> Tuple[bool, str]:
         if isinstance(output, dict):
+            # The ONLY valid pass signal for a template task is the sandbox
+            # verdict. A dict WITHOUT a `passed` key means the runner never
+            # executed the shell-script validator (e.g. the http runner) — it
+            # must NOT fall through to the "non-empty text" convenience and
+            # silently score PASS. Treat a missing verdict as unverified/fail.
+            if "passed" not in output:
+                return False, "template not validated: runner returned no 'passed' verdict"
             passed = bool(output.get("passed"))
             return passed, "" if passed else str(output.get("reason") or "validator failed")
         ok = bool(output and str(output).strip())

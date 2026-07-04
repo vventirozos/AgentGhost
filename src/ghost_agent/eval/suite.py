@@ -191,9 +191,14 @@ class EvalSuite:
             # non-empty string. Scoped to template tasks: every other
             # task type's validator expects a string.
             from .tasks import ChallengeTemplateTask as _CTT
+            # For a template task, ALWAYS hand the dict to validate() (even
+            # without a `passed` key) so its dict branch can reject a missing
+            # verdict as unverified. Previously a dict lacking `passed` fell
+            # through to output_text and passed as a non-empty string —
+            # silently greenlighting unvalidated template solutions.
             output = (
                 result_val
-                if ("passed" in result_val and isinstance(task, _CTT))
+                if isinstance(task, _CTT)
                 else output_text
             )
         else:

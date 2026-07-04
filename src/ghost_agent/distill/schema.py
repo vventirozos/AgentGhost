@@ -103,9 +103,25 @@ class Trajectory:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "Trajectory":
-        tc_list = [ToolCall(**t) if not isinstance(t, ToolCall) else t
-                   for t in (d.get("tool_calls") or [])]
-        # Strip sub-fields we rebuild manually, so **d doesn't double-pass them.
-        d = dict(d)
-        d.pop("tool_calls", None)
-        return cls(tool_calls=tc_list, **d)
+        # Filter unknown keys on BOTH the tool calls and the trajectory, so a
+        # record written by a NEWER schema (an added field) isn't rejected by
+        # a bare `**` TypeError — which iter_trajectories silently swallows as
+        # "schema drift → skip", dropping EVERY such record from the training
+        # corpus on any version skew / rollback.
+        _tc_fields = ToolCall.__dataclass_fields__
+        tc_list = [
+            t if isinstance(t, ToolCall)
+            else ToolCall(**{k: v for k, v in t.items() if k in _tc_fields})
+            for t in (d.get("tool_calls") or [])
+            if isinstance(t, (ToolCall, dict))
+        ]
+        known = {k: v for k, v in d.items()
+                 if k in cls.__dataclass_fields__ and k != "tool_calls"}
+        # A record with NO recognized fields is genuinely malformed (not mere
+        # schema drift) — raise so iter_trajectories skips it, rather than
+        # materializing a hollow all-default Trajectory. A drift record still
+        # carries its real fields alongside the unknown one, so `known` is
+        # non-empty and it loads (with the extra field dropped).
+        if not known and not tc_list:
+            raise ValueError("trajectory record has no recognized fields")
+        return cls(tool_calls=tc_list, **known)

@@ -112,10 +112,18 @@ class SelfState:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "SelfState":
-        oq = [OpenQuestion(**q) for q in (d.get("open_questions") or [])]
-        ut = [UnfinishedThread(**t) for t in (d.get("unfinished_threads") or [])]
+        # Filter unknown keys (like Experience/Principle.from_dict) so a
+        # schema-divergent, newer, or hand-edited state.json is NOT rejected
+        # by a bare `**q` TypeError — which _read_or_empty swallows into an
+        # empty state that the next mutation then OVERWRITES onto the good
+        # file (silent cross-session data loss).
+        oq = [OpenQuestion(**{k: v for k, v in q.items() if k in OpenQuestion.__annotations__})
+              for q in (d.get("open_questions") or []) if isinstance(q, dict)]
+        ut = [UnfinishedThread(**{k: v for k, v in t.items() if k in UnfinishedThread.__annotations__})
+              for t in (d.get("unfinished_threads") or []) if isinstance(t, dict)]
         mood_raw = d.get("mood")
-        mood = Mood(**mood_raw) if isinstance(mood_raw, dict) else None
+        mood = (Mood(**{k: v for k, v in mood_raw.items() if k in Mood.__annotations__})
+                if isinstance(mood_raw, dict) else None)
         return cls(
             schema_version=str(d.get("schema_version") or SCHEMA_VERSION),
             open_questions=oq,

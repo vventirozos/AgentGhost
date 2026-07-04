@@ -322,7 +322,17 @@ class Task:
 
 def load_curriculum(path: str) -> list[Task]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
-    items = raw["tasks"] if isinstance(raw, dict) else raw
+    # Tolerate a dict without a "tasks" key (e.g. {"curriculum": [...]}) with a
+    # clear error instead of a bare KeyError.
+    if isinstance(raw, dict):
+        items = raw.get("tasks")
+        if items is None:
+            raise ValueError(
+                f"curriculum JSON object at {path} has no 'tasks' key "
+                f"(keys: {sorted(raw.keys())})"
+            )
+    else:
+        items = raw
     out: list[Task] = []
     for it in items:
         if isinstance(it, str):

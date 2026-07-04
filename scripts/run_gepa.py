@@ -52,8 +52,15 @@ async def main() -> int:
                         help="Where to write the tuned instruction JSON. Defaults to $GHOST_HOME/system/optim/<signature>.json")
     parser.add_argument("--max-examples", type=int, default=200)
     parser.add_argument("--eval-fraction", type=float, default=0.2)
+    # The A/B ship-gate is now ON BY DEFAULT: the tuned instruction is written
+    # to a STAGING path and only PROMOTED to the live path if it beats the
+    # baseline on the eval split. `--ab-gate` is kept as a deprecated no-op
+    # (the gate always runs unless explicitly opted out) so old invocations
+    # still parse; `--no-ab-gate` opts out to adopt an unverified candidate.
     parser.add_argument("--ab-gate", action="store_true", default=False,
-                        help="After optimizing, A/B the candidate vs the baseline on the eval split and only KEEP the tuned file if it beats the baseline by --ab-min-delta. Otherwise the file is removed so an unproven prompt never supersedes the baseline at inference (compare_prompts was previously unwired).")
+                        help="(deprecated no-op — the A/B gate is on by default)")
+    parser.add_argument("--no-ab-gate", action="store_true", default=False,
+                        help="Skip the A/B gate and adopt the tuned prompt UNVERIFIED. Use only when there is no eval split to compare on.")
     parser.add_argument("--ab-min-delta", type=float, default=0.02,
                         help="Minimum eval pass-rate improvement for --ab-gate to ship the candidate. Default 0.02.")
     args = parser.parse_args()
@@ -106,6 +113,10 @@ async def main() -> int:
             return 0.0
         return 1.0 if want[:120] in got else 0.0
 
+    # Write the tuned instruction to a STAGING path, NOT the live path the
+    # agent reads. It is only promoted after passing the A/B gate below, so a
+    # crash / rejected candidate can never leave an unproven prompt live.
+    staging_path = output_path.with_name(output_path.name + ".candidate")
     from ghost_agent.optim.run_gepa import run_gepa
     result = run_gepa(
         sig,
@@ -115,60 +126,80 @@ async def main() -> int:
         metric=_metric,
         max_iterations=args.max_iterations,
         optimizer=args.optimizer,
-        output_path=output_path,
+        output_path=staging_path,
     )
 
-    print(f"optimized instruction written to {output_path}")
+    print(f"optimized instruction written to staging {staging_path}")
     print(f"baseline: {result.baseline_instruction[:120]}...")
     print(f"optimized: {result.optimized_instruction[:120]}...")
 
-    # A/B ship-gate (opt-in): only let the tuned prompt supersede the
-    # baseline at inference if it actually wins on the eval split. The
-    # compare_prompts harness existed but had no caller — GEPA output
-    # shipped unconditionally. This closes that gap.
-    if args.ab_gate:
-        from ghost_agent.optim.ab_eval import compare_prompts
-        import json as _json
+    def _discard_staging():
+        try:
+            staging_path.unlink()
+        except FileNotFoundError:
+            pass
 
-        async def _ab_runner(payload):
-            instruction = payload.get("prompt", "")
-            inputs = payload.get("inputs") or {}
-            user_req = (
-                inputs.get("user_request")
-                or next((str(v) for v in inputs.values() if v), "")
-                or _json.dumps(inputs, default=str)
-            )
-            res = await llm_client.chat_completion({
-                "model": args.model,
-                "messages": [
-                    {"role": "system", "content": instruction},
-                    {"role": "user", "content": str(user_req)},
-                ],
-                "temperature": 0.0, "max_tokens": 1024, "stream": False,
-            })
-            got = ((res or {}).get("choices", [{}])[0]
-                   .get("message", {}).get("content", "") or "")
-            want = str((payload.get("expected_output") or {})
-                       .get("final_response", "")).strip().lower()
-            passed = bool(want and want[:120] in got.strip().lower())
-            return {"passed": passed, "output": got}
+    def _promote_staging():
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging_path, output_path)
 
-        cmp = await compare_prompts(
-            result.baseline_instruction, result.optimized_instruction,
-            eval_set, _ab_runner, min_delta=args.ab_min_delta,
+    # A/B ship-gate — ON BY DEFAULT. Only let the tuned prompt supersede the
+    # baseline at inference if it actually wins on the held-out eval split.
+    # Previously the gate was opt-in (`--ab-gate`) AND the tuned file was
+    # written straight to the live path, so the documented invocation adopted
+    # an UNPROVEN prompt globally (planning / tool-selection / reflection).
+    if args.no_ab_gate:
+        _promote_staging()
+        print(f"A/B gate DISABLED (--no-ab-gate) — adopted UNVERIFIED at {output_path}")
+        return 0
+
+    if not eval_set:
+        _discard_staging()
+        print("A/B gate is ON but the eval split is empty — cannot verify the "
+              "candidate; NOT promoting. Re-run with --no-ab-gate to adopt it "
+              "unverified, or log more passing trajectories.", file=sys.stderr)
+        return 1
+
+    from ghost_agent.optim.ab_eval import compare_prompts
+    import json as _json
+
+    async def _ab_runner(payload):
+        instruction = payload.get("prompt", "")
+        inputs = payload.get("inputs") or {}
+        user_req = (
+            inputs.get("user_request")
+            or next((str(v) for v in inputs.values() if v), "")
+            or _json.dumps(inputs, default=str)
         )
-        print(f"A/B: baseline={cmp.baseline_pass_rate:.2f} "
-              f"candidate={cmp.candidate_pass_rate:.2f} "
-              f"delta={cmp.delta:+.2f} ships={cmp.candidate_ships}")
-        if not cmp.candidate_ships:
-            try:
-                output_path.unlink()
-            except FileNotFoundError:
-                pass
-            print(f"A/B gate REJECTED the candidate (delta {cmp.delta:+.2f} "
-                  f"≤ {args.ab_min_delta}); removed {output_path} — baseline stands.")
-            return 1
-        print("A/B gate PASSED — candidate shipped.")
+        res = await llm_client.chat_completion({
+            "model": args.model,
+            "messages": [
+                {"role": "system", "content": instruction},
+                {"role": "user", "content": str(user_req)},
+            ],
+            "temperature": 0.0, "max_tokens": 1024, "stream": False,
+        })
+        got = ((res or {}).get("choices", [{}])[0]
+               .get("message", {}).get("content", "") or "")
+        want = str((payload.get("expected_output") or {})
+                   .get("final_response", "")).strip().lower()
+        passed = bool(want and want[:120] in got.strip().lower())
+        return {"passed": passed, "output": got}
+
+    cmp = await compare_prompts(
+        result.baseline_instruction, result.optimized_instruction,
+        eval_set, _ab_runner, min_delta=args.ab_min_delta,
+    )
+    print(f"A/B: baseline={cmp.baseline_pass_rate:.2f} "
+          f"candidate={cmp.candidate_pass_rate:.2f} "
+          f"delta={cmp.delta:+.2f} ships={cmp.candidate_ships}")
+    if not cmp.candidate_ships:
+        _discard_staging()
+        print(f"A/B gate REJECTED the candidate (delta {cmp.delta:+.2f} "
+              f"≤ {args.ab_min_delta}); discarded staging — baseline stands.")
+        return 1
+    _promote_staging()
+    print(f"A/B gate PASSED — candidate promoted to {output_path}")
     return 0
 
 

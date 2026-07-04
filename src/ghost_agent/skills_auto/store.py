@@ -122,7 +122,11 @@ class GraduatedSkillStore:
                 )
                 data = dict(ordered[:MAX_SKILLS])
             self._save(data)
-            return entry
+            # If the just-added skill was itself the lowest-confidence entry
+            # and got evicted by the overflow trim, it was NOT persisted —
+            # return None so the caller doesn't count/mint a macro for a skill
+            # the store won't surface.
+            return entry if sig in data else None
 
     # ------------------------------------------------------------------
     # Read API

@@ -119,7 +119,13 @@ def derive_step_labels(
         return []
 
     outcome = (traj.outcome or "").lower()
-    if outcome == Outcome.UNKNOWN.value:
+    # Only PASSED / FAILED trajectories carry a usable terminal signal.
+    # UNKNOWN — and ANY out-of-enum value the free-form `outcome` string can
+    # hold ("", "error", "timeout", a mis-serialized enum, …) — must be
+    # SKIPPED, not silently treated as an all-negative (terminal=0.0) sample.
+    # The old code only special-cased UNKNOWN, so a junk outcome trained the
+    # PRM on false negatives.
+    if outcome not in (Outcome.PASSED.value, Outcome.FAILED.value):
         return []
     if outcome == Outcome.FAILED.value and not spec.include_failed:
         return []

@@ -27,7 +27,9 @@ let ws;
 let monologueTimeout;
 let chatHistory = [];
 const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const wsUrl = `${wsProtocol}//${window.location.host}/ws`;
+// The /ws log stream is auth-gated server-side. Browsers can't set custom
+// headers on a WebSocket, so pass the injected key as a query param.
+const wsUrl = `${wsProtocol}//${window.location.host}/ws?key=${encodeURIComponent(window.GHOST_API_KEY || '')}`;
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
     (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const isSafari = /^((?!chrome|android).)*safari/i.test(navigator.userAgent);

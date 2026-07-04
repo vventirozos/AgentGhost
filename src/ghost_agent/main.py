@@ -1308,6 +1308,18 @@ async def lifespan(app):
                 await _mc.shutdown()
             except Exception as _msx:
                 logger.debug("metacog shutdown error: %s", _msx)
+        # Uninstall the process-wide Tor egress guard (the socket.connect
+        # monkeypatch installed at startup). Without this, a lifespan run
+        # inside a long-lived process — the in-process test suite / repeated
+        # ASGI-lifespan cycles — leaves the guard patched into every
+        # subsequent test and stacks a second patch on the next boot.
+        _tg_uninstall = getattr(context, "_tor_guard_uninstall", None)
+        if callable(_tg_uninstall):
+            try:
+                _tg_uninstall()
+            except Exception as _tgx:
+                logger.debug("tor guard uninstall error: %s", _tgx)
+            context._tor_guard_uninstall = None
         # Cancel via the canonical reference on context.
         bio = context.biological_task
         if bio is not None:

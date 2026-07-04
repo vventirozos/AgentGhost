@@ -119,7 +119,15 @@ async def _run_one(url: str, model: str, timeout: float, task) -> Tuple[bool, fl
     output = out.get("output", "")
     dur = float(out.get("duration_s", 0.0))
     try:
-        passed, reason = task.validate(output, None)
+        from ghost_agent.eval.tasks import ChallengeTemplateTask as _CTT
+        # For a template task the ONLY valid pass signal is the sandbox
+        # verdict — hand validate() the whole runner dict so a missing
+        # `passed` key is scored unverified/fail, not passed on any non-empty
+        # text (mirrors eval/suite.py). Passing the bare string here made
+        # every template task false-pass, and scored them opposite to the
+        # sequential ablation driver.
+        validate_input = out if isinstance(task, _CTT) else output
+        passed, reason = task.validate(validate_input, None)
     except Exception as e:
         passed, reason = False, f"validator raised: {type(e).__name__}: {e}"
     return bool(passed), dur, "" if passed else str(reason)

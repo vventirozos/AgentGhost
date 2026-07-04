@@ -714,13 +714,18 @@ class PostMortemEngine:
         )
 
         if category == CATEGORY_BEHAVIOURAL:
-            rep.lesson = {
-                "task": (getattr(traj, "user_request", "") or "")[:400],
-                "mistake": (parsed.get("root_cause") or "")[:400],
-                "solution": (parsed.get("lesson") or parsed.get("root_cause") or "")[:1200],
-                "source": "postmortem",
-                "source_trajectory_id": traj.id,
-            }
+            _solution = (parsed.get("lesson") or parsed.get("root_cause") or "")[:1200]
+            # A terse classifier reply can carry CATEGORY + TITLE but no ROOT
+            # CAUSE and no LESSON → empty solution. Don't route a blank lesson
+            # into the playbook (learn_lesson doesn't reject an empty solution).
+            if _solution.strip():
+                rep.lesson = {
+                    "task": (getattr(traj, "user_request", "") or "")[:400],
+                    "mistake": (parsed.get("root_cause") or "")[:400],
+                    "solution": _solution,
+                    "source": "postmortem",
+                    "source_trajectory_id": traj.id,
+                }
         elif category == CATEGORY_CONFIGURATION:
             rep.config_change = (parsed.get("config_change") or "")[:1000]
         elif category == CATEGORY_CODE_DEFECT:
@@ -761,17 +766,28 @@ def _split_patch_output(text: str) -> Tuple[str, str]:
         return "", ""
     import re
     lower = text.lower()
-    test_pos = -1
-    for marker in ("reproducing test", "failing test", "test:"):
-        p = lower.find(marker)
-        if p != -1:
-            test_pos = p
-            break
+
+    def _find(markers):
+        # Word-boundary match so "patch" doesn't hit "dispatch"/"patchwork",
+        # "diff" doesn't hit "difference", and "test:" doesn't hit "latest:".
+        for marker in markers:
+            pat = r"\b" + re.escape(marker)
+            if marker[-1].isalnum():
+                pat += r"\b"
+            m = re.search(pat, lower)
+            if m:
+                return m.start()
+        return -1
+
+    test_pos = _find(("reproducing test", "failing test", "test:"))
     patch_pos = -1
     for marker in ("patch", "diff", "unified diff"):
-        p = lower.find(marker)
-        if p != -1 and p != test_pos:
-            patch_pos = p
+        pat = r"\b" + re.escape(marker)
+        if marker[-1].isalnum():
+            pat += r"\b"
+        m = re.search(pat, lower)
+        if m and m.start() != test_pos:
+            patch_pos = m.start()
             break
     if test_pos != -1 and patch_pos != -1 and patch_pos > test_pos:
         return text[test_pos:patch_pos].strip(), text[patch_pos:].strip()

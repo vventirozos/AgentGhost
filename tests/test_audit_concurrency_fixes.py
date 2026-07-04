@@ -60,8 +60,13 @@ async def test_run_marks_reflected_before_awaiting():
     refl._reflect_one = spy
     await refl.run(failed_source=[_failed_traj("tX")], already_reflected=shared)
 
+    # Claim-before-await: during _reflect_one the id was already in the set
+    # (so a concurrent reflect_one would skip it).
     assert seen_in_set.get("tX") is True
-    assert "tX" in shared
+    # ...but the spy returned an ERROR outcome, and a transient failure must
+    # NOT permanently claim the trajectory — it's un-claimed after the await
+    # so a later tick can retry it.
+    assert "tX" not in shared
 
 
 # =================================================================

@@ -59,7 +59,13 @@ GAIA_SYSTEM_PROMPT = (
     "in the list is a number or a string."
 )
 
-FINAL_ANSWER_RE = re.compile(r"FINAL ANSWER:\s*(.+?)\s*$", re.IGNORECASE | re.DOTALL)
+# MULTILINE (not DOTALL): each "FINAL ANSWER:" line is its own match ending at
+# the end of THAT line, so `matches[-1]` genuinely selects the LAST occurrence.
+# With DOTALL + `$`(=end-of-string) the lazy group spanned from the FIRST
+# occurrence to the end, collapsing finditer to a single match — so a model
+# that emitted a preliminary answer then a corrected final one was scored on
+# the preliminary. (The downstream `.split("\n")[0]` already keeps one line.)
+FINAL_ANSWER_RE = re.compile(r"FINAL ANSWER:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
 
 
 def extract_final_answer(text: str) -> str | None:
@@ -221,7 +227,15 @@ def main() -> int:
 
             is_correct = None
             if ground_truth is not None:
-                is_correct = question_scorer(model_answer, ground_truth)
+                # An EMPTY extracted answer must never be scored CORRECT. On the
+                # GAIA test split the ground truth is a "?" placeholder that
+                # normalizes to empty, so question_scorer("", "?") → "" == ""
+                # → True, falsely crediting every task where the agent emitted
+                # no FINAL ANSWER.
+                if not model_answer.strip():
+                    is_correct = False
+                else:
+                    is_correct = question_scorer(model_answer, ground_truth)
                 total += 1
                 if is_correct:
                     correct += 1

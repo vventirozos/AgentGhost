@@ -221,6 +221,11 @@ class Reflector:
                         logger.warning("reflection sink failed: %s", e)
             else:
                 report.reflected_errors += 1
+                # A transient failure (idle-LLM timeout, unparseable critique)
+                # must NOT permanently claim the trajectory — un-mark it so a
+                # later tick can retry. The id was held only to block a
+                # concurrent reflect_one from double-reflecting DURING the await.
+                reflected_set.discard(traj.id)
 
         return report
 
@@ -268,11 +273,17 @@ class Reflector:
         reflected_set.add(traj.id)
 
         out = await self._reflect_one(traj)
-        if out.ok and sink is not None and out.reflected_trajectory is not None:
-            try:
-                sink(out.reflected_trajectory)
-            except Exception as e:
-                logger.warning("reflect_one sink failed: %s", e)
+        if out.ok:
+            if sink is not None and out.reflected_trajectory is not None:
+                try:
+                    sink(out.reflected_trajectory)
+                except Exception as e:
+                    logger.warning("reflect_one sink failed: %s", e)
+        else:
+            # Transient failure → un-claim so a later tick / re-schedule can
+            # retry (mirrors the batch path in run()). Harmless when
+            # `already_reflected` was None (the local set is discarded anyway).
+            reflected_set.discard(traj.id)
         return out
 
     def _is_reflectable(self, traj: Trajectory) -> bool:

@@ -107,7 +107,12 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # username char leaked exactly that form.
     ("conn_uri_password", re.compile(
         r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|rediss|amqp|amqps|mssql)://[^\s:\"'/]*:)"
-        r"([^\s:\"'@/]+)(@)"
+        # Password runs up to the `@` delimiter. The old class excluded `:`
+        # and `/`, so a password CONTAINING either (`admin:aB/cD3f@host`, a
+        # base64/colon-bearing password) truncated the match before `@`, the
+        # rule failed to fire, and the credential leaked verbatim into the
+        # corpus. Only whitespace / quotes / the `@` delimiter now terminate it.
+        r"([^\s\"'@]+)(@)"
     ), r"\1<REDACTED>\3"),
 
     # Named secret env-var assignments (NAME=value or "NAME": "value").
@@ -137,7 +142,10 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
 
     # JSON-style "api_key": "..." / "token": "..."
     ("json_secret_field", re.compile(
-        r'("(?:api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|password|passwd|client[_-]?secret|refresh[_-]?token)"\s*:\s*")[^"]+(")',
+        # Value body tolerates escaped quotes (`"a\"b_secret"`): the old
+        # `[^"]+` stopped at the first inner quote, redacting only `a\` and
+        # leaking the rest.
+        r'("(?:api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|password|passwd|client[_-]?secret|refresh[_-]?token)"\s*:\s*")(?:\\.|[^"\\])+(")',
         re.IGNORECASE,
     ), r"\1<REDACTED>\2"),
 

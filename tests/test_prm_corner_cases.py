@@ -369,11 +369,13 @@ class TestIOFailures:
         with pytest.raises((KeyError, ValueError)):
             StepValueModel.load(p)
 
-    def test_load_wrong_weights_length_silently_loads_then_predict_raises(
+    def test_load_wrong_weights_length_raises_loudly_at_load(
         self, tmp_path: Path,
     ):
-        """If somehow a checkpoint with the right feature_names but
-        wrong weights length is loaded, predict should fail loud."""
+        """A checkpoint whose weight length doesn't match the current feature
+        count must be rejected at LOAD time (loud), not silently loaded to
+        blow up later inside predict_proba (which PRMScorer.score would
+        swallow into a neutral 0.5 for every candidate)."""
         p = tmp_path / "shortw.json"
         p.write_text(json.dumps({
             "schema": "ghost.prm.logreg.v1",
@@ -381,9 +383,8 @@ class TestIOFailures:
             "weights": [0.5, 0.5],  # shorter than feature names
             "bias": 0.0,
         }))
-        m = StepValueModel.load(p)
-        with pytest.raises((ValueError, IndexError, RuntimeError)):
-            m.predict_proba(extract_step_features(_state(), _action()))
+        with pytest.raises(ValueError):
+            StepValueModel.load(p)
 
     def test_save_creates_parent_dir(self, tmp_path: Path):
         m = StepValueModel(epochs=50)

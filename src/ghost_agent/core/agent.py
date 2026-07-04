@@ -2281,10 +2281,15 @@ class GhostAgent:
                                         try:
                                             _vr = verify_candidate(_cand, _verify_fn)
                                             if _vr.passed and _vr.action == "keep":
-                                                _store.graduate(
+                                                _persisted = _store.graduate(
                                                     _cand,
                                                     confidence=_vr.updated_confidence,
                                                 )
+                                                if _persisted is None:
+                                                    # Overflow-trimmed by the store
+                                                    # (lowest confidence) — not really
+                                                    # graduated; skip count + macro mint.
+                                                    continue
                                                 _graduated += 1
                                                 # Also mint the proven sequence
                                                 # as a composed-skill MACRO so a

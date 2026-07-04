@@ -107,6 +107,12 @@ def _looks_like_tool_error(result: str) -> bool:
     """
     if not isinstance(result, str):
         return False
+    # A NON-ZERO exit-code banner is a hard failure signal even without an
+    # "error:" prefix (127 = command not found, 130 = SIGINT, 1..9, …). The
+    # banner can trail stdout, so search the whole result, not just the head.
+    _exit_m = re.search(r"EXIT CODE:\s*(\d+)", result)
+    if _exit_m is not None and _exit_m.group(1) != "0":
+        return True
     head = result.strip()[:120].lower()
     return any(
         marker in head

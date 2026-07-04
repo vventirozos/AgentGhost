@@ -367,6 +367,16 @@ class StepValueModel:
         )
         m.weights_ = np.array(raw["weights"], dtype=float)
         m.bias_ = float(raw["bias"])
+        # Even when the checkpoint omits feature_names (so the drift check
+        # above couldn't run), the weight vector must match the current
+        # feature count — otherwise the mismatch surfaces only later as a
+        # silent np.dot shape error that PRMScorer.score swallows into a
+        # neutral 0.5 for every candidate. Reject it loudly at load time.
+        if m.weights_.shape[0] != len(PRM_FEATURE_NAMES):
+            raise ValueError(
+                f"PRM checkpoint weight length {int(m.weights_.shape[0])} != "
+                f"{len(PRM_FEATURE_NAMES)} current features — retrain before loading."
+            )
         m.feature_names_ = tuple(saved_names) if saved_names else PRM_FEATURE_NAMES
         if raw.get("report"):
             m.report_ = PRMTrainingReport(**raw["report"])

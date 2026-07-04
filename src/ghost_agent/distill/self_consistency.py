@@ -168,6 +168,19 @@ class SelfConsistencySampler:
             else Outcome.UNKNOWN.value
         )
 
+        # Coerce runner-supplied metrics defensively. These conversions live
+        # OUTSIDE the runner/validator try above, so a non-numeric value
+        # (steps="unknown", duration_s="n/a") would otherwise raise out of
+        # _one and abort every sibling sample — defeating the whole point of
+        # drawing N samples ("a single runtime error doesn't waste the rest").
+        def _num(v, cast, default):
+            try:
+                return cast(v)
+            except (TypeError, ValueError):
+                return default
+        _md = metrics if isinstance(metrics, dict) else {}
+        _vs = _md.get("validator_signal")
+        _ex = _md.get("extra")
         traj = Trajectory(
             session_id=session_id,
             task_kind=self.task_kind,
@@ -180,15 +193,15 @@ class SelfConsistencySampler:
             system_prompt=system_prompt,
             user_request=prompt,
             tool_calls=[],  # Wiring tool-call capture is a caller concern
-            n_steps=int(metrics.get("steps") or 0),
-            tokens_in=int(metrics.get("tokens_in") or 0),
-            tokens_out=int(metrics.get("tokens_out") or 0),
-            duration_s=float(metrics.get("duration_s") or duration),
+            n_steps=_num(_md.get("steps"), int, 0),
+            tokens_in=_num(_md.get("tokens_in"), int, 0),
+            tokens_out=_num(_md.get("tokens_out"), int, 0),
+            duration_s=_num(_md.get("duration_s"), float, duration),
             outcome=outcome,
             failure_reason=failure_reason or (reason if passed is False else ""),
-            validator_signal=dict(metrics.get("validator_signal") or {}),
+            validator_signal=_vs if isinstance(_vs, dict) else {},
             final_response=output_text,
-            extra=dict(metrics.get("extra") or {}),
+            extra=_ex if isinstance(_ex, dict) else {},
         )
         return Sample(trajectory=traj, passed=passed, reason=reason)
 

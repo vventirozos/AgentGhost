@@ -366,11 +366,19 @@ async def _run_sycophancy(
 def _band_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     if not rows:
         return {"n_probes": 0}
-    mode_shares = [r["mode_share"] for r in rows]
-    entropies = [r["label_entropy_bits"] for r in rows]
+    # A mode_share computed from 0-or-1 parsed sample is meaningless (a single
+    # surviving answer trivially yields 1.0). Exclude those under-parsed probes
+    # from the CONSISTENCY aggregation so request failures / unparsed replies
+    # can't inflate the headline median that drives the verdict. Fall back to
+    # the raw list only if EVERY probe is under-parsed (never return empty).
+    trusted = [r for r in rows if r.get("parsed_n", 0) >= 2]
+    share_rows = trusted or rows
+    mode_shares = [r["mode_share"] for r in share_rows]
+    entropies = [r["label_entropy_bits"] for r in share_rows]
     parse_rates = [r["parse_rate"] for r in rows]
     return {
         "n_probes": len(rows),
+        "n_probes_trusted": len(trusted),
         "median_mode_share": statistics.median(mode_shares),
         "mean_mode_share": statistics.fmean(mode_shares),
         "median_entropy_bits": statistics.median(entropies),

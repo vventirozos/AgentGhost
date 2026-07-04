@@ -60,6 +60,15 @@ class SuiteResult:
     # results.
     summary: Dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Honour the "recomputed on construction" contract above: if a caller
+        # builds a SuiteResult from results without an explicit summary, derive
+        # it now. Otherwise `compare_to_baseline` reads an empty `.summary`,
+        # `diff_summaries` treats the missing pass_rate as 0.0, and a whole run
+        # is spuriously flagged as a regression/improvement.
+        if not self.summary and self.results:
+            self.summary = aggregate(self.results)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "suite_name": self.suite_name,

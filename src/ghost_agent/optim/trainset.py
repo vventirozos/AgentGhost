@@ -158,6 +158,11 @@ def split_train_eval(
     shuffled = list(examples)
     rng.shuffle(shuffled)
     n_eval = max(1, int(len(shuffled) * eval_fraction))
+    # Never let the holdout consume the ENTIRE corpus. With a single example
+    # `max(1, int(1*0.2))` is 1, which put the only example in eval and left
+    # `train_set` EMPTY — so GEPA would then "optimize" on nothing. Keep at
+    # least one example in train (a 1-example corpus → train=[it], eval=[]).
+    n_eval = min(n_eval, len(shuffled) - 1)
     eval_set = shuffled[:n_eval]
     train_set = shuffled[n_eval:]
     return train_set, eval_set

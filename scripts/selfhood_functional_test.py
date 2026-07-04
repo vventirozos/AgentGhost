@@ -486,7 +486,11 @@ def section_g_corruption(report: TestReport):
     report.section("G. Recovery from corrupted state.json")
 
     state_path = SELFHOOD_DIR / "state.json"
-    backup = state_path.read_text(encoding="utf-8")
+    # Guard the pre-try read: running this section standalone (`--only g`)
+    # before any state-creating section means state.json may not exist yet —
+    # a bare read_text() would FileNotFoundError and abort the whole run
+    # before any report is printed.
+    backup = state_path.read_text(encoding="utf-8") if state_path.exists() else None
     try:
         state_path.write_text("not json {{{ broken", encoding="utf-8")
         sm = SelfModel(root=SELFHOOD_DIR, enabled=True)
@@ -507,8 +511,12 @@ def section_g_corruption(report: TestReport):
         report.passed("G", "recovers from corrupt state", "no crash, fresh start")
         report.passed("G", "writeable after recovery", "")
     finally:
-        # Restore the original
-        state_path.write_text(backup, encoding="utf-8")
+        # Restore the original (or clean up the corrupt file we wrote if there
+        # was no pre-existing state to back up).
+        if backup is not None:
+            state_path.write_text(backup, encoding="utf-8")
+        else:
+            state_path.unlink(missing_ok=True)
 
 
 # -----------------------------------------------------------------

@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import uvicorn
 import os
+import secrets
 
 # GHOST_API_KEY is required. A hardcoded default (e.g. "ghost-secret-123")
 # turns the interface server into an open relay for anyone who knows the
@@ -66,7 +67,12 @@ async def verify_interface_key(x_ghost_key: str | None = Header(default=None)) -
     header. Without this, anyone who can reach the interface server has
     full agent access (the proxies bake the upstream key into outgoing
     requests, so they were effectively open relays)."""
-    if not x_ghost_key or x_ghost_key != GHOST_API_KEY:
+    # Constant-time compare (encode to bytes so a non-ASCII header can't
+    # raise) — the main API mandates this (api/routes.py + a regression test);
+    # the interface must not diverge to a timing-leaky `!=`.
+    if not x_ghost_key or not secrets.compare_digest(
+        x_ghost_key.encode("utf-8"), GHOST_API_KEY.encode("utf-8")
+    ):
         raise HTTPException(status_code=401, detail="Missing or invalid X-Ghost-Key header.")
 
 
@@ -202,7 +208,9 @@ async def get(key: str | None = None):
     # The page itself must be gated, otherwise we'd be handing out the
     # injected API key to anyone who can reach the server. Accept the key
     # via `?key=...` so a user can bookmark the URL once.
-    if key != GHOST_API_KEY:
+    if not key or not secrets.compare_digest(
+        key.encode("utf-8"), GHOST_API_KEY.encode("utf-8")
+    ):
         return HTMLResponse(
             content="<h1>401 Unauthorized</h1><p>Append <code>?key=YOUR_KEY</code> to the URL.</p>",
             status_code=401,
@@ -231,7 +239,17 @@ async def get_sw():
     return FileResponse(static_dir / "sw.js", media_type="application/javascript")
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
+async def websocket_endpoint(websocket: WebSocket, key: str | None = None):
+    # Gate the live log stream exactly like the `/` UI. The log carries tool
+    # outputs and file contents; without this, ANY LAN host — or any website
+    # the operator visits, since WebSockets bypass CORS (cross-site WebSocket
+    # hijacking) — could connect and exfiltrate the stream. The browser client
+    # passes the injected key as `?key=` (it can't set custom WS headers).
+    if not key or not secrets.compare_digest(
+        str(key).encode("utf-8"), GHOST_API_KEY.encode("utf-8")
+    ):
+        await websocket.close(code=1008)  # policy violation
+        return
     await websocket.accept()
     connected_websockets.add(websocket)
     try:
@@ -309,9 +327,14 @@ async def chat_proxy(request: Request):
     """Proxies chat requests to the Ghost Agent."""
     try:
         body = await request.json()
+        # A valid-JSON but non-object body ([], "x", 5) would make body.get
+        # below raise AttributeError → caught as a 502 + leaked str(e). Reject
+        # it cleanly as a 400 client error.
+        if not isinstance(body, dict):
+            return _err_json(400, "Request body must be a JSON object.")
         # Reject grossly oversized chat bodies upfront — no point shipping
         # 100K messages downstream just to have the agent trim them.
-        msgs = body.get("messages", []) if isinstance(body, dict) else []
+        msgs = body.get("messages", [])
         if isinstance(msgs, list) and len(msgs) > MAX_CHAT_MESSAGES:
             return _err_json(413, f"Too many messages ({len(msgs)} > {MAX_CHAT_MESSAGES} cap)")
         is_streaming = body.get("stream", False)
@@ -669,6 +692,8 @@ async def tts_proxy(request: Request):
     """Proxies text chunks to the Raspberry Pi for Text-to-Speech."""
     try:
         body = await request.json()
+        if not isinstance(body, dict):
+            return _err_json(400, "Request body must be a JSON object.")
         payload = {"text": body.get("text", "")}
         client = httpx.AsyncClient(timeout=60.0)
         # Same leak guard as workspace_save: close on pre-stream failure.

@@ -701,14 +701,22 @@ def detect_referenced_experiences(
     response_trigrams = set(_trigrams(response_text))
     if not response_trigrams:
         return []
+    # Only credit experiences that were actually SHOWN in the wake-up prefix
+    # (the documented contract: "which experiences FROM THE PREFIX were
+    # echoed"). Without this gate the function ignored `prefix_text` entirely
+    # and bumped reference_count for any recent experience sharing a trigram
+    # with the response — e.g. one the model never saw but that overlaps the
+    # echoed-back user request — polluting the recall relevance prior.
+    prefix_trigrams = set(_trigrams(prefix_text or ""))
     matched: List[str] = []
     for exp in experiences:
         exp_text = (getattr(exp, "summary", "") or "") + " " + (
             getattr(exp, "user_first_words", "") or "")
-        for tg in _trigrams(exp_text):
-            if tg in response_trigrams:
-                matched.append(exp.id)
-                break
+        exp_trigrams = list(_trigrams(exp_text))
+        if not any(tg in prefix_trigrams for tg in exp_trigrams):
+            continue  # not in the prefix → not a real reference
+        if any(tg in response_trigrams for tg in exp_trigrams):
+            matched.append(exp.id)
     return matched
 
 

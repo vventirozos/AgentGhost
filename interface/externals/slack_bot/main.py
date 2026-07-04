@@ -159,6 +159,14 @@ async def download_slack_file(file_info: dict) -> str | None:
     filename = file_info.get("name")
     if not url or not filename:
         return None
+    # The Slack `name` is attacker-controlled by any workspace member. Strip
+    # any directory component so an absolute path (`/Users/.../authorized_keys`)
+    # or a `../` sequence can't escape the sandbox when joined below —
+    # os.path.join discards the base on an absolute component, and basename
+    # neutralizes both forms.
+    filename = os.path.basename(filename)
+    if not filename or filename in (".", ".."):
+        return None
 
     os.makedirs(GHOST_SANDBOX_DIR, exist_ok=True)
     filepath = os.path.join(GHOST_SANDBOX_DIR, filename)
@@ -293,7 +301,15 @@ async def _process_message(messages: list, say, thread_ts: str | None = None, ev
                 # Upload images to slack
                 uploaded_files = []
                 for img_name in images:
-                    img_path = os.path.join(GHOST_SANDBOX_DIR, img_name)
+                    # `img_name` comes from a regex over the agent reply
+                    # (`[^)]+`, so it can contain `/` or `..`). Sanitize the
+                    # LOCAL path so it can't read/write outside the sandbox;
+                    # the download URL keeps the original (the /api/download
+                    # endpoint enforces its own containment).
+                    safe_name = os.path.basename(img_name)
+                    if not safe_name or safe_name in (".", ".."):
+                        continue
+                    img_path = os.path.join(GHOST_SANDBOX_DIR, safe_name)
                     if os.path.exists(img_path):
                         uploaded_files.append(img_path)
                     else:

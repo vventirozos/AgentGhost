@@ -43,19 +43,94 @@ regression tests; docs updated; full suite green on that session's date.
 | 17 | core-dream | core/: dream, challenge_templates, journal_challenges, adversarial_generator, self_play_scoring, solution_novelty | 6697 | CLEAR 2026-07-03 |
 | 18a | core-agent (1/2) | core/agent.py lines ~1–5300 (init, loop, tool dispatch) | 5300 | CLEAR 2026-07-03 |
 | 18b | core-agent (2/2) | core/agent.py lines ~5300–end + agent_qwen.py | 5245 | CLEAR 2026-07-03 |
-| 19 | prm | src/ghost_agent/prm/ | 1599 | in-progress |
-| 20 | reflection | src/ghost_agent/reflection/ | 1711 | in-progress |
-| 21 | selfhood | src/ghost_agent/selfhood/ | 2278 | in-progress |
-| 22 | distill | src/ghost_agent/distill/ | 1564 | in-progress |
-| 23 | eval | src/ghost_agent/eval/ | 1062 | in-progress |
-| 24 | optim | src/ghost_agent/optim/ | 792 | in-progress |
-| 25 | skills_auto | src/ghost_agent/skills_auto/ | 621 | in-progress |
-| 26 | entrypoint | src/ghost_agent/main.py, _env.py, __init__.py | ~400 | in-progress |
-| 27 | interface | interface/server.py, slack_project_commands.py | ~? | pending |
-| 28 | scripts | scripts/*.py (best-effort; eval/ablation tooling) | ~? | pending |
+| 19 | prm | src/ghost_agent/prm/ | 1599 | CLEAR 2026-07-04 |
+| 20 | reflection | src/ghost_agent/reflection/ | 1711 | CLEAR 2026-07-04 |
+| 21 | selfhood | src/ghost_agent/selfhood/ | 2278 | CLEAR 2026-07-04 |
+| 22 | distill | src/ghost_agent/distill/ | 1564 | CLEAR 2026-07-04 |
+| 23 | eval | src/ghost_agent/eval/ | 1062 | CLEAR 2026-07-04 |
+| 24 | optim | src/ghost_agent/optim/ | 792 | CLEAR 2026-07-04 |
+| 25 | skills_auto | src/ghost_agent/skills_auto/ | 621 | CLEAR 2026-07-04 |
+| 26 | entrypoint | src/ghost_agent/main.py, _env.py, __init__.py | ~400 | CLEAR 2026-07-04 |
+| 27 | interface | interface/server.py, slack_project_commands.py | ~? | CLEAR 2026-07-04 |
+| 28 | scripts | scripts/*.py (best-effort; eval/ablation tooling) | ~? | CLEAR 2026-07-04 |
 
 ## Deferred findings (not yet fixed — revisit)
 
+- **optim GEPA pipeline: not dspy-compatible + A/B validity (units 24/28)** — the adoption-ordering
+  half is RESOLVED 2026-07-04: `scripts/run_gepa.py` now writes the tuned prompt to a `.candidate`
+  STAGING path and promotes (os.replace) only after the A/B gate, which is ON BY DEFAULT
+  (`--no-ab-gate` opts out; empty eval split refuses to promote). STILL DEFERRED (need a dspy env):
+  `tuner.compile` is handed plain `TrainExample`s never converted to `dspy.Example`, so a real dspy
+  run crashes (masked by the mock in tests); signature input-field names
+  (`available_tools`/`memory_snippets`) don't match what `build_trainset` emits (`cluster`/`tier`);
+  the A/B `_ab_runner` feeds the instruction as a bare system prompt via chat_completion, which is
+  NOT how the agent embeds the signature at inference (gate can pass/fail on out-of-distribution
+  behaviour); `compare_prompts` ships on `delta>min_delta` with no min-sample guard. (med — offline, opt-in)
+- **interface external servers + clockwork client (unit 27)** — the TTS/STT (`voice_server.py`) and
+  image-gen (`img_gen_server.py`) HTTP servers bind `0.0.0.0` with NO auth on expensive GPU endpoints
+  (LAN-reachable resource exhaustion) + unbounded upload/text reads + blocking model calls on the async
+  loop; fixing needs a shared-key check coordinated with the clients (home-lab threat model). The
+  clockwork desktop client parses SSE with `aiter_text` on non-line-aligned chunks (token misframing →
+  silent drops; use aiter_lines), ships a placeholder `X-Ghost-Key: YOUR_KEY_HERE` (401s against a
+  key-enforcing server), and leaks the camera/QTimer on WM-close. (med/low — peripheral)
+- **scripts best-effort measurement/robustness (unit 28)** — `eval_baseline`'s default `--runner stub`
+  makes `compare` an unconditional green gate (CI footgun); `ablation_eval` globs a fixed report dir and
+  folds stale/foreign-model result JSONs into the verdict table, and treats each (task,repeat) as
+  independent in its Wilson CIs (over-narrow); `selfhood_functional_test` Section C/G do non-atomic
+  read-modify-writes on the LIVE selfhood store the agent also writes (lost-update window) and Section D
+  hardcodes upstream :8088 (false FAIL if unreachable); `load_tokens` builds its synthetic filler in an
+  O(n²) re-encode loop; several scripts don't expanduser report paths / collide on same-second timestamps;
+  `backfill_project_concepts` over-counts edges on re-runs (reporting only — the upsert itself is safe). (low)
+- **skills_auto graduation pipeline built-but-unwired (unit 25)** — nothing graduates today: the
+  only trajectory producer with real tool_calls (the chat recorder) writes UNKNOWN and can only be
+  promoted to FAILED, never PASSED; the two PASSED producers write `tool_calls=[]` which the
+  extractor skips. So these are LATENT until the producer wiring is fixed: (a) consolidator's
+  single-member passthrough keeps the extractor's cluster-specific `signature_hash` while merged
+  members recompute a cluster-independent one → same skill graduates under two store keys;
+  (b) `support=len(trajs)` has no per-session/batch dedup → N self-consistency samples of one turn
+  count as N independent supports (a one-turn coincidence could clear the ≥3 gate);
+  (c) `_signature_hash` delimiter-injection collision (`::`/`|`). (med — latent)
+- **prm binary-floor gates continuous training + train↔serve feature skew (unit 19)** — the class-
+  balance floor (`min_class_fraction`) is computed on BINARY labels while the model fits CONTINUOUS
+  labels by default, so an all-PASSED corpus with long trajectories (0.9^7<0.5) clears the floor and
+  trains "success everywhere"; and several step features (steps_so_far, failures_so_far, tool_used/
+  failed_this_turn) are always 0 at the only live scoring site (turn start) but vary at train, so
+  deployed discrimination is weaker than train_accuracy implies. (med/low — needs a training-signal redesign)
+- **reflection selection oldest-first + non-persistent dedup (unit 20)** — `Reflector.run` takes the
+  FIRST `max_failures` reflectable in iteration order (oldest-first), contradicting the "recent"
+  contract; and `_reflected_trajectory_ids` is in-memory only, so restarts re-reflect the oldest
+  failures. Also: `_truncate` head-keeps `tc.error`/`failure_reason`, dropping the tail exception of a
+  traceback from the reflection prompt; a diagnosis containing "plan:" is truncated at that word.
+  Fix needs a recency window + persisted dedup. (med/low)
+- **distill user_correction / outcome-heuristic false positives (unit 22)** — an affirming follow-up
+  reusing the prior request's content words ("actually the sort works great, thanks") can trip the
+  correction classifier (Signal A "actually" AND Jaccard≥0.4) → promotes a GOOD turn to FAILED and
+  retracts its lesson; the tool-error heuristic's bare substrings ("exception"/"traceback") match
+  benign read content; the `[ATTEMPT_ABORTED_*]` regex is searched in the user-facing final_response.
+  Heuristic tuning — bounded today by the 3-repeat / two-signal gates. (med)
+- **agent.py trajectory tool-result pairing on id-less duplicates (units 18/22)** — flagged again by
+  the distill reviewer: two same-named tool calls in one turn with empty ids collide on the `name`
+  key in `pending_calls`, so one result is dropped (blank ToolCall on disk) and Signal-3 error-repeat
+  promotion is undercounted. Contingent on local models streaming id-less tool calls. Needs an
+  index-fallback key. (low-med / contingent)
+- **eval network_guard + sync-runner timeout (unit 23)** — the guard patches only connect/connect_ex/
+  sendto/sendmsg, NOT `getaddrinfo`, so a DNS lookup leaks the hostname despite the "no bytes leave"
+  claim (blocking it risks breaking localhost resolution — needs a loopback-allow patch); and
+  `per_task_timeout_s` is applied via `wait_for` AFTER the runner is called, so a blocking SYNC runner
+  isn't interrupted (shipped runners are async → latent). (low)
+- **entrypoint lifecycle/observability nits (unit 26)** — `--no-memory` leaks a `/tmp/ghost_no_memory_*`
+  dir per boot; `_host_signal_to_bus` logs hardcoded 85/90 thresholds instead of the configured
+  `--metacog-*-high` values (observability only); bare `LLMClient`/`MemoryBus`/`GhostAgent`/watchdog
+  startup statements leak the scheduler/telemetry/tor-guard if they throw before `yield`; unbounded
+  numeric CLI args (`--max-context`, prob/threshold in 0..1). (low)
+- **streamed-turn calibration gap (unit 18 residue)** — streamed final generations bypass the finalize
+  tail (handle_chat returns the stream generator first), so they write NO calibration JSONL pair and
+  log a competence-only `below=`; the verdict is deferred to a next-turn banner. Async-verification
+  design gap, not a finalize skip. (low)
+- **correction-lookup fingerprint mismatch on prepended turns (unit 18)** — the calib-negative and
+  trajectory stashes key on the pre-prepend response text while the next-turn lookup fingerprints the
+  returned (banner/clarifying/digest-prepended) text → cache miss drops the "confidently wrong" signal
+  on hedged turns. Fix touches the two-mode finalize+return hot path. (med)
 - **current_project_id cross-conversation race (projects + api)** — the process-global
   active project is set by switch/resume and read live by upload/download scoping and
   file_system; concurrent conversations can cross-place files. Same structural race class
@@ -277,6 +352,50 @@ regression tests; docs updated; full suite green on that session's date.
 ## Session log
 
 (newest first)
+
+### 2026-07-04 — units 27-28 (interface + scripts) — CLEAR — **SWEEP COMPLETE (all 28 units)**
+- Final units: the interface layer (server.py + slack_project_commands + external integration
+  servers, ~3.1k lines) and the offline scripts/ tooling (~5.4k lines). 4 scoped lenses, 12 fixes.
+- HIGH: unauthenticated `/ws` live-log broadcast (cross-site WebSocket-hijackable since WS bypass
+  CORS) — now key-gated (+ app.js passes `?key=`); Slack upload path traversal → arbitrary file
+  write (basename sanitize); and RESOLVED the long-deferred GEPA adoption ordering — run_gepa now
+  stages to `.candidate` and promotes only after an A/B gate that is ON BY DEFAULT.
+- MED: ablation_paired template false-pass (routed dict to validate like suite.py — was scoring
+  opposite the sequential driver → bogus McNemar verdict); gaia_eval extract_final_answer picked
+  the FIRST "FINAL ANSWER" not the last (DOTALL→MULTILINE) + empty answer scored correct vs "?" GT;
+  introspective mode-share inflated by under-parsed probes (band summary now excludes parsed_n<2).
+- LOW: interface constant-time key compare (was `!=`) + non-dict body → 400 (was 502+leak);
+  selfhood_functional_test Section G pre-try read crash; claude_trainer load_curriculum KeyError.
+- Deferred (see Deferred findings): external GPU servers 0.0.0.0-no-auth (home-lab threat model,
+  needs coordinated client keys); clockwork SSE aiter_text misframing; eval_baseline stub-default
+  green gate; ablation_eval stale-dir folding + independent-repeat CIs; GEPA dspy incompatibility
+  + OOD A/B runner (need a dspy env). 
+- Tests: tests/test_bughunt_unit27to28.py (12). Docs: audit_fixes.html (units 27-28).
+- **Ledger status: units 1-28 all CLEAR. System-wide bug hunt complete.**
+
+### 2026-07-04 — units 19-26 (prm/reflection/selfhood/distill/eval/optim/skills_auto/entrypoint) — CLEAR
+- 8 subsystems (~9.9k lines, ~40 files) reviewed one-lens-per-unit in parallel. 16 fixes.
+- Cross-cutting theme: the `**d` dataclass-from-dict silent-drop/wipe pattern (schema drift
+  either crashes the load — swallowed into a dropped record or an empty-then-overwritten file
+  — or mislabels) and fragile substring heuristics.
+- Notable: selfhood state.json schema-drift wipe (SelfState.from_dict now filters keys);
+  distill Trajectory.from_dict corpus-wide drop on version skew (filters keys, still skips
+  no-field garbage); conn-URI password leak for `/`- or `:`-bearing passwords (redact class);
+  eval template tasks silently PASS on non-empty text when the runner gives no `passed` verdict
+  (now unverified/fail); reflection transient-error permanently burned the failure (un-claim on
+  error); self-consistency batch aborted by one non-numeric metric (defensive coerce); prm junk
+  outcome trained as false-negative (skip) + checkpoint weight-length rejected at load.
+- Smaller: optim 1-example empty-train split; postmortem empty-lesson bail + word-boundary
+  patch split; outcome-heuristic non-zero exit codes; selfhood detect_referenced_experiences
+  now honours prefix_text; eval SuiteResult __post_init__ summary; skills-auto graduate returns
+  None on overflow-evict (+ caller guard in agent.py); main.py Tor-guard uninstall on shutdown.
+- Deferred (see Deferred findings): optim GEPA opt-in adoption + dspy incompatibility (needs dspy
+  env / spans unit 28); skills-auto pipeline built-but-unwired (latent dedup/support bugs); prm
+  binary-floor-vs-continuous + train↔serve skew; reflection oldest-first + non-persistent dedup;
+  distill user_correction false positives; eval getaddrinfo/sync-timeout; entrypoint lifecycle nits.
+- Tests: tests/test_bughunt_unit19to26.py (18) + 3 existing tests updated to the corrected
+  behaviour (prm load-raises, reflection un-claim-on-error, distill drift-tolerant). Docs:
+  audit_fixes.html (units 19-26).
 
 ### 2026-07-03 — unit 18 (core-agent: agent.py + agent_qwen.py) — CLEAR
 - The biggest/most-central file (10.5k lines; handle_chat ~5.6k on its own).
