@@ -323,10 +323,20 @@ class MCTSReasoner:
             return candidates
 
         async def _sim(candidate: ActionCandidate) -> ActionCandidate:
+            # `/no_think` soft-switch + `enable_thinking=False` hard-switch:
+            # this is a REASONING model, and the scoring prompt is a cheap
+            # utility call. Without disabling thinking it spent the entire
+            # max_tokens budget on the <think> channel and returned EMPTY
+            # content — so `_parse_json` got nothing, every candidate collapsed
+            # to progress=cost=risk=0.5 (a flat 0.50 score), and MCTS ranked
+            # nothing while still paying for N candidate simulations. Disabling
+            # thinking makes it emit the JSON directly (verified: real, varied
+            # progress/cost/risk). Mirrors dream.py / project_research.py.
             prompt = _SIMULATE_PROMPT.format(
                 action=f"{candidate.description} (tool: {candidate.tool_name})",
                 context=context[:2000],
-            )
+            ) + "\n\n/no_think"
+            _no_think = {"enable_thinking": False}
             try:
                 # Use worker nodes if available (cheaper)
                 route_fn = getattr(self.llm_client, "route", None)
@@ -334,6 +344,7 @@ class MCTSReasoner:
                     result = await route_fn(
                         "MCTS_SIMULATE", {
                             "messages": [{"role": "user", "content": prompt}],
+                            "chat_template_kwargs": _no_think,
                         },
                         max_tokens=256, temperature=0.2, fallback=None,
                     )
@@ -346,6 +357,7 @@ class MCTSReasoner:
                         "temperature": 0.2,
                         "max_tokens": 256,
                         "stream": False,
+                        "chat_template_kwargs": _no_think,
                     })
 
                 # route() returns the content STRING on success (see

@@ -364,6 +364,43 @@ regression tests; docs updated; full suite green on that session's date.
 
 (newest first)
 
+### 2026-07-04 — LIVE BUG: native tool_call corruption broke `introspect` (FIXED)
+- Symptom (operator-reported, session e260ae3e): "tell me about yourself" → `introspect` failed every
+  turn with `SYSTEM ERROR: 'action' must be one of [...]` even though the model passed a valid action.
+- Root cause: with `--native-tools` on (Qwen 3.6 default), the UPSTREAM server parses tool-call XML
+  itself and returns structured `message.tool_calls`, bypassing our own (correct) XML parser. On a
+  multi-tool reply using the equals-format `<function=name>`/`<parameter=name>`, the server closed the
+  first `<parameter>` but leaked the whole serialized XML of every FOLLOWING call into the first arg's
+  string value → `{"action": "summary</parameter>...<function=list_lessons>...all", "limit": 10}` →
+  invalid action. Confirmed from the trajectory (args stored as a dict with tag-soup; the `<tool_call>`
+  literal inside the value proves it did NOT come from our `re.split`-based parser — it's native).
+- Fix: `_repair_native_tool_calls` in core/agent.py, applied on the native fallback path (~line 7413).
+  Detects the CLOSE-then-OPEN leak signature; only acts when the leaked tail names a KNOWN tool;
+  truncates the primary value at the first framing token AND recovers the merged calls as separate
+  tool_calls (introspect(summary,limit=10) + list_lessons(scope=all)). Clean calls pass through
+  byte-for-byte; legit code/doc content (no close-then-open, or unknown tool names) is never mangled.
+- Tests: tests/test_native_toolcall_repair.py (16, incl. the two verbatim corrupt strings) + eval
+  invariant `probe:native_toolcall_repair` (offline gate now 11→ probes). Docs: audit_fixes.html new
+  top section. Full suite re-run green.
+- NOTE (not fixed here, deliberate): we did NOT flip `--native-tools` off. Native saves ~7K tokens/turn
+  and our repair brings the native path up to our XML parser's robustness. If the upstream server is
+  later fixed/replaced, the repair is a harmless no-op (clean calls untouched).
+
+### 2026-07-04 — LIVE VALIDATION: capability gate frozen green
+- Steps 1-3 validated end-to-end against the live agent (http runner, real memory). First
+  `--suite default` freeze was 0.679/28 — but that counted 8 challenge-TEMPLATE tasks that the
+  plain http runner can't validate (no in-sandbox `passed` verdict → correctly scored unverified,
+  not silent-passed) as fails; on scorable tasks it was 19/20.
+- Fixed the two things the baseline surfaced: relaxed the `curated:hello` greeting validator
+  (validator noise — a personalized "Good morning, <name>!" is a correct greeting) and added
+  `--suite capability` (regression + capability + curated, NO templates — the http-scorable set).
+- Re-froze `--suite capability` → **1.000 / 21**, confirming all the step 1-3 code runs clean
+  against the existing 33MB corpus + profile + selfhood (schema-drift fixes are backward-compatible;
+  no memory wipe needed). Baseline committed at $GHOST_HOME/system/eval/baseline.json.
+- NOTE: 1.000 means the suite is a solid REGRESSION floor but too easy to DISCRIMINATE improvement.
+  Measuring coding capability (the templates) still needs a sandbox-verdict runner — the natural
+  next investment if a discriminating (not just regression) capability signal is wanted.
+
 ### 2026-07-04 — post-hunt strategy step 3: close the reflection loop
 - The reflection loop (FAILED traj → Reflector → lesson → SkillMemory → retrieved next similar
   turn) was already wired; step 3 made it EFFECTIVE + proved closure, and packaged the live A/B.

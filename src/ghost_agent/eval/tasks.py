@@ -332,6 +332,41 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
         bad = [msg for ok, msg in checks if not ok]
         return (not bad, "outcome consolidation wrong: " + "; ".join(bad) if bad else "")
 
+    def probe_native_toolcall_repair(_ctx) -> Tuple[bool, str]:
+        # With --native-tools on, some upstream servers merge a multi-tool
+        # reply into ONE call's arguments, leaking the following call's XML
+        # into the first argument's string value — so a valid `action` like
+        # 'summary' arrives as 'summary</parameter>...<function=...>' and
+        # fails validation. _repair_native_tool_calls must recover the
+        # intended value and split the leaked call back out.
+        try:
+            import json
+            from ..core.agent import _repair_native_tool_calls
+            from ..tools.introspect import _VALID_ACTIONS
+        except Exception as e:
+            return False, f"cannot import repair helper: {e}"
+        corrupt = ("summary</parameter>\n</function>\n</tool_call>\n<tool_call>\n"
+                   "<function=list_lessons>\n<parameter=scope>\nall")
+        tc = {"id": "c", "type": "function", "function": {
+            "name": "introspect",
+            "arguments": json.dumps({"action": corrupt, "limit": 10})}}
+        out, repaired = _repair_native_tool_calls([tc], ["introspect", "list_lessons"])
+        if not repaired:
+            return False, "leak not detected — corrupt native tool_call left uncorrected"
+        action = json.loads(out[0]["function"]["arguments"]).get("action")
+        if action not in _VALID_ACTIONS:
+            return False, f"recovered action {action!r} still invalid"
+        names = [t["function"]["name"] for t in out]
+        if "list_lessons" not in names:
+            return False, "leaked second tool call was dropped, not recovered"
+        # A clean call must pass through byte-for-byte.
+        clean = {"id": "d", "type": "function", "function": {
+            "name": "introspect", "arguments": json.dumps({"action": "summary"})}}
+        out2, rep2 = _repair_native_tool_calls([clean], ["introspect"])
+        if rep2 or out2 != [clean]:
+            return False, "clean tool_call was mutated by the repair"
+        return True, ""
+
     return [
         RegressionProbeTask(
             task_id="probe:cooldown_constants",
@@ -392,6 +427,12 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
             category="regression",
             prompt="trajectory outcome folds in verifier + structural signals",
             validator=probe_outcome_consolidation,
+        ),
+        RegressionProbeTask(
+            task_id="probe:native_toolcall_repair",
+            category="regression",
+            prompt="corrupt native tool_call args are repaired to a valid call",
+            validator=probe_native_toolcall_repair,
         ),
     ]
 

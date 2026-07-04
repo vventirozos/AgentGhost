@@ -15,6 +15,15 @@ logger = logging.getLogger("GhostAgent")
 # this explicitly), so unreferenced tasks can be GC'd before they run.
 _GRAPH_EXTRACT_TASKS: set = set()
 
+# Hard ceiling on the INLINE graph-triplet extraction in the bus-aware
+# insert_fact path. That LLM call is pure enrichment (the fact itself is
+# stored regardless), but it is awaited on the tool's critical path — so an
+# upstream/worker stall (e.g. no --worker-nodes pool, or a 503) would hang the
+# whole turn AND, because it blocks before publish_fact(), the fact would
+# never be stored at all. Bounding it means a slow extractor costs at most
+# this many seconds and the fact still lands in the vector store.
+_GRAPH_EXTRACT_TIMEOUT_S = 20.0
+
 
 def _is_within_root(path: Path, root: Path) -> bool:
     """True iff `path` is inside `root`, compared path-component-wise.
@@ -94,23 +103,49 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
     # --- BUS-AWARE PATH ---
     if memory_bus is not None:
         try:
-            extracted_triplets = []
-            if llm_client is not None:
-                try:
-                    from ..core.agent import extract_json_from_text
-                    prompt = f"Extract explicit entity relationships from this fact into a 'graph_triplets' array as objects with 'subject', 'predicate', and 'object' keys. Predicates MUST be uppercase verbs. Return ONLY JSON. Fact: {text}"
-                    payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Graph Extractor. Output JSON."}, {"role": "user", "content": prompt}], "temperature": 0.0, "response_format": {"type": "json_object"}}
-                    data = await llm_client.chat_completion(payload, use_worker=True, is_background=True)
-                    res = extract_json_from_text(data["choices"][0]["message"].get("content", ""), repair_truncated=True)
-                    extracted_triplets = res.get("graph_triplets", []) or []
-                except Exception:
-                    extracted_triplets = []
-
+            # Store the fact IMMEDIATELY, without triplets. Graph-triplet
+            # extraction is a separate LLM call that reliably STALLS when made
+            # from inside a live turn (worker/upstream contention). It used to
+            # be AWAITED inline BEFORE this publish, which (a) hung the turn to
+            # the 600s _wait_for_foreground_clear ceiling and (b) — because the
+            # hang was before the publish — never stored the fact at all. It is
+            # pure enrichment, so we move it off the critical path: publish now,
+            # extract-and-add-triplets in a background task (where
+            # is_background=True is finally correct — a fire-and-forget task,
+            # not something the turn awaits, so it can't self-deadlock).
             await memory_bus.publish_fact("insert_fact", {
                 "text": text,
                 "metadata": {"timestamp": get_utc_timestamp(), "type": "manual"},
-                "triplets": extracted_triplets,
+                "triplets": [],
             })
+
+            graph = getattr(memory_bus, "graph", None) or graph_memory
+            if llm_client is not None and graph is not None:
+                _payload_text = text
+
+                async def _extract_and_add_triplets():
+                    try:
+                        from ..core.agent import extract_json_from_text
+                        prompt = f"Extract explicit entity relationships from this fact into a 'graph_triplets' array as objects with 'subject', 'predicate', and 'object' keys. Predicates MUST be uppercase verbs. Return ONLY JSON. Fact: {_payload_text}"
+                        payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Graph Extractor. Output JSON."}, {"role": "user", "content": prompt}], "temperature": 0.0, "response_format": {"type": "json_object"}}
+                        data = await asyncio.wait_for(
+                            llm_client.chat_completion(payload, use_worker=True, is_background=True),
+                            timeout=_GRAPH_EXTRACT_TIMEOUT_S,
+                        )
+                        res = extract_json_from_text(data["choices"][0]["message"].get("content", ""), repair_truncated=True)
+                        triplets = res.get("graph_triplets", []) or []
+                        if triplets:
+                            await asyncio.to_thread(graph.add_triplets, triplets)
+                    except Exception:
+                        pass
+
+                # Strong ref: the loop keeps only weak refs to tasks, so a bare
+                # create_task can be GC'd mid-flight (same guard as the legacy
+                # path below).
+                _t = asyncio.create_task(_extract_and_add_triplets())
+                _GRAPH_EXTRACT_TASKS.add(_t)
+                _t.add_done_callback(_GRAPH_EXTRACT_TASKS.discard)
+
             return f"Memory stored: '{text}'"
         except Exception as e:
             return f"Error storing memory: {e}"

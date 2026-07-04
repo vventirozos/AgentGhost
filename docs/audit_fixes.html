@@ -73,6 +73,169 @@
     label leakage). Everything else preserves documented behaviour while fixing a latent bug.
   </div>
 
+  <h2>Live regression (2026-07-04): native tool_call corruption broke <code>introspect</code></h2>
+  <p>
+    A live <q>hey ghost, tell me about yourself</q> turn wedged: the agent called
+    <code>introspect</code> and got, every turn,
+    <code>SYSTEM ERROR: 'action' must be one of ['narrative', 'recall', 'recent', 'stats', 'summary']</code>
+    — even though its own reasoning clearly passed a valid action (<code>summary</code> / <code>narrative</code> / <code>stats</code>).
+    The model was not at fault; the argument was being corrupted <em>before</em> it reached the tool.
+  </p>
+  <p>
+    <strong>Root cause.</strong> With <code>--native-tools</code> on (the Qwen&nbsp;3.6+ default), the upstream
+    server parses the tool-call XML itself and hands us structured <code>message.tool_calls</code>, bypassing
+    Ghost's own robust XML parser. On a <em>multi-tool</em> reply using the equals-format
+    <code>&lt;function=name&gt;</code>&nbsp;/&nbsp;<code>&lt;parameter=name&gt;</code> shape, the server closes the
+    first <code>&lt;parameter&gt;</code> correctly but then leaks the entire serialized XML of every
+    <em>following</em> tool call into the first argument's string value:
+  </p>
+  <pre><code>{"action": "summary&lt;/parameter&gt;\n&lt;/function&gt;\n&lt;/tool_call&gt;\n&lt;tool_call&gt;\n&lt;function=list_lessons&gt;\n&lt;parameter=scope&gt;\nall",
+ "limit": 10}</code></pre>
+  <p>
+    So <code>action</code> becomes a giant invalid string and the turn is wasted (and the pre-flight
+    dedup guard then blocks the retry). The trace above is verbatim from session <code>e260ae3e</code>.
+  </p>
+  <table>
+    <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Corrupt native <code>tool_calls</code> merged a multi-tool reply into one call's arguments</td>
+        <td>New <code>_repair_native_tool_calls</code> (in <a href="core/agent.html">core/agent</a>) runs on the
+        native-tool_call fallback path. It detects the leak by its unambiguous <strong>CLOSE-then-OPEN</strong>
+        signature (a <code>&lt;/parameter&gt;</code>/<code>&lt;/function&gt;</code>/<code>&lt;/tool_call&gt;</code>
+        close followed by a <em>new</em> <code>&lt;tool_call&gt;</code>/<code>&lt;function=…&gt;</code> opening),
+        and — only when the leaked tail names at least one <strong>known tool</strong> — truncates the value at
+        the first framing token and <em>recovers</em> the merged calls as separate <code>tool_calls</code>. The
+        example above becomes a valid <code>introspect(action=summary, limit=10)</code> plus a recovered
+        <code>list_lessons(scope=all)</code>.</td>
+        <td>high (broke every multi-tool native turn)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    <strong>Why it's safe.</strong> Clean tool_calls pass through byte-for-byte. Content that merely
+    <em>mentions</em> framing text (code, docs) has no close-then-open pair, or names no real tool, so it is
+    never mangled — verified by <code>tests/test_native_toolcall_repair.py</code> (16 tests) and the
+    <code>probe:native_toolcall_repair</code> invariant in the offline eval gate. Ghost's own XML parser
+    already handled this reply shape correctly; this fix brings the native path up to the same robustness
+    rather than disabling native tools (which would forfeit the ~7&nbsp;K-token-per-turn schema saving).
+  </p>
+  <p>
+    <strong>Follow-up (functional hunt unit 5).</strong> A live <code>file_system</code> read exposed a gap:
+    when the native parser dumps the <em>entire</em> merged reply into the first argument, the value STARTS
+    with framing (no clean prefix, <code>m.start()==0</code>). The first version left that value untouched
+    and dispatched a tool call whose argument was raw tag-soup — a wasted strike. Now that "phantom" primary
+    is dropped and the first recovered call is promoted in its place (its real content was in the tail all
+    along). Pinned by an added case in <code>tests/test_native_toolcall_repair.py</code>.
+  </p>
+  <p>
+    <strong>Follow-up (functional hunt unit 7).</strong> A live <code>manage_tasks</code> stop showed a
+    third shape: the SECOND <em>parameter</em> of the same call leaked into the first —
+    <code>{"action": "stop&lt;/parameter&gt;&lt;parameter=task_identifier&gt;task_123"}</code> — i.e. a
+    <code>&lt;/parameter&gt;</code> followed by a sibling <code>&lt;parameter=…&gt;</code>, not a new
+    <code>&lt;function&gt;</code>. The repair was generalised from "close-then-new-call" to
+    "close-then-continuation": a leaked sibling <code>&lt;parameter&gt;</code> now folds back into the same
+    call's arguments (<code>{action: stop, task_identifier: task_123}</code>), so the call succeeds in one
+    turn instead of striking with an "Unknown action".
+  </p>
+
+  <h2>Functional hunt (2026-07-04): MCTS ranked nothing — the sim ate its token budget on <code>&lt;think&gt;</code></h2>
+  <p>
+    Unit&nbsp;11 (deep-reason). Every live MCTS selection logged <code>score=0.50</code> across candidates —
+    a flat, non-discriminating value. <code>_simulate_parallel</code> asks the model to rate each candidate
+    action as JSON <code>{progress, cost, risk}</code>, but on this <em>reasoning</em> model the
+    <code>max_tokens=256</code> budget was entirely consumed by the <code>&lt;think&gt;</code> channel — the
+    response <code>content</code> came back <strong>empty</strong> (confirmed against the upstream: even
+    1024 tokens produced 3500+ reasoning chars and zero content). <code>_parse_json("")</code> returned
+    <code>{}</code>, so <code>progress=cost=risk</code> all defaulted to 0.5 → a flat 0.50 score for every
+    candidate. MCTS still paid for N candidate simulations but ranked nothing (it just kept the first).
+  </p>
+  <table>
+    <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>MCTS simulation value function returned empty content on a reasoning model</td>
+        <td>Disabled thinking on the sim call (<a href="core/mcts.html">core/mcts</a>): the payload now
+        carries <code>chat_template_kwargs={"enable_thinking": False}</code> and appends <code>/no_think</code>
+        to the prompt — the same soft+hard switch <code>dream.py</code> / <code>project_research.py</code> use
+        for utility calls. The model now emits the JSON directly with real, varied progress/cost/risk, so
+        MCTS actually discriminates instead of burning simulations for a flat score.</td>
+        <td>med (deep-reason paid for lookahead it never used)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>Pinned by <code>tests/test_mcts.py::test_simulate_disables_thinking_and_scores</code>.</p>
+
+  <h2>Functional hunt (2026-07-04): a quoted <code>&lt;tool_call&gt;</code> mention truncated the <code>&lt;think&gt;</code> strip</h2>
+  <p>
+    First finding of the <strong>live functional bug hunt</strong> (<code>BUGHUNT_FUNCTIONAL.md</code> — driving the
+    running agent on&nbsp;:8000 and scanning the log). The app log showed a recurring
+    <code>system_parse_error</code> on coding tasks:
+  </p>
+  <pre><code>Parse target truncated. len=66 chars. tool_call=1/0 function=0/0 ...
+HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/think&gt;</code></pre>
+  <p>
+    <strong>Cause.</strong> When the model reasons about the guidance <q>emit exactly one <code>&lt;tool_call&gt;</code>
+    per turn</q>, it quotes <code>&lt;tool_call&gt;</code> <em>inside</em> its <code>&lt;think&gt;</code> block. The
+    stripper — <code>&lt;think&gt;.*?(?:&lt;/think&gt;|(?=&lt;tool_call|function)|$)</code> with a lazy <code>.*?</code>
+    — cut the block at that quoted mention instead of the real <code>&lt;/think&gt;</code>, leaving
+    <code>&lt;tool_call&gt;` per turn…&lt;/think&gt;\n&lt;tool_call&gt;…</code> as the parse target. The tool parser read
+    the leading tag-soup as a malformed call → <code>system_parse_error</code>, a wasted turn, and an execution strike.
+  </p>
+  <table>
+    <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Lazy <code>&lt;think&gt;</code> strip truncated at a quoted <code>&lt;tool_call&gt;</code> mention</td>
+        <td>New <code>_strip_think_blocks</code> (<a href="core/agent.html">core/agent</a>, applied at all four
+        strip sites) <strong>prefers the real <code>&lt;/think&gt;</code></strong>: closed blocks are removed whole
+        (a quoted mention inside can no longer truncate anything), and only a genuinely <em>unclosed</em>
+        <code>&lt;think&gt;</code> is stripped up to a REAL tool-call opening (a wrapped
+        <code>&lt;tool_call&gt;&lt;function&gt;</code> or a named <code>&lt;function …&gt;</code>) — never a bare quoted
+        mention.</td>
+        <td>med (recurring wasted turns on coding tasks)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>Pinned by <code>tests/test_think_strip_toolcall_mention.py</code> (12 tests, incl. the verbatim log shape and the unclosed-think design case).</p>
+
+  <h2>Functional hunt (2026-07-04): <code>insert_fact</code> hung the turn and dropped the fact</h2>
+  <p>
+    Unit&nbsp;3 (memory). <q>Add this to your knowledge base: … Bluefin …</q> hung the turn to the client
+    timeout (&gt;150&nbsp;s); a follow-up query then could not find Bluefin at all. The log showed
+    <code>📝 memory store</code> and then <em>nothing</em> — no <code>request finished</code>.
+  </p>
+  <p>
+    <strong>Cause.</strong> <code>tool_remember</code>'s bus-aware path <code>await</code>ed the graph-triplet
+    extraction LLM call <em>inline</em>, BEFORE the <code>publish_fact()</code> that stores the fact — and
+    with <code>is_background=True</code>. The background path parks on
+    <code>_wait_for_foreground_clear()</code>, which waits until <code>foreground_requests==0</code>; but the
+    request it waits for is THIS turn — a <strong>self-deadlock</strong> that parks for the 600&nbsp;s
+    ceiling. So the turn hung <em>and</em>, because the hang was before the publish, the fact was never
+    written (only the raw journal logged it, so recall found nothing). The legacy direct path had always
+    backgrounded this extraction; the bus path had regressed to a blocking inline await.
+  </p>
+  <table>
+    <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
+    <tbody>
+      <tr>
+        <td>Inline, self-deadlocking graph-triplet extraction in <code>insert_fact</code></td>
+        <td>Moved the extraction OFF the turn's critical path (<a href="tools/memory_tools.html">tools/memory</a>):
+        <code>publish_fact()</code> now stores the fact <em>immediately</em> with empty triplets, and a
+        fire-and-forget background task extracts triplets (bounded by
+        <code>asyncio.wait_for(_GRAPH_EXTRACT_TIMEOUT_S=20s)</code>) and adds them to the graph — mirroring
+        the legacy path. There <code>is_background=True</code> is finally correct, because the turn no longer
+        awaits it, so it can't self-deadlock. The turn returns in ~5&nbsp;s (was &gt;150&nbsp;s hang), the
+        fact is stored and immediately recall-able, and the graph is enriched asynchronously.</td>
+        <td>high (turn hang + silent data loss)</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>Verified live: "store … Kestrel …" returned in 7&nbsp;s and a follow-up recall quoted the fact back
+  (match 0.76). Pinned by <code>tests/test_insert_fact_hang.py</code> (4 tests: a 1-hour-hang client returns
+  the turn fast with the fact published; a fast extractor lands triplets in the graph via the background
+  task with <code>is_background=True</code>; no-LLM and empty-text paths).</p>
+
   <h2>Critical — security &amp; data integrity</h2>
   <table>
     <thead><tr><th>Area</th><th>What was wrong → fix</th><th>Module</th></tr></thead>

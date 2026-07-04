@@ -108,6 +108,30 @@ class TestMCTSReasoner:
         result = await mcts._simulate_parallel(candidates, "context")
         assert result[0].score > 0
 
+    async def test_simulate_disables_thinking_and_scores(self, mcts, mock_llm_client):
+        # Regression (functional hunt unit 11): the sim is a cheap utility call
+        # on a REASONING model. Without disabling thinking it spent the whole
+        # max_tokens budget on <think> and returned EMPTY content, so every
+        # candidate collapsed to a flat 0.50 score and MCTS ranked nothing while
+        # still paying for N simulations. The payload must carry the no-think
+        # switches so the model emits the JSON directly.
+        captured = {}
+
+        async def _cc(payload, *a, **k):
+            captured.update(payload)
+            return {"choices": [{"message": {"content": json.dumps(
+                {"progress": 0.9, "cost": 0.1, "risk": 0.1})}}]}
+
+        mock_llm_client.route.return_value = None
+        mock_llm_client.chat_completion.side_effect = _cc
+        candidates = [ActionCandidate(description="read file", tool_name="file_system")]
+        result = await mcts._simulate_parallel(candidates, "ctx")
+
+        assert captured.get("chat_template_kwargs") == {"enable_thinking": False}
+        assert captured["messages"][0]["content"].rstrip().endswith("/no_think")
+        # A real (non-flat) score is computed from the varied metrics.
+        assert result[0].score > 0.7  # progress 0.9 dominates → ~0.90
+
     def test_parse_json_valid(self):
         assert MCTSReasoner._parse_json('{"a": 1}') == {"a": 1}
 

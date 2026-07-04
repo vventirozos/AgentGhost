@@ -148,9 +148,18 @@ async def test_tool_remember_routes_through_bus_when_supplied():
 
 
 @pytest.mark.asyncio
-async def test_tool_remember_extracts_triplets_via_llm_then_publishes():
+async def test_tool_remember_publishes_immediately_then_extracts_triplets_in_background():
+    # New contract (functional hunt unit 3): the fact is published IMMEDIATELY
+    # with empty triplets, and triplet extraction runs OFF the critical path in
+    # a background task (the old inline-await hung the turn and lost the write —
+    # see tests/test_insert_fact_hang.py). Triplets land in the graph, not in
+    # the publish_fact payload.
+    from ghost_agent.tools import memory as M
     bus = MagicMock()
     bus.publish_fact = AsyncMock()
+    graph = MagicMock()
+    graph.add_triplets = MagicMock(return_value=1)
+    bus.graph = graph
     llm = AsyncMock()
     llm.chat_completion = AsyncMock(return_value={
         "choices": [{"message": {"content": '{"graph_triplets": [{"subject": "user", "predicate": "OWNS", "object": "max"}]}'}}]
@@ -163,9 +172,18 @@ async def test_tool_remember_extracts_triplets_via_llm_then_publishes():
         model_name="test-model",
     )
 
+    # Fact published immediately, without waiting on extraction.
     bus.publish_fact.assert_awaited_once()
     _, fact_data = bus.publish_fact.await_args.args
-    assert fact_data["triplets"] == [{"subject": "user", "predicate": "OWNS", "object": "max"}]
+    assert fact_data["text"] == "user owns max"
+    assert fact_data["triplets"] == []
+
+    # Triplets are extracted + added to the graph off the critical path.
+    tasks = list(M._GRAPH_EXTRACT_TASKS)
+    if tasks:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
+    graph.add_triplets.assert_called_once_with(
+        [{"subject": "user", "predicate": "OWNS", "object": "max"}])
 
 
 @pytest.mark.asyncio

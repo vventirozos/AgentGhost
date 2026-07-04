@@ -1105,6 +1105,223 @@ logger = logging.getLogger("GhostAgent")
 
 
 # ============================================================================
+# NATIVE TOOL-CALL DE-CORRUPTION
+# ----------------------------------------------------------------------------
+# With ``--native-tools`` on (default for Qwen 3.6+), the upstream server
+# parses the model's tool-call XML itself and hands us structured
+# ``message.tool_calls`` — bypassing our own robust XML parser. Some servers
+# mis-handle a MULTI-tool reply (especially the equals-format
+# ``<function=name>`` / ``<parameter=name>`` shape): they close the first
+# ``<parameter>`` correctly but then leak the ENTIRE serialized XML of every
+# FOLLOWING tool call into the first argument's string value, e.g.
+#
+#   {"action": "summary</parameter>\n</function>\n</tool_call>\n
+#              <tool_call>\n<function=list_lessons>\n<parameter=scope>\nall",
+#    "limit": 10}
+#
+# The value the model actually intended is ``"summary"``; everything from the
+# first framing token on is another tool call. Left uncorrected, ``action``
+# fails validation ('action' must be one of [...]) and the whole turn is
+# wasted — the exact "introspect keeps erroring on a valid action" symptom.
+#
+# We detect the leak by its unambiguous CLOSE-then-CONTINUATION signature (a
+# ``</parameter>`` / ``</function>`` / ``</tool_call>`` close FOLLOWED by a NEW
+# ``<tool_call>`` / ``<function=...>`` opening OR a sibling ``<parameter=...>``)
+# then truncate the value at the first framing token and reconstruct intent:
+#  - a leaked sibling ``<parameter=...>`` folds back into the SAME call's args
+#    (e.g. manage_tasks: ``action="stop</parameter><parameter=task_identifier>…"``
+#    → ``{action: stop, task_identifier: …}``);
+#  - a leaked ``<function=...>`` naming a KNOWN tool is recovered as a separate
+#    call; and when the whole value is framing (no clean prefix) the phantom
+#    primary is dropped and the first recovered call promoted.
+# Content that merely *mentions* framing text (code, docs) has no ordered
+# close-then-continuation pair — or names no real tool and carries no sibling
+# param — so it is never mangled.
+# ============================================================================
+_TC_NEXT_CALL_RE = re.compile(r'<tool_call\b|<function\s*=|<function\s+name\s*=', re.IGNORECASE)
+# Leak-continuation tokens: a NEW tool call (function/tool_call) OR a sibling
+# `<parameter …>` of the SAME call. The upstream native parser can merge either
+# shape into the first argument's value — e.g. manage_tasks got
+# `{"action": "stop</parameter>\n<parameter=task_identifier>\ntask_123"}` where
+# the second PARAMETER leaked into the first, not a whole new call.
+_TC_NEXT_LEAK_RE = re.compile(
+    r'<tool_call\b|<function\s*=|<function\s+name\s*=|<parameter\s*=|<parameter\s+name\s*=',
+    re.IGNORECASE)
+_TC_CLOSE_RE = re.compile(r'</parameter\s*>|</function\s*>|</tool_call\s*>', re.IGNORECASE)
+_TC_FIRST_FRAME_RE = re.compile(
+    r'</parameter\s*>|</function\s*>|</tool_call\s*>|<tool_call\b|<function\s*=|<function\s+name\s*=',
+    re.IGNORECASE,
+)
+_TC_FUNC_OPEN_RE = re.compile(
+    r'<function(?:\s+name\s*=\s*["\']?|\s*=\s*["\']?)\s*([a-zA-Z0-9_]+)', re.IGNORECASE)
+_TC_PARAM_RE = re.compile(
+    r'<parameter(?:\s+name\s*=\s*["\']?|\s*=\s*["\']?)\s*([a-zA-Z0-9_]+)["\']?\s*>'
+    r'(.*?)(?=</parameter>|<parameter[\s=]|<function[\s=]|</function>|</tool_call>|<tool_call\b|$)',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _value_has_leaked_framing(value) -> bool:
+    """True when a string argument value carries the CLOSE-then-LEAK signature
+    of an upstream-merged reply: a ``</parameter>``/``</function>``/``</tool_call>``
+    close followed by a new tool call OR a sibling ``<parameter …>`` (see block
+    comment). Content that merely mentions framing text lacks the ordered pair."""
+    if not isinstance(value, str):
+        return False
+    close = _TC_CLOSE_RE.search(value)
+    if not close:
+        return False
+    return _TC_NEXT_LEAK_RE.search(value, close.end()) is not None
+
+
+def _recover_calls_from_tail(tail: str, available_names) -> list:
+    """Recover ``[(name, args_dict), ...]`` for each ``<function ...>`` opening
+    in the leaked ``tail``, keeping only functions in ``available_names``."""
+    calls = []
+    opens = list(_TC_FUNC_OPEN_RE.finditer(tail))
+    for i, fm in enumerate(opens):
+        fname = fm.group(1)
+        if available_names and fname not in available_names:
+            continue
+        seg_start = fm.end()
+        seg_end = opens[i + 1].start() if i + 1 < len(opens) else len(tail)
+        segment = tail[seg_start:seg_end]
+        args = {}
+        for pm in _TC_PARAM_RE.finditer(segment):
+            args[pm.group(1)] = pm.group(2).strip().strip('"').strip("'")
+        calls.append((fname, args))
+    return calls
+
+
+def _repair_one_native_tool_call(tc: dict, available_names):
+    """Return ``(primary_tc, [recovered_tcs])``. When no leak is present (or
+    the leaked tail names no known tool), returns ``(tc, [])`` unchanged."""
+    fn = tc.get("function") or {}
+    raw = fn.get("arguments")
+    if isinstance(raw, str):
+        try:
+            args = json.loads(raw, strict=False)
+        except Exception:
+            return tc, []
+    elif isinstance(raw, dict):
+        args = dict(raw)
+    else:
+        return tc, []
+    if not isinstance(args, dict):
+        return tc, []
+
+    def _mk(name, a):
+        return {"id": f"call_{uuid.uuid4().hex[:8]}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(a)}}
+
+    for k, v in list(args.items()):
+        if not (isinstance(v, str) and _value_has_leaked_framing(v)):
+            continue
+        m = _TC_FIRST_FRAME_RE.search(v)
+        if not m:
+            continue
+        tail = v[m.start():]
+        # Split the tail at the first NEW-CALL opening. Everything before it is
+        # sibling <parameter …> of THIS call that leaked into the value; from
+        # the opening on are separate merged tool calls.
+        call_open = _TC_NEXT_CALL_RE.search(tail)
+        pre = tail[:call_open.start()] if call_open else tail
+        post = tail[call_open.start():] if call_open else ""
+        sibling = {}
+        for pm in _TC_PARAM_RE.finditer(pre):
+            sibling[pm.group(1)] = pm.group(2).strip().strip('"').strip("'")
+        recovered = _recover_calls_from_tail(post, available_names) if post else []
+        # Positively identify a leak: we must have recovered a known call OR
+        # extracted at least one sibling parameter. Otherwise it's content we
+        # can't attribute to the parser — leave it untouched.
+        if not recovered and not sibling:
+            continue
+        recovered_tcs = [_mk(name, a) for name, a in recovered]
+        if m.start() > 0:
+            # A clean prefix survives before the framing: truncate the primary's
+            # value to it, fold in any leaked sibling params (without clobbering
+            # an existing key), and append the recovered separate calls.
+            new_args = dict(args)
+            new_args[k] = v[:m.start()].rstrip().strip('"').strip("'")
+            for sk, sv in sibling.items():
+                new_args.setdefault(sk, sv)
+            primary = {**tc, "function": {**fn, "arguments": json.dumps(new_args)}}
+            return primary, recovered_tcs
+        # m.start() == 0: the value is ENTIRELY framing (no clean prefix). The
+        # native parser dumped the whole merged reply into this one argument.
+        if recovered_tcs:
+            # The primary call is a phantom whose real content IS the first
+            # recovered call — promote it rather than dispatch raw tag-soup
+            # (that struck as an invalid-arg failure — seen live on file_system).
+            return recovered_tcs[0], recovered_tcs[1:]
+        # Only leaked sibling params, no recovered call, no clean prefix: attach
+        # them to the primary (dropping the tag-soup value for this key).
+        new_args = {kk: vv for kk, vv in args.items() if kk != k}
+        for sk, sv in sibling.items():
+            new_args.setdefault(sk, sv)
+        return {**tc, "function": {**fn, "arguments": json.dumps(new_args)}}, []
+    return tc, []
+
+
+def _repair_native_tool_calls(tool_calls: list, available_names=None):
+    """Repair upstream native ``tool_calls`` corrupted by the server's own
+    multi-call XML parser. Returns ``(new_tool_calls, repaired: bool)``.
+    Clean calls pass through byte-for-byte."""
+    out, repaired = [], False
+    for tc in (tool_calls or []):
+        primary, extras = _repair_one_native_tool_call(tc, available_names)
+        out.append(primary)
+        out.extend(extras)
+        # A repair happened if we recovered extra calls OR rewrote the primary
+        # (the pure-framing "phantom" case promotes a recovered call in place,
+        # with no extras).
+        if extras or primary is not tc:
+            repaired = True
+    return out, repaired
+
+
+# ============================================================================
+# <think> STRIPPING
+# ----------------------------------------------------------------------------
+# A single lazy regex `<think>.*?(?:</think>|(?=<tool_call|function)|$)` was
+# used to strip reasoning blocks before tool-call parsing. The `(?=<tool_call>)`
+# alternation exists for the pathological case where the model opens `<think>`
+# and runs straight into a REAL tool call without ever emitting `</think>`.
+# But with a lazy `.*?`, that lookahead also fires on a `<tool_call>` merely
+# MENTIONED inside the reasoning — e.g. the model quoting the guidance
+# "emit exactly one `<tool_call>` per turn". It cut the block at the quoted
+# mention, leaving `<tool_call>` per turn.\n\n</think>\n<tool_call>…` as the
+# parse target, which the tool parser then mis-read as a malformed call →
+# `system_parse_error`, a wasted turn, and an execution strike (seen recurring
+# in the live log on coding tasks). The fix PREFERS a real `</think>`: closed
+# blocks are removed whole (a quoted `<tool_call>` inside them can no longer
+# truncate anything), and only a genuinely UNCLOSED `<think>` is stripped up
+# to the first real tool-call opening (wrapped `<tool_call><function>` or a
+# named `<function …>`), never a bare quoted mention.
+# ============================================================================
+_THINK_CLOSED_RE = re.compile(r'<think\b[^>]*>.*?</think\s*>', re.DOTALL | re.IGNORECASE)
+_THINK_UNCLOSED_RE = re.compile(
+    r'<think\b[^>]*>.*?(?=<tool_call\b[^>]*>\s*<function\b|<function\s+name\b|<function\s*=)'
+    r'|<think\b[^>]*>.*$',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _strip_think_blocks(text: str) -> str:
+    """Remove `<think>…</think>` reasoning, preferring the real close tag so a
+    quoted `<tool_call>` mention inside the reasoning can't truncate the block
+    (see block comment). Handles an unclosed `<think>` by stripping to the
+    first real tool-call opening or EOS. Returns the input unchanged when there
+    is no think block (cheap fast-path)."""
+    if not isinstance(text, str) or '<think' not in text.lower():
+        return text
+    text = _THINK_CLOSED_RE.sub('', text)
+    if '<think' in text.lower():
+        text = _THINK_UNCLOSED_RE.sub('', text)
+    return text
+
+
+# ============================================================================
 # ARCHITECTURAL OPTIMISATION #7: TOOL-SCHEMA CACHE
 # ----------------------------------------------------------------------------
 # `_json_to_xml_schema` used to be defined and executed inside the turn loop
@@ -6562,7 +6779,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         prev_turn_opening_words = _stream_opening_words
 
                         # CRITICAL FIX: Strip <think> blocks from permanent history to prevent cognitive looping
-                        clean_msg_content = re.sub(r'<think>.*?(?:</think>|(?=<(?:tool_call|function))|$)', '', merged_content, flags=re.DOTALL | re.IGNORECASE).strip()
+                        clean_msg_content = _strip_think_blocks(merged_content).strip()
                         msg["content"] = clean_msg_content
 
                         if thinking_loop_detected:
@@ -6708,7 +6925,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     #   ROBUST XML TOOL PARSER
                     # ---------------------------------------------------------
                     # Isolate actual output from <think> blocks FIRST
-                    parse_target = re.sub(r'<think>.*?(?:</think>|(?=<(?:tool_call|function))|$)', '', content, flags=re.DOTALL | re.IGNORECASE)
+                    parse_target = _strip_think_blocks(content)
 
                     # --- XML TAG NORMALIZATION ---
                     # Heal prompt-induced hallucinations (<tool> instead of <tool_call>)
@@ -7284,6 +7501,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # Fallback: honour native tool_calls if the model didn't use XML format
                         tool_calls = list(msg.get("tool_calls") or [])
 
+                        # De-corrupt native tool_calls the upstream server
+                        # mangled by merging a multi-tool reply into one
+                        # call's arguments (see _repair_native_tool_calls).
+                        # This is the fix for "introspect keeps erroring on a
+                        # valid action" — the server leaked the following
+                        # tool call's XML into the `action` value.
+                        if tool_calls:
+                            _avail = (list(self.available_tools.keys())
+                                      if hasattr(self, 'available_tools') else None)
+                            tool_calls, _repaired = _repair_native_tool_calls(tool_calls, _avail)
+                            if _repaired:
+                                pretty_log(
+                                    "Agent Parser",
+                                    "Repaired corrupt native tool_call(s): upstream merged a "
+                                    "multi-tool reply into one call's arguments — recovered the "
+                                    "intended value and split the leaked calls.",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
+
                         if not tool_calls and parse_target.strip().startswith('{'):
                             # Fallback: check if it outputted raw JSON instead of XML
                             try:
@@ -7312,7 +7548,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             except Exception:
                                 pass
 
-                    ui_content = re.sub(r'<think>.*?(?:</think>|(?=<(?:tool_call|function))|$)', '', ui_content, flags=re.DOTALL | re.IGNORECASE).strip()
+                    ui_content = _strip_think_blocks(ui_content).strip()
 
                     # --- HALLUCINATION & LEAK SCRUBBERS ---
                     if ui_content:
@@ -7342,7 +7578,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                     # CRITICAL: Preserve the raw XML tags in the assistant's internal message context so it remembers!
                     # BUT STRIP <think> blocks to prevent cognitive looping!
-                    clean_content_for_history = re.sub(r'<think>.*?(?:</think>|(?=<(?:tool_call|function))|$)', '', content, flags=re.DOTALL | re.IGNORECASE).strip()
+                    clean_content_for_history = _strip_think_blocks(content).strip()
                     msg["content"] = clean_content_for_history
                     msg["tool_calls"] = tool_calls
 
