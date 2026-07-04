@@ -63,7 +63,7 @@ def _boot_arm(name, flags, port, boot_timeout, logdir):
     ok = AE._wait_ready(url, boot_timeout)
     AE._log(f"  {'ready' if ok else '!! NOT READY'}: {name} on {url} (pid {proc.pid})")
     return {"proc": proc, "lf": lf, "url": url, "home": gh,
-            "container": AE._container_name(gh / "sandbox"), "port": port}
+            "container": AE._container_name(gh / "sandbox"), "port": port, "ready": ok}
 
 
 async def _run_treatment(rep, items, url, model, timeout, delay):
@@ -158,6 +158,19 @@ def main() -> int:
     AE._log(f"Track B2: {len(items)} correction items × {args.repeats} repeats")
     probs = [p for p in AE._preflight("http://127.0.0.1:8088", f"http://127.0.0.1:{args.base_port}")
              if "ALREADY listening" not in p]
+    # Arms run sequentially on base_port (one alive at a time), so that port
+    # must be free at start. Bind-test it — the default preflight filters out
+    # "ALREADY listening", which let a stale listener silently break an arm
+    # (see the Track B1 port bug: control booted, hit EADDRINUSE, shut down,
+    # and its dead probes fabricated a bogus 0/N).
+    import socket as _socket
+    _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    try:
+        _s.bind(("0.0.0.0", args.base_port))
+    except OSError:
+        probs.append(f"arm port {args.base_port} already in use — free it or pick another --base-port")
+    finally:
+        _s.close()
     if probs:
         for p in probs:
             AE._log(f"  PREFLIGHT PROBLEM: {p}")
@@ -174,6 +187,11 @@ def main() -> int:
         # the arms one after another doesn't affect the McNemar statistics.
         AE._log(f"--- repeat {rep+1}/{args.repeats}: TREATMENT arm ---")
         treat = _boot_arm("treatment", TREATMENT_FLAGS, args.base_port, args.boot_timeout, logdir)
+        if not treat.get("ready"):
+            AE._log("  ABORT: treatment arm not ready — not scoring (a dead arm "
+                    "fabricates results). See agent-logs/treatment.log.")
+            AE._teardown(treat["proc"], treat["lf"], treat["container"])
+            return 3
         try:
             t_recs = asyncio.run(_run_treatment(rep, order, treat["url"], args.model,
                                                 args.timeout, args.delay))
@@ -186,6 +204,10 @@ def main() -> int:
 
         AE._log(f"--- repeat {rep+1}/{args.repeats}: CONTROL arm ---")
         ctrl = _boot_arm("control", CONTROL_FLAGS, args.base_port, args.boot_timeout, logdir)
+        if not ctrl.get("ready"):
+            AE._log("  ABORT: control arm not ready — not scoring. See agent-logs/control.log.")
+            AE._teardown(ctrl["proc"], ctrl["lf"], ctrl["container"])
+            return 3
         try:
             c_recs = asyncio.run(_run_control(rep, order, ctrl["url"], args.model, args.timeout))
             records.extend(c_recs)

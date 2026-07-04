@@ -196,6 +196,21 @@ def main() -> int:
     probs = [p for p in AE._preflight("http://127.0.0.1:8088",
                                       f"http://127.0.0.1:{args.base_port}")
              if "ALREADY listening" not in p]
+    # BOTH arm ports must be free. The treatment uses base_port and the control
+    # uses base_port+1 — the control port was previously UNCHECKED, so a stale
+    # listener there let the control's uvicorn hit "address already in use",
+    # shut the control down, and every control probe errored → an invalid 0/10
+    # that looks like "memory helps". Bind-test both (0.0.0.0, matching the
+    # agent's own bind) so ANY listener — agent or not — is caught up front.
+    import socket as _socket
+    for _p in (args.base_port, args.base_port + 1):
+        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        try:
+            _s.bind(("0.0.0.0", _p))
+        except OSError:
+            probs.append(f"arm port {_p} already in use — free it or pick another --base-port")
+        finally:
+            _s.close()
     if probs:
         for p in probs:
             AE._log(f"  PREFLIGHT PROBLEM: {p}")
@@ -209,6 +224,16 @@ def main() -> int:
                           args.boot_timeout, logdir)
         ctrl = _boot_arm("control", CONTROL_FLAGS, args.base_port + 1,
                          args.boot_timeout, logdir)
+        # VALIDITY GUARD: if either arm didn't come up, ABORT — do NOT score.
+        # A dead control still "answers" nothing → every probe errors → a bogus
+        # 0/10 that reads as "memory helps". Fail loudly instead of lying.
+        if not (treat.get("ready") and ctrl.get("ready")):
+            AE._log(f"  ABORT: arm not ready (treatment={treat.get('ready')} "
+                    f"control={ctrl.get('ready')}). See agent-logs/*.log. Not scoring — "
+                    f"a dead arm would fabricate a result.")
+            AE._teardown(treat["proc"], treat["lf"], treat["container"])
+            AE._teardown(ctrl["proc"], ctrl["lf"], ctrl["container"])
+            return 3
         try:
             recs = asyncio.run(_run_repeat(rep, pairs, treat, ctrl, args.model,
                                            args.timeout, args.delay, args.repeats, rng))
