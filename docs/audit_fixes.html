@@ -329,6 +329,16 @@
   </table>
   <p>Deferred (recorded in <code>BUGHUNT.md</code>): <code>telemetry.stop()</code> can swallow a <em>caller's</em> cancellation (rare, needs careful shutdown-semantics work); <code>is_removal_or_negation_text</code> substring matching false-positives are by design (fail-safe direction, documented as cheap).</p>
 
+  <h2>Round 10 — deferred-findings backlog (2026-07-04+)</h2>
+  <p>After the 28-unit sweep completed, the confirmed-but-deferred findings in <code>BUGHUNT.md</code> are being worked highest-impact first. Each entry here resolves (fully or in its high-severity core) one deferred item.</p>
+  <table>
+    <thead><tr><th>Item</th><th>Resolution</th><th>Severity</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Browser redirect / loopback SSRF + Tor-bypass (core resolved)</strong></td><td>The sandbox runs under HOST networking, and the host-side guard only vetted the INITIAL url — so a page the agent navigated to that <code>302</code>-redirected to an internal address (<code>http://127.0.0.1:9051</code> Tor control, <code>169.254.169.254</code> cloud metadata, a LAN host), or that pulled an internal subresource (blind SSRF via <code>&lt;img&gt;</code>/<code>&lt;iframe&gt;</code>/<code>fetch</code>), reached host-local services (agent API, postgres, Tor control). Chromium does not re-vet redirects and bypasses the proxy for loopback (the Tor-bypass half). Fix: a Playwright request interceptor in the in-sandbox runner (<code>context.route("**/*")</code>, installed before the first navigation) that aborts EVERY http(s) request whose host classifies as loopback / private / link-local / reserved / metadata. It covers the redirect chain, cross-origin subresources, AND the <code>.last_url</code> re-navigation in one place; <code>file://</code> fixtures and external hosts pass through. Classifies by URL host only (no DNS → no Tor leak). Pinned in <code>tests/test_bughunt_browser_ssrf.py</code> (33 tests, exercising the real embedded-runner decision function + route handler with playwright mocked, since it isn't installed in CI).</td><td>high</td></tr>
+    </tbody>
+  </table>
+  <p>Residual (still in <code>BUGHUNT.md</code>): <code>file://</code> can still read a container file outside the sandbox subtree when NOT project-scoped (container-internal read, lower severity — the always-heal fix risks the working fixture path); and DNS-rebind of a SUBRESOURCE hostname (public host → internal IP) in non-Tor mode isn't caught by the URL-host classifier (Tor mode's DNS-over-SOCKS already prevents it). Both are smaller residuals of this finding.</p>
+
   <h2>Round 9, units 27–28: interface + scripts — FINAL units (2026-07-04)</h2>
   <p>The last two units close the sweep: the user-facing interface layer (<code>interface/server.py</code>, <code>slack_project_commands.py</code>, and the external integration servers) and the offline <code>scripts/</code> tooling (~5.4k lines of eval / ablation / probe / optimization drivers). Reviewed by four scoped lenses. Twelve fixes landed, pinned in <code>tests/test_bughunt_unit27to28.py</code> (12 tests). This pass also RESOLVED the long-deferred GEPA adoption-ordering finding. With this, all 28 units are CLEAR.</p>
   <table>

@@ -109,13 +109,87 @@ payload) or `[BROWSER_ERR] ` (error string) so the caller can parse
 reliably. Exits 0 on success, 1 on failure.
 """
 import asyncio
+import ipaddress
 import json
 import os
 import shutil
 import sys
 import traceback
+from urllib.parse import urlparse
 
 from playwright.async_api import async_playwright
+
+
+# ── SSRF guard (runner side) ──────────────────────────────────────────
+# The host-side guard (_browser_blocked_url) only vets the INITIAL url, but
+# the sandbox runs under HOST networking, so a page navigated to an untrusted
+# public host that 302-redirects to an internal address — http://127.0.0.1:9051
+# (Tor control), 169.254.169.254 (cloud metadata), a LAN host — would reach
+# host-local services. Chromium does NOT re-vet redirects and bypasses the
+# proxy for loopback. This request interceptor runs at the navigation layer and
+# aborts EVERY http(s) request to an internal host, so it covers redirects,
+# cross-origin subresources (blind-SSRF <img>/<iframe>/fetch), and the .last_url
+# re-navigation. file:// fixtures pass through (not http).
+_SSRF_BLOCKED_HOSTNAMES = frozenset({
+    "localhost", "ip6-localhost", "ip6-loopback",
+    "metadata.google.internal", "metadata",
+})
+
+
+def _host_is_internal(host):
+    """True if `host` is a loopback / private / link-local / reserved /
+    multicast / unspecified / metadata target — an SSRF-relevant internal
+    address. Classifies the host STRING only (no DNS, so no Tor leak)."""
+    if not host:
+        return False
+    h = str(host).strip().lower().strip("[]")  # strip IPv6 brackets
+    if h in _SSRF_BLOCKED_HOSTNAMES:
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+    except ValueError:
+        return False
+    return (ip.is_private or ip.is_loopback or ip.is_link_local
+            or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+
+def _ssrf_should_block(url):
+    """Block an http(s) request whose host is internal. file://, about:, data:
+    (self-play fixtures + inert schemes) always pass."""
+    try:
+        p = urlparse(str(url or ""))
+    except Exception:
+        return False
+    if (p.scheme or "").lower() not in ("http", "https"):
+        return False
+    return _host_is_internal(p.hostname)
+
+
+async def _install_ssrf_guard(ctx):
+    """Register the request interceptor on a BrowserContext. Fail-safe: a
+    classification is robust (never raises), and route-method errors degrade
+    to continue so a guard bug can't brick every navigation."""
+    async def _route(route):
+        try:
+            u = route.request.url or ""
+        except Exception:
+            u = ""
+        if _ssrf_should_block(u):
+            try:
+                sys.stderr.write("[BROWSER_SSRF_BLOCK] " + str(u)[:200] + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
+            try:
+                await route.abort("blockedbyclient")
+            except Exception:
+                pass
+            return
+        try:
+            await route.continue_()
+        except Exception:
+            pass
+    await ctx.route("**/*", _route)
 
 
 _LAST_URL_FILENAME = ".last_url"
@@ -319,6 +393,9 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
         ctx = await p.chromium.launch_persistent_context(**launch_kwargs)
+        # Install the redirect/subresource SSRF guard BEFORE any navigation so
+        # it covers the very first goto (and its redirect chain).
+        await _install_ssrf_guard(ctx)
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             page.set_default_timeout(timeout_ms)

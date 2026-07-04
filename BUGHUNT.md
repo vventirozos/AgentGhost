@@ -163,19 +163,21 @@ regression tests; docs updated; full suite green on that session's date.
   (low)
 
 
-- **browser redirect / loopback SSRF + Tor bypass (HIGH — top priority)** — Chromium
-  bypasses the proxy for loopback and does NOT re-check redirects, so a page navigated
-  to a public host that returns `302 → http://127.0.0.1:9051` (Tor control),
-  `169.254.169.254` (cloud metadata), or a LAN host reaches host-local services under
-  host networking (agent API, postgres, Tor control), and the host-side guard only vetted
-  the initial URL. DNS-rebind (resolve public at check, internal at nav) is the same class.
-  Related: the `.last_url` sidecar re-navigation (runner-side) skips the SSRF check
-  entirely; and `file://` can read any container-readable file (not restricted to the
-  sandbox subtree). Fix candidates: (a) runner-side Playwright `page.route` interceptor
-  that aborts requests to loopback/private/link-local/metadata when a proxy is set;
-  (b) `--proxy-bypass-list="<-loopback>"` to force loopback through the SOCKS proxy in
-  Tor mode. BOTH need a live Chromium (Docker) to verify they block the vector without
-  breaking self-play fixtures — deferred rather than shipped untested. (high / likely)
+- **browser redirect / loopback SSRF + Tor bypass — CORE RESOLVED 2026-07-04** — the HIGH
+  vector is fixed: an in-sandbox Playwright request interceptor (`context.route("**/*")`,
+  installed in `_with_context` before the first navigation) now ABORTS every http(s) request
+  whose host is loopback/private/link-local/reserved/metadata. This catches 3xx REDIRECTS to
+  internal addresses (`302 → http://127.0.0.1:9051` / `169.254.169.254` / LAN), cross-origin
+  SUBRESOURCES (blind-SSRF `<img>`/`<iframe>`/fetch), AND the `.last_url` re-navigation in one
+  place — none of which the host-side initial-URL guard saw. It also closes the Tor-bypass half
+  (Chromium bypassing the proxy for loopback) since loopback is aborted outright. Classifies by
+  URL host only (no DNS → no Tor leak). Pinned in tests/test_bughunt_browser_ssrf.py (33 — the
+  real embedded-runner decision fn + route handler, playwright mocked). RESIDUAL (still deferred,
+  lower severity): (1) `file://` can read a container file outside the sandbox subtree when NOT
+  project-scoped (`_resolve_file_url` only heals when `sb.parent.name=="projects"`) — container-
+  internal read; the always-heal fix risks the working fixture path. (2) DNS-rebind of a
+  SUBRESOURCE hostname (public → internal IP) in non-Tor mode isn't caught by the URL-host
+  classifier (Tor mode's DNS-over-SOCKS already prevents it). (residual: low-med)
 - **darkweb onion body-cap after full download** — `_fetch_onion_text` reads the whole
   response (`.get()`, non-streaming) before `_cap_body`; an untrusted onion engine sending
   a chunked multi-GB body with no Content-Length OOMs the host. Same streaming-cap shape
@@ -352,6 +354,21 @@ regression tests; docs updated; full suite green on that session's date.
 ## Session log
 
 (newest first)
+
+### 2026-07-04 — deferred backlog #1: browser SSRF (HIGH) — CORE RESOLVED
+- Highest-impact deferred finding. Sandbox is host-networked, host-side guard only vetted the
+  initial URL, Chromium doesn't re-vet redirects + bypasses proxy for loopback → a public page
+  302-redirecting to http://127.0.0.1:9051 / 169.254.169.254 / LAN reached host services.
+- Fix: in-sandbox Playwright `context.route("**/*")` interceptor (installed in _with_context
+  before the first navigation) aborts every http(s) request to a loopback/private/link-local/
+  reserved/metadata host. One interceptor covers redirects + subresources + the .last_url
+  re-navigation, and closes the Tor-bypass half. Classifies by URL host only (no DNS leak).
+- Verified without a live browser: tests exec the REAL embedded-runner source (playwright
+  mocked) and exercise `_ssrf_should_block` / `_host_is_internal` + the route handler's
+  abort/continue. tests/test_bughunt_browser_ssrf.py (33). 184 existing browser tests still green.
+- Residual (kept deferred, lower sev): file:// container-read outside the sandbox subtree when
+  not project-scoped; DNS-rebind of a subresource hostname in non-Tor mode.
+- Docs: audit_fixes.html (Round 10).
 
 ### 2026-07-04 — units 27-28 (interface + scripts) — CLEAR — **SWEEP COMPLETE (all 28 units)**
 - Final units: the interface layer (server.py + slack_project_commands + external integration
