@@ -30,7 +30,7 @@ the agent's first action — all without any weight update.
 | Module | Purpose | Wires into |
 |---|---|---|
 | `ghost_agent._env` | Telemetry hardening (single source of truth) | `main.py` import + `probe:telemetry_disabled` |
-| `ghost_agent.eval` | Trust-aware eval harness (offline invariant gate + online capability baseline) + network egress guard | CLI `scripts/eval_baseline.py` (`gate` \| `freeze`/`compare --suite {default,offline,post_learning} --runner {stub,http}`) |
+| `ghost_agent.eval` | Trust-aware eval harness (offline invariant gate + protective capability baseline + **execution-grounded behavioral suite**) + network egress guard | CLI `scripts/eval_baseline.py` (`gate` \| `freeze`/`compare --suite {default,capability,behavioral,offline,post_learning} --runner {stub,http}`; `behavioral` forces its own agent-driving+verifying runner) |
 | `ghost_agent.distill` | Trajectory JSONL logs + N-sample self-consistency | `$GHOST_HOME/system/trajectories/` |
 | `ghost_agent.router` | Hand-crafted features → numpy logistic regression → dispatch | `core/agent.py::handle_chat` (body\["_router_decision"\]) |
 | `ghost_agent.optim` | DSPy/GEPA prompt optimisation (scope-gated) | Tunes planning / tool-selection / reflection prompts |
@@ -188,10 +188,14 @@ Docker.
 > plain http runner can't run their in-sandbox shell-script validator — so they
 > score unverified→fail and drag the pass-rate down. First live run of the
 > default suite measured 0.679, but that was 19/20 on scorable tasks with 8
-> templates counted as un-measured fails. Measuring **coding** capability needs
-> a sandbox-verdict runner (the runner must run the challenge setup + the
-> agent's solution + the shell-script validator and return `passed`); until
-> that exists, use `--suite capability`.
+> templates counted as un-measured fails.
+
+> ⚠️ **`capability` is PROTECTIVE, not DISCRIMINATING.** It is single-turn,
+> zero-tool text Q&A: `mean_tool_calls: 0.0`, and it sits at `pass_rate: 1.000`.
+> It proves the agent can still say "Paris" — but it stayed 1.000 green straight
+> through five live tool-path bugs (insert_fact hang, flat-0.50 MCTS, native
+> tool-call corruption, the `<think>`-strip parse error). For a signal that
+> actually exercises tools, use **Tier 3** below.
 
 ```bash
 # Freeze the capability baseline against a running Ghost on 127.0.0.1:8000.
@@ -226,6 +230,39 @@ python -m scripts.eval_baseline compare \
     --baseline "$GHOST_HOME/system/eval/baseline.json"
 # Exit 0 = no regressions; 1 = a top-level pass_rate drop; 2 = the compare is
 # NOT trustworthy (stub involved, or a model/suite mismatch vs the baseline).
+```
+
+### Tier 3 — the behavioral (execution-grounded) suite — needs a live agent
+
+This is the **discriminating** signal `capability` isn't. Each task DRIVES the
+live agent and then VERIFIES the real side-effect — a file written in the
+sandbox, a fact that recalls on a follow-up turn, a row from the actual DB — so
+it only passes when the tool did its job. It forces `--suite behavioral` onto
+its own runner (`agent_behavioral_runner`) + an `EvalContext` that owns the
+agent endpoint, the sandbox path, DB access, and trajectory-metric extraction; a
+stub/echo can't verify a sandbox file, so a `BehavioralTask` run under any other
+runner scores FAIL ("unverified"), never a soft green.
+
+Why it matters: the first live run reported `mean_tool_calls: 2.40` /
+`mean_tool_errors: 0.40` (vs `capability`'s `0.0` / `0.0`) — it actually
+exercises the tool paths, and even surfaces recovered tool-strikes on passing
+tasks. The five shipped tasks (`eval/behavioral.py`) are grounded regression
+catchers — each would have FAILED on the pre-fix agent (e.g. `beh:memory_roundtrip`
+times out on the old insert_fact hang; the native corruption strikes). Next step
+for full *upward* headroom: add a few genuinely-hard graded tasks so improvement
+shows, not just regression.
+
+```bash
+# Freeze the behavioral baseline (kept SEPARATE from the capability baseline).
+GHOST_HOME=/path/to/ghost_home python -m scripts.eval_baseline freeze \
+    --suite behavioral \
+    --base-url http://127.0.0.1:8000 \
+    --api-key "$GHOST_API_KEY" \
+    --model qwen-3.6-35b-a3 \
+    --timeout 200 \
+    --output "$GHOST_HOME/system/eval/baseline_behavioral.json"
+# GHOST_HOME must be exported — the runner reads $GHOST_HOME/sandbox to verify
+# files and $GHOST_HOME/system/trajectories for real tool_calls/tool_errors.
 ```
 
 **Using it as the self-improvement gate.** This is the intended workflow for

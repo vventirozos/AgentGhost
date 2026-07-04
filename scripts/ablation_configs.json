@@ -34,6 +34,12 @@
       "note": "Drops the pre-flight repeat-failure guard. Expect to see it only on robustness/loop tasks."
     },
     {
+      "name": "full_no_verifier",
+      "track": "A (in-session) — steel-man",
+      "flags": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle", "--no-verifier"],
+      "note": "Drops the post-response self-verifier (critic). NOTE: here the verifier runs INLINE (no --critic-nodes on the throwaway agent), i.e. its STRONGEST form — it can repair-before-ship. Production runs it ASYNC (can't fix the shipped turn), so it's strictly weaker. If even inline-verifier ON is indistinguishable from OFF here, the async production verifier is not paying for its per-turn LLM call → CUT. (Its only remaining defence is cross-session lesson-scrubbing — judge that via Track B.)"
+    },
+    {
       "name": "full_no_selfmodel",
       "track": "B (cross-session) — expect ~no in-session effect",
       "flags": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard", "--postmortem", "--smart-memory 0.9", "--autoadvance-idle", "--no-self-model"],

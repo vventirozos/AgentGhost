@@ -63,6 +63,14 @@ def _load_suite(name: str):
     if name == "ablation":
         from ablation_tasks import load_ablation_suite
         return load_ablation_suite()
+    if name == "behavioral":
+        # Execution-grounded tasks: verified against the isolated agent's real
+        # sandbox / memory / DB, so a "tooluse" verdict can't be faked by text.
+        from ghost_agent.eval import load_behavioral_suite
+        return load_behavioral_suite()
+    if name == "hard":
+        from ablation_hard_tasks import load_hard_suite
+        return load_hard_suite()
     if name == "default":
         return [t for t in load_default_suite() if t.category != "regression"]
     if name == "post_learning":
@@ -100,13 +108,28 @@ def _make_http_runner(base_url: str, api_key: str, model: str, timeout: float):
 
 
 async def _score_config(base_url: str, api_key: str, model: str, suite_name: str,
-                        repeats: int, timeout: float) -> List[Dict[str, Any]]:
+                        repeats: int, timeout: float,
+                        ghost_home: Optional[str] = None) -> List[Dict[str, Any]]:
     suite_tasks = _load_suite(suite_name)
     suite = EvalSuite(f"ablation:{suite_name}", suite_tasks)
-    runner = _make_http_runner(base_url, api_key, model, timeout)
+    if suite_name == "behavioral":
+        # Grounded runner + a context pointed at THIS agent's GHOST_HOME (so it
+        # verifies the isolated agent's own sandbox / trajectory, not the
+        # driver's). The DB is external (shared), so it works per-config too.
+        from ghost_agent.eval import EvalContext, agent_behavioral_runner
+        gh = Path(ghost_home) if ghost_home else None
+        ctx = EvalContext(
+            base_url=base_url, model=model, api_key=api_key,
+            ghost_home=gh, sandbox_dir=(gh / "sandbox" if gh else None),
+            default_db=os.getenv("GHOST_DEFAULT_DB") or "postgresql://ghost@127.0.0.1:5432/agent",
+            timeout_s=timeout)
+        runner = agent_behavioral_runner()
+    else:
+        ctx = None
+        runner = _make_http_runner(base_url, api_key, model, timeout)
     records: List[Dict[str, Any]] = []
     for rep in range(repeats):
-        result = await suite.run(runner, ctx=None, per_task_timeout_s=timeout)
+        result = await suite.run(runner, ctx=ctx, per_task_timeout_s=timeout)
         passed = sum(1 for r in result.results if r.passed)
         tot = len(result.results)
         mean_lat = sum(r.duration_s for r in result.results) / max(tot, 1)
@@ -432,7 +455,8 @@ def cmd_auto(args) -> int:
                 continue
             _log(f"    ready. scoring {args.repeats} repeats ...")
             records = asyncio.run(_score_config(base_url, "", args.model, args.suite,
-                                                args.repeats, args.timeout))
+                                                args.repeats, args.timeout,
+                                                ghost_home=str(tmp)))
             _write_result(report_dir, name, base_url, args.suite, args.repeats,
                           records, flags=cfg_flags, note=cfg.get("note", ""))
             collected[name] = {"config": name, "records": records,
@@ -483,7 +507,8 @@ async def cmd_run(args) -> int:
     n_tasks = len(_load_suite(args.suite))
     print(f"config={args.config}  suite={args.suite}  tasks={n_tasks}  repeats={args.repeats}")
     records = await _score_config(args.base_url, args.api_key, args.model,
-                                  args.suite, args.repeats, args.timeout)
+                                  args.suite, args.repeats, args.timeout,
+                                  ghost_home=os.getenv("GHOST_HOME"))
     out = _write_result(_default_report_dir(), args.config, args.base_url,
                         args.suite, args.repeats, records)
     k = sum(1 for r in records if r["passed"]); n = len(records)
@@ -524,7 +549,7 @@ def main() -> int:
 
     pa = sub.add_parser("auto", help="fully automated: boot+score+teardown every config, then report")
     pa.add_argument("--repeats", type=int, default=5)
-    pa.add_argument("--suite", default="ablation", choices=("ablation", "default", "post_learning"))
+    pa.add_argument("--suite", default="ablation", choices=("ablation", "behavioral", "hard", "default", "post_learning"))
     pa.add_argument("--port", type=int, default=8010, help="test port for the throwaway agents")
     pa.add_argument("--upstream-url", default="http://127.0.0.1:8088")
     pa.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
@@ -538,7 +563,7 @@ def main() -> int:
     pr.add_argument("--base-url", default="http://127.0.0.1:8000")
     pr.add_argument("--api-key", default=os.getenv("GHOST_API_KEY", ""))
     pr.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
-    pr.add_argument("--suite", default="ablation", choices=("ablation", "default", "post_learning"))
+    pr.add_argument("--suite", default="ablation", choices=("ablation", "behavioral", "hard", "default", "post_learning"))
     pr.add_argument("--repeats", type=int, default=5)
     pr.add_argument("--timeout", type=float, default=300.0)
 

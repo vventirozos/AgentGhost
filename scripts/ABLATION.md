@@ -4,6 +4,39 @@ The goal is one honest number per layer: **how much does turning it off change
 task outcomes, and at what latency cost.** Anything that can't beat its cost
 (complexity + latency + LLM calls) gets cut.
 
+---
+
+## Status & triage (2026-07-04)
+
+The apparatus is **complete** (Track A auto+paired, Track B1+B2) but had
+**never been run for real** — the only result was a 1-shot smoke of `full`. This
+pass added the missing pieces and a cheap static triage that answers part of the
+question without any sweep.
+
+**New this pass:**
+- `--no-verifier` flag + `full_no_verifier` config — the late verifier is now
+  ablatable (it wasn't before). Tested in the strongest (inline) form; see the
+  config note.
+- `--suite behavioral` wired into `ablation_eval.py` — execution-grounded tasks
+  (verified against the isolated agent's real sandbox / memory / DB), so a
+  `tooluse` verdict can't be faked by plausible text. `--suite hard` (16 tasks)
+  is also loadable now.
+
+**Trace-to-consumer triage (production flags: no `--prm-model`, no
+`--router-model`, no `--swarm-nodes`) — definitive WITHOUT a sweep:**
+
+| Subsystem | Live consumer today? | Verdict |
+|---|---|---|
+| PRM (scoring/training) | **No** — `--prm-model` unset → MCTS/self-play/frontier read a neutral **0.5 placeholder** | INERT. MCTS's value-function branch runs on a placeholder. Wire a trained PRM (needs the discriminating suite as labels) or stop counting it. |
+| Router / swarm dispatch | **No** — `--router-model` unset = "no-op that always allows full swarm"; no swarm nodes exist | INERT in production. |
+| Reflection → lessons | **Yes** — injected as `### RELEVANT PRIOR LESSONS` (agent.py) | Live loop; magnitude = Track B. |
+| Post-mortem *patch proposals* | **Human-only** — `proposal only — it is never applied` (main.py) | Cost (extra LLM calls generating diffs+repro on failed runs) for output only a human reads via the `postmortem` tool. Cut `--postmortem-propose-patch` if you don't read them. |
+| Late verifier | Partial — next-turn correction is live; the PRM-feed is dead | Ablate: Track A = cost, Track B = the cross-session value. |
+
+So two layers (PRM, router/swarm) are **provably inert now** — no experiment
+needed; the decision is *wire them or delete them*. One (`postmortem-propose-patch`)
+is pure cost unless a human consumes it. The rest need the sweep / Track B below.
+
 This is deliberately built on the existing `ghost_agent.eval` harness
 (`EvalSuite`, `CuratedRequestTask`, `aggregate`) — it adds the three things that
 were missing: a **discriminating** task suite, **repeats + confidence intervals**
@@ -77,10 +110,13 @@ sessions." To test that you need exposure → consolidation → fresh-session re
    `--no-self-model`, `--no-memory`, …). If retention is identical with it off,
    the layer is theater.
 
-You already wrote the seed of this: **`scripts/claude_trainer.py`** re-asks a
-question in a fresh conversation and scores whether the lesson stuck. Generalize
-it into a paired A/B (layer-on vs layer-off) over a small curriculum. This is the
-next harness to build — happy to do it.
+This is **already built** (correcting an earlier note that said "next to build"):
+- **`scripts/ablation_trackb.py`** (B1) — passive recall: seed→probe pairs,
+  TREATMENT (memory ON) vs CONTROL (`--no-memory`), McNemar on matched probes.
+- **`scripts/ablation_trackb2.py`** (B2) — cross-session RULE learning: task →
+  correction → (consolidation delay) → probe, TREATMENT vs CONTROL, McNemar.
+- Task banks: `trackb_tasks.py`, `trackb2_tasks.py`. `claude_trainer.py` was the seed.
+Both are runnable today; like Track A they had never been run for real (see Status).
 
 ---
 

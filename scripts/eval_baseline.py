@@ -29,6 +29,9 @@ from ghost_agent.eval import (  # noqa: E402
     load_default_suite,
     load_offline_suite,
     load_capability_suite,
+    load_behavioral_suite,
+    EvalContext,
+    agent_behavioral_runner,
     freeze_baseline,
     load_baseline_provenance,
     compare_to_baseline,
@@ -110,8 +113,8 @@ async def main() -> int:
         parser.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
         parser.add_argument("--timeout", type=float, default=300.0,
                             help="Per-task wall-clock in seconds. Applied both to the HTTP client and to EvalSuite.per_task_timeout_s. Default 300s — template tasks that trigger multi-turn tool use need more than the 60s default.")
-        parser.add_argument("--suite", choices=("default", "capability", "offline", "post_learning"), default="default",
-                            help="Which task bank to run. 'capability' = regression+capability+curated (http-scorable, no Docker — use this for a clean live-agent baseline); 'default' adds the challenge-template bank (needs a sandbox-verdict runner or they score unverified); 'offline' = invariant probes only; 'post_learning' targets the reflector's file-parsing lesson.")
+        parser.add_argument("--suite", choices=("default", "capability", "behavioral", "offline", "post_learning"), default="default",
+                            help="Which task bank to run. 'behavioral' = EXECUTION-GROUNDED tasks that drive the live agent and verify the real side-effect (sandbox file, memory recall, DB row) — the DISCRIMINATING suite that actually exercises tools (needs a live agent; forces the behavioral runner). 'capability' = regression+capability+curated (http-scorable text Q&A, no tools — protective floor); 'default' adds the challenge-template bank; 'offline' = invariant probes only; 'post_learning' targets the reflector's file-parsing lesson.")
 
     p_freeze = sub.add_parser("freeze", help="freeze a new baseline")
     p_freeze.add_argument("--output", type=Path, default=None)
@@ -151,27 +154,43 @@ async def main() -> int:
     elif suite_name == "capability":
         tasks = load_capability_suite()
         suite = EvalSuite("ghost-capability", tasks)
+    elif suite_name == "behavioral":
+        tasks = load_behavioral_suite()
+        suite = EvalSuite("ghost-behavioral", tasks)
     else:
         tasks = load_default_suite()
         suite = EvalSuite("ghost-default", tasks)
 
     # Runner resolution
-    runner_kind = getattr(args, "runner", "stub")
     timeout_s = float(getattr(args, "timeout", 300.0))
-    if runner_kind == "http":
-        runner = _http_runner_factory(
-            base_url=args.base_url,
-            api_key=args.api_key,
-            model=args.model,
-            timeout=timeout_s,
-        )
+    eval_ctx = None
+    if suite_name == "behavioral":
+        # The behavioral suite is grounded: it MUST drive the live agent and
+        # inspect its real side-effects. Force the behavioral runner + context
+        # regardless of --runner (a stub/echo can't verify a sandbox file).
+        runner_kind = "behavioral"
+        runner = agent_behavioral_runner()
+        eval_ctx = EvalContext.from_env(
+            base_url=args.base_url, model=args.model,
+            api_key=args.api_key, timeout_s=timeout_s)
     else:
-        runner = _stub_runner
+        runner_kind = getattr(args, "runner", "stub")
+        if runner_kind == "http":
+            runner = _http_runner_factory(
+                base_url=args.base_url,
+                api_key=args.api_key,
+                model=args.model,
+                timeout=timeout_s,
+            )
+        else:
+            runner = _stub_runner
 
     provenance = {
         "runner": runner_kind,
         "model": getattr(args, "model", ""),
         "suite": suite_name,
+        # A stub can't verify anything; the behavioral + http runners drive the
+        # real agent, so their runs are trustworthy capability signals.
         "trustworthy": runner_kind != "stub",
     }
 
@@ -180,7 +199,7 @@ async def main() -> int:
         cm = (no_external_network() if not args.no_network_guard
               else _null_context())
         with cm:
-            result = await suite.run(runner=runner, per_task_timeout_s=timeout_s)
+            result = await suite.run(runner=runner, ctx=eval_ctx, per_task_timeout_s=timeout_s)
         p = freeze_baseline(result, out, provenance=provenance)
         print(f"frozen baseline → {p}")
         print(f"pass_rate={result.summary.get('pass_rate'):.3f}  n={result.summary.get('n')}")
@@ -199,7 +218,7 @@ async def main() -> int:
             print(f"no baseline at {base_path}; run `freeze` first", file=sys.stderr)
             return 2
         with no_external_network():
-            result = await suite.run(runner=runner, per_task_timeout_s=timeout_s)
+            result = await suite.run(runner=runner, ctx=eval_ctx, per_task_timeout_s=timeout_s)
         diff = compare_to_baseline(Path(base_path), result)
         # Footgun guard: surface any reason this comparison is NOT a
         # trustworthy capability verdict (a stub on either side, a missing

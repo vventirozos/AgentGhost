@@ -190,15 +190,16 @@ class EvalSuite:
             # {"passed": False, "output": "<traceback>"} passed as a
             # non-empty string. Scoped to template tasks: every other
             # task type's validator expects a string.
-            from .tasks import ChallengeTemplateTask as _CTT
-            # For a template task, ALWAYS hand the dict to validate() (even
-            # without a `passed` key) so its dict branch can reject a missing
-            # verdict as unverified. Previously a dict lacking `passed` fell
-            # through to output_text and passed as a non-empty string —
-            # silently greenlighting unvalidated template solutions.
+            from .tasks import ChallengeTemplateTask as _CTT, BehavioralTask as _BT
+            # Hand the whole dict to validate() when the runner produced a
+            # VERDICT (`passed` key) — that's the sandbox/behavioral contract —
+            # OR when the task type is verdict-based (template/behavioral), so
+            # its dict branch can reject a MISSING verdict as unverified rather
+            # than fall through to output_text and pass as a non-empty string
+            # (which silently greenlit unvalidated template/behavioral runs).
             output = (
                 result_val
-                if isinstance(task, _CTT)
+                if ("passed" in result_val or isinstance(task, (_CTT, _BT)))
                 else output_text
             )
         else:

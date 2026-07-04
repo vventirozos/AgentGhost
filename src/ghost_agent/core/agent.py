@@ -3854,6 +3854,12 @@ class GhostAgent:
         from .verifier import VerifyVerdict
         verifier = getattr(self.context, "verifier", None)
         last_tool = _find_substantive_tool_for_verifier(tools_run_this_turn)
+        # --no-verifier ablation off-switch (covers BOTH the gated post-loop
+        # gate and the direct in-loop auto-repair call): no verdict is computed
+        # at all, so nothing is scrubbed/backfilled/repaired.
+        if getattr(getattr(self, "context", None), "args", None) is not None and \
+                getattr(self.context.args, "no_verifier", False) is True:
+            return None, last_tool
         # Flat early-return (not an `if (verifier is not None and ...)`
         # block) so the post-loop gate stays the single match for the
         # gate-strictness source check — and so a missing verifier /
@@ -4140,6 +4146,16 @@ class GhostAgent:
         plain ``await`` — byte-for-byte the legacy behaviour.
         """
         last_tool = _find_substantive_tool_for_verifier(tools_run_this_turn)
+
+        # --no-verifier ablation off-switch: skip the post-response verifier
+        # entirely (no verdict computed, no lesson scrubbing, no backfill). The
+        # response ships exactly as the "verdict missed the budget" path already
+        # handles (v_result is None). Lets the ablation harness measure whether
+        # the late verifier's cost earns its (cross-session-only) keep.
+        if getattr(getattr(self, "context", None), "args", None) is not None and \
+                getattr(self.context.args, "no_verifier", False) is True:
+            return None, last_tool
+
         gate = self._critic_gate_timeout()
 
         # Fast path / legacy: block for the verdict (no critic pool, or an

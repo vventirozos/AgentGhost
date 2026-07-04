@@ -86,6 +86,41 @@ class ChallengeTemplateTask(EvalTask):
 
 
 @dataclass
+class BehavioralTask(EvalTask):
+    """An EXECUTION-GROUNDED task: drive the live agent, then verify the REAL
+    side-effect (a file written in the sandbox, a fact that recalls, a DB row),
+    not the response text.
+
+    This is the DISCRIMINATING half of the harness. The trivial `capability`
+    suite is single-turn, zero-tool text Q&A (it scored 1.000 straight through
+    five live tool-path bugs). A BehavioralTask instead exercises the tool
+    surface and only passes when the real effect is observed.
+
+    `verify` is `async (output_text, ctx) -> (passed, reason)` and lives on the
+    task (self-describing); the behavioral runner invokes it and folds the
+    verdict into a `{"passed": ...}` dict — the same verdict contract templates
+    use. Run under a NON-behavioral runner (stub/http), a BehavioralTask has no
+    verdict and correctly scores FAIL ("unverified"), never a false green.
+    """
+
+    verify: Optional[Callable[[str, Any], Any]] = None
+
+    def __post_init__(self) -> None:
+        self.category = "behavioral"
+
+    def validate(self, output: Any, ctx: Any = None) -> Tuple[bool, str]:
+        if isinstance(output, dict):
+            if "passed" not in output:
+                return False, "behavioral task not verified: runner returned no verdict"
+            passed = bool(output.get("passed"))
+            return passed, "" if passed else str(
+                output.get("failure_reason") or output.get("reason") or "verification failed")
+        # A plain string means it ran under a runner that did NOT execute the
+        # grounded verify (stub/http) — treat as unverified, never a soft pass.
+        return False, "behavioral task requires the behavioral runner (no execution verdict)"
+
+
+@dataclass
 class CuratedRequestTask(EvalTask):
     """A replayed real-world request.
 

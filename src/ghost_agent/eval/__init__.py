@@ -24,10 +24,16 @@ from .tasks import (
     ChallengeTemplateTask,
     CuratedRequestTask,
     RegressionProbeTask,
+    BehavioralTask,
     load_default_suite,
     load_offline_suite,
     load_capability_suite,
     load_post_learning_suite,
+)
+from .behavioral import (
+    EvalContext,
+    agent_behavioral_runner,
+    load_behavioral_suite,
 )
 from .suite import EvalSuite, RunnerCallable
 from .baseline import (
@@ -47,6 +53,10 @@ __all__ = [
     "ChallengeTemplateTask",
     "CuratedRequestTask",
     "RegressionProbeTask",
+    "BehavioralTask",
+    "EvalContext",
+    "agent_behavioral_runner",
+    "load_behavioral_suite",
     "load_default_suite",
     "load_offline_suite",
     "load_capability_suite",

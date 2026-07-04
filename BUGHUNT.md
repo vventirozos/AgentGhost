@@ -364,6 +364,23 @@ regression tests; docs updated; full suite green on that session's date.
 
 (newest first)
 
+### 2026-07-04 — DEFERRED RESOLVED: sandbox-verdict runner + discriminating behavioral eval BUILT
+- The recurring gap from this ledger ("capability gate is 1.000 = PROTECTIVE not DISCRIMINATING;
+  measuring real capability needs a sandbox-verdict runner") is now closed. Built an
+  execution-grounded **behavioral** eval: `eval/behavioral.py` (`EvalContext` drives the live agent
+  + inspects its sandbox / DB / trajectory; `agent_behavioral_runner`), a `BehavioralTask` type
+  (verdict contract — unverified under any non-behavioral runner, never a soft green), and
+  `--suite behavioral` in the CLI. 5 grounded tasks: code write+run (assert 12!), file round-trip,
+  memory store→recall (the exact loop the insert_fact hang broke), compute→save chain, DB query
+  cross-checked against the real database.
+- Live result: `mean_tool_calls=2.4` / `mean_tool_errors=0.4` (vs capability's 0.0 / 0.0) — it
+  actually exercises tools and surfaces recovered strikes. Frozen at
+  `$GHOST_HOME/system/eval/baseline_behavioral.json` (runner=behavioral, trustworthy). Tests:
+  tests/test_eval_behavioral.py (11). Docs: self_improvement.md Tier 3. Full suite green (6198).
+- These 5 are grounded REGRESSION catchers (each would FAIL on the pre-fix agent). Next for full
+  upward headroom: add a few genuinely-hard graded tasks. Then it can label the PRM / reward
+  self-play / gate every change — the foundation the value-driven machinery presupposes.
+
 ### 2026-07-04 — LIVE BUG: native tool_call corruption broke `introspect` (FIXED)
 - Symptom (operator-reported, session e260ae3e): "tell me about yourself" → `introspect` failed every
   turn with `SYSTEM ERROR: 'action' must be one of [...]` even though the model passed a valid action.
