@@ -215,3 +215,88 @@ class TestCorrectFragmentUnit:
         self._seed(vm, "ingested chess document chunk", {"type": "document"})
         ok, _ = vm.correct_fragment("chess document", "replacement text")
         assert not ok
+
+
+class TestMemoryDeleteEndpoint:
+    def test_delete_ok(self):
+        client, _, memory = _make_app([])
+        memory.delete_fragment = MagicMock(
+            return_value=(True, {"deleted_id": "abc",
+                                 "deleted_text": "poisoned note"}))
+        res = client.post("/api/memory/delete",
+                          json={"match": "poisoned note"})
+        assert res.status_code == 200
+        assert res.json()["ok"] is True
+        assert res.json()["deleted_text"] == "poisoned note"
+        memory.delete_fragment.assert_called_once_with("poisoned note")
+
+    def test_delete_refusal_is_409(self):
+        client, _, memory = _make_app([])
+        memory.delete_fragment = MagicMock(
+            return_value=(False, "no stored fragment matches"))
+        res = client.post("/api/memory/delete", json={"match": "nope"})
+        assert res.status_code == 409
+        assert res.json()["ok"] is False
+
+    def test_delete_bad_json_is_400(self):
+        client, _, memory = _make_app([])
+        memory.delete_fragment = MagicMock()
+        res = client.post("/api/memory/delete",
+                          content=b"{not json",
+                          headers={"Content-Type": "application/json"})
+        assert res.status_code == 400
+        memory.delete_fragment.assert_not_called()
+
+
+class TestDeleteFragmentUnit:
+    """VectorMemory.delete_fragment — the surgical-delete companion to
+    correct_fragment, for fragments that are WHOLLY false (the 2026-07-04
+    dream synthesis 'user prefers a random AI move selection')."""
+
+    _vm = TestCorrectFragmentUnit._vm
+    _seed = TestCorrectFragmentUnit._seed
+
+    def test_exact_text_delete(self):
+        vm = self._vm()
+        poisoned = ("User is developing a terminal chess game and explicitly "
+                    "prefers a random AI move selection strategy over "
+                    "positional evaluation for the ghost piece.")
+        self._seed(vm, poisoned)
+        ok, detail = vm.delete_fragment(poisoned)
+        assert ok
+        assert detail["deleted_text"] == poisoned
+        assert len(vm.collection.rows) == 0
+
+    def test_substring_match_unique_delete(self):
+        vm = self._vm()
+        self._seed(vm, "the Marlin dream synthesis memory")
+        ok, detail = vm.delete_fragment("Marlin dream")
+        assert ok
+        assert len(vm.collection.rows) == 0
+
+    def test_ambiguous_substring_refused(self):
+        vm = self._vm()
+        self._seed(vm, "chess memory one")
+        self._seed(vm, "chess memory two")
+        ok, err = vm.delete_fragment("chess memory")
+        assert not ok and "2 fragments match" in err
+        assert len(vm.collection.rows) == 2  # nothing deleted
+
+    def test_no_match_refused(self):
+        vm = self._vm()
+        self._seed(vm, "an unrelated fact")
+        ok, err = vm.delete_fragment("nothing like this")
+        assert not ok
+        assert len(vm.collection.rows) == 1
+
+    def test_empty_match_refused(self):
+        vm = self._vm()
+        ok, err = vm.delete_fragment("   ")
+        assert not ok
+
+    def test_document_type_excluded_from_substring_scan(self):
+        vm = self._vm()
+        self._seed(vm, "ingested chess document chunk", {"type": "document"})
+        ok, _ = vm.delete_fragment("chess document")
+        assert not ok
+        assert len(vm.collection.rows) == 1

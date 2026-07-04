@@ -511,13 +511,22 @@ async def advance_once(
         _single_file = any(s in _goal for s in (
             "single-file", "single file", "one file", "one html",
             "one index.html", "in one html", "single html"))
+        # User-mandated constraints stored on the project record must reach
+        # the executor's spec prompt: the 2026-07-04 chess session's first
+        # engine violation was written by THIS path, which never saw the
+        # captured "with YOU - Ghost plays directly, not a generated chess
+        # AI" constraint at all.
+        _constraints = [str(c) for c in
+                        ((proj.get("metadata") or {}).get("constraints")
+                         or [])]
         cres = None
         try:
             cres = await coding_executor(
                 context, nxt.description, tool_runner=tool_runner, ledger=ledger,
                 existing_files=_gather_project_files(store, project_id),
                 research_context=_gather_research_briefs(store, project_id),
-                single_file=_single_file)
+                single_file=_single_file,
+                constraints=_constraints)
         except Exception as e:
             logger.warning("coding_executor crashed: %s", e)
         if cres is not None:

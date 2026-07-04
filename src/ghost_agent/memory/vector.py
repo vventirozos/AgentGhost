@@ -783,6 +783,56 @@ class VectorMemory:
             logger.warning("correct_fragment failed: %s", e, exc_info=True)
             return False, f"Error: {e}"
 
+    def delete_fragment(self, match: str):
+        """Surgically DELETE one stored fragment, in-process.
+
+        Companion to ``correct_fragment`` for the case where the poisoned
+        memory is WHOLLY false — nothing true to rewrite it into (e.g. the
+        2026-07-04 dream synthesis that fused bug-hunt test probes with a
+        misread complaint into "user prefers a random AI move selection").
+        Same safety rules: must run inside the owning process (a second
+        PersistentClient risks HNSW corruption; exposed via POST
+        /api/memory/delete), ``match`` is tried as the EXACT stored text
+        first (ids are md5(text)), then as a case-insensitive substring
+        over non-document fragments; refuses ambiguous matches rather than
+        guessing — unlike ``delete_by_query``, which trusts a semantic
+        top-1 and can land on a neighbor. Returns (ok, detail_or_error).
+        """
+        if not (match or "").strip():
+            return False, "match must be non-empty"
+        try:
+            with self._get_lock():
+                old_id = hashlib.md5(match.encode("utf-8")).hexdigest()
+                got = self.collection.get(ids=[old_id], include=["documents"])
+                if got and got.get("ids"):
+                    old_doc = (got.get("documents") or [""])[0]
+                else:
+                    all_rows = self.collection.get(
+                        include=["documents", "metadatas"])
+                    needle = match.lower()
+                    hits = [
+                        (i, d) for i, d, m in zip(
+                            all_rows.get("ids") or [],
+                            all_rows.get("documents") or [],
+                            all_rows.get("metadatas") or [])
+                        if needle in (d or "").lower()
+                        and (m or {}).get("type") != "document"
+                    ]
+                    if not hits:
+                        return False, "no stored fragment matches"
+                    if len(hits) > 1:
+                        previews = [d[:80] for _, d in hits[:5]]
+                        return False, (f"{len(hits)} fragments match — be "
+                                       f"more specific. Matches: {previews}")
+                    old_id, old_doc = hits[0]
+                self.collection.delete(ids=[old_id])
+            pretty_log("Memory Delete", f"'{(old_doc or '')[:80]}…'",
+                       icon=Icons.MEM_WIPE)
+            return True, {"deleted_id": old_id, "deleted_text": old_doc}
+        except Exception as e:
+            logger.warning("delete_fragment failed: %s", e, exc_info=True)
+            return False, f"Error: {e}"
+
     def delete_by_query(self, query: str):
         try:
             with self._get_lock():

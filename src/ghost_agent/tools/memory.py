@@ -790,8 +790,46 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     key = key or kwargs.get("key")
     value = value or kwargs.get("value")
 
-    if not key or not value:
-        return "Error: Both 'key' and 'value' are required arguments for update_profile."
+    if not key:
+        return "Error: 'key' is a required argument for update_profile."
+
+    if not value:
+        # DELETE path: an empty/omitted value removes the key — mirroring
+        # `manage_projects config`, where an empty config_value deletes.
+        # ProfileMemory.delete() existed but was unreachable from the tool;
+        # live 2026-07-05 the model reasonably tried exactly this call
+        # shape to remove a field, got a hard error, its corrected retry
+        # was idempotency-blocked, and the turn finalised on a false
+        # "Done — removed".
+        prof = profile_memory
+        if prof is None and memory_bus is not None:
+            prof = getattr(memory_bus, "profile", None)
+        if prof is None or not hasattr(prof, "delete"):
+            return "Error: Profile memory not loaded."
+        old_val = None
+        try:
+            data = prof.load() if hasattr(prof, "load") else None
+            if isinstance(data, dict):
+                cat_data = data.get(str(category).strip().lower(), {})
+                if isinstance(cat_data, dict):
+                    old_val = cat_data.get(str(key).strip().lower())
+        except Exception:
+            pass
+        pretty_log("Profile Update", f"delete {category}.{key}",
+                   icon=Icons.USER_ID)
+        msg = await asyncio.to_thread(prof.delete, category, key)
+        # Best-effort: scrub the derived vector fact ("User <key> is
+        # <value>") so semantic retrieval stops surfacing the deleted
+        # field. The canonical store is the JSON profile — a miss here is
+        # not a failure.
+        if (old_val is not None and memory_system is not None
+                and hasattr(memory_system, "delete_fragment")):
+            try:
+                await asyncio.to_thread(
+                    memory_system.delete_fragment, f"User {key} is {old_val}")
+            except Exception:
+                pass
+        return msg
 
     pretty_log("Profile Update", f"{category}.{key}={value}", icon=Icons.USER_ID)
 

@@ -667,6 +667,30 @@ async def memory_correct(request: Request):
     return {"ok": True, **detail}
 
 
+@router.post("/api/memory/delete", dependencies=[Security(verify_api_key)])
+async def memory_delete(request: Request):
+    """Surgically DELETE one vector-memory fragment.
+
+    Companion to /api/memory/correct for a fragment that is WHOLLY false
+    (nothing true to rewrite it into). Runs in-process for the same reason
+    (a second PersistentClient against the live Chroma dir risks HNSW
+    corruption). Body: {"match": <exact text or unique substring>}.
+    """
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        return JSONResponse({"error": f"Invalid JSON: {e}"}, 400)
+    match = str(body.get("match") or "")
+    memory = getattr(getattr(agent, "context", None), "memory_system", None)
+    if memory is None or not hasattr(memory, "delete_fragment"):
+        return JSONResponse({"error": "memory system unavailable"}, 503)
+    ok, detail = memory.delete_fragment(match)
+    if not ok:
+        return JSONResponse({"ok": False, "error": detail}, 409)
+    return {"ok": True, **detail}
+
+
 @router.post("/api/upload", dependencies=[Security(verify_api_key)])
 async def upload_file(request: Request, file: UploadFile = File(...)):
     agent = get_agent(request)

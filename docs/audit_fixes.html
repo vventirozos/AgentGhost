@@ -73,6 +73,84 @@
     label leakage). Everything else preserves documented behaviour while fixing a latent bug.
   </div>
 
+  <h2>Functional hunt (2026-07-04): async-critic mode shipped six untested writes — the chess post-mortem</h2>
+  <p>
+    A live request — <q>play chess against each other. with YOU, not a generated chess AI …
+    turn based from the terminal</q> — failed comprehensively: five distinct crashes shipped
+    to the user (a <code>chess.py</code> that shadowed the <code>python-chess</code> library, a
+    rank off-by-one <code>IndexError</code>, a <code>NameError</code> from a half-renamed function,
+    a hallucinated <code>chess.square_index()</code>), and the final deliverable violated the one
+    constraint the agent had itself captured on create.
+  </p>
+  <p>
+    <strong>Root cause 1 — the unverified-write guard was OFF in the deployed mode.</strong>
+    The in-loop <em>VERIFIER-GATE AUTO-REPAIR</em> (which forces an <q>actually RUN it</q>
+    re-entry when a turn finalises on an untested file write) was gated behind
+    <code>not self._critic_async_enabled()</code> — and the production config runs
+    <code>--critic-nodes</code> (async critic). So all six <q>finalised on an UNVERIFIED file
+    write — flagged INCOMPLETE</q> warnings fired, appended a note, and shipped anyway: the
+    user became the test harness. The check itself
+    (<code>_is_unverified_mutation</code>) is a pure predicate over the turn's tool records —
+    no LLM call — so there was never a latency reason to skip it in async mode.
+    <em>Fix:</em> async mode now runs the deterministic check inline and triggers the same
+    bounded repair re-entry; the LLM verdict itself stays deferred to the post-loop gate,
+    preserving async's non-blocking contract.
+    Tests: <code>tests/test_async_unverified_repair.py</code> (5).
+  </p>
+  <p>
+    <strong>Root cause 2 — the captured constraint never reached the code generator, and the
+    steer had no teeth.</strong> The project record stored
+    <q>with YOU - Ghost plays directly, not a generated chess AI</q>, but the autoadvance
+    coding executor's spec prompt contained no trace of it — the first engine violation was
+    written by that exact path. And when the post-write constraint steer did fire, it carried
+    no architecture guidance, so the model rationalised <q>the evaluation function IS me</q>.
+    Meanwhile the correct infrastructure already existed: <code>POST /api/game/move</code>
+    (built after the 2026-07-02 chess incident) has the agent's LLM choose the move at
+    inference time with no engine fallback — and a terminal script run on the <em>user's</em>
+    machine reaches <code>127.0.0.1:8000</code> fine (only the agent's sandbox cannot; the model
+    over-generalised the sandbox-loopback fact and dismissed the design).
+    <em>Fixes:</em>
+    (a) <code>project_advancer</code> now passes the project's stored constraints into
+    <code>build_coding_task</code> → <code>_generate_build_spec</code>, which renders them as an
+    <q>EXPLICIT USER CONSTRAINTS (PROJECT-WIDE)</q> block;
+    (b) new <code>has_participant_constraint()</code> + <code>PARTICIPANT_STEER</code>
+    (<code>utils/constraints.py</code>) detect player-role constraints and append a binding
+    architecture directive — state-file + per-chat-turn reasoning, or a thin client POSTing to
+    <code>/api/game/move</code> — to both the post-write steer and the executor spec prompt;
+    (c) the PARTICIPANT MODE prompt section now states explicitly that a user-run terminal
+    client <em>can</em> reach the API and is the correct terminal-game design.
+    Tests: <code>tests/test_participant_constraint_steer.py</code> (15).
+  </p>
+  <p>
+    <strong>Caught live while verifying (2026-07-05): profile delete was impossible and a failed
+    call poisoned the idempotency guard.</strong> Asking the live agent to remove a profile
+    field exposed a three-step failure: (1) <code>update_profile</code> had no delete path —
+    <code>ProfileMemory.delete()</code> existed but was unreachable, so the model's reasonable
+    empty-value call hard-errored; (2) the corrected retry was blocked by the idempotency
+    guard as <q>args already applied</q>, because the hash was recorded at <em>dispatch</em>
+    time — a call whose result was an Error still registered as applied; (3) the model
+    trusted the guard and finalised on a false <q>Done — I've removed it</q>.
+    <em>Fixes:</em> an empty/omitted <code>value</code> now routes to
+    <code>ProfileMemory.delete</code> (and best-effort scrubs the derived
+    <q>User &lt;key&gt; is &lt;value&gt;</q> vector fact); the durable idempotency hash commits at
+    result time only on SUCCESS, with a batch-local pending set preserving intra-response
+    dedup (the original 9×-identical-calls loop protection is intact).
+    Tests: <code>tests/test_profile_delete_and_idempotency.py</code> (11).
+  </p>
+  <p>
+    <strong>Root cause 3 — the misread turn poisoned long-term memory.</strong> The user's
+    complaint <q>i'm not playing against you, i am playing against a random AI, i didn't ask
+    for that</q> was read backwards; consolidation then stored <q>user … explicitly prefers a
+    random AI move selection strategy</q> and a dream pass fused it with unrelated bug-hunt
+    test probes into a fabricated project memory. A wholly-false fragment cannot be fixed by
+    <code>/api/memory/correct</code> (there is nothing true to rewrite it into), and the only
+    delete path (<code>delete_by_query</code>) trusts a semantic top-1 that can land on a
+    neighbour. <em>Fix:</em> new <code>VectorMemory.delete_fragment()</code> +
+    <code>POST /api/memory/delete</code> — exact-text-first, unique-substring fallback, refuses
+    ambiguity, in-process (Chroma HNSW safety). The two poisoned fragments were deleted live.
+    Tests: <code>tests/test_game_move_api.py</code> (+9).
+  </p>
+
   <h2>Live regression (2026-07-04): native tool_call corruption broke <code>introspect</code></h2>
   <p>
     A live <q>hey ghost, tell me about yourself</q> turn wedged: the agent called

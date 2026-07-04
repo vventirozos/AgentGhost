@@ -7819,13 +7819,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # are never "repaired".
                         if (repair_round < self._MAX_VERIFIER_REPAIRS
                                 and not force_stop
-                                and execution_failure_count == 0
-                                and not self._critic_async_enabled()):
-                            # Async mode skips this whole block: no blocking
-                            # in-loop verdict and no repair-before-ship. The
-                            # post-loop gate (pure-async) then runs the verdict
-                            # off the critical path and queues a next-turn
-                            # correction if it refutes.
+                                and execution_failure_count == 0):
+                            # Async-critic mode skips the BLOCKING verdict (it
+                            # stays deferred to the post-loop gate, off the
+                            # critical path) — but NOT the unverified-mutation
+                            # check, which is a pure predicate over this turn's
+                            # tool records (no LLM call, no latency). The
+                            # 2026-07-04 chess hunt showed why: with
+                            # --critic-nodes on, this whole block was skipped,
+                            # so SIX consecutive turns finalised on file writes
+                            # that were never run — every crash (module
+                            # shadowing, IndexError, NameError, hallucinated
+                            # API) shipped to the user, who became the test
+                            # harness. Now async mode still forces the bounded
+                            # "actually RUN it" re-entry on untested writes.
                             #
                             # Defensive like the post-loop gate: a verifier
                             # error (or a misconfigured/non-async verifier in
@@ -7835,23 +7842,40 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _directive = ""
                             _crit = ""
                             _refuted = False
+                            _unverified = False
                             try:
                                 from .verifier import VerifyVerdict as _VV
-                                _vr, _lt = await self._compute_verifier_verdict(
-                                    tools_run_this_turn=tools_run_this_turn,
-                                    messages=messages,
-                                    final_ai_content=final_ai_content,
-                                    last_user_content=last_user_content,
-                                    lc=lc,
-                                )
-                                _verifier_verdict_cache = (_vr, _lt)
-                                _verdict_is_fresh = True
-                                _refuted = (
-                                    _vr is not None
-                                    and _vr.verdict == _VV.REFUTED
-                                    and _vr.confidence >= 0.7
-                                )
-                                _unverified = (_vr is None and _is_unverified_mutation(_lt))
+                                if self._critic_async_enabled():
+                                    # Exact mirror of the sync path's decision:
+                                    # there, EVERY skip case of
+                                    # `_compute_verifier_verdict` (no verifier,
+                                    # ablated, trivial) returns
+                                    # ``(None, last_tool)`` and the repair
+                                    # fires on ``_is_unverified_mutation``
+                                    # alone — it is a deterministic guard,
+                                    # independent of the verifier. No verdict
+                                    # is computed here; the cache stays
+                                    # untouched so the post-loop gate still
+                                    # defers exactly as before.
+                                    _lt = _find_substantive_tool_for_verifier(
+                                        tools_run_this_turn)
+                                    _unverified = _is_unverified_mutation(_lt)
+                                else:
+                                    _vr, _lt = await self._compute_verifier_verdict(
+                                        tools_run_this_turn=tools_run_this_turn,
+                                        messages=messages,
+                                        final_ai_content=final_ai_content,
+                                        last_user_content=last_user_content,
+                                        lc=lc,
+                                    )
+                                    _verifier_verdict_cache = (_vr, _lt)
+                                    _verdict_is_fresh = True
+                                    _refuted = (
+                                        _vr is not None
+                                        and _vr.verdict == _VV.REFUTED
+                                        and _vr.confidence >= 0.7
+                                    )
+                                    _unverified = (_vr is None and _is_unverified_mutation(_lt))
                                 if _refuted:
                                     _crit = (
                                         "; ".join(_vr.issues[:3]) if _vr.issues
@@ -7975,6 +7999,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                     tool_tasks, tool_call_metadata = [], []
                     tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
+                    # Idempotent setters dispatched in THIS batch. The guard
+                    # checks it alongside `executed_idempotent` so two
+                    # identical calls in one response still dedupe, while
+                    # the durable hash only commits at result time on
+                    # SUCCESS (a failed call must not block its own
+                    # corrected retry on the next iteration).
+                    pending_idempotent = set()
                     for _tc_idx, tool in enumerate(tool_calls):
                         # Strike cap inside the per-tool loop. The outer cap
                         # at the top of the turn loop only runs at turn
@@ -8148,7 +8179,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             or (fname == "knowledge_base"
                                 and t_args.get("action") in ("insert_fact", "forget"))
                         )
-                        if is_idempotent_setter and a_hash in executed_idempotent:
+                        if is_idempotent_setter and (
+                                a_hash in executed_idempotent
+                                or a_hash in pending_idempotent):
                             pretty_log(
                                 "Idempotency Guard",
                                 f"Blocked duplicate {fname} call (args already applied)",
@@ -8386,13 +8419,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 _coro = self.available_tools[fname](**t_args)
                                 tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
                                 tool_durations.append(None)
-                                tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args)))
-                                # Record the idempotency hash only now that the
-                                # call has actually been dispatched (not at the
-                                # guard above) so an aborted gate doesn't block a
-                                # later legitimate re-issue.
+                                tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter))
+                                # The DURABLE idempotency hash is recorded at
+                                # the RESULT-processing site, and only when
+                                # the call actually SUCCEEDED. Recording it
+                                # here (at dispatch) marked a call "applied"
+                                # even when the tool returned an Error —
+                                # observed live 2026-07-05: update_profile
+                                # rejected a missing-value call, the model's
+                                # corrected retry was then blocked as a
+                                # "duplicate (args already applied)", and the
+                                # turn finalised on a false "Done — removed".
+                                # The batch-local pending set below still
+                                # dedupes identical calls within THIS
+                                # response.
                                 if is_idempotent_setter:
-                                    executed_idempotent.add(a_hash)
+                                    pending_idempotent.add(a_hash)
                             except Exception as e:
                                 pretty_log("Tool Invocation Error", str(e), level="WARNING", icon=Icons.WARN)
                                 err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error invoking tool '{fname}' (Did you forget a required argument?): {str(e)}"}
@@ -8465,7 +8507,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # earlier failure can't latch the pivot prompt.
                         consecutive_parse_errors = 0
                         for i, result in enumerate(results):
-                            fname, tool_id, a_hash, is_mutating, ptarget = tool_call_metadata[i]
+                            fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter = tool_call_metadata[i]
                             str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
 
                             # Record this call's outcome uniformly (before the
@@ -8474,6 +8516,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # last-write-wins on last_error_*.
                             _res_is_error = str_res.startswith((
                                 "Error:", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
+
+                            # Idempotency hash lands only on SUCCESS: a failed
+                            # setter was NOT applied, so an identical corrected
+                            # retry must be allowed through the guard.
+                            if _is_idem_setter and not _res_is_error:
+                                executed_idempotent.add(a_hash)
                             op_outcomes.append({
                                 "tool": fname,
                                 "ok": not _res_is_error,
@@ -8517,25 +8565,41 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             if (_constraint_steer_pending and not _res_is_error
                                     and fname == "file_system" and is_mutating):
                                 _constraint_steer_pending = False
+                                # Participant-role constraints get the
+                                # architecture directive appended: the
+                                # 2026-07-04 chess session showed the generic
+                                # reminder alone is rationalised away ("the
+                                # evaluation function IS me") — the steer must
+                                # name the only two designs that satisfy the
+                                # constraint, including the /api/game/move
+                                # endpoint the model keeps forgetting exists.
+                                from ..utils.constraints import (
+                                    PARTICIPANT_STEER,
+                                    has_participant_constraint,
+                                )
+                                _steer_txt = (
+                                    "SYSTEM ALERT (constraint check): you "
+                                    "just wrote an artifact, and this "
+                                    "request carries EXPLICIT USER "
+                                    "CONSTRAINTS:\n"
+                                    + "\n".join(f"- {c}" for c in
+                                                _request_constraints)
+                                    + "\nBefore replying or marking "
+                                    "anything done: re-read what you "
+                                    "wrote and verify NONE of these are "
+                                    "violated. A coded stand-in for a "
+                                    "role the user assigned to YOU "
+                                    "(e.g. an embedded AI opponent when "
+                                    "the user said YOU will play) is a "
+                                    "violation — fix the artifact NOW "
+                                    "if so, then continue."
+                                )
+                                if has_participant_constraint(
+                                        _request_constraints):
+                                    _steer_txt += "\n\n" + PARTICIPANT_STEER
                                 messages.append({
                                     "role": "user",
-                                    "content": (
-                                        "SYSTEM ALERT (constraint check): you "
-                                        "just wrote an artifact, and this "
-                                        "request carries EXPLICIT USER "
-                                        "CONSTRAINTS:\n"
-                                        + "\n".join(f"- {c}" for c in
-                                                    _request_constraints)
-                                        + "\nBefore replying or marking "
-                                        "anything done: re-read what you "
-                                        "wrote and verify NONE of these are "
-                                        "violated. A coded stand-in for a "
-                                        "role the user assigned to YOU "
-                                        "(e.g. an embedded AI opponent when "
-                                        "the user said YOU will play) is a "
-                                        "violation — fix the artifact NOW "
-                                        "if so, then continue."
-                                    ),
+                                    "content": _steer_txt,
                                 })
                                 pretty_log(
                                     "Constraint Check",

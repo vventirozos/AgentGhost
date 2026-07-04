@@ -115,3 +115,56 @@ def render_constraint_block(constraints: List[str],
     for c in constraints:
         lines.append(f"- {c}")
     return "\n".join(lines)
+
+
+# Participant-mode DETECTION over already-captured constraints (broader than
+# `_PARTICIPANT_RE`, which decides clause capture): the chess sessions showed
+# the binding clauses arrive as "with YOU", "play chess with you", "Ghost
+# plays directly", "not a generated chess AI" — none of which the capture
+# regex's verb forms cover. False positives are cheap (an extra steer
+# paragraph); a false negative ships another coded stand-in.
+_PARTICIPANT_MODE_RE = re.compile(
+    r"\b(?:against|with|vs\.?)\s+you\b"          # "play chess with you"
+    r"|\byou\b.{0,32}?\bplay(?:s|ing)?\b"        # "you ... will play"
+    r"|\bplay(?:s|ing)?\b.{0,32}?\byou\b"        # "playing against you"
+    r"|\bagainst\s+me\b|\bbetween\s+us\b"
+    r"|\bplays?\s+directly\b"
+    r"|\bnot\s+a\s+generated\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def has_participant_constraint(constraints: List[str]) -> bool:
+    """True when any captured constraint assigns a PLAYER role to the agent
+    itself ("with YOU", "you will play against me", "Ghost plays directly",
+    "not a generated chess AI") — i.e. the deliverable must make the agent a
+    runtime participant, not embed a coded stand-in."""
+    return any(
+        _PARTICIPANT_MODE_RE.search(c or "") for c in (constraints or [])
+    )
+
+
+# The architecture directive injected (post-write steer + coding-executor
+# spec prompt) whenever a participant constraint is active. Deterministic
+# counterweight to the observed rationalisation "the evaluation function IS
+# me" (2026-07-04 chess session): names the only two designs that satisfy
+# the constraint and the endpoint that already implements "the agent picks
+# the move at inference time".
+PARTICIPANT_STEER = (
+    "PARTICIPANT-MODE ARCHITECTURE (binding): the user assigned a PLAYER "
+    "role to YOU. No code you write can BE you — an embedded move picker "
+    "(random.choice, minimax, evaluation loops, piece-square tables) "
+    "violates this no matter what it is named. Exactly two valid designs: "
+    "(A) conversational — authoritative game state lives in a workspace "
+    "file; each chat turn you validate+apply the user's move with a short "
+    "script, then YOU choose your reply move by reasoning and apply it; or "
+    "(B) live client — the program the user runs on THEIR machine POSTs "
+    "each position to your API: POST http://127.0.0.1:8000/api/game/move "
+    "with JSON {\"fen\": ..., \"user_move\": ..., \"history\": [...]}; the "
+    "response's 'move' is chosen by YOU at inference time (no engine "
+    "fallback exists on that endpoint). The user's machine reaches that "
+    "endpoint fine — ONLY your code sandbox cannot, so never test the call "
+    "from the sandbox and never mock it; verify the script offline and ask "
+    "the user to run it live. If what you just wrote embeds move-selection "
+    "logic for your side, rewrite it to design (B) NOW."
+)

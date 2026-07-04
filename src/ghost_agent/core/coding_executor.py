@@ -282,7 +282,8 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
                                single_file: bool = False,
                                feedback: str = "",
                                research_context: Optional[Dict[str, str]] = None,
-                               is_background: bool = False) -> Tuple[dict, bool]:
+                               is_background: bool = False,
+                               constraints: Optional[List[str]] = None) -> Tuple[dict, bool]:
     """Ask the model for a JSON build spec.
 
     Returns ``(spec, was_empty)``: ``spec`` is ``{}`` on any failure, and
@@ -315,6 +316,21 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         "task needs; prefer a runnable verify that exercises what you built."
     )
     user = f"TASK: {description}\n"
+    if constraints:
+        # User-mandated constraints from the project record. Before this
+        # block the executor never saw them — the 2026-07-04 chess session's
+        # first "coded AI opponent" violation was written by an autoadvance
+        # leaf whose spec prompt contained no trace of "with YOU - Ghost
+        # plays directly, not a generated chess AI".
+        from ..utils.constraints import (
+            PARTICIPANT_STEER, has_participant_constraint,
+            render_constraint_block,
+        )
+        user += "\n" + render_constraint_block(
+            list(constraints),
+            header="EXPLICIT USER CONSTRAINTS (PROJECT-WIDE)") + "\n"
+        if has_participant_constraint(list(constraints)):
+            user += "\n" + PARTICIPANT_STEER + "\n"
     if ledger:
         user += ("\nPROJECT LEDGER (existing files / APIs / conventions — build "
                  f"CONSISTENTLY with these):\n{ledger}\n")
@@ -529,6 +545,7 @@ async def build_coding_task(
     max_files: int = MAX_FILES,
     max_attempts: int = MAX_ATTEMPTS,
     is_background: bool = False,
+    constraints: Optional[List[str]] = None,
     **_ignored,
 ) -> CodingResult:
     """Build one coding leaf: spec → write/edit (non-regressively) → verify,
@@ -560,7 +577,7 @@ async def build_coding_task(
                 llm, model, description, ledger,
                 existing_files=existing, single_file=single_file,
                 feedback=feedback, research_context=research_context,
-                is_background=is_background)
+                is_background=is_background, constraints=constraints)
         except Exception as e:  # pragma: no cover - LLM/network variance
             return CodingResult(False, f"build-spec generation failed: {e}")
 

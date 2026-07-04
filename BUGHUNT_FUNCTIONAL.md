@@ -140,6 +140,54 @@ Status values: PENDING · IN-PROGRESS · CLEAR.
 
 (newest first)
 
+### 2026-07-05 — POST-SWEEP live regression: the chess post-mortem (5 fixes shipped)
+User-reported total failure of "play chess against each other. with YOU, not a generated
+chess AI … turn based from the terminal" (2026-07-04 21:59–23:22). Post-mortem verdict:
+LLM wrote 5 distinct crash bugs + 1 comprehension inversion, but the AGENT had every
+signal to stop the bleeding and used none. Fixes (all tested, docs updated, live-verified):
+1. **[unit 10] Async-critic mode shipped untested writes** — the in-loop VERIFIER-GATE
+   AUTO-REPAIR was gated behind `not _critic_async_enabled()`; production runs
+   GHOST_CRITIC_ASYNC=1, so six consecutive turns finalised on never-run
+   `terminal_chess.py` writes ("flagged INCOMPLETE" ×6, shipped anyway). Fix: the
+   unverified-mutation check is a pure predicate (no LLM) — async mode now runs it inline
+   and forces the bounded "actually RUN it" re-entry; verdict itself stays deferred.
+   LIVE-VERIFIED: write-only probe → `verifier gate UNVERIFIED → auto-repair round 1/1`
+   → model executed the file → "Confirmed working" grounded in real output.
+   `tests/test_async_unverified_repair.py` (5).
+2. **[unit 9] Project constraints never reached the autoadvance coding executor** — the
+   captured "with YOU - Ghost plays directly, not a generated chess AI" constraint was
+   stored on the project record but `_generate_build_spec`'s prompt never saw it; the
+   first engine violation was written by that exact path. Fix: `project_advancer` passes
+   `metadata.constraints` → `build_coding_task` → spec prompt block.
+3. **[unit 9] Participant-mode architecture steer** — new `has_participant_constraint()` +
+   `PARTICIPANT_STEER` (`utils/constraints.py`): player-role constraints now append a
+   binding directive (state-file + per-chat-turn reasoning, or thin client POSTing to
+   `/api/game/move`) to the post-write steer AND the executor spec prompt. Prompt's
+   PARTICIPANT MODE section now states a USER-run terminal client CAN reach
+   127.0.0.1:8000 (only the sandbox can't — the model had over-generalised the loopback
+   fact and dismissed the correct design). `/api/game/move` LIVE-VERIFIED: e2e4 → LLM
+   replied e5 + comment, attempt 1. `tests/test_participant_constraint_steer.py` (15).
+4. **[unit 3] Poisoned memories + no surgical delete** — the misread "i'm not playing
+   against you…" complaint got consolidated as "user explicitly prefers a random AI move
+   selection", then dream-fused with Unit-3 test probes (Marlin/teal/number-7) into a
+   fabricated project memory. No safe delete existed (`delete_by_query` = semantic top-1).
+   Fix: `VectorMemory.delete_fragment()` + `POST /api/memory/delete` (exact-id first,
+   unique-substring fallback, refuses ambiguity, in-process). Deleted live: both Marlin
+   fragments + the tabs-over-spaces probe residue. `tests/test_game_move_api.py` (+9).
+5. **[unit 3+core] update_profile couldn't delete + idempotency guard poisoned by failures**
+   (caught LIVE during verification): `ProfileMemory.delete()` existed but was unreachable
+   — empty-value call hard-errored; the corrected retry was blocked "args already applied"
+   (hash recorded at DISPATCH, not on success); model finalised on a false "Done — removed".
+   Fix: empty value now routes to delete (+ scrubs the derived vector fact); durable
+   idempotency hash commits at result time on SUCCESS only, batch-local pending set keeps
+   intra-response dedup. LIVE-VERIFIED: retry actually removed the key from disk.
+   `tests/test_profile_delete_and_idempotency.py` (11).
+Full suite: 6241 passed / 11 skipped. NOTE: `tests/test_thinking_loop_guards.py` has 2
+env-sensitive tests that fail if `FORCE_COLOR` is set in the shell — run with
+`env -u FORCE_COLOR` (pre-existing, not a regression).
+Remaining from the post-mortem, NOT fixed (model-behavior, not agent): qwen-3.6 wrote the
+5 chess bugs and misread the complaint; the repair gate now contains the blast radius.
+
 ### 2026-07-04 — unit 14 (API / interface layer) — CLEAR (no code change) — **SWEEP COMPLETE (14/14)**
 - SSE streaming (stream:true) works: OpenAI-compatible `data:` chunks (delta.role/content/finish),
   keep-alive comment line. Malformed bodies → clean 400 (`"just a string"` → 400; missing messages
