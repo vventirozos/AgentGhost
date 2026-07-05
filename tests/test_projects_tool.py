@@ -299,6 +299,35 @@ async def test_list_returns_all_projects_with_current(context):
     assert res["current"] == p2["created"]
 
 
+async def test_list_display_block_leads_with_ids(context):
+    # 2026-07-05: the ids were in the JSON but the model's summaries
+    # dropped them, leaving the user referencing projects by title
+    # (ambiguity-prone; a bare title delete has cascaded before). The
+    # list result now carries a ready-made id-first 'display' block and
+    # a note directing the model to always show the ids.
+    p1 = _parse(await tool_manage_projects(context, action="create", title="A"))
+    p2 = _parse(await tool_manage_projects(context, action="create", title="B"))
+    res = _parse(await tool_manage_projects(context, action="list"))
+    display = res["display"]
+    for pid in (p1["created"], p2["created"]):
+        assert pid in display
+    # Every non-empty display line starts with a project id.
+    ids = {p["id"] for p in res["projects"]}
+    for line in display.splitlines():
+        assert line.split()[0] in ids
+    # The active project is marked, and the note demands ids be shown.
+    active_line = next(l for l in display.splitlines()
+                       if l.startswith(p2["created"]))
+    assert "ACTIVE" in active_line
+    assert "id" in res["note"]
+
+
+async def test_list_display_empty_store(context):
+    res = _parse(await tool_manage_projects(context, action="list"))
+    assert res["projects"] == []
+    assert res["display"] == "(no projects)"
+
+
 async def test_list_filters_by_status(context):
     a = _parse(await tool_manage_projects(context, action="create", title="A"))
     _parse(await tool_manage_projects(context, action="create", title="B"))

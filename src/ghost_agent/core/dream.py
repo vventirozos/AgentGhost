@@ -926,7 +926,7 @@ class Dreamer:
         if not self.memory or not self.memory.collection:
             return "Memory system not available."
 
-        pretty_log("Dream Mode", "Entering REM cycle (Consolidating Memory & Extracting Heuristics)...", icon="💤")
+        pretty_log("Dream Mode", "Entering REM cycle (Consolidating Memory & Extracting Heuristics)...", icon=Icons.DREAM)
 
         # Drain the short-term journal into the consolidation pipeline so
         # entries the agent appended during the day actually become long-
@@ -940,7 +940,7 @@ class Dreamer:
                     pretty_log(
                         "Dream Journal Drain",
                         f"Pulled {len(drained)} journal entries into consolidation.",
-                        icon="🧠",
+                        icon=Icons.BRAIN_SUM,
                     )
                     for entry in drained:
                         try:
@@ -973,7 +973,7 @@ class Dreamer:
             )
         except Exception as e:
             msg = f"Dream error: {e}"
-            pretty_log("Dream Mode", msg, level="ERROR", icon="❌")
+            pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
 
         ids = results['ids']
@@ -981,7 +981,7 @@ class Dreamer:
 
         if len(documents) < 3:
             msg = "Not enough entropy to dream. (Need > 3 auto-memories to form heuristics)"
-            pretty_log("Dream Mode", msg, icon="💤")
+            pretty_log("Dream Mode", msg, icon=Icons.DREAM)
             return msg
 
         # Idempotency guard: if the auto-memory set hasn't changed since
@@ -998,12 +998,12 @@ class Dreamer:
         # the cache when it's a real frozenset.
         if isinstance(last_fragment_key, frozenset) and last_fragment_key == current_fragment_key:
             msg = f"Skipping REM — fragment set unchanged ({len(ids)} memories, no new input since last cycle)."
-            pretty_log("Dream Mode", msg, icon="⏭️")
+            pretty_log("Dream Mode", msg, icon=Icons.SKIP)
             return msg
 
         mem_list = [f"ID:{i} | {doc}" for i, doc in zip(ids, documents)]
         mem_block = "\n".join(mem_list[:150])
-        pretty_log("Dream Mode", f"Analyzing {len(ids)} fragments for meta-patterns...", icon="🧠")
+        pretty_log("Dream Mode", f"Analyzing {len(ids)} fragments for meta-patterns...", icon=Icons.BRAIN_SUM)
         
         prompt = f"""### IDENTITY
 You are the Active Memory Consolidation (Dream) Subsystem.
@@ -1082,7 +1082,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                     # isn't adding value, it's just paraphrasing.
                     if compression_ratio < 0.05 and source_chars > 0:
                         skipped_low_compression += 1
-                        pretty_log("Dream Skip", f"Skipped low-compression consolidation ({compression_ratio:.1%}): {synthesis[:50]}...", icon="⏭️")
+                        pretty_log("Dream Skip", f"Skipped low-compression consolidation ({compression_ratio:.1%}): {synthesis[:50]}...", icon=Icons.SKIP)
                         continue
 
                 # Tag syntheses as "synthesis" rather than "auto" so
@@ -1189,12 +1189,12 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             self.context._last_dream_fragment_ids = current_fragment_key
 
             msg = f"Dream Complete. Synthesized {applied_consolidations} new meta-memories and extracted {h_count} heuristics.{metrics_note}"
-            pretty_log("Dream Mode", msg, icon="✅")
+            pretty_log("Dream Mode", msg, icon=Icons.OK)
             return msg
 
         except Exception as e:
             msg = f"Dream error: {e}"
-            pretty_log("Dream Mode", msg, level="ERROR", icon="❌")
+            pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
 
     def _fallback_trajectory_collector(self):
@@ -1420,7 +1420,7 @@ Return ONLY a JSON object with:
                         pretty_log(
                             "Skill Graduated",
                             f"Lesson '{lesson['task'][:40]}' graduated into acquired skill: {result['name']}",
-                            icon="🎓"
+                            icon=Icons.SKILL_GRADUATE
                         )
                     else:
                         # TDD/creation failed — leave the lesson un-graduated so

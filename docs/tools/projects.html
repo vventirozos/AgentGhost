@@ -107,6 +107,9 @@
   shallow work done. Covered by <code>tests/test_advance_pacing.py</code> and
   <code>tests/test_coding_executor.py</code>.</p>
 
+  <h2>list always surfaces the ids (2026-07-05)</h2>
+  <p>The ids were always present in <code>action=list</code>'s JSON, but the model's user-facing summaries dropped them — the user was left referencing projects by <em>title</em> for follow-up commands (delete/switch), which is exactly the ambiguity-prone path the delete-resolution machinery below exists to defend against. The list result now additionally carries a ready-made <code>display</code> block — one line per project, <strong>id first</strong>, status, title, with the conversation-bound project marked <code>&lt;- ACTIVE</code> — plus a <code>note</code> directing the model to always show the ids when presenting projects ("the id is the only unambiguous reference for follow-up get/switch/update/delete calls"). Empty store renders <code>(no projects)</code>. Covered by <code>tests/test_projects_tool.py::test_list_display_block_leads_with_ids</code>.</p>
+
   <h2>switch / get resolve a title → id (2026-06-22)</h2>
   <p>The model routinely passes a project's <strong>title</strong> where an id
   is expected (<code>switch petai</code>), which hard-errored with "project not

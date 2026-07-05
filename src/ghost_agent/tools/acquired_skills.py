@@ -391,7 +391,7 @@ class AcquiredSkillManager:
                 pretty_log(
                     "Skill Retired",
                     f"Auto-retired degraded skill '{name}' (failures={_fail_n})",
-                    level="WARNING", icon="🗄️"
+                    level="WARNING", icon=Icons.MEM_WIPE
                 )
                 logger.info(f"Auto-retired skill '{name}'")
 

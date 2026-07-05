@@ -229,3 +229,318 @@ class TestInTurnSteer:
         joined = "\n".join("\n".join(c) for c in calls[1:])
         assert "SYSTEM ALERT (constraint check)" in joined
         assert "PARTICIPANT-MODE ARCHITECTURE" not in joined
+
+
+# --------------------------------------------------------------------------
+# Engine-pattern detection (2026-07-05: the deterministic write guard)
+# --------------------------------------------------------------------------
+
+from ghost_agent.utils.constraints import (  # noqa: E402
+    find_engine_patterns,
+    participant_write_violation,
+)
+
+# Condensed from the ACTUAL violating artifact of the 2026-07-05 session
+# (projects/bb181a973669/terminal_chess.py, ghost_choose_move).
+LIVE_ENGINE_SNIPPET = """
+import chess
+
+def ghost_choose_move(board):
+    legal_moves = list(board.legal_moves)
+    captures = [m for m in legal_moves if board.is_capture(m)]
+    if captures:
+        import random
+        return random.choice(captures)
+    import random
+    return random.choice(legal_moves)
+"""
+
+# The sanctioned design (B) thin client — must NEVER trip the guard.
+THIN_CLIENT_SNIPPET = """
+import chess
+import requests
+
+def ghost_move(board, history):
+    r = requests.post("http://127.0.0.1:8000/api/game/move",
+                      json={"fen": board.fen(), "history": history},
+                      timeout=180)
+    r.raise_for_status()
+    data = r.json()
+    board.push(board.parse_san(data["move"]))
+    return data
+"""
+
+PARTICIPANT_CONS = [
+    "with YOU - Ghost plays directly, not a generated chess AI",
+]
+
+
+class TestFindEnginePatterns:
+    def test_live_artifact_random_picker_flagged(self):
+        hits = find_engine_patterns(LIVE_ENGINE_SNIPPET)
+        assert any("random" in h for h in hits)
+
+    def test_minimax_flagged_anywhere(self):
+        assert find_engine_patterns("def minimax(board, depth): pass")
+
+    def test_alpha_beta_and_piece_square_flagged(self):
+        hits = find_engine_patterns(
+            "// alpha-beta search over PIECE_SQUARE tables")
+        assert len(hits) == 2
+
+    def test_stockfish_flagged(self):
+        assert find_engine_patterns("engine = Stockfish(path)")
+
+    def test_math_random_in_js_board_flagged(self):
+        content = ("<script src='chess.js'></script><script>"
+                   "const m = moves[Math.floor(Math.random()*moves.length)];"
+                   "</script>")
+        assert find_engine_patterns(content)
+
+    def test_coin_toss_without_game_context_is_clean(self):
+        # random.* alone (no move-generation markers) must not trip the
+        # guard — benign randomness in unrelated scripts stays writable.
+        assert find_engine_patterns(
+            "import random\nside = random.choice(['heads', 'tails'])") == []
+
+    def test_thin_client_is_clean(self):
+        assert find_engine_patterns(THIN_CLIENT_SNIPPET) == []
+
+    def test_empty_and_none_safe(self):
+        assert find_engine_patterns("") == []
+        assert find_engine_patterns(None) == []
+
+
+class TestParticipantWriteViolation:
+    def test_blocks_live_engine_write(self):
+        msg = participant_write_violation(
+            PARTICIPANT_CONS,
+            {"operation": "write", "path": "terminal_chess.py",
+             "content": LIVE_ENGINE_SNIPPET})
+        assert msg is not None
+        assert "SYSTEM BLOCK" in msg
+        assert "/api/game/move" in msg          # names the sanctioned design
+        assert "terminal_chess.py" in msg
+
+    def test_replace_with_body_is_scanned(self):
+        # replace→write auto-promotion means replace_with can become the
+        # whole file body — it must be scanned too.
+        msg = participant_write_violation(
+            PARTICIPANT_CONS,
+            {"operation": "replace", "path": "game.py",
+             "content": "old text",
+             "replace_with": "def minimax(b, d): pass"})
+        assert msg is not None
+
+    def test_no_participant_constraint_never_blocks(self):
+        assert participant_write_violation(
+            ["don't use html / js etc"],
+            {"operation": "write", "path": "t.py",
+             "content": LIVE_ENGINE_SNIPPET}) is None
+
+    def test_clean_thin_client_not_blocked(self):
+        assert participant_write_violation(
+            PARTICIPANT_CONS,
+            {"operation": "write", "path": "client.py",
+             "content": THIN_CLIENT_SNIPPET}) is None
+
+    def test_non_write_operations_ignored(self):
+        assert participant_write_violation(
+            PARTICIPANT_CONS,
+            {"operation": "read", "path": "terminal_chess.py"}) is None
+
+    def test_empty_inputs_safe(self):
+        assert participant_write_violation([], {"operation": "write",
+                                                "content": "x"}) is None
+        assert participant_write_violation(PARTICIPANT_CONS, None) is None
+        assert participant_write_violation(
+            PARTICIPANT_CONS, {"operation": "write", "content": ""}) is None
+
+
+# --------------------------------------------------------------------------
+# Project-constraint replay into the request (agent.py helpers)
+# --------------------------------------------------------------------------
+
+from types import SimpleNamespace  # noqa: E402
+
+
+class TestProjectConstraintHelpers:
+    def _fake_agent(self, constraints=None, pid="p1", store_raises=False):
+        from ghost_agent.core.agent import GhostAgent
+        store = MagicMock()
+        if store_raises:
+            store.get_project.side_effect = RuntimeError("db gone")
+        else:
+            store.get_project.return_value = {
+                "metadata": {"constraints": list(constraints or [])}}
+        fake = SimpleNamespace(
+            context=SimpleNamespace(project_store=store,
+                                    current_project_id=pid))
+        fake._project_constraints_for = (
+            lambda p, limit=5: GhostAgent._project_constraints_for(
+                fake, p, limit))
+        fake._active_project_constraints = (
+            lambda limit=5: GhostAgent._active_project_constraints(
+                fake, limit))
+        fake._store = store
+        return fake
+
+    def test_returns_stored_constraints(self):
+        fake = self._fake_agent(["no html", "with YOU - Ghost plays"])
+        assert fake._active_project_constraints() == [
+            "no html", "with YOU - Ghost plays"]
+
+    def test_empty_without_bound_project(self):
+        fake = self._fake_agent(["no html"], pid=None)
+        assert fake._active_project_constraints() == []
+
+    def test_store_error_is_safe(self):
+        fake = self._fake_agent(store_raises=True)
+        assert fake._active_project_constraints() == []
+
+    def test_merge_dedups_and_arms_steer(self):
+        from ghost_agent.core.agent import GhostAgent
+        fake = self._fake_agent(["No HTML", "with YOU - Ghost plays"])
+        with patch("ghost_agent.core.agent.pretty_log"):
+            merged, block, pending = GhostAgent._merge_project_constraints(
+                fake, ["no html"])  # dup differs only by case
+        assert merged == ["no html", "with YOU - Ghost plays"]
+        assert "EXPLICIT USER CONSTRAINTS (CURRENT REQUEST)" in block
+        assert pending is True
+
+    def test_merge_empty_everything(self):
+        from ghost_agent.core.agent import GhostAgent
+        fake = self._fake_agent([])
+        merged, block, pending = GhostAgent._merge_project_constraints(
+            fake, [])
+        assert merged == [] and block == "" and pending is False
+
+    def test_merge_replays_project_referenced_by_path(self):
+        # The C5 2026-07-05 escape: traceback pasted into a FRESH chat
+        # (no binding, pid=None) but naming the project on every line.
+        from ghost_agent.core.agent import GhostAgent
+        fake = self._fake_agent(
+            ["with YOU - Ghost plays directly, not a coded AI"], pid=None)
+        traceback_text = (
+            'Traceback (most recent call last):\n  File '
+            '"/Users/x/Data/AI/Data/sandbox/projects/6d0dd7371d17/chess/'
+            'chess_client.py", line 41, in post_move\nTimeoutError: timed out')
+        with patch("ghost_agent.core.agent.pretty_log"):
+            merged, block, pending = GhostAgent._merge_project_constraints(
+                fake, [], traceback_text)
+        assert merged == ["with YOU - Ghost plays directly, not a coded AI"]
+        assert pending is True
+        fake._store.get_project.assert_any_call("6d0dd7371d17")
+
+    def test_merge_bound_and_referenced_dedup(self):
+        # Bound project and path-referenced project return the same
+        # clauses — must not double up.
+        from ghost_agent.core.agent import GhostAgent
+        fake = self._fake_agent(["No HTML"], pid="p1")
+        with patch("ghost_agent.core.agent.pretty_log"):
+            merged, _, _ = GhostAgent._merge_project_constraints(
+                fake, [], "see projects/abcdef123456/main.py")
+        assert merged == ["No HTML"]
+
+    def test_merge_plain_text_no_reference_no_binding(self):
+        from ghost_agent.core.agent import GhostAgent
+        fake = self._fake_agent(["No HTML"], pid=None)
+        merged, block, pending = GhostAgent._merge_project_constraints(
+            fake, [], "the board is not lined up")
+        assert merged == [] and pending is False
+
+
+# --------------------------------------------------------------------------
+# In-turn integration: "proceed." with stored project constraints
+# --------------------------------------------------------------------------
+
+def _make_agent():
+    from ghost_agent.core.agent import GhostAgent, GhostContext
+    ctx = MagicMock(spec=GhostContext)
+    ctx.args = MagicMock()
+    ctx.args.temperature = 0.7
+    ctx.args.max_context = 8000
+    ctx.args.smart_memory = 0.0
+    ctx.args.use_planning = False
+    ctx.args.model = "Qwen-Test"
+    ctx.llm_client = MagicMock()
+    ctx.profile_memory = MagicMock()
+    ctx.profile_memory.get_context_string.return_value = ""
+    ctx.skill_memory = MagicMock()
+    ctx.skill_memory.get_context_string.return_value = ""
+    ctx.memory_system = MagicMock()
+    ctx.memory_system.search = MagicMock(return_value="")
+    ctx.cached_sandbox_state = None
+    ctx.sandbox_dir = "/tmp/sandbox"
+    ctx.verifier = None
+    return GhostAgent(ctx)
+
+
+class TestProjectConstraintReplayInTurn:
+    """The 2026-07-05 regression: the request that wrote the engine said
+    just "proceed." — no clause in the message, so neither the steer nor
+    any guard armed. Stored project constraints must now cover it."""
+
+    @pytest.fixture
+    def agent(self):
+        return _make_agent()
+
+    async def _drive(self, agent, user, write_content):
+        calls = []
+        seq = [
+            {"choices": [{"message": {"content": "", "tool_calls": [
+                {"id": "t1", "function": {"name": "file_system",
+                 "arguments": json.dumps({
+                     "operation": "write", "path": "game.py",
+                     "content": write_content})}}]}}]},
+            {"choices": [{"message": {
+                "content": "Done.", "tool_calls": []}}]},
+        ]
+
+        async def _spy(payload, **kw):
+            calls.append([m.get("content", "")
+                          for m in payload.get("messages", [])])
+            return seq[min(len(calls) - 1, len(seq) - 1)]
+
+        fs_mock = AsyncMock(
+            return_value="SUCCESS: wrote to 'game.py'.")
+        agent.available_tools["file_system"] = fs_mock
+        agent.context.llm_client.chat_completion = AsyncMock(
+            side_effect=_spy)
+        body = {"messages": [{"role": "user", "content": user}],
+                "model": "Qwen-Test"}
+        with patch("ghost_agent.core.agent.pretty_log"):
+            await agent.handle_chat(body, background_tasks=MagicMock())
+        return calls, fs_mock
+
+    async def test_proceed_arms_steer_from_project_constraints(self, agent):
+        with patch.object(agent, "_active_project_constraints",
+                          return_value=list(PARTICIPANT_CONS)):
+            calls, fs_mock = await self._drive(
+                agent, "proceed.", "print(1)")
+        joined = "\n".join("\n".join(c) for c in calls[1:])
+        assert fs_mock.called                       # clean write dispatched
+        assert "SYSTEM ALERT (constraint check)" in joined
+        assert "PARTICIPANT-MODE ARCHITECTURE" in joined
+        assert "/api/game/move" in joined
+
+    async def test_proceed_engine_write_is_blocked(self, agent):
+        with patch.object(agent, "_active_project_constraints",
+                          return_value=list(PARTICIPANT_CONS)):
+            calls, fs_mock = await self._drive(
+                agent, "proceed.", LIVE_ENGINE_SNIPPET)
+        joined = "\n".join("\n".join(c) for c in calls[1:])
+        assert not fs_mock.called                   # never reached the tool
+        assert "SYSTEM BLOCK (participant-mode engine guard)" in joined
+        assert "/api/game/move" in joined
+
+    async def test_proceed_without_project_constraints_untouched(
+            self, agent):
+        with patch.object(agent, "_active_project_constraints",
+                          return_value=[]):
+            calls, fs_mock = await self._drive(
+                agent, "proceed.", LIVE_ENGINE_SNIPPET)
+        joined = "\n".join("\n".join(c) for c in calls[1:])
+        assert fs_mock.called                       # no constraint, no block
+        assert "SYSTEM BLOCK" not in joined
+        assert "SYSTEM ALERT (constraint check)" not in joined

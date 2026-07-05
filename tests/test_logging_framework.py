@@ -18,6 +18,7 @@ import pytest
 from ghost_agent.utils import logging as glog
 from ghost_agent.utils.logging import (
     setup_logging, pretty_log, Icons, _GHOST_LOGGERS, request_id_context,
+    _icon_cell, _icon_display_width, _fill_rule, _CONTENT_COL,
 )
 
 
@@ -172,3 +173,125 @@ def test_setup_logging_idempotent_for_all_loggers(tmp_path):
         setup_logging(str(tmp_path / "g.log"), daemon=False)
     for n in _GHOST_LOGGERS:
         assert len(logging.getLogger(n).handlers) == counts[n], f"{n} accumulated handlers"
+
+
+# -----------------------------------------------------------------
+# Beautification pass — registry hygiene, icon-column width, frames
+# -----------------------------------------------------------------
+
+def test_no_inline_emoji_literal_icons_in_source():
+    """Every pretty_log icon must come from the Icons registry. Inline
+    literals (icon="💤") bypass it and collide silently — 💤 was both dream
+    and SYSTEM_SHUT. This guard fails if any reappear. (utils/logging.py is
+    excluded: the registry and the default-icon param legitimately live
+    there.)"""
+    import glob
+    import os
+    import re
+
+    import ghost_agent
+    root = os.path.dirname(os.path.dirname(ghost_agent.__file__))   # .../src
+    pat = re.compile(r'icon\s*=\s*[\'"]')   # single OR double quote literal
+    offenders = []
+    for path in glob.glob(os.path.join(root, "ghost_agent", "**", "*.py"),
+                          recursive=True):
+        if path.replace(os.sep, "/").endswith("utils/logging.py"):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            for i, line in enumerate(fh, 1):
+                if pat.search(line):
+                    offenders.append(f"{os.path.relpath(path, root)}:{i}")
+    assert not offenders, (
+        "inline-literal icons bypass the Icons registry (add a named "
+        "constant instead): " + ", ".join(offenders))
+
+
+def test_dream_and_reinforce_icons_present_and_distinct():
+    for name in ("DREAM", "SKIP", "MEM_REINFORCE"):
+        assert getattr(Icons, name, None), f"Icons.{name} missing"
+    # dream must NOT reuse the shutdown glyph (the old inline-literal bug).
+    assert Icons.DREAM != Icons.SYSTEM_SHUT
+    assert Icons.MEM_REINFORCE != Icons.RETRY
+
+
+def test_skill_graduate_icon_is_actually_used():
+    """The 🎓 constant existed but no call site used it (skill graduation
+    logged with a raw literal). It must now be wired to a real call."""
+    import glob
+    import os
+
+    import ghost_agent
+    root = os.path.dirname(os.path.dirname(ghost_agent.__file__))
+    used = False
+    for path in glob.glob(os.path.join(root, "ghost_agent", "**", "*.py"),
+                          recursive=True):
+        if path.replace(os.sep, "/").endswith("utils/logging.py"):
+            continue
+        if "Icons.SKILL_GRADUATE" in open(path, encoding="utf-8").read():
+            used = True
+            break
+    assert used, "Icons.SKILL_GRADUATE is defined but never used"
+
+
+def test_icon_cell_normalizes_to_two_display_cells():
+    # A stray narrow glyph gets padded so columns after it still line up...
+    assert _icon_cell("*") == "* "
+    assert _icon_display_width("*") == 1
+    # ...while real 2-cell emoji are left untouched (no over-pad).
+    assert _icon_cell("💭") == "💭"
+    assert _icon_display_width("💭") == 2
+    # A narrow-base glyph — including a VS16 emoji like ⚠️, whose true width
+    # is terminal-dependent — measures 1 and is padded up to the 2-cell
+    # field. (The registry itself avoids these; this is the stray-glyph
+    # backstop.)
+    assert _icon_display_width("⚠️") == 1
+    assert _icon_cell("⚠️") == "⚠️ "
+
+
+def test_every_registry_icon_is_wide_base():
+    """The alignment GUARANTEE: every Icons glyph renders as exactly 2 cells
+    on any terminal because its base codepoint is East-Asian Wide/Fullwidth.
+    Narrow-base or bare-VS16 symbols (⚠️ 🗣️ 🛡️ …) are terminal-dependent —
+    they were the source of the mis-aligned columns and are now banned."""
+    narrow = {k: v for k, v in vars(Icons).items()
+              if not k.startswith("_") and isinstance(v, str)
+              and _icon_display_width(v) != 2}
+    assert not narrow, f"narrow/ambiguous-width icons in registry: {narrow}"
+
+
+def test_metacog_subsystem_icons_are_wide_base():
+    from ghost_agent.core import metacog_log as mc
+    glyphs = list(mc._SUBSYSTEM_ICONS.values()) + [mc._DEFAULT_ICON]
+    narrow = [g for g in glyphs if _icon_display_width(g) != 2]
+    assert not narrow, f"narrow-base metacog icons: {narrow}"
+
+
+def test_content_column_derives_from_layout_formula():
+    # Single source of truth for the content/continuation-indent column.
+    assert _CONTENT_COL == 39
+    assert len(glog._CONTINUATION_INDENT) == _CONTENT_COL
+
+
+def test_frame_rule_fills_terminal_width():
+    # The BEGIN/END rule fills the rest of the line, so a wider terminal
+    # yields a longer separator (capped for sanity).
+    assert len(_fill_rule(10, cap=80)) == 70
+    assert len(_fill_rule(10, cap=40)) == 30
+    # Never negative, even if the prefix already overflows a narrow terminal.
+    assert len(_fill_rule(200, cap=80)) == 4
+
+
+def test_begin_end_frames_span_and_keep_markers():
+    token = request_id_context.set("ab12cd34")
+    try:
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            pretty_log("x", special_marker="BEGIN")
+            pretty_log("x", special_marker="END")
+        out = buf.getvalue()
+        assert "┌─" in out and "└─" in out
+        assert "request started" in out and "request finished" in out
+        # Each frame line carries a run of box-drawing rule characters.
+        assert "────" in out
+    finally:
+        request_id_context.reset(token)

@@ -235,7 +235,7 @@ class VectorMemory:
                 # function. The previous `sys.exit(1)` here contradicted the
                 # "Resetting collection" log right above it and hard-killed the
                 # whole process on a fixable mismatch.
-                pretty_log("Memory Conflict", "Embedding provider mismatch. Resetting collection for new provider...", level="WARNING", icon="⚠️")
+                pretty_log("Memory Conflict", "Embedding provider mismatch. Resetting collection for new provider...", level="WARNING", icon=Icons.WARN)
                 try:
                     collection_name = "agent_memory"
                     try:

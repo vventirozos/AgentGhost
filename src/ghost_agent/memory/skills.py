@@ -605,7 +605,7 @@ class SkillMemory:
                             pretty_log(
                                 "SKILL REINFORCED",
                                 f"Merged duplicate lesson: {effective_trigger[:30]}... (freq={existing['frequency']})",
-                                icon="🔄",
+                                icon=Icons.MEM_REINFORCE,
                             )
                             return
                 else:
@@ -642,14 +642,14 @@ class SkillMemory:
                             pretty_log(
                                 "SKILL REINFORCED",
                                 f"Vector-dedup: bumped lesson freq={existing['frequency']}: {effective_trigger[:30]}...",
-                                icon="🔄",
+                                icon=Icons.MEM_REINFORCE,
                             )
                         else:
                             pretty_log(
                                 "SKILL DEDUP",
                                 f"Skipped near-duplicate (dist={duplicate.get('distance', 0):.3f}, "
                                 f"no JSON twin to bump): {effective_trigger[:30]}...",
-                                icon="🔄",
+                                icon=Icons.SKIP,
                             )
                     return
 
@@ -699,7 +699,7 @@ class SkillMemory:
             pretty_log(
                 "SKILL ACQUIRED",
                 f"Lesson learned: {effective_trigger[:30]}...",
-                icon="🎓",
+                icon=Icons.SKILL_GRADUATE,
             )
         except Exception as e:
             logger.error(f"Failed to save skill: {e}")
@@ -809,7 +809,7 @@ class SkillMemory:
                     "Skill Retracted",
                     f"removed {removed} lesson(s) sourced from "
                     f"trajectory {trajectory_id[:8]}",
-                    icon="🧹",
+                    icon=Icons.MEM_WIPE,
                 )
             except Exception:
                 pass
@@ -1011,7 +1011,7 @@ class SkillMemory:
             pretty_log(
                 "SKILL PRUNE",
                 f"Dropped {removed} low-utility lesson(s).",
-                icon="🧹",
+                icon=Icons.MEM_WIPE,
             )
         return removed
 

@@ -61,11 +61,11 @@ class Subsystem:
 _SUBSYSTEM_ICONS = {
     Subsystem.BOOT:    "🌱",   # sprout — startup / lifecycle
     Subsystem.SUMMARY: "📊",   # bar chart — rollup
-    Subsystem.CONF:    "🌡️",   # thermometer — calibration / measurement
+    Subsystem.CONF:    "📈",   # trend chart — confidence reading (wide-base; was 🌡️)
     Subsystem.CALIB:   "📐",   # ruler — calibration measurement / Brier refit
     Subsystem.ARBITER: "🧮",   # abacus — decision / weighing candidates
     Subsystem.VALID:   "🚧",   # construction barrier — pre-exec block
-    Subsystem.HOST:    "🖥️",   # monitor — host resource signal
+    Subsystem.HOST:    "💻",   # laptop — host resource signal (wide-base; was 🖥️)
     Subsystem.REPLAN:  "🔀",   # shuffle — alternate route
     Subsystem.GATE:    "🚪",   # door — gate pass / skip (debug)
 }

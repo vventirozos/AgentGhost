@@ -63,7 +63,18 @@
 │   │   └── icon — picks itself per event type
 │   └── 2-char request tag (deterministic colour; groups concurrent requests)
 └── left frame edge</code></pre>
-  <p>Requests are framed by <code>┌─ … request started</code> / <code>└─ … request finished +12.3s</code> markers, and the boot and shutdown sequences are framed by <code>🌅 System Boot</code> … <code>🚀 System Ready</code> … <code>💤 System Shutdown</code>.</p>
+  <p>Requests are framed by <code>┌─ … request started</code> / <code>└─ … request finished +12.3s</code> markers. These now <strong>fill the terminal width</strong> with a <code>─</code> rule, so each request is a visually distinct block even in a busy interleaved stream. The boot and shutdown sequences are framed by <code>🌅 System Boot</code> … <code>🚀 System Ready</code> … <code>💤 System Shutdown</code>.</p>
+
+  <div class="note">
+    <strong>Guaranteed column alignment.</strong> The icon sits in a fixed <em>2-cell</em> field, so
+    the delta / title / content columns line up on every line. This holds because every registry
+    glyph is <em>East-Asian wide-base</em> (renders as 2 cells on any terminal). Narrow-base or
+    bare variation-selector symbols (<code>⚠️ 🗣️ 🛡️</code>) are terminal-dependent — 2 cells on some,
+    1 on others — and were the cause of columns drifting on certain lines; they are now banned from
+    the registry (<code>test_every_registry_icon_is_wide_base</code>). <code>_icon_cell</code> still
+    pads any stray narrow glyph as a backstop, and the content column is derived from one layout
+    formula (<code>_CONTENT_COL</code>) so it can't silently drift.
+  </div>
 
   <h2>Icon catalog</h2>
   <p>Icons are defined once in the <code>Icons</code> class and reused, so a glyph means the same thing everywhere. A selection:</p>
@@ -74,9 +85,9 @@
       <tr><td>Request flow</td><td>🎬 start · 🏁 done · ⏳ wait</td></tr>
       <tr><td>Reasoning</td><td>💭 thinking · 🧠 summary · 📋 plan · 🧩 context · 🧭 route · 🎯 frontier · 🌳 MCTS · 🧪 verifier</td></tr>
       <tr><td>Tools</td><td>🌐 search · 🔬 deep/vision · 🐍 code · 🐚 shell · 🌎 browser · 🐘 postgres · 🎨 image · 📄 PDF</td></tr>
-      <tr><td>Inference nodes</td><td>⚙️ worker · 🛰️ swarm edge</td></tr>
-      <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 🧹 wipe · 👤 profile · 🪞 self-state · 🎓 skill graduate · ⚖️ belief</td></tr>
-      <tr><td>Status</td><td>✅ ok · ❌ fail · ⚠️ warn · 🛑 stop · 🔄 retry · 💡 idea · 🛡️ shield (security/guard) · ✂️ cut</td></tr>
+      <tr><td>Inference nodes</td><td>🔧 worker · 🛸 swarm edge</td></tr>
+      <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 💪 reinforce · 🧹 wipe · 🌙 dream (REM consolidation) · 👤 profile · 🪞 self-state · 🎓 skill graduate · 🧾 belief</td></tr>
+      <tr><td>Status</td><td>✅ ok · ❌ fail · 🔶 warn · 🛑 stop · 🔄 retry · ⏩ skip · 💡 idea · 🔒 shield (security/guard) · 🔻 cut</td></tr>
     </tbody>
   </table>
 
@@ -95,6 +106,17 @@
     <li><strong>Distinct icons.</strong> De-collided glyphs that were double-bound (📚/📓, ✂️ vs split, ⚡ boot vs edge-node) and gave the browser/image/PDF/worker/edge events their own icons instead of borrowing 🐚/literals.</li>
     <li><strong>Distinct titles.</strong> The 8-way overloaded <code>Sandbox</code> boot title was split into <code>Sandbox Provision / Image / Chromium / Tor / Cache / Ready</code>; node-failover messages that were crammed into the 18-char <em>title</em> (losing the error) are now a short title + full content; a failed verifier no longer renders a green ✅.</li>
   </ul>
+
+  <h2>Beautification pass — alignment &amp; icon accuracy</h2>
+  <p>A follow-up pass took the stream "a step further" for the monitoring operator: aligned by construction, each request cleanly separated, and every icon accurately matched to its event.</p>
+  <ul>
+    <li><strong>Fixed-width icon column.</strong> The layout always assumed a 2-cell icon; a narrow or variation-selector glyph would shift every following column on that line. Icons now pass through <code>_icon_cell</code>, and the content column is computed from one formula (<code>_CONTENT_COL</code>) rather than a hard-coded constant.</li>
+    <li><strong>All icons are wide-base.</strong> A real-terminal report showed lines like <code>💬 llm request</code> and <code>📈 metacog conf</code> drifting right — their old glyphs (<code>🗣️</code>, <code>🌡️</code>) were narrow-base + VS16, whose width is terminal-dependent. All 17 such glyphs (registry + metacog) were swapped for East-Asian wide-base emoji that render as 2 cells everywhere: <code>⚠️→🔶 warn</code>, <code>🛡️→🔒 shield</code>, <code>🗣️→💬 llm</code>, <code>⬇️→📥 download</code>, <code>⚙️→🔧 worker</code>, <code>🛰️→🛸 edge</code>, <code>✂️→🔻 cut</code>, <code>⛓️→🔗 constraint</code>, <code>♟️→🎮 game</code>, and more. A test now fails the build if any narrow-base glyph re-enters the registry.</li>
+    <li><strong>Full-width request frames.</strong> <code>┌─/└─</code> markers fill the terminal width, turning each request into a clearly delimited block in an interleaved stream.</li>
+    <li><strong>No more registry-bypassing icons.</strong> 18 inline emoji <em>literals</em> (e.g. <code>icon="💤"</code>) across <code>dream.py</code>, <code>skills.py</code>, <code>acquired_skills.py</code>, <code>vector.py</code> were replaced with named <code>Icons</code> constants. Literals silently collided — dream was reusing <code>💤 SYSTEM_SHUT</code>; it now has its own <code>🌙 DREAM</code>. A guard test (<code>test_no_inline_emoji_literal_icons_in_source</code>) fails the build if any reappear, now catching single- <em>and</em> double-quoted literals (the <code>🌡️</code> metacog icon had slipped through as a single-quoted one).</li>
+    <li><strong>Icon accuracy fixes.</strong> New constants <code>🌙 DREAM</code>, <code>⏩ SKIP</code>, <code>💪 MEM_REINFORCE</code>; the previously-orphaned <code>🎓 SKILL_GRADUATE</code> is now wired to the graduation call sites; skill reinforcement (was <code>🔄</code>, read as "retry") and skipped/deduped work now read at a glance.</li>
+  </ul>
+  <p class="dim">Covered by <code>tests/test_logging_framework.py</code> (registry-hygiene guard, icon-width normalization, derived content column, adaptive frames, new-icon presence/distinctness).</p>
 
   <div class="note">
     <strong>Verbosity knobs.</strong> <code>--verbose</code> lifts the content truncation entirely

@@ -73,6 +73,21 @@ class TestGameMove:
         assert res.status_code == 422
         assert "Illegal move" in res.json()["detail"]
 
+    def test_empty_user_move_is_422_not_agent_turn(self):
+        # 2026-07-05: a client forwarded a bare Enter keypress as "" — the
+        # old falsy check treated it as "field omitted" and the agent
+        # silently moved for whichever side was to move (it ended up
+        # playing BOTH sides). Empty string must be rejected, not
+        # reinterpreted; omission stays the explicit way to request an
+        # agent move.
+        client, llm, _ = _make_app(["MOVE: e4"])
+        for empty in ("", "   "):
+            res = client.post("/api/game/move",
+                              json={"fen": START_FEN, "user_move": empty})
+            assert res.status_code == 422
+            assert "Empty user_move" in res.json()["detail"]
+        assert not llm.chat_completion.called
+
     def test_bad_fen_is_422(self):
         client, _, _ = _make_app([])
         res = client.post("/api/game/move", json={"fen": "not a fen"})
@@ -122,6 +137,61 @@ class TestGameMove:
         res = client.post("/api/game/move", json={"fen": START_FEN},
                           headers={"X-Ghost-Key": "sekrit"})
         assert res.status_code == 200
+
+
+class TestGameCoaching:
+    """The learning-app surface: `critique` (the agent's read on the USER's
+    move) and `move_explanation` (the reasoning behind the agent's OWN move),
+    with `comment` kept as a backward-compatible friendly line."""
+
+    def test_all_three_fields_surface(self):
+        reply = ("MOVE: e5\n"
+                 "CRITIQUE: 1.e4 grabs the centre and frees the bishop — "
+                 "a principled opening move.\n"
+                 "EXPLANATION: I mirror with ...e5 to contest the centre "
+                 "immediately.\n"
+                 "COMMENT: Your move!")
+        client, _, _ = _make_app([reply])
+        res = client.post("/api/game/move",
+                          json={"fen": START_FEN, "user_move": "e4"})
+        body = res.json()
+        assert body["move"] == "e5"
+        assert "grabs the centre" in body["critique"]
+        assert "contest the centre" in body["move_explanation"]
+        assert body["comment"] == "Your move!"
+
+    def test_critique_empty_when_user_did_not_move(self):
+        # Agent moves from the position (no user_move) → nothing to critique.
+        reply = ("MOVE: e4\n"
+                 "EXPLANATION: I open with 1.e4 for central space.")
+        client, llm, _ = _make_app([reply])
+        res = client.post("/api/game/move", json={"fen": START_FEN})
+        body = res.json()
+        assert body["critique"] == ""
+        assert "central space" in body["move_explanation"]
+        # The prompt must NOT solicit a critique when there was no user move.
+        prompt = llm.chat_completion.call_args_list[0][0][0][
+            "messages"][0]["content"]
+        assert "CRITIQUE" not in prompt
+
+    def test_prompt_requests_critique_after_user_move(self):
+        client, llm, _ = _make_app(["MOVE: e5\nEXPLANATION: symmetry."])
+        client.post("/api/game/move",
+                    json={"fen": START_FEN, "user_move": "e4"})
+        prompt = llm.chat_completion.call_args_list[0][0][0][
+            "messages"][0]["content"]
+        assert "CRITIQUE" in prompt
+        assert "Your opponent just played: e4" in prompt
+
+    def test_legacy_comment_only_reply_still_works(self):
+        # Older model output with just a COMMENT line: comment populated,
+        # the new fields empty (backward compatibility).
+        client, _, _ = _make_app(["MOVE: e4\nCOMMENT: Good luck!"])
+        res = client.post("/api/game/move", json={"fen": START_FEN})
+        body = res.json()
+        assert body["comment"] == "Good luck!"
+        assert body["move_explanation"] == ""
+        assert body["critique"] == ""
 
 
 class TestMemoryCorrectEndpoint:
@@ -300,3 +370,132 @@ class TestDeleteFragmentUnit:
         ok, _ = vm.delete_fragment("chess document")
         assert not ok
         assert len(vm.collection.rows) == 1
+
+
+# --------------------------------------------------------------------------
+# Full-rules coverage (2026-07-05): en passant, promotion, mate/stalemate/
+# material endings, and the repetition rules — the last only work because
+# _restore_move_stack replays the SAN history (a bare FEN has no memory,
+# so "fivefold" could never trigger across stateless requests).
+# --------------------------------------------------------------------------
+
+def _fen_after(moves):
+    b = chess.Board()
+    for san in moves:
+        b.push_san(san)
+    return b.fen()
+
+
+class TestChessRules:
+    def test_en_passant_capture_applied(self):
+        moves = ["e4", "a6", "e5", "d5"]          # d5 makes exd6 e.p. legal
+        client, _, _ = _make_app(["MOVE: Nc6"])
+        res = client.post("/api/game/move",
+                          json={"fen": _fen_after(moves), "history": moves,
+                                "user_move": "exd6"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["user_move"] == "exd6"
+        assert "d6" in body["fen"].split()[0] or "P" in body["fen"]
+        # the captured d-pawn is gone: black has 7 pawns left
+        assert body["fen"].split()[0].count("p") == 7
+
+    def test_promotion_san_and_uci(self):
+        fen = "8/P6k/8/8/8/4K3/8/8 w - - 0 1"
+        for promo in ("a8=Q", "a7a8q"):
+            client, _, _ = _make_app(["MOVE: Kh6"])
+            res = client.post("/api/game/move",
+                              json={"fen": fen, "user_move": promo})
+            assert res.status_code == 200
+            body = res.json()
+            assert body["user_move"] == "a8=Q"
+            assert "Q" in body["fen"].split()[0]
+
+    def test_user_checkmate_ends_game_no_llm(self):
+        fen = ("r1bqkbnr/pppp1ppp/2n5/4p3/2B1P3/5Q2/PPPP1PPP/RNB1K1NR "
+               "w kq - 0 4")
+        client, llm, _ = _make_app([])
+        res = client.post("/api/game/move",
+                          json={"fen": fen, "user_move": "Qxf7#"})
+        assert res.status_code == 200
+        body = res.json()
+        assert body["game_over"] is True
+        assert body["result"] == "1-0"
+        assert body["termination"] == "CHECKMATE"
+        assert body["move"] is None
+        assert not llm.chat_completion.called
+
+    def test_stalemate_is_draw(self):
+        fen = "k7/8/8/1Q6/8/8/8/7K w - - 0 1"
+        client, llm, _ = _make_app([])
+        res = client.post("/api/game/move",
+                          json={"fen": fen, "user_move": "Qb6"})
+        body = res.json()
+        assert body["game_over"] is True
+        assert body["result"] == "1/2-1/2"
+        assert body["termination"] == "STALEMATE"
+        assert not llm.chat_completion.called
+
+    def test_insufficient_material_is_draw(self):
+        fen = "7k/8/8/8/8/8/1q6/K7 w - - 0 1"
+        client, _, _ = _make_app([])
+        res = client.post("/api/game/move",
+                          json={"fen": fen, "user_move": "Kxb2"})
+        body = res.json()
+        assert body["game_over"] is True
+        assert body["termination"] == "INSUFFICIENT_MATERIAL"
+
+    def test_fivefold_repetition_auto_draw_via_history(self):
+        # 4 knight-shuffle cycles = start position occurs 5 times.
+        moves = ["Nf3", "Nf6", "Ng1", "Ng8"] * 4
+        client, llm, _ = _make_app([])
+        res = client.post("/api/game/move",
+                          json={"fen": _fen_after(moves), "history": moves})
+        body = res.json()
+        assert body["game_over"] is True
+        assert body["result"] == "1/2-1/2"
+        assert body["termination"] == "FIVEFOLD_REPETITION"
+        assert body["move"] is None
+        assert not llm.chat_completion.called
+
+    def test_arrival_game_over_beats_user_move(self):
+        # Same fivefold position + a user_move: report the ending, not
+        # a confusing "Illegal move" against an empty legal list.
+        moves = ["Nf3", "Nf6", "Ng1", "Ng8"] * 4
+        client, llm, _ = _make_app([])
+        res = client.post("/api/game/move",
+                          json={"fen": _fen_after(moves), "history": moves,
+                                "user_move": "e4"})
+        body = res.json()
+        assert res.status_code == 200
+        assert body["game_over"] is True
+        assert body["user_move"] is None
+        assert not llm.chat_completion.called
+
+    def test_fifty_move_rule_surfaces_claim(self):
+        # Halfmove clock ≥ 100 → claimable, but NOT auto-ended.
+        fen = "7k/8/8/4Q3/8/8/8/K7 w - - 100 80"
+        client, _, _ = _make_app(["MOVE: Qe4"])
+        res = client.post("/api/game/move", json={"fen": fen})
+        body = res.json()
+        assert body["game_over"] is False
+        assert body["can_claim_draw"] is True
+
+    def test_inconsistent_history_falls_back_to_fen(self):
+        # History that doesn't reproduce the FEN must not break anything.
+        fen = _fen_after(["e4"])
+        client, _, _ = _make_app(["MOVE: Nf3"])
+        res = client.post("/api/game/move",
+                          json={"fen": fen, "history": ["d4"],
+                                "user_move": "e5"})
+        assert res.status_code == 200
+        assert res.json()["user_move"] == "e5"
+
+    def test_castling_through_attacked_square_rejected(self):
+        # Black rook on g-file attacks g1 — O-O must be illegal.
+        fen = "4k3/8/8/8/8/8/6r1/R3K2R w KQ - 0 1"
+        client, _, _ = _make_app([])
+        res = client.post("/api/game/move",
+                          json={"fen": fen, "user_move": "O-O"})
+        assert res.status_code == 422
+        assert "Illegal move" in res.json()["detail"]

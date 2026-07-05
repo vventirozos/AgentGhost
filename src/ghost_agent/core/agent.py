@@ -3817,24 +3817,83 @@ class GhostAgent:
             return page_rel, ""
         return page_rel, text[text.index(marker):][:1200]
 
+    def _project_constraints_for(self, pid, limit: int = 5) -> List[str]:
+        """Explicit user constraints stored on project ``pid``'s record
+        (captured at create/correction time by tools.projects). Empty list
+        when the project is missing or carries none. Never raises — every
+        caller treats constraints as best-effort context."""
+        try:
+            store = getattr(self.context, "project_store", None)
+            if store is None or not pid:
+                return []
+            proj = store.get_project(pid) or {}
+            cons = [str(c) for c in
+                    ((proj.get("metadata") or {}).get("constraints") or [])]
+            return cons[:limit]
+        except Exception:
+            return []
+
+    def _active_project_constraints(self, limit: int = 5) -> List[str]:
+        """Stored constraints of the ACTIVE (conversation-bound) project."""
+        return self._project_constraints_for(
+            getattr(self.context, "current_project_id", None), limit)
+
     def _active_constraint_note(self, limit: int = 5) -> str:
         """Explicit user constraints stored on the active project, rendered
         as a short prefix for the verifier's request view. Empty string when
         no project is active or the project carries no constraints."""
-        try:
-            store = getattr(self.context, "project_store", None)
-            pid = getattr(self.context, "current_project_id", None)
-            if store is None or not pid:
-                return ""
-            proj = store.get_project(pid) or {}
-            cons = [str(c) for c in
-                    ((proj.get("metadata") or {}).get("constraints") or [])]
-            if not cons:
-                return ""
-            return ("ACTIVE PROJECT CONSTRAINTS (user-mandated, MUST hold): "
-                    + " | ".join(cons[:limit]) + " || USER REQUEST: ")
-        except Exception:
+        cons = self._active_project_constraints(limit)
+        if not cons:
             return ""
+        return ("ACTIVE PROJECT CONSTRAINTS (user-mandated, MUST hold): "
+                + " | ".join(cons) + " || USER REQUEST: ")
+
+    def _merge_project_constraints(self, request_constraints, user_text=""):
+        """Merge stored project constraints into a request's constraint set.
+
+        Returns ``(constraints, rendered_block, steer_pending)`` — the same
+        triple the request-start extraction produces, so the call site
+        overwrites all three locals in place. Rationale (2026-07-05 chess
+        session): the request that wrote the forbidden engine carried the
+        message "proceed." — ``extract_constraints()`` sees only the CURRENT
+        message, so the post-write steer never armed even though the binding
+        clauses ("not a coded AI, YOU play") sat on the project record from
+        an earlier message. The verifier already replays stored constraints
+        via ``_active_constraint_note``, but that whole path is dead under
+        ``--no-verifier``; this merge makes the dynamic-state block and the
+        post-write steer see them regardless.
+
+        Two sources, both best-effort: the conversation-BOUND project, and
+        any project referenced BY PATH in the message text (``projects/<id>/
+        …``). The second covers the fresh-conversation escape (2026-07-05
+        request C5): a traceback pasted into a new chat named the project
+        on every line, but the new conversation had no binding, so zero
+        constraints replayed and the mock-server misdiagnosis ran
+        unchecked."""
+        merged = list(request_constraints or [])
+        seen = {c.lower() for c in merged}
+        added = 0
+        pools = [self._active_project_constraints()]
+        referenced = list(dict.fromkeys(re.findall(
+            r"\bprojects/([0-9a-f]{6,32})\b", (user_text or "").lower())))
+        for pid in referenced[:3]:
+            pools.append(self._project_constraints_for(pid))
+        for pool in pools:
+            for c in pool:
+                if c.lower() not in seen:
+                    merged.append(c)
+                    seen.add(c.lower())
+                    added += 1
+        if added:
+            pretty_log(
+                "Constraints",
+                f"replayed {added} stored project constraint(s) into the "
+                f"request ({len(merged)} active)",
+                icon=Icons.CONSTRAINT,
+            )
+        block = render_constraint_block(
+            merged, header="EXPLICIT USER CONSTRAINTS (CURRENT REQUEST)")
+        return merged, block, bool(merged)
 
     async def _compute_verifier_verdict(
         self, *, tools_run_this_turn, messages, final_ai_content,
@@ -4517,6 +4576,16 @@ class GhostAgent:
                 # created seconds earlier in the same request).
                 self.context.request_start_project_id = getattr(
                     self.context, "current_project_id", None)
+
+                # Replay the bound project's stored constraints into THIS
+                # request's constraint set (arming the post-write steer and
+                # the dynamic-state block). Placed AFTER the conversation⇄
+                # project reconciliation above so the binding is
+                # trustworthy. See _merge_project_constraints for why the
+                # message-only extraction at request start is not enough.
+                (_request_constraints, _request_constraint_block,
+                 _constraint_steer_pending) = self._merge_project_constraints(
+                    _request_constraints, last_user_content)
 
                 # Repro-first nudge for bug reports. Injected BEFORE the
                 # first LLM call so the very first action is an
@@ -8266,6 +8335,44 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                             icon=Icons.OK,
                                         )
                                         t_args["content"] = ""
+
+                            # PARTICIPANT-MODE ENGINE GUARD (deterministic).
+                            # Steers ask the model to reconsider; this guard
+                            # refuses. When the request carries a
+                            # participant constraint ("YOU play against
+                            # me"), a write/replace whose body embeds
+                            # move-selection logic is rejected BEFORE
+                            # dispatch — the 2026-07-05 chess session
+                            # shipped random.choice(legal_moves) past both
+                            # the system prompt and the post-write steer.
+                            if op in ("write", "replace"):
+                                from ..utils.constraints import (
+                                    participant_write_violation,
+                                )
+                                _pv_msg = participant_write_violation(
+                                    _request_constraints, t_args)
+                                if _pv_msg:
+                                    _pv_path = str(t_args.get("path")
+                                                   or t_args.get("filename")
+                                                   or "?")
+                                    pretty_log(
+                                        "Local Guard",
+                                        f"Blocked file_system {op} embedding "
+                                        f"move-selection logic "
+                                        f"(path={_pv_path!r}) — participant "
+                                        f"constraint active",
+                                        icon=Icons.STOP,
+                                    )
+                                    err_msg = {"role": "tool",
+                                               "tool_call_id": tool["id"],
+                                               "name": fname,
+                                               "content": _pv_msg}
+                                    messages.append(err_msg)
+                                    tools_run_this_turn.append(
+                                        {**err_msg, "_synthetic": True})
+                                    execution_failure_count += 1
+                                    last_was_failure = True
+                                    continue
 
                                 target_path = str(t_args.get("path", "")).lower()
 

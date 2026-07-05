@@ -45,3 +45,28 @@ def test_relative_paths_unchanged(sandbox):
 def test_traversal_still_rejected(sandbox):
     with pytest.raises(ValueError):
         _get_safe_path(sandbox, "../etc/passwd")
+
+
+# --- Tilde-prefixed host paths (2026-07-05) ---------------------------------
+# The model echoes the run command it just gave the user
+# ("python3 ~/Data/AI/Data/sandbox/chess_client.py") back into file_system
+# and used to burn a strike on the unexpanded "~".
+
+def test_tilde_sandbox_path_equals_relative(sandbox, monkeypatch):
+    monkeypatch.setenv("HOME", str(sandbox.parent))
+    p = _get_safe_path(sandbox, f"~/{sandbox.name}/report.md")
+    assert p == (sandbox / "report.md").resolve()
+
+
+def test_tilde_nested_path(sandbox, monkeypatch):
+    monkeypatch.setenv("HOME", str(sandbox.parent))
+    p = _get_safe_path(sandbox, f"~/{sandbox.name}/chess/client.py")
+    assert p == (sandbox / "chess" / "client.py").resolve()
+
+
+def test_tilde_outside_sandbox_stays_inside_sandbox(sandbox, monkeypatch):
+    # A "~" that expands OUTSIDE the sandbox must still resolve to a path
+    # under the sandbox root (traversal safety invariant unchanged).
+    monkeypatch.setenv("HOME", "/nonexistent_home_xyz")
+    p = _get_safe_path(sandbox, "~/other/file.txt")
+    assert str(p).startswith(str(sandbox.resolve()))

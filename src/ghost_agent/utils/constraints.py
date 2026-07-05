@@ -22,7 +22,7 @@ the model); false negatives are what we are trying to eliminate.
 """
 
 import re
-from typing import List
+from typing import List, Optional
 
 # Clause-level markers of an explicit prohibition / exclusion.
 _NEGATION_RE = re.compile(
@@ -168,3 +168,87 @@ PARTICIPANT_STEER = (
     "the user to run it live. If what you just wrote embeds move-selection "
     "logic for your side, rewrite it to design (B) NOW."
 )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic engine-pattern detection (participant-mode WRITE GUARD)
+# ---------------------------------------------------------------------------
+# The 2026-07-05 chess session shipped `random.choice(legal_moves)` straight
+# through BOTH the PARTICIPANT MODE system-prompt rule and (in a later
+# request) the post-write steer — steers ask the model to reconsider; only a
+# guard refuses. These patterns feed `participant_write_violation`, the
+# pre-dispatch check on file_system write/replace. Intentionally narrow:
+# a false negative is still caught by the steer/verifier layers, while a
+# false positive blocks a legitimate write outright.
+
+# Unambiguous engine machinery — flagged wherever it appears.
+_ENGINE_GLOBAL_PATTERNS = [
+    (re.compile(r"\bminimax\b", re.IGNORECASE), "minimax search"),
+    (re.compile(r"\bnegamax\b", re.IGNORECASE), "negamax search"),
+    (re.compile(r"\balpha[\s_-]?beta\b", re.IGNORECASE),
+     "alpha-beta pruning"),
+    (re.compile(r"\bpiece[\s_-]?square\b", re.IGNORECASE),
+     "piece-square tables"),
+    (re.compile(r"\bstockfish\b", re.IGNORECASE),
+     "external engine (stockfish)"),
+]
+# Randomness is only a move picker when the same content is recognisably
+# move-generation code; a coin toss in an unrelated script must not trip
+# the guard.
+_ENGINE_RANDOM_RE = re.compile(
+    r"\brandom\.(?:choice|choices|sample|shuffle|randint|randrange)\s*\("
+    r"|\bMath\.random\s*\("
+)
+_GAME_MOVE_CONTEXT_RE = re.compile(
+    r"legal_moves|legalMoves|import\s+chess|from\s+chess\s+import"
+    r"|chess\.js|generate_moves|movegen",
+    re.IGNORECASE,
+)
+
+
+def find_engine_patterns(content: str) -> List[str]:
+    """Human-readable labels of embedded move-selection logic in *content*.
+
+    Deterministic, no LLM. Empty list means clean."""
+    text = content or ""
+    hits = [label for rx, label in _ENGINE_GLOBAL_PATTERNS
+            if rx.search(text)]
+    if _ENGINE_RANDOM_RE.search(text) and _GAME_MOVE_CONTEXT_RE.search(text):
+        hits.append("randomised move picker (random.* over game moves)")
+    return hits
+
+
+def participant_write_violation(constraints: List[str],
+                                tool_args: dict) -> Optional[str]:
+    """Pre-dispatch guard for ``file_system`` write/replace calls.
+
+    Returns the SYSTEM BLOCK message when a participant constraint is
+    active and the write body embeds move-selection logic; ``None``
+    otherwise. Pure function (agent.py calls it before dispatching the
+    tool) so the whole guard is unit-testable without an agent loop.
+    Scans ``content`` AND ``replace_with``: the replace→write
+    auto-promotion means either argument can become the full file body.
+    """
+    if not constraints or not has_participant_constraint(list(constraints)):
+        return None
+    args = tool_args or {}
+    op = str(args.get("operation") or "")
+    if op not in ("write", "replace"):
+        return None
+    body = "\n".join(str(args.get(k) or "")
+                     for k in ("content", "replace_with"))
+    if not body.strip():
+        return None
+    hits = find_engine_patterns(body)
+    if not hits:
+        return None
+    path = str(args.get("path") or args.get("filename") or "?")
+    return (
+        f"SYSTEM BLOCK (participant-mode engine guard): the {op} to "
+        f"'{path}' was ABORTED before execution because its content embeds "
+        f"move-selection logic — {'; '.join(hits)} — while the user's "
+        f"explicit constraint assigns the PLAYER role to YOU. No code you "
+        f"write can BE you. " + PARTICIPANT_STEER +
+        " Rewrite the artifact with the embedded move picker removed, then "
+        "write it again."
+    )

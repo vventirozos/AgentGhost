@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>api.game_routes — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>API</h3>
+    <a href="routes.html">routes</a>
+    <a href="projects_routes.html">projects routes</a>
+    <a class="current" href="game_routes.html">game routes</a>
+    <h3>Related</h3>
+    <a href="../core/prompts.html">core.prompts</a>
+    <a href="../core/agent.html">core.agent</a>
+  </nav>
+</aside>
+<main>
+  <h1>api / game_routes.py</h1>
+  <p class="subtitle">Participant-mode games: the agent PLAYS, it does not delegate. A game-agnostic move endpoint over a registry of <code>GameAdapter</code>s.</p>
+
+  <p>All endpoints require <code>X-Ghost-Key</code>. The router (prefix <code>/api/game</code>) is included <em>before</em> the catch-all proxy in <code>app.py</code>, like <code>projects_routes</code>.</p>
+
+  <h2>Why this exists</h2>
+  <p>"Play against the agent" must be <em>literal</em>: the client sends a position and the <strong>agent's LLM, at inference time,</strong> chooses the reply move. The endpoint owns the <strong>protocol</strong> — stateless, client-owns-the-state, code-enforced legality, bounded retries, and <strong>no engine fallback</strong> — and delegates each game's rules to an adapter. A silent engine fallback is exactly the "random AI" failure this endpoint was built to prevent (chess incident, 2026-07-02): if the model can't produce a legal move after <code>_MAX_MOVE_ATTEMPTS</code> (3), the endpoint returns <strong>502</strong> rather than picking a move for it.</p>
+
+  <h2>Endpoints</h2>
+  <table>
+    <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
+    <tbody>
+      <tr><td>GET /api/game/games</td><td>Lists the registered games, e.g. <code>{"games": ["chess", "tictactoe"], "default": "chess"}</code>.</td></tr>
+      <tr><td>POST /api/game/move</td><td>Apply the user's move (if any) to the state, then have the agent choose and apply its reply. Returns the updated state, the agent's move, an optional friendly comment, the move history, and game status. See the request/response shapes below.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Request</h2>
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>game</code></td><td>Which game to play. Optional, default <code>"chess"</code>. Unknown game → <strong>400</strong> with the available list.</td></tr>
+      <tr><td><code>state</code></td><td>Serialized state to move <em>from</em> (chess: a FEN; tic-tac-toe: 9 cells + side to move). Omit to start from the game's initial position.</td></tr>
+      <tr><td><code>fen</code></td><td><em>[chess]</em> Backward-compatible alias for <code>state</code> — existing chess clients that POST <code>{fen, user_move?, history?}</code> keep working unchanged.</td></tr>
+      <tr><td><code>user_move</code></td><td>The user's move, applied before the agent replies. <strong>Omit the field entirely</strong> to ask the agent to move from the given state. An empty string is a client bug → <strong>422</strong> (a bare Enter forwarded as <code>""</code> once made the agent play both sides, 2026-07-05).</td></tr>
+      <tr><td><code>history</code></td><td>Move list so far. Context for the agent, and the input some games replay to detect repetition endings (see chess below).</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Response</h2>
+  <p>A common envelope — <code>{ok, game, user_move, move, comment, move_explanation, critique, state, history, attempts, …}</code> — merged with the adapter's status (<code>game_over</code>, <code>result</code>, <code>termination</code>, <code>turn</code>, plus game-specific keys) and the move's extras. Chess additionally returns <code>fen</code> (alias of <code>state</code>), <code>move_uci</code>, <code>check</code>, and <code>can_claim_draw</code>. Status codes: <strong>400</strong> unknown game · <strong>422</strong> bad state / illegal or empty <code>user_move</code> · <strong>501</strong> a required library is missing (e.g. python-chess) · <strong>502</strong> LLM failure or no legal move after retries · <strong>503</strong> LLM client unavailable.</p>
+
+  <h2>Coaching text — for learning clients</h2>
+  <p>The endpoint surfaces the agent's own words about the position, so a client can build a learning experience (e.g. <code>chess_client.py</code>) rather than just a move relay. All three are game-agnostic and produced in the same single LLM call that chooses the move:</p>
+  <table>
+    <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>critique</code></td><td>The agent's read on the <strong>user's</strong> move — is it sound, what it threatens or overlooks, a stronger idea. Empty when the user didn't move this turn (the prompt only asks for it when there was a move to critique).</td></tr>
+      <tr><td><code>move_explanation</code></td><td>The reasoning behind the agent's <strong>own</strong> move — the plan, threat, or defence it serves.</td></tr>
+      <tr><td><code>comment</code></td><td>A short friendly one-liner. Kept for backward compatibility; older clients that only know <code>comment</code> keep working, and a model that emits only a <code>COMMENT:</code> line still populates it.</td></tr>
+    </tbody>
+  </table>
+  <p>Under the hood the adapter's prompt asks the model for <code>MOVE:</code> / <code>EXPLANATION:</code> / (conditionally) <code>CRITIQUE:</code> / optional <code>COMMENT:</code> lines, and the endpoint parses each into the field above. Because parsing lives in the generic layer, every game gets the coaching fields for free — a game only has to word its prompt.</p>
+
+  <h2>Adding a game — the adapter contract</h2>
+  <p>Games live in <code>api/games/</code>. A <code>GameAdapter</code> (<code>games/base.py</code>) owns one game's rules; the endpoint never changes. Register the adapter in <code>games/__init__.py</code> and it becomes selectable via the <code>game</code> field. The one invariant every adapter honours: it validates legality and detects endings with <strong>code</strong>, but <strong>never chooses a move</strong> — <code>apply_move</code> only accepts or rejects the text the model produced.</p>
+  <table>
+    <thead><tr><th>Method</th><th>Responsibility</th></tr></thead>
+    <tbody>
+      <tr><td><code>initial_state()</code></td><td>Serialized starting position (used when the client omits <code>state</code>).</td></tr>
+      <tr><td><code>load(state, history)</code></td><td>Build an opaque game-state object; raise <code>GameStateError</code> (→422) on a bad state or <code>GameDependencyError</code> (→501) on a missing library. Replay <code>history</code> here if the game's rules need it.</td></tr>
+      <tr><td><code>serialize(game_state)</code></td><td>Serialize the state object back to the string the client stores.</td></tr>
+      <tr><td><code>is_over</code> / <code>status</code></td><td>Detect mandatory endings; report <code>game_over</code>/<code>result</code>/<code>termination</code>/<code>turn</code> (+ game-specific keys).</td></tr>
+      <tr><td><code>apply_move(game_state, text)</code></td><td>Validate <code>text</code> for the side to move; if legal, MUTATE the state and return an <code>AppliedMove(notation, extras)</code>; else <code>None</code>.</td></tr>
+      <tr><td><code>legal_examples</code> / <code>prompt</code></td><td>A few legal moves for the error message; the instruction shown to the LLM. The prompt must ask for a <code>MOVE:</code> line and an <code>EXPLANATION:</code> line, and — when handed the opponent's <code>user_move</code> — a <code>CRITIQUE:</code> line, so the coaching fields are populated.</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Bundled games</h2>
+  <h3>chess (<code>games/chess_game.py</code>)</h3>
+  <p>python-chess is used strictly for legality — validating SAN/UCI moves, listing legal replies, detecting endings. State is a FEN. The SAN <code>history</code> is replayed to restore the board's move stack when it reproduces the FEN, which is what makes the repetition rules real across the stateless boundary: a bare FEN has no memory, so "fivefold" could never fire ("occurred once" every request). Mandatory endings (checkmate, stalemate, insufficient material, 75-move, fivefold) end the game automatically, including on ARRIVAL (reported instead of a confusing "Illegal move" against an empty legal list); claimable draws (threefold, 50-move) surface as <code>can_claim_draw</code> for the client to offer. python-chess is imported lazily, so a missing install only 501s a chess request — other games still work.</p>
+  <h3>tictactoe (<code>games/tictactoe.py</code>)</h3>
+  <p>A small, dependency-free second game that proves the endpoint is genuinely game-agnostic. State is nine cells in reading order (<code>X</code>/<code>O</code>/<code>.</code>) plus the side to move, e.g. <code>"......... X"</code>. Cells are numbered 1-9 in reading order (top-left = 1); a move is that number (<code>a1</code>..<code>c3</code> coordinates also accepted). Wins are the eight lines; a full board with no line is a draw. Impossible positions (counts off by more than one, since X moves first) are rejected with 422.</p>
+
+  <h2>Tests</h2>
+  <p>Chess rules: <code>tests/test_game_move_api.py</code>. Game dispatch, tic-tac-toe, and the adapter registry: <code>tests/test_game_adapters.py</code>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

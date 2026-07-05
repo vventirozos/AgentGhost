@@ -1273,9 +1273,30 @@ async def tool_manage_projects(
                         "briefing": _briefing(store, pid)})
 
         if act == "list":
+            projs = store.list_projects(status_filter=status_filter)
+            current = getattr(context, "current_project_id", None)
+            # Pre-rendered id-first lines + an explicit directive. The ids
+            # were always present in the JSON, but the model's user-facing
+            # summaries dropped them (2026-07-05: the user was left
+            # deleting by TITLE — title refs are ambiguity-prone, and a
+            # bare title delete has cascaded before). Making the id the
+            # first column of a ready-made display block, with a note that
+            # it MUST be shown, is the reliable contract for a small model.
+            lines = [
+                f"{p.get('id')}  {str(p.get('status') or ''):<9}  "
+                f"{p.get('title')}"
+                + ("   <- ACTIVE" if p.get("id") == current else "")
+                for p in projs
+            ]
             return _ok({
-                "projects": store.list_projects(status_filter=status_filter),
-                "current": getattr(context, "current_project_id", None),
+                "projects": projs,
+                "current": current,
+                "display": "\n".join(lines) or "(no projects)",
+                "note": (
+                    "ALWAYS show each project's id (first column of "
+                    "'display') when presenting projects to the user — the "
+                    "id is the only unambiguous reference for follow-up "
+                    "get/switch/update/delete calls."),
             })
 
         if act == "get":

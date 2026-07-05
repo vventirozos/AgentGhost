@@ -132,6 +132,19 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
     """
     raw = str(filename).strip()
 
+    # 0a. Expand a leading "~" first. The model echoes host-style paths it
+    # saw in conversation (e.g. the run command "python3 ~/Data/AI/Data/
+    # sandbox/chess_client.py" it just gave the user — 2026-07-05 request
+    # 9F burned a strike on exactly this). expanduser yields the host-
+    # absolute form, which step 0 below maps back inside the sandbox; a
+    # "~" that expands OUTSIDE the sandbox falls through to the normal
+    # relative-path handling like any other foreign absolute path.
+    if raw == "~" or raw.startswith("~/"):
+        try:
+            raw = str(Path(raw).expanduser())
+        except Exception:
+            pass
+
     # 0. Host-absolute sandbox path → sandbox-relative. The LLM sometimes
     # echoes the full HOST path of the sandbox (it sees it in a prior
     # sandbox-tree listing / file-read error and passes it back), e.g.
@@ -552,6 +565,51 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
     if not old_text: return "Error: You must specify the exact 'content' to be replaced."
 
     has_aider_blocks = "<<<< SEARCH" in str(old_text)
+
+    # IDENTICAL-ARGS CORRUPTION GUARD (2026-07-05). Measured over 5 days of
+    # trajectories: 50 of 99 replace calls arrived with content ==
+    # replace_with byte-identical — 27 of the 34 "search block NOT found"
+    # failures, plus silent no-op "successes" where the identical text still
+    # matched the file and was replaced with itself (the model then believed
+    # a fix was applied that never happened). Cause is upstream tool-call
+    # argument transport (the same native-tools parser that merged
+    # multi-tool replies into one call's args — see the introspect
+    # incident), so no matcher improvement can help: the search text is
+    # usually the NEW block, which does not exist in the file yet.
+    # Replacing a block with itself is never intentional → reject fast and
+    # teach the single-argument SEARCH/REPLACE form, which cannot be
+    # cross-merged.
+    if (not has_aider_blocks and new_text is not None
+            and str(old_text) == str(new_text)):
+        pretty_log(
+            "File Replace Corruption Guard",
+            f"content == replace_with ({len(str(old_text))} chars) on "
+            f"'{filename}' — suspected upstream tool-call argument "
+            f"corruption; rejected before any file change",
+            level="WARNING",
+            icon=Icons.WARN,
+        )
+        return (
+            "SYSTEM INSTRUCTION: REPLACE REJECTED — your 'content' and "
+            f"'replace_with' arguments arrived BYTE-IDENTICAL "
+            f"({len(str(old_text))} chars). Replacing a block with itself is "
+            "always a mistake; this usually means the tool-call transport "
+            "merged your two arguments, and the text that arrived is "
+            "probably your NEW version (the old block was lost in transit). "
+            f"The file '{filename}' was NOT modified. Do NOT resend the same "
+            "two-argument call. Re-issue ONE file_system call with "
+            "operation='replace', NO 'replace_with' argument, and 'content' "
+            "containing exactly this structure:\n"
+            "<<<< SEARCH\n"
+            "<the exact CURRENT text from the file — re-read the file if "
+            "unsure>\n"
+            "====\n"
+            "<your NEW text>\n"
+            ">>>>\n"
+            "This single-argument form is immune to the argument-merge "
+            "corruption."
+        )
+
     if not has_aider_blocks and new_text is None:
         # Auto-promote path: if the caller forgot `replace_with` but their
         # `content` is a complete, parseable Python module, they almost
@@ -690,36 +748,77 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         
         if has_aider_blocks:
             import re
-            # Much more robust parsing to catch missing trailing newlines or extra spaces
-            blocks = re.findall(r'(?s)<<<<\s*SEARCH\s*(.*?)\s*====\s*(.*?)\s*>>>>', str(old_text))
-            
+            # Indentation-preserving parse FIRST: capture block bodies
+            # starting on the line AFTER each marker, so the first line's
+            # leading whitespace survives. The loose fallback's `\s*` used
+            # to swallow it, which (a) made exact matches impossible for
+            # indented blocks and (b) fed _reindent_replacement a new_text
+            # whose first line was dedented, mis-computing its indent base
+            # — the fuzzy/anchor rungs then inserted a broken first line.
+            blocks = re.findall(
+                r'<<<<[ \t]*SEARCH[ \t]*\r?\n(.*?)\r?\n====[ \t]*\r?\n(.*?)\r?\n?>>>>',
+                str(old_text), re.DOTALL)
+            if not blocks:
+                # Loose fallback: tolerates content on the marker lines and
+                # missing newlines, at the cost of stripping the blocks'
+                # leading/trailing whitespace.
+                blocks = re.findall(r'(?s)<<<<\s*SEARCH\s*(.*?)\s*====\s*(.*?)\s*>>>>', str(old_text))
+
             if not blocks:
                 return "SYSTEM INSTRUCTION: Found SEARCH/REPLACE markers but failed to parse them. Ensure you use <<<< SEARCH, ====, and >>>> correctly."
             
             success_count = 0
             errors = []
+            strategies = []
             prev_content = file_content
 
             for search_str, replace_str in blocks:
-                if search_str in file_content:
-                    file_content = file_content.replace(search_str, replace_str, 1)
-                    success_count += 1
+                # Same corruption signature as the two-argument form: a
+                # block that "replaces" text with itself is a no-op and
+                # means the old block was lost in transit.
+                if search_str.strip() and search_str == replace_str:
+                    errors.append(
+                        "Block is a NO-OP (SEARCH == REPLACE) — the file "
+                        "would be unchanged. Re-emit it with the exact "
+                        "CURRENT text in SEARCH and your NEW text after "
+                        "====.")
+                    continue
+                # Full matching ladder (exact → whitespace-flexible →
+                # fuzzy → anchor), same rescue chain the two-argument form
+                # gets — the SEARCH-block form is the one we now steer the
+                # model toward, so it must not be the weaker matcher.
+                located = _locate_block(file_content, search_str)
+                if located is None:
+                    errors.append(f"Could not find block:\n{search_str[:50]}...")
+                    continue
+                matched_text, strategy = located
+                if strategy == "flexible":
+                    # Re-anchor the replacement's indentation to the matched
+                    # region so the whitespace-flexible match doesn't corrupt
+                    # block indentation.
+                    replacement = _reindent_replacement(
+                        file_content, matched_text, replace_str)
                 else:
-                    # Heuristic fallback (robust whitespace handling). Re-anchor
-                    # the replacement's indentation to the matched region so the
-                    # whitespace-flexible match doesn't corrupt block indentation.
-                    words = [re.escape(w) for w in str(search_str).split()]
-                    flexible_search = r'\s+'.join(words)
-                    matches = re.findall(flexible_search, file_content)
-                    if len(matches) == 1:
-                        reindented = _reindent_replacement(file_content, matches[0], replace_str)
-                        file_content = file_content.replace(matches[0], reindented, 1)
-                        success_count += 1
-                    else:
-                        errors.append(f"Could not find block:\n{search_str[:50]}...")
+                    replacement = replace_str
+                    # Fuzzy/anchor windows are sliced with keepends; preserve
+                    # a trailing newline the model's replacement omits, else
+                    # the following line is welded onto the edited one.
+                    if (matched_text.endswith("\n")
+                            and not replacement.endswith("\n")):
+                        replacement += "\n"
+                file_content = file_content.replace(
+                    matched_text, replacement, 1)
+                success_count += 1
+                strategies.append(strategy)
 
             if success_count > 0:
                 msg = f"SUCCESS: Applied {success_count} SEARCH/REPLACE blocks to '{filename}'."
+                non_exact = [s for s in strategies if s != "exact"]
+                if non_exact:
+                    msg += (" NOTE: " + str(len(non_exact)) + " block(s) did "
+                            "not byte-match and were rescued by tolerant "
+                            "matching (" + ", ".join(non_exact) + ") — "
+                            "VERIFY the result is what you intended.")
                 if errors:
                     msg += f" SYSTEM INSTRUCTION: {len(errors)} blocks failed:\n" + "\n".join(errors)
                 return await _write_replace_guarded(path, prev_content, file_content, filename, msg)
@@ -873,6 +972,32 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
+
+def _locate_block(file_content: str, search_str: str):
+    """Full matching ladder shared by the SEARCH/REPLACE-block loop:
+    exact → whitespace-flexible (unique) → fuzzy window → anchor block.
+
+    Returns ``(matched_text, strategy)`` where ``matched_text`` is the
+    ORIGINAL bytes in the file to replace and ``strategy`` is one of
+    ``"exact"``, ``"flexible"``, ``"fuzzy:NN%"``, ``"anchor:L1-L2"`` — or
+    ``None`` when no matcher produces a unique, high-confidence hit."""
+    if search_str in file_content:
+        return search_str, "exact"
+    words = [re.escape(w) for w in str(search_str).split()]
+    if words:
+        flexible = r'\s+'.join(words)
+        matches = re.findall(flexible, file_content)
+        if len(matches) == 1:
+            return matches[0], "flexible"
+    fuzzy = _fuzzy_block_match(file_content, str(search_str))
+    if fuzzy is not None:
+        return fuzzy[0], f"fuzzy:{fuzzy[1]:.0%}"
+    anchor = _anchor_block_match(file_content, str(search_str))
+    if anchor is not None:
+        info = anchor[1]
+        return anchor[0], f"anchor:{info['start_line']}-{info['end_line']}"
+    return None
+
 
 def _nearest_snippet(file_content: str, target: str,
                      context_lines: int = 3,

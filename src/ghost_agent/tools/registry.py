@@ -94,7 +94,7 @@ TOOL_DEFINITIONS = [
                     "operation": {
                         "type": "string",
                         "enum": ["read", "read_chunked", "inspect", "search", "find", "list_files", "write", "replace", "download", "copy", "rename", "move", "delete"],
-                        "description": "The exact operation to perform. Use 'write' to create a new file OR completely overwrite an existing one (provide the FULL file in 'content'). Use 'replace' for TARGETED edits to a small region of an existing file — `replace` REQUIRES both 'content' (the exact old block) AND 'replace_with' (the new block). If you are rewriting the whole file, always use 'write', not 'replace'."
+                        "description": "The exact operation to perform. Use 'write' to create a new file OR completely overwrite an existing one (provide the FULL file in 'content'). Use 'replace' for TARGETED edits to a small region of an existing file — ALWAYS PREFER the single-argument form: put ONE block in 'content' shaped exactly like `<<<< SEARCH\\n<exact current text>\\n====\\n<new text>\\n>>>>` and OMIT 'replace_with' entirely (this form survives argument-transport corruption; concatenate several blocks for multiple edits in one call). The legacy two-argument form (content=old block + replace_with=new block) still works but is fragile in transport. If you are rewriting the whole file, always use 'write', not 'replace'."
                     },
                     "path": {
                         "type": "string",
@@ -110,7 +110,7 @@ TOOL_DEFINITIONS = [
                     },
                     "content": {
                         "type": "string",
-                        "description": "MANDATORY for 'write': the FULL new file contents. MANDATORY for 'replace': the exact EXISTING code block to find in the file (paired with 'replace_with'), OR an Aider-style `<<<< SEARCH ==== >>>>` block (in which case 'replace_with' is not used). If you want to rewrite the whole file, use operation='write', not 'replace'."
+                        "description": "MANDATORY for 'write': the FULL new file contents. MANDATORY for 'replace': PREFERRED — an Aider-style block `<<<< SEARCH\\n<exact current text>\\n====\\n<new text>\\n>>>>` with 'replace_with' omitted (immune to argument-transport corruption); LEGACY — the exact EXISTING code block to find, paired with 'replace_with'. If you want to rewrite the whole file, use operation='write', not 'replace'."
                     },
                     "destination": {
                         "type": "string",
@@ -122,7 +122,7 @@ TOOL_DEFINITIONS = [
                     },
                     "replace_with": {
                         "type": "string",
-                        "description": "REQUIRED for 'replace' operation: the new code/text that takes the place of the existing block in 'content'. The ONLY exception is when 'content' itself contains Aider-style `<<<< SEARCH ==== >>>>` blocks (in that case the old→new pairs live inside 'content' and you omit 'replace_with'). If you omit both, use operation='write' instead — 'replace' without 'replace_with' is an error."
+                        "description": "For the LEGACY two-argument 'replace' form only: the new code/text that takes the place of the existing block in 'content'. PREFER omitting this entirely and putting Aider-style `<<<< SEARCH ==== >>>>` block(s) inside 'content' — the old→new pairs then live in ONE argument, which survives argument-transport corruption. NEVER send the same text in 'content' and 'replace_with'; such a call is rejected. If you meant to rewrite the whole file, use operation='write' instead."
                     },
                     "url": {
                         "type": "string",

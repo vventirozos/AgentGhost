@@ -21,6 +21,35 @@ from .file_system import _get_safe_path
 # genuine errors (bad regex, unreadable file) with exit 2 + stderr output.
 _EXIT1_MEANS_NO_MATCH = {"grep", "egrep", "fgrep", "zgrep", "rg", "pgrep"}
 
+# SANDBOX EGRESS GUARD (agent's own ports). The sandbox container has its
+# own loopback, so 127.0.0.1:8000 in there is NOT the agent's API and
+# 127.0.0.1:8088 is NOT the upstream LLM. Every observed probe of these
+# ports from inside the sandbox ended in the same misdiagnosis chain:
+# connection failure → "the server is down on the user's machine" → write
+# a mock/stand-in server (the forbidden engine, three incidents:
+# 2026-07-02, 07-04, 07-05 request C5). Prompt-side warnings did not stop
+# it — the model trusts its own curl over the prompt — so the probe itself
+# is intercepted before execution and answered with the ground truth.
+_AGENT_PORT_PROBE_RE = re.compile(
+    r"(?:127\.0\.0\.1|localhost|0\.0\.0\.0)\s*:\s*(?:8000|8088)\b",
+    re.IGNORECASE,
+)
+
+_AGENT_PORT_PROBE_MSG = (
+    "SANDBOX EGRESS BLOCKED (known blind spot — command NOT executed): "
+    "this references 127.0.0.1:8000 / :8088, but inside your sandbox that "
+    "loopback is the CONTAINER'S OWN, not the host's. The agent API "
+    "(:8000) and upstream LLM (:8088) are running fine on the host — a "
+    "connection failure from in here would prove NOTHING, and acting on "
+    "one has repeatedly led to writing a forbidden mock server. Ground "
+    "truth: from the USER'S machine, 127.0.0.1:8000 reaches the agent. "
+    "What to do instead: (a) verify endpoints with the `browser` tool "
+    "(it runs on the host), (b) ask the user to run the command on THEIR "
+    "machine, or (c) if you need an in-sandbox server for something "
+    "unrelated, bind a DIFFERENT port (e.g. 8081). NEVER write a mock or "
+    "stand-in for the agent's API."
+)
+
 
 def _looks_like_file_not_found(out) -> bool:
     """Heuristic: did a command fail because the target file wasn't where it
@@ -46,6 +75,21 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     command = command or kwargs.get("cmd")
     filename = filename or kwargs.get("file") or kwargs.get("script") or kwargs.get("name")
     content = content or kwargs.get("code") or kwargs.get("script_content") or kwargs.get("text")
+
+    # --- 🛡️ SANDBOX EGRESS GUARD (agent's own ports) ---
+    # Checked BEFORE any execution, over both the shell command and inline
+    # code content. Returns a plain instruction (not an EXIT CODE failure)
+    # so the block teaches without burning a strike.
+    for _probe_text in (command, content):
+        if _probe_text and _AGENT_PORT_PROBE_RE.search(str(_probe_text)):
+            pretty_log(
+                "Sandbox Egress Guard",
+                "Blocked in-sandbox probe of the agent's own port "
+                "(127.0.0.1:8000/:8088 is the container's loopback, not "
+                "the host) — returned ground-truth explanation instead",
+                level="WARNING", icon=Icons.SHIELD,
+            )
+            return _AGENT_PORT_PROBE_MSG
 
     # --- 🛡️ HIJACK LAYER: CODE SANITIZATION ---
     

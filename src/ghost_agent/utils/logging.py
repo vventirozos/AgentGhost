@@ -8,6 +8,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 import contextvars
 from typing import Any, Optional
 
@@ -158,7 +159,7 @@ class Icons:
     BRAIN_CTX    = "🧩"
     BRAIN_ROUTE  = "🧭"   # semantic routing / skill selection
     BRAIN_AIM    = "🎯"   # self-play frontier targeting
-    LLM_ASK      = "🗣️"
+    LLM_ASK      = "💬"   # LLM request (wide-base; was 🗣️, a narrow-base+VS16 glyph)
     LLM_REPLY    = "🤖"
 
     # --- Specialized Tools ---
@@ -170,39 +171,42 @@ class Icons:
     TOOL_FILE_R  = "📖"
     TOOL_FILE_S  = "🔍"
     TOOL_FILE_I  = "👀"
-    TOOL_DOWN    = "⬇️"
+    TOOL_DOWN    = "📥"   # download / incoming (wide-base; was ⬇️)
     TOOL_BROWSER = "🌎"   # headless browser automation (distinct from shell 🐚)
     TOOL_DARKWEB = "🧅"   # dark-web (.onion) search over Tor (onion = 🧅, distinct from clearnet 🌐)
     IMAGE_GEN    = "🎨"
     REPORT_PDF   = "📄"
-    NODE_WORKER  = "⚙️"   # background / edge worker-node compute
-    NODE_EDGE    = "🛰️"   # swarm edge-node compute (NOT ⚡ — that's SYSTEM_BOOT)
+    NODE_WORKER  = "🔧"   # background / edge worker-node compute (wide-base; was ⚙️)
+    NODE_EDGE    = "🛸"   # swarm edge-node compute (wide-base; was 🛰️)
 
     # --- Memory & Identity ---
     MEM_SAVE     = "📝"
     MEM_READ     = "🔎"
     MEM_MATCH    = "📍"
     MEM_INGEST   = "📚"
-    MEM_SPLIT    = "📑"   # chunk split (distinct from CUT ✂️)
+    MEM_SPLIT    = "📑"   # chunk split (distinct from CUT 🔻)
     MEM_EMBED    = "🧬"
     MEM_WIPE     = "🧹"
-    MEM_SCRATCH  = "🗒️"
+    MEM_SCRATCH  = "📔"   # scratchpad memory (wide-base; was 🗒️)
+    MEM_REINFORCE = "💪"  # an existing memory/skill strengthened or merged (NOT 🔄 RETRY)
     USER_ID      = "👤"
     SELF_STATE   = "🪞"   # selfhood state / mood transition
     SKILL_GRADUATE = "🎓" # a lesson graduates into a reusable skill
+    DREAM        = "🌙"   # REM / dream consolidation cycle (NOT 💤 — that's SYSTEM_SHUT)
+    SKIP         = "⏩"   # a step/cycle deliberately skipped
 
     # --- Status ---
     OK           = "✅"
     FAIL         = "❌"
-    WARN         = "⚠️"
+    WARN         = "🔶"   # warning / caution — amber (wide-base; was ⚠️, a narrow-base+VS16 glyph)
     STOP         = "🛑"
     RETRY        = "🔄"
     IDEA         = "💡"
     BUG          = "🐛"
-    SHIELD       = "🛡️"
-    CUT          = "✂️"
-    CONSTRAINT   = "⛓️"   # explicit-user-constraint capture/steer/gate (NOT 🛡️ — that's tor fail-closed)
-    GAME_MOVE    = "♟️"   # participant-mode game turn (/api/game/move)
+    SHIELD       = "🔒"   # security / guard / fail-closed (wide-base; was 🛡️)
+    CUT          = "🔻"   # context compaction / trim (wide-base; was ✂️)
+    CONSTRAINT   = "🔗"   # explicit-user-constraint capture/steer/gate (wide-base; was ⛓️)
+    GAME_MOVE    = "🎮"   # participant-mode game turn (/api/game/move) (wide-base; was ♟️)
 
     # --- Custom Modes ---
     MODE_GHOST   = "🫥"
@@ -216,13 +220,13 @@ class Icons:
     # boot sequence, while the specific lines in between use these.
     BOOT_AWAKE       = "🌅"   # process spark — the very first line
     SANDBOX_BOX      = "📦"   # sandbox container mount
-    GRAPH_WEB        = "🕸️"   # triplet / knowledge-graph store
+    GRAPH_WEB        = "🪢"   # triplet / knowledge-graph store (wide-base; was 🕸️)
     VECTOR_EMBED     = "🧬"   # vector DB + sentence embeddings
-    MEM_INDEX        = "🗃️"   # memory system fully loaded with items
+    MEM_INDEX        = "📇"   # memory system fully loaded with items (wide-base; was 🗃️)
     MEM_LIBRARY      = "📓"   # indexed fragments ready for recall (distinct from MEM_INGEST 📚)
-    BELIEF_SCALES    = "⚖️"   # contradiction log / belief versioning
-    THRESHOLD_TUNE   = "🎚️"   # adaptive recall threshold
-    EPISODE_REEL     = "🎞️"   # episodic memory (sessions = frames)
+    BELIEF_SCALES    = "🧾"   # contradiction log / belief versioning (wide-base; was ⚖️)
+    THRESHOLD_TUNE   = "📶"   # adaptive recall threshold (wide-base; was 🎚️)
+    EPISODE_REEL     = "🎥"   # episodic memory (sessions = frames) (wide-base; was 🎞️)
     EVENT_BUS        = "📡"   # memory-bus pub/sub fan-out
     VERIFIER_LAB     = "🧪"   # self-evaluation gate
     UNCERTAINTY_DIE  = "🎲"   # uncertainty tracker
@@ -350,14 +354,66 @@ def _truncate(content_str: str, limit: int) -> str:
     return cut + "…"
 
 
-# Width of the visible prefix before the content column, i.e. the column
-# where wrapped continuation lines should be indented to. Computed from:
-# `│  TG  🙂  +12.3s  title_padded  ` with TITLE_WIDTH=18 and a 2-space
-# separator. Emoji display width varies across terminals so this is a
-# best-effort alignment, not a guarantee.
+# --- Icon-column normalization ------------------------------------------
+# The whole layout assumes the icon occupies a FIXED 2-cell field. Whether a
+# glyph actually renders as 2 cells is decided by its BASE codepoint's
+# East-Asian width: a Wide/Fullwidth base (💬 🔶 🐍 …) renders as 2 on every
+# terminal; a NARROW base — even with a VS16 (U+FE0F) emoji-presentation
+# selector, e.g. ⚠️ 🗣️ 🛡️ — is genuinely ambiguous (2 cells on some
+# terminals, 1 on others), which shifted the columns after it on exactly
+# those lines. So the Icons registry is kept entirely wide-base (enforced by
+# test_every_registry_icon_is_wide_base), and this helper pads any *stray*
+# narrow glyph up to 2 cells as a best-effort backstop. Measuring by base
+# width — NOT assuming VS16 ⇒ 2 — is what makes that measurement correct.
+ICON_CELLS = 2
+
+
+def _icon_display_width(icon: str) -> int:
+    """Display width of ``icon`` in terminal cells, by base codepoint width.
+    VS16 selectors, ZWJ, and combining marks are zero-advance."""
+    w = 0
+    for ch in icon:
+        if unicodedata.combining(ch) or ord(ch) in (0x200D, 0xFE0F):
+            continue
+        w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return w
+
+
+def _icon_cell(icon: str) -> str:
+    """Pad an icon out to the fixed 2-cell icon column."""
+    pad = ICON_CELLS - _icon_display_width(icon)
+    return icon + " " * pad if pad > 0 else icon
+
+
+# The column where content begins (and where wrapped continuation lines are
+# indented to). Derived from ONE formula so the layout can't silently drift:
+#   │ ·· TG ·· <icon> ·· +12.3s ·· <title>·· <content>
+#   1  2  2  2   2     2    6     2    18    2   →  content starts at col 39
 TITLE_WIDTH = 18
-_CONTENT_COL = 39
+_CONTENT_COL = (
+    1            # left frame edge │
+    + 2 + 2      # 2 spaces + 2-char request tag
+    + 2 + ICON_CELLS  # 2 spaces + icon field
+    + 2 + 6      # 2 spaces + fixed 6-char delta
+    + 2 + TITLE_WIDTH  # 2 spaces + padded title
+    + 2          # separator before content
+)
 _CONTINUATION_INDENT = " " * _CONTENT_COL
+
+
+def _term_cols() -> int:
+    try:
+        return shutil.get_terminal_size((120, 24)).columns
+    except Exception:
+        return 120
+
+
+def _fill_rule(visible_len: int, cap: int = 120) -> str:
+    """A ``─`` rule that fills the rest of the terminal line after a frame's
+    visible prefix, so each request's BEGIN/END spans the full console width
+    — a much stronger visual separator than the old fixed 40 dashes."""
+    cols = min(_term_cols(), cap)
+    return "─" * max(4, cols - visible_len)
 
 
 def _fit_title(title_str: str) -> str:
@@ -427,7 +483,10 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         with _REQ_STATE_LOCK:
             _REQ_STATE[req_id] = {"started": time.monotonic()}
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        rule = "─" * 40
+        # Measure the plain (ANSI-free) prefix, then fill the rest of the
+        # line so the frame spans the full console width.
+        visible = len(f"┌─ {tag} {req_id[:8]}  request started  {ts} ")
+        rule = _fill_rule(visible)
         line = (
             f"{rcol}┌─ {BOLD}{tag}{RESET}{rcol} {req_id[:8]}{RESET}  "
             f"{DIM}request started  {ts}{RESET} "
@@ -440,7 +499,8 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         delta = _format_delta(req_id).strip()
         with _REQ_STATE_LOCK:
             _REQ_STATE.pop(req_id, None)
-        rule = "─" * 40
+        visible = len(f"└─ {tag}  request finished  {delta} ")
+        rule = _fill_rule(visible)
         line = (
             f"{rcol}└─ {BOLD}{tag}{RESET}  "
             f"{DIM}request finished  {delta}{RESET} "
@@ -453,7 +513,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         delta = _format_delta(req_id)
         title_str = title.lower().replace("_", " ")
         line = (
-            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {icon}  "
+            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▼ {title_str}{RESET}"
         )
@@ -464,7 +524,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
         delta = _format_delta(req_id)
         title_str = title.lower().replace("_", " ")
         line = (
-            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {icon}  "
+            f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▲ {title_str}{RESET}"
         )
@@ -500,7 +560,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     lvl_col = _LEVEL_COLOR.get(level.upper(), "")
     sep = "  " if content_str else ""
     line = (
-        f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {icon}  "
+        f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
         f"{DIM}{delta}{RESET}  "
         f"{lvl_col}{BOLD}{_fit_title(title_str)}{RESET}{sep}{content_str}"
     )
