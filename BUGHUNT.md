@@ -85,15 +85,20 @@ regression tests; docs updated; full suite green on that session's date.
   hardcodes upstream :8088 (false FAIL if unreachable); `load_tokens` builds its synthetic filler in an
   O(n²) re-encode loop; several scripts don't expanduser report paths / collide on same-second timestamps;
   `backfill_project_concepts` over-counts edges on re-runs (reporting only — the upsert itself is safe). (low)
-- **skills_auto graduation pipeline built-but-unwired (unit 25)** — nothing graduates today: the
-  only trajectory producer with real tool_calls (the chat recorder) writes UNKNOWN and can only be
-  promoted to FAILED, never PASSED; the two PASSED producers write `tool_calls=[]` which the
-  extractor skips. So these are LATENT until the producer wiring is fixed: (a) consolidator's
-  single-member passthrough keeps the extractor's cluster-specific `signature_hash` while merged
-  members recompute a cluster-independent one → same skill graduates under two store keys;
-  (b) `support=len(trajs)` has no per-session/batch dedup → N self-consistency samples of one turn
-  count as N independent supports (a one-turn coincidence could clear the ≥3 gate);
-  (c) `_signature_hash` delimiter-injection collision (`::`/`|`). (med — latent)
+- **skills_auto graduation pipeline built-but-unwired (unit 25) — RESOLVED 2026-07-05.** Root
+  cause of "nothing graduates": in async-critic mode (production) the verifier verdict lands
+  after the chat trajectory was recorded UNKNOWN and nothing backfilled the corpus — the sync
+  path already folded the verdict in at write time (`resolve_turn_outcome`), so the wiring only
+  worked when the verdict landed inline (live corpus: 2058 UNKNOWN, 1116 with ≥2 tools, 0
+  extractor-eligible). Fixed: `_record_late_verdict` → `_backfill_trajectory_outcome`
+  (CONFIRMED ≥0.7 → PASSED, guarded UNKNOWN-only; REFUTED ≥0.7 → FAILED, also a Reflector/PRM
+  negative; corrections-sidecar overlay so user corrections still win by ordering). Latent bugs
+  (a)/(b)/(c) all fixed with it: consolidator singles now recompute the sequence-only signature
+  (one store key per skill), support/failures/triggers dedup by batch_id-or-id, and
+  `_signature_hash` uses a repr-encoded identity (store was empty in prod — no migration).
+  tests/test_critic_async.py (+5), test_graduation_producer_wiring.py (3), extractor/consolidator
+  (+6). NOTE (still open, low): `SelfConsistencySampler` has no production caller and writes
+  `tool_calls=[]` — if it ever gets wired to a runner, tool-call capture is that caller's job.
 - **prm binary-floor gates continuous training + train↔serve feature skew (unit 19)** — the class-
   balance floor (`min_class_fraction`) is computed on BINARY labels while the model fits CONTINUOUS
   labels by default, so an all-PASSED corpus with long trajectories (0.9^7<0.5) clears the floor and
@@ -108,12 +113,15 @@ regression tests; docs updated; full suite green on that session's date.
   progress persists): `Reflector.run` is still oldest-first within a tick (a recency window would
   reach fresh failures faster); `_truncate` head-keeps `tc.error`/`failure_reason` (drops the tail
   exception of a traceback); a diagnosis containing "plan:" is truncated at that word. (low)
-- **distill user_correction / outcome-heuristic false positives (unit 22)** — an affirming follow-up
-  reusing the prior request's content words ("actually the sort works great, thanks") can trip the
-  correction classifier (Signal A "actually" AND Jaccard≥0.4) → promotes a GOOD turn to FAILED and
-  retracts its lesson; the tool-error heuristic's bare substrings ("exception"/"traceback") match
-  benign read content; the `[ATTEMPT_ABORTED_*]` regex is searched in the user-facing final_response.
-  Heuristic tuning — bounded today by the 3-repeat / two-signal gates. (med)
+- **distill user_correction / outcome-heuristic false positives (unit 22)** — the correction-
+  classifier half is RESOLVED 2026-07-05: an affirming follow-up tripping both signals ("actually
+  the sort works great" — Signal A "actually" AND Jaccard≥0.4) is now killed by an affirmation
+  veto (`_AFFIRMATION_RE` hit with no `_NEGATIVE_MARKER_RE` hit → is_correction=False,
+  "affirmation-veto" in audit signals; an anchored "no" blocks the veto so "No, you're right, …"
+  still promotes — ambiguity resolves toward correction). tests/test_user_correction.py (+5).
+  STILL DEFERRED: the tool-error heuristic's bare substrings ("exception"/"traceback") match
+  benign read content; the `[ATTEMPT_ABORTED_*]` regex is searched in the user-facing
+  final_response. Heuristic tuning — bounded today by the 3-repeat / two-signal gates. (low-med)
 - **agent.py trajectory tool-result pairing on id-less duplicates (units 18/22)** — flagged again by
   the distill reviewer: two same-named tool calls in one turn with empty ids collide on the `name`
   key in `pending_calls`, so one result is dropped (blank ToolCall on disk) and Signal-3 error-repeat

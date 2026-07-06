@@ -132,3 +132,41 @@ def test_consolidation_preserves_sort_order():
     ]
     out, _ = consolidate(cs)
     assert out[0].support >= out[1].support
+
+
+# ---------------------------------------------------------------------
+# Latent-bug regression (BUGHUNT.md unit 25, fixed 2026-07-05):
+# a single-member passthrough kept the extractor's CLUSTER-SPECIFIC
+# signature while merged groups recompute a sequence-only one — the
+# same skill graduated under two store keys depending on whether its
+# sequence happened to merge that run.
+# ---------------------------------------------------------------------
+
+
+def test_single_member_signature_is_sequence_only():
+    from ghost_agent.skills_auto.extractor import _signature_hash
+    from ghost_agent.skills_auto.consolidator import consolidate
+
+    single = _c(name="s", seq=("a", "b"), support=3, cluster="sql")
+    out, _ = consolidate([single])
+    assert len(out) == 1
+    assert out[0].signature_hash == _signature_hash(None, ("a", "b"))
+    # The candidate keeps its observed cluster — only the dedupe
+    # identity collapses to the sequence.
+    assert out[0].cluster == "sql"
+    # The input object is not mutated (replace(), not assignment).
+    assert single.signature_hash != out[0].signature_hash or \
+        single is not out[0]
+
+
+def test_single_and_merged_share_store_key_across_runs():
+    from ghost_agent.skills_auto.consolidator import consolidate
+
+    # Run 1: the sequence appears once (single-member passthrough).
+    run1, _ = consolidate([_c(name="s", seq=("a", "b"), cluster="sql")])
+    # Run 2: the same sequence appears in two clusters (merged).
+    run2, _ = consolidate([
+        _c(name="s", seq=("a", "b"), cluster="sql"),
+        _c(name="s2", seq=("a", "b"), cluster="bash"),
+    ])
+    assert run1[0].signature_hash == run2[0].signature_hash

@@ -150,6 +150,93 @@ def test_late_low_confidence_refuted_queues_nothing(agent, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# Late-verdict → trajectory-corpus backfill (the skills-auto producer fix:
+# in async mode the verdict lands after the trajectory was recorded
+# UNKNOWN, so without this the corpus NEVER contains a passed-with-tools
+# chat turn and graduation has zero input — 2058 UNKNOWN / 0 eligible in
+# production on 2026-07-05)
+# --------------------------------------------------------------------------
+
+def _traj(tid="t1", outcome="unknown"):
+    from ghost_agent.distill.schema import Trajectory
+    return Trajectory(id=tid, user_request="do the thing",
+                      final_response="done", outcome=outcome)
+
+
+def _wire_corpus(agent, traj):
+    """Attach a mock collector + the correction cache holding `traj`."""
+    from collections import OrderedDict
+    collector = MagicMock()
+    agent.context.trajectory_collector = collector
+    agent.context._recent_trajectories_for_correction = OrderedDict(
+        [("fp", traj)] if traj is not None else [])
+    return collector
+
+
+def _run_sync(agent, verdict, tid="t1"):
+    """Drive _record_late_verdict with spawn_task executing inline so the
+    sidecar write can be asserted synchronously."""
+    with patch("ghost_agent.core.agent.pretty_log"), \
+         patch("ghost_agent.core.agent._glog.spawn_task",
+               new=lambda coro: asyncio.run(coro)):
+        agent._record_late_verdict(verdict, trajectory_id=tid)
+
+
+def test_late_confirmed_backfills_passed_outcome(agent, monkeypatch):
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    traj = _traj()
+    collector = _wire_corpus(agent, traj)
+    _run_sync(agent, _verdict(VerifyVerdict.CONFIRMED, conf=0.95))
+    collector.update_outcome.assert_called_once_with(
+        "t1", "passed", reason="", source="verifier_late")
+    assert traj.outcome == "passed"   # in-process cache updated too
+
+
+def test_late_confirmed_never_upgrades_failed(agent, monkeypatch):
+    # A shape-heuristic / structural FAILED must not be upgraded by a
+    # late text CONFIRMED — mirrors resolve_turn_outcome's priorities.
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    traj = _traj(outcome="failed")
+    collector = _wire_corpus(agent, traj)
+    _run_sync(agent, _verdict(VerifyVerdict.CONFIRMED, conf=0.95))
+    collector.update_outcome.assert_not_called()
+    assert traj.outcome == "failed"
+
+
+def test_late_confirmed_cache_miss_skips_promotion(agent, monkeypatch):
+    # Can't prove the recorded outcome was UNKNOWN → conservative skip.
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    collector = _wire_corpus(agent, None)
+    _run_sync(agent, _verdict(VerifyVerdict.CONFIRMED, conf=0.95))
+    collector.update_outcome.assert_not_called()
+
+
+def test_late_refuted_backfills_failed_even_on_cache_miss(agent, monkeypatch):
+    # Failure direction is fail-safe: lands regardless of cache state,
+    # so the Reflector / PRM get their negative.
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    agent._pending_corrections = []
+    collector = _wire_corpus(agent, None)
+    _run_sync(agent, _verdict(VerifyVerdict.REFUTED, conf=0.9, issues=["wrong"]))
+    collector.update_outcome.assert_called_once()
+    args, kwargs = collector.update_outcome.call_args
+    assert args == ("t1", "failed")
+    assert "verifier refuted (late)" in kwargs["reason"]
+    assert kwargs["source"] == "verifier_late"
+
+
+def test_late_low_confidence_no_backfill(agent, monkeypatch):
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    agent._pending_corrections = []
+    traj = _traj()
+    collector = _wire_corpus(agent, traj)
+    _run_sync(agent, _verdict(VerifyVerdict.CONFIRMED, conf=0.6))
+    _run_sync(agent, _verdict(VerifyVerdict.REFUTED, conf=0.5, issues=["maybe"]))
+    collector.update_outcome.assert_not_called()
+    assert traj.outcome == "unknown"
+
+
+# --------------------------------------------------------------------------
 # _consume_pending_corrections
 # --------------------------------------------------------------------------
 

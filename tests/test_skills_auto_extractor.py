@@ -155,3 +155,60 @@ def test_extraction_report_counts():
     assert report.n_trajectories_seen == 5
     assert report.n_passed_with_tools == 3
     assert report.n_candidates_emitted == len(cands)
+
+
+# ---------------------------------------------------------------------
+# Latent-bug regressions (BUGHUNT.md unit 25, fixed 2026-07-05)
+# ---------------------------------------------------------------------
+
+
+def test_support_dedups_self_consistency_samples():
+    """N samples of ONE turn share a batch_id and must count as ONE
+    support — a single-turn coincidence sampled 3× must not clear the
+    graduation gate on its own."""
+    same_batch = []
+    for i in range(3):
+        t = _mk()
+        t.batch_id = "batch-1"
+        t.sample_index = i
+        same_batch.append(t)
+    cands, _ = extract_candidates(same_batch, min_support=2)
+    assert cands == []  # support collapses to 1 → below the gate
+
+    # Two DISTINCT batches → support 2 → clears.
+    b2 = _mk()
+    b2.batch_id = "batch-2"
+    cands, _ = extract_candidates(same_batch + [b2], min_support=2)
+    assert len(cands) == 1
+    assert cands[0].support == 2
+
+
+def test_failed_tally_dedups_batches_too():
+    """The confidence denominator dedups failures symmetrically."""
+    passed = [_mk(traj_id=f"p{i}") for i in range(3)]
+    fails = []
+    for i in range(4):
+        t = _mk(passed=False)
+        t.batch_id = "fail-batch"
+        fails.append(t)
+    cands, _ = extract_candidates(passed + fails, min_support=2)
+    assert len(cands) == 1
+    # 3 passed / (3 + 1 deduped failure + 1.0 smoothing)
+    assert abs(cands[0].confidence - 3 / 5.0) < 1e-9
+
+
+def test_signature_hash_no_delimiter_collision():
+    """Old scheme joined with '::' and '|': cluster='a', seq=('b|c',)
+    and cluster='a', seq=('b','c') both encoded to 'a::b|c' — distinct
+    identities, one store key. The repr encoding keeps them apart."""
+    from ghost_agent.skills_auto.extractor import _signature_hash
+    assert _signature_hash("a", ("b|c",)) != _signature_hash("a", ("b", "c"))
+    assert _signature_hash("a::b", ("c",)) != _signature_hash("a", ("b::c",))
+
+
+def test_trigger_examples_deduped():
+    """N samples of one prompt must not fill every trigger slot."""
+    trajs = [_mk(user_request="same ask") for _ in range(3)]
+    trajs.append(_mk(user_request="different ask"))
+    cands, _ = extract_candidates(trajs, min_support=2)
+    assert cands[0].trigger_examples == ["same ask", "different ask"]

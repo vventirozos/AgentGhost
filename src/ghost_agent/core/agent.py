@@ -3727,6 +3727,15 @@ class GhostAgent:
     # file from another project and reported it clean — a false confirm).
     _WEB_EXEC_FRESH_WINDOW_S = 900.0
 
+    # When the turn WROTE web artifacts but the execution probe could not
+    # run (no loadable entry page, navigation failed, probe crashed), a
+    # CONFIRMED verdict rests on text/vision alone — the artifact was never
+    # executed. Cap its confidence below the 0.7 consumption threshold so
+    # an unexecuted build can't be recorded as a verified pass (observed
+    # live 2026-06-20: "WEB-EXEC check skipped" followed by CONFIRMED 100%
+    # on vision alone, on a page that threw on load).
+    _WEB_EXEC_SKIP_CONF_CAP = 0.6
+
     def _locate_entry_page(self, candidates: list, sbx: Path, root: Path):
         """Resolve a web entry-page name to an existing host file, or None.
 
@@ -4017,11 +4026,13 @@ class GhostAgent:
         # exception refutes the answer regardless of how plausible the
         # claim text is. Runs last so it outranks the visual check —
         # execution is harder ground truth than pixels.
+        _wx_inconclusive = False
         try:
             written = _web_artifacts_written(tools_run_this_turn)
             if written:
                 check = await self._execute_web_artifact(written)
                 if check is None:
+                    _wx_inconclusive = True
                     pretty_log(
                         "Verifier",
                         "WEB-EXEC check skipped (no loadable entry page "
@@ -4055,10 +4066,33 @@ class GhostAgent:
                             icon=Icons.BRAIN_THINK,
                         )
         except Exception as _wx_exc:
+            _wx_inconclusive = True
             pretty_log(
                 "Verifier",
                 f"WEB-EXEC check error: {type(_wx_exc).__name__}: {_wx_exc}",
                 icon=Icons.WARN, level="WARNING",
+            )
+        # Fail-safe, not fail-open: web artifacts landed this turn but the
+        # execution probe was inconclusive — a CONFIRMED from the text/vision
+        # passes above certifies a build that never ran. Keep the verdict
+        # (there is no evidence it's broken) but cap the confidence below
+        # every ≥0.7 consumption gate (backfill "passed", auditor note,
+        # calibration), so an unexecuted build is recorded as unverified.
+        if (_wx_inconclusive and v_result is not None
+                and v_result.verdict == VerifyVerdict.CONFIRMED
+                and v_result.confidence > self._WEB_EXEC_SKIP_CONF_CAP):
+            v_result.confidence = self._WEB_EXEC_SKIP_CONF_CAP
+            v_result.reasoning = (
+                (v_result.reasoning or "")
+                + " [WEB-EXEC inconclusive: web artifacts were written this "
+                  "turn but the entry page could not be loaded, so this "
+                  "CONFIRMED is not execution-backed; confidence capped.]"
+            ).strip()
+            pretty_log(
+                "Verifier",
+                "WEB-EXEC inconclusive → CONFIRMED capped at "
+                f"{self._WEB_EXEC_SKIP_CONF_CAP:.0%} (artifact never executed)",
+                icon=Icons.BRAIN_THINK, level="WARNING",
             )
         return v_result, last_tool
 
@@ -4309,25 +4343,124 @@ class GhostAgent:
         def _on_done(t):
             try:
                 v_result, _lt = t.result()
-            except Exception:
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                # This used to be a bare silent return — which hid the fact
+                # that the async verdict NEVER completed in production (the
+                # live log had 5 "verdict deferred" lines and 0 "LATE …"
+                # lines): every safety side effect downstream (lesson scrub,
+                # correction banner, corpus backfill) was dead without a
+                # trace. A dying verdict task must be loud.
+                pretty_log(
+                    "Verifier",
+                    f"async verdict task died: {type(exc).__name__}: "
+                    f"{str(exc)[:200]}",
+                    icon=Icons.WARN, level="WARNING",
+                )
                 return
             self._record_late_verdict(v_result, trajectory_id, conv_fp)
 
         task.add_done_callback(_on_done)
+
+    def _backfill_trajectory_outcome(self, trajectory_id, outcome, reason=""):
+        """Fold a late verifier verdict into the trajectory corpus.
+
+        In async-critic mode (production) the verdict lands after
+        ``_record_turn_trajectory`` already wrote ``outcome=UNKNOWN``, so
+        the corpus that feeds the Reflector / PRM / skills-auto never saw
+        what the verifier concluded — the sync path folds the same signal
+        in at write time via ``resolve_turn_outcome``, so chat turns could
+        only ever become PASSED when the verdict happened to land inline.
+        Net effect before this: skills-auto graduation had ZERO passed-
+        with-tools input in production (2058 UNKNOWN / 0 eligible on
+        2026-07-05) and a late REFUTED never became a Reflector/PRM
+        negative. Writes the corrections sidecar (overlay-on-read, audit-
+        safe) and mutates the in-process correction cache so next-turn
+        logic sees the current state.
+
+        Direction guards mirror ``resolve_turn_outcome``'s priorities:
+        FAILED always lands (a refute is never upgraded away by ordering);
+        PASSED lands only when the recorded outcome is still UNKNOWN — a
+        shape-heuristic or structural FAILED must never be upgraded, so a
+        cache miss (can't prove UNKNOWN) skips conservatively. A later
+        user-correction still wins either way: the sidecar is last-write-
+        wins per id and the user's message arrives after this. Never
+        raises — corpus backfill must not break the done-callback.
+        """
+        try:
+            from ..distill.schema import Outcome as _Outcome
+            collector = getattr(self.context, "trajectory_collector", None)
+            if collector is None or not trajectory_id:
+                return
+            cached = None
+            cache = getattr(
+                self.context, "_recent_trajectories_for_correction", None)
+            for t in (cache or {}).values():
+                if getattr(t, "id", None) == trajectory_id:
+                    cached = t
+                    break
+            if outcome == _Outcome.PASSED.value:
+                if cached is None or cached.outcome != _Outcome.UNKNOWN.value:
+                    return
+            if cached is not None:
+                cached.outcome = outcome
+                if reason and outcome == _Outcome.FAILED.value \
+                        and not (cached.failure_reason or ""):
+                    cached.failure_reason = reason
+            _glog.spawn_task(asyncio.to_thread(
+                collector.update_outcome,
+                trajectory_id, outcome,
+                reason=reason, source="verifier_late",
+            ))
+            pretty_log(
+                "Verifier",
+                f"late verdict backfilled into the corpus: trajectory "
+                f"{trajectory_id[:8]} → {outcome}",
+                icon=Icons.VERIFIER_LAB,
+            )
+        except Exception as e:
+            logger.debug(
+                "late-verdict outcome backfill skipped: %s: %s",
+                type(e).__name__, e,
+            )
 
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp=""):
         """Apply the side effects of a verdict that lands AFTER its
         response shipped. Extracted from the done-callback so it is
         unit-testable. On a high-confidence REFUTED: log it, scrub any
         poisoned lesson the turn wrote, and — in async mode — queue a
-        correction to surface on the next turn. Otherwise just log.
+        correction to surface on the next turn. Either way, fold the
+        high-confidence verdict into the trajectory corpus (the async
+        counterpart of ``resolve_turn_outcome`` at record time).
         """
         if not v_result:
+            # The verdict pipeline produced nothing (verifier error or an
+            # inapplicable turn slipping through) — log it so a silently
+            # dead async path is visible in the stream.
+            pretty_log(
+                "Verifier",
+                "LATE verdict was empty (verifier returned no result) — "
+                "no side effects applied",
+                icon=Icons.BRAIN_THINK,
+            )
             return
         try:
             from .verifier import VerifyVerdict
         except Exception:
             return
+        if v_result.confidence >= 0.7:
+            if v_result.verdict == VerifyVerdict.CONFIRMED:
+                self._backfill_trajectory_outcome(trajectory_id, "passed")
+            elif v_result.verdict == VerifyVerdict.REFUTED:
+                _bf_reason = (
+                    "; ".join(v_result.issues[:2])
+                    if v_result.issues else (v_result.reasoning or "")
+                )
+                self._backfill_trajectory_outcome(
+                    trajectory_id, "failed",
+                    reason=f"verifier refuted (late): {_bf_reason}"[:300],
+                )
         if (v_result.verdict == VerifyVerdict.REFUTED
                 and v_result.confidence >= 0.7):
             issues_str = (
@@ -7944,7 +8077,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         and _vr.verdict == _VV.REFUTED
                                         and _vr.confidence >= 0.7
                                     )
-                                    _unverified = (_vr is None and _is_unverified_mutation(_lt))
+                                    # No verdict OR an unconvincing (<0.7)
+                                    # CONFIRMED — e.g. one capped because the
+                                    # WEB-EXEC probe couldn't run — is not
+                                    # good enough to finalise on an untested
+                                    # write: force the "actually RUN it"
+                                    # re-entry, mirroring the async path's
+                                    # pure-predicate behaviour.
+                                    _unverified = (
+                                        (_vr is None
+                                         or (_vr.verdict == _VV.CONFIRMED
+                                             and _vr.confidence < 0.7))
+                                        and _is_unverified_mutation(_lt)
+                                    )
                                 if _refuted:
                                     _crit = (
                                         "; ".join(_vr.issues[:3]) if _vr.issues
@@ -9674,6 +9819,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         "finalised on an UNVERIFIED file write (never "
                                         "run/rendered) — flagged INCOMPLETE "
                                         "(outcome=failed)",
+                                        icon=Icons.WARN, level="WARNING",
+                                    )
+                                elif getattr(getattr(self.context, "args", None),
+                                             "no_verifier", False) is True:
+                                    # Ablated, not deferred. This branch used to
+                                    # fall into the async "deferred" message
+                                    # below, which claimed a verdict was running
+                                    # that was never spawned — the live log
+                                    # showed days of "verdict deferred" while
+                                    # --no-verifier (an ablation leftover in the
+                                    # launcher) had the whole subsystem off, and
+                                    # nothing ever contradicted it.
+                                    pretty_log(
+                                        "Verifier",
+                                        "no verdict — verifier is ABLATED "
+                                        "(--no-verifier); nothing will land late",
                                         icon=Icons.WARN, level="WARNING",
                                     )
                                 elif self._critic_async_enabled():

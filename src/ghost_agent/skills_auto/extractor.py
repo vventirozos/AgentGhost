@@ -93,7 +93,11 @@ def _auto_name(cluster: Optional[str], seq: Tuple[str, ...]) -> str:
 
 
 def _signature_hash(cluster: Optional[str], seq: Tuple[str, ...]) -> str:
-    joined = f"{cluster or ''}::{'|'.join(seq)}"
+    # repr() of the (cluster, seq) tuple is an unambiguous encoding —
+    # the previous f"{cluster}::{'|'.join(seq)}" join collided when a
+    # cluster contained "::" or a tool name contained "|" (delimiter
+    # injection): distinct identities hashed to the same store key.
+    joined = repr((cluster or "", tuple(seq)))
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:12]
 
 
@@ -121,8 +125,15 @@ def extract_candidates(
 
     # Count failed trajectories by signature too, so confidence reflects
     # the full record, not just the successes we kept.
-    failed_by_key: Dict[Tuple[Optional[str], Tuple[str, ...]], int] = defaultdict(int)
+    failed_by_key: Dict[Tuple[Optional[str], Tuple[str, ...]], set] = defaultdict(set)
     groups: Dict[Tuple[Optional[str], Tuple[str, ...]], List[Trajectory]] = defaultdict(list)
+
+    # Support-dedup key: N self-consistency samples of ONE turn share a
+    # batch_id and must count as ONE independent support — otherwise a
+    # single-turn coincidence sampled 3× clears the graduation gate on
+    # its own. Trajectories without a batch (chat turns) count by id.
+    def _support_key(t: Trajectory) -> str:
+        return t.batch_id or t.id
 
     for t in trajectories:
         report.n_trajectories_seen += 1
@@ -136,23 +147,27 @@ def extract_candidates(
             report.n_passed_with_tools += 1
             groups[key].append(t)
         elif t.outcome == Outcome.FAILED.value:
-            failed_by_key[key] += 1
+            failed_by_key[key].add(_support_key(t))
 
     report.n_groups_considered = len(groups)
     candidates: List[SkillCandidate] = []
     for key, trajs in groups.items():
-        support = len(trajs)
+        support = len({_support_key(t) for t in trajs})
         if support < min_support:
             report.rejected_below_support += 1
             continue
         cluster, seq = key
         exemplar = _pick_exemplar(trajs)
-        triggers = [
-            (t.user_request or "").strip()
-            for t in trajs
-            if (t.user_request or "").strip()
-        ][:max_trigger_examples]
-        failed = failed_by_key.get(key, 0)
+        # Unique triggers, insertion-ordered — N samples of one batch
+        # repeat the same prompt and would otherwise fill every slot.
+        triggers: List[str] = []
+        for t in trajs:
+            tg = (t.user_request or "").strip()
+            if tg and tg not in triggers:
+                triggers.append(tg)
+            if len(triggers) >= max_trigger_examples:
+                break
+        failed = len(failed_by_key.get(key, ()))
         # Confidence: fraction of validated runs that passed, with a
         # small Laplace smoothing so rarely-seen skills don't shoot to
         # 1.0 on a single successful pass.

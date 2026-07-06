@@ -226,3 +226,85 @@ def test_promoted_verdict_has_descriptive_reason():
     # Should mention BOTH signals.
     assert "phrase" in v.reason
     assert "rephrase" in v.reason
+
+
+# ------------------------------------------------------- affirmation veto
+# Deferred finding (BUGHUNT.md, unit 22): an AFFIRMING follow-up that
+# opens with "actually" and echoes the request's content words trips
+# BOTH signals — promoting a good turn to FAILED and retracting its
+# lesson (self-poisoning). A clear affirmation with no negative marker
+# now vetoes the verdict.
+
+
+def test_affirming_actually_followup_is_vetoed():
+    prev_user = "sort the list by date descending"
+    current = "actually the list sort by date descending works great!"
+    v = classify_user_correction(
+        prev_user_request=prev_user,
+        prev_assistant_response="sorted, newest first",
+        current_user_text=current,
+    )
+    # Sanity: both raw signals DID fire (this is the false-positive shape)…
+    assert "phrase" in v.signals
+    assert any(s.startswith("rephrase") for s in v.signals)
+    # …and the veto killed the promotion.
+    assert "affirmation-veto" in v.signals
+    assert not v.is_correction
+    assert v.confidence == 0.0
+    assert v.reason == ""
+
+
+def test_you_were_right_is_vetoed():
+    prev_user = "use binary search for the symbol lookup"
+    current = "actually you were right, binary search for the symbol lookup is faster"
+    v = classify_user_correction(
+        prev_user_request=prev_user,
+        prev_assistant_response="switched to binary search",
+        current_user_text=current,
+    )
+    assert "affirmation-veto" in v.signals
+    assert not v.is_correction
+
+
+def test_negative_marker_blocks_the_veto():
+    """A complaint that HAPPENS to contain praise-shaped words must
+    still promote — the negative marker wins."""
+    prev_user = "sort the list by date descending"
+    current = ("actually the list sort by date descending looks good "
+               "but doesn't work")
+    v = classify_user_correction(
+        prev_user_request=prev_user,
+        prev_assistant_response="done",
+        current_user_text=current,
+    )
+    assert "affirmation-veto" not in v.signals
+    assert v.is_correction
+
+
+def test_anchored_no_blocks_the_veto():
+    """'No, you're right, …' is genuinely ambiguous — ambiguity resolves
+    toward correction (a missed veto only costs a lesson; a wrongly
+    vetoed real correction costs the FAILED label)."""
+    prev_user = "sort the list by date descending"
+    current = "no, you're right, sort the list by date descending like i said"
+    v = classify_user_correction(
+        prev_user_request=prev_user,
+        prev_assistant_response="descending it is",
+        current_user_text=current,
+    )
+    assert "affirmation-veto" not in v.signals
+    assert v.is_correction
+
+
+def test_plain_praise_never_consults_the_veto():
+    """No correction opener → veto never appears in signals (it is only
+    consulted when both raw signals fired)."""
+    prev_user = "sort the list by date descending"
+    current = "the list sort by date descending works great, thanks!"
+    v = classify_user_correction(
+        prev_user_request=prev_user,
+        prev_assistant_response="done",
+        current_user_text=current,
+    )
+    assert not v.is_correction
+    assert "affirmation-veto" not in v.signals

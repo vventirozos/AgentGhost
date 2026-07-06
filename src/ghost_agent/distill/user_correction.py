@@ -103,6 +103,49 @@ _CORRECTION_RE = re.compile(
 )
 
 
+# ---------- Affirmation veto (Signal A+B false-positive guard) -------
+
+# An affirming follow-up can trip BOTH signals: "actually the sort you
+# wrote works great, thanks" starts with a correction phrase
+# ("actually") and clears the rephrase overlap by echoing the request's
+# content words — yet it is PRAISE. Promoting it retracts a good lesson
+# and stamps a good turn FAILED (the exact self-poisoning class the
+# 2026-07-05 chess post-mortem cleaned out of vector memory). When the
+# message carries a clear affirmation and NO negative marker, the
+# correction verdict is vetoed.
+_AFFIRMATION_RE = re.compile(
+    r"\b(?:works?\s+(?:great|now|fine|perfectly|well|as\s+expected)|"
+    r"it\s+works|working\s+(?:now|great|fine|perfectly)|"
+    r"you\s*(?:['’]?re|are|were)\s+right|"
+    r"that['’ ]?s\s+(?:right|correct|it|perfect)|"
+    r"looks\s+(?:good|great|right|correct)|spot\s+on|"
+    r"perfect|excellent|awesome|brilliant|well\s+done|nicely\s+done|"
+    r"good\s+job|great\s+job|"
+    r"exactly\s+(?:right|what\s+i\s+(?:wanted|meant|asked)))\b",
+    re.IGNORECASE,
+)
+
+# Strong negative markers BLOCK the veto: "no, it works locally but
+# your fix broke prod" praises nothing — the complaint must win.
+# Deliberately phrase-based (no bare "error"/"exception" substrings —
+# those false-positive on benign content like "no errors now"; see the
+# outcome-heuristics deferred finding). A bare leading "no" also
+# blocks: "No, you're right" is genuinely ambiguous, and a missed veto
+# only costs a lesson — a wrongly vetoed real correction costs the
+# label, so ambiguity resolves toward correction.
+_NEGATIVE_MARKER_RE = re.compile(
+    r"^\s*no\b|"
+    r"\b(?:nope|wrong|incorrect|"
+    r"not\s+(?:right|correct|working|what)|"
+    r"didn['’]?t\s+work|doesn['’]?t\s+work|"
+    r"isn['’]?t\s+working|stopped\s+working|"
+    r"still\s+(?:broken|failing|fails|wrong|not\s+working)|"
+    r"failed|failing|fails|broke|broken|"
+    r"misunderstood|misread)\b",
+    re.IGNORECASE,
+)
+
+
 # ---------- Signal B: rephrase similarity ---------------------------
 
 # Common stopwords + question scaffolding tokens. Removing them makes
@@ -249,6 +292,16 @@ def classify_user_correction(
     is_correction = ("phrase" in signals) and any(
         s.startswith("rephrase") for s in signals
     )
+
+    # Affirmation veto — only consulted when both signals fired, so the
+    # common paths pay nothing. A clear affirmation with no negative
+    # marker means the user is praising the result, not correcting it,
+    # no matter how correction-shaped the opener ("actually …") is.
+    if is_correction and _AFFIRMATION_RE.search(cu) \
+            and not _NEGATIVE_MARKER_RE.search(cu):
+        signals.append("affirmation-veto")
+        is_correction = False
+        confidence = 0.0
 
     if is_correction:
         reason = (

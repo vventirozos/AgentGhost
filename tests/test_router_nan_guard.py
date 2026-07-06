@@ -101,3 +101,63 @@ def test_load_accepts_finite_checkpoint(tmp_path):
     p = clf.save(tmp_path / "ckpt.json")
     loaded = ComplexityClassifier.load(p)
     assert loaded.is_finite()
+
+
+# ---------------------------------------------------------------------
+# _vectorize choke-point sanitisation (functional-hunt deferred finding,
+# 2026-07-05): fit() sanitised its design matrix but predict_proba /
+# partial_fit / bce_loss took raw vectors — a NaN feature meant a 0.5
+# blanket fallback at predict, a silently-dropped online step, or a NaN
+# holdout loss. Sanitising in _vectorize covers every path.
+# ---------------------------------------------------------------------
+
+
+def test_predict_proba_salvages_non_finite_feature():
+    # a NaN in ONE feature must zero just that component, not blanket 0.5:
+    # the prediction should equal the same vector with that slot at 0
+    clf = ComplexityClassifier(epochs=50)
+    clf.fit(*_trainable())
+    dirty = _row(0.7)
+    dirty[3] = float("nan")
+    clean = _row(0.7)
+    clean[3] = 0.0
+    assert clf.predict_proba(dirty) == pytest.approx(clf.predict_proba(clean))
+    assert clf.predict_proba(dirty) != 0.5
+
+
+def test_partial_fit_applies_step_despite_non_finite_feature():
+    # pre-fix: a NaN feature poisoned the gradient → non-finite w → the
+    # whole (legitimate) update was silently reverted. Post-fix the NaN
+    # component is zeroed and the step applies.
+    clf = ComplexityClassifier(epochs=50)
+    clf.fit(*_trainable())
+    before = clf.weights_.copy()
+    dirty = _row(0.9)
+    dirty[0] = float("inf")
+    clf.partial_fit([dirty], ["hard"], lr=0.01, steps=1)
+    assert clf.is_finite()
+    assert not np.allclose(clf.weights_, before)
+
+
+def test_bce_loss_finite_on_non_finite_features():
+    clf = ComplexityClassifier(epochs=50)
+    clf.fit(*_trainable())
+    dirty = _row(0.2)
+    dirty[1] = float("-inf")
+    loss = clf.bce_loss([dirty, _row(0.8)], ["easy", "hard"])
+    assert np.isfinite(loss)
+
+
+def test_fit_emits_no_runtime_warnings():
+    # The train-accuracy matmul (post-loop) sat OUTSIDE the errstate block:
+    # on macOS the Accelerate BLAS raises spurious divide/overflow/invalid
+    # FPE flags on matmul even with provably-finite inputs, spamming the
+    # boot/idle-retrain log. On non-Accelerate hosts this passes trivially;
+    # on the production Mac it pins the suppression.
+    import warnings
+
+    clf = ComplexityClassifier(epochs=50)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        clf.fit(*_trainable())
+    assert clf.is_finite()

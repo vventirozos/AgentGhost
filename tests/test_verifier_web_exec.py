@@ -249,3 +249,88 @@ async def test_clean_exec_keeps_text_verdict(tmp_path, monkeypatch):
         lc="build me a web game",
     )
     assert v_result is confirmed
+    assert v_result.confidence == 0.9  # exec-backed → NOT capped
+
+
+# ── skipped/failed probe must cap a CONFIRMED (fail-safe, not fail-open) ──
+def _verdict_agent(verdict_result):
+    """Bare agent whose text verifier returns `verdict_result`."""
+    from unittest.mock import AsyncMock, MagicMock
+    agent = GhostAgent.__new__(GhostAgent)
+    agent.context = MagicMock()
+    agent.available_tools = {}
+    agent._is_strict_trivial_chat = lambda lc: False
+    verifier = MagicMock()
+    verifier.llm_client = MagicMock()
+    verifier.verify_claim = AsyncMock(return_value=verdict_result)
+    agent.context.verifier = verifier
+    return agent
+
+
+_WEB_WRITE_TOOLS = [{"role": "tool", "name": "file_system",
+                     "content": "SUCCESS: Wrote 1000 chars to 'index.html'."}]
+
+
+async def _verdict_for(agent):
+    return await agent._compute_verifier_verdict(
+        tools_run_this_turn=_WEB_WRITE_TOOLS,
+        messages=[{"role": "user", "content": "build me a web game"}],
+        final_ai_content="Done! The game is ready.",
+        last_user_content="build me a web game",
+        lc="build me a web game",
+    )
+
+
+async def test_skipped_exec_caps_text_confirmed():
+    """Live failure (2026-06-20): WEB-EXEC logged 'skipped' and the verifier
+    still said CONFIRMED 100% without ever executing the artifact. A skipped
+    probe must cap a CONFIRMED below the 0.7 consumption threshold."""
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=1.0, reasoning="looks right"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)  # probe skipped
+    v_result, _ = await _verdict_for(agent)
+    assert v_result.verdict == VerifyVerdict.CONFIRMED  # verdict kept
+    assert v_result.confidence == GhostAgent._WEB_EXEC_SKIP_CONF_CAP
+    assert v_result.confidence < 0.7
+    assert "WEB-EXEC inconclusive" in v_result.reasoning
+
+
+async def test_probe_crash_caps_confirmed():
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(side_effect=RuntimeError("boom"))
+    v_result, _ = await _verdict_for(agent)
+    assert v_result.verdict == VerifyVerdict.CONFIRMED
+    assert v_result.confidence == GhostAgent._WEB_EXEC_SKIP_CONF_CAP
+
+
+async def test_skipped_exec_leaves_refuted_untouched():
+    # Refuting is already the fail-safe direction — never weaken it.
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.REFUTED, confidence=0.9, reasoning="wrong"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    v_result, _ = await _verdict_for(agent)
+    assert v_result.verdict == VerifyVerdict.REFUTED
+    assert v_result.confidence == 0.9
+
+
+async def test_no_web_writes_no_cap():
+    # A turn that wrote no web artifacts never runs the probe → no cap.
+    from ghost_agent.core.verifier import VerifyResult, VerifyVerdict
+    agent = _verdict_agent(VerifyResult(
+        verdict=VerifyVerdict.CONFIRMED, confidence=0.95, reasoning="ok"))
+    agent._execute_web_artifact = AsyncMock(return_value=None)
+    tools = [{"role": "tool", "name": "file_system",
+              "content": "SUCCESS: Wrote 90 chars to 'notes.md'."}]
+    v_result, _ = await agent._compute_verifier_verdict(
+        tools_run_this_turn=tools,
+        messages=[{"role": "user", "content": "take a note"}],
+        final_ai_content="Noted.",
+        last_user_content="take a note",
+        lc="take a note",
+    )
+    assert v_result.confidence == 0.95
+    agent._execute_web_artifact.assert_not_awaited()

@@ -212,6 +212,53 @@ async def test_unverified_mutation_triggers_repair_without_verifier(agent):
 
 
 # --------------------------------------------------------------------------
+# WEB-EXEC fail-open closed: a CONFIRMED without execution is capped and,
+# on an untested write, still forces the "actually RUN it" repair
+# --------------------------------------------------------------------------
+
+async def test_web_confirmed_without_exec_is_capped_and_repaired(agent):
+    """Live failure (2026-06-20): the turn wrote a web page, the WEB-EXEC
+    probe logged 'skipped' (no browser tool here), and the verifier said
+    CONFIRMED — pre-fix that shipped as a verified pass on a build that
+    never ran. Post-fix the CONFIRMED is capped below 0.7 and the sync
+    in-loop gate treats the untested write as unverified → repair round."""
+    agent.available_tools["file_system"] = AsyncMock(
+        return_value="SUCCESS: Wrote 1000 chars to 'index.html'.")
+    # Text verifier is confidently wrong BOTH times (finalisation + the
+    # post-loop recompute after the repair round reset the cache).
+    verifier, vmock = _make_verifier([
+        _verdict(VerifyVerdict.CONFIRMED, conf=0.95),
+        _verdict(VerifyVerdict.CONFIRMED, conf=0.95),
+    ])
+    agent.context.verifier = verifier
+
+    calls = []
+    async def _spy(payload, *a, **k):
+        calls.append([m.get("content", "") for m in payload.get("messages", [])])
+        seq = [
+            _tool_call(name="file_system",
+                       args='{"operation": "write", "path": "index.html", "content": "<html>"}'),
+            _final("Done — the page is ready."),          # capped → repair
+            _final("I loaded the page; it renders cleanly."),
+        ]
+        return seq[len(calls) - 1]
+    agent.context.llm_client.chat_completion = AsyncMock(side_effect=_spy)
+    body = {"messages": [{"role": "user", "content": "build me a web page"}],
+            "model": "Qwen-Test"}
+    with patch("ghost_agent.core.agent.pretty_log"):
+        result, _, _ = await agent.handle_chat(body, background_tasks=MagicMock())
+
+    # The repair directive fired despite the CONFIRMED verdict.
+    assert len(calls) == 3
+    third = "\n".join(calls[-1])
+    assert "UNVERIFIED change" in third
+    assert "renders cleanly" in result
+    # Two verifier passes: the capped finalisation verdict + the post-loop
+    # recompute after the repair invalidated the cache.
+    assert vmock.await_count == 2
+
+
+# --------------------------------------------------------------------------
 # Safety: error/abort answers are never repaired
 # --------------------------------------------------------------------------
 

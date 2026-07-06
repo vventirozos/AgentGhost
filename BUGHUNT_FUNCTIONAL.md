@@ -45,8 +45,13 @@ a measured before (log evidence: wasted turns, redundant calls, latency).
 - **Agent**: `python -m src.ghost_agent.main --port 8000` under launchd
   (`/Library/LaunchDaemons/com.local.ghost-agent.plist`, **KeepAlive=true**).
   Upstream LLM = Eva `http://127.0.0.1:8088` (qwen-3.6-35b-a3). Auth OFF
-  (`--api-key ""`). Flags: `--deep-reason --smart-memory 0.9 --enable-metacog
-  --mandatory-tor --autoadvance-idle --postmortem --postmortem-propose-patch`.
+  (`--api-key ""`). Flags as of 2026-07-05 (final): `--verbose --deep-reason
+  --smart-memory 0.9 --max-context 240000 --enable-metacog --metacog-mem-high 98
+  --metacog-mem-floor-mb 300 --mandatory-tor --autoadvance-idle`. Verifier ENABLED
+  (the Jul-4 `--no-verifier` was unintended and is permanently removed); the absence
+  of `--postmortem --postmortem-propose-patch` IS a deliberate operator cost/value
+  decision (do not re-add). The exec line in `bin/start-ghost-agent.sh` is the only
+  source of truth, not this list.
 - **Send a request** (model name is validated — must be `qwen-3.6-35b-a3`):
   ```bash
   curl -s -m 180 -X POST http://127.0.0.1:8000/api/chat \
@@ -91,12 +96,15 @@ Status values: PENDING · IN-PROGRESS · CLEAR.
 
 ## Deferred findings (not yet fixed — revisit)
 
-- **[router] `router/model.py:178` matmul non-finite** (unit 10) — boot/idle retrain
-  logs `RuntimeWarning: divide by zero / overflow / invalid value encountered in matmul`
-  at `preds = (_sigmoid(X_arr @ w + b) >= 0.5)`. `w`/`b` are finite (backstop at ~L169),
-  so `X_arr` (feature matrix) carries non-finite values into matmul → garbage train_acc
-  and, via `predict`, garbage routing. Fix: sanitize/clip features to finite before matmul
-  (both fit and predict). Low severity (warnings, doesn't crash) — take under unit 10.
+- **[router] `router/model.py:178` matmul non-finite — RESOLVED 2026-07-05.** Diagnosis
+  was wrong: inputs at that line are provably finite (design matrix nan_to_num'd at fit
+  entry; per-epoch divergence guard raises before line 178 is reachable), so routing was
+  NOT garbage. The warnings are spurious FPE flags from Apple's Accelerate BLAS (this
+  venv's numpy backend) on matmul with finite data — and that one matmul sat OUTSIDE the
+  fit loop's `errstate` suppression (reconfirmed live at the 17:17 boot). Wrapped it;
+  also moved feature sanitisation to the `_vectorize` choke point so predict_proba /
+  partial_fit / bce_loss no longer take raw vectors (one NaN feature = blanket 0.5
+  predict / silently-dropped online step / NaN holdout loss). tests/test_router_nan_guard.py (+4).
 - **[coding] huge-reasoning, no file spec** (unit 4, REVIEWED — no fix) — `coding_executor: no
   file spec parsed (content=0 reasoning=67454)`. Reviewed: coding_executor.py already salvages by
   re-parsing reasoning+content combined (`extract_json_from_text(f"{reasoning}\n{content}")`),
@@ -139,6 +147,67 @@ Status values: PENDING · IN-PROGRESS · CLEAR.
 ## Session log
 
 (newest first)
+
+### 2026-07-05c — skills_auto graduation producer wiring (BUGHUNT.md unit-25 deferred, closed)
+The graduation pipeline was structurally unreachable in production: corpus had 2058
+UNKNOWN chat turns (1116 with ≥2 tool calls — the latent pool) and ZERO extractor-eligible
+PASSED-with-tools trajectories, because async-critic mode records the trajectory before
+the verdict lands and nothing backfilled the corpus. Fixes:
+1. **[core] late verdict → corpus backfill** — `_record_late_verdict` now routes
+   high-conf verdicts through new `_backfill_trajectory_outcome`: CONFIRMED ≥0.7 →
+   UNKNOWN→PASSED (cache-verified UNKNOWN only, never upgrades FAILED), REFUTED ≥0.7 →
+   FAILED (Reflector/PRM negative). Sidecar overlay, last-write-wins → user corrections
+   still override. tests/test_critic_async.py (+5), test_graduation_producer_wiring.py (3).
+2. **[skills_auto] latent (a)(b)(c)** — consolidator single-member cluster-specific
+   signature (dual store keys), support over-count on same-batch samples, signature-hash
+   delimiter injection. All fixed + regression-pinned (+6). Store empty in prod → hash
+   change migrates nothing.
+3. **[config, ROOT CAUSE of "no late verdict ever"] `--no-verifier` in the production
+   launcher** — live verification kept failing (verdict task invisible: no socket, no
+   log, absent from asyncio.all_tasks); a new SIGUSR2 task-dump handler (main.py;
+   `kill -USR2 <pid>` → every live task + await stack in the log) proved the task was
+   never spawned. `bin/start-ghost-agent.sh` (edited Jul 4 19:10) passed
+   `--no-verifier`, so the whole verdict subsystem (verdicts, WEB-EXEC, verdict-driven
+   lesson retraction, correction banners, corpus labels) was OFF — while the log
+   printed "verdict deferred — verifying asynchronously" every turn, hiding the
+   ablated state even from the operator's stream (misleading-message FIXED: an ablated
+   verifier now logs "verifier is ABLATED (--no-verifier); nothing will land late" —
+   live-verified). FINAL RESOLUTION after an operator round-trip (the flag was
+   unintended; a miscommunication briefly re-added it): `--no-verifier` permanently
+   REMOVED — verifier runs in production; the postmortem flags dropped in the same
+   Jul-4 edit stay off (that half WAS deliberate). Backfill chain re-verified after
+   the final restart: trajectory 0961d276 → passed, LATE CONFIRMED (100%),
+   verifier_late sidecar line.
+4. **[observability] async-verdict done-callback swallowed exceptions bare** — a dying
+   verdict task vanished without a trace; now logs "async verdict task died: …" +
+   "LATE verdict was empty" for the None-result path.
+Docs: docs/algorithms/skill_acquisition.html ("Producer wiring" section),
+docs/self_improvement.md, docs/audit_fixes.html (Round 10). Full suite: 6366 passed /
+11 skipped. LIVE-VERIFIED end-to-end after the config fix: sum7 request →
+"late verdict backfilled into the corpus: trajectory f91d7efa → passed" +
+"LATE CONFIRMED (100%)" in the log, verifier_late line in corrections.jsonl, and
+iter_trajectories yields outcome=passed with seq ['file_system','execute'] —
+extractor-eligible. NOTE the Harness section flags above are stale vs the launcher
+(no --postmortem since Jul 4; --metacog-mem-high 98 --metacog-mem-floor-mb 300 added).
+
+### 2026-07-05b — deferred-findings closure: router matmul noise, WEB-EXEC fail-open, correction-classifier FP (3 fixes)
+1. **[router] matmul warning spam** — RESOLVED (see Deferred findings above: Accelerate
+   FPE noise on a provably-finite matmul left outside `errstate`, + `_vectorize`
+   choke-point sanitisation for the predict/online paths). tests/test_router_nan_guard.py (+4).
+2. **[verifier] WEB-EXEC fail-open** (req-70 residue, observed live 2026-06-20:
+   "WEB-EXEC check skipped" → CONFIRMED 100% on vision alone) — an inconclusive probe
+   (skipped or crashed) on a turn that WROTE web artifacts now caps a CONFIRMED at 0.6
+   (below every ≥0.7 consumption gate); REFUTED never weakened; sync in-loop gate now
+   fires the "actually RUN it" repair on a sub-0.7 CONFIRMED over an untested write
+   (mirrors the async pure-predicate path). tests/test_verifier_web_exec.py (+4),
+   tests/test_verifier_auto_repair.py (+1 end-to-end cap→repair).
+3. **[distill] correction-classifier affirmation FP** (BUGHUNT.md unit-22 deferred) —
+   praise that opens with "actually" and echoes the request no longer promotes the
+   prior turn to FAILED / retracts its lesson: affirmation veto with negative-marker
+   blocking. tests/test_user_correction.py (+5).
+Docs: docs/core/verifier.html, docs/self_improvement.md, docs/audit_fixes.html (Round 10, 3 rows).
+Full suite: 6352 passed / 11 skipped. Agent restarted; router warning absence + health
+verified live post-restart.
 
 ### 2026-07-05 — POST-SWEEP live regression: the chess post-mortem (5 fixes shipped)
 User-reported total failure of "play chess against each other. with YOU, not a generated

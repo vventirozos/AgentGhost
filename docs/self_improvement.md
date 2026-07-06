@@ -34,7 +34,7 @@ the agent's first action — all without any weight update.
 | `ghost_agent.distill` | Trajectory JSONL logs + N-sample self-consistency | `$GHOST_HOME/system/trajectories/` |
 | `ghost_agent.router` | Hand-crafted features → numpy logistic regression → dispatch | `core/agent.py::handle_chat` (body\["_router_decision"\]) |
 | `ghost_agent.optim` | DSPy/GEPA prompt optimisation (scope-gated) | Tunes planning / tool-selection / reflection prompts |
-| `ghost_agent.skills_auto` | Passive skill extraction from validator-passing trajectories | Biological phase 2.6 (logs candidates) |
+| `ghost_agent.skills_auto` | Passive skill extraction from validator-passing trajectories | Biological phase 2.6 (extract → consolidate → verify → graduate to `auto_skills.json`; PASSED input flows from the late-verdict backfill, 2026-07-05) |
 | `ghost_agent.reflection` | Self-critique biological phase on FAILED trajectories | Biological phase 2.5 → composite sink (JSONL + SkillMemory) |
 | `ghost_agent.reflection.postmortem` | Whole-transcript post-mortem → classified, durable defect reports (behavioural / configuration / code_defect) | Biological phase 2.5c (`--postmortem`) → SkillMemory (behavioural) + `DefectQueue` (`$GHOST_HOME/postmortem/`) → `postmortem` tool |
 | `ghost_agent.prm` | Per-step value model — scores `(state, action)` for MCTS lookahead | Biological phase 2.7 (retrain) → `core.mcts.MCTSReasoner` (fast scoring) |
@@ -587,6 +587,24 @@ X?"* is rephrase-without-phrase. Both signals together catch the
 genuine corrections while leaving prosaic follow-ups alone. The
 classifier is purely lexical — no LLM call, no embeddings.
 
+* **Affirmation veto (2026-07-05).** Both signals CAN fire on
+  praise: *"actually the sort you wrote works great"* opens with a
+  correction phrase ("actually") and echoes enough of the request's
+  content words to clear the Jaccard threshold — pre-fix that
+  promoted a GOOD turn to FAILED and retracted its lesson
+  (self-poisoning, the same class the 2026-07-05 chess post-mortem
+  cleaned out of vector memory). Now, when both signals fired, a
+  clear affirmation (`_AFFIRMATION_RE`: "works great/now/fine",
+  "you're right", "looks good", "spot on", …) with **no negative
+  marker** (`_NEGATIVE_MARKER_RE`: anchored "no", "wrong",
+  "doesn't/didn't work", "broke", "still failing", … — phrase-based,
+  no bare "error"/"exception" substrings) vetoes the verdict
+  (`is_correction=False`, `confidence=0.0`, `"affirmation-veto"`
+  appended to `signals` for audit). Ambiguity resolves toward
+  correction: *"No, you're right, …"* still promotes (the anchored
+  "no" blocks the veto) — a missed veto only costs a lesson, a
+  wrongly vetoed real correction costs the FAILED label.
+
 Knobs (module-level constants for runtime tuning):
 
 | Constant | Default | Meaning |
@@ -594,10 +612,10 @@ Knobs (module-level constants for runtime tuning):
 | `JACCARD_REPHRASE_THRESHOLD` | `0.40` | Minimum content-token overlap for Signal B |
 | `MIN_CURRENT_TOKENS_FOR_REPHRASE` | `2` | Floor on current-message content tokens (a bare "no" can't fire B) |
 
-Coverage: `tests/test_user_correction.py` (24 cases — phrase
+Coverage: `tests/test_user_correction.py` (29 cases — phrase
 coverage, single-signal guards, anchored start, defensive
 normalisation of None / non-string inputs, threshold pinning,
-verdict-shape contract).
+verdict-shape contract, affirmation-veto true/false positives).
 
 ### 2. The wiring (`core/agent.py`)
 
@@ -1236,11 +1254,13 @@ The trajectory log is the ingredient Stage 2 (local SFT via rejection
 sampling) needs. `distill.self_consistency.pairwise_pass_fail()`
 produces the (failed, succeeded) pairs; `optim.trainset.build_trainset`
 consolidates them per signature. Training itself needs GPU and is
-out of Stage 1 scope. The skills_auto phase currently LOGS candidates
-only — promoting them into `memory/skills.py` or
-`tools/acquired_skills.py` is a deliberate follow-up step because
-persisting auto-extracted sequences without human review can poison
-retrieval.
+out of Stage 1 scope. The skills_auto phase now graduates verified
+candidates into `auto_skills.json` (support ≥ 3, confidence ≥ 0.5,
+surfaced as "PROVEN APPROACHES" + minted as `proposed` composed
+macros) — and since 2026-07-05 its PASSED input actually exists in
+production: the async late-verdict backfill promotes verifier-CONFIRMED
+chat turns UNKNOWN→PASSED in the corpus (see
+`docs/algorithms/skill_acquisition.html`, "Producer wiring").
 
 The PRM lands as a Stage-1.5 capability: it doesn't fine-tune weights
 (stays inside the no-GPU constraint) but it does close a measurable

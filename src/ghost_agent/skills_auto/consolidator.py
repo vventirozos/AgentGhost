@@ -22,7 +22,7 @@ so f_i = s_i / confidence_i - s_i - 1).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Tuple
 
 from .extractor import SkillCandidate, _signature_hash
@@ -58,7 +58,16 @@ def consolidate(
     merges = 0
     for seq, group in by_seq.items():
         if len(group) == 1:
-            out.append(group[0])
+            # Recompute the signature on the SEQUENCE-ONLY identity, same
+            # as the merged branch below. Post-consolidation the dedupe
+            # identity is the sequence (clusters collapse on merge), so a
+            # single-member passthrough keeping the extractor's
+            # cluster-specific hash would graduate the same skill under a
+            # DIFFERENT store key than a run where the sequence happened
+            # to merge — splitting one skill across two store entries.
+            out.append(replace(
+                group[0], signature_hash=_signature_hash(None, seq),
+            ))
             continue
 
         merges += len(group) - 1

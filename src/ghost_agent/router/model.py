@@ -175,7 +175,15 @@ class ComplexityClassifier:
         self.weights_ = w
         self.bias_ = b
 
-        preds = (_sigmoid(X_arr @ w + b) >= 0.5).astype(float)
+        # errstate: X_arr is sanitized (nan_to_num above) and w/b are
+        # guaranteed finite (the per-epoch guard raises otherwise), so this
+        # matmul cannot see non-finite data — yet on macOS the Accelerate
+        # BLAS raises spurious divide/overflow/invalid FPE flags on matmul
+        # even with finite inputs, and this was the one matmul left outside
+        # the suppression (the boot/idle-retrain warning spam at this line).
+        # Real divergence is still detected explicitly by the guards above.
+        with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+            preds = (_sigmoid(X_arr @ w + b) >= 0.5).astype(float)
         train_acc = float(np.mean(preds == y_arr))
         class_counts = {
             "easy": int(np.sum(y_arr == 0)),
@@ -389,14 +397,23 @@ class ComplexityClassifier:
 
     def _vectorize(self, x: Any) -> np.ndarray:
         if isinstance(x, FeatureVector):
-            return np.array(x.values, dtype=float)
-        if isinstance(x, np.ndarray):
-            return x.astype(float)
-        if isinstance(x, (list, tuple)):
-            return np.array(x, dtype=float)
-        if isinstance(x, str):
-            return np.array(extract_features(x).values, dtype=float)
-        raise TypeError(f"cannot vectorize {type(x).__name__}")
+            vec = np.array(x.values, dtype=float)
+        elif isinstance(x, np.ndarray):
+            vec = x.astype(float)
+        elif isinstance(x, (list, tuple)):
+            vec = np.array(x, dtype=float)
+        elif isinstance(x, str):
+            vec = np.array(extract_features(x).values, dtype=float)
+        else:
+            raise TypeError(f"cannot vectorize {type(x).__name__}")
+        # Sanitise here, the single choke point every path flows through
+        # (fit/partial_fit/bce_loss via _to_arrays, predict_proba directly):
+        # a non-finite feature is always a bug, never signal, and one NaN
+        # otherwise poisons the dot product → a 0.5 blanket fallback at
+        # predict, a silently-dropped partial_fit step, or a NaN holdout
+        # loss. Mapping just the bad component to 0 keeps the remaining
+        # features informative.
+        return np.nan_to_num(vec, nan=0.0, posinf=0.0, neginf=0.0)
 
     def _to_arrays(
         self,

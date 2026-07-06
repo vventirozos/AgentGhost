@@ -1289,6 +1289,43 @@ async def lifespan(app):
     app.state.biological_task = context.biological_task
     pretty_log("Biological Daemon", "Native asyncio watchdog started", icon=Icons.HEARTBEAT)
 
+    # Debug affordance: `kill -USR2 <pid>` dumps every live asyncio task
+    # with the top of its await stack into the log. Built for hunting
+    # silently-parked background coroutines (the async verifier verdict
+    # that never landed, 2026-07-05) — a parked task holds no socket, no
+    # CPU and prints nothing, so from the outside it is indistinguishable
+    # from "done"; this makes the loop's state inspectable in production
+    # without a restart. Signal-safe: the handler only schedules the dump
+    # onto the loop via call_soon_threadsafe.
+    try:
+        import signal as _signal
+
+        def _dump_asyncio_tasks():
+            try:
+                tasks = [t for t in asyncio.all_tasks() if not t.done()]
+                pretty_log("Task Dump", f"{len(tasks)} live asyncio task(s)",
+                           icon=Icons.BRAIN_PLAN, level="WARNING")
+                for t in tasks:
+                    frames = t.get_stack(limit=3)
+                    where = " <- ".join(
+                        f"{f.f_code.co_name}:{f.f_lineno}"
+                        f" ({f.f_code.co_filename.rsplit('/', 1)[-1]})"
+                        for f in reversed(frames)
+                    ) or "(no frame)"
+                    pretty_log("Task Dump",
+                               f"{t.get_name()}: {where}",
+                               icon=Icons.BRAIN_PLAN, level="WARNING")
+            except Exception as _tde:
+                logger.warning("task dump failed: %s", _tde)
+
+        _dump_loop = asyncio.get_running_loop()
+        _signal.signal(
+            _signal.SIGUSR2,
+            lambda *_: _dump_loop.call_soon_threadsafe(_dump_asyncio_tasks),
+        )
+    except Exception as _sge:
+        logger.debug("SIGUSR2 task-dump handler not installed: %s", _sge)
+
     pretty_log("System Ready", "Listening for requests", icon=Icons.SYSTEM_READY)
 
     try:
