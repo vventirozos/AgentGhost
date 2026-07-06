@@ -204,6 +204,55 @@ async def test_build_prefers_content_when_present():
     assert res.ok and res.files == ["parser.py", "README.md"]
 
 
+# --------------------------------------------- think-ate-the-budget retry
+
+class ThinkHogLLM:
+    """First call burns the whole budget inside <think> (content empty,
+    reasoning is prose with NO spec — the live 2026-07-06 failure); the
+    no-think retry then answers with a clean spec."""
+    def __init__(self, retry_content=None):
+        self.calls = 0
+        self.payloads = []
+        self.retry_content = SPEC_OK if retry_content is None else retry_content
+
+    async def chat_completion(self, payload, is_background=False, **_kw):
+        self.calls += 1
+        self.payloads.append(payload)
+        if self.calls == 1:
+            return {"choices": [{"message": {
+                "content": "",
+                "reasoning_content": "The user wants me to build... " * 200}}]}
+        return {"choices": [{"message": {
+            "content": self.retry_content, "reasoning_content": ""}}]}
+
+
+@pytest.mark.asyncio
+async def test_think_only_response_retries_once_without_thinking():
+    llm = ThinkHogLLM()
+    res = await build_coding_task(_ctx(llm), "build x", tool_runner=FakeRunner())
+    assert res.ok and res.files == ["parser.py", "README.md"]
+    assert llm.calls == 2                      # exactly ONE extra call
+    retry = llm.payloads[1]
+    # hard-switch, soft-switch and system nudge all present on the retry
+    assert retry.get("chat_template_kwargs") == {"enable_thinking": False}
+    assert retry["messages"][-1]["content"].rstrip().endswith("/no_think")
+    assert "<think>" in retry["messages"][0]["content"]
+    # first attempt keeps thinking enabled (no hard-switch)
+    assert "chat_template_kwargs" not in llm.payloads[0]
+
+
+@pytest.mark.asyncio
+async def test_prose_content_does_not_trigger_nothink_retry():
+    # Unusable spec but content NON-empty → not the think-hog signature; the
+    # normal feedback loop owns it, no silent extra completion per attempt.
+    llm = FakeReasoningLLM(content="Sorry, here is prose not JSON.",
+                           reasoning="musing")
+    res = await build_coding_task(_ctx(llm), "build x", tool_runner=FakeRunner())
+    assert not res.ok
+    from ghost_agent.core import coding_executor as ce
+    assert llm.calls == ce.MAX_ATTEMPTS       # one call per attempt, no retries
+
+
 async def _instant_sleep(*_a, **_kw):
     return None
 

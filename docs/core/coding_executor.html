@@ -97,6 +97,27 @@
   Covered by <code>test_build_recovers_spec_from_reasoning_content</code> and
   siblings in <code>tests/test_coding_executor.py</code>.</p>
 
+  <h2>Think-ate-the-budget: one no-think retry (2026-07-06)</h2>
+  <p>The reasoning-channel fallback above only helps when the JSON spec actually
+  made it into <code>reasoning_content</code>. The worse shape (observed live
+  2026-07-06, twice in one project: <code>content=0
+  reasoning=40&ndash;62k chars</code>) is the model spending the ENTIRE
+  16384-token budget on think-prose and never starting the JSON at all — each
+  occurrence a ~5-minute generation lost, logged as
+  <code>extract_json_from_text: malformed JSON-like content</code> followed by
+  <code>no file spec parsed</code>. <code>_generate_build_spec</code> now
+  detects exactly this signature (no usable spec AND empty
+  <code>content</code> AND non-empty <code>reasoning</code>) and retries
+  ONCE with thinking disabled, using the established no-think recipe from
+  <code>project_research._llm_call</code>/<code>dream.py</code>: the
+  <code>/no_think</code> soft-switch, the
+  <code>chat_template_kwargs {"enable_thinking": false}</code> hard-switch, and
+  a system nudge. Attempt&nbsp;1 keeps thinking ON (design depth is worth it
+  when it works); prose-in-<code>content</code> failures do NOT trigger the
+  retry (that's the normal feedback loop's job). Covered by
+  <code>test_think_only_response_retries_once_without_thinking</code> and
+  <code>test_prose_content_does_not_trigger_nothink_retry</code>.</p>
+
   <h2>Already-built leaf: empty <code>files</code> + a <code>verify</code> (2026-06-22)</h2>
   <p>When a task's deliverable was already written by a prior interactive turn,
   the autoadvance tick re-picks the task and the model — correctly — returns a

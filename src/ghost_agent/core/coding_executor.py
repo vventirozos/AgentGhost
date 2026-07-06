@@ -376,6 +376,36 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
             # across the closing </think> boundary).
             spec = extract_json_from_text(
                 f"{reasoning}\n{content}", repair_truncated=True) or spec
+    if not _usable(spec) and not content.strip() and reasoning.strip():
+        # The think block consumed the whole max_tokens budget before the
+        # JSON ever started: content is empty and everything sits in the
+        # reasoning channel as prose (observed live 2026-07-06: content=0,
+        # reasoning=40-62k chars, twice in one project — each a ~5-minute
+        # generation lost). Thinking earns its cost on attempt 1, but once
+        # it has eaten the budget the only productive move is ONE retry with
+        # thinking off — same recipe as project_research._llm_call and
+        # dream.py: /no_think soft-switch + enable_thinking=False
+        # hard-switch + a system nudge.
+        logger.warning(
+            "coding_executor: think block consumed the whole budget "
+            "(content=0, reasoning=%d chars) — retrying once with thinking "
+            "disabled", len(reasoning.strip()))
+        resp = await llm.chat_completion({
+            "model": model,
+            "messages": [
+                {"role": "system", "content": sys_hint +
+                 "\nDo NOT emit a <think> block — output the JSON object directly."},
+                {"role": "user", "content": user + "\n\n/no_think"},
+            ],
+            "temperature": 0.3, "max_tokens": 16384, "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }, is_background=is_background)
+        msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        spec = extract_json_from_text(content, repair_truncated=True) or {}
+        if not _usable(spec) and reasoning:
+            spec = extract_json_from_text(reasoning, repair_truncated=True) or spec
     was_empty = not content.strip() and not reasoning.strip()
     if not _usable(spec):
         # Diagnostic: the model returned no usable file spec. Log a window of
