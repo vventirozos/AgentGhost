@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import re
 import sys
 import os
 import threading
@@ -55,6 +56,39 @@ def _embedding_degradation_reason(probe_vector) -> Optional[str]:
             "model — the real all-MiniLM-L6-v2 config was not loaded"
         )
     return None
+
+
+# smart_update dedups on embedding distance, but near-identical *templates*
+# embed close even when the fact differs — "user's favorite color is blue"
+# and "user's favorite food is blue cheese" sit well under the 0.50 dedup
+# threshold yet are DISTINCT facts; deleting one when the other arrives
+# silently erases it. `_subject_key` extracts the subject/attribute a
+# templated fact is ABOUT so smart_update can require the subjects to agree
+# before it treats a close neighbour as the same fact restated.
+_SUBJECT_COPULAS = (" is ", " are ", " was ", " were ")
+_SUBJECT_STOPWORDS = frozenset({
+    "the", "a", "an", "my", "your", "our", "their", "his", "her", "its",
+    "user", "users", "assistant", "i", "you", "we", "they", "he", "she", "it",
+})
+
+
+def _subject_key(text: Optional[str]) -> Optional[str]:
+    """Normalised subject/attribute of a templated fact — e.g.
+    "User's favorite color is blue" → "favorite color". Splits on the first
+    copula (`is`/`are`/`was`/`were`), drops possessives, punctuation and a
+    small stopword set, then keeps the remaining head tokens. Returns None
+    when the text has no copula to split on, so callers fall back to a
+    distance-only decision instead of guessing. Pure — unit-testable."""
+    if not text:
+        return None
+    low = text.strip().lower()
+    idxs = [i for i in (low.find(t) for t in _SUBJECT_COPULAS) if i > 0]
+    if not idxs:
+        return None
+    subject = low[:min(idxs)].replace("'s", " ").replace("’s", " ")
+    subject = re.sub(r"[^a-z0-9 ]+", " ", subject)
+    tokens = [t for t in subject.split() if t not in _SUBJECT_STOPWORDS]
+    return " ".join(tokens) or None
 
 
 def _bm25_score(query_tokens: list, doc_tokens: list, avg_dl: float, k1: float = 1.5, b: float = 0.75) -> float:
@@ -462,12 +496,32 @@ class VectorMemory:
                 if results['ids'] and results['ids'][0]:
                     dist = results['distances'][0][0]
                     existing_id = results['ids'][0][0]
+                    docs = results.get('documents') or []
+                    neighbor_doc = docs[0][0] if docs and docs[0] else None
 
                     # Relaxed threshold (was 0.30). 0.30 almost never fired,
                     # so semantic dupes accumulated. 0.50 still keeps
                     # genuinely distinct memories apart while letting real
                     # paraphrases collapse into a single canonical entry.
-                    if dist < 0.50:
+                    #
+                    # Distance ALONE over-matches on shared templates, though:
+                    # "user's favorite color is blue" and "user's favorite
+                    # food is blue cheese" embed under 0.50 yet are distinct
+                    # facts — deleting one on the other's arrival silently
+                    # ERASES it. Guard: when both texts expose a subject/
+                    # attribute key, only treat the neighbour as the same fact
+                    # when the keys AGREE. Facts with no extractable key fall
+                    # back to distance-only, so genuine paraphrases (which
+                    # don't share this template shape) still collapse.
+                    new_key = _subject_key(text)
+                    neighbor_key = _subject_key(neighbor_doc)
+                    keys_conflict = (
+                        new_key is not None and neighbor_key is not None
+                        and new_key != neighbor_key
+                        and new_key not in neighbor_key
+                        and neighbor_key not in new_key
+                    )
+                    if dist < 0.50 and not keys_conflict:
                         self.collection.delete(ids=[existing_id])
                         pretty_log("Memory Update", f"Refining existing entry (Sim={dist:.2f})", icon=Icons.RETRY)
 
@@ -845,9 +899,16 @@ class VectorMemory:
                 new_id = hashlib.md5(replacement.encode("utf-8")).hexdigest()
                 if new_id != old_id:
                     self.collection.delete(ids=[old_id])
-                    self.collection.add(documents=[replacement],
-                                        metadatas=[old_meta or {"type": "auto"}],
-                                        ids=[new_id])
+                    # `upsert`, not `add`: Chroma derives the doc id from the
+                    # text and SILENTLY IGNORES an `add()` whose id already
+                    # exists. If the corrected text hashes to an id already
+                    # in the collection, a plain add() would be a no-op — old
+                    # fragment deleted, new one never written, correction
+                    # LOST. upsert always lands (same guarantee
+                    # ingest_document relies on).
+                    self.collection.upsert(documents=[replacement],
+                                           metadatas=[old_meta or {"type": "auto"}],
+                                           ids=[new_id])
             pretty_log("Memory Correct",
                        f"'{(old_doc or '')[:60]}…' → '{replacement[:60]}…'",
                        icon=Icons.MEM_SAVE)

@@ -58,7 +58,7 @@
       <tr><td><code>wipe_all()</code></td><td>Truncate.</td></tr>
       <tr><td><code>get_recent_triplets(limit)</code></td><td>Most recent edges.</td></tr>
       <tr><td><code>get_expired_triplets(subject, limit)</code></td><td>Superseded facts.</td></tr>
-      <tr><td><code>execute_graph_compression(merges)</code></td><td>Merge synonym nodes (line 216-266).</td></tr>
+      <tr><td><code>execute_graph_compression(merges)</code></td><td>Merge synonym nodes (entity dedup, <code>old_node → new_node</code>). <strong>Temporal-safe (2026-07-07):</strong> snapshots every triple touching <code>old_node</code> on either side, rewrites <em>both</em> endpoints (so an <code>old→old</code> self-loop survives as <code>new→new</code> instead of being swept by the <code>object = old_node</code> delete), and carries <code>valid_from</code>/<code>valid_until</code> through <code>_merge_triplet_row</code> so a superseded (expired) fact is <em>not</em> resurrected as current. Weights sum without double-counting; a temporal merge is <strong>current-wins</strong> (either side current ⇒ current; both expired ⇒ later expiry, earliest <code>valid_from</code>). Currently unwired (only a no-op stub in <code>dream.py</code> calls it) — hardened before wiring.</td></tr>
       <tr><td><code>get_neighborhood(words, global_limit)</code></td><td>Spreading-activation BFS retrieval.</td></tr>
     </tbody>
   </table>

@@ -6184,11 +6184,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     except Exception:
                         pass
 
-                    # GHOST_PIN_TOOL_SCHEMAS (opt-in, default off): pin the
-                    # byte-stable block to a FIXED position so the upstream
-                    # KV-cache reuses it across every turn of this request (see
-                    # `_compose_injection`). Default off so it's an explicit,
-                    # reversible A/B — flip on to test the latency win.
+                    # GHOST_PIN_TOOL_SCHEMAS: pin the byte-stable block to a
+                    # FIXED position so the upstream KV-cache reuses it across
+                    # every turn of this request (see `_compose_injection`).
+                    # ENABLED durably in PROD via the launcher export
+                    # (bin/start-ghost-agent.sh) and validated holding — a
+                    # per-turn "prefill cache · stable-prefix h=…" log line whose
+                    # hash is stable within a conversation. The CODE default is
+                    # deliberately left OFF: flipping it globally reorders prompt
+                    # assembly for every non-prod launch and trips 8 integration
+                    # tests that pin the unpinned message layout, so durability
+                    # lives in the launcher (the real prod path), not here.
                     _pin_stable = os.getenv("GHOST_PIN_TOOL_SCHEMAS", "0").strip().lower() not in ("0", "false", "no")
                     req_messages = self._compose_injection(
                         req_messages, _stable_injection, dynamic_state, _pin_stable,
@@ -10607,11 +10613,45 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             pretty_log("Request Finished", special_marker="END")
             request_id_context.reset(token)
 
+    # Banners this agent DETERMINISTICALLY prepends to a reply, all sharing
+    # this exact separator and all stacked in FRONT of the answer body:
+    #   • async-verdict correction  — "⚠️ **Correction to my previous answer:** …\n\n---\n\n"  (_consume_pending_corrections)
+    #   • clarifying-question lead-in — "…things.)\n\n---\n\n{body}"                            (finalize)
+    #   • autonomous-progress digest  — "{digest}\n\n---\n\n{body}"                             (finalize)
+    _BANNER_SEP = "\n\n---\n\n"
+    _BANNER_MAX_BLOCK = 1500   # every real banner is far shorter; a longer
+                               # leading block is genuine content before a rule.
+
+    @staticmethod
+    def _strip_leading_banners(text: str) -> str:
+        """Peel any prepended banner block(s) off the front of a reply so the
+        fingerprint keys off the ACTUAL answer body. Each banner is a short
+        block terminated by ``_BANNER_SEP`` and stacked ahead of the body, so
+        we drop leading separator-terminated blocks that are banner-sized
+        (a large leading block before a markdown rule is real content and is
+        left intact). This runs symmetrically at stash- and lookup-time: the
+        banner-less body is invariant, so a next-turn user-correction still
+        matches even though the returned message carried a banner the stashed
+        response text did not (which otherwise shifted the hashed prefix and
+        silently dropped the 'confidently wrong' calibration signal)."""
+        if not isinstance(text, str) or not text:
+            return text
+        sep = GhostAgent._BANNER_SEP
+        body = text
+        for _ in range(4):   # correction + digest + clarifying can co-occur
+            idx = body.find(sep)
+            if 0 <= idx <= GhostAgent._BANNER_MAX_BLOCK:
+                body = body[idx + len(sep):]
+            else:
+                break
+        return body
+
     @staticmethod
     def _response_fingerprint(text: str) -> str:
         """Stable short fingerprint of an assistant response, used as
-        the lookup key for correction-detection. First 500 chars of
-        the response, lowercased and whitespace-collapsed, then
+        the lookup key for correction-detection. Leading banners are
+        peeled (see ``_strip_leading_banners``), then the first 500 chars
+        of the remaining body are lowercased and whitespace-collapsed and
         md5-hashed. Empty input → empty string (a never-matched key).
 
         We hash the prefix, not the full response, because Slack /
@@ -10620,11 +10660,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         round-trip back into the next request's `messages`. Matching
         on a stable prefix tolerates that without false collisions
         for distinct responses (md5 keeps collision risk negligible
-        at this scale)."""
+        at this scale). Peeling the leading banners first makes the key
+        equally tolerant of the correction/clarifying/digest blocks this
+        agent prepends to a reply — the returned text carries them but the
+        stashed response text does not."""
         if not isinstance(text, str) or not text:
             return ""
         import hashlib
-        norm = re.sub(r"\s+", " ", text[:500]).strip().lower()
+        core = GhostAgent._strip_leading_banners(text)
+        norm = re.sub(r"\s+", " ", core[:500]).strip().lower()
         if not norm:
             return ""
         return hashlib.md5(norm.encode("utf-8")).hexdigest()

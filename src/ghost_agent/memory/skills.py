@@ -11,6 +11,18 @@ from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
 
+# Cross-process advisory lock for the JSON playbook. Slack + web + CLI can
+# run in parallel and save skills_playbook.json concurrently; the
+# thread-lock alone only serialises intra-process writes, so two processes
+# could write the same fixed `.tmp` at once and `os.replace` a torn file
+# into place. `fcntl` is POSIX-only — on platforms without it we degrade
+# gracefully to the threading lock (mirrors memory/frontier.py).
+try:
+    import fcntl  # type: ignore
+    _HAS_FCNTL = True
+except ImportError:  # pragma: no cover — Windows fallback
+    _HAS_FCNTL = False
+
 
 # ---------------------------------------------------------------------------
 # Structured lesson schema (additive; backward-compatible with legacy
@@ -407,6 +419,11 @@ class SkillMemory:
     def __init__(self, memory_dir: Path):
         self.file_path = memory_dir / "skills_playbook.json"
         self._lock = threading.RLock()
+        # Sibling file used purely for cross-process `fcntl.flock` around the
+        # atomic save. Kept separate from the data file so the `os.replace`
+        # in `_save_playbook_unlocked` can't race with lock acquisition
+        # (mirrors FrontierTracker).
+        self._lock_path = self.file_path.with_suffix(".lock")
         if not self.file_path.exists():
             self.save_playbook([])
 
@@ -418,11 +435,79 @@ class SkillMemory:
             self._lock = lock
         return lock
 
+    def _crossproc_lock(self):
+        """Context manager that acquires an fcntl advisory lock ACROSS
+        processes on a sibling ``.lock`` file, so two processes (or two
+        SkillMemory instances in one process — same PID, distinct RLocks)
+        can't run the save's write + ``os.replace`` at the same time and
+        promote a torn temp file. No-op fallback on platforms without fcntl,
+        or when ``file_path`` was monkeypatched past ``__init__`` (tests).
+        Mirrors FrontierTracker._crossproc_lock."""
+        memory = self
+
+        class _Ctx:
+            def __enter__(self_inner):
+                self_inner._fh = None
+                if not _HAS_FCNTL:
+                    return
+                lock_path = getattr(memory, "_lock_path", None)
+                if lock_path is None:
+                    # __init__ bypassed (tests set file_path directly) —
+                    # derive the sibling lock path when file_path is a real
+                    # path; skip (no-op) for MagicMock-style file paths.
+                    fp = getattr(memory, "file_path", None)
+                    if isinstance(fp, (str, Path)):
+                        try:
+                            lock_path = Path(fp).with_suffix(".lock")
+                        except Exception:
+                            lock_path = None
+                if not isinstance(lock_path, (str, Path)):
+                    return
+                # Open in append mode so we never truncate; the lock is on
+                # the fd, not the file contents.
+                self_inner._fh = open(lock_path, "a+")
+                try:
+                    fcntl.flock(self_inner._fh.fileno(), fcntl.LOCK_EX)
+                except OSError:
+                    # Lock acquisition failed — degrade to the in-process lock.
+                    self_inner._fh.close()
+                    self_inner._fh = None
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                fh = getattr(self_inner, "_fh", None)
+                if fh is None:
+                    return
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
+
+        return _Ctx()
+
     def _save_playbook_unlocked(self, playbook):
-        """Atomic write — caller MUST already hold self._get_lock()."""
-        temp_path = self.file_path.with_suffix('.tmp')
-        temp_path.write_text(json.dumps(playbook, indent=2))
-        os.replace(temp_path, self.file_path)
+        """Atomic write — caller MUST already hold self._get_lock().
+
+        The temp file name carries the writer's PID so two PROCESSES (Slack,
+        web and CLI each run their own) never write the SAME ``.tmp`` — the
+        old fixed temp path let concurrent processes interleave into one torn
+        file that ``os.replace`` then promoted to the live playbook. The
+        write + replace is additionally serialised across processes by an
+        fcntl advisory lock (``_crossproc_lock``), which also covers two
+        SkillMemory instances in one process. ``os.replace`` stays atomic."""
+        temp_path = self.file_path.with_suffix(f'.{os.getpid()}.tmp')
+        with self._crossproc_lock():
+            try:
+                temp_path.write_text(json.dumps(playbook, indent=2))
+                os.replace(temp_path, self.file_path)
+            finally:
+                # os.replace consumes temp_path on success; this only fires
+                # on the error path (e.g. write_text raised), so a crashed
+                # save doesn't leave a stale pid-named temp behind.
+                try:
+                    if temp_path.exists():
+                        temp_path.unlink()
+                except OSError:
+                    pass
 
     def save_playbook(self, playbook):
         # Helper for atomic save

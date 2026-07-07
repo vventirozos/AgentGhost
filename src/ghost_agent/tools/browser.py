@@ -113,9 +113,10 @@ import ipaddress
 import json
 import os
 import shutil
+import socket
 import sys
 import traceback
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 from playwright.async_api import async_playwright
 
@@ -127,9 +128,17 @@ from playwright.async_api import async_playwright
 # (Tor control), 169.254.169.254 (cloud metadata), a LAN host — would reach
 # host-local services. Chromium does NOT re-vet redirects and bypasses the
 # proxy for loopback. This request interceptor runs at the navigation layer and
-# aborts EVERY http(s) request to an internal host, so it covers redirects,
-# cross-origin subresources (blind-SSRF <img>/<iframe>/fetch), and the .last_url
-# re-navigation. file:// fixtures pass through (not http).
+# aborts EVERY offending request, so it covers redirects, cross-origin
+# subresources (blind-SSRF <img>/<iframe>/fetch), and the .last_url
+# re-navigation. It enforces THREE rules (see _ssrf_should_block):
+#   1. http(s) to an internal HOST STRING (literal IP / known local name).
+#   2. http(s) whose host RE-RESOLVES to an internal IP — the DNS-rebind case
+#      (top-level host vetted public, a later fetch flips to internal). Non-Tor
+#      only: over Tor DNS is at the exit node, so a local lookup both leaks the
+#      query and means nothing (mirrors url_ssrf_reason's `resolve` flag).
+#   3. file:// whose resolved real path ESCAPES the sandbox subtree — a
+#      container-read SSRF (file:///etc/passwd, any path above the mount).
+#      file:// inside the subtree (self-play fixtures) still passes.
 _SSRF_BLOCKED_HOSTNAMES = frozenset({
     "localhost", "ip6-localhost", "ip6-loopback",
     "metadata.google.internal", "metadata",
@@ -153,28 +162,86 @@ def _host_is_internal(host):
             or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
 
 
-def _ssrf_should_block(url):
-    """Block an http(s) request whose host is internal. file://, about:, data:
-    (self-play fixtures + inert schemes) always pass."""
+def _resolves_internal(host, port):
+    """Best-effort: True if `host` DNS-resolves to an internal IP.
+
+    Defeats DNS-rebind of a subresource/redirect host — the original name was
+    vetted while it pointed at a public IP, but a later re-resolution flips it
+    to an internal one, which the host-STRING check can't see. Only used in
+    non-Tor mode (see _ssrf_should_block). A resolution failure returns False
+    so a transient resolver hiccup can't brick a legitimate fetch (matches
+    url_ssrf_reason)."""
+    if not host or _host_is_internal(host):
+        # A literal internal host is already caught by the string check; and a
+        # host we can't resolve just falls through to "allow".
+        return _host_is_internal(host)
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except Exception:
+        return False
+    for info in infos:
+        if _host_is_internal(info[4][0]):
+            return True
+    return False
+
+
+def _file_escapes_sandbox(path, sandbox_root):
+    """True if a file:// path resolves OUTSIDE the sandbox subtree.
+
+    file:// renders self-play fixtures, but under HOST mounts a
+    file:///etc/passwd (or any path above the mount, incl. `../` escapes and
+    symlink hops) is a container-read SSRF. Allowed ONLY when the resolved
+    REAL path stays within `sandbox_root` (the sandbox mount, derived from the
+    profile dir). No declared root → not applicable, file:// passes (the
+    interceptor's caller always declares one in production); an
+    unresolvable/relative path fails CLOSED — a guard must not fail open."""
+    if not sandbox_root:
+        return False
+    try:
+        real = os.path.realpath(unquote(path or ""))
+        root = os.path.realpath(sandbox_root)
+        return os.path.commonpath([root, real]) != root
+    except Exception:
+        return True
+
+
+def _ssrf_should_block(url, sandbox_root=None, anonymous=False):
+    """Return True if this request must be aborted. about:/data: (inert) and
+    an unparseable URL pass; the three real rules are documented on the guard
+    block above. `sandbox_root` scopes file://; `anonymous` (Tor mode) skips
+    the DNS re-resolution so no query leaks to the host resolver."""
     try:
         p = urlparse(str(url or ""))
     except Exception:
         return False
-    if (p.scheme or "").lower() not in ("http", "https"):
+    scheme = (p.scheme or "").lower()
+    if scheme == "file":
+        return _file_escapes_sandbox(p.path, sandbox_root)
+    if scheme not in ("http", "https"):
         return False
-    return _host_is_internal(p.hostname)
+    host = p.hostname
+    if _host_is_internal(host):
+        return True
+    if not anonymous:
+        port = p.port or (443 if scheme == "https" else 80)
+        if _resolves_internal(host, port):
+            return True
+    return False
 
 
-async def _install_ssrf_guard(ctx):
+async def _install_ssrf_guard(ctx, sandbox_root=None, anonymous=False):
     """Register the request interceptor on a BrowserContext. Fail-safe: a
     classification is robust (never raises), and route-method errors degrade
-    to continue so a guard bug can't brick every navigation."""
+    to continue so a guard bug can't brick every navigation.
+
+    `sandbox_root` — the container mount file:// must stay within (/workspace).
+    `anonymous` — Tor mode; skips DNS re-resolution (see _ssrf_should_block)."""
     async def _route(route):
         try:
             u = route.request.url or ""
         except Exception:
             u = ""
-        if _ssrf_should_block(u):
+        if _ssrf_should_block(u, sandbox_root, anonymous):
             try:
                 sys.stderr.write("[BROWSER_SSRF_BLOCK] " + str(u)[:200] + "\n")
                 sys.stderr.flush()
@@ -394,8 +461,12 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
             launch_kwargs["proxy"] = {"server": proxy}
         ctx = await p.chromium.launch_persistent_context(**launch_kwargs)
         # Install the redirect/subresource SSRF guard BEFORE any navigation so
-        # it covers the very first goto (and its redirect chain).
-        await _install_ssrf_guard(ctx)
+        # it covers the very first goto (and its redirect chain). The sandbox
+        # subtree file:// must stay inside is the mount holding the profile dir
+        # (/workspace); a set proxy means Tor mode, where we skip DNS
+        # re-resolution so the guard itself leaks no query.
+        sandbox_root = os.path.dirname(os.path.abspath(profile_dir))
+        await _install_ssrf_guard(ctx, sandbox_root=sandbox_root, anonymous=bool(proxy))
         try:
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             page.set_default_timeout(timeout_ms)

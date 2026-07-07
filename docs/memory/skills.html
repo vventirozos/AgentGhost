@@ -36,6 +36,13 @@
     <li><code>threading.RLock</code> for JSON reads/writes; lazy-init fallback for tests.</li>
   </ul>
 
+  <h3>Atomic save (cross-process)</h3>
+  <p><code>_save_playbook_unlocked</code> writes to a temp file and then <code>os.replace</code>s it over the live playbook (atomic on POSIX). Two problems the in-process <code>RLock</code> alone could not solve — Slack, web and CLI each run their own process — are now closed:</p>
+  <ul>
+    <li><strong>Torn temp file.</strong> The temp path was FIXED (<code>skills_playbook.tmp</code>), so two processes writing at once interleaved into one corrupt temp that <code>os.replace</code> then promoted. The temp name now carries the writer's PID (<code>skills_playbook.&lt;pid&gt;.tmp</code>), so each process promotes only its <em>own</em> fully-written file. Any leftover temp on the error path is unlinked in a <code>finally</code>.</li>
+    <li><strong>Concurrent promotion.</strong> The write + replace is wrapped in an <code>fcntl</code> advisory lock (<code>_crossproc_lock</code>) on a sibling <code>skills_playbook.lock</code> file — mirroring <a href="frontier.html">FrontierTracker</a> — so at most one writer (across processes, or two <code>SkillMemory</code> instances in one process) is inside the critical section at a time. On platforms without <code>fcntl</code> the lock degrades to a graceful no-op (the PID-unique temp still prevents cross-process tearing). Covered by <code>tests/test_memory_crossproc_locking.py</code>.</li>
+  </ul>
+
   <h2>Lesson schema (v2)</h2>
   <pre><code>{
   "schema_version":      2,

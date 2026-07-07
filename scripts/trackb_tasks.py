@@ -116,4 +116,64 @@ def load_trackb_pairs() -> List[SeedProbe]:
             "What is my employee id?",
             says("90210", "e-90210", "e 90210"),
         ),
+        # ── Richer / higher-entropy seeds (2026-07-07). The thin 10-fact set
+        #    left the idle DREAM loop quiet (it needs associative material, not
+        #    isolated single facts). These carry multi-entity structure,
+        #    procedures, and relationships the dream/self-play loops can connect.
+        SeedProbe(
+            "server_map", "graph",
+            "Remember my infra for later: server Falcon runs the API, server "
+            "Wren runs the database, and server Kestrel runs the cache. Acknowledge.",
+            "Which one of my servers runs the database?",
+            says("wren"),
+        ),
+        SeedProbe(
+            "backup_rule", "vector",
+            "Standing procedure to remember: for backups I always use restic to "
+            "the vault named coldstore, never rsync. Acknowledge.",
+            "Which tool do I always use for backups?",
+            says("restic"),
+        ),
+        SeedProbe(
+            "mentor", "profile",
+            "For the future: my mentor's name is Salvora Quen and she taught me "
+            "to always write the test first. Acknowledge.",
+            "What is my mentor's name?",
+            says("salvora", "quen"),
+        ),
+        SeedProbe(
+            "rotation", "vector",
+            "Remember this policy: we rotate the production API keys every 37 "
+            "days. Acknowledge.",
+            "How often do we rotate the production API keys? Give the number of days.",
+            says("37"),
+        ),
+        SeedProbe(
+            "allergy", "profile",
+            "Important for later: I refuse the library called leftpad-9 and it "
+            "must never be added to my projects. Acknowledge.",
+            "Which library must never be added to my projects?",
+            says("leftpad-9", "leftpad 9", "leftpad9"),
+        ),
+        SeedProbe(
+            "repo", "vector",
+            "Remember our repo layout: source lives under quill/, tests under "
+            "proof/, and docs under scroll/. Acknowledge.",
+            "In our repo layout, under which directory do the tests live?",
+            says("proof"),
+        ),
+        SeedProbe(
+            "budget", "vector",
+            "For later: project codenamed Marlin has a monthly cloud budget of "
+            "8300 credits. Acknowledge.",
+            "What is the monthly cloud budget for project Marlin? Give the number.",
+            says("8300"),
+        ),
+        SeedProbe(
+            "standup", "profile",
+            "Remember my schedule: our team standup is at 10:42 every morning, an "
+            "odd time we picked on purpose. Acknowledge.",
+            "What time is our team standup?",
+            says("10:42", "10 42", "1042"),
+        ),
     ]

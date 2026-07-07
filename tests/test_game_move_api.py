@@ -239,6 +239,9 @@ class TestCorrectFragmentUnit:
             def add(self, documents, metadatas, ids):
                 self.rows[ids[0]] = (documents[0], metadatas[0])
 
+            def upsert(self, documents, metadatas, ids):
+                self.rows[ids[0]] = (documents[0], metadatas[0])
+
         vm = object.__new__(VectorMemory)
         vm.collection = FakeCollection()
         return vm

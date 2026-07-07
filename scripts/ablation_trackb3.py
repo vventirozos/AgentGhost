@@ -47,25 +47,87 @@ from ablation_trackb2 import _post  # reuse the proven HTTP helper
 from trackb_tasks import load_trackb_pairs          # SeedProbe(seed, probe, validator)
 
 
+def _mcnemar_exact(b: int, c: int) -> float:
+    """Two-sided exact McNemar p-value on the discordant pair counts (b, c).
+    Exact binomial sign test on n=b+c discordants under H0 p=0.5 — the right
+    choice for the small matched-sample counts this harness produces. Returns
+    1.0 when there are no discordant pairs (no evidence either way)."""
+    import math
+    n = b + c
+    if n == 0:
+        return 1.0
+    k = min(b, c)
+    tail = sum(math.comb(n, i) for i in range(0, k + 1)) * (0.5 ** n)
+    return min(1.0, 2.0 * tail)
+
+
 def _b3_report(records, artifacts, meta) -> str:
     """Self-contained B3 report (trackb2's _build_report expects different meta
     keys — reusing it crashed the first run at the formatting step)."""
+    from collections import defaultdict
     L = [f"# Track B3 — idle-loop adjudication", ""]
     L.append(f"harness meta: {meta}")
+
     # Probe outcomes per arm.
-    from collections import defaultdict
     by_arm = defaultdict(lambda: [0, 0])
     for r in records:
         by_arm[r["arm"]][0] += 1
         by_arm[r["arm"]][1] += 1 if r.get("passed") else 0
     L.append("\n## Probe outcomes")
     for arm, (n, p) in sorted(by_arm.items()):
-        L.append(f"- {arm}: {p}/{n} passed")
+        rate = (p / n) if n else 0.0
+        L.append(f"- {arm}: {p}/{n} passed ({rate:.0%})")
+
+    # #4 — McNemar on MATCHED (item, repeat) probe outcomes: does running the
+    # idle loops between seed and probe change task success vs the idle-off
+    # control? Discordant cells only (concordant pairs carry no information).
+    outcome = {}  # (arm) -> {(item_id, repeat): passed}
+    for r in records:
+        outcome.setdefault(r["arm"], {})[(r["item_id"], r["repeat"])] = bool(r.get("passed"))
+    L.append("\n## McNemar — treatment vs control (matched probe outcomes)")
+    tre, con = outcome.get("treatment", {}), outcome.get("control", {})
+    keys = sorted(set(tre) & set(con))
+    b = sum(1 for k in keys if tre[k] and not con[k])   # treatment win
+    c = sum(1 for k in keys if con[k] and not tre[k])   # control win
+    both = sum(1 for k in keys if tre[k] and con[k])
+    neither = sum(1 for k in keys if not tre[k] and not con[k])
+    p = _mcnemar_exact(b, c)
+    L.append(f"- matched pairs: {len(keys)}  (both pass={both}, both fail={neither})")
+    L.append(f"- discordant: treatment-only win b={b}, control-only win c={c}")
+    L.append(f"- exact McNemar two-sided p = {p:.4f}  "
+             f"→ {'idle loops shift task success' if p < 0.05 else 'no significant probe-success shift (see lesson yield)'}")
+
+    # #27b — verified-lesson yield: frontier self-play (treatment) vs uniform
+    # seeding (treatment_uniform). The keep/delete-PRM decision hinges on
+    # whether frontier selection out-yields a uniform baseline.
+    def _lessons(arm_key):
+        tot = defaultdict(int); grad = 0; macro = 0
+        for rep in artifacts:
+            a = rep.get(arm_key, {})
+            for src, n in (a.get("lessons_by_source", {}) or {}).items():
+                tot[src] += n
+            grad += a.get("graduated_skills", 0)
+            macro += a.get("proposed_macros", 0)
+        return dict(tot), grad, macro
+    has_uniform = any("treatment_uniform" in rep for rep in artifacts)
+    if has_uniform:
+        L.append("\n## #27b — frontier vs uniform self-play (verified-lesson yield)")
+        for arm_key, label in (("treatment", "frontier (default)"),
+                               ("treatment_uniform", "uniform (--no-frontier-selfplay)")):
+            tot, grad, macro = _lessons(arm_key)
+            L.append(f"- {label}: lessons_by_source={tot} "
+                     f"total_lessons={sum(tot.values())} graduated_skills={grad} proposed_macros={macro}")
+        tf, _, _ = _lessons("treatment"); tu, _, _ = _lessons("treatment_uniform")
+        L.append(f"- verdict input: frontier total={sum(tf.values())} vs uniform total={sum(tu.values())} "
+                 f"(pre-registered criterion: keep frontier only if it out-yields uniform across repeats)")
+
     # Learning artifacts produced DURING idle (the primary B3 signal).
-    L.append("\n## Idle-loop learning artifacts (treatment vs control)")
+    L.append("\n## Idle-loop learning artifacts (per repeat, per arm)")
     for rep in artifacts:
         L.append(f"### repeat {rep.get('repeat')}")
-        for arm in ("treatment", "control"):
+        for arm in ("treatment", "treatment_uniform", "control"):
+            if arm not in rep:
+                continue
             a = rep.get(arm, {})
             lbs = a.get("lessons_by_source", {})
             L.append(f"- {arm}: lessons_by_source={lbs} "
@@ -79,8 +141,17 @@ COMMON = ["--upstream-url", "http://127.0.0.1:8088", "--api-key", "",
 
 def _treatment_flags(time_scale: float) -> List[str]:
     # Idle loops accelerated + deterministic so they actually fire in the run.
+    # Frontier-aware self-play is ON by default (the base treatment arm).
     return ["--bio-time-scale", str(time_scale), "--bio-deterministic",
             "--enable-metacog"]
+
+
+def _treatment_uniform_flags(time_scale: float) -> List[str]:
+    # #27b sub-arm: SAME accelerated idle as treatment, but self-play seeds
+    # UNIFORMLY (--no-frontier-selfplay) instead of frontier-weighted. Compared
+    # to the base treatment on verified-lesson yield — does frontier selection
+    # actually earn its ~2k lines vs a uniform-sampling baseline?
+    return _treatment_flags(time_scale) + ["--no-frontier-selfplay"]
 
 
 def _control_flags() -> List[str]:
@@ -182,6 +253,9 @@ def main() -> int:
     ap.add_argument("--model", default=os.getenv("GHOST_MODEL", "qwen-3.6-35b-a3"))
     ap.add_argument("--timeout", type=float, default=300.0)
     ap.add_argument("--boot-timeout", type=float, default=300.0)
+    ap.add_argument("--no-frontier-arm", action="store_true",
+                    help="skip the #27b treatment_uniform (--no-frontier-selfplay) "
+                         "sub-arm; run only treatment vs control")
     ap.add_argument("--report-dir", required=True)
     args = ap.parse_args()
 
@@ -192,14 +266,22 @@ def main() -> int:
     async def _driver():
         for rep in range(args.repeats):
             AE._log(f"=== B3 repeat {rep+1}/{args.repeats} ===")
-            # Sequential arms: the host has room for only ONE throwaway agent
-            # plus prod (Track-A OOM lesson).
+            # Sequential arms: the host has room for only ONE throwaway agent at
+            # a time (Track-A OOM lesson) — prod is stopped for this run.
             t_recs, t_art = await _run_arm(
                 "treatment", _treatment_flags(args.time_scale), args, items, rep, args.epoch_sleep)
+            arts = {"repeat": rep, "treatment": t_art}
+            if not args.no_frontier_arm:
+                u_recs, u_art = await _run_arm(
+                    "treatment_uniform", _treatment_uniform_flags(args.time_scale),
+                    args, items, rep, args.epoch_sleep)
+                all_records.extend(u_recs)
+                arts["treatment_uniform"] = u_art
             c_recs, c_art = await _run_arm(
                 "control", _control_flags(), args, items, rep, args.epoch_sleep)
             all_records.extend(t_recs); all_records.extend(c_recs)
-            all_artifacts.append({"repeat": rep, "treatment": t_art, "control": c_art})
+            arts["control"] = c_art
+            all_artifacts.append(arts)
 
     asyncio.run(_driver())
 

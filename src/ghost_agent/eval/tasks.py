@@ -333,7 +333,10 @@ def _load_regression_probes() -> List[RegressionProbeTask]:
             src = browser._runner_script()
         except Exception as e:
             return False, f"cannot load browser runner: {e}"
-        if "await _install_ssrf_guard(ctx)" not in src:
+        # Tolerant of the guard's kwargs (sandbox_root=, anonymous=) added when
+        # the file://-escape + DNS-rebind residuals were closed — just assert
+        # the interceptor is still installed on the context.
+        if "_install_ssrf_guard(ctx" not in src:
             return False, "browser runner missing the SSRF request interceptor"
         return True, ""
 

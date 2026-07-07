@@ -36,16 +36,35 @@ def test_profile_memory_atomic_save_real_fs(tmp_path):
 def test_skill_memory_atomic_learn_real_fs(tmp_path):
     sm = SkillMemory(tmp_path)
     
-    with patch("os.replace") as mock_replace:
+    # skills.py now writes a PID-unique temp (skills_playbook.<pid>.tmp) so
+    # concurrent processes can't clobber a shared .tmp, then os.replace's it
+    # onto the live file atomically — and a finally-clause unlinks the temp on
+    # any path where replace didn't consume it. So we can't leave a dangling
+    # mock in place (it would delete the temp); instead capture the temp's
+    # content at replace-time and let the REAL replace land the file.
+    captured = {}
+    real_replace = os.replace
+
+    def _capture_and_replace(src, dst):
+        captured["content"] = json.loads(Path(src).read_text())
+        real_replace(src, dst)
+
+    with patch("os.replace", side_effect=_capture_and_replace) as mock_replace:
         sm.learn_lesson("Task", "Mistake", "Solution")
-        
-        expected_tmp = sm.file_path.with_suffix('.tmp')
-        mock_replace.assert_called_with(expected_tmp, sm.file_path)
-        
-        assert expected_tmp.exists()
-        content = json.loads(expected_tmp.read_text())
-        assert len(content) == 1
-        assert content[0]["task"] == "Task"
+
+        assert mock_replace.call_count == 1
+        src_tmp, dst = mock_replace.call_args.args
+        src_tmp = Path(src_tmp)
+        assert dst == sm.file_path
+        expected_tmp = sm.file_path.with_suffix(f'.{os.getpid()}.tmp')
+        assert src_tmp == expected_tmp
+        assert src_tmp.name != "skills_playbook.tmp"  # must be pid-qualified
+
+    # Content written to the temp (captured before the atomic replace) and now
+    # live on disk.
+    assert len(captured["content"]) == 1
+    assert captured["content"][0]["task"] == "Task"
+    assert json.loads(sm.file_path.read_text())[0]["task"] == "Task"
 
 def test_profile_memory_locking(tmp_path):
     # Verify that the lock is acquired

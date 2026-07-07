@@ -24,12 +24,28 @@ Design notes:
 from __future__ import annotations
 
 import logging
+import statistics
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from ..distill.schema import Trajectory
 from .features import extract_step_features
+
+# Features that VARY across training samples (drawn mid-turn) but are ALWAYS 0
+# at the live scoring site — the PRM scores at TURN START, where no step has run
+# yet (steps_so_far=0, failures_so_far=0, no tool used/failed this turn). A fit
+# that leans on them reports a train accuracy the deployed model can't reproduce.
+# We surface this skew (see PRMTrainer.run); a full fix is a training-signal
+# redesign (score at turn start, or drop these columns). Names must exist in
+# PRM_FEATURE_NAMES (guarded by a unit test).
+SERVE_TURN_START_INERT_FEATURES: Tuple[str, ...] = (
+    "plan_steps_so_far_log1p",
+    "plan_failures_so_far_log1p",
+    "plan_has_any_failure",
+    "tool_already_used_this_turn",
+    "tool_failed_this_turn",
+)
 from .labels import (
     StepLabelSpec,
     StepSample,
@@ -75,18 +91,24 @@ class TrainerReport:
     bail_reason: str = ""
     saved_to: str = ""
     model_report: Optional[PRMTrainingReport] = None
+    # Non-empty when the fit leaned on features that are inert at serve time
+    # (see SERVE_TURN_START_INERT_FEATURES) — a caveat on train accuracy.
+    feature_skew_warning: str = ""
 
     def summary(self) -> str:
         if not self.fit_attempted:
             return f"no fit attempted: {self.bail_reason or 'unknown'}"
         if not self.fit_succeeded:
             return f"fit failed: {self.bail_reason or 'unknown'}"
-        return (
+        base = (
             f"trained on {self.n_samples_total} samples "
             f"({self.n_samples_positive}+/{self.n_samples_negative}-) "
             f"from {self.n_trajectories_seen} trajectories; "
             f"saved to {self.saved_to or '<unsaved>'}"
         )
+        if self.feature_skew_warning:
+            base += f"  ⚠ {self.feature_skew_warning}"
+        return base
 
 
 class PRMTrainer:
@@ -111,8 +133,14 @@ class PRMTrainer:
     DEFAULT_MIN_TRAJECTORIES: int = 5
 
     # Each class must have at least this fraction of total samples,
-    # else the model's bias just memorises the prior.
+    # else the model's bias just memorises the prior. Applies to the BINARY
+    # label mode only (see the continuous-mode floor below).
     DEFAULT_MIN_CLASS_FRACTION: float = 0.05
+
+    # Continuous-label mode fits soft targets, so the viability floor is on
+    # label VARIANCE, not binary class balance: an all-but-constant target has
+    # nothing to learn but the mean. std below this ⇒ bail.
+    DEFAULT_MIN_LABEL_STD: float = 0.02
 
     def __init__(
         self,
@@ -121,6 +149,7 @@ class PRMTrainer:
         min_samples: int = DEFAULT_MIN_SAMPLES,
         min_trajectories: int = DEFAULT_MIN_TRAJECTORIES,
         min_class_fraction: float = DEFAULT_MIN_CLASS_FRACTION,
+        min_label_std: float = DEFAULT_MIN_LABEL_STD,
         learning_rate: float = 0.1,
         l2: float = 1e-3,
         epochs: int = 300,
@@ -131,6 +160,7 @@ class PRMTrainer:
         self.min_samples = int(min_samples)
         self.min_trajectories = int(min_trajectories)
         self.min_class_fraction = float(min_class_fraction)
+        self.min_label_std = float(min_label_std)
         self.learning_rate = float(learning_rate)
         self.l2 = float(l2)
         self.epochs = int(epochs)
@@ -184,12 +214,47 @@ class PRMTrainer:
             balance["negative"] / balance["total"]
             if balance["total"] else 0.0
         )
-        if min(pos_frac, neg_frac) < self.min_class_fraction:
-            report.bail_reason = (
-                f"class imbalance: positive={pos_frac:.2%}, "
-                f"negative={neg_frac:.2%} (need ≥{self.min_class_fraction:.0%} of each)"
-            )
-            return report
+        # Training-viability gate — matched to what the fit ACTUALLY consumes.
+        # A binary classifier needs BOTH classes present (a one-sided gradient
+        # sends the bias to ±∞); a continuous regressor only needs the soft
+        # targets to VARY (all-constant y ⇒ nothing to learn but the mean).
+        # Gating the DEFAULT continuous fit on the BINARY class balance wrongly
+        # bailed on a perfectly trainable set whose discount-weighted values all
+        # sit on one side of the 0.5 binary threshold (e.g. 0.1‥0.48 reads as
+        # 100% "negative" in the binary view, yet carries a clean gradient).
+        if self.use_continuous_labels:
+            # Both regimes must be REPRESENTED (≥1 success-side and ≥1
+            # failure-side sample) — a value model that never saw a failure
+            # (or never a success) can't discriminate, so an all-PASSED or
+            # all-FAILED corpus still bails. But we deliberately do NOT
+            # re-impose the binary FRACTION floor: a few high-value anchors
+            # among many lows is a legitimate soft-target gradient, and gating
+            # that on binary balance is exactly the bug this fix removes.
+            if balance["positive"] < 1 or balance["negative"] < 1:
+                report.bail_reason = (
+                    f"class imbalance (single-regime): "
+                    f"{balance['positive']} success-side / "
+                    f"{balance['negative']} failure-side sample(s), need ≥1 of each"
+                )
+                return report
+            # Even with both regimes present, near-constant soft targets carry
+            # no gradient to fit (a safety net for tightly-clustered values).
+            _vals = [float(s.value) for s in samples]
+            _std = statistics.pstdev(_vals) if len(_vals) > 1 else 0.0
+            if _std < self.min_label_std:
+                report.bail_reason = (
+                    f"continuous labels near-constant: std={_std:.4f} "
+                    f"(need ≥{self.min_label_std}); "
+                    f"range=[{min(_vals):.3f}, {max(_vals):.3f}]"
+                )
+                return report
+        else:
+            if min(pos_frac, neg_frac) < self.min_class_fraction:
+                report.bail_reason = (
+                    f"class imbalance: positive={pos_frac:.2%}, "
+                    f"negative={neg_frac:.2%} (need ≥{self.min_class_fraction:.0%} of each)"
+                )
+                return report
 
         # Build training arrays.
         X = [extract_step_features(s.state, s.action) for s in samples]
@@ -197,6 +262,24 @@ class PRMTrainer:
             y = [s.value for s in samples]
         else:
             y = [s.binary for s in samples]
+
+        # Train↔serve skew check: flag serve-inert features that nonetheless
+        # vary across the training samples, so a caller doesn't read the model's
+        # train accuracy as deployed discrimination (the live scorer sees these
+        # as 0). Cheap, best-effort — never blocks a fit.
+        try:
+            skewed = [
+                name for name in SERVE_TURN_START_INERT_FEATURES
+                if statistics.pstdev([fv.by_name.get(name, 0.0) for fv in X]) > 1e-6
+            ] if len(X) > 1 else []
+            if skewed:
+                report.feature_skew_warning = (
+                    "serve-inert features vary in training but read 0 at "
+                    "turn-start scoring: " + ", ".join(sorted(skewed))
+                )
+                logger.warning("PRM %s", report.feature_skew_warning)
+        except Exception as exc:
+            logger.debug("PRM feature-skew check skipped: %s", exc)
 
         report.fit_attempted = True
         try:

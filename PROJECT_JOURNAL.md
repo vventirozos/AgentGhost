@@ -26,12 +26,15 @@ Structure:
 - **Cognitive-layer redesign: APPLIED + deployed** (2026-06-28). A paired ablation showed the
   in-session cognitive stack ≈ a stripped baseline at ~1.8× latency; advisory/ungrounded layers
   are default-OFF via module constants (§3). Cross-session memory DOES earn its keep (Track B).
-- **6-agent improvement review (2026-07-07): 24 of 27 items DONE.** Full unit suite **6508
-  passed / 11 skipped / 0 failed** (+110 tests this cycle). Partials/blocked (§4): #5-big,
-  #6, #7-descriptions, #27b.
+- **6-agent improvement review (2026-07-07): 24 of 27 items DONE**, then #6 (pin durable) and #7
+  (accept lean state — no trim) CLOSED later the same day. Only **#5** (agent.py hot-path refactor,
+  deferred to a focused session) and the **B3-gated #4/#27b** remain. Full unit suite **6587 passed /
+  11 skipped / 0 failed** after the 2026-07-07 correctness/security sweep (+~70 tests).
 - **Live validations (2026-07-07):** KV pin confirmed holding in prod (byte-identical
-  stable-prefix hash across a request's turns); B3 idle-loop ablation ran its first live pass —
-  the pure-idle self-play loop is **proven productive** (treatment produced a lesson, control 0).
+  stable-prefix hash across a request's turns); B3 idle-loop ablation ran a first pass AND a deeper
+  3-arm run — idle loops are **proven productive** (self-play + reflection lessons; control 0), but the
+  fact-recall probes hit a **ceiling** (97% both arms — memory saturates them), so the "does idle output
+  improve *outcomes*" and "frontier vs uniform self-play" verdicts need a harder task battery (§4A #4/#27b).
 
 Deployment: single long-running asyncio process on macOS (Darwin), served on :8000, upstream
 local Qwen3.6-35B-A3B "heretic" on llama-server :8088. RAM-tight (36GB box, llama ~22.6GB
@@ -172,23 +175,50 @@ Everything below is open. Start here. Grouped: (A) improvement-review partials/b
   interface. Each needs live-driven hot-path validation (the unit suite alone can't catch a
   parse/dispatch regression). #26 (test builders) de-risks it. **This is the single biggest
   maintainability lever left** — agent.py is 11k+ lines and every hardening session appends to it.
-- **#6 — flip `GHOST_PIN_TOOL_SCHEMAS` default (CODE-READY).** The blocker (#7c byte-stable tool
-  set) is fixed and the pin is **validated holding in prod**. Remaining: watch llama-server `n_past`
-  with the pin on for a session to quantify the prefill saving, then set it as the launcher default
-  (it's currently set in the live env; make it durable). Operator session.
-- **#7a/b — tool-schema diet (PARTIAL).** #7c (byte-stable advertised set) is done. Remaining: cut
-  the mega tool descriptions ~⅓ (manage_projects 10.6KB — ~4KB is workflow doctrine that belongs in
-  the system prompt / error messages; browser 5.7KB; file_system 4KB) and consolidate the ~12
-  selfhood/meta tools behind one `self_report(area=…)` or semantic routing. Needs **live tool-use
-  validation** (a description trim can regress tool selection; can't be verified headless).
-- **#27b — PRM keep/delete verdict (PARTIAL, blocked on more B3).** B3 showed the self-play loop
-  PRM feeds IS live-productive → "delete PRM (~2k lines)" is **not** triggered. Remaining: the
-  PRM-specific sub-arm — self-play with frontier-weighted (`--frontier-selfplay`) vs uniform seeding,
-  compared on verified-lesson yield — for a full keep/wire decision. Pre-register the criterion.
-- **#4 — B3 deeper run (first pass done).** Remaining: more repeats + a **richer seed set** so the
-  dream loop fires (it needs >3 seed auto-memories for entropy; the 10-task seed was too thin) and
-  the **probe-outcome McNemar** (does idle-produced learning *improve* task success, not just exist?).
-  Harness is ready (`scripts/ablation_trackb3.py`); the report-builder bug is fixed. Operator session.
+- **#6 — `GHOST_PIN_TOOL_SCHEMAS` durable — DONE 2026-07-07.** Durability was already in place: the
+  launcher (`bin/start-ghost-agent.sh` line 231) exports `GHOST_PIN_TOOL_SCHEMAS=1`, which launchd
+  runs — so prod is durable across restarts. Confirmed the pin is **holding live**: a per-turn
+  `prefill cache · stable-prefix h=… len=…` log line, hash stable within a conversation. The **code**
+  default stays OFF deliberately — flipping `os.getenv(..., "0")→"1"` reorders prompt assembly for
+  every non-prod launch and trips 8 integration tests that pin the unpinned message layout (tried,
+  reverted); durability belongs in the launcher, not the global code default. Measurement caveat:
+  precise `n_past` quantification needs llama-server `--metrics` (currently off) — not enabled to
+  avoid restarting the OOM-protected prod LLM; the `--swa-full` caveat in the launcher comment is
+  moot here (Qwen3.6-35B-A3B is full-attention MoE, not SWA). Code comment updated to record the
+  decision.
+- **#7a/b — tool-schema diet — CLOSED 2026-07-07: accept the current lean state (operator decision).**
+  Measured all 35 advertised tools live: the finding's "10.6KB/5.7KB/4KB" were **full** schemas
+  (desc+params); the DESCRIPTIONS are already lean from the #7a/b/c work — `manage_projects` desc is
+  3.3KB (not 10.6KB), `browser` 797 chars, `file_system` 621. Totals: desc 19.5KB, **params 31KB**
+  (~13.5k tokens full). The remaining bulk is PARAMETER schemas, and it's necessary contract:
+  `manage_projects` is one tool exposing **23 actions across 34 fields** (each field explains a
+  non-obvious arg — `ledger`, `constraints`, `count`). Trimming risks the model not knowing an
+  action/arg exists, for token savings the **KV pin already amortizes** across a request's turns. The
+  ~11 "selfhood/meta" tools (introspect, self_state, dream_mode, self_play×3, skills×3) are
+  functionally DISTINCT — folding behind one `self_report()` would conflate different operations and
+  hurt selection. **Decision: no trim.** The descriptions are already lean; the residual size is real
+  contract; a blind cut is net-negative risk (same shape as #6's declined code-default flip). If ever
+  revisited, it must be a live A/B (trim → battery of tool-selection/arg-filling prompts → compare),
+  never a headless cut — but the operator has accepted the lean state, so this is CLOSED.
+- **#27b — PRM keep/delete verdict (STILL OPEN — frontier sub-arm ran, INCONCLUSIVE 2026-07-07).**
+  The frontier-vs-uniform self-play sub-arm executed (deeper B3, 3 arms × 2 repeats). Result: on the
+  metric that matters — *self-play* lesson yield — frontier and uniform **TIED (2 vs 2)**. Frontier's
+  4-vs-2 total edge was entirely 2 *reflection* lessons, which are orthogonal to `--frontier-selfplay`.
+  So at N=2 repeats the frontier selection is a **wash** — no evidence it out-yields uniform seeding.
+  "Delete PRM" is still **not** triggered (self-play loop is productive either way), but "keep frontier
+  BECAUSE it beats uniform" is **unproven**. Verdict needs more repeats + a HARDER task battery (see #4).
+- **#4 — B3 deeper run — EXECUTED 2026-07-07 (methodological result, not a clean win).** Ran 3 arms
+  (treatment/frontier, treatment_uniform, control) × 2 repeats on 18 enriched seeds; added McNemar +
+  frontier-yield to the harness. Findings: (1) **idle loops confirmed productive** — treatment 4
+  lessons (2 self_play + 2 reflection), uniform 2, control 0; reflection fired this time (first pass
+  only got self-play). (2) **Probe-outcome McNemar is a CEILING ARTIFACT** — fact-recall probes sit at
+  ~97% in BOTH arms because memory is ON in both, so they cannot detect idle-loop value (p=1.0 is
+  uninformative, not negative). The "does idle output improve outcomes" question needs a **harder task
+  battery** where recall isn't the bottleneck — the current Track-B recall probes are the wrong
+  instrument. (3) **Dream STILL didn't fire** even with 18 richer seeds — fact-shaped seeds aren't
+  enough; it likely needs failed/diverse *trajectories*, not stored facts. Report:
+  `ablation_out/trackb3-20260707-191216/`. Remaining: harder-task probe suite + more repeats for a
+  real outcome-improvement + frontier verdict.
 - **#1 — version control:** SKIPPED per operator (repo versioned on another server). No action.
 
 Also deferred within done items: #3 launchd supervisor plist in-repo (out-of-repo launcher);
@@ -213,22 +243,41 @@ model-behavior edges.
   mid-turn get stamped with whichever conversation last assembled a prompt. #22's serialization
   should close the concurrent window; confirm, else thread the active project id through each
   `record_*` call.
-- **memory projects metadata split-lock + skills cross-process lock** (med/multi-process) —
-  `projects.py` append_ledger/set_config_value do a read-modify-write across two lock acquisitions
-  (lost update); `skills.py` writes a fixed `.tmp` with only an in-process RLock (torn tmp under
-  multi-process). Mirror `frontier.py`'s fcntl advisory lock.
-- **graph.execute_graph_compression resurrects expired facts** (med/latent, UNWIRED) — node-merge
-  SELECTs without a `valid_until` filter and re-INSERTs without setting it, so superseded facts come
-  back as current; also loses self-loops. Fix before wiring.
-- **vector smart_update template over-match + correct_fragment id-collision** (low-med) —
-  smart_update deletes the nearest neighbor at L2²<0.50 (can erase a distinct fact sharing the
-  "User <key> is <value>" template); correct_fragment deletes old id then add()s new — if the new
-  text hashes to an existing id, add() no-ops and the fragment is lost.
-- **prm binary-floor gates continuous training + train↔serve feature skew** (med/low) — class-balance
-  floor computed on BINARY labels while the model fits CONTINUOUS labels; several step features
-  (steps_so_far, failures_so_far, tool_used/failed_this_turn) are always 0 at the live scoring site
-  (turn start) but vary at train → weaker deployed discrimination than train_accuracy implies. Needs
-  a training-signal redesign. (Relevant to #27b's PRM verdict.)
+- **memory projects metadata split-lock + skills cross-process lock** — **RESOLVED 2026-07-07.**
+  `projects.py` is SQLite-backed, so the RMW (`append_ledger`/`set_ledger`/`set_config_value`) now
+  routes through `_atomic_metadata_update`, which runs SELECT→mutate→UPDATE inside a single
+  `BEGIN IMMEDIATE` transaction (grabs the write lock before the read → cross-connection
+  serialization; a competing writer waits on `busy_timeout` instead of clobbering). `skills.py` (JSON)
+  now writes a **PID-unique** temp and wraps write+`os.replace` in an `fcntl` advisory lock on a
+  sibling `.lock` file (mirrors `frontier.py`, graceful no-op without fcntl). Tests:
+  test_memory_crossproc_locking.py (7). Docs: memory/projects.html, memory/skills.html.
+- **graph.execute_graph_compression resurrects expired facts** — **RESOLVED 2026-07-07.** The
+  node-merge now snapshots every triple touching `old_node` on either side, rewrites *both* endpoints
+  (so an `old→old` self-loop migrates to `new→new` instead of being swept by the `object = old_node`
+  delete), and carries `valid_from`/`valid_until` through a new `_merge_triplet_row` helper — a
+  superseded fact stays expired instead of re-entering as current, weights sum without double-counting,
+  and a temporal merge is current-wins (either side current ⇒ current; both expired ⇒ later expiry +
+  earliest `valid_from`). Still unwired (only a no-op stub in `dream.py` calls it) — hardened before
+  wiring. Tests: test_graph_compression_temporal.py (7). Docs: memory/graph.html.
+- **vector smart_update template over-match + correct_fragment id-collision** — **RESOLVED
+  2026-07-07.** smart_update still computes `dist<0.50` but now ALSO requires the neighbor's
+  extracted subject key to agree before deleting (`_subject_key`: "User's favorite color is blue" →
+  `favorite color`), so a distinct template-sibling ("favorite food") is kept while a genuine
+  restatement still collapses; template-less paraphrases fall back to distance-only (preserves dedup).
+  correct_fragment switched `add()` → `upsert()` so a replacement whose md5-of-text collides with an
+  existing id always lands. Tests: test_vector_memory_dataloss.py (8, reproduction confirmed on
+  revert). Docs: memory/vector.html.
+- **prm binary-floor gates continuous training + train↔serve feature skew** — **RESOLVED (gate) +
+  SURFACED (skew) 2026-07-07.** The training-viability floor is now mode-aware: continuous mode
+  (the default) requires both regimes represented (≥1 success-side + ≥1 failure-side sample, so
+  all-PASSED/all-FAILED still bail) plus a `min_label_std` variance floor, and does NOT re-impose the
+  binary `min_class_fraction`; binary mode keeps the fraction floor. A mostly-failing corpus with a
+  few high-value anchors (~3% binary-positive) now trains instead of false-bailing "class imbalance."
+  The feature skew is now SURFACED: `TrainerReport.feature_skew_warning` flags any
+  `SERVE_TURN_START_INERT_FEATURES` (steps_so_far, failures_so_far, tool_used/failed_this_turn) that
+  carry training variance, so train accuracy isn't read as deployed discrimination. Full skew fix
+  (score at turn start / drop those columns) is still the training-signal redesign — left open,
+  relevant to #27b. Tests: test_prm_binary_floor_and_skew.py (6). Docs: algorithms/prm.md.
 - **reflection selection oldest-first** (low) — `Reflector.run` is oldest-first within a tick (a
   recency window reaches fresh failures faster); `_truncate` head-keeps `tc.error`/`failure_reason`
   (drops the tail exception of a traceback); a diagnosis with "plan:" is truncated at that word.
@@ -237,10 +286,15 @@ model-behavior edges.
   substrings ("exception"/"traceback") match benign read content; `[ATTEMPT_ABORTED_*]` regex is
   searched in the user-facing final_response. Bounded today by the 3-repeat/two-signal gates.
   (Structured `ToolCall.error` on the chat path landed 2026-07-07 as #27d — improves this.)
-- **agent.py correction-lookup fingerprint mismatch on prepended turns** (med) — calib-negative +
-  trajectory stashes key on the pre-prepend response text; the next-turn lookup fingerprints the
-  returned (banner/clarifying/digest-prepended) text → cache miss drops the "confidently wrong"
-  signal on hedged turns. Fix touches the two-mode finalize+return hot path.
+- **agent.py correction-lookup fingerprint mismatch on prepended turns** — **RESOLVED 2026-07-07.**
+  `_response_fingerprint` now peels leading banner blocks (`_strip_leading_banners`) before hashing —
+  the three deterministic prepends (async-verdict correction ⚠️, clarifying-question lead-in,
+  autonomous-progress digest) all share a `\n\n---\n\n` separator and stack in front of the body, so
+  the banner-less core is invariant and stash- (body) vs lookup-time (banner+body) hash the same key.
+  The bound keeps a genuine long intro before a markdown rule intact; peeling loops so stacked banners
+  all strip. Closes the silent drop of the "confidently wrong" calibration-negative + FAILED promotion
+  on hedged/corrected turns. Tests: test_correction_fingerprint_banners.py (11, incl. e2e promotion
+  gate). Docs: self_improvement.md.
 - **streamed-turn calibration gap** (low) — streamed final generations bypass the finalize tail →
   write no calibration JSONL pair, log a competence-only `below=`; verdict deferred to a next-turn
   banner. Async-verification design gap, not a finalize skip.
@@ -264,8 +318,13 @@ model-behavior edges.
   The onion fetch (`_fetch_raw_html`) now STREAMS the body (`iter_content`/`iter_bytes`) and stops at
   `_MAX_ONION_BODY_BYTES` instead of materializing `r.text` whole. Tests: test_download_redirect_ssrf.py
   (9). Docs: file_system.html, darkweb_search.html. Browser SSRF CORE was RESOLVED 2026-07-04
-  (in-sandbox route interceptor); residual (still open): `file://` container-read outside the sandbox
-  subtree when not project-scoped, and DNS-rebind of a subresource hostname in non-Tor mode.
+  (in-sandbox route interceptor); the two residuals are now **RESOLVED 2026-07-07** — the in-sandbox
+  interceptor (`_install_ssrf_guard` in browser.py's embedded runner) now (a) blocks `file://` unless
+  the `os.path.realpath` stays within the `/workspace` sandbox root (component-wise `commonpath`,
+  fail-closed on unresolvable), and (b) in non-Tor mode re-resolves each request host via
+  `getaddrinfo` and aborts on any internal IP (defeats DNS-rebind of a subresource); over Tor the
+  lookup is skipped (no leak, can't route internal anyway). Tests: test_browser_ssrf_residual.py (24).
+  Docs: tools/browser.html.
 - **execute nits** (low) — `_inline_py` `-c` body detector false-block on a chained command reusing
   the delimiter quote (annoyance, never wrong execution); `stateful=True, args=[…]` drops argv[2:];
   file-not-found retry re-runs side-effecting commands (substring heuristic); single global stateful
@@ -340,7 +399,9 @@ inflation), #17 (bound autobiographical), #18 (async-critic bounded repair), #19
 priority), #20 (`spawn_bg`), #21 (/api/health + config dump), #22 (serialize turns), #23 (workspace
 save off-loop), #24 (dream heuristic keying), #25 (redesign doc + docs truth), #26 (test builders),
 #27a (wire context_manager), #27c (graph forgetting + node-cache), #27d (ToolCall.error on chat path).
-PARTIAL/CODE-READY/BLOCKED: #4, #5, #6, #7, #27b (see §4A). SKIPPED: #1 (git).
+CLOSED post-review 2026-07-07: #6 (pin durable via launcher), #7 (accept lean — no trim). STILL OPEN:
+#5 (agent.py refactor — deferred to a focused session), #4 + #27b (B3-gated; deeper run executed
+2026-07-07, see §4A/§6). SKIPPED: #1 (git).
 Full detail of each in §6 and in git history on the other server.
 
 ### 5B. Static bug hunt — 28 units, all CLEAR (2026-07-03/04)
@@ -363,6 +424,25 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-07 — Correctness/security sweep + deeper B3 + #6/#7 closed
+- **7 headless fixes** shipped with tests + docs, suite 6528→**6587** green (0 fail): graph-compression
+  expired-fact resurrection (temporal-safe node merge, +7); correction-lookup banner fingerprint
+  (`_strip_leading_banners`, +11 incl. e2e promotion gate); browser SSRF residuals (`file://` subtree +
+  non-Tor DNS-rebind re-resolve, +24); vector smart_update subject-key guard + correct_fragment upsert
+  (+8); projects/skills cross-process locks (`BEGIN IMMEDIATE` + fcntl/PID-temp, +7); PRM mode-aware
+  training-viability gate + serve-skew warning (+6). Plus 2 stale tests updated (PID-unique tmp; SSRF
+  probe marker tolerant of new kwargs). §4B entries marked RESOLVED.
+- **#6 (pin) CLOSED** — durable already via launcher; code-default flip tried and reverted (broke 8
+  prompt-assembly tests). **#7 (schema diet) CLOSED — accept lean** (operator): descriptions already
+  lean; residual size is necessary param-contract; KV pin amortizes; blind trim is net-negative risk.
+- **Deeper B3 (#4/#27b) executed.** Extended the harness: 18 enriched seeds (was 10 thin fact-recalls),
+  a 3rd `treatment_uniform` (`--no-frontier-selfplay`) arm, exact-McNemar + frontier-yield in the
+  report. 3 arms × 2 repeats vs the shared llama (prod stopped for RAM). Idle loops productive (treat 4
+  / uniform 2 / control 0 lessons; reflection fired). BUT: recall-probe McNemar is a **ceiling artifact**
+  (97% both arms) — wrong instrument; frontier vs uniform self-play **tied 2v2** (inconclusive); dream
+  still didn't fire on fact-seeds. Report: `ablation_out/trackb3-20260707-191216/`. Open work (§4A):
+  harder task battery + more repeats. **#8 (agent.py refactor) deferred** to a focused session by operator.
 
 ### 2026-07-07 — Live validations after the improvement review
 - **KV pin (#6) validated in prod.** Across the 2 turns of a real coding request, the

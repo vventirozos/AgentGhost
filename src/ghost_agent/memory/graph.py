@@ -330,37 +330,30 @@ class GraphMemory:
                     new_node = m.get("new_node", "").lower().strip()
                     if old_node and new_node and old_node != new_node:
                         try:
-                            # Rather than UPDATE OR IGNORE (which silently
-                            # drops merges where the target row exists and
-                            # loses the source weight), explicitly merge
-                            # weights by summing them into the target row.
-                            # Subject-side rewrite.
+                            # Snapshot every triple that touches old_node on
+                            # EITHER side (a self-loop old->old matches once),
+                            # then rewrite old_node -> new_node wherever it
+                            # appears and merge each rewritten triple into the
+                            # target. We carry valid_from/valid_until through so
+                            # a superseded (expired) fact does NOT come back as
+                            # current, and rewrite both endpoints so an
+                            # old->old self-loop survives as new->new instead of
+                            # being deleted. Weights sum; temporal state merges
+                            # current-wins (see _merge_triplet_row).
                             cursor.execute(
-                                '''SELECT predicate, object, weight FROM triplets
-                                   WHERE subject = ?''', (old_node,))
+                                '''SELECT subject, predicate, object, weight, valid_from, valid_until
+                                   FROM triplets WHERE subject = ? OR object = ?''',
+                                (old_node, old_node))
                             src_rows = cursor.fetchall()
-                            for pred, obj, w in src_rows:
-                                cursor.execute(
-                                    '''INSERT INTO triplets (subject, predicate, object, weight, timestamp, valid_from)
-                                       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                                       ON CONFLICT(subject, predicate, object)
-                                       DO UPDATE SET weight = weight + excluded.weight,
-                                                     timestamp = CURRENT_TIMESTAMP''',
-                                    (new_node, pred, obj, int(w or 1)))
-                            # Object-side rewrite.
-                            cursor.execute(
-                                '''SELECT subject, predicate, weight FROM triplets
-                                   WHERE object = ? AND subject != ?''', (old_node, old_node))
-                            obj_rows = cursor.fetchall()
-                            for subj, pred, w in obj_rows:
-                                cursor.execute(
-                                    '''INSERT INTO triplets (subject, predicate, object, weight, timestamp, valid_from)
-                                       VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-                                       ON CONFLICT(subject, predicate, object)
-                                       DO UPDATE SET weight = weight + excluded.weight,
-                                                     timestamp = CURRENT_TIMESTAMP''',
-                                    (subj, pred, new_node, int(w or 1)))
-                            # Now delete all rows that still reference old_node.
+                            for subj, pred, obj, w, vfrom, vuntil in src_rows:
+                                n_subj = new_node if subj == old_node else subj
+                                n_obj = new_node if obj == old_node else obj
+                                self._merge_triplet_row(
+                                    cursor, n_subj, pred, n_obj,
+                                    int(w or 1), vfrom, vuntil)
+                            # Delete the migrated source rows. Rewritten targets
+                            # never reference old_node, so this only removes the
+                            # originals, never the freshly-merged copies.
                             cursor.execute(
                                 "DELETE FROM triplets WHERE subject = ? OR object = ?",
                                 (old_node, old_node))
@@ -371,6 +364,40 @@ class GraphMemory:
             # Rebuild mirror after a structural rewrite — simpler than diffing.
             self.initialize_graph()
         return ops
+
+    @staticmethod
+    def _merge_triplet_row(cursor, subject: str, predicate: str, obj: str,
+                           weight: int, valid_from, valid_until) -> None:
+        """Insert (subject, predicate, obj) or, if it already exists, merge into
+        it: weights sum, valid_from keeps the earliest, and valid_until is
+        current-wins — if EITHER the incoming or existing row is current
+        (valid_until IS NULL) the result is current; if both are expired we keep
+        the later (max) expiry. Used by graph compression so a node merge never
+        resurrects a superseded fact and never double-counts weight."""
+        cursor.execute(
+            '''SELECT weight, valid_from, valid_until FROM triplets
+               WHERE subject = ? AND predicate = ? AND object = ?''',
+            (subject, predicate, obj))
+        existing = cursor.fetchone()
+        if existing is None:
+            cursor.execute(
+                '''INSERT INTO triplets (subject, predicate, object, weight, timestamp, valid_from, valid_until)
+                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)''',
+                (subject, predicate, obj, int(weight or 1), valid_from, valid_until))
+            return
+        ex_w, ex_from, ex_until = existing
+        merged_w = int(ex_w or 1) + int(weight or 1)
+        if ex_until is None or valid_until is None:
+            merged_until = None
+        else:
+            merged_until = max(ex_until, valid_until)
+        froms = [v for v in (ex_from, valid_from) if v is not None]
+        merged_from = min(froms) if froms else None
+        cursor.execute(
+            '''UPDATE triplets SET weight = ?, timestamp = CURRENT_TIMESTAMP,
+                                   valid_from = ?, valid_until = ?
+               WHERE subject = ? AND predicate = ? AND object = ?''',
+            (merged_w, merged_from, merged_until, subject, predicate, obj))
 
     def get_expired_triplets(self, subject: str = None, limit: int = 50) -> List[Dict]:
         """Return expired (superseded) triplets, optionally filtered by subject."""

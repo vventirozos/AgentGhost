@@ -113,7 +113,23 @@ trajectories. Covered by `tests/test_trajectory_failure_heuristic.py`.
                                           └──→ SkillMemory.learn_lesson
                                                (retrieved by memory bus
                                                 on next similar user turn)
+```
 
+> **`response_fp` is banner-insensitive.** The stash keys the trajectory (and the
+> paired calibration components) by `_response_fingerprint` of the *response text*,
+> but the next turn looks it up via `messages[-2]` — the message the client echoed
+> back, which carries any banner this agent deterministically **prepends** to a
+> reply: the async-verdict correction (`⚠️ **Correction to my previous answer:** …`),
+> a clarifying-question lead-in, or an autonomous-progress digest — each terminated
+> by a `\n\n---\n\n` separator and stacked in front of the body. A raw prefix hash
+> shifted on the banner and missed, silently dropping the "confidently wrong"
+> calibration negative + FAILED promotion on exactly the hedged/corrected turns that
+> matter most. `_response_fingerprint` now peels leading banner blocks
+> (`_strip_leading_banners`, bounded so a genuine long intro before a markdown rule
+> is left intact) before hashing, so stash and lookup agree whether or not a banner
+> is present. Covered by `tests/test_correction_fingerprint_banners.py`.
+
+```
    on-demand:
             │
             ▼

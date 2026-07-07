@@ -142,9 +142,10 @@ class TestRouteHandler:
 def test_guard_installed_before_navigation():
     import ghost_agent.tools.browser as browser
     src = browser._runner_script()
-    # Installed inside _with_context, before op_fn runs.
-    assert "await _install_ssrf_guard(ctx)" in src
+    # Installed inside _with_context, before op_fn runs. (The call now passes
+    # sandbox_root/anonymous kwargs, so match the prefix, not the bare `(ctx)`.)
+    assert "await _install_ssrf_guard(ctx," in src
     ctx_idx = src.index("launch_persistent_context")
-    guard_idx = src.index("await _install_ssrf_guard(ctx)")
+    guard_idx = src.index("await _install_ssrf_guard(ctx")
     op_idx = src.index("result = await op_fn(page)")
     assert ctx_idx < guard_idx < op_idx

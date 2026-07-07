@@ -133,13 +133,40 @@ $GHOST_HOME/system/trajectories/YYYY-MM-DD/session-*.jsonl
                   PRMScorer.load(path) → live scoring
 ```
 
-`PRMTrainer.run` enforces three floors before fitting:
+`PRMTrainer.run` enforces size + viability floors before fitting:
 
 | Floor | Default | Why |
 |---|---|---|
 | `min_trajectories` | 5 | Single-trajectory data doesn't span the input distribution. |
 | `min_samples` | 20 | Below this the model overfits hard. |
-| `min_class_fraction` | 5% per class | All-positive (or all-negative) corpora produce a model that just memorizes the prior. |
+| `min_class_fraction` | 5% per class | **Binary mode only** (`use_continuous_labels=False`): a one-sided gradient runs the bias to ±∞. |
+| `min_label_std` | 0.02 | **Continuous mode only:** near-constant soft targets carry no gradient to fit. |
+
+**The viability floor is matched to the label mode (fixed 2026-07-07).**
+The trainer's default is `use_continuous_labels=True` — it fits the
+discount-weighted soft values, not the 0/1 threshold. But the gate used
+to bail on the **binary** class balance (`min_class_fraction` on the 0.5
+threshold view), so a perfectly trainable set whose soft values all sit
+on one side of 0.5 (e.g. a mostly-failing corpus with a few high-value
+success anchors → ~3% binary-positive) was wrongly rejected as "class
+imbalance." Now: continuous mode requires **both regimes represented**
+(≥1 success-side and ≥1 failure-side sample — so an all-PASSED or
+all-FAILED corpus still bails) **plus** a label-variance floor
+(`min_label_std`), and it does *not* re-impose the fraction floor;
+binary mode keeps the original per-class fraction floor.
+
+**Train↔serve feature skew is surfaced.** Several turn-progress features
+(`plan_steps_so_far_log1p`, `plan_failures_so_far_log1p`,
+`plan_has_any_failure`, `tool_already_used_this_turn`,
+`tool_failed_this_turn` — `SERVE_TURN_START_INERT_FEATURES`) vary across
+training samples (drawn mid-turn) but are **always 0 at the live scoring
+site**, which fires at TURN START (no step run, no tool used yet). A fit
+that leans on them reports a train accuracy the deployed model can't
+reproduce. When any such feature carries non-trivial training variance,
+`run` sets `TrainerReport.feature_skew_warning` (and logs it) so the
+caveat rides alongside the accuracy number. A full fix — scoring at turn
+start, or dropping these columns — is a training-signal redesign left as
+a known item.
 
 When ANY floor isn't met, `run` returns a `TrainerReport` with
 `fit_attempted=False` and a human-readable `bail_reason`. **No

@@ -850,43 +850,123 @@ class ProjectStore:
             )
             conn.commit()
 
+    def _atomic_metadata_update(self, project_id: str,
+                                mutate) -> Optional[Dict[str, Any]]:
+        """Read-modify-write a project's metadata atomically ACROSS PROCESSES.
+
+        ``mutate`` receives the current metadata dict, mutates it in place
+        (or returns a replacement dict), and the result is persisted. The
+        whole read-modify-write runs inside a single ``BEGIN IMMEDIATE``
+        transaction so a concurrent metadata writer in ANOTHER process can't
+        interleave and clobber the update. The previous
+        ``get_project`` (read, lock released) → ``_write_metadata`` (write,
+        lock re-taken) shape let two processes both read the same snapshot
+        and lose one side's edit — the in-process ``RLock`` only serialises
+        writers *inside* one process, and Slack, web and CLI each run their
+        own.
+
+        ``BEGIN IMMEDIATE`` takes SQLite's write lock up front, before the
+        read, so a competing writer waits on ``busy_timeout`` instead of
+        racing; ``isolation_level=None`` hands us manual transaction control
+        (Python's sqlite3 otherwise opens a DEFERRED transaction that would
+        not lock until the first write — too late to protect the read).
+
+        Returns the persisted metadata, or ``None`` when the project is
+        missing. Logs no ``project_updated`` event, matching the ledger /
+        config callers that use it.
+        """
+        project_id = _canon_id(project_id)
+        with self._lock, self._connect() as conn:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT metadata_json FROM projects WHERE id = ?",
+                    (project_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return None
+                try:
+                    meta = json.loads(row["metadata_json"] or "{}")
+                except Exception:
+                    meta = {}
+                if not isinstance(meta, dict):
+                    meta = {}
+                new_meta = mutate(meta)
+                if new_meta is None:
+                    new_meta = meta
+                conn.execute(
+                    "UPDATE projects SET metadata_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(new_meta or {}), _now(), project_id),
+                )
+                conn.execute("COMMIT")
+                return new_meta
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+
     def get_ledger(self, project_id: str) -> str:
         proj = self.get_project(project_id)
         return ((proj or {}).get("metadata") or {}).get("design_ledger") or ""
 
     def append_ledger(self, project_id: str, line: str) -> str:
         """Append one line to the project's design ledger (bounded, dedup'd
-        against an identical trailing line). Returns the new ledger text."""
+        against an identical trailing line). Returns the new ledger text.
+
+        The read-modify-write runs inside a single ``BEGIN IMMEDIATE``
+        transaction (via ``_atomic_metadata_update``) so a concurrent ledger
+        / config write in another process can't interleave and drop the
+        appended line."""
         line = " ".join((line or "").split())  # collapse whitespace/newlines
-        proj = self.get_project(project_id)
-        if not proj:
-            return ""
         if not line:
+            # Nothing to append — return the current ledger without writing
+            # (matches the pre-atomic behaviour: no updated_at bump).
+            proj = self.get_project(project_id)
+            if not proj:
+                return ""
             return ((proj.get("metadata") or {}).get("design_ledger") or "")
-        meta = dict(proj.get("metadata") or {})
-        existing = [l for l in (meta.get("design_ledger") or "").splitlines() if l.strip()]
-        if not existing or existing[-1].strip() != line:
-            existing.append(line)
-        existing = existing[-self.LEDGER_MAX_LINES:]
-        text = "\n".join(existing)
-        if len(text) > self.LEDGER_MAX_CHARS:
-            # Drop whole lines from the front until under the char budget.
-            while existing and len("\n".join(existing)) > self.LEDGER_MAX_CHARS:
-                existing.pop(0)
+
+        result = {"text": ""}
+
+        def _mutate(meta):
+            existing = [l for l in (meta.get("design_ledger") or "").splitlines() if l.strip()]
+            if not existing or existing[-1].strip() != line:
+                existing.append(line)
+            existing = existing[-self.LEDGER_MAX_LINES:]
             text = "\n".join(existing)
-        meta["design_ledger"] = text
-        self._write_metadata(project_id, meta)
-        return text
+            if len(text) > self.LEDGER_MAX_CHARS:
+                # Drop whole lines from the front until under the char budget.
+                while existing and len("\n".join(existing)) > self.LEDGER_MAX_CHARS:
+                    existing.pop(0)
+                text = "\n".join(existing)
+            meta["design_ledger"] = text
+            result["text"] = text
+            return meta
+
+        updated = self._atomic_metadata_update(project_id, _mutate)
+        if updated is None:  # project not found
+            return ""
+        return result["text"]
 
     def set_ledger(self, project_id: str, text: str) -> str:
-        """Replace the project's design ledger wholesale (bounded)."""
-        proj = self.get_project(project_id)
-        if not proj:
+        """Replace the project's design ledger wholesale (bounded).
+
+        Atomic across processes (see ``_atomic_metadata_update``) so a
+        concurrent config write to the same project's metadata isn't lost."""
+        new_text = (text or "")[: self.LEDGER_MAX_CHARS]
+
+        def _mutate(meta):
+            meta["design_ledger"] = new_text
+            return meta
+
+        updated = self._atomic_metadata_update(project_id, _mutate)
+        if updated is None:
             return ""
-        meta = dict(proj.get("metadata") or {})
-        meta["design_ledger"] = (text or "")[: self.LEDGER_MAX_CHARS]
-        self._write_metadata(project_id, meta)
-        return meta["design_ledger"]
+        return new_text
 
     # The config slot is the project's durable record of settings that shape
     # how it builds/runs — env vars, key flags, dependency versions, the
@@ -910,32 +990,41 @@ class ProjectStore:
 
         Keys are normalised (trimmed, whitespace-collapsed); an empty value
         deletes the key. The map is capped at ``CONFIG_MAX_KEYS`` (oldest
-        insertion dropped first) and ``CONFIG_MAX_CHARS`` total. Returns the
-        updated config map."""
-        proj = self.get_project(project_id)
-        if not proj:
-            return {}
+        insertion dropped first) and ``CONFIG_MAX_CHARS`` total. The
+        read-modify-write is atomic across processes (see
+        ``_atomic_metadata_update``) so a concurrent config / ledger write
+        can't clobber a sibling key. Returns the updated config map."""
         key = " ".join((key or "").split())
         if not key:
+            # No key to upsert — return the current map without writing.
+            # Also yields {} when the project is missing, as before.
             return self.get_config(project_id)
-        meta = dict(proj.get("metadata") or {})
-        cfg = dict(meta.get("config") or {}) if isinstance(meta.get("config"), dict) else {}
         value = " ".join((value or "").split())[: self.CONFIG_MAX_VALUE_CHARS]
-        if not value:
-            cfg.pop(key, None)
-        else:
-            # Re-insert at the end so the oldest key is dropped first on
-            # overflow (dict preserves insertion order).
-            cfg.pop(key, None)
-            cfg[key] = value
-        # Enforce key count, then total-char budget, dropping oldest first.
-        while len(cfg) > self.CONFIG_MAX_KEYS:
-            cfg.pop(next(iter(cfg)))
-        while cfg and len(json.dumps(cfg)) > self.CONFIG_MAX_CHARS:
-            cfg.pop(next(iter(cfg)))
-        meta["config"] = cfg
-        self._write_metadata(project_id, meta)
-        return cfg
+
+        result = {"cfg": {}}
+
+        def _mutate(meta):
+            cfg = dict(meta.get("config") or {}) if isinstance(meta.get("config"), dict) else {}
+            if not value:
+                cfg.pop(key, None)
+            else:
+                # Re-insert at the end so the oldest key is dropped first on
+                # overflow (dict preserves insertion order).
+                cfg.pop(key, None)
+                cfg[key] = value
+            # Enforce key count, then total-char budget, dropping oldest first.
+            while len(cfg) > self.CONFIG_MAX_KEYS:
+                cfg.pop(next(iter(cfg)))
+            while cfg and len(json.dumps(cfg)) > self.CONFIG_MAX_CHARS:
+                cfg.pop(next(iter(cfg)))
+            meta["config"] = cfg
+            result["cfg"] = cfg
+            return meta
+
+        updated = self._atomic_metadata_update(project_id, _mutate)
+        if updated is None:  # project not found
+            return {}
+        return result["cfg"]
 
     # ------------------------------------------------------------------ events
 
