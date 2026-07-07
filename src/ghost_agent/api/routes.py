@@ -776,8 +776,13 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     agent = get_agent(request)
     # When a project is active, land the upload in its scoped dir so it joins
     # the working set the model sees and the (scoped) file_system can read it.
+    # A client may pass ?project_id=<id> to scope RACE-FREE (the process-global
+    # current_project_id can be pointed at another conversation's project by a
+    # concurrent switch/reconcile); absent that, the global is the fallback.
     from ..tools.file_system import project_scoped_sandbox
-    sandbox_dir = project_scoped_sandbox(agent.context)[0]
+    _qp = getattr(request, "query_params", None)
+    _explicit_pid = _qp.get("project_id") if _qp else None
+    sandbox_dir = project_scoped_sandbox(agent.context, explicit_project_id=_explicit_pid)[0]
     # Reject path traversal AND the absent-filename case explicitly.
     if not file.filename or ".." in file.filename or file.filename.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid filename")
@@ -808,7 +813,10 @@ async def download_file(request: Request, filename: str):
     # isn't at the root, retry under the active project's scoped dir so the
     # link still resolves. Containment is re-checked below.
     if not file_path.exists() and "/" not in filename:
-        pid = getattr(agent.context, "current_project_id", None)
+        # Prefer an explicit ?project_id= (race-free) over the process-global,
+        # which a concurrent conversation's switch could have moved.
+        _qp = getattr(request, "query_params", None)
+        pid = (_qp.get("project_id") if _qp else None) or getattr(agent.context, "current_project_id", None)
         if isinstance(pid, str) and pid.strip():
             cand = (sandbox_dir / "projects" / pid.strip().lower() / filename).resolve()
             if _is_within(sandbox_dir, cand) and cand.exists():

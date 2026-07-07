@@ -200,12 +200,15 @@ graph inverted index (the forgetting pass + node-cache landed).
 Severity in parens. Many are latent (no prod caller), multi-process (single-tenant today), or
 model-behavior edges.
 
-- **`current_project_id` cross-conversation race (projects + api)** (med) — process-global active
-  project set by switch/resume, read live by upload/download scoping + file_system; concurrent
-  conversations can cross-place files. Same class as the workspace event-stamping race. **Partially
-  mitigated 2026-07-07 by #22** (turns serialized, semaphore→1), which closes the concurrent-turn
-  window; the proper fix is still per-conversation scoping, not a global. Re-verify whether #22
-  fully closes this or only narrows it.
+- **`current_project_id` cross-conversation race (projects + api)** — **RESOLVED 2026-07-07.** #22
+  (turn serialization) closes the chat-turn-vs-chat-turn window; the residual was the stateless
+  `/api/upload` + `/api/download` endpoints, which carry no conversation context and read the racy
+  global (a concurrent switch/reconcile could land an upload in another conversation's sandbox).
+  Fix: `project_scoped_sandbox(..., explicit_project_id=)` + a `?project_id=<id>` query param on
+  both endpoints → a client scopes race-free; the global stays the fallback when absent. Tests:
+  test_upload_project_scope.py (6). Docs: file_system.html, api/routes.html. (Full per-conversation
+  threading of every `record_*` call remains the deeper option, but the exploitable API surface is
+  now closed.)
 - **workspace `current_project_id` event-stamping race** (high/likely, but see #22) — events recorded
   mid-turn get stamped with whichever conversation last assembled a prompt. #22's serialization
   should close the concurrent window; confirm, else thread the active project id through each
@@ -250,18 +253,19 @@ model-behavior edges.
   thread step N output into step N+1 ($var only resolves against initial params — feature gap);
   qwen_bridge `_run_coro_blocking` runs each native coroutine on a fresh loop (cross-loop error if a
   native tool caches a loop-bound client — agent_qwen.py variant only).
-- **file_system replace bad-byte write-back corruption** (med/likely) — `tool_replace_text` reads
-  with `errors="replace"` then writes the whole file back → a mostly-text file with a few
-  invalid-UTF-8 bytes has every bad byte persisted as U+FFFD (corrupts untouched regions). Correct
-  fix: `errors="surrogateescape"` round-trip through the shared write path. (The .tmp-leak half was
-  fixed.)
-- **file_system + darkweb SSRF-on-redirect / body-cap** (med) — `tool_download_file` validates the
-  original URL but both clients follow redirects → non-Tor 302 → link-local/metadata bypasses the
-  guard (fix: disable auto-redirect, manually follow ≤N hops re-validating each Location);
-  `_fetch_onion_text` reads the whole response before `_cap_body` → a chunked no-Content-Length onion
-  body OOMs the host (apply the streaming cap). Browser SSRF CORE was RESOLVED 2026-07-04 (in-sandbox
-  route interceptor); residual: `file://` container-read outside the sandbox subtree when not
-  project-scoped, and DNS-rebind of a subresource hostname in non-Tor mode.
+- **file_system replace bad-byte write-back corruption** — **RESOLVED 2026-07-07.** The replace
+  read + guarded write + streaming path now use `errors="surrogateescape"`, so untouched non-UTF-8
+  bytes round-trip to their exact originals instead of being persisted as U+FFFD; the
+  syntax-regression guard fails open when `ast.parse` raises `UnicodeEncodeError` on a lone
+  surrogate. Tests: test_replace_bad_byte_roundtrip.py (5). Docs: tools/file_system.html.
+- **file_system + darkweb SSRF-on-redirect / body-cap** — **RESOLVED 2026-07-07.**
+  `tool_download_file` disables auto-redirect and follows hops manually, re-validating each
+  `Location` with the SSRF guard (`_download_redirect_target`, bounded at `_MAX_DOWNLOAD_REDIRECTS`).
+  The onion fetch (`_fetch_raw_html`) now STREAMS the body (`iter_content`/`iter_bytes`) and stops at
+  `_MAX_ONION_BODY_BYTES` instead of materializing `r.text` whole. Tests: test_download_redirect_ssrf.py
+  (9). Docs: file_system.html, darkweb_search.html. Browser SSRF CORE was RESOLVED 2026-07-04
+  (in-sandbox route interceptor); residual (still open): `file://` container-read outside the sandbox
+  subtree when not project-scoped, and DNS-rebind of a subresource hostname in non-Tor mode.
 - **execute nits** (low) — `_inline_py` `-c` body detector false-block on a chained command reusing
   the delimiter quote (annoyance, never wrong execution); `stateful=True, args=[…]` drops argv[2:];
   file-not-found retry re-runs side-effecting commands (substring heuristic); single global stateful

@@ -349,6 +349,15 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
     exhaust the shared executor. Returns (status_code, body); (None, "") on
     transport failure."""
 
+    # Read at most this many BYTES off the wire regardless of Content-Length.
+    # An untrusted onion engine can send a chunked body with no (or a lying)
+    # Content-Length; reading `r.text` (the whole body into RAM) before
+    # `_cap_body` could truncate it OOMs the host. Stream and stop at the cap.
+    _STREAM_LIMIT = _MAX_ONION_BODY_BYTES + 4096
+
+    def _decode(buf: bytes) -> str:
+        return buf.decode("utf-8", errors="replace")
+
     def run() -> Tuple[Optional[int], str]:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -359,16 +368,31 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
 
             proxies = {"http": proxy, "https": proxy} if proxy else None
             with creq.Session(impersonate="chrome110", proxies=proxies, timeout=timeout) as c:
-                r = c.get(url, headers=headers)
+                r = c.get(url, headers=headers, stream=True)
+                buf = bytearray()
+                try:
+                    for chunk in r.iter_content():
+                        if chunk:
+                            buf.extend(chunk)
+                            if len(buf) >= _STREAM_LIMIT:
+                                break
+                finally:
+                    try: r.close()
+                    except Exception: pass
                 return _cap_body(r.status_code, r.headers.get("content-type"),
-                                 r.headers.get("content-length"), r.text)
+                                 r.headers.get("content-length"), _decode(bytes(buf)))
         except ImportError:
             import httpx
 
             with httpx.Client(proxy=proxy, timeout=timeout, follow_redirects=True) as c:
-                r = c.get(url, headers=headers)
-                return _cap_body(r.status_code, r.headers.get("content-type"),
-                                 r.headers.get("content-length"), r.text)
+                with c.stream("GET", url, headers=headers) as r:
+                    buf = bytearray()
+                    for chunk in r.iter_bytes():
+                        buf.extend(chunk)
+                        if len(buf) >= _STREAM_LIMIT:
+                            break
+                    return _cap_body(r.status_code, r.headers.get("content-type"),
+                                     r.headers.get("content-length"), _decode(bytes(buf)))
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_ONION_EXECUTOR, run)

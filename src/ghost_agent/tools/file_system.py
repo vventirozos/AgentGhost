@@ -358,11 +358,19 @@ def _conversation_bound_project(context) -> str:
     return ""
 
 
-def project_scoped_sandbox(context, stateful: bool = False):
+def project_scoped_sandbox(context, stateful: bool = False, explicit_project_id=None):
     """Return ``(host_dir, container_workdir)`` scoped to the active project's
     workspace (``<sandbox>/projects/<id>/``), creating the dir on demand; or
     ``(sandbox_root, None)`` when no project is active (or ``stateful=True``,
     since the Jupyter kernel is pinned to ``/workspace``).
+
+    ``explicit_project_id`` (when a non-empty string) scopes to THAT project
+    directly, bypassing the process-global ``current_project_id``. The
+    stateless ``/api/upload`` / ``/api/download`` endpoints carry no
+    conversation context, so they read the global — which a concurrent
+    conversation's switch/reconcile can point at the wrong project, landing an
+    upload in another conversation's sandbox. A client that passes its own
+    ``project_id`` gets a race-free scope (the global stays the fallback).
 
     This is the SINGLE SOURCE OF TRUTH for per-project sandbox scoping. Every
     surface that reads or writes the agent's working files routes through it
@@ -378,9 +386,13 @@ def project_scoped_sandbox(context, stateful: bool = False):
     """
     sb = getattr(context, "sandbox_dir", None)
     base = Path(sb) if sb is not None else None
-    pid = getattr(context, "current_project_id", None)
-    pid = pid.strip().lower() if isinstance(pid, str) else ""
-    if not pid and not stateful:
+    # An explicit caller-supplied project id wins over the racy global.
+    if isinstance(explicit_project_id, str) and explicit_project_id.strip():
+        pid = explicit_project_id.strip().lower()
+    else:
+        pid = getattr(context, "current_project_id", None)
+        pid = pid.strip().lower() if isinstance(pid, str) else ""
+    if not pid and not stateful and explicit_project_id is None:
         # ``current_project_id`` is process-global and can be cleared MID-REQUEST
         # by a concurrent conversation's reconcile (observed live: a 700s
         # autoadvance+manual build had its scoping wiped, so the agent's file
@@ -787,13 +799,14 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                     replaced = 0
                     tmp_path = None
                     try:
-                        # errors="replace" for the same tolerance as the
-                        # non-streaming path above (bad-byte write-back is a
-                        # deferred finding, not fixed here).
-                        with open(path, 'r', encoding='utf-8', errors='replace') as f_in:
+                        # surrogateescape on BOTH read and write so untouched
+                        # bad bytes round-trip to their exact originals (matches
+                        # the non-streaming path); errors="replace" used to
+                        # corrupt them to U+FFFD on write-back.
+                        with open(path, 'r', encoding='utf-8', errors='surrogateescape') as f_in:
                             with tempfile.NamedTemporaryFile(mode='w', dir=path.parent,
                                                             suffix='.tmp', delete=False,
-                                                            encoding='utf-8') as f_out:
+                                                            encoding='utf-8', errors='surrogateescape') as f_out:
                                 tmp_path = Path(f_out.name)
                                 for line in f_in:
                                     if old_text in line:
@@ -822,13 +835,15 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 return f"Error: Streaming replace failed: {e}"
 
         try:
-            # NOTE: errors="replace" is deliberately tolerant so a mostly-text
-            # file with a few stray bad bytes can still be edited. The known
-            # downside (untouched bad bytes are persisted as U+FFFD on
-            # write-back) is tracked as a deferred finding in BUGHUNT.md; the
-            # correct fix is a surrogateescape round-trip through the shared
-            # write path, which is out of scope for this pass.
-            file_content = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="replace")
+            # errors="surrogateescape" (not "replace"): a mostly-text file with
+            # a few stray non-UTF-8 bytes stays editable, AND the bad bytes
+            # ROUND-TRIP losslessly — each becomes a lone surrogate on read and
+            # is re-encoded to the exact original byte on write (see the
+            # matching surrogateescape write in _write_replace_guarded and the
+            # streaming path). Previously errors="replace" persisted every bad
+            # byte as U+FFFD on write-back, corrupting regions the edit never
+            # touched (was a deferred finding).
+            file_content = await asyncio.to_thread(path.read_text, encoding="utf-8", errors="surrogateescape")
         except (UnicodeDecodeError, LookupError):
             return f"Error: '{filename}' appears to be a binary file and cannot be text-replaced."
         except OSError as oe:
@@ -1563,6 +1578,13 @@ def _syntax_regression(prev_content: str, new_content: str, filename: str) -> st
             except SyntaxError:
                 return ""  # already broken — not a regression
             return f"{se.msg} (line {se.lineno}, col {se.offset})"
+        except Exception:
+            # ast.parse can raise UnicodeEncodeError/ValueError (not a
+            # SyntaxError) on content carrying lone surrogates — which the
+            # surrogateescape read preserves for a file with stray non-UTF-8
+            # bytes. We can't judge a regression then, so FAIL OPEN (allow the
+            # edit) rather than crash the replace.
+            return ""
     elif ext == "json":
         try:
             json.loads(new_content)
@@ -1573,6 +1595,8 @@ def _syntax_regression(prev_content: str, new_content: str, filename: str) -> st
             except json.JSONDecodeError:
                 return ""
             return f"{je.msg} (line {je.lineno}, col {je.colno})"
+        except Exception:
+            return ""
     return ""
 
 
@@ -1598,7 +1622,12 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
             f"Re-read the file, then emit a TIGHT single-line SEARCH/REPLACE "
             f"for the surgical edit. Do NOT rewrite the whole file."
         )
-    await asyncio.to_thread(path.write_text, new_content, encoding="utf-8")
+    # errors="surrogateescape": new_content is the replace result, which splices
+    # the LLM's (clean) replacement into the untouched file body — that body may
+    # carry lone surrogates from bytes the surrogateescape READ preserved. Write
+    # them back as the exact original bytes; a default (strict) write would raise
+    # UnicodeEncodeError on those surrogates.
+    await asyncio.to_thread(path.write_text, new_content, encoding="utf-8", errors="surrogateescape")
     return success_msg + await _syntax_feedback(path, filename)
 
 
@@ -1710,11 +1739,41 @@ async def tool_list_files(sandbox_dir: Path, memory_system=None):
         return f"CURRENT SANDBOX DIRECTORY STRUCTURE:\n{sandbox_tree}\n\n(Use these filenames for all file tools)"
     except Exception as e: return f"Error scanning sandbox: {e}"
 
+# Max HTTP redirect hops the downloader will follow. Each hop's Location is
+# re-validated against the SSRF guard, so a public page 302-redirecting to
+# 127.0.0.1 / 169.254.169.254 / a LAN host is blocked — the original-URL-only
+# check missed this because both clients auto-follow redirects.
+_MAX_DOWNLOAD_REDIRECTS = 5
+
+
+def _download_redirect_target(status, headers, cur_url, ssrf_reason):
+    """Redirect-hop decision for the downloader.
+
+    Returns ``(target_url, error)``:
+      * ``(url, None)`` — this is a redirect to a SAFE host; follow it.
+      * ``(None, "Error: …")`` — redirect to an SSRF host; block.
+      * ``(None, None)`` — not a redirect; this is the final response.
+    """
+    if status in (301, 302, 303, 307, 308):
+        loc = headers.get("location") or headers.get("Location")
+        if loc:
+            target = urllib.parse.urljoin(str(cur_url), str(loc))
+            reason = ssrf_reason(target)
+            if reason:
+                return None, f"Error: download redirect blocked (SSRF): {reason}"
+            return target, None
+    return None, None
+
+
 async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filename: str = None):
     # --- SSRF guard (shared) ---
     # Block file:// and internal/metadata hosts BEFORE any fetch, so the
     # LLM can't make the host read local files or reach 169.254.169.254 /
-    # loopback services. file:// is reachable regardless of the proxy.
+    # loopback services. file:// is reachable regardless of the proxy. Every
+    # REDIRECT hop is re-validated below (both HTTP clients auto-followed
+    # redirects, so a 302 → internal host used to bypass this original-URL
+    # check on the non-Tor WEB path; under Tor the SOCKS proxy already can't
+    # reach link-local/metadata).
     from ..utils.helpers import url_ssrf_reason as _url_ssrf_reason
     _ssrf = _url_ssrf_reason(url)
     if _ssrf:
@@ -1740,14 +1799,32 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                 except ValueError as ve: return str(ve)
                 
                 async with curl_requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=60.0) as client:
-                    resp = await client.get(url, stream=True)
+                    # Manual redirect follow (auto-redirect OFF) so each hop's
+                    # Location is SSRF-validated before we fetch it.
+                    cur_url = url
+                    resp = None
+                    for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+                        resp = await client.get(cur_url, stream=True, allow_redirects=False)
+                        _next, _rerr = _download_redirect_target(
+                            resp.status_code, resp.headers, cur_url, _url_ssrf_reason)
+                        if _rerr:
+                            try: resp.close()
+                            except Exception: pass
+                            return _rerr
+                        if _next is None:
+                            break  # final (non-redirect) response
+                        try: resp.close()
+                        except Exception: pass
+                        cur_url = _next
+                    else:
+                        return "Error: too many redirects (possible redirect loop)."
                     if resp.status_code != 200:
                         if resp.status_code in [401, 403, 503] and mode == "TOR":
                             await asyncio.to_thread(request_new_tor_identity)
                             await asyncio.sleep(5)
                             continue
                         return f"Error {resp.status_code} - Failed to download from {url}"
-                    
+
                     clength = resp.headers.get("Content-Length")
                     if clength and int(clength) > 50000000:
                         return f"Error: File is too large ({int(clength)/1000000:.1f}MB). Download limit is 50MB."
@@ -1776,47 +1853,66 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                         return "Error: download exceeded the 50MB cap (server omitted or exceeded Content-Length)."
                     return f"SUCCESS: Downloaded '{url}' to '{filename}'."
             else:
-                async with httpx.AsyncClient(proxy=proxy_url, headers=headers, follow_redirects=True, timeout=60.0) as client:
-                    async with client.stream("GET", url) as resp:
-                        if resp.status_code != 200:
-                            if resp.status_code in [401, 403, 503] and mode == "TOR":
-                                await asyncio.to_thread(request_new_tor_identity)
-                                await asyncio.sleep(5)
-                                continue
-                            return f"Error {resp.status_code} - Failed to download from {url}"
-                        
-                        clength = resp.headers.get("Content-Length")
-                        if clength and int(clength) > 50000000:
-                            return f"Error: File is too large ({int(clength)/1000000:.1f}MB). Download limit is 50MB."
+                # follow_redirects=False + manual hop loop so each Location is
+                # SSRF-validated before the fetch (see _download_redirect_target).
+                async with httpx.AsyncClient(proxy=proxy_url, headers=headers, follow_redirects=False, timeout=60.0) as client:
+                    cur_url = url
+                    for _hop in range(_MAX_DOWNLOAD_REDIRECTS + 1):
+                        async with client.stream("GET", cur_url) as resp:
+                            _next, _rerr = _download_redirect_target(
+                                resp.status_code, resp.headers, cur_url, _url_ssrf_reason)
+                            if _rerr:
+                                return _rerr
+                            if _next is not None:
+                                cur_url = _next
+                                continue  # closes this stream, re-requests the validated hop
+                            if resp.status_code != 200:
+                                if resp.status_code in [401, 403, 503] and mode == "TOR":
+                                    await asyncio.to_thread(request_new_tor_identity)
+                                    await asyncio.sleep(5)
+                                    break  # break the hop loop → outer attempt retry
+                                return f"Error {resp.status_code} - Failed to download from {url}"
 
-                        try:
-                            target_path = _get_safe_path(sandbox_dir, filename)
-                        except ValueError as ve: return str(ve)
+                            clength = resp.headers.get("Content-Length")
+                            if clength and int(clength) > 50000000:
+                                return f"Error: File is too large ({int(clength)/1000000:.1f}MB). Download limit is 50MB."
 
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                            try:
+                                target_path = _get_safe_path(sandbox_dir, filename)
+                            except ValueError as ve: return str(ve)
 
-                        _MAX_DL = 50_000_000
-                        _total = 0
-                        _overflow = False
-                        with open(target_path, "wb") as f:
-                            buffer = bytearray()
-                            async for chunk in resp.aiter_bytes():
-                                buffer.extend(chunk)
-                                _total += len(chunk)
-                                if _total > _MAX_DL:
-                                    _overflow = True
-                                    break
-                                if len(buffer) >= 1024 * 1024:
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+
+                            _MAX_DL = 50_000_000
+                            _total = 0
+                            _overflow = False
+                            with open(target_path, "wb") as f:
+                                buffer = bytearray()
+                                async for chunk in resp.aiter_bytes():
+                                    buffer.extend(chunk)
+                                    _total += len(chunk)
+                                    if _total > _MAX_DL:
+                                        _overflow = True
+                                        break
+                                    if len(buffer) >= 1024 * 1024:
+                                        await asyncio.to_thread(f.write, buffer)
+                                        buffer.clear()
+                                if buffer and not _overflow:
                                     await asyncio.to_thread(f.write, buffer)
-                                    buffer.clear()
-                            if buffer and not _overflow:
-                                await asyncio.to_thread(f.write, buffer)
-                        if _overflow:
-                            try: target_path.unlink()
-                            except Exception: pass
-                            return "Error: download exceeded the 50MB cap (server omitted or exceeded Content-Length)."
+                            if _overflow:
+                                try: target_path.unlink()
+                                except Exception: pass
+                                return "Error: download exceeded the 50MB cap (server omitted or exceeded Content-Length)."
 
-                    return f"SUCCESS: Downloaded '{url}' to '{filename}'."
+                            return f"SUCCESS: Downloaded '{url}' to '{filename}'."
+                    else:
+                        return "Error: too many redirects (possible redirect loop)."
+                    # reached only via the 401/403/503 `break` → fall to the
+                    # outer `for attempt` Tor-identity retry.
+                    if mode == "TOR":
+                        await asyncio.to_thread(request_new_tor_identity)
+                        await asyncio.sleep(5)
+                        continue
         except Exception as e:
             last_error = e
             if mode == "TOR":
