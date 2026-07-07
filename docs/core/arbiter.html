@@ -27,7 +27,7 @@
   <div class="status-banner" style="border-left:4px solid #ffb454;padding:0.5em 1em;margin:1em 0;background:rgba(255,180,84,0.08)">
     <strong>DISABLED on the request path since the 2026-06 cognitive-layer redesign.</strong>
     Gating constant: <code>_METACOG_ARBITER_ENABLED = False</code> (core/agent.py:106).
-    A paired ablation found it net-negative — it sampled two paraphrased completions, computed their divergence, then threw both away and dispatched the ORIGINAL args, paying 2× inference for a number that gated a near-unreachable <code>ask_user</code> pause (dominant latency, zero answer changes). <strong>Re-enable criterion:</strong> only via its intended grounded replacement — verifier-judged best-of-N that SUBSTITUTES the winning answer, which landed 2026-07-07 as the async-critic bounded repair (<a href="verifier.html">verifier</a>, IMPROVEMENTS.md #18). See <code>COGNITIVE_LAYER_REDESIGN.md</code> at the repo root. The code + tests below are preserved as a parked subsystem.
+    A paired ablation found it net-negative — it sampled two paraphrased completions, computed their divergence, then threw both away and dispatched the ORIGINAL args, paying 2× inference for a number that gated a near-unreachable <code>ask_user</code> pause (dominant latency, zero answer changes). <strong>Re-enable criterion:</strong> only via its intended grounded replacement — verifier-judged best-of-N that SUBSTITUTES the winning answer, which landed 2026-07-07 as the async-critic bounded repair (<a href="verifier.html">verifier</a>, IMPROVEMENTS.md #18). See <code>PROJECT_JOURNAL.md §3</code> at the repo root. The code + tests below are preserved as a parked subsystem.
   </div>
 
   <h2>Decision tree</h2>

@@ -132,10 +132,16 @@ This is **already built** (correcting an earlier note that said "next to build")
   (playbook lessons by `source`, graduated-skill count, proposed macros). Covered
   by `tests/test_bio_time_scale.py`.
 - Task banks: `trackb_tasks.py`, `trackb2_tasks.py`. `claude_trainer.py` was the seed.
-All three are runnable today; like Track A they had never been run for real (see
-Status). **B3's LIVE run still needs an operator session** — even accelerated it
-needs a real llama-server and idle time; the harness is the apparatus, it does
-not fabricate results.
+All three are runnable today. **B3 FIRST LIVE PASS RUN 2026-07-07** (prod stopped
+to free RAM; isolated arms against the shared llama-server): treatment (idle loops
+accelerated, `--bio-time-scale 30 --bio-deterministic`) produced **1 `self_play`
+lesson** ("alternative idiom for sql tasks", challenge SOLVED, score +1.900);
+control (scale 1, loops never fire) produced **0**. First live proof a pure-idle
+loop is productive (not dead code) — the thing Track B could not reach. Caveats:
+1 repeat; dream did not fire (too few seed memories for entropy) and reflection had
+0 failed turns; the probe-outcome McNemar (does idle output *improve* task success?)
+needs richer seeds + more repeats. The harness works end-to-end (a report-builder
+bug was fixed post-run — `_b3_report`).
 
 ---
 

@@ -43,8 +43,35 @@ from typing import Any, Dict, List
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ablation_eval as AE          # noqa: E402
-from ablation_trackb2 import _post, _build_report  # reuse the proven helpers
+from ablation_trackb2 import _post  # reuse the proven HTTP helper
 from trackb_tasks import load_trackb_pairs          # SeedProbe(seed, probe, validator)
+
+
+def _b3_report(records, artifacts, meta) -> str:
+    """Self-contained B3 report (trackb2's _build_report expects different meta
+    keys — reusing it crashed the first run at the formatting step)."""
+    L = [f"# Track B3 — idle-loop adjudication", ""]
+    L.append(f"harness meta: {meta}")
+    # Probe outcomes per arm.
+    from collections import defaultdict
+    by_arm = defaultdict(lambda: [0, 0])
+    for r in records:
+        by_arm[r["arm"]][0] += 1
+        by_arm[r["arm"]][1] += 1 if r.get("passed") else 0
+    L.append("\n## Probe outcomes")
+    for arm, (n, p) in sorted(by_arm.items()):
+        L.append(f"- {arm}: {p}/{n} passed")
+    # Learning artifacts produced DURING idle (the primary B3 signal).
+    L.append("\n## Idle-loop learning artifacts (treatment vs control)")
+    for rep in artifacts:
+        L.append(f"### repeat {rep.get('repeat')}")
+        for arm in ("treatment", "control"):
+            a = rep.get(arm, {})
+            lbs = a.get("lessons_by_source", {})
+            L.append(f"- {arm}: lessons_by_source={lbs} "
+                     f"graduated_skills={a.get('graduated_skills', 0)} "
+                     f"proposed_macros={a.get('proposed_macros', 0)}")
+    return "\n".join(L) + "\n"
 
 COMMON = ["--upstream-url", "http://127.0.0.1:8088", "--api-key", "",
           "--no-mandatory-tor"]
@@ -176,9 +203,9 @@ def main() -> int:
 
     asyncio.run(_driver())
 
-    report = _build_report(all_records, {"harness": "trackb3",
-                                         "time_scale": args.time_scale,
-                                         "idle_epochs": args.idle_epochs})
+    report = _b3_report(all_records, all_artifacts, {"harness": "trackb3",
+                                                     "time_scale": args.time_scale,
+                                                     "idle_epochs": args.idle_epochs})
     out = Path(args.report_dir)
     (out / "trackb3_report.md").write_text(report)
     (out / "trackb3_artifacts.json").write_text(json.dumps(all_artifacts, indent=2))

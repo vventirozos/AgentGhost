@@ -30,7 +30,7 @@
   <div class="status-banner" style="border-left:4px solid #ffb454;padding:0.5em 1em;margin:1em 0;background:rgba(255,180,84,0.08)">
     <strong>Turn-start hint DISABLED on the request path since the 2026-06 cognitive-layer redesign.</strong>
     Gating constant: <code>_MCTS_TURNSTART_ENABLED = False</code> (core/agent.py:86).
-    The MCTS "next action" was injected as a prompt block ending "a strong hint, not a mandate — deviate if needed", so the model regenerated freely and ignored it while the search cost ~4 LLM round-trips (the 390 s blow-ups). It is <strong>ungrounded</strong>: it scores the model's self-prediction of un-executed actions. <strong>Re-enable criterion:</strong> only once it has an execution-grounded value function (not self-prediction). See <code>COGNITIVE_LAYER_REDESIGN.md</code> at the repo root. The PRM that would feed it is likewise parked pending Track-B3 adjudication (IMPROVEMENTS.md #27b). Code + tests preserved as a parked subsystem.
+    The MCTS "next action" was injected as a prompt block ending "a strong hint, not a mandate — deviate if needed", so the model regenerated freely and ignored it while the search cost ~4 LLM round-trips (the 390 s blow-ups). It is <strong>ungrounded</strong>: it scores the model's self-prediction of un-executed actions. <strong>Re-enable criterion:</strong> only once it has an execution-grounded value function (not self-prediction). See <code>PROJECT_JOURNAL.md §3</code> at the repo root. The PRM that would feed it is likewise parked pending Track-B3 adjudication (IMPROVEMENTS.md #27b). Code + tests preserved as a parked subsystem.
   </div>
 
   <h2>Pipeline</h2>

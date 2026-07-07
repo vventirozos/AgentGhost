@@ -15,8 +15,11 @@ _REPO = Path(__file__).resolve().parents[1]
 
 
 def test_redesign_doc_exists_and_covers_toggles():
-    doc = _REPO / "COGNITIVE_LAYER_REDESIGN.md"
-    assert doc.exists(), "COGNITIVE_LAYER_REDESIGN.md was lost again"
+    # The redesign rationale now lives in PROJECT_JOURNAL.md §3 (the unified
+    # journal that replaced the separate COGNITIVE_LAYER_REDESIGN.md +
+    # BUGHUNT*.md + IMPROVEMENTS.md, 2026-07-07).
+    doc = _REPO / "PROJECT_JOURNAL.md"
+    assert doc.exists(), "PROJECT_JOURNAL.md was lost — the redesign rationale lives in its §3"
     text = doc.read_text()
     for tog in ("_MCTS_TURNSTART_ENABLED", "_SELFHOOD_PREFIX_ENABLED",
                 "_METACOG_ARBITER_ENABLED"):

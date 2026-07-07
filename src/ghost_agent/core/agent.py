@@ -70,7 +70,7 @@ FACTUAL_SAMPLING_PARAMS = {
 }
 
 # ---------------------------------------------------------------------------
-# Cognitive-layer toggles (2026-06 redesign — see COGNITIVE_LAYER_REDESIGN.md).
+# Cognitive-layer toggles (2026-06 redesign — see PROJECT_JOURNAL.md §3).
 # A paired ablation showed the full cognitive stack did NOT beat a stripped
 # baseline on a hard graded suite (78% vs 80%, p=1.0) at ~1.8x latency. The
 # offending pieces were "advisory, not load-bearing" injections and ungrounded
@@ -101,7 +101,7 @@ _HYPOTHESIS_GROUNDING_ENABLED = True
 #    for a number that gates a near-unreachable `ask_user` pause. Net-negative
 #    (the dominant latency source; zero answer changes). OFF. The intended
 #    grounded replacement is a verifier-judged best-of-N that SUBSTITUTES the
-#    winning answer (see COGNITIVE_LAYER_REDESIGN.md P0#4) — a finalize-path
+#    winning answer (see PROJECT_JOURNAL.md §3, deferred #4) — a finalize-path
 #    feature, tracked separately.
 _METACOG_ARBITER_ENABLED = False
 
