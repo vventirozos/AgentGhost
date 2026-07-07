@@ -8,7 +8,7 @@ Ghost Agent is a self-contained reasoning runtime that wraps an upstream LLM wit
 
 - **Six-tier memory** — vector, graph, profile, skill, journal, and episodic stores, fused per turn via reciprocal rank fusion.
 - **Docker-isolated tool execution** — every tool call runs in a managed container with mounts and resource limits.
-- **Swarm inference & MCTS planning** — multi-sample reasoning with a hand-crafted complexity classifier deciding when to escalate.
+- **Grounded verify-and-repair** — a second-model verifier judges the final answer and drives a bounded in-loop repair of REFUTED/unverified answers. (The older MCTS turn-start hint and dual-solver arbiter are default-OFF since the 2026-06 cognitive-layer redesign proved them advisory/ungrounded — see `COGNITIVE_LAYER_REDESIGN.md`.)
 - **Dream / self-play loop** — idle-time consolidation, reflection, and passive skill mining from validator-passing trajectories.
 - **Local-only self-improvement** — DSPy/GEPA prompt optimisation, redacted trajectory distillation, and reflection-driven skill writes. No external teacher, no weight updates.
 
@@ -60,7 +60,7 @@ Companion processes (web UI, Slack bot, voice, image-gen) are documented under [
 
 | Path | Purpose |
 | --- | --- |
-| `src/ghost_agent/core/` | Reasoning loop, planning, dream cycle, MCTS, swarm router |
+| `src/ghost_agent/core/` | Reasoning loop, planning, dream cycle, verifier + async-critic repair, memory bus, context compression (MCTS/arbiter present but default-OFF — see `COGNITIVE_LAYER_REDESIGN.md`) |
 | `src/ghost_agent/memory/` | Vector + graph + profile + skill + journal + episodic stores |
 | `src/ghost_agent/tools/` | Tool registry and per-tool implementations |
 | `src/ghost_agent/sandbox/` | Docker container manager |

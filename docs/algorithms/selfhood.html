@@ -105,6 +105,9 @@
     probes/                   Dated summaries from scripts/run_selfhood_probes.sh</code></pre>
   <p><code>$GHOST_HOME/system/selfhood/</code> mirrors the shape of <code>$GHOST_HOME/system/memory/</code> — same parent directory, same non-sandboxed location (the autobiographical record survives sandbox wipes / <code>docker volume rm</code>).</p>
 
+  <h3>Bounded growth (2026-07-07)</h3>
+  <p>The diary had <em>no</em> cap and grew monotonically, while the per-turn hot path did 3-4 full-file O(n) parses plus one O(n) rewrite — quadratic over the agent's lifetime. It now follows the same compaction pattern as <a href="../workspace/activity.html">workspace/activity.jsonl</a>: on append, once the file passes <code>_COMPACT_MAX_BYTES</code> (2 MB) it is rewritten keeping the newest <code>_COMPACT_KEEP_LINES</code> (2000) entries, with the dropped entries rolled into a single <code>[Consolidated] N earlier entries…</code> summary record at the head so the narrative layer still knows earlier history existed. Compaction clears the IDF/search cache so the next search rebuilds against the compacted contents. <code>recent(N)</code> now reads only the tail (a bounded <code>deque</code> over the lines, parsing only the last N) instead of materialising and parsing the whole log on every wake-up prefix / reference-note call. Covered by <code>tests/test_autobiographical_bounds.py</code>.</p>
+
   <h2>The capture path (per turn)</h2>
   <pre><code>        handle_chat(messages)
               │

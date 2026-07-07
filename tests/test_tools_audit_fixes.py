@@ -240,33 +240,37 @@ class TestSwarmAwaitResults:
 # ---------------------------------------------------------------------------
 class TestExecuteTruncation:
     @pytest.mark.asyncio
-    async def test_oversized_output_keeps_head_and_tail(self, tmp_path):
+    async def test_oversized_output_delegated_to_sandbox_spill(self, tmp_path):
+        """2026-07-07 (#10): truncation moved from execute.py to the sandbox
+        layer (spill mode). execute.py now requests spill and passes the
+        sandbox's already-trimmed result through — head+tail preserved. The
+        real head+tail/spill behavior is covered by test_execute_output_spill.py
+        against the actual DockerSandbox."""
         from ghost_agent.tools import execute as execute_mod
 
         head_marker = "HEAD_MARKER_START"
         tail_marker = "TAIL_MARKER_END"
-        # Build an output of ~600 KB with markers at both ends
-        filler = "x" * (600 * 1024)
-        oversized = head_marker + filler + tail_marker
-
-        # Mock sandbox manager whose execute returns the oversized payload
+        # Simulate what the sandbox layer returns after spill-truncation:
+        # a small head+tail view with the banner.
+        trimmed = (head_marker + "\n[... 600000 chars truncated (run output) ...]\n"
+                   + tail_marker + "\n[Full output saved to '.ghost_runs/run_1.log' ...]")
         sm = MagicMock()
-        sm.execute = MagicMock(return_value=(oversized, 0))
+        sm.execute = MagicMock(return_value=(trimmed, 0))
 
-        # Write a trivial script so the path-resolution branch passes
         script_dir = tmp_path
         script_dir.mkdir(exist_ok=True)
-        script_path = script_dir / "test_script.py"
-        script_path.write_text("print('hi')")
+        (script_dir / "test_script.py").write_text("print('hi')")
 
         result = await execute_mod.tool_execute(
             filename="test_script.py",
             sandbox_dir=script_dir,
             sandbox_manager=sm,
         )
-        assert head_marker in result, "head was lost in truncation"
-        assert tail_marker in result, "tail was lost in truncation (Python tracebacks live there!)"
+        # execute.py requested spill mode and passed the trimmed view through.
+        assert sm.execute.call_args.kwargs.get("spill_large_output") is True
+        assert head_marker in result and tail_marker in result
         assert "truncated" in result.lower()
+        assert ".ghost_runs/run_" in result
 
     @pytest.mark.asyncio
     async def test_small_output_passes_through_unchanged(self, tmp_path):

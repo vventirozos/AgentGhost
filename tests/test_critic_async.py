@@ -1,13 +1,15 @@
 """Async-critic mode (GHOST_CRITIC_ASYNC=1).
 
-In async mode the verifier never sits on the critical path: the in-loop
-repair-before-ship is skipped and the verdict runs purely AFTER the
-response ships. A high-confidence REFUTED then (a) scrubs the turn's
-lessons and (b) queues a correction surfaced at the top of the NEXT turn.
+The verdict runs on the OFF-HOST critic model, so it never sits on the MAIN
+inference slot. As of 2026-07-07 (#18) async mode AWAITS that off-host verdict
+at loop-exit for a bounded budget (GHOST_CRITIC_REPAIR_BUDGET, default 25s) and
+REPAIRS a REFUTED answer in-loop — instead of shipping it with only a next-turn
+note. On timeout (or budget 0) it falls back to the old behaviour: ship, then
+the late verdict (a) scrubs the turn's lessons and (b) queues a correction
+surfaced at the top of the NEXT turn.
 
-These tests cover the knobs, the late-verdict recorder, the next-turn
-surfacing, and a full handle_chat run proving the repair is skipped and a
-correction is queued.
+These tests cover the knobs, the in-loop repair, the disabled-repair defer
+path, the late-verdict recorder, and the next-turn surfacing.
 """
 
 import asyncio
@@ -296,30 +298,58 @@ def test_consume_sets_turn_flag_to_skip_trivial_path(agent):
 # --------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_async_mode_ships_unrepaired_and_queues_correction(agent, monkeypatch):
+async def test_async_mode_repairs_refuted_in_loop(agent, monkeypatch):
+    """IMPROVEMENTS.md #18: with a repair budget, async mode now AWAITS the
+    off-host verdict at loop-exit and REPAIRS a REFUTED answer in-loop instead
+    of shipping it with only a next-turn note. The critic runs on the second
+    model, so this costs the main slot nothing."""
     monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    monkeypatch.setenv("GHOST_CRITIC_REPAIR_BUDGET", "10")  # explicit, fast
+    agent.available_tools["execute"] = AsyncMock(return_value="OUTPUT: 7")
+    verifier, vmock = _make_verifier([
+        _verdict(VerifyVerdict.REFUTED, issues=["wrong number"]),
+        _verdict(VerifyVerdict.CONFIRMED),  # the repaired answer verifies
+    ])
+    agent.context.verifier = verifier
+    agent.context.skill_memory = MagicMock()
+
+    # THREE turns now: tool call, refuted final, repaired final.
+    result = await _run(agent, "compute the answer and report it", [
+        _tool_call(),
+        _final("The answer is 7."),
+        _final("Corrected: the answer is 42."),
+    ])
+
+    # The repaired answer shipped; the refuted one was replaced, not appended.
+    assert "42" in result
+    assert "The answer is 7." not in result
+    # Repaired in-loop → nothing deferred to the next turn.
+    await asyncio.sleep(0.02)
+    assert not agent._pending_corrections
+
+
+async def test_async_repair_disabled_defers_correction(agent, monkeypatch):
+    """With the repair budget at 0 (opt-out), async mode keeps the old
+    ship-then-queue-a-correction behaviour."""
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    monkeypatch.setenv("GHOST_CRITIC_REPAIR_BUDGET", "0")
     agent.available_tools["execute"] = AsyncMock(return_value="OUTPUT: 7")
     verifier, vmock = _make_verifier([_verdict(VerifyVerdict.REFUTED, issues=["wrong number"])])
     agent.context.verifier = verifier
     agent.context.skill_memory = MagicMock()
 
-    # Only TWO llm turns provided: tool call + final. If async wrongly
-    # triggered a repair it would demand a third and raise StopAsyncIteration.
+    # Only two turns — no repair should be demanded.
     result = await _run(agent, "compute the answer and report it", [
         _tool_call(),
         _final("The answer is 7."),
     ])
 
-    # The (refuted) answer shipped as-is — no before-ship repair.
     assert "The answer is 7." in result
-
-    # The verdict runs AFTER the response: let the spawned task + done
-    # callback drain, then assert the correction was queued for next turn.
     for _ in range(50):
         await asyncio.sleep(0.01)
         if agent._pending_corrections:
             break
-    assert agent._pending_corrections, "async verdict should have queued a correction"
+    assert agent._pending_corrections, "disabled-repair async verdict should queue a correction"
     assert "wrong number" in agent._pending_corrections[0]["note"]
     assert vmock.await_count == 1  # exactly one verdict, off the critical path
 

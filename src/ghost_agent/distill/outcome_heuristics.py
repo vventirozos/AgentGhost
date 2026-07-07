@@ -96,14 +96,23 @@ def _normalize_tool_error(s: str) -> str:
     return s[:200]
 
 
-def _looks_like_tool_error(result: str) -> bool:
-    """Cheap detector for "this tool call failed".
+def _tool_call_failed(tc) -> bool:
+    """True if a ToolCall failed, preferring its STRUCTURED ``error`` flag.
 
-    The trajectory schema doesn't carry a structured per-call error
-    flag for chat turns (the ``ToolCall.error`` field is populated by
-    self-play / batch paths, not the chat path). So we sniff the
-    result text. Conservative — favours false negatives over false
-    positives.
+    As of 2026-07-07 the chat recorder populates ``ToolCall.error`` too (it was
+    previously self-play/batch only), so a structured failure with atypical
+    result text — e.g. the native-tools corruption shapes — is caught even when
+    the text sniff below would miss it. The text sniff remains the fallback for
+    legacy trajectories written before the flag was populated."""
+    if getattr(tc, "error", ""):
+        return True
+    return _looks_like_tool_error(getattr(tc, "result", "") or "")
+
+
+def _looks_like_tool_error(result: str) -> bool:
+    """Cheap text detector for "this tool call failed" — the FALLBACK when the
+    structured ``ToolCall.error`` flag isn't set (legacy trajectories).
+    Conservative: favours false negatives over false positives.
     """
     if not isinstance(result, str):
         return False
@@ -205,12 +214,13 @@ def classify_chat_outcome(
             )
 
     # 3. Repeated identical tool errors — agent ignored prior feedback.
+    # Prefer the structured ToolCall.error flag; fall back to the text sniff.
     error_counts: dict = {}
     for tc in traj.tool_calls or []:
-        result = getattr(tc, "result", "") or ""
-        if not _looks_like_tool_error(result):
+        if not _tool_call_failed(tc):
             continue
-        key = (tc.name or "", _normalize_tool_error(result))
+        sig = getattr(tc, "error", "") or _normalize_tool_error(getattr(tc, "result", "") or "")
+        key = (tc.name or "", sig)
         error_counts[key] = error_counts.get(key, 0) + 1
     for (tool_name, _err), count in error_counts.items():
         if count >= repeated_error_threshold:

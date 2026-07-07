@@ -87,15 +87,19 @@ def test_smart_update_source_threshold_value():
 
 
 def test_search_uses_wider_candidate_pool():
-    """The chroma query inside `search()` must request 30 candidates."""
+    """The chroma query in the selection core must request 30 candidates.
+
+    (2026-07-07: search() was split into `_search_selection` (scoring/
+    selection) + string/per-item renderers; the collection.query lives in
+    the selection core now.)"""
     src = Path(__file__).resolve().parents[1] / "src/ghost_agent/memory/vector.py"
     text = src.read_text()
-    start = text.index("def search(")
+    start = text.index("def _search_selection(")
     rest = text[start:]
     end_rel = rest.index("\n    def ", 1)
     body = rest[:end_rel]
-    assert "n_results=30" in body, "search() must query 30 candidates"
-    assert "n_results=10" not in body, "stale n_results=10 left in search()"
+    assert "n_results=30" in body, "_search_selection() must query 30 candidates"
+    assert "n_results=10" not in body, "stale n_results=10 left in _search_selection()"
 
 
 # ---------------------------------------------------------------------------

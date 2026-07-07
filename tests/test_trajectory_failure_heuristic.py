@@ -369,3 +369,54 @@ def test_classification_handles_non_dict_action_in_actions_list():
     )])
     # Just must not raise — outcome doesn't matter.
     classify_chat_outcome(t)
+
+
+# --------------------------------------------- #27d: structured ToolCall.error
+
+
+def test_structured_error_flag_drives_repeated_error_signal():
+    """When ToolCall.error is populated (now done on the chat path too), the
+    repeated-identical-error signal fires even if the result TEXT wouldn't trip
+    the sniff — e.g. a native-tools corruption shape."""
+    # Result text is deliberately NOT sniff-detectable (no 'error:'/traceback).
+    weird = "unexpected internal state 0xdeadbeef quux"
+    t = _traj(tool_calls=[
+        ToolCall(name="introspect", result=weird, error="introspect :: bad args"),
+        ToolCall(name="introspect", result=weird, error="introspect :: bad args"),
+        ToolCall(name="introspect", result=weird, error="introspect :: bad args"),
+    ])
+    c = classify_chat_outcome(t)
+    assert c.outcome == Outcome.FAILED.value
+    assert "introspect" in c.reason
+
+
+def test_text_sniff_still_works_without_flag():
+    """Legacy trajectories with no ToolCall.error still classify via the text
+    fallback."""
+    err = "Error: something broke badly"
+    t = _traj(tool_calls=[
+        ToolCall(name="execute", result=err),
+        ToolCall(name="execute", result=err),
+        ToolCall(name="execute", result=err),
+    ])
+    assert classify_chat_outcome(t).outcome == Outcome.FAILED.value
+
+
+def test_tool_call_failed_prefers_flag():
+    from ghost_agent.distill.outcome_heuristics import _tool_call_failed
+    # Flag set, clean text → still failed.
+    assert _tool_call_failed(ToolCall(name="x", result="all good", error="boom")) is True
+    # No flag, clean text → not failed.
+    assert _tool_call_failed(ToolCall(name="x", result="all good")) is False
+    # No flag, error-ish text → failed via fallback.
+    assert _tool_call_failed(ToolCall(name="x", result="Traceback (most recent call last)")) is True
+
+
+def test_recorder_populates_error_flag_on_chat_path():
+    """The trajectory recorder must set ToolCall.error for a failing chat tool
+    result (integration guard on the agent-side wiring)."""
+    import inspect
+    from ghost_agent.core.agent import GhostAgent
+    src = inspect.getsource(GhostAgent._record_turn_trajectory)
+    assert "obj.error = _normalize_tool_error" in src
+    assert "_looks_like_tool_error(obj.result)" in src

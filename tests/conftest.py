@@ -5,6 +5,11 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock
 
+# Canonical builders (IMPROVEMENTS.md #26). Importable directly
+# (`from tests.helpers import make_context`) or via the fixtures below.
+from tests.helpers import make_context, make_agent, FakeBgTasks  # noqa: F401
+
+
 @pytest.fixture
 def mock_llm():
     client = MagicMock()
@@ -12,6 +17,18 @@ def mock_llm():
         "choices": [{"message": {"content": "Test Response", "tool_calls": []}}]
     })
     return client
+
+
+@pytest.fixture
+def agent_context():
+    """Canonical GhostContext mock — see tests/helpers.make_context."""
+    return make_context()
+
+
+@pytest.fixture
+def built_agent(agent_context):
+    """A real GhostAgent over the canonical context — see helpers.make_agent."""
+    return make_agent(agent_context)
 
 
 @pytest.fixture

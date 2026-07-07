@@ -52,10 +52,11 @@ def test_sandbox_execute_caps_huge_output():
     fake_exec.exit_code = 0
     sb.container.exec_run = MagicMock(return_value=fake_exec)
 
-    output, exit_code = sb.execute("echo hi")
+    output, exit_code = sb.execute("echo hi")  # default mode = legacy 256KB cap
     assert exit_code == 0
-    # Should contain the truncation banner AND be drastically smaller
-    assert "truncated by sandbox" in output.lower()
+    # Should contain the truncation banner AND be drastically smaller. The
+    # banner wording moved to the shared truncate_head_tail helper (2026-07-07).
+    assert "truncated" in output.lower() and "sandbox" in output.lower()
     assert len(output) < 400_000  # well under 1 MB
     # Both head and tail must be present
     assert output.startswith("A")
@@ -466,22 +467,27 @@ def test_parse_utc_timestamp_rejects_garbage():
 
 
 # =====================================================================
-# MED-16 — workspace save streams chunks and closes BytesIO
+# MED-16 / #23 — workspace save builds off-loop to a spool file with a cap
 # =====================================================================
 
 
-def test_workspace_save_streams_in_chunks():
+def test_workspace_save_offloads_and_caps():
+    """2026-07-07 (#23): the save no longer walks+deflates the whole sandbox
+    inline in the coroutine (which froze the event loop) or holds the archive
+    in RAM (an OOM vector). It builds in a worker thread to a spool file with
+    a byte ceiling, streamed via FileResponse."""
     src = Path("src/ghost_agent/api/routes.py").read_text()
     code_only = "\n".join(
         line for line in src.splitlines()
         if not line.strip().startswith("#")
     )
-    # The old `iter([zip_buffer.getvalue()])` should be gone from CODE.
+    # The old in-RAM getvalue() streaming is gone.
     assert "iter([zip_buffer.getvalue()])" not in code_only
-    # The new helper yields in chunks.
-    assert "_stream_chunks" in code_only
-    # zip_buffer must be explicitly closed.
-    assert "zip_buffer.close()" in code_only
+    assert "zip_buffer.getvalue()" not in code_only
+    # Build runs off the event loop, is capped, and streams from a file.
+    assert "asyncio.to_thread(_build_zip)" in code_only
+    assert "_MAX_WORKSPACE_SAVE_BYTES" in code_only
+    assert "FileResponse(" in code_only
 
 
 # =====================================================================

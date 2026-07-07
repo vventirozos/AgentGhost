@@ -1,4 +1,11 @@
-"""Unit tests for ghost_agent.core.arbiter — dual-solver arbitration."""
+"""Unit tests for ghost_agent.core.arbiter — dual-solver arbitration.
+
+ABLATED-LAYER TESTS: the dual-solver arbiter is DISABLED on the request path
+(`_METACOG_ARBITER_ENABLED = False`, core/agent.py) since the 2026-06 cognitive
+-layer redesign — see COGNITIVE_LAYER_REDESIGN.md. These tests pin the parked
+subsystem's behavior so it stays correct if ever re-enabled under its criterion;
+they do NOT assert live request-path behavior.
+"""
 
 import asyncio
 import math

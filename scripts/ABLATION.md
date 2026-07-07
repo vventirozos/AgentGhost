@@ -115,8 +115,27 @@ This is **already built** (correcting an earlier note that said "next to build")
   TREATMENT (memory ON) vs CONTROL (`--no-memory`), McNemar on matched probes.
 - **`scripts/ablation_trackb2.py`** (B2) — cross-session RULE learning: task →
   correction → (consolidation delay) → probe, TREATMENT vs CONTROL, McNemar.
+- **`scripts/ablation_trackb3.py`** (B3, 2026-07-07) — isolates the **pure-idle
+  learning loops** (dream/self-play, idle reflection critique, skills-auto
+  graduation) that B1/B2 could not reach because they only fire in long idle
+  windows. It exploits two new flags (`core/agent.py` / `main.py`):
+  - `--bio-time-scale N` divides every biological-watchdog idle window bound and
+    phase cooldown by N (via `GhostAgent._bio_scaled`), so a 1-hour window fires
+    after ~1 minute of idle. Default 1.0 = production timing. **Never set in prod.**
+  - `--bio-deterministic` makes the probabilistic idle phases (dream 0.5,
+    self-play 0.2) fire every eligible tick (`GhostAgent._bio_roll`) so the arms
+    exercise the same phases each accelerated epoch.
+  TREATMENT boots accelerated + deterministic; CONTROL boots at scale 1 (idle
+  loops never reach their windows in the short run) — isolating the IDLE loops,
+  not memory (Track B already validated memory). The harness compares probe
+  outcomes (McNemar) AND the learning artifacts each arm produced during idle
+  (playbook lessons by `source`, graduated-skill count, proposed macros). Covered
+  by `tests/test_bio_time_scale.py`.
 - Task banks: `trackb_tasks.py`, `trackb2_tasks.py`. `claude_trainer.py` was the seed.
-Both are runnable today; like Track A they had never been run for real (see Status).
+All three are runnable today; like Track A they had never been run for real (see
+Status). **B3's LIVE run still needs an operator session** — even accelerated it
+needs a real llama-server and idle time; the harness is the apparatus, it does
+not fabricate results.
 
 ---
 

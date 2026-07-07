@@ -28,6 +28,9 @@ def spawn_task(coro):
     behaviour is the same in either case. Use this helper instead of
     ``asyncio.create_task(...)`` for any background work that should
     log under the spawning request's id.
+
+    NOTE: prefer :func:`spawn_bg` for real fire-and-forget work — it adds
+    the strong-ref + exception-logging guarantees this bare helper lacks.
     """
     ctx = contextvars.copy_context()
     loop = asyncio.get_event_loop()
@@ -40,6 +43,59 @@ def spawn_task(coro):
         # propagation. (We can't easily reapply an arbitrary `ctx` to a
         # coroutine on 3.10 without subclassing Task.)
         return loop.create_task(coro)
+
+
+# Process-wide strong-ref registry for fire-and-forget tasks. asyncio keeps
+# only a WEAK ref to a bare create_task, so an un-stored task can be garbage-
+# collected mid-flight and the work silently never lands. Every spawn_bg task
+# is held here until it finishes; the lifespan shutdown drains this set.
+_BG_TASKS: set = set()
+
+
+def spawn_bg(coro, *, name: str = "bg"):
+    """The one fire-and-forget primitive. Composes the three guarantees the
+    four ad-hoc conventions each had only some of:
+
+    1. contextvars propagation — the task logs under the spawning request id
+       (same as :func:`spawn_task`).
+    2. a strong reference held in a module registry until the task completes,
+       so it can't be GC'd mid-flight and CAN be drained at shutdown.
+    3. a done-callback that logs any non-Cancelled exception via
+       ``logger.warning`` (auto-renders on the operator's live stream) —
+       instead of the error vanishing into a swallowed background coroutine.
+
+    Use this for background memory writes, retractions, reflections, PRM
+    updates, graph extraction — anything that must not block a turn but whose
+    silent death would be a real loss. Returns the Task.
+    """
+    task = spawn_task(coro)
+    _BG_TASKS.add(task)
+
+    def _done(t: "asyncio.Task"):
+        _BG_TASKS.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning("background task %r failed: %s: %s",
+                           name, type(exc).__name__, exc)
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def drain_background_tasks(timeout: float = 5.0):
+    """Await outstanding spawn_bg tasks at shutdown (best-effort, bounded).
+    Called from the lifespan finally-block so in-flight memory writes get a
+    chance to land before the process exits."""
+    pending = [t for t in list(_BG_TASKS) if not t.done()]
+    if not pending:
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+    except (asyncio.TimeoutError, Exception):
+        pass
 
 # Serializes stdout writes so concurrent requests can never interleave a line.
 # Without this, two requests streaming `print(token, end="")` will splice into

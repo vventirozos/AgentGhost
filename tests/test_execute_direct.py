@@ -31,8 +31,9 @@ async def test_execute_direct_python():
         
         result = await tool_execute("calc_salary.py", "print('Hello World')", mock_sandbox_dir, mock_sandbox)
         
-        # Verify the command ran directly with python3 -u
-        mock_sandbox.execute.assert_any_call("python3 -u calc_salary.py")
+        # Verify the command ran directly with python3 -u (spill mode on for
+        # the execute tool path — 2026-07-07 #10).
+        mock_sandbox.execute.assert_any_call("python3 -u calc_salary.py", spill_large_output=True)
         assert "Hello World" in result
 
 @pytest.mark.asyncio
@@ -57,5 +58,5 @@ async def test_execute_direct_shell():
         
         result = await tool_execute("script.sh", "echo 'hi'", mock_sandbox_dir, mock_sandbox)
         
-        # Verify the command ran directly with bash
-        mock_sandbox.execute.assert_called_once_with("bash script.sh")
+        # Verify the command ran directly with bash (spill mode on).
+        mock_sandbox.execute.assert_called_once_with("bash script.sh", spill_large_output=True)

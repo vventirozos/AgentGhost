@@ -138,6 +138,15 @@
     known sensitive patterns, so ordinary log lines stay byte-identical and readable. Covered by
     <code>tests/test_quick_wins.py</code>.
   </p>
+
+  <h2>Fire-and-forget: <code>spawn_bg</code> (2026-07-07)</h2>
+  <p>Background work that must not block a turn — memory writes, lesson retraction, PRM online updates, graph-triplet extraction, reflection — is scheduled through one primitive, <code>utils.logging.spawn_bg(coro, *, name)</code>. It composes the three guarantees that four earlier ad-hoc conventions each had only some of:</p>
+  <ul>
+    <li><strong>contextvars propagation</strong> — the task logs under the spawning request's id (same as <code>spawn_task</code>).</li>
+    <li><strong>strong reference</strong> — held in a process-wide registry (<code>_BG_TASKS</code>) until completion. asyncio keeps only a <em>weak</em> ref to a bare <code>create_task</code>, so an un-stored task can be garbage-collected mid-flight and the work silently never lands; two real sites (lesson retraction, PRM online update) were doing exactly this in violation of the codebase's own documented rule.</li>
+    <li><strong>exception logging</strong> — a done-callback logs any non-Cancelled failure via <code>logger.warning</code> (auto-renders on the live stream). Previously a dying background coroutine vanished into an <code>except: pass</code> body — the root of the "built-but-silently-not-happening" pathology.</li>
+  </ul>
+  <p><code>drain_background_tasks(timeout)</code> awaits the registry at lifespan shutdown (bounded) so in-flight writes get a chance to land. The three superseded variants (bare <code>spawn_task</code> for fire-and-forget, the module-local <code>_GRAPH_EXTRACT_TASKS</code> set, and GC-unsafe bare <code>create_task</code>) are removed; the remaining legitimate strong-ref sites (the biological daemon task, the swarm task registry, the context <code>_pending_background_tasks</code> set, the self-play loop) are allow-listed. A grep-based regression guard (<code>tests/test_spawn_bg.py::test_no_bare_create_task_in_hot_modules</code>) fails the suite if a new bare <code>create_task</code> appears outside that allow-list.</p>
 </main>
 </body>
 </html>

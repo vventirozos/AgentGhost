@@ -49,6 +49,9 @@ def _make_agent(*, llm_response="ok", with_tools=False, native_tools=False):
     ctx.scratchpad = MagicMock()
     ctx.scratchpad.list_all = MagicMock(return_value="")
     ctx.memory_system = MagicMock()
+    # Bus prefers the per-item search_items entry point (2026-07-07); keep
+    # the legacy search stub too for any direct callers.
+    ctx.memory_system.search_items = MagicMock(return_value=[])
     ctx.memory_system.search = MagicMock(return_value="")
     ctx.graph_memory = MagicMock()
     ctx.graph_memory.get_neighborhood = MagicMock(return_value=[])
@@ -665,7 +668,7 @@ async def test_agent_query_expansion_uses_router_when_available():
     call = agent.context.llm_client.route.await_args
     assert call.kwargs.get("task") == "EXPAND_QUERY"
     # The bus's vector search must have been called with the rewritten query.
-    search_args = agent.context.memory_system.search.call_args
+    search_args = agent.context.memory_system.search_items.call_args
     if search_args is not None:
         assert "rewritten via router" in str(search_args)
 
@@ -685,7 +688,7 @@ async def test_agent_query_expansion_falls_back_to_legacy_concat():
         "model": "test",
     }
     await agent.handle_chat(body, MagicMock())
-    search_args = agent.context.memory_system.search.call_args
+    search_args = agent.context.memory_system.search_items.call_args
     assert search_args is not None
     called_query = search_args[0][0]
     assert "Context: I have created the calculation script." in called_query

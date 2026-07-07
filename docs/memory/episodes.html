@@ -76,10 +76,14 @@
       <tr><td><code>get_recent_episodes(limit)</code></td><td>Most recent episodes (no actions).</td></tr>
       <tr><td><code>get_episodes_by_cluster(cluster_id, limit)</code></td><td>Cluster-grouped.</td></tr>
       <tr><td><code>mark_consolidated(ids)</code> / <code>get_unconsolidated(limit)</code></td><td>Dream-cycle markers.</td></tr>
-      <tr><td><code>format_for_context(episodes, max_chars)</code></td><td>LLM-injection format.</td></tr>
+      <tr><td><code>format_episode(ep) -&gt; str</code></td><td>Render ONE episode as a compact line. Extracted 2026-07-07 so the MemoryBus can emit one RRF item per episode; <code>format_for_context</code> is built from it, so the blob and per-item renderings can't drift.</td></tr>
+      <tr><td><code>format_for_context(episodes, max_chars)</code></td><td>LLM-injection blob (kept for legacy callers).</td></tr>
       <tr><td><code>count()</code></td><td>Total episodes.</td></tr>
     </tbody>
   </table>
+
+  <h2>Semantic recall wiring (2026-07-07)</h2>
+  <p>The write path ingests every episode's trigger into the vector store expressly so this tier can recall episodes by <em>meaning</em>. The <code>MemoryBus._fetch_episodic</code> read path now passes its vector store to <code>search_similar</code>, activating <code>_vector_search</code> (relevance-gated, best-distance-per-episode). Previously the bus called <code>search_similar</code> with no <code>vector_memory</code>, so recall always used the substring fallback over only the 100 most-recent episodes — episodes with no keyword overlap to the query (nearly half the live collection) were unreachable. <code>search_recoveries</code> (System-3 crisis pivots) inherits the same fix wherever it is called with the store.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

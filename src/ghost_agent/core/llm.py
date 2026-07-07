@@ -911,15 +911,42 @@ class LLMClient:
                     return
             if not request_active and waited >= 30.0:
                 return
+            # One visibility line per long park: a background call waiting
+            # minutes for the slot is normal under load, but the operator
+            # watching the stream should be able to SEE it — a silent
+            # multi-minute gap is indistinguishable from a hang.
+            if waited == 120.0:
+                pretty_log(
+                    "BG Queue Wait",
+                    "Background LLM call parked 120s waiting for the "
+                    "foreground to clear (user request active). Will keep "
+                    "waiting up to 600s.",
+                    icon=Icons.RETRY,
+                )
             await asyncio.sleep(1.0)
             waited += 1.0
 
     async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
         if is_background:
-            # Wait for foreground to clear (see _wait_for_foreground_clear
-            # for the two-signal policy), then acquire a semaphore slot
-            # (allows up to 3 concurrent background tasks).
-            await self._wait_for_foreground_clear()
+            # The foreground wait protects exactly one resource: the MAIN
+            # inference slot. A call that will be served by an off-main
+            # pool (worker/critic/vision/swarm) doesn't contend for it, so
+            # parking it behind an active user request is pure added
+            # latency — and for calls awaited inline it was a deadlock-
+            # shaped self-stall (the request waits on a call that waits on
+            # the request). Only fall back to the wait when the call will
+            # actually land on the main node. (If every off-main node
+            # fails, _do_chat_completion may still fall back to main — a
+            # rare, already-bounded edge, same as proceeding after the
+            # 600s ceiling.)
+            targets_main_node = not (
+                (use_worker and getattr(self, "worker_clients", None))
+                or (use_critic and getattr(self, "critic_clients", None))
+                or (use_vision and getattr(self, "vision_clients", None))
+                or (use_swarm and getattr(self, "swarm_clients", None))
+            )
+            if targets_main_node:
+                await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
                 return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout)
         else:

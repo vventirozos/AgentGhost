@@ -22,6 +22,79 @@ def _read_head(path: Path, max_bytes: int = 8192) -> bytes:
         return f.read(max_bytes)
 
 
+# Hard ceiling on a single line-range read so an absurd range (1..1e9) can't
+# materialise a whole huge file. Generous — a surgical re-read is normally a
+# few dozen lines — but bounded.
+_LINE_RANGE_MAX_LINES = 2000
+
+
+def _read_line_range(path: Path, filename: str,
+                     start_line: int = None, end_line: int = None) -> str:
+    """Return a 1-based, line-number-prefixed slice ``[start_line, end_line]``.
+
+    Streams the file and stops at ``end_line`` (or the line cap), so cost is
+    proportional to the requested range, not the file size. Defaults: start=1,
+    end=start+cap. Clamps/validates the bounds and reports what actually came
+    back so the model can widen or shift the window."""
+    try:
+        s = 1 if start_line is None else int(start_line)
+        e = None if end_line is None else int(end_line)
+    except (TypeError, ValueError):
+        return ("Error: start_line/end_line must be integers, e.g. "
+                f"file_system(operation='read', path='{filename}', start_line=200, end_line=260).")
+    if s < 1:
+        s = 1
+    if e is not None and e < s:
+        return (f"Error: end_line ({e}) is before start_line ({s}). "
+                "Give a range where end_line >= start_line.")
+    # Cap the span so a runaway range can't dump the whole file.
+    cap_end = s + _LINE_RANGE_MAX_LINES - 1
+    hard_end = cap_end if e is None else min(e, cap_end)
+
+    # Binary sniff first (mirrors the whole-file read path).
+    try:
+        if _looks_like_binary(_read_head(path, 8192)):
+            return (f"Error: '{filename}' appears to be a binary file. You "
+                    "cannot read it as text. If it is an image, use "
+                    "'vision_analysis'.")
+    except OSError as oe:
+        return f"Error: failed to read '{filename}': {oe}"
+
+    picked = []
+    last_lineno = 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            for lineno, line in enumerate(f, start=1):
+                last_lineno = lineno
+                if lineno < s:
+                    continue
+                if lineno > hard_end:
+                    break
+                picked.append(f"{lineno}\t{line.rstrip(chr(10))}")
+    except OSError as oe:
+        return f"Error: failed to read '{filename}': {oe}"
+
+    if not picked:
+        if last_lineno == 0:
+            return f"--- {filename} (lines {s}-{hard_end}) ---\n(file is empty)"
+        return (f"Error: start_line {s} is past the end of '{filename}' "
+                f"(only {last_lineno} lines). Re-read with a start_line "
+                f"between 1 and {last_lineno}.")
+
+    body = "\n".join(picked)
+    shown_first = s
+    shown_last = s + len(picked) - 1
+    truncated = ""
+    if e is not None and hard_end < e:
+        truncated = (f"\n[... range capped at {_LINE_RANGE_MAX_LINES} lines; "
+                     f"re-read from start_line={hard_end + 1} for more]")
+    elif e is None and len(picked) == _LINE_RANGE_MAX_LINES:
+        truncated = (f"\n[... {_LINE_RANGE_MAX_LINES}-line cap; re-read from "
+                     f"start_line={hard_end + 1} for more]")
+    return (f"--- {filename} (lines {shown_first}-{shown_last}) ---\n"
+            f"{body}{truncated}")
+
+
 # Allowable text-control characters (TAB, LF, CR, FF) — anything else in the
 # 0..31 range that ISN'T one of these is a strong binary signal.
 _TEXT_CTRL_OK = frozenset({0x09, 0x0A, 0x0C, 0x0D})
@@ -476,8 +549,13 @@ class ReadBudget:
 
 
 async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 8192,
-                         read_budget: "ReadBudget | None" = None):
-    pretty_log("File Read", filename, icon=Icons.TOOL_FILE_R)
+                         read_budget: "ReadBudget | None" = None,
+                         start_line: int = None, end_line: int = None):
+    if start_line is not None or end_line is not None:
+        pretty_log("File Read", f"{filename} [{start_line or 1}:{end_line or 'end'}]",
+                   icon=Icons.TOOL_FILE_R)
+    else:
+        pretty_log("File Read", filename, icon=Icons.TOOL_FILE_R)
     # GUARD 1: Stop model from trying to read URLs as files. The error
     # surface PRIMES the model's next tool choice, so we lead with `browser`
     # (the right answer when the user says "open this page" or "what's on
@@ -505,10 +583,20 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
         if not path.exists():
             return _missing_file_message(filename, sandbox_dir)
 
+        # LINE-RANGE READ (#11): a bounded slice, EXEMPT from the whole-file
+        # size cap — this is the cheap recovery path after a failed replace or
+        # a too-large-file error. The range is streamed (we stop reading at
+        # end_line) so a 300 KB file costs only the requested lines, and the
+        # slice is returned with line-number prefixes so it chains directly
+        # from `rg --line-number` output and the replace-failure snippet.
+        if start_line is not None or end_line is not None:
+            return await asyncio.to_thread(
+                _read_line_range, path, filename, start_line, end_line)
+
         file_size = path.stat().st_size
         max_bytes = read_byte_budget(max_context)
         if file_size > max_bytes: # dynamic limit for raw reads
-            return f"Error: File '{filename}' is too large to read entirely ({file_size / 1024:.1f} KB) into your chat context window. Limit is {max_bytes / 1024:.1f} KB. Note: This limit only applies to 'read'. The 'knowledge_base(action=ingest_document)' tool has NO size limits. Use file_system(operation='read_chunked', filename='{filename}') to read it page-by-page, operation='search' to find specific lines, operation='inspect' to read the first few lines, or write a Python script using the 'execute' tool."
+            return f"Error: File '{filename}' is too large to read entirely ({file_size / 1024:.1f} KB) into your chat context window. Limit is {max_bytes / 1024:.1f} KB. Note: This limit only applies to a WHOLE-file 'read'. Best option: read only the region you need — file_system(operation='read', path='{filename}', start_line=200, end_line=260) (line-ranged, exempt from this cap, chains directly from 'search' line numbers). Also: operation='read_chunked' to page through it, operation='search' to find specific lines, operation='inspect' for the first few lines, knowledge_base(action='ingest_document') (NO size limit) to index it, or a Python script via 'execute'."
 
         # Per-BATCH cumulative budget: even when THIS file clears the per-file
         # cap above, earlier reads dispatched from the SAME assistant message may
@@ -939,7 +1027,10 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 "and routinely introduces NEW bugs. Instead, copy the exact "
                 "current text from the CLOSEST MATCH below (line numbers shown) "
                 "and emit a tight single-line SEARCH block for the surgical edit.\n"
-                "  2. Only if the edit genuinely spans many lines, replace each "
+                "  2. If the snippet below isn't enough, re-read ONLY that "
+                f"region — file_system(operation='read', path='{filename}', "
+                "start_line=<N>, end_line=<M>) — do NOT re-read the whole file.\n"
+                "  3. Only if the edit genuinely spans many lines, replace each "
                 "line as its own one-line SEARCH/REPLACE rather than rewriting "
                 "the file.\n"
             )
@@ -2110,7 +2201,21 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
     if not target_path: 
         return f"SYSTEM INSTRUCTION: The 'path' (target filename) is missing for the '{operation}' operation. You MUST specify WHICH file to {operation}."
     
-    if operation == "read": return await tool_read_file(target_path, sandbox_dir, max_context=max_context, read_budget=read_budget)
+    if operation == "read":
+        # Optional line-range (#11). Accept the common aliases the model
+        # reaches for (start/from/line_start ...). None → whole-file read.
+        def _as_int(v):
+            try:
+                return int(v) if v is not None and str(v).strip() != "" else None
+            except (TypeError, ValueError):
+                return None
+        _start = _as_int(kwargs.get("start_line", kwargs.get("start",
+                         kwargs.get("from_line", kwargs.get("line_start")))))
+        _end = _as_int(kwargs.get("end_line", kwargs.get("end",
+                       kwargs.get("to_line", kwargs.get("line_end")))))
+        return await tool_read_file(target_path, sandbox_dir, max_context=max_context,
+                                    read_budget=read_budget,
+                                    start_line=_start, end_line=_end)
     elif operation == "read_chunked":
         page = kwargs.get("page", 1)
         chunk_size = kwargs.get("chunk_size", 32000)

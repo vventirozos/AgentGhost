@@ -423,6 +423,9 @@
 └── Documentation/          (this set)
 </code></pre>
 
+  <h2>Test builders (2026-07-07, #26)</h2>
+  <p>The suite (~6,500 tests) had accreted heavy per-file duplication — measured 22 separate <code>def agent()</code> fixtures, ~94 files hand-constructing <code>GhostAgent</code>, 233 <code>SimpleNamespace</code> fakes, 17 copies of a <code>FakeBgTasks</code> shim — each re-deriving the same <code>GhostContext</code> shape. That coupled the suite to the monolith's internals, so any constructor change fanned out across ~90 files (which actively deterred the <a href="core/agent.html">agent.py</a> extraction). <code>tests/helpers.py</code> centralizes the shape: <code>make_context(**overrides)</code> (a fully-wired, inert <code>GhostContext</code> mock with every field overridable), <code>make_agent(**overrides)</code> (a real <code>GhostAgent</code> built through the normal <code>__init__</code> so init-time wiring is exercised), and the shared <code>FakeBgTasks</code>. Both are exposed as the <code>agent_context</code> / <code>built_agent</code> conftest fixtures. New tests use these; existing session-named files migrate opportunistically when touched. Covered by <code>tests/test_canonical_builders.py</code>.</p>
+
   <footer><a href="index.html">← Back to index</a></footer>
 </main>
 </body>

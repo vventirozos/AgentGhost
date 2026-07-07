@@ -18,6 +18,20 @@ logger = logging.getLogger("GhostAgent")
 # This will need to be bound to run_proactive_task from agent.py
 run_proactive_task_fn = None
 
+
+def should_defer_scheduled_task(llm_client) -> bool:
+    """True when a scheduled (idle-time autonomous) task should skip THIS
+    firing because a live user request is in flight.
+
+    Turns are serialized (agent_semaphore == 1, see core.agent #22), so a
+    scheduled job dispatched now would queue against the user's turn. These
+    jobs are idle-time work and the scheduler re-fires them on the next tick,
+    so skipping is strictly better than making a user wait. Only a REAL
+    positive int defers — a missing attr or a mocked client (MagicMock) reads
+    as "no user active" so tests and partial contexts proceed."""
+    cur = getattr(llm_client, "foreground_requests", 0)
+    return isinstance(cur, int) and cur > 0
+
 async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, scheduler, memory_system):
     pretty_log("Task Schedule", f"Name: {task_name} | Expr: {cron_expression}", icon=Icons.BRAIN_PLAN)
     if not scheduler:

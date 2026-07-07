@@ -22,6 +22,7 @@ import asyncio
 import pytest
 
 from ghost_agent.tools import memory as M
+from ghost_agent.utils import logging as _glog
 
 
 class _HangingClient:
@@ -58,16 +59,18 @@ class _FakeBus:
         self.published.append((action, payload))
 
 
+# Graph extraction now schedules through the unified spawn_bg registry
+# (utils.logging._BG_TASKS), not the removed module-local set.
 @pytest.fixture(autouse=True)
 async def _clear_bg_tasks():
     yield
-    for t in list(M._GRAPH_EXTRACT_TASKS):
+    for t in list(_glog._BG_TASKS):
         t.cancel()
-    M._GRAPH_EXTRACT_TASKS.clear()
+    _glog._BG_TASKS.clear()
 
 
 async def _drain_bg():
-    tasks = list(M._GRAPH_EXTRACT_TASKS)
+    tasks = list(_glog._BG_TASKS)
     if tasks:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
 
@@ -111,7 +114,7 @@ async def test_fact_stored_with_no_llm_client():
     assert "stored" in res.lower()
     assert bus.published[0][1]["triplets"] == []
     # No extraction task without an llm_client.
-    assert not M._GRAPH_EXTRACT_TASKS
+    assert not _glog._BG_TASKS
 
 
 async def test_empty_text_rejected():

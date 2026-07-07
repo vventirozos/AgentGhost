@@ -81,7 +81,7 @@ async def test_contextual_query_expansion(mock_context):
         
         # Find the memory search call
         print("Mocked calls:", mock_to_thread.call_args_list)
-        search_call = next(call for call in mock_to_thread.call_args_list if call.args[0] == mock_context.memory_system.search)
+        search_call = next(call for call in mock_to_thread.call_args_list if call.args[0] == mock_context.memory_system.search_items)
         actual_query = search_call.args[1]
         
         assert "Context: I have created the calculation script." in actual_query
@@ -109,7 +109,7 @@ async def test_self_contained_command_is_not_contaminated(mock_context):
         mock_to_thread.return_value = "Mocked Memory"
         await agent.handle_chat({"messages": messages, "model": "test"}, MagicMock())
 
-        search_call = next(call for call in mock_to_thread.call_args_list if call.args[0] == mock_context.memory_system.search)
+        search_call = next(call for call in mock_to_thread.call_args_list if call.args[0] == mock_context.memory_system.search_items)
         actual_query = search_call.args[1]
 
         # The prior comparison must NOT leak into the delete's search query.

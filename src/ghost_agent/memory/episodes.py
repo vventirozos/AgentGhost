@@ -429,6 +429,24 @@ class EpisodicMemory:
                 )
                 return [dict(row) for row in cursor]
 
+    @staticmethod
+    def format_episode(ep: Dict) -> str:
+        """Render ONE episode as a single compact line.
+
+        Shared by `format_for_context` (blob rendering, legacy callers) and
+        the MemoryBus per-item fetcher — one episode per RRF item so fusion
+        can rank episodes individually instead of treating the whole tier
+        as a single rank-1 blob."""
+        entry = (
+            f"- [{ep.get('cluster_id', 'general')}] "
+            f"Trigger: {ep['trigger'][:100]} | "
+            f"Outcome: {'SUCCESS' if ep.get('outcome_success') else 'FAILURE'} — "
+            f"{ep.get('outcome', 'unknown')[:100]}"
+        )
+        if ep.get("lesson"):
+            entry += f" | Lesson: {ep['lesson'][:100]}"
+        return entry
+
     def format_for_context(self, episodes: List[Dict], max_chars: int = 2000) -> str:
         """Format episodes for injection into LLM context."""
         if not episodes:
@@ -436,14 +454,7 @@ class EpisodicMemory:
         lines = ["### RELEVANT PAST EPISODES (from prior sessions — for reference only, NOT events in the current conversation):"]
         used = 0
         for ep in episodes:
-            entry = (
-                f"- [{ep.get('cluster_id', 'general')}] "
-                f"Trigger: {ep['trigger'][:100]} | "
-                f"Outcome: {'SUCCESS' if ep.get('outcome_success') else 'FAILURE'} — "
-                f"{ep.get('outcome', 'unknown')[:100]}"
-            )
-            if ep.get("lesson"):
-                entry += f" | Lesson: {ep['lesson'][:100]}"
+            entry = self.format_episode(ep)
             if used + len(entry) > max_chars:
                 lines.append(f"[... +{len(episodes) - len(lines) + 1} more episodes]")
                 break

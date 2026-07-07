@@ -123,16 +123,31 @@ def _cross_encoder_rerank(query: str, candidates: list, top_k: int = 12) -> list
     candidates.sort(key=lambda x: x.get('rerank_score', x.get('combined_score', 0)))
     return candidates[:top_k]
 
+
+# Weight of the category prior (p_score) in combined_score. At the old ×10
+# the tiers sat ±10 apart while dist + time_penalty spans only ~2.3 and the
+# BM25 rerank ±0.3 — category priority was ABSOLUTE: a barely-over-threshold
+# name-memory (dist 1.4) could never lose to a dist-0.1 exact-match document,
+# so semantic relevance was cosmetic across tiers. At 0.3 the prior still
+# dominates between distant tiers (identity vs auto ≈ 3.3 apart) but a
+# decisively closer match CAN cross adjacent tiers (manual vs auto = 0.3,
+# document vs manual = 1.5). Module-level (not a class attr) so unbound-method
+# tests on MagicMock instances don't shadow it.
+_TIER_WEIGHT = 0.3
+
 class VectorMemory:
-    # Bounded growth for the open-ended tiers. Only `auto` / `manual` /
-    # `name` / `summary` entries — the ones the agent accretes turn after
-    # turn — are eligible for eviction; ingested documents, skill twins and
+    # Bounded growth for the open-ended tiers. Entries the agent accretes
+    # turn after turn — `auto` / `manual`, plus `synthesis` (dream
+    # consolidation output, written every REM cycle with no cap of its own)
+    # — are eligible for eviction; ingested documents, skill twins and
     # episodes are owned by their own capped stores and are never pruned
-    # here. Eviction is by utility (retrieval_count) then age (oldest
-    # last_accessed first), the same spaced-repetition signal the search
-    # ranker already uses, so frequently-recalled memories survive.
+    # here. `identity` stays non-prunable deliberately: losing "user's name
+    # is X" to an eviction sweep is worse than the slow growth of a
+    # user-driven tier. Eviction is by utility (retrieval_count) then age
+    # (oldest last_accessed first), the same spaced-repetition signal the
+    # search ranker already uses, so frequently-recalled memories survive.
     MAX_PRUNABLE_MEMORIES = 5000
-    _PRUNABLE_TYPES = ("auto", "manual")
+    _PRUNABLE_TYPES = ("auto", "manual", "synthesis")
     # Re-check the cap every N adds rather than counting on every write.
     _PRUNE_CHECK_EVERY = 200
 
@@ -509,7 +524,77 @@ class VectorMemory:
             logger.error(f"Ingest failed: {e}")
             return False, str(e)
 
-    def search(self, query: str, inject_identity: bool = True):
+    def bump_retrievals(self, ids: list):
+        """Public, deduplicating wrapper around `_bump_retrieval_stats`.
+
+        Exists for callers that defer reinforcement until AFTER a selection
+        step (the MemoryBus credits only the memories that actually entered
+        the prompt, once per turn — not every candidate of every sub-query).
+        """
+        uniq = [i for i in dict.fromkeys(ids or []) if i]
+        if uniq:
+            self._bump_retrieval_stats(uniq)
+
+    def search_items(self, query: str, inject_identity: bool = True) -> list:
+        """Per-item variant of `search()` for the MemoryBus.
+
+        Returns ``[{"id": <chroma id>, "text": <formatted line>, "score":
+        <combined_score, lower is better>}]`` and — deliberately — does NOT
+        bump retrieval stats: under RAG-fusion the bus runs up to 4
+        sub-queries per turn, and bumping every candidate credited memories
+        the model never saw (inflating the spaced-repetition half-life and
+        the prune-survival ranking). The bus credits the survivors via
+        `bump_retrievals` after fusion.
+        """
+        selection = self._search_selection(query, inject_identity)
+        return [
+            {
+                "id": item.get("mem_id"),
+                "text": self._render_item(item),
+                "score": item.get("combined_score", 0.0),
+            }
+            for item in selection
+        ]
+
+    def search(self, query: str, inject_identity: bool = True, record_retrievals: bool = True):
+            try:
+                selection = self._search_selection(query, inject_identity)
+                if not selection:
+                    return ""
+
+                # Bump retrieval stats for memories that made the final cut.
+                # This closes the reinforcement loop: retrieved memories get
+                # their last_accessed refreshed and retrieval_count incremented,
+                # so they decay slower on future searches (spaced-repetition).
+                # Callers that select AGAIN downstream (MemoryBus) pass
+                # record_retrievals=False and credit only the survivors.
+                if record_retrievals:
+                    try:
+                        self.bump_retrievals([item.get("mem_id") for item in selection])
+                    except Exception:
+                        pass
+
+                return "\n---\n".join(self._render_item(item) for item in selection)
+            except Exception as e:
+                logger.error(f"Search failed: {e}")
+                return ""
+
+    @staticmethod
+    def _render_item(item: dict) -> str:
+        ts = item['meta'].get('timestamp', '?')
+        m_type = item['meta'].get('type', 'auto').upper()
+        doc_text = item['doc']
+
+        prefix = ""
+        if item['p_score'] <= -15: prefix = "**[MASTER SUMMARY]** "
+        elif item['p_score'] == -12: prefix = "**[EPISODE]** "
+        elif item['p_score'] <= -10: prefix = "**[IDENTITY]** "
+        elif item['p_score'] == -5: prefix = "**[DOCUMENT SOURCE]** "
+        elif item['p_score'] == 0: prefix = "**[USER PRIORITY]** "
+
+        return f"[{ts}] ({m_type}) {prefix}{doc_text}"
+
+    def _search_selection(self, query: str, inject_identity: bool = True) -> list:
             try:
                 search_queries = [query]
                 
@@ -556,6 +641,16 @@ class VectorMemory:
 
                         is_summary = m_type == "document_summary"
                         is_episode = m_type == "episode"
+                        # Deliberately-written high-curation types that the
+                        # scorer used to IGNORE: `identity` (written by the
+                        # update-profile path) fell into the generic else —
+                        # lowest priority, 0.55 threshold — unless its text
+                        # happened to match the name-string heuristics below;
+                        # `synthesis` (dream consolidation output) likewise
+                        # ranked below raw auto chunks. Score them from
+                        # METADATA, on par with their heuristic twins.
+                        is_identity_type = m_type == "identity"
+                        is_synthesis = m_type == "synthesis"
 
                         is_name_memory = (
                             "name is" in doc_lower or
@@ -566,10 +661,12 @@ class VectorMemory:
 
                         if is_name_memory:
                             threshold = 1.0  # Tightened from 1.2
-                        elif is_summary:
+                        elif is_summary or is_synthesis:
                             threshold = 0.75 # Tightened from 0.85
                         elif is_episode:
                             threshold = 0.70
+                        elif is_identity_type:
+                            threshold = 0.8  # matches manual-in-identity-batch
                         elif is_identity_batch:
                             threshold = 0.8 if m_type == 'manual' else 0.65
                         else:
@@ -593,9 +690,9 @@ class VectorMemory:
                             priority_score = 1
 
                             if is_name_memory: priority_score = -20
-                            elif is_summary: priority_score = -15
+                            elif is_summary or is_synthesis: priority_score = -15
                             elif is_episode: priority_score = -12
-                            elif is_identity_batch: priority_score = -10
+                            elif is_identity_type or is_identity_batch: priority_score = -10
                             elif m_type == 'document': priority_score = -5 # Elevate document priority above general manual/auto
                             elif m_type == 'manual': priority_score = 0
 
@@ -641,10 +738,12 @@ class VectorMemory:
                     except Exception:
                         time_penalty = 0.05
 
-                    # p_score defines the absolute category priority multiplier.
-                    # dist + time_penalty provides semantic/recency nuance within those bounds.
+                    # p_score is a category PRIOR, no longer an absolute gate:
+                    # at _TIER_WEIGHT the prior separates distant tiers but a
+                    # decisively closer match can cross adjacent ones (see the
+                    # constant's comment for the calibration).
                     # (Since lower distance is better, lower combined_score is better)
-                    c['combined_score'] = (c['p_score'] * 10.0) + c['dist'] + time_penalty
+                    c['combined_score'] = (c['p_score'] * _TIER_WEIGHT) + c['dist'] + time_penalty
 
                 # Sort by the new contextual combined score ascending (lowest score is best)
                 candidates.sort(key=lambda x: x['combined_score'])
@@ -653,13 +752,8 @@ class VectorMemory:
                 # of semantic distance to catch exact-match needs (error codes,
                 # function names, file paths) that pure embedding search misses.
                 final_selection = _cross_encoder_rerank(query, candidates, top_k=12)
-                if not final_selection: return ""
+                if not final_selection: return []
 
-                # Bump retrieval stats for memories that made the final cut.
-                # This closes the reinforcement loop: retrieved memories get
-                # their last_accessed refreshed and retrieval_count incremented,
-                # so they decay slower on future searches (spaced-repetition).
-                bump_ids = []
                 for item in final_selection:
                     # Prefer the REAL Chroma id captured from the query result.
                     # The old code only had meta['id'] (rarely set) and fell
@@ -670,33 +764,13 @@ class VectorMemory:
                     if not mem_id:
                         import hashlib as _hl
                         mem_id = _hl.md5(item['doc'].encode("utf-8")).hexdigest()
-                    bump_ids.append(mem_id)
-                if bump_ids:
-                    try:
-                        self._bump_retrieval_stats(bump_ids)
-                    except Exception:
-                        pass
+                    item['mem_id'] = mem_id
 
-                output = []
-                for item in final_selection:
-                    ts = item['meta'].get('timestamp', '?')
-                    m_type = item['meta'].get('type', 'auto').upper()
-                    doc_text = item['doc']
-
-                    prefix = ""
-                    if item['p_score'] <= -15: prefix = "**[MASTER SUMMARY]** "
-                    elif item['p_score'] == -12: prefix = "**[EPISODE]** "
-                    elif item['p_score'] <= -10: prefix = "**[IDENTITY]** "
-                    elif item['p_score'] == -5: prefix = "**[DOCUMENT SOURCE]** "
-                    elif item['p_score'] == 0: prefix = "**[USER PRIORITY]** "
-
-                    output.append(f"[{ts}] ({m_type}) {prefix}{doc_text}")
-
-                return "\n---\n".join(output)
+                return final_selection
 
             except Exception as e:
                 logger.error(f"Search failed: {e}")
-                return ""
+                return []
 
     def forget_episode(self, episode_id) -> None:
         """Remove an episode's vector entry by its ``episode_id`` metadata.

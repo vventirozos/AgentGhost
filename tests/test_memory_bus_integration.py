@@ -33,6 +33,8 @@ def _make_agent_context():
     ctx.scratchpad = MagicMock()
     ctx.scratchpad.list_all = MagicMock(return_value="")
     ctx.memory_system = MagicMock()
+    ctx.memory_system.search_items = MagicMock(return_value=[
+        {"id": "m1", "text": "Mocked Vector Memory", "score": 0.1}])
     ctx.memory_system.search = MagicMock(return_value="Mocked Vector Memory")
     ctx.graph_memory = MagicMock()
     ctx.graph_memory.get_neighborhood = MagicMock(
@@ -62,8 +64,11 @@ async def test_agent_handle_chat_uses_memory_bus_for_hydration():
     }
     await agent.handle_chat(body, MagicMock())
 
-    # Both subsystems must have been queried via the bus's asyncio.to_thread
-    ctx.memory_system.search.assert_called()
+    # Both subsystems must have been queried via the bus's asyncio.to_thread.
+    # The bus prefers the per-item search_items API (2026-07-07) and falls
+    # back to the string search() for stubs without it — accept either.
+    assert (ctx.memory_system.search_items.call_count
+            + ctx.memory_system.search.call_count) > 0
     ctx.graph_memory.get_neighborhood.assert_called()
     # Bus extracts query terms before hitting graph
     graph_call = ctx.graph_memory.get_neighborhood.call_args
@@ -179,7 +184,9 @@ async def test_tool_remember_publishes_immediately_then_extracts_triplets_in_bac
     assert fact_data["triplets"] == []
 
     # Triplets are extracted + added to the graph off the critical path.
-    tasks = list(M._GRAPH_EXTRACT_TASKS)
+    # Graph extraction schedules through the unified spawn_bg registry now.
+    from ghost_agent.utils import logging as _glog
+    tasks = list(_glog._BG_TASKS)
     if tasks:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=5.0)
     graph.add_triplets.assert_called_once_with(

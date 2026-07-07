@@ -1,4 +1,10 @@
-"""Tests for the MCTS Reasoning module."""
+"""Tests for the MCTS Reasoning module.
+
+ABLATED-LAYER TESTS: the MCTS turn-start hint is DISABLED on the request path
+(`_MCTS_TURNSTART_ENABLED = False`, core/agent.py) since the 2026-06 cognitive
+-layer redesign — see COGNITIVE_LAYER_REDESIGN.md. These pin the parked
+subsystem's behavior, not live request-path behavior.
+"""
 
 import pytest
 from unittest.mock import AsyncMock, MagicMock

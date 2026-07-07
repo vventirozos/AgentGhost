@@ -42,16 +42,23 @@ async def test_memory_search_is_async(mock_context):
         body = {"messages": [{"role": "user", "content": "Please remember this important fact"}]}
         await agent.handle_chat(body, background_tasks=MagicMock())
         
-        # Verify to_thread was called with memory_system.search
+        # Verify to_thread was called with the vector search entry point.
+        # The MemoryBus prefers the per-item `search_items` API (2026-07-07:
+        # deferred retrieval credit + per-item RRF); `search` remains the
+        # fallback for stubs without it — either counts as "offloaded".
         found_call = False
+        offload_targets = (
+            mock_context.memory_system.search_items,
+            mock_context.memory_system.search,
+        )
         for call in mock_to_thread.call_args_list:
             # Check if the FIRST argument is the function we expect
-            if call.args and call.args[0] == mock_context.memory_system.search:
+            if call.args and call.args[0] in offload_targets:
                 assert call.args[1] == "Please remember this important fact"
                 found_call = True
                 break
-        
-        assert found_call, f"memory_system.search was not offloaded to thread. Calls: {mock_to_thread.call_args_list}"
+
+        assert found_call, f"vector search was not offloaded to thread. Calls: {mock_to_thread.call_args_list}"
 
 @pytest.mark.asyncio
 async def test_playbook_context_is_async(mock_context):

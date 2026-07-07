@@ -22,4 +22,4 @@ async def test_tool_execute_shell_argument_escaping():
              await tool_execute(filename, content, sandbox_dir, sandbox_manager, args=args)
              
              expected_cmd = "bash script.sh " + shlex.quote(malicious_arg)
-             sandbox_manager.execute.assert_called_with(expected_cmd)
+             sandbox_manager.execute.assert_called_with(expected_cmd, spill_large_output=True)

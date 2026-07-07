@@ -64,14 +64,13 @@ def test_process_rolling_window_sliding(mock_agent):
 
 def test_agent_semaphore_initialization(mock_agent):
     """
-    Verify that the agent's semaphore is initialized to 10 to allow
-    concurrent background tasks and user chats.
+    Verify turns are SERIALIZED (semaphore == 1) — 2026-07-07 (#22). Per-turn
+    state (`last_user_content`, `current_project_id`) lives on the singleton
+    context, so concurrent turns (esp. a cron job firing mid-user-turn) would
+    clobber each other's project scope. One llama slot makes concurrency mostly
+    illusory anyway, so serializing is near-free and closes that hazard.
     """
-    # In asyncio.Semaphore, the initial value is stored in _value (internal) 
-    # but we can also just check if we can acquire it multiple times in a loop 
-    # or check the internal attribute for a unit test.
-    # checking internal _value is implementation specific but simplest for unit test.
-    assert mock_agent.agent_semaphore._value == 10
+    assert mock_agent.agent_semaphore._value == 1
 
 @pytest.mark.asyncio
 async def test_agent_streaming(mock_agent):

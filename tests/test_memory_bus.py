@@ -13,6 +13,14 @@ from ghost_agent.core.bus import MemoryBus
 @pytest.fixture
 def mocks():
     vec = MagicMock()
+    # Per-item API preferred by the bus (2026-07-07): items carry the real
+    # Chroma id so post-fusion credit can bump only what got injected.
+    vec.search_items = MagicMock(return_value=[
+        {"id": "id-1", "text": "Doc one", "score": 0.10},
+        {"id": "id-2", "text": "Doc two", "score": 0.20},
+    ])
+    vec.bump_retrievals = MagicMock()
+    # Legacy string API kept as the fallback for stubs without search_items.
     vec.search = MagicMock(return_value="Doc one\n---\nDoc two")
     vec.add = MagicMock()
 
@@ -24,6 +32,11 @@ def mocks():
     graph.add_triplets = MagicMock(return_value=2)
 
     skill = MagicMock()
+    # Per-lesson API preferred by the bus; the blob renderer is the fallback.
+    skill.get_playbook_items = MagicMock(return_value=[
+        {"text": "Don't recurse forever.", "trigger": "recursion"},
+    ])
+    skill.record_retrievals_bulk = MagicMock()
     skill.get_playbook_context = MagicMock(return_value="## RECENT LESSONS\n1. Don't recurse forever.")
     skill.learn_lesson = MagicMock()
 
@@ -112,9 +125,9 @@ def test_extract_query_terms_caps_and_does_not_append_user():
 async def test_hydrate_context_fans_out_in_parallel(bus, mocks):
     """All three subsystems must be queried for a single hydrate call."""
     out = await bus.hydrate_context("tell me about my dog")
-    mocks["vector"].search.assert_called_once_with("tell me about my dog")
+    mocks["vector"].search_items.assert_called_once_with("tell me about my dog")
     mocks["graph"].get_neighborhood.assert_called_once()
-    mocks["skill"].get_playbook_context.assert_called_once()
+    mocks["skill"].get_playbook_items.assert_called_once()
     # Combined Markdown contains markers from each section.
     assert "TOPOLOGICAL KNOWLEDGE GRAPH" in out
     assert "MEMORY CONTEXT" in out
@@ -143,23 +156,28 @@ async def test_hydrate_context_actually_concurrent(bus, mocks):
         await bus.hydrate_context("anything")
         elapsed = time.monotonic() - t0
 
-    # Three 50ms sleeps in series would be >=150ms; concurrent ≈50ms.
-    assert elapsed < 0.13, f"hydrate_context appears sequential ({elapsed:.3f}s)"
-    assert timings["started"] == 3
-    assert timings["finished"] == 3
+    # Three concurrent 50ms fetches ≈50ms, plus ONE post-fusion credit pass
+    # (also via to_thread, sequential after formatting) ≈50ms → ~100ms total.
+    # A sequential implementation would be >=200ms.
+    assert elapsed < 0.16, f"hydrate_context appears sequential ({elapsed:.3f}s)"
+    assert timings["started"] == 4
+    assert timings["finished"] == 4
 
 
 @pytest.mark.asyncio
 async def test_hydrate_context_empty_query_short_circuits(bus, mocks):
     out = await bus.hydrate_context("")
     assert out == ""
+    mocks["vector"].search_items.assert_not_called()
     mocks["vector"].search.assert_not_called()
     mocks["graph"].get_neighborhood.assert_not_called()
+    mocks["skill"].get_playbook_items.assert_not_called()
     mocks["skill"].get_playbook_context.assert_not_called()
 
 
 @pytest.mark.asyncio
 async def test_hydrate_context_swallows_subsystem_errors(mocks):
+    mocks["vector"].search_items = MagicMock(side_effect=RuntimeError("vector down"))
     mocks["vector"].search = MagicMock(side_effect=RuntimeError("vector down"))
     bus = MemoryBus(
         vector_memory=mocks["vector"],
@@ -176,6 +194,8 @@ async def test_hydrate_context_swallows_subsystem_errors(mocks):
 @pytest.mark.asyncio
 async def test_hydrate_context_truncates_to_char_budget(bus, mocks):
     big = "x" * 200_000
+    mocks["vector"].search_items = MagicMock(
+        return_value=[{"id": "big", "text": big, "score": 0.1}])
     mocks["vector"].search = MagicMock(return_value=big)
     out = await bus.hydrate_context("query", max_chars=500)
     # Either the per-section budget or the global truncation marker fires;
@@ -186,6 +206,7 @@ async def test_hydrate_context_truncates_to_char_budget(bus, mocks):
 
 @pytest.mark.asyncio
 async def test_hydrate_context_skips_skill_no_lessons(bus, mocks):
+    mocks["skill"].get_playbook_items = MagicMock(return_value=[])
     mocks["skill"].get_playbook_context = MagicMock(return_value="No lessons learned yet.")
     out = await bus.hydrate_context("anything")
     assert "SKILL PLAYBOOK" not in out

@@ -145,6 +145,8 @@ def parse_args():
     parser.add_argument("--postmortem-cooldown", type=int, default=10800, help="Seconds between idle-time post-mortem passes (phase 2.5c). Default 3 hours. Only active under --postmortem.")
     parser.add_argument("--postmortem-min-severity", type=float, default=0.4, help="Minimum structural-severity (0..1) a failed run must score before it earns a post-mortem LLM call. Lower = more runs analysed. Default 0.4.")
     parser.add_argument("--postmortem-propose-patch", action="store_true", default=False, help="For code_defect post-mortems, also ask the coding model for a reproducing test + unified diff and attach them to the defect report (stored as a PROPOSAL, never applied). Requires --postmortem. Adds one coding-model call per code-defect finding.")
+    parser.add_argument("--bio-time-scale", type=float, default=1.0, help="B3 idle-loop ablation (IMPROVEMENTS.md #4): divide every biological-watchdog idle-window bound and phase cooldown by N, so hours-long idle windows compress into minutes. Default 1.0 = production timings. e.g. 60 → a 1h window fires after ~1min idle. Used by scripts/ablation_trackb3.py to exercise the pure-idle learning loops in accelerated epochs. DO NOT set in production.")
+    parser.add_argument("--bio-deterministic", action="store_true", default=False, help="B3 idle-loop ablation: make the probabilistic idle phases (dream 0.5, self-play 0.2) fire deterministically every eligible tick instead of sampling, so the ablation's control/treatment arms exercise the same phases each accelerated epoch. Default off (production sampling). Pairs with --bio-time-scale.")
     parser.add_argument("--router-model", default=None, help="Path to a persisted ComplexityClassifier JSON. When set, the router is loaded and consulted; when unset (default), the dispatcher is a no-op that always allows the full swarm pool list.")
     parser.add_argument("--router-confidence-threshold", type=float, default=0.3, help="Minimum router confidence required to route a request to a cheap path. Below this, the dispatcher escalates to the full swarm.")
     # Process Reward Model. When --prm-model points at a valid
@@ -272,6 +274,41 @@ def parse_args():
     if args.upstream_url:
         args.upstream_url = args.upstream_url.replace("http:://", "http://").replace("https:://", "https://")
     return args
+
+def _build_resolved_config(args, context) -> dict:
+    """Collapse the 5 config sources into one flat, redacted dict.
+
+    Sources: (1) argparse flags (vars(args)), (2) the GHOST_* env vars actually
+    consumed, (3) the module-constant cognitive toggles in core/agent.py,
+    (4) a couple of derived runtime facts. Used by the boot dump, /api/health,
+    and $GHOST_HOME/system/last_config.json."""
+    cfg = {}
+    # (1) argparse — redact the api key.
+    for k, v in vars(args).items():
+        if k == "api_key":
+            cfg[f"arg.{k}"] = "***set***" if v else "(none)"
+        else:
+            cfg[f"arg.{k}"] = v
+    # (2) GHOST_* env vars (only those present — the consumed surface).
+    for k, v in sorted(os.environ.items()):
+        if k.startswith("GHOST_"):
+            cfg[f"env.{k}"] = v
+    # (3) module-constant cognitive toggles — the ones no flag controls, so
+    # the ONLY place their live value is visible.
+    try:
+        from .core import agent as _agent_mod
+        for tog in ("_MCTS_TURNSTART_ENABLED", "_SELFHOOD_PREFIX_ENABLED",
+                    "_HYPOTHESIS_GROUNDING_ENABLED", "_METACOG_ARBITER_ENABLED"):
+            if hasattr(_agent_mod, tog):
+                cfg[f"toggle.{tog}"] = getattr(_agent_mod, tog)
+    except Exception:
+        pass
+    # (4) derived runtime facts operators ask about.
+    cfg["runtime.critic_async"] = os.environ.get("GHOST_CRITIC_ASYNC", "0")
+    cfg["runtime.memory_system_loaded"] = getattr(context, "memory_system", None) is not None
+    cfg["runtime.scheduler_enabled"] = getattr(context, "scheduler", None) is not None
+    return cfg
+
 
 @asynccontextmanager
 async def lifespan(app):
@@ -437,6 +474,19 @@ async def lifespan(app):
             except Exception:  # noqa: BLE001
                 task_name = job_id
             try:
+                # Turns are serialized (agent_semaphore == 1). A scheduled job
+                # is idle-time autonomous work and must never make a live user
+                # wait behind it: if a user request is in flight, skip this
+                # firing rather than queue behind the user. The scheduler
+                # re-fires the job on its next tick.
+                if _tools_tasks.should_defer_scheduled_task(
+                        getattr(context, "llm_client", None)):
+                    pretty_log(
+                        "Scheduled Task Deferred",
+                        f"{job_id} — a user request is active; will retry next tick.",
+                        icon=Icons.SKIP,
+                    )
+                    return
                 pretty_log(
                     "Scheduled Task Fire",
                     f"{job_id} | prompt={prompt[:80]!r}",
@@ -714,7 +764,15 @@ async def lifespan(app):
                     "max_tokens": 4096,
                     "stream": False,
                 }
-                res = await context.llm_client.chat_completion(payload)
+                # BACKGROUND priority: reflection is learning work, never
+                # part of a user-facing reply. At foreground priority it
+                # contended head-on with the user's next turn for the single
+                # 35B slot AND inflated foreground_tasks, making the
+                # "is a user live?" checks (self-play gate, bg queue) misread
+                # an idle reflection as an active user. If a user turn is
+                # running, this parks and the Reflector's per-call timeout
+                # simply defers the trajectory to the idle backstop.
+                res = await context.llm_client.chat_completion(payload, is_background=True)
                 return (
                     (res or {})
                     .get("choices", [{}])[0]
@@ -752,7 +810,8 @@ async def lifespan(app):
                     "max_tokens": 2048,
                     "stream": False,
                 }
-                res = await context.llm_client.chat_completion(payload)
+                # BACKGROUND priority — same rationale as _critique_fn.
+                res = await context.llm_client.chat_completion(payload, is_background=True)
                 content = (
                     (res or {}).get("choices", [{}])[0]
                     .get("message", {}).get("content", "") or ""
@@ -888,7 +947,9 @@ async def lifespan(app):
                     "max_tokens": 4096,
                     "stream": False,
                 }
-                res = await context.llm_client.chat_completion(payload)
+                # BACKGROUND priority: post-mortem analysis runs from the
+                # idle watchdog and must never contend with a live user.
+                res = await context.llm_client.chat_completion(payload, is_background=True)
                 return (
                     (res or {}).get("choices", [{}])[0]
                     .get("message", {}).get("content", "") or ""
@@ -909,7 +970,8 @@ async def lifespan(app):
                         "max_tokens": 4096,
                         "stream": False,
                     }
-                    res = await context.llm_client.chat_completion(payload)
+                    # BACKGROUND priority — same rationale as _analyze_fn.
+                    res = await context.llm_client.chat_completion(payload, is_background=True)
                     return (
                         (res or {}).get("choices", [{}])[0]
                         .get("message", {}).get("content", "") or ""
@@ -1326,6 +1388,31 @@ async def lifespan(app):
     except Exception as _sge:
         logger.debug("SIGUSR2 task-dump handler not installed: %s", _sge)
 
+    # --- RESOLVED CONFIG DUMP (IMPROVEMENTS.md #21) ---
+    # Behaviour is set by 5 different sources (argparse flags, GHOST_* env
+    # vars, module-constant toggles in core/agent.py, the interface server's
+    # own env, and the out-of-repo launcher). Nothing ever printed the
+    # RESOLVED result, so "is the verifier actually on?" required ps + reading
+    # three files — the recurring drift-investigation class. Emit it once here,
+    # expose it on /api/health, and persist it for post-crash forensics.
+    import time as _time
+    app.state.boot_monotonic = _time.monotonic()
+    try:
+        resolved_config = _build_resolved_config(args, context)
+        app.state.resolved_config = resolved_config
+        _lines = "\n".join(f"  {k} = {v}" for k, v in sorted(resolved_config.items()))
+        pretty_log("Resolved Config", f"effective settings this boot:\n{_lines}",
+                   icon=Icons.BOOT_AWAKE)
+        try:
+            _cfg_path = context.memory_dir.parent / "last_config.json"
+            _cfg_path.parent.mkdir(parents=True, exist_ok=True)
+            _cfg_path.write_text(json.dumps(resolved_config, indent=2, default=str))
+        except Exception as _cfgw:
+            logger.debug("last_config.json write skipped: %s", _cfgw)
+    except Exception as _cfge:
+        logger.debug("resolved-config dump skipped: %s", _cfge)
+        app.state.resolved_config = {}
+
     pretty_log("System Ready", "Listening for requests", icon=Icons.SYSTEM_READY)
 
     try:
@@ -1411,6 +1498,14 @@ async def lifespan(app):
                     )
             except Exception as e:
                 logger.warning(f"Background-task drain error: {e}")
+        # Drain the unified spawn_bg registry (graph extraction, lesson
+        # retraction, PRM updates, …). Bounded so a stuck write can't pin
+        # shutdown; never raises.
+        try:
+            from .utils.logging import drain_background_tasks
+            await drain_background_tasks(timeout=5.0)
+        except Exception as e:
+            logger.debug(f"spawn_bg drain error: {e}")
         # Cancel any in-flight continuous self-play loop so the
         # process can exit cleanly. The loop is NOT persisted across
         # restarts by design — a fresh session starts with no loop.

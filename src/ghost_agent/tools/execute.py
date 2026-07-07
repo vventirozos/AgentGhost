@@ -371,7 +371,12 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         import time as _time
         _t0 = _time.time()
         cmd_str = f"bash -c {shlex.quote(command)}"
-        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=600, **_workdir_kw)
+        # spill_large_output: same small-view + full-log-to-file policy as the
+        # script path (the bash branch previously had NO tool-level trim, so a
+        # noisy direct command dumped its whole 256 KB into context).
+        output, exit_code = await asyncio.to_thread(
+            sandbox_manager.execute, cmd_str, timeout=600,
+            spill_large_output=True, **_workdir_kw)
         # Root fallback for project-scoped commands. When a project is active
         # the command runs from /workspace/projects/<id>, but the model may
         # reference a file that lives at the sandbox ROOT — e.g. one it wrote
@@ -819,40 +824,16 @@ if has_error:
                  args = [args]
              cmd += " " + " ".join(shlex.quote(str(a)) for a in args)
 
-        output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, **_workdir_kw)
-
-        # --- Output truncation (head + tail) ---
-        # The sandbox layer may already cap output at its own limit, but we
-        # apply a defensive head+tail trim here too. Keeping the TAIL is
-        # critical: Python tracebacks always print the actual exception
-        # type at the very end, so a head-only trim would hide the most
-        # useful diagnostic information from the LLM.
-        # Cap: 512 KB total, weighted toward the tail (100 KB head + 400 KB tail).
-        try:
-            if isinstance(output, str):
-                MAX_TOTAL = 512 * 1024
-                HEAD_BYTES = 100 * 1024
-                TAIL_BYTES = 400 * 1024
-                # `len(str)` here is a chars-as-proxy-for-bytes heuristic.
-                # For mostly-ASCII script output it's accurate; for output
-                # with heavy multibyte content we slightly over-trim, which
-                # is the safer failure mode.
-                if len(output) > MAX_TOTAL:
-                    head = output[:HEAD_BYTES]
-                    tail = output[-TAIL_BYTES:]
-                    dropped = len(output) - HEAD_BYTES - TAIL_BYTES
-                    output = (
-                        f"{head}\n\n"
-                        f"[... {dropped} bytes truncated by execute.py — "
-                        f"showing first {HEAD_BYTES // 1024} KB and last "
-                        f"{TAIL_BYTES // 1024} KB of {len(output) // 1024} KB total ...]\n\n"
-                        f"{tail}"
-                    )
-        except Exception as _trim_err:
-            # Truncation is best-effort — never let it crash the tool path.
-            logging.getLogger("GhostAgent").debug(
-                f"execute output truncation failed: {_trim_err}"
-            )
+        # Output truncation is owned by the sandbox layer now (one shared
+        # head+tail policy via utils.text_truncate). The execute tool opts into
+        # SPILL mode: the returned view is small (~24 KB head+tail) and the FULL
+        # output is written to a workspace run-log the model can read with
+        # file_system — so a noisy pip-install / test-run can no longer inject
+        # ~70 KB of tokens that persist in history, and nothing is lost. The old
+        # 512 KB trim here was dead code (docker capped at 256 KB before it saw
+        # the output) and a fourth divergent budget; it is removed.
+        output, exit_code = await asyncio.to_thread(
+            sandbox_manager.execute, cmd, spill_large_output=True, **_workdir_kw)
 
         diagnostic_info = ""
         if exit_code != 0:

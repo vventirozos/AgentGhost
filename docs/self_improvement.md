@@ -25,6 +25,21 @@ whose diagnosis + plan is persisted into `SkillMemory`, retrieved by
 the memory bus on a fresh-but-similar user turn, and visibly changes
 the agent's first action — all without any weight update.
 
+### Auto-FAILED labelling — structured `ToolCall.error` on the chat path (2026-07-07)
+
+The UNKNOWN→FAILED promotion for chat turns (`distill.outcome_heuristics`)
+already existed with conservative flood control (repeated-selector,
+≥3-identical-error, verifier-REFUTED, interact-abort signals; never demotes
+PASSED/FAILED). This closes the deferred item #5 as **landed** by removing its
+one residual weakness: the repeated-identical-error signal used to depend on
+regex-sniffing result *text* because the chat recorder left `ToolCall.error`
+empty (only self-play/batch set it), so failures with atypical text — e.g. the
+native-tools tool-call-corruption shapes — were missed. `_record_turn_trajectory`
+now populates `ToolCall.error` (a short normalized signature) whenever a paired
+tool result looks like a failure, and the heuristic (`_tool_call_failed`) checks
+the structured flag first with the text sniff as fallback for legacy
+trajectories. Covered by `tests/test_trajectory_failure_heuristic.py`.
+
 ## Module map
 
 | Module | Purpose | Wires into |

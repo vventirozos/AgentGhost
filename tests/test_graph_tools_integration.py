@@ -51,6 +51,8 @@ def mock_context():
 async def test_tool_remember_graph_extraction(mock_memory_system, mock_graph_memory, mock_llm_client):
     """Test that tool_remember offloads LLM-based triplet extraction into Graph Memory asynchronously."""
     
+    from ghost_agent.utils import logging as _glog
+    _glog._BG_TASKS.clear()
     with patch("ghost_agent.tools.memory.asyncio.to_thread") as mock_to_thread:
         # We need asyncio.to_thread patched to actually await logic right away so we can verify effects
         async def passthrough(func, *args, **kwargs):
@@ -58,29 +60,22 @@ async def test_tool_remember_graph_extraction(mock_memory_system, mock_graph_mem
                 return await func(*args, **kwargs)
             return func(*args, **kwargs)
         mock_to_thread.side_effect = passthrough
-        
-        with patch("ghost_agent.tools.memory.asyncio.create_task") as mock_task:
-            tasks = []
-            def track_task(coro):
-                t = asyncio.get_event_loop().create_task(coro)
-                tasks.append(t)
-                return t
-            mock_task.side_effect = track_task
-            
-            result = await tool_remember(
-                text="The user owns the repo.",
-                memory_system=mock_memory_system,
-                graph_memory=mock_graph_memory,
-                llm_client=mock_llm_client,
-                model_name="test-model"
-            )
-            
-            for t in tasks:
-                await t
-            
-            assert "Memory stored: 'The user owns the repo.'" in result
-            mock_memory_system.add.assert_called_once()
-            mock_graph_memory.add_triplets.assert_called_once_with([{"subject": "user", "predicate": "OWNS", "object": "repo"}])
+
+        result = await tool_remember(
+            text="The user owns the repo.",
+            memory_system=mock_memory_system,
+            graph_memory=mock_graph_memory,
+            llm_client=mock_llm_client,
+            model_name="test-model"
+        )
+
+        # Graph extraction is scheduled via spawn_bg → drain the registry.
+        for t in list(_glog._BG_TASKS):
+            await t
+
+        assert "Memory stored: 'The user owns the repo.'" in result
+        mock_memory_system.add.assert_called_once()
+        mock_graph_memory.add_triplets.assert_called_once_with([{"subject": "user", "predicate": "OWNS", "object": "repo"}])
 
 @pytest.mark.asyncio
 async def test_tool_recall_neighborhood_injection(mock_memory_system, mock_graph_memory):

@@ -74,7 +74,38 @@ class DockerSandbox:
         # models are not thread-safe either.
         self._lock = threading.Lock()
 
+        # Readiness TTL: execute() calls ensure_running() before EVERY command,
+        # and the full readiness probe is 3 docker round-trips (reload + host
+        # touch/stat + echo) ≈ 100-400ms, serialized under _lock. When a
+        # command has demonstrably just succeeded, the container is ready — so
+        # a probe within _READY_TTL_S of the last confirmed-good exec is
+        # skipped. Any exec failure / OCI error clears the stamp
+        # (`invalidate_ready`) so the recreate path still triggers promptly.
+        self._last_ready_ok = 0.0
+        self._READY_TTL_S = 8.0
+
         pretty_log("Sandbox Init", f"Mounting {self.host_workspace} -> {CONTAINER_WORKDIR}", icon=Icons.SANDBOX_BOX)
+
+    def _ready_is_fresh(self) -> bool:
+        # getattr defaults keep this safe when __init__ was bypassed (tests
+        # construct via __new__ / a stub), mirroring _get_lock's lazy pattern.
+        ttl = getattr(self, "_READY_TTL_S", 8.0)
+        last = getattr(self, "_last_ready_ok", 0.0)
+        return (
+            self.container is not None
+            and (time.monotonic() - last) < ttl
+        )
+
+    def mark_ready(self):
+        """Stamp a confirmed-good moment (a command exited without an
+        infrastructure error). Called by execute() after a successful run."""
+        self._last_ready_ok = time.monotonic()
+
+    def invalidate_ready(self):
+        """Force the next ensure_running() to run the full probe — call on any
+        exec failure / exit 126/127 / OCI error, since those are exactly the
+        signals that the container/mount may be gone."""
+        self._last_ready_ok = 0.0
 
     def get_stats(self):
         # Snapshot the handle: a concurrent ensure_running() reprovision can
@@ -103,44 +134,33 @@ class DockerSandbox:
                 return False
 
     def _probe_container_ready(self):
-        self.container.reload()
-        if self.container.status != "running":
-            return False
-
         # Verify the volume mount is still valid (not a deleted host inode)
+        # AND the container responds to exec — in ONE exec_run. Previously
+        # this was reload() + stat + echo = 3 daemon round-trips; the reload
+        # was redundant (a dead/stopped container fails the exec anyway) and
+        # the two execs collapse into a single `stat <syncfile> && echo OK`.
+        # We MUST run with workdir=CONTAINER_WORKDIR: if the host directory
+        # inode was deleted + recreated, any command against the bind mount
+        # returns a non-zero OCI error, which is exactly the not-ready signal.
         import uuid
         test_file = f".mount_sync_{uuid.uuid4().hex}"
         test_path = self.host_workspace / test_file
 
         try:
-            # Write to host
             test_path.touch(exist_ok=True)
-
-            # We specifically MUST use workdir=CONTAINER_WORKDIR.
-            # If the host directory inode was deleted + recreated,
-            # running any command with workdir set to the bind mount
-            # will immediately return exit code 128 (OCI breakout)
-            exec_kwargs = {
-                "workdir": CONTAINER_WORKDIR,
-                "demux": True
-            }
-            exit_code, _ = self.container.exec_run(f"stat {test_file}", **exec_kwargs)
-            if exit_code != 0:
-                return False
+            code, out = self.container.exec_run(
+                f"sh -c 'stat {test_file} >/dev/null 2>&1 && echo OK'",
+                workdir=CONTAINER_WORKDIR,
+            )
         finally:
             if test_path.exists():
                 test_path.unlink()
 
-        # Final liveness probe: a tiny `echo OK` confirms the container
-        # is responding to exec_run, not just sitting in `running` state
-        # with a hung kernel. Any non-zero / non-"OK" output → fail-fast.
-        code, out = self.container.exec_run("echo OK", workdir=CONTAINER_WORKDIR)
         if code != 0:
             return False
         if out is not None and isinstance(out, (bytes, bytearray)):
             if b"OK" not in out:
                 return False
-
         return True
 
     def ensure_running(self):
@@ -152,6 +172,13 @@ class DockerSandbox:
             return self._ensure_running_impl()
 
     def _ensure_running_impl(self):
+        # Fast path: a command succeeded within the TTL, so the container +
+        # mount were confirmed good microseconds-to-seconds ago. Skip the
+        # 3-round-trip probe entirely. invalidate_ready() (called on any exec
+        # failure) resets the stamp, so a broken container never rides the TTL.
+        if self._ready_is_fresh():
+            return
+
         # Track whether this call did any actual work. Most invocations are
         # no-ops (the container is already up and provisioned) and must stay
         # silent — `execute()` calls `ensure_running` before every shell
@@ -550,6 +577,11 @@ class DockerSandbox:
                         level="WARNING", icon=Icons.WARN,
                     )
 
+        # Reached the end of ensure_running without raising → container +
+        # mount + environment are all confirmed good. Stamp the readiness TTL
+        # so the next command within the window skips the probe entirely.
+        self.mark_ready()
+
         # Only announce readiness when this call actually had to bring the
         # environment up. Silent on the steady-state common path.
         if did_work:
@@ -592,7 +624,29 @@ class DockerSandbox:
     # setting (mem_limit from GHOST_SANDBOX_MEM at creation). The old
     # `memory_limit` parameter here was accepted but silently ignored,
     # implying a per-call cap that never applied; removed.
-    def execute(self, cmd: str, timeout: int = 600, workdir: str = None):
+    # Monotonic counter for spill filenames (Date/time are unavailable to keep
+    # runs reproducible; a counter is enough for uniqueness within a process).
+    _spill_counter = 0
+
+    def _spill_run_output(self, text: str):
+        """Write the full run output to a log file under the workspace and
+        return its workspace-relative path (readable via file_system), or None
+        on failure. Bounded at 10 MB so a pathological output can't fill disk."""
+        try:
+            spill_dir = self.host_workspace / ".ghost_runs"
+            spill_dir.mkdir(parents=True, exist_ok=True)
+            type(self)._spill_counter += 1
+            name = f"run_{type(self)._spill_counter}.log"
+            path = spill_dir / name
+            capped = text[: 10 * 1024 * 1024]  # 10 MB hard ceiling
+            path.write_text(capped, encoding="utf-8", errors="replace")
+            return f".ghost_runs/{name}"
+        except Exception as e:
+            logger.debug(f"run-output spill failed (non-critical): {e}")
+            return None
+
+    def execute(self, cmd: str, timeout: int = 600, workdir: str = None,
+                spill_large_output: bool = False, max_output_chars: int = None):
         try:
             # ensure_running() either just probed readiness (steady path)
             # or raised (provision path) — re-probing here doubled the
@@ -631,36 +685,63 @@ class DockerSandbox:
             stdout_bytes = exec_result.output
             exit_code = exec_result.exit_code
 
-            # Hard output cap. A sandbox script that prints multi-MB to
-            # stdout used to materialise the entire blob into Python memory
-            # and then forward it to the model context — capable of OOMing
-            # the host or flooding the LLM with 100k+ tokens of garbage.
-            # We keep the head AND tail (most error stack traces are at the
-            # tail; setup logs at the head) and drop the middle.
+            # Output handling. A sandbox script that prints multi-MB to stdout
+            # would flood the model context with 100k+ tokens of garbage (and
+            # the whole blob is already in RAM via exec_result.output). Two
+            # modes:
+            #   - spill_large_output (the execute TOOL path): keep the returned
+            #     view SMALL (max_output_chars, default 24 KB head+tail) and
+            #     write the FULL output to a run-log file under the workspace so
+            #     the model can inspect it with file_system — truncation becomes
+            #     an affordance instead of information loss.
+            #   - default (rg/find/browser via sandbox_manager.execute): the
+            #     legacy 256 KB head+tail, no spill, so those callers are
+            #     unchanged.
             output = ""
             if stdout_bytes:
-                MAX_OUTPUT_BYTES = 256 * 1024  # 256 KB
-                total = len(stdout_bytes)
-                if total > MAX_OUTPUT_BYTES:
-                    half = MAX_OUTPUT_BYTES // 2
-                    head = stdout_bytes[:half].decode("utf-8", errors="replace")
-                    tail = stdout_bytes[-half:].decode("utf-8", errors="replace")
-                    dropped = total - MAX_OUTPUT_BYTES
-                    output = (
-                        f"{head}\n\n"
-                        f"[... {dropped} bytes truncated by sandbox 256KB cap — "
-                        f"showing first 128KB and last 128KB ...]\n\n"
-                        f"{tail}"
-                    )
+                from ..utils.text_truncate import truncate_head_tail
+                decoded = stdout_bytes.decode("utf-8", errors="replace")
+                if spill_large_output:
+                    budget = max_output_chars or 24 * 1024
+                    trimmed, was_trunc, _dropped = truncate_head_tail(
+                        decoded, budget, label="run output")
+                    if was_trunc:
+                        rel = self._spill_run_output(decoded)
+                        pointer = (
+                            f"\n[Full output ({len(decoded) // 1024} KB) saved to "
+                            f"'{rel}' — inspect it with file_system "
+                            f"operation='search' (find lines) or "
+                            f"operation='read' start_line/end_line.]" if rel else ""
+                        )
+                        output = trimmed + pointer
+                    else:
+                        output = decoded
                 else:
-                    output = stdout_bytes.decode("utf-8", errors="replace")
+                    MAX_OUTPUT_CHARS = 256 * 1024  # 256 KB legacy cap
+                    trimmed, _was, _dropped = truncate_head_tail(
+                        decoded, MAX_OUTPUT_CHARS, label="sandbox 256KB cap",
+                        head_frac=0.5)
+                    output = trimmed
 
             if not output.strip() and exit_code != 0:
                  output = f"[SYSTEM ERROR]: Process failed (Exit {exit_code}) with no output."
 
+            # Readiness TTL bookkeeping. exec_run returning at all means the
+            # daemon + container are live, so a normal command (even one that
+            # exits non-zero — a failing script is not an infra fault) confirms
+            # readiness. Exit 126/127/128 are the OCI-level codes that a
+            # deleted/recreated mount inode produces, so those INVALIDATE
+            # instead — forcing a full reprobe (and reprovision) next call.
+            if exit_code in (126, 127, 128):
+                self.invalidate_ready()
+            else:
+                self.mark_ready()
+
             return output, exit_code
 
         except Exception as e:
+            # The container/daemon may be gone — force a full probe next time.
+            self.invalidate_ready()
             pretty_log("Sandbox Exec Failed", f"{type(e).__name__}: {e}",
                        icon=Icons.FAIL, level="ERROR")
             return f"Container Execution Error: {str(e)}", 1

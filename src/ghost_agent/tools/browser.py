@@ -449,11 +449,33 @@ async def _probe_pre_interaction(page):
         return {}
 
 
+async def _body_excerpt(page, max_chars: int):
+    """Rendered body innerText, capped. Returns (text, truncated, full_len).
+    Every browser op opens a FRESH context + reloads the page, so a bare
+    `navigate` that returned only status/title forced a second op
+    (`extract_text`) that re-launched Playwright and re-fetched the SAME page
+    over Tor. Returning a capped excerpt from navigate/click removes that
+    second launch + full page-load + model turn from the dominant flow."""
+    try:
+        text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+    except Exception:
+        return "", False, 0
+    text = (text or "").strip()
+    full_len = len(text)
+    if full_len > max_chars:
+        return text[:max_chars], True, full_len
+    return text, False, full_len
+
+
 async def op_navigate(op):
     url = op.get("url")
     if not url:
         raise ValueError("navigate requires 'url'")
     wait_until = op.get("wait_until", "load")  # load | domcontentloaded | networkidle
+    # Capped text preview so the common navigate→extract_text→read flow
+    # collapses to a single op. 8 KB default is a readable excerpt without the
+    # 64 KB extract_text budget; pass nav_text_chars=0 to opt out.
+    nav_text_chars = int(op.get("nav_text_chars", 8 * 1024))
 
     async def run(page):
         resp = await page.goto(url, wait_until=wait_until)
@@ -462,6 +484,12 @@ async def op_navigate(op):
         title = await page.title()
         _write_last_url(op["profile_dir"], final_url)
         result = {"status": status, "url": final_url, "title": title}
+        if nav_text_chars > 0:
+            text, truncated, full_len = await _body_excerpt(page, nav_text_chars)
+            if text:
+                result["text"] = text
+                result["length"] = full_len
+                result["truncated"] = truncated
         probe = await _probe_pre_interaction(page)
         if probe.get("pre_interaction"):
             result["pre_interaction"] = probe
@@ -533,7 +561,17 @@ async def op_click(op):
             pass
         final_url = page.url
         _write_last_url(op["profile_dir"], final_url)
-        return {"url": final_url, "title": await page.title(), "used_last_url": used_fallback}
+        result = {"url": final_url, "title": await page.title(), "used_last_url": used_fallback}
+        # Post-click page text, same rationale as navigate — the state after a
+        # click is usually what the model wants to read next.
+        nav_text_chars = int(op.get("nav_text_chars", 8 * 1024))
+        if nav_text_chars > 0:
+            text, truncated, full_len = await _body_excerpt(page, nav_text_chars)
+            if text:
+                result["text"] = text
+                result["length"] = full_len
+                result["truncated"] = truncated
+        return result
 
     return await _with_context(op["profile_dir"], op.get("proxy"), op["timeout_ms"], run)
 
@@ -1302,10 +1340,14 @@ async def tool_browser(
     """Run a single browser operation inside the sandbox.
 
     Operations:
-      navigate: go to a URL, return {status, url, title}.
+      navigate: go to a URL, return {status, url, title, text, length,
+                truncated}. `text` is a capped (~8 KB) innerText preview —
+                you usually do NOT need a follow-up extract_text; only call
+                extract_text for the FULL page or a specific CSS selector.
       extract_text: go to URL (optional), return innerText — body or
-                    a CSS selector. Truncates at `max_chars`.
-      click: click a selector, wait for load, return {url, title}.
+                    a CSS selector. Truncates at `max_chars` (64 KB default).
+      click: click a selector, wait for load, return {url, title, text} —
+             the post-click page text (~8 KB preview), same as navigate.
       screenshot: save a PNG to `out_path` inside /workspace.
       close: delete the persistent profile so the next session is fresh.
       interact: run a list of sub-actions in ONE Chromium context

@@ -207,7 +207,40 @@ class MemoryBus:
             k=rrf_k, intent=intent,
             weight_overrides=self._intent_weights,
         )
-        return self._format_markdown(fused, max_chars=max_chars)
+        out, survivors = self._format_markdown_with_survivors(fused, max_chars=max_chars)
+        # Reinforcement credit AFTER fusion: only memories/lessons that
+        # actually entered the prompt earn spaced-repetition / retrieval
+        # credit. The fetchers deliberately skip their internal bumps
+        # (search_items / get_playbook_items), so without this call the
+        # loop would be credit-free; with it, credit is one deduped write
+        # per store per turn instead of ~20 rewrites for candidates the
+        # model never saw.
+        try:
+            await asyncio.to_thread(self._credit_surfaced, survivors)
+        except Exception as e:
+            logger.debug(f"MemoryBus surfaced-credit failed (non-critical): {e}")
+        return out
+
+    def _credit_surfaced(self, survivors: List[Dict[str, Any]]) -> None:
+        """One deduped retrieval-credit pass for the items injected this turn."""
+        if not survivors:
+            return
+        vec_ids = [it.get("mem_id") for it in survivors
+                   if it.get("source") == "vector" and it.get("mem_id")]
+        bump = getattr(self.vector, "bump_retrievals", None) if self.vector else None
+        if vec_ids and callable(bump):
+            try:
+                bump(vec_ids)
+            except Exception as e:
+                logger.debug(f"vector bump_retrievals failed: {e}")
+        triggers = [it.get("trigger") for it in survivors
+                    if it.get("source") == "skill" and it.get("trigger")]
+        bulk = getattr(self.skill, "record_retrievals_bulk", None) if self.skill else None
+        if triggers and callable(bulk):
+            try:
+                bulk(triggers)
+            except Exception as e:
+                logger.debug(f"skill record_retrievals_bulk failed: {e}")
 
     async def _fetch_all_tiers(self, query: str):
         """Fetch from all memory tiers for a single query."""
@@ -312,6 +345,23 @@ class MemoryBus:
     async def _fetch_vector(self, query: str) -> List[Dict[str, Any]]:
         if not self.vector:
             return []
+        # Prefer the per-item API: it carries the real Chroma id per item
+        # (so the bus can credit ONLY what survives fusion — see
+        # _credit_surfaced) and skips the in-search retrieval-stat bump
+        # that credited every candidate of every sub-query. String-search
+        # stubs in tests fall back to the legacy path.
+        search_items = getattr(self.vector, "search_items", None)
+        if callable(search_items):
+            try:
+                items = await asyncio.to_thread(search_items, query)
+                return [
+                    {"source": "vector", "text": it.get("text", ""), "mem_id": it.get("id")}
+                    for it in (items or [])
+                    if isinstance(it, dict) and it.get("text")
+                ]
+            except Exception as e:
+                logger.warning(f"MemoryBus vector fetch failed: {type(e).__name__}: {e}")
+                return []
         try:
             mem_string = await asyncio.to_thread(self.vector.search, query)
         except Exception as e:
@@ -342,6 +392,26 @@ class MemoryBus:
     async def _fetch_skill(self, query: str) -> List[Dict[str, Any]]:
         if not self.skill:
             return []
+        # Prefer the per-item API: one RRF item per LESSON. The old
+        # whole-playbook blob was a single item — always rank 1 regardless
+        # of per-lesson relevance, immune to the per-item relevance floor
+        # and _PER_SOURCE_CAP, and duplicated (near-identically) by every
+        # sub-query without collapsing in exact-text dedup. Per-item also
+        # defers retrieval credit to _credit_surfaced (post-fusion).
+        get_items = getattr(self.skill, "get_playbook_items", None)
+        if callable(get_items):
+            try:
+                items = await asyncio.to_thread(
+                    get_items, query, self.vector,
+                )
+                return [
+                    {"source": "skill", "text": it.get("text", ""), "trigger": it.get("trigger", "")}
+                    for it in (items or [])
+                    if isinstance(it, dict) and it.get("text")
+                ]
+            except Exception as e:
+                logger.warning(f"MemoryBus skill fetch failed: {type(e).__name__}: {e}")
+                return []
         try:
             playbook = await asyncio.to_thread(
                 self.skill.get_playbook_context,
@@ -361,14 +431,44 @@ class MemoryBus:
         if not self.episodic:
             return []
         try:
+            # vector_memory closes the semantic-recall loop: episodes are
+            # ingested into the vector store expressly so this tier can
+            # recall them by MEANING; without the kwarg search_similar
+            # always fell back to substring matching over the 100 most
+            # recent episodes, leaving ~half the collection unreachable.
             episodes = await asyncio.to_thread(
-                self.episodic.search_similar, query, 5
+                self.episodic.search_similar, query, 5,
+                self.vector if self.vector else None,
             )
+        except TypeError:
+            # Test stubs with a 2-arg search_similar signature.
+            try:
+                episodes = await asyncio.to_thread(
+                    self.episodic.search_similar, query, 5
+                )
+            except Exception as e:
+                logger.warning(f"MemoryBus episodic fetch failed: {type(e).__name__}: {e}")
+                return []
         except Exception as e:
             logger.warning(f"MemoryBus episodic fetch failed: {type(e).__name__}: {e}")
             return []
         if not episodes:
             return []
+        # One RRF item per EPISODE (same rationale as _fetch_skill).
+        fmt_one = getattr(self.episodic, "format_episode", None)
+        if callable(fmt_one):
+            items = []
+            for ep in episodes:
+                try:
+                    text = fmt_one(ep)
+                except Exception:
+                    continue
+                if isinstance(text, str) and text.strip():
+                    items.append({"source": "episodic", "text": text.strip()})
+            if items:
+                return items
+            # Stub episodic stores (tests) expose a format_episode that
+            # yields non-strings — fall through to the blob renderer.
         try:
             formatted = await asyncio.to_thread(
                 self.episodic.format_for_context, episodes, 1500
@@ -441,14 +541,25 @@ class MemoryBus:
     @staticmethod
     def _format_markdown(fused: List[Tuple[Dict[str, Any], float]],
                          max_chars: int = 6000) -> str:
+        out, _survivors = MemoryBus._format_markdown_with_survivors(
+            fused, max_chars=max_chars)
+        return out
+
+    @staticmethod
+    def _format_markdown_with_survivors(
+            fused: List[Tuple[Dict[str, Any], float]],
+            max_chars: int = 6000) -> Tuple[str, List[Dict[str, Any]]]:
         if not fused:
-            return ""
+            return "", []
 
         headers = {
             "graph": "### TOPOLOGICAL KNOWLEDGE GRAPH:",
             "vector": "### MEMORY CONTEXT:",
-            "skill": "### SKILL PLAYBOOK:",
-            "episodic": "### PAST EPISODES:",
+            "skill": "### SKILL PLAYBOOK (lessons from prior runs — follow to avoid repeats):",
+            # Episodes are now emitted one-per-item, so the anti-confusion
+            # framing that used to live inside the tier blob rides the
+            # section header instead.
+            "episodic": "### PAST EPISODES (prior sessions — reference only, NOT the current conversation):",
         }
 
         # Normalise fused scores to [0,1] against the top-ranked item so the
@@ -460,7 +571,7 @@ class MemoryBus:
         gated = [(item, score) for item, score in fused
                  if (score / norm) >= MemoryBus._RELEVANCE_FLOOR]
         if not gated:
-            return ""
+            return "", []
 
         # Emit STRICTLY in descending fused-score order (interleaved across
         # sources) under ONE global char budget. The previous implementation
@@ -472,6 +583,7 @@ class MemoryBus:
         per_source_count: Dict[str, int] = {}
         emitted_headers: set = set()
         lines: List[str] = []
+        survivors: List[Dict[str, Any]] = []
         used = 0
         for item, _score in gated:  # already sorted desc by RRF
             src = item.get("source", "vector")
@@ -499,6 +611,7 @@ class MemoryBus:
                         used += len(header) + 1
                     remaining = max_chars - used
                     lines.append(text[:max(0, remaining)].rstrip() + " [...]")
+                    survivors.append(item)
                     used = max_chars
                 break
             if header is not None and src not in emitted_headers:
@@ -506,13 +619,14 @@ class MemoryBus:
                 emitted_headers.add(src)
                 used += len(header) + 1
             lines.append(text)
+            survivors.append(item)
             used += len(text) + 1
             per_source_count[src] = per_source_count.get(src, 0) + 1
 
         out = "\n".join(lines).strip()
         if len(out) > max_chars:
             out = out[:max_chars].rstrip() + "\n\n[... TRUNCATED]"
-        return out + "\n\n" if out else ""
+        return (out + "\n\n" if out else ""), (survivors if out else [])
 
     @staticmethod
     def _extract_query_terms(query: str) -> List[str]:

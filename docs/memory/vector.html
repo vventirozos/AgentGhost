@@ -56,9 +56,11 @@
     <thead><tr><th>Method</th><th>Behaviour</th></tr></thead>
     <tbody>
       <tr><td><code>add(text, meta)</code></td><td>Insert. MD5 dedup; skip if &lt; 5 chars. Every <code>_PRUNE_CHECK_EVERY</code> (200) adds, triggers <code>_prune_if_needed</code>.</td></tr>
-      <tr><td><code>_prune_if_needed()</code></td><td>Bounded growth: when the open-ended prunable tiers (<code>auto</code> / <code>manual</code>) exceed <code>MAX_PRUNABLE_MEMORIES</code> (5000), evict the lowest-utility entries — fewest <code>retrieval_count</code>, then oldest <code>last_accessed</code> (the same spaced-repetition signal the ranker uses). Documents, skill twins and episodes are exempt (owned by their own capped stores). Amortised: the cap is probed once per 200 adds, not per write. Never raises.</td></tr>
+      <tr><td><code>_prune_if_needed()</code></td><td>Bounded growth: when the open-ended prunable tiers (<code>auto</code> / <code>manual</code> / <code>synthesis</code>) exceed <code>MAX_PRUNABLE_MEMORIES</code> (5000), evict the lowest-utility entries — fewest <code>retrieval_count</code>, then oldest <code>last_accessed</code> (the same spaced-repetition signal the ranker uses). <code>synthesis</code> (dream-consolidation output) joined the prunable set 2026-07-07 — it was written every REM cycle with no cap of its own. <code>identity</code> stays exempt on purpose (losing "user's name is X" to a sweep is worse than slow growth). Documents, skill twins and episodes are exempt (owned by their own capped stores). Amortised: the cap is probed once per 200 adds, not per write. Never raises.</td></tr>
       <tr><td><code>smart_update(text, type_label)</code></td><td>Vector dedup with distance &lt; 0.50 → if existing similar memory, delete + re-add atomically under lock.</td></tr>
-      <tr><td><code>search(query, inject_identity)</code></td><td>Hybrid search: optional dual-query (user query + identity probe) → wide candidate pool (30) → priority filter → BM25 re-rank → top-12 with section labels.</td></tr>
+      <tr><td><code>search(query, inject_identity, record_retrievals=True)</code></td><td>Hybrid search string renderer: <code>_search_selection</code> (dual-query → wide pool (30) → priority filter → BM25 re-rank → top-12) → labelled markdown. Bumps retrieval stats for the survivors unless <code>record_retrievals=False</code> (the bus selects again downstream, so it defers credit).</td></tr>
+      <tr><td><code>search_items(query, inject_identity)</code></td><td><strong>Per-item, side-effect-free</strong> variant for the MemoryBus: returns <code>[{id, text, score}]</code> (real Chroma id per item) and does <strong>not</strong> bump retrieval stats — the bus credits only the post-fusion survivors via <code>bump_retrievals</code>. Shares <code>_search_selection</code> with <code>search()</code> so ranking can't drift.</td></tr>
+      <tr><td><code>bump_retrievals(ids)</code></td><td>Public, deduplicating wrapper over <code>_bump_retrieval_stats</code> for deferred, select-then-credit callers.</td></tr>
       <tr><td><code>search_advanced(query, limit)</code></td><td>Raw results + retrieval-count bump.</td></tr>
       <tr><td><code>ingest_document(filename, chunks) -&gt; (bool, str)</code></td><td>Batch upsert, library dedup; 25-chunk batches under a single lock.</td></tr>
       <tr><td><code>delete_document_by_name(filename)</code></td><td>Drop all chunks of a source document.</td></tr>
@@ -68,19 +70,21 @@
   </table>
 
   <h2>Scoring</h2>
-  <p>For each candidate the bus computes:</p>
-  <pre><code>combined = (priority_score · 10) + distance + time_penalty
+  <p>For each candidate:</p>
+  <pre><code>combined = (priority_score · _TIER_WEIGHT) + distance + time_penalty
 time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
   <p>Then a cross-encoder re-rank subtracts up to 0.3 from <code>combined</code> based on BM25 keyword overlap (normalised 0-1).</p>
+  <p><strong>Prior weight, not absolute gate (2026-07-07):</strong> <code>_TIER_WEIGHT</code> was cut from <strong>10</strong> to <strong>0.3</strong>. At ×10 the category tiers sat ±10 apart while <code>distance + time_penalty</code> spans only ~2.3 and the BM25 rerank ±0.3 — so category priority was <em>absolute</em>: a barely-over-threshold name-memory (dist 1.4) could never lose to a dist-0.1 exact-match document, making cross-tier semantic relevance cosmetic. At 0.3 the prior still separates <em>distant</em> tiers (identity vs auto ≈ 3.3 apart) but a decisively closer match <em>can</em> cross an <em>adjacent</em> tier (manual↔auto = 0.3, document↔manual = 1.5).</p>
 
   <h3>Priority scores</h3>
+  <p>Priority + threshold are now taken from <code>metadata.type</code>. The deliberately-written <code>identity</code> and <code>synthesis</code> types used to have no case in the scorer and fell into the generic <code>auto</code> else-branch (lowest priority, 0.55 threshold) unless their text happened to match the name-string heuristics — so the highest-curation tiers ranked <em>below</em> raw document chunks. Fixed 2026-07-07: <code>identity</code> scores with the identity tier, <code>synthesis</code> with the summary tier.</p>
   <table>
     <thead><tr><th>Type</th><th>Priority</th><th>Max distance</th></tr></thead>
     <tbody>
       <tr><td>name_memory</td><td>−20</td><td>1.00</td></tr>
-      <tr><td>summary</td><td>−15</td><td>0.75</td></tr>
+      <tr><td>summary · <strong>synthesis</strong></td><td>−15</td><td>0.75</td></tr>
       <tr><td>episode</td><td>−12</td><td>0.70</td></tr>
-      <tr><td>identity</td><td>−10</td><td>0.65</td></tr>
+      <tr><td><strong>identity</strong> (typed) · identity-batch</td><td>−10</td><td>0.80 / 0.65</td></tr>
       <tr><td>document</td><td>−5</td><td>1.25</td></tr>
       <tr><td>manual</td><td>0</td><td>0.55</td></tr>
       <tr><td>auto</td><td>1</td><td>0.55</td></tr>

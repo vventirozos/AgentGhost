@@ -44,7 +44,7 @@
   <table>
     <thead><tr><th>Operation</th><th>Handler</th><th>Behaviour</th></tr></thead>
     <tbody>
-      <tr><td>read</td><td><code>tool_read_file</code></td><td>Binary sniff first 8 KB; errors on binary; clamps to <code>max_context · 3.5 · 0.5</code> chars.</td></tr>
+      <tr><td>read</td><td><code>tool_read_file</code></td><td>Binary sniff first 8 KB; errors on binary; clamps to <code>max_context · 3.5 · 0.5</code> chars. <strong>Line-ranged read (2026-07-07):</strong> pass <code>start_line</code>/<code>end_line</code> for a 1-based, line-number-prefixed slice that is <em>exempt</em> from the whole-file size cap and streamed (stops at <code>end_line</code>, ≤ 2000-line span) — the cheap recovery after a failed replace or a too-large-file error, and it chains directly from <code>search</code> line numbers. Both the too-large error and the large-file replace-failure guidance now point at it. Accepts aliases (<code>start</code>/<code>from_line</code>, <code>end</code>/<code>to_line</code>).</td></tr>
       <tr><td>read_chunked</td><td><code>tool_read_document_chunked</code></td><td>PyMuPDF for PDF pages; text-file byte chunking with overlap.</td></tr>
       <tr><td>inspect</td><td><code>tool_inspect_file</code></td><td>First N lines (default 10).</td></tr>
       <tr><td>write</td><td><code>tool_write_file</code></td><td>Auto-serialise JSON, strip markdown, auto-create parent dirs, fixture summary for data files. Writes are always <code>encoding="utf-8"</code> (never the process locale — which mojibaked non-ASCII and truncated the file on an encode error). Rejects an empty payload or the literal Python <code>None</code>, but not the legit word <q>none</q>.</td></tr>

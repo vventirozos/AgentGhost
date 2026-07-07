@@ -122,3 +122,47 @@ class TestDreamConsolidationMetrics:
 
         result = await mock_dreamer.dream()
         assert "low-compression" in result or "Synthesized 0" in result
+
+
+class TestDreamHeuristicKeying:
+    """IMPROVEMENTS.md #24: each dream heuristic must be keyed on its own
+    content (+ source='dream'), not the constant '[System] Dream Heuristic'
+    that collapsed every heuristic from every REM cycle into one playbook slot.
+    """
+
+    @pytest.mark.asyncio
+    async def test_heuristics_keyed_per_content_with_source(self, mock_dreamer):
+        # >3 auto-memories so the dream clears the entropy gate.
+        mock_dreamer.memory.collection.get.return_value = {
+            "ids": [f"id{i}" for i in range(5)],
+            "documents": [f"auto memory number {i}" for i in range(5)],
+            "metadatas": [{"type": "auto"}] * 5,
+            "embeddings": [[0.1]] * 5,
+        }
+        mock_dreamer.context.llm_client.chat_completion.return_value = {
+            "choices": [{"message": {"content": json.dumps({
+                "consolidations": [],
+                "heuristics": [
+                    "Always probe container readiness before exec.",
+                    "Prefer line-ranged reads after a failed replace.",
+                ],
+            })}}]
+        }
+        mock_dreamer.context.skill_memory.learn_lesson = MagicMock()
+
+        await mock_dreamer.dream()
+
+        calls = mock_dreamer.context.skill_memory.learn_lesson.call_args_list
+        heuristic_calls = [
+            c for c in calls
+            if c.kwargs.get("source") == "dream"
+        ]
+        assert len(heuristic_calls) == 2
+        # Each keyed on its OWN content, never the old constant.
+        tasks = {c.args[0] for c in heuristic_calls}
+        assert "[System] Dream Heuristic" not in tasks
+        assert any("probe container readiness" in t for t in tasks)
+        assert any("line-ranged reads" in t for t in tasks)
+        # trigger mirrors the content-derived task so BM25 retrieval can find it.
+        for c in heuristic_calls:
+            assert c.kwargs.get("trigger") == c.args[0]

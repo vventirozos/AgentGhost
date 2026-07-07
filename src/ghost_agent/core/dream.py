@@ -1100,7 +1100,27 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             for h in heuristics:
                 if h:
                     if hasattr(self.context, 'skill_memory') and self.context.skill_memory:
-                        await asyncio.to_thread(self.context.skill_memory.learn_lesson, "[System] Dream Heuristic", "none", h, memory_system=self.memory)
+                        # Key each heuristic on its OWN content, not the
+                        # constant "[System] Dream Heuristic". SkillMemory
+                        # dedups on the normalized trigger/task, so a constant
+                        # task collapsed every heuristic from every REM cycle
+                        # into ONE churning playbook slot (a new one either
+                        # overwrote the previous — if longer — or was dropped),
+                        # inflating that entry's frequency toward bogus
+                        # graduation while matching no real user query. A
+                        # per-heuristic task lets the existing dedup/cap/utility
+                        # machinery treat each as a first-class lesson, and the
+                        # `source="dream"` tag lets B3 count dream's real
+                        # contribution by provenance. Retrieval is trigger/BM25-
+                        # keyed, so a content-derived trigger is also findable.
+                        _h_task = " ".join(str(h).split())[:80] or "Dream Heuristic"
+                        await asyncio.to_thread(
+                            self.context.skill_memory.learn_lesson,
+                            _h_task, "none", h,
+                            memory_system=self.memory,
+                            trigger=_h_task,
+                            source="dream",
+                        )
 
             # --- CROSS-EPISODE PATTERN DETECTION ---
             # Scan the skill playbook for recurring tool-call sequences
@@ -1182,6 +1202,18 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 metrics_note += f" ({macros_proposed} macros proposed)"
             if pruned_count > 0:
                 metrics_note += f" ({pruned_count} low-utility lessons pruned)"
+
+            # Graph forgetting: drop weight-1 stale edges so the only uncapped
+            # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced
+            # edges survive regardless of age. Best-effort; never fails a dream.
+            try:
+                _graph = getattr(self.context, "graph_memory", None)
+                if _graph is not None and hasattr(_graph, "prune_stale_edges"):
+                    _gpruned = await asyncio.to_thread(_graph.prune_stale_edges)
+                    if _gpruned > 0:
+                        metrics_note += f" ({_gpruned} stale graph edges forgotten)"
+            except Exception as _gpx:
+                logger.debug("graph prune skipped: %s", _gpx)
             # Record the fragment set we just processed so the next REM
             # cycle can short-circuit if no new auto-memories have arrived.
             # Only stored on success — a transient LLM error must not

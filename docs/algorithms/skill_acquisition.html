@@ -61,8 +61,9 @@
 
   <h3>Retrieval feedback loop</h3>
   <ul>
-    <li><code>SkillMemory.get_playbook_context(query)</code> — vector-search (distance &lt; 0.45) + BM25-lite re-rank, top 5 injected under the <code>### SKILL PLAYBOOK:</code> header in both the planner and execution system prompts.</li>
-    <li><code>record_retrieval(trigger)</code> fires on every injection and emits a debug log keyed by <code>source</code> + <code>source_challenge_hash</code> — lets us answer "is this self-play lesson ever actually used?" empirically.</li>
+    <li><code>SkillMemory.get_playbook_items(query, memory_system)</code> — vector-search (distance &lt; 0.45) + BM25-lite re-rank, top 5 returned as <strong>per-lesson</strong> dicts <code>{text, trigger}</code> with <strong>no</strong> side effects. This is the MemoryBus entry point: per-item so each lesson is ranked / gated / capped individually by RRF (a whole-playbook blob was always rank 1), and side-effect-free so credit can be deferred to the post-fusion survivors.</li>
+    <li><code>get_playbook_context(query)</code> — the legacy string renderer (same retrieval core via <code>_playbook_items_and_branch</code>); still injects the <code>### SKILL PLAYBOOK:</code> block for direct callers and bumps counters via <code>record_retrievals_bulk</code>.</li>
+    <li><code>record_retrieval(trigger)</code> (single) / <code>record_retrievals_bulk(triggers)</code> (many, <strong>one</strong> playbook rewrite for the whole set). The bus credits only lessons that actually entered the prompt, once per turn — previously every candidate of every RAG-fusion sub-query was credited inside the search call, inflating <code>retrievals</code> ~4× while <code>helpful_retrievals</code> credits at most once per window, which crushed <code>hit_rate</code> and pushed useful lessons toward eviction, at up to ~20 full-file rewrites per turn.</li>
     <li><code>record_helpful_retrieval(trigger)</code> / <code>credit_recent_retrievals(window_seconds=300)</code> bump <code>helpful_retrievals</code> when a turn succeeds shortly after a lesson was surfaced.</li>
     <li><code>prune_low_utility(min_retrievals=5, max_drop_fraction=0.25)</code> drops lessons that have been surfaced many times but never marked helpful — non-verified only.</li>
   </ul>

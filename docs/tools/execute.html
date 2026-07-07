@@ -77,8 +77,9 @@
     <li>Streams stdout / stderr; detects 5-min timeout or mid-execution kernel death.</li>
   </ul>
 
-  <h2>Output handling</h2>
-  <p>Truncates output at 512 KB (head 100 KB + tail 400 KB). Extracts error line numbers and produces snippet context for tracebacks. Diagnostic mode shows the surrounding lines around an error.</p>
+  <h2>Output handling — one policy + spill-to-file (2026-07-07)</h2>
+  <p>Truncation is owned by the sandbox layer via one shared helper, <code>utils.text_truncate.truncate_head_tail(text, budget, label)</code> (head 25% / tail 75% by default — tracebacks print the exception at the end). Before, four call sites each had their own budget and message shape (docker 256 KB, execute.py's <em>dead</em> 512 KB layer that never fired behind docker, file_search 40 KB, browser 64 KB); at <code>--max-context 240000</code> docker's 256 KB was the only real gate, so one noisy <code>pip install</code> / test run could inject ~70 K tokens that then persisted in history and re-prefilled every subsequent turn.</p>
+  <p>The <code>execute</code> tool now runs in <strong>spill mode</strong> (<code>DockerSandbox.execute(spill_large_output=True)</code>): the returned view is small (~24 KB head+tail) and the FULL output is written to a workspace run-log <code>.ghost_runs/run_&lt;n&gt;.log</code> (disk-bounded, 10 MB ceiling) with a pointer telling the model to inspect it via <code>file_system</code> (<code>operation='search'</code> for lines, <code>operation='read'</code> with <code>start_line</code>/<code>end_line</code>). Truncation becomes an <em>affordance</em> instead of information loss. Both the script path and the bare-<code>bash</code> path (which previously had no tool-level trim at all) use it. Non-execute callers of <code>sandbox_manager.execute</code> (ripgrep <code>search</code>, <code>find</code>, browser) keep the legacy 256 KB head+tail and do not spill. The dead 512 KB <code>execute.py</code> layer is removed. Covered by <code>tests/test_execute_output_spill.py</code>.</p>
 
   <h2>Return shape</h2>
   <pre><code>--- EXECUTION RESULT ---

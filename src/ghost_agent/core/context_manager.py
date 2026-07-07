@@ -56,7 +56,7 @@ class ContextManager:
         return self._compression_level
 
     def compress_if_needed(self, messages: List[dict],
-                           llm_summarizer=None) -> List[dict]:
+                           llm_summarizer=None, max_level: int = 4) -> List[dict]:
         """Apply progressive compression if context budget is stressed.
 
         Parameters
@@ -64,6 +64,11 @@ class ContextManager:
         messages : list of message dicts
         llm_summarizer : optional async callable(text) -> summary_text
             If provided, used for L1 summarization. If None, uses truncation.
+        max_level : cap on the compression level (default 4). The agent hot
+            path passes ``max_level=3`` so this only ever does CONTENT
+            compression (every message preserved → tool-call/result pairing
+            intact) and never L4 message-dropping — the existing
+            ``_prune_context`` remains the L4 emergency.
 
         Returns
         -------
@@ -85,6 +90,9 @@ class ContextManager:
             self._compression_level = 3
         else:
             self._compression_level = 4
+        self._compression_level = min(self._compression_level, max_level)
+        if self._compression_level == 0:
+            return messages
 
         # Surface compaction on the monitored stream when it ESCALATES — the
         # operator otherwise can't see when answers begin degrading from

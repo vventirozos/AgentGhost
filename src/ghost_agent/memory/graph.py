@@ -3,7 +3,7 @@ import threading
 import difflib
 import logging
 from pathlib import Path
-from typing import List, Dict, Iterable, Tuple
+from typing import List, Dict, Iterable, Optional, Tuple
 
 import networkx as nx
 
@@ -23,8 +23,21 @@ class GraphMemory:
         self.db_path = memory_dir / "knowledge_graph.db"
         self._lock = threading.RLock()
         self.nx_graph: nx.MultiDiGraph = nx.MultiDiGraph()
+        # Cached node-name list for _map_words_to_seeds. Rebuilding
+        # list(nx_graph.nodes()) on EVERY query word was O(nodes) per turn
+        # (the graph is the only uncapped memory tier); this snapshots it and
+        # invalidates on any edge mutation.
+        self._node_list_cache: Optional[List[str]] = None
         self._init_db()
         self.initialize_graph()
+
+    def _invalidate_node_cache(self):
+        self._node_list_cache = None
+
+    def _nodes_snapshot(self) -> List[str]:
+        if self._node_list_cache is None:
+            self._node_list_cache = list(self.nx_graph.nodes())
+        return self._node_list_cache
 
     # ------------------------------------------------------------------ setup
 
@@ -65,6 +78,7 @@ class GraphMemory:
         Pass ``include_expired=True`` to load the full history."""
         with self._lock:
             self.nx_graph = nx.MultiDiGraph()
+            self._invalidate_node_cache()
             with sqlite3.connect(self.db_path) as conn:
                 if include_expired:
                     query = 'SELECT subject, predicate, object, weight FROM triplets'
@@ -88,6 +102,7 @@ class GraphMemory:
             self.nx_graph[s][o][existing_key]["weight"] = weight
         else:
             self.nx_graph.add_edge(s, o, predicate=p, weight=weight)
+            self._invalidate_node_cache()  # new nodes may have appeared
 
     def _remove_edge(self, s: str, p: str, o: str):
         if not self.nx_graph.has_edge(s, o):
@@ -99,6 +114,7 @@ class GraphMemory:
         for n in (s, o):
             if n in self.nx_graph and self.nx_graph.degree(n) == 0:
                 self.nx_graph.remove_node(n)
+                self._invalidate_node_cache()
 
     # ------------------------------------------------------------ public CRUD
 
@@ -248,6 +264,46 @@ class GraphMemory:
                 conn.execute('DELETE FROM triplets')
                 conn.commit()
             self.nx_graph = nx.MultiDiGraph()
+            self._invalidate_node_cache()
+
+    def prune_stale_edges(self, max_age_days: int = 45, keep_min_weight: int = 1) -> int:
+        """Forget low-signal stale edges — the graph's decay story.
+
+        The graph is the only uncapped memory tier (vector 5000, episodes 500,
+        skills 50); non-functional predicates (LIKES/HAS/KNOWS/…) accumulate
+        forever, and weight-1 edges older than a threshold are almost always
+        one-off extractor noise that dilutes retrieval. This deletes currently-
+        valid edges with ``weight <= keep_min_weight`` and a ``timestamp``
+        older than ``max_age_days`` from BOTH the DB and the in-memory mirror.
+        Reinforced edges (weight > threshold) are kept regardless of age —
+        weight IS the decay signal, previously stored but never used for
+        forgetting. Returns the number of edges pruned. Idempotent, best-effort.
+        Intended to run from the dream cycle."""
+        removed = 0
+        try:
+            with self._lock:
+                with sqlite3.connect(self.db_path) as conn:
+                    cutoff_expr = f"datetime('now', '-{int(max_age_days)} days')"
+                    rows = conn.execute(
+                        f"""SELECT subject, predicate, object FROM triplets
+                            WHERE valid_until IS NULL
+                              AND COALESCE(weight, 1) <= ?
+                              AND timestamp < {cutoff_expr}""",
+                        (int(keep_min_weight),),
+                    ).fetchall()
+                    for s, p, o in rows:
+                        conn.execute(
+                            "DELETE FROM triplets WHERE subject=? AND predicate=? AND object=?",
+                            (s, p, o),
+                        )
+                        self._remove_edge(s, p, o)
+                        removed += 1
+                    conn.commit()
+                if removed:
+                    self._invalidate_node_cache()
+        except Exception as e:
+            logger.warning("graph prune_stale_edges failed: %s", e)
+        return removed
 
     def get_recent_triplets(self, limit: int = 100) -> List[Dict[str, str]]:
         with self._lock:
@@ -349,7 +405,7 @@ class GraphMemory:
             return []
         seeds: List[str] = []
         seen = set()
-        all_nodes = list(self.nx_graph.nodes())
+        all_nodes = self._nodes_snapshot()
         for w in words:
             wl = str(w).lower().strip()
             if len(wl) < 3:

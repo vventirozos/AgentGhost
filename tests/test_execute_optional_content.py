@@ -7,7 +7,7 @@ class MockSandboxManager:
     def __init__(self):
         self.commands_run = []
         
-    def execute(self, cmd, timeout=None):
+    def execute(self, cmd, timeout=None, spill_large_output=False, max_output_chars=None):
         self.commands_run.append(cmd)
         return "Executed", 0
 

@@ -4,16 +4,18 @@ import logging
 import os
 from pathlib import Path
 from typing import List
-from ..utils.logging import Icons, pretty_log
+from ..utils.logging import Icons, pretty_log, spawn_bg
 from ..utils.helpers import get_utc_timestamp, helper_fetch_url_content, recursive_split_text, semantic_split_text
 from ..memory.scratchpad import Scratchpad
 
 logger = logging.getLogger("GhostAgent")
 
 # Strong references to in-flight fire-and-forget graph-extraction tasks.
-# The event loop holds only weak refs to tasks (CPython docs warn about
-# this explicitly), so unreferenced tasks can be GC'd before they run.
-_GRAPH_EXTRACT_TASKS: set = set()
+# Fire-and-forget graph extraction is scheduled via utils.logging.spawn_bg,
+# which owns the process-wide strong-ref registry (the event loop keeps only
+# weak refs, so an unreferenced task can be GC'd before it runs) and drains at
+# shutdown. (The old module-local _GRAPH_EXTRACT_TASKS set was one of four
+# ad-hoc fire-and-forget conventions, now consolidated.)
 
 # Hard ceiling on the INLINE graph-triplet extraction in the bus-aware
 # insert_fact path. That LLM call is pure enrichment (the fact itself is
@@ -139,12 +141,7 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
                     except Exception:
                         pass
 
-                # Strong ref: the loop keeps only weak refs to tasks, so a bare
-                # create_task can be GC'd mid-flight (same guard as the legacy
-                # path below).
-                _t = asyncio.create_task(_extract_and_add_triplets())
-                _GRAPH_EXTRACT_TASKS.add(_t)
-                _t.add_done_callback(_GRAPH_EXTRACT_TASKS.discard)
+                spawn_bg(_extract_and_add_triplets(), name="graph-extract")
 
             return f"Memory stored: '{text}'"
         except Exception as e:
@@ -168,12 +165,7 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
                     if triplets:
                         await asyncio.to_thread(graph_memory.add_triplets, triplets)
                 except Exception: pass
-            # Keep a strong reference: the event loop only holds weak refs
-            # to tasks, so a bare create_task can be garbage-collected
-            # mid-flight and the graph extraction silently never completes.
-            _task = asyncio.create_task(_extract_graph())
-            _GRAPH_EXTRACT_TASKS.add(_task)
-            _task.add_done_callback(_GRAPH_EXTRACT_TASKS.discard)
+            spawn_bg(_extract_graph(), name="graph-extract-legacy")
 
         return f"Memory stored: '{text}'"
     except Exception as e:

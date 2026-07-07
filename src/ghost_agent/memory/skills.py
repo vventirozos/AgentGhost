@@ -6,7 +6,7 @@ import threading
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
@@ -1015,26 +1015,83 @@ class SkillMemory:
             )
         return removed
 
-    def get_playbook_context(
+    def get_playbook_items(
         self,
         query: str = None,
         memory_system=None,
         *,
         distance_threshold: float = DEFAULT_RETRIEVAL_DISTANCE,
         limit: int = 5,
-        record_retrievals: bool = True,
-    ) -> str:
-        """Render the top lessons relevant to `query` for prompt injection.
+    ) -> List[Dict[str, str]]:
+        """Top lessons relevant to `query` as PER-ITEM dicts.
 
-        Uses vector search first (if memory_system provided), tightens
-        the distance threshold, and re-ranks the candidates with a BM25-
-        lite overlap score against the lesson trigger. Increments
-        retrieval counters on every lesson actually surfaced so the
-        feedback loop can tell which lessons the agent sees."""
+        Returns ``[{"text": <rendered lesson>, "trigger": <trigger>}]`` with
+        NO retrieval-counter side effects. This is the MemoryBus entry point:
+        one item per lesson lets RRF rank lessons individually (a monolithic
+        playbook blob always sat at rank 1 regardless of per-lesson
+        relevance, and the per-item relevance floor / source cap were no-ops
+        on it), and deferring the counter bump lets the caller credit only
+        what actually entered the prompt (see ``record_retrievals_bulk``) —
+        bumping every candidate inflated ``retrievals`` ~4x per turn under
+        sub-query fan-out while ``helpful_retrievals`` credits at most once
+        per window, structurally crushing hit_rate and mis-flagging good
+        lessons as stale.
+        """
+        items, _branch = self._playbook_items_and_branch(
+            query, memory_system,
+            distance_threshold=distance_threshold, limit=limit,
+        )
+        return items
+
+    def record_retrievals_bulk(self, triggers) -> int:
+        """Bump retrieval counters for many lessons in ONE playbook write.
+
+        `record_retrieval` does a full load+rewrite of the playbook file per
+        lesson (~100KB each); crediting a turn's surfaced lessons one at a
+        time cost up to ~20 synchronous rewrites per turn. This variant takes
+        the lock once, bumps every matching lesson, and saves once. Returns
+        the number of lessons updated. Duplicate/empty triggers are ignored.
+        """
+        keys = {t.strip().lower() for t in (triggers or []) if t and str(t).strip()}
+        if not keys:
+            return 0
+        updated = 0
+        try:
+            with self._get_lock():
+                playbook = self._load_playbook()
+                changed = False
+                for idx, raw in enumerate(playbook):
+                    t = (raw.get("trigger") or raw.get("task") or "").strip().lower()
+                    if t in keys:
+                        lesson = _normalize_lesson(raw)
+                        lesson["retrievals"] = int(lesson.get("retrievals") or 0) + 1
+                        lesson["last_retrieved_at"] = _now_iso()
+                        playbook[idx] = lesson
+                        changed = True
+                        updated += 1
+                if changed:
+                    self._save_playbook_unlocked(playbook)
+        except Exception as e:
+            logger.debug(f"record_retrievals_bulk failed (non-critical): {e}")
+        return updated
+
+    def _playbook_items_and_branch(
+        self,
+        query: str = None,
+        memory_system=None,
+        *,
+        distance_threshold: float = DEFAULT_RETRIEVAL_DISTANCE,
+        limit: int = 5,
+    ):
+        """Shared retrieval core for get_playbook_items/get_playbook_context.
+
+        Returns ``(items, branch)`` where branch ∈ {"vector", "vector_empty",
+        "empty_playbook", "bm25", "bm25_empty", "recency"} so the string
+        renderer can preserve its legacy per-branch contracts exactly.
+        """
         with self._get_lock():
             playbook_snapshot = self._load_playbook()
 
-        # Build a {trigger → index} map for quick counter bumping.
         def _trigger_of(lesson):
             return (lesson.get("trigger") or lesson.get("task") or "").strip().lower()
 
@@ -1069,46 +1126,36 @@ class SkillMemory:
                 if candidates:
                     candidates.sort(key=lambda t: -t[0])
                     chosen = candidates[:limit]
-                    lines = ["## RELEVANT LESSONS LEARNED (Follow these to avoid repeats):"]
-                    for i, (_, _dist, doc, meta, trig) in enumerate(chosen):
+                    items = []
+                    for (_, _dist, doc, meta, trig) in chosen:
                         # Prefer the structured rendering from the on-disk
                         # copy (has verified flag, code example) — fall
                         # back to the raw embedded doc if no playbook
                         # match was found.
                         lesson_entry = _find_playbook_entry_by_trigger(playbook_snapshot, trig)
-                        if lesson_entry:
-                            lines.append(f"{i+1}. {render_lesson_for_prompt(lesson_entry)}")
-                        else:
-                            lines.append(f"{i+1}. {doc}")
-                        if record_retrievals and trig:
-                            try:
-                                self.record_retrieval(trig)
-                            except Exception:
-                                pass
-                    return "\n".join(lines)
+                        text = render_lesson_for_prompt(lesson_entry) if lesson_entry else doc
+                        items.append({"text": text, "trigger": trig or ""})
+                    return items, "vector"
                 # Vector search was attempted and came back clean (or
                 # nothing above threshold). Preserve the legacy
                 # contract: don't fall back to recency in that case,
                 # just return empty. Recency fallback applies only
                 # when the vector path wasn't available at all.
                 if vector_attempted:
-                    return ""
+                    return [], "vector_empty"
         except Exception as e:
             logger.debug(f"Playbook retrieval path failed: {e}")
 
         if not playbook_snapshot:
-            return "No lessons learned yet."
+            return [], "empty_playbook"
 
         # BM25 fallback: when the caller has a query but the vector
         # path wasn't attempted (memory_system is None — common when
         # VectorMemory init failed or is disabled), do keyword-overlap
         # filtering on the playbook's triggers BEFORE falling back to
-        # recency. Without this, a query like "what's the capital of
-        # France?" would surface a Python-syntax lesson just because
-        # it happened to be the most recent. The recency fallback is
-        # only appropriate when there's NO query — i.e. the caller
-        # wants a generic "any recent lesson" injection for the system
-        # prompt, not a per-turn retrieval.
+        # recency. The recency fallback is only appropriate when there's
+        # NO query — i.e. the caller wants a generic "any recent lesson"
+        # injection for the system prompt, not a per-turn retrieval.
         if query and str(query).strip():
             scored: List[Tuple[float, dict]] = []
             for p in playbook_snapshot:
@@ -1118,32 +1165,63 @@ class SkillMemory:
                     scored.append((score, p))
             if scored:
                 scored.sort(key=lambda t: -t[0])
-                lines = ["## RELEVANT LESSONS LEARNED (Follow these to avoid repeats):"]
-                for i, (_, p) in enumerate(scored[:limit]):
-                    lines.append(f"{i+1}. {render_lesson_for_prompt(p)}")
-                    if record_retrievals:
-                        trig = _trigger_of(p)
-                        if trig:
-                            try:
-                                self.record_retrieval(trig)
-                            except Exception:
-                                pass
-                return "\n".join(lines)
+                items = [
+                    {"text": render_lesson_for_prompt(p), "trigger": _trigger_of(p)}
+                    for _, p in scored[:limit]
+                ]
+                return items, "bm25"
             # Had a query, zero BM25 hits → no lesson is relevant to
-            # this turn. Return empty instead of dumping recency.
-            return ""
+            # this turn. Empty instead of dumping recency.
+            return [], "bm25_empty"
 
         # No query supplied → recency fallback (system-prompt injection style).
-        lines = ["## RECENT LESSONS LEARNED (Follow these to avoid repeats):"]
-        for i, p in enumerate(playbook_snapshot[:limit]):
-            lines.append(f"{i+1}. {render_lesson_for_prompt(p)}")
-            if record_retrievals:
-                trig = _trigger_of(p)
-                if trig:
-                    try:
-                        self.record_retrieval(trig)
-                    except Exception:
-                        pass
+        items = [
+            {"text": render_lesson_for_prompt(p), "trigger": _trigger_of(p)}
+            for p in playbook_snapshot[:limit]
+        ]
+        return items, "recency"
+
+    def get_playbook_context(
+        self,
+        query: str = None,
+        memory_system=None,
+        *,
+        distance_threshold: float = DEFAULT_RETRIEVAL_DISTANCE,
+        limit: int = 5,
+        record_retrievals: bool = True,
+    ) -> str:
+        """Render the top lessons relevant to `query` for prompt injection.
+
+        Uses vector search first (if memory_system provided), tightens
+        the distance threshold, and re-ranks the candidates with a BM25-
+        lite overlap score against the lesson trigger. Increments
+        retrieval counters on every lesson actually surfaced so the
+        feedback loop can tell which lessons the agent sees. (The
+        MemoryBus uses `get_playbook_items` instead and credits AFTER
+        fusion decides what enters the prompt.)"""
+        items, branch = self._playbook_items_and_branch(
+            query, memory_system,
+            distance_threshold=distance_threshold, limit=limit,
+        )
+
+        if branch in ("vector_empty", "bm25_empty"):
+            return ""
+        if branch == "empty_playbook":
+            return "No lessons learned yet."
+
+        if record_retrievals and items:
+            try:
+                self.record_retrievals_bulk(
+                    [it["trigger"] for it in items if it.get("trigger")])
+            except Exception:
+                pass
+
+        if branch in ("vector", "bm25"):
+            lines = ["## RELEVANT LESSONS LEARNED (Follow these to avoid repeats):"]
+        else:  # recency
+            lines = ["## RECENT LESSONS LEARNED (Follow these to avoid repeats):"]
+        for i, it in enumerate(items):
+            lines.append(f"{i+1}. {it['text']}")
         return "\n".join(lines)
 
     def get_recent_failures(self, limit: int = 5) -> str:

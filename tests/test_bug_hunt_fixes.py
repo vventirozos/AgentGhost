@@ -389,16 +389,12 @@ def test_load_tokenizer_removes_flag_it_set(tmp_path, monkeypatch):
 
 async def test_tool_remember_keeps_graph_task_reference(monkeypatch):
     from ghost_agent.tools import memory as memory_tools
+    from ghost_agent.utils import logging as _glog
 
-    captured = {}
-    real_create_task = asyncio.create_task
-
-    def spy_create_task(coro):
-        task = real_create_task(coro)
-        captured["task"] = task
-        return task
-
-    monkeypatch.setattr(memory_tools.asyncio, "create_task", spy_create_task)
+    # Graph extraction now schedules through the unified spawn_bg registry
+    # (utils.logging._BG_TASKS), which holds the strong ref + drains at
+    # shutdown — the old module-local _GRAPH_EXTRACT_TASKS set was removed.
+    _glog._BG_TASKS.clear()
 
     memory_system = MagicMock()
     graph_memory = MagicMock()
@@ -414,9 +410,11 @@ async def test_tool_remember_keeps_graph_task_reference(monkeypatch):
         llm_client=llm_client,
     )
     assert "Memory stored" in result
-    assert captured["task"] in memory_tools._GRAPH_EXTRACT_TASKS
-    await captured["task"]
-    assert captured["task"] not in memory_tools._GRAPH_EXTRACT_TASKS  # done_callback discards
+    tasks = list(_glog._BG_TASKS)
+    assert len(tasks) == 1  # strong ref held while pending
+    await tasks[0]
+    await asyncio.sleep(0)
+    assert tasks[0] not in _glog._BG_TASKS  # done_callback discards
 
 
 # ---------------------------------------------------------------------------

@@ -65,7 +65,7 @@
 
   <h2>Spreading-activation retrieval</h2>
   <ol>
-    <li>Word-to-node fuzzy match: exact → substring → <code>difflib.get_close_matches</code>.</li>
+    <li>Word-to-node fuzzy match: exact → substring → <code>difflib.get_close_matches</code>. The candidate node list is now a <strong>cached snapshot</strong> (<code>_nodes_snapshot</code>, invalidated on any edge mutation) instead of <code>list(nodes())</code> rebuilt per query word — the graph is the only uncapped tier, so that O(nodes) rebuild ran per-turn (2026-07-07).</li>
     <li>3-hop BFS from each seed.</li>
     <li>Score paths by sum of edge weights.</li>
     <li>Format winners as <code>(subject)-[PREDICATE]-&gt; (object) -[P2]-&gt; (target)</code>.</li>
@@ -73,6 +73,9 @@
 
   <h2>Functional vs. non-functional predicates</h2>
   <p>One-to-one predicates (WORKS_AT, LIVES_IN, DRIVES) auto-expire old values when a new fact arrives. Many-to-many predicates (LIKES, KNOWS, HAS) accumulate.</p>
+
+  <h2>Forgetting — decay for the only uncapped tier (2026-07-07, #27c)</h2>
+  <p>Unlike vector (5000-cap), episodes (500) and skills (50), the graph had <em>no</em> bound: every non-functional predicate accumulated forever, and weight-1 edges (one-off extractor noise) diluted retrieval as the graph grew. <code>prune_stale_edges(max_age_days=45, keep_min_weight=1)</code> deletes currently-valid edges whose <code>weight &le; keep_min_weight</code> AND whose <code>timestamp</code> is older than the age threshold — from both SQLite and the mirror. Reinforced edges (weight &gt; threshold) survive regardless of age: <strong>weight IS the decay signal</strong>, previously stored but never used for forgetting. It runs from the <a href="../algorithms/dream_cycle.html">dream cycle</a> (best-effort, never fails a dream) and reports the count in the Dream-Complete line. Covered by <code>tests/test_graph_forgetting.py</code>. (A persistent token→node inverted index — replacing the substring/difflib scan entirely — remains a further optimization.)</p>
 
   <h2>Concurrency</h2>
   <p><code>threading.RLock</code> guards both SQLite and the networkx mirror. <code>initialize_graph()</code> rebuilds the entire mirror from disk.</p>

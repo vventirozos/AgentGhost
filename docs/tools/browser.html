@@ -54,14 +54,17 @@
   <table>
     <thead><tr><th>operation</th><th>required</th><th>returns</th></tr></thead>
     <tbody>
-      <tr><td><code>navigate</code></td><td><code>url</code></td><td>HTTP status, final URL, page title</td></tr>
-      <tr><td><code>extract_text</code></td><td>—</td><td>Rendered <code>innerText</code> of body (or a CSS selector), truncated at <code>max_chars</code></td></tr>
-      <tr><td><code>click</code></td><td><code>selector</code></td><td>Post-click URL + title</td></tr>
+      <tr><td><code>navigate</code></td><td><code>url</code></td><td>HTTP status, final URL, page title, <strong>and a capped ~8&nbsp;KB <code>text</code> preview</strong> of the body innerText (+ <code>length</code>, <code>truncated</code>) — 2026-07-07</td></tr>
+      <tr><td><code>extract_text</code></td><td>—</td><td>Rendered <code>innerText</code> of body (or a CSS selector), truncated at <code>max_chars</code> (64&nbsp;KB default)</td></tr>
+      <tr><td><code>click</code></td><td><code>selector</code></td><td>Post-click URL + title <strong>+ the post-click <code>text</code> preview</strong></td></tr>
       <tr><td><code>screenshot</code></td><td>—</td><td>Writes PNG to <code>out_path</code> inside <code>/workspace</code>; returns <code>/api/download/</code> URL</td></tr>
       <tr><td><code>close</code></td><td>—</td><td>Deletes the persistent profile so the next session starts fresh</td></tr>
       <tr><td><code>interact</code></td><td><code>actions</code></td><td>Per-action results (ok/error), final URL, final title. One Chromium context across the whole list.</td></tr>
     </tbody>
   </table>
+
+  <h2>navigate/click return page text (2026-07-07)</h2>
+  <p>Every atomic op opens a <em>fresh</em> Chromium context and reloads the page, so a bare <code>navigate</code> that returned only status/title forced a second <code>extract_text</code> op that re-launched Playwright and re-fetched the <strong>same page over Tor</strong> (5–20&nbsp;s) — the dominant cost of the common scrape flow. <code>navigate</code> and <code>click</code> now include a capped ~8&nbsp;KB <code>text</code> preview (<code>_body_excerpt</code>), so <code>navigate → read</code> is one op instead of two; call <code>extract_text</code> only when the preview was truncated or you need a precise selector. Pass <code>nav_text_chars=0</code> to opt out. The tool description tells the model it usually does not need a follow-up <code>extract_text</code>. The <em>warm-runner</em> tier (a long-lived in-sandbox process holding the persistent context open, eliminating the per-op launch entirely — the L tier of this improvement) remains future work. Covered by <code>tests/test_browser_navigate_text.py</code>.</p>
 
   <h2>Atomic ops vs. <code>interact</code></h2>
   <p>The atomic ops are perfect for single-page scrapes. They are <strong>not</strong> suitable for interactive multi-step flows, because every op's fresh context discards the JS-driven DOM mutations made by the previous op. A click that opens a modal is invisible to the next click, which sees a page just-loaded from its initial HTML. The 2026-04-23 WebOS eval hit this wall: the agent couldn't drive the Calculator because the Calculator window vanished between every click.</p>

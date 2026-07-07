@@ -131,3 +131,46 @@ class TestContextManager:
         msgs = [{"role": "user", "content": [{"type": "text", "text": "hello world"}]}]
         estimate = ContextManager._default_estimate(msgs)
         assert estimate > 0
+
+
+# --------------------------------------------- #27a: wired into the hot path
+
+
+def test_max_level_caps_compression():
+    """The agent passes max_level=3 so L4 message-dropping never fires from the
+    hot path — content compression only, all messages preserved."""
+    from ghost_agent.core.context_manager import ContextManager
+    cm = ContextManager(max_tokens=100)
+    # A conversation well over budget (ratio >= 0.95 would be L4 uncapped).
+    msgs = [{"role": "system", "content": "sys"}]
+    for i in range(20):
+        msgs.append({"role": "user", "content": "u" * 400})
+        msgs.append({"role": "tool", "name": "execute",
+                     "content": "\n".join(f"line {j}" for j in range(40))})
+    out = cm.compress_if_needed(msgs, max_level=3)
+    assert cm.compression_level <= 3
+    # Every message survives (no L4 emergency drop) → pairing intact.
+    assert len([m for m in out if m.get("role") == "tool"]) == 20
+
+
+def test_agent_wires_context_manager_before_prune():
+    """handle_chat must run the deterministic ContextManager before the LLM
+    summarization _prune_context."""
+    import inspect
+    from ghost_agent.core.agent import GhostAgent
+    src = inspect.getsource(GhostAgent.handle_chat)
+    i_cm = src.index("_get_context_manager().compress_if_needed")
+    i_prune = src.index("await self._prune_context(messages")
+    assert i_cm < i_prune, "compression must run BEFORE the summarization prune"
+    assert "max_level=3" in src
+
+
+def test_get_context_manager_is_cached():
+    from types import SimpleNamespace
+    from ghost_agent.core.agent import GhostAgent
+    ag = GhostAgent.__new__(GhostAgent)
+    ag.context = SimpleNamespace(args=SimpleNamespace(max_context=8000))
+    cm1 = ag._get_context_manager()
+    cm2 = ag._get_context_manager()
+    assert cm1 is cm2
+    assert cm1.max_tokens == 8000

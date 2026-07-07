@@ -31,6 +31,10 @@
   <h1>core / context_manager.py</h1>
   <p class="subtitle">Progressive context compression. Avoids the binary "fits" / "emergency-prune" cliff by compressing in five graduated levels.</p>
 
+  <div class="status-banner" style="border-left:4px solid #5dd39e;padding:0.5em 1em;margin:1em 0;background:rgba(93,211,158,0.08)">
+    <strong>Wired into the hot path (2026-07-07, #27a).</strong> This module previously had ZERO production callers — the live path degraded in one cliff via <a href="agent.html">core.agent</a>'s <code>_prune_context</code> (an LLM summarization pass). <code>handle_chat</code> now runs <code>compress_if_needed(messages, max_level=3)</code> immediately BEFORE <code>_prune_context</code> (via <code>_get_context_manager()</code>, lazily built with the real token estimator). The <code>max_level=3</code> cap means only <em>content</em> compression runs (L1-L3) — every message is preserved, so tool-call/result pairing stays intact — and <code>_prune_context</code> remains the L4 emergency for the extreme case. Net effect: the expensive LLM summarization fires less often because the deterministic, LLM-free levels shed tokens first. Covered by <code>tests/test_context_manager.py</code>.
+  </div>
+
   <h2>Levels</h2>
   <table>
     <thead><tr><th>Level</th><th>Used-token ratio</th><th>Effect</th><th>Full-fidelity turns</th></tr></thead>

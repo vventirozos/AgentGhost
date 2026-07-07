@@ -38,6 +38,15 @@ logger = logging.getLogger("GhostSelfhood")
 
 AUTOBIO_FILENAME = "autobiographical.jsonl"
 
+# Bounded growth (mirrors workspace/activity.py). Without a cap the log grew
+# monotonically (877 KB / 1.7k lines at ~6 weeks) while every turn did 3-4
+# full-file O(n) parses + one O(n) rewrite — quadratic over the agent's
+# lifetime. Once the file passes the byte cap on append we keep the newest N
+# entries and roll the dropped ones into a single summary record so the
+# narrative layer still knows history existed.
+_COMPACT_MAX_BYTES = 2 * 1024 * 1024
+_COMPACT_KEEP_LINES = 2000
+
 
 # Lightweight, zero-dependency topic clustering. The `cluster` field on
 # Experience used to be inert (set to None on every record); deriving a
@@ -261,10 +270,50 @@ class AutobiographicalMemory:
                     f.write(exp.to_jsonl())
                     f.write("\n")
                     f.flush()
+                self._maybe_compact_locked()
             return self.path
         except Exception as e:
             logger.warning("autobiographical append failed: %s", e)
             return None
+
+    def _maybe_compact_locked(self) -> None:
+        """Rewrite the log keeping the newest ``_COMPACT_KEEP_LINES`` entries
+        once it passes the byte cap, rolling the dropped entries into ONE
+        summary record at the head so the narrative layer still knows earlier
+        history existed. Caller holds ``self._lock``. Best-effort — a failed
+        compaction must never fail the append that triggered it."""
+        try:
+            if self.path.stat().st_size <= _COMPACT_MAX_BYTES:
+                return
+            from collections import deque
+            with self.path.open("r", encoding="utf-8") as f:
+                tail = deque(f, maxlen=_COMPACT_KEEP_LINES)
+            # Count what we're dropping so the summary is honest.
+            with self.path.open("r", encoding="utf-8") as f:
+                total = sum(1 for _ in f)
+            dropped = max(0, total - len(tail))
+            tmp = self.path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                if dropped > 0:
+                    summary_exp = Experience(
+                        summary=(f"[Consolidated] {dropped} earlier autobiographical "
+                                 f"entries were compacted out of the diary to bound "
+                                 f"its size; the newest {len(tail)} are retained."),
+                        subject="self",
+                    )
+                    f.write(summary_exp.to_jsonl())
+                    f.write("\n")
+                f.writelines(tail)
+            tmp.replace(self.path)
+            # The on-disk file changed → drop the IDF/search cache so the next
+            # search rebuilds against the compacted contents.
+            self._search_cache = {}
+            logger.info(
+                "autobiographical log compacted to newest %d entries (dropped %d)",
+                len(tail), dropped,
+            )
+        except Exception as e:
+            logger.warning("autobiographical compaction failed: %s", e)
 
     # ------------------------------------------------------------------
     # Template rollup helpers
@@ -421,16 +470,33 @@ class AutobiographicalMemory:
     def recent(self, limit: int = 5) -> List[Experience]:
         """Return the most recent N experiences, newest last so the
         natural caller can do ``for e in mem.recent(3): print(e)`` and
-        read in chronological order."""
+        read in chronological order.
+
+        Reads only the tail of the file (a bounded deque over the lines)
+        instead of materialising the whole log — `recent()` is on the
+        per-turn hot path (wake-up prefix, reference-note), and a full
+        O(n) parse per call was quadratic over the log's monotonic growth."""
         if limit <= 0:
             return []
-        # Streaming the full file is fine — turns produce at most ~1
-        # entry per minute under heavy use, so even a year of operation
-        # is tens of thousands of lines.
+        if not self.path.exists():
+            return []
+        from collections import deque
+        try:
+            with self.path.open("r", encoding="utf-8") as f:
+                tail_lines = deque(f, maxlen=limit)
+        except OSError as e:
+            logger.warning("cannot read autobiographical log %s: %s", self.path, e)
+            return []
         items: List[Experience] = []
-        for exp in self.iter_experiences():
-            items.append(exp)
-        return items[-limit:]
+        for line in tail_lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                items.append(Experience.from_dict(json.loads(line)))
+            except Exception:
+                continue
+        return items
 
     def search_my_past(self, query: str, limit: int = 5) -> List[Experience]:
         """Relevance-ranked search over my own past. Deliberately

@@ -5,7 +5,7 @@ from ghost_agent.tools.execute import tool_execute
 
 # Mock Sandbox Manager
 class MockSandbox:
-    def execute(self, cmd, timeout=None):
+    def execute(self, cmd, timeout=None, spill_large_output=False, max_output_chars=None):
         if "python3 -m black" in cmd: return "reformatted", 0
         if "error_script.py" in cmd:
              return 'File "error_script.py", line 2, in <module>\n    x = 1 / 0\nZeroDivisionError: division by zero', 1

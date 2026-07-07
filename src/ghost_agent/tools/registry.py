@@ -100,6 +100,14 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "The target file or directory path relative to the active project root."
                     },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Optional for operation='read': 1-based first line of a LINE-RANGE read. Returns only that slice with line-number prefixes and is EXEMPT from the whole-file size cap — the cheap way to re-read one region after a failed 'replace' or a too-large-file error. Chains directly from 'search' line numbers. Pair with end_line."
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Optional for operation='read': 1-based last line of the range (inclusive). Omit to read from start_line to the end (capped)."
+                    },
                     "page": {
                         "type": "integer",
                         "description": "Required when operation='read_chunked'. Specifies the page or section number (1-indexed) to read from a large document or PDF."
@@ -147,7 +155,7 @@ TOOL_DEFINITIONS = [
                     "operation": {
                         "type": "string",
                         "enum": ["navigate", "extract_text", "click", "screenshot", "close", "interact"],
-                        "description": "navigate: open URL, return status/title. extract_text: return body innerText (or a specific selector). click: click a CSS selector. screenshot: save PNG to /workspace. close: clear the persistent session profile (and the last-URL sidecar). interact: run a sequence of sub-actions (in `actions`) in ONE Chromium context — required for multi-step SPA flows where the atomic per-op re-navigation would wipe intermediate DOM state."
+                        "description": "navigate: open URL, return status/title AND a capped ~8KB `text` preview of the page — you usually do NOT need a follow-up extract_text. extract_text: return the FULL body innerText (or a specific selector) up to max_chars — use only when the navigate preview was truncated or you need a precise selector. click: click a CSS selector, returns url/title AND the post-click `text` preview. screenshot: save PNG to /workspace. close: clear the persistent session profile (and the last-URL sidecar). interact: run a sequence of sub-actions (in `actions`) in ONE Chromium context — required for multi-step SPA flows where the atomic per-op re-navigation would wipe intermediate DOM state."
                     },
                     "url": {"type": "string", "description": "Target URL. REQUIRED for 'navigate'. OPTIONAL for extract_text / click / screenshot / interact: when omitted, the tool re-navigates to the URL of the most recent navigate/extract/click/screenshot/interact call (stored in <profile_dir>/.last_url). If neither an explicit URL nor a sidecar URL is available, the tool errors with a clear 'call navigate first or pass url=...' message."},
                     "selector": {"type": "string", "description": "CSS selector. Required for 'click'. Optional for 'extract_text' to narrow to a specific element."},

@@ -88,6 +88,9 @@
   <h3><code>_verify_lesson_helpful</code></h3>
   <p>For struggled-then-won and failure cases, re-runs the solver once with the lesson prepended under the production <code>### SKILL PLAYBOOK:</code> header. Keeps only if the outcome strictly improves.</p>
 
+  <h3>REM-cycle heuristics — per-content keying (2026-07-07)</h3>
+  <p>Consolidation heuristics from the dream JSON are written with <code>task = &lt;first 80 chars of the heuristic&gt;</code> and <code>source="dream"</code>. Previously every heuristic used the constant <code>task="[System] Dream Heuristic"</code>; since <code>SkillMemory</code> dedups on the normalized trigger, all heuristics from all REM cycles collapsed into a single playbook slot — a new one overwrote the previous (if longer) or was dropped, its <code>frequency</code> inflated toward bogus graduation, and its constant trigger matched no user query. Per-content keying makes each a first-class lesson governed by the normal dedup / cap / utility machinery, and the <code>source="dream"</code> tag lets the B3 idle-loop ablation count dream's real contribution by provenance.</p>
+
   <h2>Isolation markers</h2>
   <p>The isolated sub-context sets several attributes to prevent production-state writes:</p>
   <ul>

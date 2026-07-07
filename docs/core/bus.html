@@ -61,14 +61,11 @@
     </tbody>
   </table>
 
-  <h2>Section budgets</h2>
-  <p>Total <code>max_chars</code> is split across sources before truncation:</p>
-  <ul>
-    <li>graph — 25 %</li>
-    <li>vector — 40 %</li>
-    <li>skill — 20 %</li>
-    <li>episodic — 15 %</li>
-  </ul>
+  <h2>Global budget + per-item emission (2026-07-07)</h2>
+  <p>There are <strong>no</strong> fixed per-source budgets. <code>_format_markdown_with_survivors</code> emits items <strong>strictly in descending fused-score order</strong> under one global <code>max_chars</code> (headers printed lazily on first sight of a source), with a <code>_PER_SOURCE_CAP</code> (6) so one tier can't monopolise the budget. An earlier redesign moved off the old 25/40/20/15 % section split because fixed quotas discarded the fused ranking; this section previously still documented the dead quotas.</p>
+  <p><strong>Per-item, not per-tier.</strong> The skill and episodic fetchers now return <strong>one RRF item per lesson / per episode</strong> (<code>SkillMemory.get_playbook_items</code>, <code>EpisodicMemory.format_episode</code>) instead of a single whole-tier blob. A blob was always rank 1 in its ranker regardless of any individual lesson's relevance, so the per-item relevance floor and <code>_PER_SOURCE_CAP</code> were no-ops on it, and under sub-query fan-out several near-identical multi-KB blobs each consumed the global budget. Per-item, each lesson/episode is ranked, gated, capped, and deduped on its own.</p>
+  <p><strong>Episodic semantic recall is wired.</strong> <code>_fetch_episodic</code> passes the bus's vector store to <code>search_similar</code>, so the embedding-based episode retrieval path fires (previously it always fell back to substring matching over the 100 most-recent episodes, leaving ~half the collection unreachable). Stubs with a 2-arg <code>search_similar</code> still work (the bus catches the <code>TypeError</code> and retries without the kwarg).</p>
+  <p><strong>Retrieval credit is deferred to post-fusion.</strong> The fetchers use side-effect-free reads (<code>search_items</code>, <code>get_playbook_items</code>); <code>_credit_surfaced</code> then bumps reinforcement counters exactly once per turn, only for the items that actually entered the prompt, via <code>VectorMemory.bump_retrievals(ids)</code> + <code>SkillMemory.record_retrievals_bulk(triggers)</code>. Previously every candidate of every sub-query was credited inside the search call — inflating <code>retrievals</code> ~4× per turn while <code>helpful_retrievals</code> credits at most once per window, which structurally crushed <code>hit_rate</code> and mis-flagged useful lessons as stale-and-prunable, at a cost of up to ~20 full <code>skills_playbook.json</code> rewrites per turn.</p>
 
   <h2>Dedup LRU</h2>
   <p><code>_DEDUP_LRU_MAX = 256</code>. Each <code>publish_fact</code> hashes <code>(event_type, fact_data)</code> with MD5 before the fan-out — a recently-seen signature short-circuits and writes nothing. Prevents re-emission storms when the LLM repeats itself.</p>

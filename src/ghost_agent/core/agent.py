@@ -1002,61 +1002,15 @@ def _tool_call_truncated(content: str) -> bool:
     if fn_opens > fn_closes:
         return True
     return False
-THINKING_LOOP_PROBE_EVERY = 500     # run the repetition probe every N chars
-THINKING_LOOP_WINDOW = 200          # length of the n-gram we look for
-THINKING_LOOP_THRESHOLD = 3         # window appearing >= N times = loop
-# Reverted to the conservative (500/200/3) — needs ~600 chars of genuine
-# repetition before firing. The aggressive (300/150/2) was tuned to kill a
-# weak model's "I'll write X. Then Y. Then Z." enumeration loops fast, at an
-# explicitly "acceptable false-positive risk". A strong model rarely produces
-# those loops, so that false-positive cost (aborting legitimate reasoning that
-# restates a constraint / loop invariant / repeated code pattern) now outweighs
-# the benefit. The tool_call-collapse probe + the 200K char ceiling remain as
-# fast backstops for the genuine runaway case.
-
-# Tool-call generation-collapse detector. In the wild we've seen Qwen
-# emit 8000+ consecutive `<tool_call>` tokens with zero `</tool_call>` /
-# `<function>` / `<parameter>`, burning 300+ seconds of decoder time
-# before hitting max_tokens. The n-gram thinking-loop detector catches
-# this eventually, but only after ~600 chars of repetition; this
-# specialised probe fails fast after ~10 unclosed openings.
-TOOL_CALL_LOOP_THRESHOLD = 10       # unclosed `<tool_call>` openings = collapse
-TOOL_CALL_LOOP_PROBE_EVERY = 200    # run the probe every N chars of new content
-
-
-def _detect_thinking_loop(buf: str) -> bool:
-    """True if the tail of `buf` repeats itself enough to be a loop.
-
-    Checks two n-gram sizes (the tight 200-char window for fast repeats,
-    plus a 400-char window as a backstop for slightly-paraphrased runs
-    where each paragraph is just long enough to dodge the 200-char probe)."""
-    if len(buf) < THINKING_LOOP_WINDOW * THINKING_LOOP_THRESHOLD:
-        return False
-    tail = buf[-THINKING_LOOP_WINDOW:]
-    if buf.count(tail) >= THINKING_LOOP_THRESHOLD:
-        return True
-    wide_window = THINKING_LOOP_WINDOW * 2
-    if len(buf) >= wide_window * THINKING_LOOP_THRESHOLD:
-        wide_tail = buf[-wide_window:]
-        if buf.count(wide_tail) >= THINKING_LOOP_THRESHOLD:
-            return True
-    return False
-
-
-def _detect_tool_call_loop(buf: str) -> bool:
-    """True if the content buffer has accumulated too many unclosed
-    `<tool_call>` openings — a decoder-collapse signature where the
-    model is stuck emitting opening tags but never closing them.
-
-    The healthy case is N opens + N closes (≥0 complete tool calls) or a
-    single open waiting for its close. Anything where opens -
-    closes > THRESHOLD is a run of openings with no progress, and we
-    should kill the stream rather than let it run to max_tokens."""
-    if not buf:
-        return False
-    opens = len(re.findall(r'<tool_call\b', buf, re.IGNORECASE))
-    closes = len(re.findall(r'</tool_call\b', buf, re.IGNORECASE))
-    return (opens - closes) > TOOL_CALL_LOOP_THRESHOLD
+# Streaming sanity guards live in core/stream_guards.py (the guard-module seam,
+# IMPROVEMENTS.md #5) — new stream guards land THERE, not inline here. Re-export
+# the names so existing references + tests in this module keep working.
+from .stream_guards import (  # noqa: E402
+    THINKING_LOOP_PROBE_EVERY, THINKING_LOOP_WINDOW, THINKING_LOOP_THRESHOLD,
+    TOOL_CALL_LOOP_THRESHOLD, TOOL_CALL_LOOP_PROBE_EVERY,
+    _STREAM_STOP_MARKERS,
+    _detect_thinking_loop, _tail_has_stop_marker, _detect_tool_call_loop,
+)
 
 
 def _render_assistant_with_tool_calls(content: str, tool_calls: list) -> str:
@@ -1739,7 +1693,19 @@ class GhostAgent:
         self._correction_active_this_turn = False
         self._active_correction = ""
         self.available_tools = get_available_tools(context)
-        self.agent_semaphore = asyncio.Semaphore(10)
+        # Turns are SERIALIZED (was Semaphore(10)). Per-turn state lives on the
+        # singleton context — `last_user_content` (read mid-turn by intent
+        # gates in tools/projects.py + tools/memory.py) and `current_project_id`
+        # (drives project-scoped sandbox writes) — so two concurrent turns
+        # clobber each other's scope. The concrete hazard: an APScheduler cron
+        # job fires `handle_chat` mid-user-turn and switches the active project,
+        # landing the user's uploads/writes in the wrong sandbox with
+        # plausible-looking logs. There is ONE upstream llama slot, so
+        # concurrent turns mostly just interleave waits anyway — serializing
+        # costs almost nothing and closes the whole state-corruption class.
+        # (If real per-turn concurrency is ever wanted, move those two fields
+        # to contextvars instead of raising this back up.)
+        self.agent_semaphore = asyncio.Semaphore(1)
         self.memory_semaphore = asyncio.Semaphore(1)
         # Live pre-flight repeat-failure guard (feature 1A). Always present
         # and fed; only consulted as a hard pre-dispatch block when the flag
@@ -1749,6 +1715,20 @@ class GhostAgent:
         self._preflight_guard_enabled = bool(
             getattr(getattr(context, "args", None), "enable_preflight_guard", True)
         )
+        # B3 idle-loop ablation knobs (IMPROVEMENTS.md #4). Default to
+        # production timings (scale 1.0, probabilistic). The trackb3 harness
+        # sets a large scale (e.g. 60) to compress hours-long idle windows into
+        # minutes and --bio-deterministic to fire the phases every epoch.
+        _args = getattr(context, "args", None)
+        _bts = getattr(_args, "bio_time_scale", 1.0)
+        # Only a REAL positive number scales; a MagicMock args (tests) or a
+        # missing attr falls back to production timing 1.0.
+        self._bio_time_scale = _bts if (isinstance(_bts, (int, float))
+                                        and not isinstance(_bts, bool)
+                                        and _bts > 0) else 1.0
+        # Only a real bool True enables — a MagicMock attr must NOT (else every
+        # test agent fires the idle phases deterministically).
+        self._bio_deterministic = getattr(_args, "bio_deterministic", False) is True
 
     def release_unused_ram(self):
         try:
@@ -1894,6 +1874,32 @@ class GhostAgent:
 
         return system_msgs + final_history
 
+    def _get_context_manager(self):
+        """Lazily construct the progressive ContextManager (L0-L4 compression).
+        Wired in front of _prune_context so deterministic compression runs
+        before the LLM summarization prune (IMPROVEMENTS.md #27a). Uses the
+        real token estimator so its ratio matches the rest of the loop."""
+        cm = getattr(self, "_context_manager", None)
+        if cm is None:
+            from .context_manager import ContextManager
+            max_tokens = int(getattr(self.context.args, "max_context", 65536) or 65536)
+
+            def _estimator(msgs):
+                total = 0
+                for m in msgs:
+                    c = m.get("content", "")
+                    if isinstance(c, str):
+                        total += estimate_tokens(c)
+                    elif isinstance(c, list):
+                        for part in c:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                total += estimate_tokens(str(part.get("text", "")))
+                return total
+
+            cm = ContextManager(max_tokens=max_tokens, token_estimator=_estimator)
+            self._context_manager = cm
+        return cm
+
     async def _prune_context(self, messages: List[Dict[str, Any]], max_tokens: int = 12000, model: str = "test-model") -> List[Dict[str, Any]]:
         current_tokens = 0
         for m in messages:
@@ -2008,7 +2014,13 @@ class GhostAgent:
 
         summary = "[SYSTEM: PREVIOUS TURNS SUMMARIZED]\n\n"
         try:
-            summary_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
+            # FOREGROUND, not background: this summarizer is awaited INLINE
+            # by the user's own turn (handle_chat calls _prune_context when
+            # history overflows). Marking it is_background made it park in
+            # _wait_for_foreground_clear against its OWN request — a
+            # deterministic stall up to the 600s ceiling before the turn
+            # could continue. use_worker still offloads it when a pool exists.
+            summary_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=False)
             summary += str(summary_data["choices"][0]["message"].get("content") or "No summary generated.")
 
             from ..utils.helpers import get_utc_timestamp
@@ -2151,6 +2163,16 @@ class GhostAgent:
         try:
             while True:
                 await asyncio.sleep(60)
+                # RSS self-defense runs BEFORE the tick and independent of its
+                # memory_system guard: the known 270MB→2GB growth on a ~94%-RAM
+                # box can OOM-kill the shared llama-server, so it must fire even
+                # in a degraded boot. Only acts when quiescent.
+                try:
+                    self._rss_watchdog_check()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug(f"RSS watchdog check failed: {e}")
                 try:
                     await self._biological_tick()
                 except asyncio.CancelledError:
@@ -2160,6 +2182,68 @@ class GhostAgent:
         except asyncio.CancelledError:
             logger.info("Biological watchdog daemon cancelled")
             raise
+
+    def _current_rss_mb(self):
+        """Process RSS in MB, or None if psutil is unavailable / errors.
+        Cheap enough to call once per 60s tick."""
+        try:
+            import psutil
+            return psutil.Process().memory_info().rss / (1024 * 1024)
+        except Exception:
+            return None
+
+    def _rss_watchdog_check(self):
+        """When the process RSS crosses GHOST_MAX_RSS_MB and no foreground work
+        is in flight, log one WARNING and restart in place via os.execv —
+        preserving argv + the exported GHOST_HOME, no external supervisor
+        needed. Disabled when GHOST_MAX_RSS_MB<=0 (the default 0 = off, so
+        this is opt-in and cannot surprise-restart an unconfigured deployment).
+        A shutdown drain hook isn't available here, so we only fire when
+        quiescent — mid-turn RSS is never interrupted."""
+        import os
+        try:
+            limit_mb = float(os.environ.get("GHOST_MAX_RSS_MB", "0") or "0")
+        except (TypeError, ValueError):
+            limit_mb = 0.0
+        if limit_mb <= 0:
+            return  # opt-in; off by default
+
+        rss = self._current_rss_mb()
+        if rss is None or rss < limit_mb:
+            return
+
+        # Only restart when genuinely idle — never mid-request.
+        _lc = getattr(self.context, "llm_client", None)
+        if (getattr(_lc, "foreground_tasks", 0) > 0
+                or getattr(_lc, "foreground_requests", 0) > 0):
+            self._rss_over_since = getattr(self, "_rss_over_since", None) or "pending"
+            logger.warning(
+                "RSS %.0f MB over limit %.0f MB but foreground work is active; "
+                "deferring controlled restart until idle.", rss, limit_mb,
+            )
+            return
+
+        pretty_log(
+            "RSS Watchdog",
+            f"Process RSS {rss:.0f} MB exceeded GHOST_MAX_RSS_MB={limit_mb:.0f} "
+            f"while idle — restarting in place (os.execv) to reclaim memory.",
+            level="WARNING", icon=Icons.WARN,
+        )
+        try:
+            import sys
+            # Best-effort: stop the sandbox container cleanly so the restart
+            # doesn't orphan it. Other resources are reclaimed by the exec.
+            sm = getattr(self.context, "sandbox_manager", None)
+            if sm is not None:
+                try:
+                    sm.close(remove=False)
+                except Exception:
+                    pass
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os.execv(sys.executable, [sys.executable, "-m", "ghost_agent.main", *sys.argv[1:]])
+        except Exception as e:
+            logger.error(f"RSS-watchdog restart failed (continuing): {e}")
 
     # Per-phase cooldowns (in seconds) so the watchdog can't fire two REM
     # cycles or two self-play sessions back-to-back when the user remains AFK.
@@ -2181,6 +2265,29 @@ class GhostAgent:
     # would otherwise re-fire every tick. The cooldown caps refire
     # rate at the same shape as the other five phases.
     _JOURNAL_COOLDOWN = 60        # 60 s between journal-process passes
+
+    def _bio_scaled(self, seconds: float) -> float:
+        """Scale an idle-window / cooldown threshold by ``--bio-time-scale``
+        (default 1.0 = production timings). A scale of 60 turns a 1-hour idle
+        window into 1 minute so the B3 ablation harness can exercise the pure-
+        idle learning loops (dream/self-play, reflection critique, skills-auto
+        graduation) in accelerated epochs. Applied to EVERY inline window bound
+        and to the phase cooldowns via `_bio_cooldown`."""
+        scale = getattr(self, "_bio_time_scale", 1.0) or 1.0
+        return seconds / scale
+
+    def _bio_cooldown(self, seconds: float) -> float:
+        """Same scaling for a phase cooldown."""
+        return self._bio_scaled(seconds)
+
+    def _bio_roll(self, p: float) -> bool:
+        """Probability gate for the idle phases. Returns True deterministically
+        under ``--bio-deterministic`` (so the B3 control/treatment arms fire the
+        same phases every accelerated epoch instead of sampling), else
+        ``random.random() < p`` as before."""
+        if getattr(self, "_bio_deterministic", False):
+            return True
+        return random.random() < p
 
     async def _biological_tick(self):
         """One pass of the biological hook state machine. Extracted from the
@@ -2239,7 +2346,7 @@ class GhostAgent:
         idle_secs = (datetime.datetime.now() - ctx.last_activity_time).total_seconds()
 
         # Phase 1: Process Short-Term Journal (>120s idle)
-        if idle_secs > 120 and getattr(ctx, 'journal', None) is not None:
+        if idle_secs > self._bio_scaled(120) and getattr(ctx, 'journal', None) is not None:
             since_last_journal = (datetime.datetime.now() - self._last_journal_at).total_seconds()
             if since_last_journal >= self._JOURNAL_COOLDOWN:
                 has_items = False
@@ -2273,7 +2380,7 @@ class GhostAgent:
                     return
 
         # Phase 2: Deep REM Dream (10–60 min idle)
-        if 600 < idle_secs <= 3600:
+        if self._bio_scaled(600) < idle_secs <= self._bio_scaled(3600):
             since_last_dream = (datetime.datetime.now() - self._last_dream_at).total_seconds()
             if since_last_dream >= self._DREAM_COOLDOWN:
                 try:
@@ -2289,7 +2396,7 @@ class GhostAgent:
                     logger.debug("dream eligibility get() failed: %s", _cgx)
                     res = None
                 if res and len(res.get('ids', [])) >= 3:
-                    if random.random() < 0.5:
+                    if self._bio_roll(0.5):
                         from .dream import Dreamer
                         pretty_log("Biological Hook",
                                    "Agent is idle. Entering spontaneous REM cycle...",
@@ -2328,7 +2435,7 @@ class GhostAgent:
         #       code without requiring the trajectory collector to be
         #       present in every deployment.
         # Does NOT reset `ctx.last_activity_time` — same rule as dream.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_reflection = (datetime.datetime.now() - self._last_reflection_at).total_seconds()
             if since_last_reflection >= self._REFLECTION_COOLDOWN:
                 reflector = getattr(ctx, 'reflector', None)
@@ -2412,7 +2519,7 @@ class GhostAgent:
         # anchor-before-await discipline as every other phase so a crash
         # can't pin it re-firing. Never resets last_activity_time; never
         # applies anything — output is a review queue.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             engine = getattr(ctx, 'postmortem_engine', None)
             traj_collector = getattr(ctx, 'trajectory_collector', None)
             if engine is not None and traj_collector is not None:
@@ -2456,7 +2563,7 @@ class GhostAgent:
         # (nothing to extract from without it) and on its own cooldown
         # anchor so a long AFK stretch doesn't produce N redundant
         # extraction passes back-to-back.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_skills = (datetime.datetime.now() - self._last_skills_auto_at).total_seconds()
             if since_last_skills >= self._SKILLS_AUTO_COOLDOWN:
                 traj_collector = getattr(ctx, 'trajectory_collector', None)
@@ -2588,7 +2695,7 @@ class GhostAgent:
         # Does NOT reset ``ctx.last_activity_time`` — same rule as
         # phases 1 / 2 / 2.5 / 2.6: that clock is the user's, not
         # the agent's.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             # Resolve cooldown defensively: ``ctx.args`` is a MagicMock
             # in many tests, and ``getattr(MagicMock(), 'x', None)``
             # returns a fresh MagicMock instead of None — comparing
@@ -2661,7 +2768,7 @@ class GhostAgent:
         # request); this trains the ComplexityClassifier from the trajectory log
         # and hot-swaps it into the live dispatcher so cheap turns stop waking
         # the full swarm. CPU-only, same idle window + cooldown discipline.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             _rt_cd_override = getattr(getattr(ctx, 'args', None), 'router_train_cooldown', None)
             if not isinstance(_rt_cd_override, (int, float)):
                 _rt_cd_override = None
@@ -2728,7 +2835,7 @@ class GhostAgent:
         # work AND in finally so a mid-fit crash can't refire every tick).
         # No-op unless --enable-metacog produced confidence readings AND
         # the bail floors (≥40 samples, both outcome classes) are met.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             _calib_cd_override = getattr(
                 getattr(ctx, 'args', None), 'calib_refit_cooldown', None,
             )
@@ -2782,7 +2889,7 @@ class GhostAgent:
         # opt-in and one project / one tick per cooldown, so a runaway
         # is impossible. Anchor-before-await + finally, same as the
         # other phases.
-        if (900 < idle_secs <= 3600
+        if (self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600)
                 and getattr(getattr(ctx, 'args', None), 'autoadvance_idle', False) is True):
             since_last_aa = (datetime.datetime.now() - self._last_autoadvance_at).total_seconds()
             store = getattr(ctx, 'project_store', None)
@@ -2910,7 +3017,7 @@ class GhostAgent:
         #       circuits on `enabled=False`).
         # Does NOT reset `ctx.last_activity_time` — same rule as every
         # other internal phase: that clock is the user's, not the agent's.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             cooldown_override = getattr(
                 getattr(ctx, 'args', None), 'self_narrative_cooldown', None,
             )
@@ -2959,7 +3066,7 @@ class GhostAgent:
         # few hours, pull self-questions the agent has carried unresolved past
         # `max_age_days` and log them so they can be re-engaged instead of
         # silently accreting. Same idle window + cooldown discipline.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             since_last_sq = (datetime.datetime.now() - self._last_stale_questions_at).total_seconds()
             if since_last_sq >= self._STALE_QUESTIONS_COOLDOWN:
                 _sm = getattr(ctx, 'self_model', None)
@@ -2984,7 +3091,7 @@ class GhostAgent:
         # "running summary of the workspace" so the next session's
         # wake-up prefix can splice it in without a re-run. Same idle
         # window + cooldown discipline as the selfhood narrative.
-        if 900 < idle_secs <= 3600:
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
             ws_cooldown_override = getattr(
                 getattr(ctx, 'args', None), 'workspace_narrative_cooldown', None,
             )
@@ -3017,9 +3124,9 @@ class GhostAgent:
                     self._last_workspace_narrative_at = datetime.datetime.now()
 
         # Phase 3: Synthetic Self-Play (>60 min idle)
-        if idle_secs > 3600:
+        if idle_secs > self._bio_scaled(3600):
             since_last_selfplay = (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
-            if since_last_selfplay >= self._current_selfplay_cooldown and random.random() < 0.2:
+            if since_last_selfplay >= self._current_selfplay_cooldown and self._bio_roll(0.2):
                 from .dream import Dreamer
                 pretty_log("Biological Hook",
                            "Agent is deeply idle. Initiating Synthetic Self-Play...",
@@ -3317,6 +3424,7 @@ class GhostAgent:
             "_agent_ref", "_profile_str", "_profile_loaded",
             "_active_tool_defs_cache", "_xml_schema_cache",
             "_skill_playbook_cache", "_sandbox_state",
+            "_stable_tool_query",
         )
 
         def __init__(self, agent_ref):
@@ -3329,6 +3437,21 @@ class GhostAgent:
             self._xml_schema_cache: Dict[str, str] = {}
             self._skill_playbook_cache: Dict[str, str] = {}
             self._sandbox_state = None
+            # #7: the acquired-skill semantic router filters the advertised
+            # tool set by query. Feeding it the PER-TURN query (which becomes
+            # the planner's thought mid-request) byte-changes the tool header
+            # every turn → invalidates the upstream prompt-prefix KV cache →
+            # a full re-prefill each turn. Pin the routing query to the FIRST
+            # substantive query of the request so the advertised set stays
+            # byte-stable across the request's turns (the lever #6's KV pin
+            # needs). Topic relevance is preserved: the first user message
+            # sets the request's topic.
+            self._stable_tool_query = None
+
+        def stable_tool_query(self, query: str) -> str:
+            if self._stable_tool_query is None and query and query.strip():
+                self._stable_tool_query = query
+            return self._stable_tool_query or (query or "")
 
         async def get_profile_str(self) -> str:
             if not self._profile_loaded:
@@ -4215,6 +4338,25 @@ class GhostAgent:
         verifier = getattr(self.context, "verifier", None)
         llm = getattr(verifier, "llm_client", None) if verifier else None
         return 0.0 if getattr(llm, "critic_clients", None) else float("inf")
+
+    def _critic_repair_await_budget(self) -> float:
+        """Seconds to wait at loop-exit for the async critic verdict so a
+        REFUTED answer can be REPAIRED IN-LOOP rather than shipping with only a
+        next-turn note (IMPROVEMENTS.md #18).
+
+        Only meaningful in async-critic mode, where the verdict runs on the
+        OFF-HOST second model — so this wait costs the MAIN inference slot
+        nothing. Default 25s; ``GHOST_CRITIC_REPAIR_BUDGET`` overrides, 0
+        disables (pure defer, the pre-2026-07-07 async behaviour)."""
+        if not self._critic_async_enabled():
+            return 0.0
+        raw = os.getenv("GHOST_CRITIC_REPAIR_BUDGET")
+        if raw is not None and raw.strip() != "":
+            try:
+                return max(0.0, float(raw))
+            except ValueError:
+                pass
+        return 25.0
 
     async def _compute_verifier_verdict_gated(
         self, *, tools_run_this_turn, messages, final_ai_content,
@@ -5686,6 +5828,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                     # Dynamic state no longer mutated via re.sub
 
+                    # Progressive DETERMINISTIC compression (L1-L3, no LLM)
+                    # BEFORE the expensive summarization prune. This graceful
+                    # degradation (compress old tool outputs → collapse verbose
+                    # assistant turns → truncate old user msgs) reduces how
+                    # often _prune_context has to fire its LLM summarization
+                    # (which pays an upstream call). Capped at L3 so every
+                    # message is preserved (tool-call/result pairing intact);
+                    # _prune_context stays the L4 emergency for the extreme case.
+                    try:
+                        messages = self._get_context_manager().compress_if_needed(
+                            messages, max_level=3)
+                    except Exception as _cmx:
+                        logger.debug("progressive compression skipped: %s", _cmx)
+
                     # Proactive Context Pruning before request
                     messages = await self._prune_context(messages, max_tokens=self.context.args.max_context, model=model)
 
@@ -5695,7 +5851,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # search_query and tool list now hit the LRU + per-request
                     # caches instead of re-filtering and re-serialising.
                     search_query = thought_content if (use_plan and locals().get('thought_content')) else last_user_content
-                    all_tools = request_state.get_active_tool_defs(search_query or "")
+                    # #7: route acquired-skill selection off a REQUEST-STABLE
+                    # query (pinned to the first substantive query) so the
+                    # advertised tool set — and thus the tool header block —
+                    # stays byte-identical across the request's turns, letting
+                    # the upstream prompt-prefix KV cache hold instead of
+                    # re-prefilling every turn.
+                    all_tools = request_state.get_active_tool_defs(
+                        request_state.stable_tool_query(search_query or ""))
                     if hasattr(self, 'disabled_tools') and self.disabled_tools:
                         all_tools = [t for t in all_tools if t["function"]["name"] not in self.disabled_tools]
 
@@ -6211,6 +6374,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 flags=re.DOTALL | re.IGNORECASE,
                             )
                             _scrubbed_emitted_len = len(full_content) if _stream_scrub_active else 0
+                            # Once ANY '<' appears we must run the full scrub
+                            # regex (a tag might be forming). Until then — the
+                            # common case for a plain-text final answer — the
+                            # sub is a guaranteed no-op, so we skip it and emit
+                            # the raw new tokens. This turns the per-chunk
+                            # O(len(answer)) re-sub into O(1) for tag-free
+                            # answers (the majority of final generations).
+                            _scrub_seen_lt = False
 
                             # Metacog entropy tracker (roadmap phase 2.2).
                             # Allocated once per stream; observes one top-K
@@ -6289,7 +6460,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     # with the whole block removed. Net
                                     # effect: the client sees clean text
                                     # and never sees the XML flicker past.
-                                    _scrubbed_view = _stream_scrub_pattern.sub('', full_content)
+                                    if not _scrub_seen_lt and "<" in full_content[_scrubbed_emitted_len:]:
+                                        _scrub_seen_lt = True
+                                    if _scrub_seen_lt:
+                                        _scrubbed_view = _stream_scrub_pattern.sub('', full_content)
+                                    else:
+                                        # No '<' anywhere yet → the sub is a
+                                        # no-op; the scrubbed view equals the
+                                        # raw buffer. Skip the O(n) regex.
+                                        _scrubbed_view = full_content
                                     _to_emit = _scrubbed_view[_scrubbed_emitted_len:]
                                     if _to_emit:
                                         _synthetic = {
@@ -6651,6 +6830,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         thinking_token_count = 0
                         thinking_line_buf = ""
                         next_loop_probe = THINKING_LOOP_PROBE_EVERY
+                        # Cadence anchor for the tool-call-collapse probe so it
+                        # doesn't run two full-buffer regex scans on EVERY
+                        # content chunk (the TOOL_CALL_LOOP_PROBE_EVERY constant
+                        # existed but was never consulted).
+                        next_tool_probe = TOOL_CALL_LOOP_PROBE_EVERY
 
                         # Flush-size budget for streaming thought blocks.
                         # Reasoning models (Qwen3+) emit thinking as many
@@ -6733,7 +6917,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                             r_token = delta["reasoning_content"]
                                             reasoning_content += r_token
                                             if not stop_printing:
-                                                if "</think" in reasoning_content.lower() or "<tool_call" in reasoning_content.lower():
+                                                if _tail_has_stop_marker(reasoning_content, r_token):
                                                     stop_printing = True
                                                 if not stop_printing:
                                                     if _is_think_tag_fragment(r_token, reasoning_content):
@@ -6746,7 +6930,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                             text_chunk = delta["content"]
                                             full_content += text_chunk
                                             if not stop_printing:
-                                                if "</think" in full_content.lower() or "<tool_call" in full_content.lower():
+                                                if _tail_has_stop_marker(full_content, text_chunk):
                                                     stop_printing = True
                                                 if not stop_printing and not reasoning_content:
                                                     if (text_chunk.strip().lower() in ("<function", "<parameter")
@@ -6768,17 +6952,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                             # thinking-loop detector above eventually
                                             # catches this too, but only after
                                             # ~600 chars of repetition.
-                                            if _detect_tool_call_loop(full_content):
-                                                thinking_loop_detected = True
-                                                _opens = len(re.findall(r'<tool_call\b', full_content, re.IGNORECASE))
-                                                _closes = len(re.findall(r'</tool_call\b', full_content, re.IGNORECASE))
-                                                pretty_log(
-                                                    "Tool-Call Loop",
-                                                    f"Decoder collapse: {_opens} <tool_call> opens vs {_closes} closes "
-                                                    f"at {len(full_content)} chars. Aborting stream.",
-                                                    level="WARNING", icon=Icons.STOP,
-                                                )
-                                                break
+                                            if len(full_content) >= next_tool_probe:
+                                                next_tool_probe = len(full_content) + TOOL_CALL_LOOP_PROBE_EVERY
+                                                if _detect_tool_call_loop(full_content):
+                                                    thinking_loop_detected = True
+                                                    _opens = len(re.findall(r'<tool_call\b', full_content, re.IGNORECASE))
+                                                    _closes = len(re.findall(r'</tool_call\b', full_content, re.IGNORECASE))
+                                                    pretty_log(
+                                                        "Tool-Call Loop",
+                                                        f"Decoder collapse: {_opens} <tool_call> opens vs {_closes} closes "
+                                                        f"at {len(full_content)} chars. Aborting stream.",
+                                                        level="WARNING", icon=Icons.STOP,
+                                                    )
+                                                    break
 
                                         # --- Streaming sanity guards ---
                                         # Two failure modes to catch: (a) the model
@@ -6800,27 +6986,35 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         # and multi-step debugging breathe while still
                                         # killing genuine loops.
                                         override_cap = getattr(self, "max_thinking_chars_override", None)
-                                        base_cap = override_cap or MAX_THINKING_CHARS
+                                        # base cap (MAX_THINKING_CHARS) is now implicit:
+                                        # the periodic loop probe runs at all sizes, so a
+                                        # loop is caught before base regardless; only the
+                                        # extended hard cap needs an explicit length gate.
                                         extended_cap = override_cap or MAX_THINKING_CHARS_EXTENDED
 
-                                        if len(guard_buf) > base_cap and len(guard_buf) <= extended_cap:
-                                            # At the initial cap boundary: check if content
-                                            # is still diverse (not looping). If so, extend.
-                                            if _detect_thinking_loop(guard_buf):
-                                                thinking_loop_detected = True
-                                                pretty_log("Thinking Loop", f"Detected repetition at {len(guard_buf)} chars. Aborting.", level="WARNING", icon=Icons.STOP)
-                                                break
-                                            # Content is diverse → allow extension silently
-                                        elif len(guard_buf) > extended_cap:
+                                        # Hard cap: past the extended budget, abort
+                                        # regardless (a cheap length check).
+                                        if len(guard_buf) > extended_cap:
                                             thinking_loop_detected = True
                                             pretty_log("Thinking Cap", f"Stream exceeded extended cap ({extended_cap} chars). Aborting turn.", level="WARNING", icon=Icons.STOP)
                                             break
 
+                                        # The n-gram repetition detector is O(buffer)
+                                        # (`buf.count(tail)` over up to 64K chars). The
+                                        # old code ran it PER TOKEN once thinking passed
+                                        # base_cap (32K) — the dominant CPU cost of a long
+                                        # thinking stream — because that boundary branch
+                                        # ignored the `next_loop_probe` cadence. Run it
+                                        # ONCE per THINKING_LOOP_PROBE_EVERY chars at ALL
+                                        # sizes: early loops (below 32K) are still caught
+                                        # within 500 chars, and in the 32-64K window a
+                                        # clean probe implicitly allows the extension —
+                                        # the separate per-token boundary check is gone.
                                         if len(guard_buf) >= next_loop_probe:
                                             next_loop_probe = len(guard_buf) + THINKING_LOOP_PROBE_EVERY
                                             if _detect_thinking_loop(guard_buf):
                                                 thinking_loop_detected = True
-                                                pretty_log("Thinking Loop", "Detected n-gram repetition in stream. Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                                pretty_log("Thinking Loop", f"Detected n-gram repetition at {len(guard_buf)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
                                                 break
 
                                         if "tool_calls" in delta and delta["tool_calls"]:
@@ -8048,20 +8242,56 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             try:
                                 from .verifier import VerifyVerdict as _VV
                                 if self._critic_async_enabled():
-                                    # Exact mirror of the sync path's decision:
-                                    # there, EVERY skip case of
-                                    # `_compute_verifier_verdict` (no verifier,
-                                    # ablated, trivial) returns
-                                    # ``(None, last_tool)`` and the repair
-                                    # fires on ``_is_unverified_mutation``
-                                    # alone — it is a deterministic guard,
-                                    # independent of the verifier. No verdict
-                                    # is computed here; the cache stays
-                                    # untouched so the post-loop gate still
-                                    # defers exactly as before.
+                                    # The deterministic mutation guard fires
+                                    # regardless (LLM-free): an untested write
+                                    # always forces the "actually RUN it"
+                                    # re-entry.
                                     _lt = _find_substantive_tool_for_verifier(
                                         tools_run_this_turn)
                                     _unverified = _is_unverified_mutation(_lt)
+                                    # #18: bounded verdict await at loop-exit.
+                                    # The critic runs on the OFF-HOST model, so
+                                    # this wait costs the MAIN slot nothing — and
+                                    # it lets a REFUTED answer be REPAIRED in-loop
+                                    # instead of shipping with only a next-turn
+                                    # note (the production gap under
+                                    # GHOST_CRITIC_ASYNC=1). Only when the last
+                                    # tool is substantive and the mutation guard
+                                    # didn't already trip; on timeout we DEFER
+                                    # exactly as before (verdict finishes in the
+                                    # background, still scrubbing poisoned
+                                    # lessons via its done-callback).
+                                    _rbudget = self._critic_repair_await_budget()
+                                    if (_rbudget > 0 and _lt is not None
+                                            and not _unverified):
+                                        try:
+                                            _vtask = _glog.spawn_task(
+                                                self._compute_verifier_verdict(
+                                                    tools_run_this_turn=tools_run_this_turn,
+                                                    messages=list(messages),
+                                                    final_ai_content=final_ai_content,
+                                                    last_user_content=last_user_content,
+                                                    lc=lc,
+                                                ))
+                                            _vdone, _ = await asyncio.wait(
+                                                {_vtask}, timeout=_rbudget)
+                                            if _vtask in _vdone:
+                                                _vr, _lt = _vtask.result()
+                                                # Cache so the post-loop gate
+                                                # reuses it (no double compute
+                                                # on the common landed path).
+                                                _verifier_verdict_cache = (_vr, _lt)
+                                                _verdict_is_fresh = True
+                                                _refuted = (
+                                                    _vr is not None
+                                                    and _vr.verdict == _VV.REFUTED
+                                                    and _vr.confidence >= 0.7
+                                                )
+                                        except Exception as _await_exc:
+                                            logger.debug(
+                                                "async verdict await skipped: %s: %s",
+                                                type(_await_exc).__name__, _await_exc,
+                                            )
                                 else:
                                     _vr, _lt = await self._compute_verifier_verdict(
                                         tools_run_this_turn=tools_run_this_turn,
@@ -8935,7 +9165,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 }
                                 try:
                                     pretty_log("Context Shield", f"Offloading {len(str_res)} chars from {fname} to Edge Worker...", icon=Icons.SHIELD)
-                                    summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=True)
+                                    # FOREGROUND: awaited inline mid-turn. With
+                                    # is_background=True this parked against its
+                                    # own request in _wait_for_foreground_clear
+                                    # (600s self-stall) on every oversized tool
+                                    # output. use_worker still prefers a pool.
+                                    summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=False)
                                     summary_content = summary_data["choices"][0]["message"].get("content", "").strip()
                                     if summary_content:
                                         str_res = f"[EDGE CONDENSED]: {summary_content}"
@@ -9580,10 +9815,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                     if _pp_show_to_user:
                         # --perfect-it: the optimization IS part of the
-                        # reply, so it must block the response path.
+                        # reply, so it must block the response path —
+                        # foreground=True, or the call self-stalls waiting
+                        # for its own request to clear.
                         try:
                             p_msg = await self._perfect_it_generate_and_learn(
-                                p_payload, _pp_lesson_label, current_trajectory_id
+                                p_payload, _pp_lesson_label, current_trajectory_id,
+                                foreground=True,
                             )
                             if p_msg:
                                 if final_ai_content:
@@ -10692,11 +10930,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # offload to a thread like the PRM online-update below;
                 # inline only when no loop is running (sync/test callers).
                 try:
-                    asyncio.get_running_loop().create_task(asyncio.to_thread(
+                    asyncio.get_running_loop()
+                    # spawn_bg: strong ref (won't be GC'd mid-write) + failure
+                    # is logged, not swallowed. Previously a bare unstored
+                    # create_task in violation of this file's own GC-safety
+                    # rule (agent.py ~2025).
+                    _glog.spawn_bg(asyncio.to_thread(
                         skill_memory.retract_lessons_from_trajectory,
                         traj.id,
                         memory_system=vector_memory,
-                    ))
+                    ), name="lesson-retract")
                 except RuntimeError:
                     skill_memory.retract_lessons_from_trajectory(
                         traj.id,
@@ -10720,10 +10963,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 from ..prm.scorer import PRMScorer as _PRMScorer
                 scorer = getattr(ctx, "prm_scorer", None)
                 if isinstance(scorer, _PRMScorer) and scorer.has_model:
-                    loop2 = asyncio.get_running_loop()
-                    loop2.create_task(asyncio.to_thread(
+                    asyncio.get_running_loop()
+                    # spawn_bg: was a bare unstored create_task — GC-unsafe and
+                    # its failure vanished silently.
+                    _glog.spawn_bg(asyncio.to_thread(
                         self._run_prm_online_update, scorer, traj,
-                    ))
+                    ), name="prm-online-update")
         except Exception as e:
             logger.debug(
                 "PRM online update schedule skipped: %s: %s",
@@ -10898,12 +11143,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         p_payload: dict,
         lesson_label: str,
         trajectory_id: str,
+        foreground: bool = False,
     ) -> str:
         """Run the Perfect-It completion and persist the lesson.
 
         Shared by the inline path (--perfect-it: the text joins the reply,
-        so the caller awaits it on the response path) and the deferred path
-        (flag off: internal learning only, scheduled as a background task).
+        so the caller awaits it on the response path — that caller MUST pass
+        foreground=True, or the LLM call parks in _wait_for_foreground_clear
+        against its own still-active request for up to 600s) and the
+        deferred path (flag off: internal learning only, scheduled as a
+        background task — default foreground=False yields to live users).
         Returns the generated optimization text ('' when the model produced
         nothing usable). Raises on LLM failure — each caller decides how to
         surface that.
@@ -10915,7 +11164,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         the correction and poison future retrieval.
         """
         perfection_data = await self.context.llm_client.chat_completion(
-            p_payload, use_worker=True, is_background=True
+            p_payload, use_worker=True, is_background=not foreground
         )
         p_msg = perfection_data["choices"][0]["message"].get("content", "")
         p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()
@@ -11023,6 +11272,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 if entry is not None:
                     _n, _a, obj = entry
                     obj.result = str(m.get("content") or "")[:4000]
+                    # Populate the STRUCTURED error flag on the chat path too
+                    # (previously only self-play/batch set it, so the outcome
+                    # heuristics had to regex-sniff result TEXT and missed
+                    # atypical shapes — e.g. native-tools corruption). A short
+                    # normalized signature is enough for the repeated-error
+                    # counter; the full text stays in `result`.
+                    try:
+                        from ..distill.outcome_heuristics import (
+                            _looks_like_tool_error, _normalize_tool_error,
+                        )
+                        if _looks_like_tool_error(obj.result):
+                            obj.error = _normalize_tool_error(obj.result)
+                    except Exception:
+                        pass
 
         # Final response content. Non-string (streaming generator) is
         # logged as empty — the stream path gets richer tool-call data

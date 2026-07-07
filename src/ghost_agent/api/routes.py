@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, Request, BackgroundTasks, Security, HTTPException, Depends, Response, UploadFile, File
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.security.api_key import APIKeyHeader
+from starlette.background import BackgroundTask
 from ..utils.helpers import get_utc_timestamp
 import logging
 from ..utils.logging import Icons, pretty_log
@@ -115,6 +116,58 @@ async def list_openai_models(request: Request):
             {"id": model_name, "object": "model", "created": int(datetime.datetime.now().timestamp()), "owned_by": "ghost-system"}
         ]
     }
+
+@router.get("/api/health", dependencies=[Security(verify_api_key)])
+async def api_health(request: Request):
+    """Runtime introspection for the operator + NetMon + the RSS supervisor
+    (IMPROVEMENTS.md #21). Everything here is cheap and read-only. MUST stay
+    registered ABOVE the /{path:path} catch-all so it isn't proxied upstream.
+
+    Two silent-failure detectors it surfaces: `memory_system_loaded=false`
+    means a degraded boot that disabled ALL biological phases while HTTP keeps
+    answering; `biological_watchdog_alive=false` means the self-improvement
+    daemon died."""
+    import time as _time
+    app = request.app
+    agent = getattr(app.state, "agent", None)
+    context = getattr(agent, "context", None)
+    llm = getattr(context, "llm_client", None)
+
+    rss_mb = None
+    try:
+        import psutil
+        rss_mb = round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
+    except Exception:
+        pass
+
+    try:
+        live_tasks = len([t for t in asyncio.all_tasks() if not t.done()])
+    except Exception:
+        live_tasks = None
+
+    bio_task = getattr(app.state, "biological_task", None)
+    boot_mono = getattr(app.state, "boot_monotonic", None)
+
+    sched = getattr(context, "scheduler", None)
+    try:
+        sched_jobs = len(sched.get_jobs()) if sched is not None else 0
+    except Exception:
+        sched_jobs = None
+
+    return JSONResponse({
+        "status": "ok",
+        "rss_mb": rss_mb,
+        "rss_limit_mb": float(os.environ.get("GHOST_MAX_RSS_MB", "0") or "0"),
+        "uptime_s": round(_time.monotonic() - boot_mono, 1) if boot_mono else None,
+        "asyncio_tasks": live_tasks,
+        "foreground_requests": getattr(llm, "foreground_requests", None),
+        "foreground_tasks": getattr(llm, "foreground_tasks", None),
+        "biological_watchdog_alive": (bio_task is not None and not bio_task.done()),
+        "memory_system_loaded": getattr(context, "memory_system", None) is not None,
+        "scheduler_jobs": sched_jobs,
+        "config": getattr(app.state, "resolved_config", {}),
+    })
+
 
 @router.post("/api/pull")
 async def api_pull(request: Request):
@@ -456,56 +509,83 @@ async def save_workspace(request: Request):
                 status_code=400,
             )
     chat_history = body.get("chat_history", [])
+    session_data = {
+        "chat_history": chat_history,
+        "scratchpad": dict(agent.context.scratchpad._data) if getattr(agent.context, 'scratchpad', None) else {}
+    }
+    sandbox_dir = agent.context.sandbox_dir
 
-    # The previous version used `iter([zip_buffer.getvalue()])` which held
-    # the ENTIRE compressed zip in memory as one bytes object — fine for
-    # tiny workspaces, a memory spike for big ones. Stream from the buffer
-    # in chunks instead, and explicitly close it in finally.
-    zip_buffer = io.BytesIO()
-    try:
-        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-            session_data = {
-                "chat_history": chat_history,
-                "scratchpad": dict(agent.context.scratchpad._data) if getattr(agent.context, 'scratchpad', None) else {}
-            }
-            zip_file.writestr("session.json", json.dumps(session_data, indent=2))
+    # The zip is built in a WORKER THREAD to a SPOOL FILE, not inline in the
+    # coroutine to an in-memory buffer. The old version did a synchronous
+    # os.walk + deflate of the entire sandbox on the event loop — freezing
+    # every other request/SSE stream for its duration — and then held the
+    # whole archive in RAM with no ceiling (the load side caps at 500 MB; the
+    # save side had none), a self-inflicted OOM vector on a 94%-RAM box. Now
+    # the walk/compress runs off-loop, a byte ceiling aborts a runaway
+    # archive, and FileResponse streams the spool + deletes it on completion.
+    class _WorkspaceTooLarge(Exception):
+        pass
 
-            sandbox_dir = agent.context.sandbox_dir
-            for root, dirs, files in os.walk(sandbox_dir):
-                if "acquired_skills" in Path(root).parts:
-                    continue
-                for file_name in files:
-                    file_path = Path(root) / file_name
-                    arcname = file_path.relative_to(sandbox_dir)
-                    zip_file.write(file_path, f"sandbox/{arcname}")
-
-        zip_buffer.seek(0)
-        filename = f"workspace_{get_utc_timestamp().replace(':', '')}.zip"
-
-        # Take the bytes once, close the buffer, then stream chunks. The
-        # buffer's memory is reclaimed as soon as the inner generator
-        # finishes. (Holding the bytes in a local var means the BytesIO
-        # itself can be closed immediately after.)
-        zip_bytes = zip_buffer.getvalue()
-    finally:
-        zip_buffer.close()
-
-    async def _stream_chunks():
+    def _build_zip() -> str:
+        import tempfile
+        fd, tmp_path = tempfile.mkstemp(suffix=".zip", prefix="ws_save_")
+        os.close(fd)
         try:
-            CHUNK = 64 * 1024
-            for i in range(0, len(zip_bytes), CHUNK):
-                yield zip_bytes[i:i + CHUNK]
-        finally:
-            # Drop the local reference so GC can reclaim the buffer.
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED, False) as zip_file:
+                zip_file.writestr("session.json", json.dumps(session_data, indent=2))
+                total = 0
+                for root, dirs, files in os.walk(sandbox_dir):
+                    if "acquired_skills" in Path(root).parts:
+                        continue
+                    for file_name in files:
+                        file_path = Path(root) / file_name
+                        try:
+                            total += file_path.stat().st_size
+                        except OSError:
+                            continue
+                        if total > _MAX_WORKSPACE_SAVE_BYTES:
+                            raise _WorkspaceTooLarge()
+                        arcname = file_path.relative_to(sandbox_dir)
+                        zip_file.write(file_path, f"sandbox/{arcname}")
+            return tmp_path
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    try:
+        tmp_path = await asyncio.to_thread(_build_zip)
+    except _WorkspaceTooLarge:
+        return JSONResponse(
+            {"error": {"message": f"Workspace exceeds the {_MAX_WORKSPACE_SAVE_BYTES // (1024*1024)} MB save limit.",
+                       "type": "WorkspaceTooLarge"}},
+            status_code=413,
+        )
+    except Exception:
+        eid = _log_internal_error("workspace_save")
+        return JSONResponse({"error": f"internal error (error_id={eid})"}, status_code=500)
+
+    filename = f"workspace_{get_utc_timestamp().replace(':', '')}.zip"
+
+    def _cleanup(path=tmp_path):
+        try:
+            os.unlink(path)
+        except OSError:
             pass
 
-    return StreamingResponse(
-        _stream_chunks(),
+    return FileResponse(
+        tmp_path,
         media_type="application/zip",
-        headers={"Content-Disposition": f"attachment; filename={filename}"}
+        filename=filename,
+        background=BackgroundTask(_cleanup),
     )
 
 _MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB hard ceiling on inbound uploads
+# Ceiling on a workspace SAVE archive (uncompressed input bytes). Mirrors the
+# load-side 500 MB inflate cap so save and load are symmetric.
+_MAX_WORKSPACE_SAVE_BYTES = 500 * 1024 * 1024
 
 
 def _is_within(base: Path, candidate: Path) -> bool:
