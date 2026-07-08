@@ -87,11 +87,15 @@ async def test_build_happy_path_writes_and_verifies():
     assert res.ok
     assert res.files == ["parser.py", "README.md"]
     assert "parse(path)" in res.ledger_note
-    # both files written, then the verify command executed
+    # both files written, then the verify command executed, then the smoke
+    # gate ran over the written .py files (2026-07-08 post-build gate).
     written = [w["path"] for w in runner.writes()]
     assert written == ["parser.py", "README.md"]
     assert all(w["operation"] == "write" for w in runner.writes())
-    assert len(runner.execs()) == 1
+    execs = runner.execs()
+    assert len(execs) == 2
+    assert "command" in execs[0]                       # the spec's verify
+    assert execs[1].get("filename") == ".smoke_gate.py"  # the smoke gate
 
 
 @pytest.mark.asyncio

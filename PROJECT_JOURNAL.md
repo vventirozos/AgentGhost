@@ -425,6 +425,163 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-08 (night) — deep_research per-URL Tor fetch racing
+- Last leg of the Tor pipeline: the page-FETCH stage shared ONE circuit across all 8 URLs (the same
+  correlation flaw fixed in search), the outer `wait_for` was 15s < the client's 20s (guillotined
+  slow-but-live fetches — the mojeek-timeout twin), and there was no retry. **Measured before/after
+  over live Tor (8 real URLs): 6/8 in 21s → 8/8 in 14s** (both MISSes recovered: one via its own fresh
+  exit in 2s, one via timeout headroom). Fix in `tool_deep_research`: per-URL circuit
+  (`_proxy_for_attempt(url, attempt, salt="fetch")`), retry circuit-retryable failures
+  (timeout/503/conn/5xx via `_fetch_error_is_retryable`) on a fresh exit, skip definitive ones
+  (binary/401/403/SSRF/4xx), outer timeout 22s > client 20s, sem 2→3, NEWNYM still suppressed. +16 tests
+  (`tests/test_deep_research_fetch_racing.py`), docs + Tor memory updated. Test gotcha logged: dual
+  module-name patch target + AsyncMock sync-side_effect.
+
+### 2026-07-08 (night) — verifier-log clarity + host-process blind spot
+- **LATE-verdict-empty differentiated.** Traced the `None` paths: no substantive evidence tool
+  (bookkeeping-only turn), no verifier/llm_client attached (sim/ablation), empty final content, or
+  strict-trivial-chat. So the sim-turn firing WAS by design — but one ambiguous line covered all of
+  them AND the case it exists for (a dead verifier path). `_record_late_verdict` now takes `last_tool`
+  and emits 3 distinct messages: no-evidence → INFO by-design; verifier-not-attached → INFO by-design;
+  evidence + verifier present yet no verdict → **WARNING** (trivial-chat skip or real error). The
+  warning is now rare and meaningful.
+- **Host-process blind spot closed at the tool level.** The sandbox has its own PID namespace: a
+  `pkill -f app.py` aimed at the USER's host-run server exits 0 and kills NOTHING — no error text for
+  the fallback-hint table to match, and the model concludes it restarted the server (chess session,
+  twice). `execute` now detects name-based kills (`pkill`/`killall`/`kill $(pgrep …)`) and appends
+  ground truth to BOTH outcomes (the "success" is the dangerous one), naming the right action: tell the
+  user to restart it. `execute` schema warns up front. Same philosophy as the loopback guard: the exit
+  code lies, so the tool tells the truth.
+- Tests: +11 (`tests/test_host_process_and_verdict_clarity.py`) — 3 verdict branches, kill-pattern
+  detector, note contents, schema warning. Docs: agent.html, execute.html. Operator ran the suite:
+  all green. Deployed (server restarted).
+
+### 2026-07-08 (night) — guard-box incident fixed (request 04 post-mortem)
+- **Incident:** resume-Chess-Coach request got boxed in with ZERO legal write paths for ~6 min: two
+  content-less `replace` calls seeded the pre-flight guard, whose (tool,target) key then blocked the
+  CORRECT replace→write recovery 3× (each after ~80 s of full-file generation); the escape via execute
+  heredoc was blocked by the egress guard because the FILE CONTENT legitimately mentions
+  127.0.0.1:8000 (the chess app calls Ghost by design). Guard blocks advanced no loop budget.
+- **Fix 1 — pre-flight guard:** key now `(tool, target, operation)` (`RecentFailureGuard.record/
+  would_repeat` gained `op`; dispatch + record call sites thread `operation|action`); block message
+  names LEGAL alternatives; per-request block budget — 2 guard blocks force a final reply
+  (state attempts + exact error + ask the user).
+- **Fix 2 — egress guard:** shell commands judged by `_command_probes_agent_port` — heredoc bodies
+  stripped (data, not execution) AND a network-client token (curl/wget/nc/requests/urllib/httpx/…)
+  must co-occur with the loopback URL. Direct probes still blocked (incl. after a heredoc); text
+  manipulation (`echo … > file`) allowed. Inline `content` keeps the strict rule (executed code).
+  Guard message now names the legal file-writing path.
+- **Fix 3 — replace steer:** content-less `replace` error now names the escape (`operation='write'`
+  with the full file, don't retry replace). Raw args unavailable (trajectory not flushed) so
+  model-slip vs native-args corruption unconfirmed; steer helps either way.
+- Tests: +11 (`tests/test_guard_box_fixes.py`) incl. the exact false-positive heredoc and the
+  replace→write recovery. Docs: execute.html, agent.html, file_system.html. Note: agent eventually
+  escaped on its own (~17:00) and appended save/load endpoints to app.py.
+
+### 2026-07-08 (late) — chess-eval improvements #1-#3 SHIPPED (verification reflexes)
+- **(1) Constraint gate** (`core/build_gates.constraint_gate`): one background LLM audit of the files a
+  task produced vs the project's stored constraints — JUDGMENT-based, closing the gap the evidence-based
+  DONE-gate left (model wrote compliant prose while shipping a forbidden engine). Wired into BOTH paths:
+  `build_coding_task` (violation = retry feedback quoting constraint+evidence) and interactive
+  `task_update→DONE` (refusal + `CONSTRAINT-OVERRIDE:` escape hatch for user-approved exceptions).
+  Fails open on infra errors.
+- **(2) Smoke gate** (`core/build_gates.smoke_gate`): after the spec verify, `py_compile` every written
+  .py + Flask route sweep via `test_client` (GET must not 5xx; POST gets `{}`, may 4xx not 5xx);
+  SIGALRM(45s) self-bound so a blocking-server import can't wedge the exec. Wired into
+  `build_coding_task`; failures feed the retry loop.
+- **(3) Probe-before-hypothesis loop breaker**: no-progress trip now at the 2nd identical read (was 3),
+  hard abort at 3 (was 5); all steer/abort messages rewritten to lead with EVIDENCE-GATHERING (probe the
+  URL/command, apply the change, or ask the user for the exact error from devtools) instead of only
+  "trust what you have". The chess session's 536 s / 5-re-read spiral is the motivating trace.
+- Tests: +18 (`test_build_gates.py` incl. real smoke script vs a 500-ing Flask app;
+  `test_probe_before_hypothesis.py`; happy-path executor contract updated). Docs: coding_executor.html,
+  agent.html, projects.html. Suite 6644 green (2 known FORCE_COLOR env-flakes only). Deploy: needs
+  restart.
+
+### 2026-07-08 (late) — chess project fixed by operator-side Claude; weakness eval from the session
+- **Chess Coach (30d5d5b65c38) fixed & validated end-to-end** (state/move/illegal/undo/reset; Ghost
+  answered e2e4 with e7e5 + in-voice coaching via a REAL agent call). What was broken: `get_ghost_move`
+  was a random/heuristic engine (violating the stored "Ghost plays directly" constraint the model itself
+  restated in its plan); 3 crash bugs (`board.move_stack < 8` list-vs-int TypeError, `random` scoped to
+  another function → NameError, nonexistent `board.move_is_check`); frontend rendered the analysis dict
+  as `[object Object]`, expected fields the backend never sent, wiped history via `game.load(fen)`,
+  client-only undo desynced the server, dead appended script block; pieceTheme flip-flopped between two
+  CDNs — measured: chessboardjs.com=200, unpkg img path=404 (agent never probed either). Rebuilt:
+  backend asks the agent (`/api/chat`) for Black's move + comment with strict-JSON contract, legal-move
+  validation, one corrective retry, honest 502 (NO engine fallback, per constraint), server-side undo,
+  history-as-source-of-truth; frontend contract aligned. Project game_state reset.
+- **Agent weaknesses observed (8 chess requests, candidates for §4):** (1) constraints inform but don't
+  GATE — model restated the no-engine constraint, then built an engine anyway; needs a post-build
+  constraint check against the diff (sibling of the self-play reference gate). (2) No endpoint smoke-run
+  after codegen — 3 crash bugs shipped; one curl per route would catch them. (3) Debugging by hypothesis
+  looping instead of probing — E8 spun 536s/18 turns re-reading the same file 5× (loop breaker saved it),
+  flip-flopped the CDN URL twice without ever curling it, never asked the user for the failing URL from
+  devtools. (4) Host-vs-sandbox process model gap — tried twice to pkill/restart the USER's host-run
+  Flask from inside the sandbox instead of telling the user "restart app.py to pick up the fix" (same
+  family as the loopback blind spot). (5) Cross-file contract drift within one session — backend/frontend
+  it authored hours apart disagree on the response schema; coding tasks should grep consumers of a
+  changed endpoint. Positives: constraint replay fired, native-tools repair ×2, loop breaker fired,
+  late verifier REFUTED a non-answer and its correction surfaced next turn.
+
+### 2026-07-08 (evening) — thinking visible in non-verbose logs
+- Operator request: non-verbose launches truncate nicely but 💭 thinking was filtered out entirely.
+  Root cause: `_emit_thinking`/`_flush_thinking` (streaming closures) returned early unless
+  VERBOSE_MODE — thinking never reached pretty_log at all. Fix (two rounds, operator-directed):
+  gates removed AND thinking exempted from the content budget — `pretty_log` gained a per-call
+  `no_truncate` flag, passed at the 3 thinking call sites, so the FULL reasoning stream is visible in
+  every mode (newline-flatten/redact/wrap still apply → identical line format); all other lines keep
+  the standard 60-char budget in non-verbose; 🧠 post-stream summary unchanged. +6 tests
+  (`tests/test_logging_thinking_nonverbose.py`), docs/logging.html updated.
+  #8 step 1 (parser extraction) closed as DONE on the task ledger; steps 2-4 remain journaled below
+  and in the agent-py-decomposition memory for a focused session.
+
+### 2026-07-08 (evening) — #8 agent.py decomposition, step 1 of 4 SHIPPED
+- **`_parse_assistant_tool_calls` extracted** from handle_chat: the ~640-line robust tool-call parser
+  (XML normalization heals, truncation detector, flood cap, native tool_calls corruption repair,
+  raw-JSON fallback) is now a method with contract
+  `(content, msg) → (tool_calls, ui_content, parse_failure_reason)`. Extraction was VERBATIM
+  (script-driven dedent, ast.parse gate, boundary asserts) — verified no return/await/loop-control
+  crossed the boundary; only `content`, `msg`, `self.available_tools` do. Caller keeps think-strip,
+  leak scrubbers, history assignment. agent.py: handle_chat shrinks ~640 lines.
+- **Validation:** full suite 6614 green post-extraction; **+9 direct unit tests**
+  (`tests/test_parse_assistant_tool_calls.py` — first-ever isolated coverage of this hot path: XML
+  canonical/bare-function/sloppy-attrs, think-block immunity, truncation flag+recovery, native
+  pass-through, raw-JSON recovery); **LIVE hot-path validated** (agent restarted; request EB drove a
+  real file_system tool call through the new method on the native path — verifier CONFIRMED 100%,
+  zero parse errors).
+- **Remaining steps (next focused session):** (2) tool guard/dispatch/result pipeline, (3) finalization
+  chain, (4) final-generation streamer closure + `TurnState` dataclass. Same protocol: verbatim
+  extraction → suite → restart → live turn before the next step.
+
+### 2026-07-08 (later) — Full-day log eval → 3 defects fixed
+- **Log evaluation (12 requests since morning restart):** search stack 0 strike-outs all day (racing +
+  terse logs working); async verifier LATE-REFUTED request 67 (model listed 12 PG19 features from the
+  devel "fill in later" skeleton page — fabrication caught, correction queued); native-tools guard fired
+  again; PRM/router/calib/reflection/autoadvance all closed loops in idle. Three defects found & fixed:
+- **(1) frontier.py `record_run` KeyError 'runs':** `note_reflection_failure` created clusters as bare
+  `{}`; record_run's full-defaults setdefault no-ops on existing dicts → `cluster["runs"]` raised and NO
+  self-play run was ever recorded for `python_general` (live state file confirmed: only
+  `reflection_failures` key). Fix: `_ensure_cluster` = setdefault + per-key back-fill from
+  `_cluster_defaults()`, used by both writers; state file heals on next write. +3 tests
+  (test_frontier_tracker.py::TestPartialClusterSchemaBackfill).
+- **(2) self-play unwinnable-challenge gate:** LLM-generated critical-path challenge had validator
+  expecting duration=10 while its own tasks.json yields 25 — echo self-test can't catch it (validator
+  doesn't crash, it's just wrong about the data); solver failed 3/3 on CORRECT code, cluster `algo` got
+  a bogus -1.0 delta + misleading lesson. Fix: challenges must emit `<reference_solution>` (computes
+  answer FROM setup files); static gate `validate_reference_solution` rejects hardcoded references
+  (must open a setup file), sandbox gate runs reference → validator against real data and DISCARDS the
+  challenge on any non-zero exit. Templates/journal challenges skip (pre-verified); omitted block =
+  logged warning, gate skipped. +8 tests (test_selfplay_reference_gate.py).
+- **(3) autoadvance workspace placement:** idle ticks carry no conversation → process-global
+  `current_project_id` parked → TinyAI's model/train/evaluate files written to sandbox ROOT; interactive
+  session after `switch` saw only `projects/<id>/` and recreated the demo from scratch. Fix:
+  `pinned_project_context(context, project_id)` proxy (pins the id, delegates reads/writes to base);
+  BOTH tool-runner sites (agent.py idle phase 2.95 + manage_projects autoadvance batch) build tools from
+  it. Also fixes the mid-batch reconcile race. +7 tests (test_autoadvance_project_scope.py).
+- Docs: memory/frontier.html (schema back-fill), core/dream.html (gate 4), core/project_advancer.html
+  (workspace pinning). NOTE: existing root-level TinyAI artifacts were NOT moved — new builds land in
+  the project dir; the stray root files remain for the operator to reconcile.
+
 ### 2026-07-08 — Tor web-search: per-engine circuit race (search.py)
 - **Trigger:** operator's live session showed searches failing wholesale ("ZERO results across all
   engines and circuits", 74 s burned) and the model then hallucinating "research results" from its own

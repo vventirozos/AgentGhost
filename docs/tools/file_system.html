@@ -174,6 +174,8 @@ SyntaxError: Unexpected identifier 't'</pre>
   </ul>
   <p>Covered by <code>tests/test_replace_arg_corruption_guard.py</code>.</p>
 
+  <h2>Content-less replace steer (2026-07-08)</h2>
+  <p>A <code>replace</code> call without <code>content</code> (model slip or the known native-args transport corruption) now returns an error that names the escape: use <code>operation='write'</code> with the full file — do not retry <code>replace</code> without the exact existing text. Paired with the operation-aware pre-flight guard key, the write path stays legal after replace failures.</p>
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

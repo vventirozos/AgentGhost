@@ -35,6 +35,35 @@ _AGENT_PORT_PROBE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Heredoc bodies are DATA being written, not commands being run. Observed
+# false positive 2026-07-08 (chess session): `cat > app.py <<'EOF' …` was
+# blocked because the FILE CONTENT legitimately references the agent's API
+# (the app calls Ghost by design) — sealing off the model's only remaining
+# write path. Strip heredoc bodies before matching; a real probe puts the
+# URL in the executed part of the command.
+_HEREDOC_BODY_RE = re.compile(
+    r"<<-?\s*(['\"]?)(\w+)\1.*?(?:\n\2(?=\s|$)|\Z)", re.DOTALL)
+
+# A probe needs a network client. Plain text manipulation that mentions the
+# URL (echo > file, sed on a config) proves nothing and is allowed.
+_NET_CLIENT_RE = re.compile(
+    r"(?:\bcurl\b|\bwget\b|\bnc\b|\bncat\b|\bnetcat\b|\btelnet\b|\bhttpx\b|"
+    r"\baiohttp\b|\brequests\b|\burllib\b|\burlopen\b|http\.client|"
+    r"\bsocket\b|/dev/tcp/|\bfetch\s*\(|\baxios\b|\bhttpie\b)",
+    re.IGNORECASE)
+
+
+def _command_probes_agent_port(command: str) -> bool:
+    """True iff a SHELL command actually probes the agent's ports: the
+    loopback URL must appear OUTSIDE heredoc bodies AND a network-client
+    token must be present. Inline ``content`` (code handed to an
+    interpreter) is judged by the caller with the strict any-match rule —
+    executed code that mentions the URL is always suspect."""
+    stripped = _HEREDOC_BODY_RE.sub("<<HEREDOC-BODY>>", str(command))
+    if not _AGENT_PORT_PROBE_RE.search(stripped):
+        return False
+    return bool(_NET_CLIENT_RE.search(stripped))
+
 _AGENT_PORT_PROBE_MSG = (
     "SANDBOX EGRESS BLOCKED (known blind spot — command NOT executed): "
     "this references 127.0.0.1:8000 / :8088, but inside your sandbox that "
@@ -46,8 +75,34 @@ _AGENT_PORT_PROBE_MSG = (
     "What to do instead: (a) verify endpoints with the `browser` tool "
     "(it runs on the host), (b) ask the user to run the command on THEIR "
     "machine, or (c) if you need an in-sandbox server for something "
-    "unrelated, bind a DIFFERENT port (e.g. 8081). NEVER write a mock or "
-    "stand-in for the agent's API."
+    "unrelated, bind a DIFFERENT port (e.g. 8081). Writing a FILE whose "
+    "text merely mentions these URLs is fine — use file_system "
+    "operation='write' (or a shell heredoc), which is not blocked. NEVER "
+    "write a mock or stand-in for the agent's API."
+)
+
+
+# HOST-PROCESS BLIND SPOT (2026-07-08). The sandbox has its own PID
+# namespace: a process the USER started on the host (their `python app.py`)
+# is invisible and unkillable from in here. `pkill -f app.py` therefore
+# "succeeds" (exit 0, no output, nothing killed) and the model concludes it
+# restarted the server — then keeps debugging against stale code. Observed
+# twice in the chess session. Same family as the loopback blind spot: the
+# tool must tell the truth, because the exit code lies.
+_HOST_PROCESS_RE = re.compile(
+    r"\b(?:pkill|killall)\b|\bkill\s+(?:-\w+\s+)?\$?\(?\s*(?:pgrep|pidof)\b",
+    re.IGNORECASE)
+
+_HOST_PROCESS_NOTE = (
+    "\n\n--- 💡 SANDBOX PID NAMESPACE ---\n"
+    "You just tried to kill a process by name. The sandbox has its OWN pid "
+    "namespace: processes the USER runs on their machine (their "
+    "`python app.py`, their dev server) are NOT visible here, so this "
+    "command killed nothing even if it exited 0 — do NOT conclude the "
+    "server restarted. If the user runs the process, tell them: \"I've "
+    "changed <file>; restart it to pick up the fix.\" Only processes YOU "
+    "started inside this sandbox can be killed from here.\n"
+    "------------------------"
 )
 
 
@@ -80,16 +135,22 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
     # Checked BEFORE any execution, over both the shell command and inline
     # code content. Returns a plain instruction (not an EXIT CODE failure)
     # so the block teaches without burning a strike.
-    for _probe_text in (command, content):
-        if _probe_text and _AGENT_PORT_PROBE_RE.search(str(_probe_text)):
-            pretty_log(
-                "Sandbox Egress Guard",
-                "Blocked in-sandbox probe of the agent's own port "
-                "(127.0.0.1:8000/:8088 is the container's loopback, not "
-                "the host) — returned ground-truth explanation instead",
-                level="WARNING", icon=Icons.SHIELD,
-            )
-            return _AGENT_PORT_PROBE_MSG
+    _is_probe = bool(
+        (command and _command_probes_agent_port(command))
+        # Inline code EXECUTES — keep the strict any-match rule there; a
+        # probe script always carries the URL, and file-writing belongs in
+        # file_system.write (which is not gated on content).
+        or (content and _AGENT_PORT_PROBE_RE.search(str(content)))
+    )
+    if _is_probe:
+        pretty_log(
+            "Sandbox Egress Guard",
+            "Blocked in-sandbox probe of the agent's own port "
+            "(127.0.0.1:8000/:8088 is the container's loopback, not "
+            "the host) — returned ground-truth explanation instead",
+            level="WARNING", icon=Icons.SHIELD,
+        )
+        return _AGENT_PORT_PROBE_MSG
 
     # --- 🛡️ HIJACK LAYER: CODE SANITIZATION ---
     
@@ -478,10 +539,27 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 "failed.)"
             )
 
-        if exit_code != 0:
-            return _format_error(output or f"Process failed (Exit {exit_code}) with no output.")
+        # A name-based kill in the sandbox can never touch a host process.
+        # Append the ground truth to BOTH outcomes — a "successful" pkill
+        # that killed nothing is the dangerous case (the model believes it
+        # restarted the user's server).
+        _host_proc_note = (_HOST_PROCESS_NOTE
+                           if _HOST_PROCESS_RE.search(command) else "")
+        if _host_proc_note:
+            pretty_log(
+                "Sandbox PID Namespace",
+                "Name-based kill in the sandbox cannot reach host processes "
+                "— appended ground truth to the result",
+                level="WARNING", icon=Icons.SHIELD,
+            )
 
-        return f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\nSTDOUT/STDERR:\n{output}"
+        if exit_code != 0:
+            return _format_error(
+                output or f"Process failed (Exit {exit_code}) with no output."
+            ) + _host_proc_note
+
+        return (f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\n"
+                f"STDOUT/STDERR:\n{output}{_host_proc_note}")
 
     is_ephemeral = False
     if content and not filename and not command:

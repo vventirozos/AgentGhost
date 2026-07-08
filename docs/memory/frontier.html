@@ -141,6 +141,10 @@
   <p><code>pick_seed</code> gained a <code>reflection_priority_prob</code> parameter (default 0.35): with that probability it drills a reflection-hot cluster instead of a self-play-brittle one. This closes the loop so self-play practices the topics the agent fails at in REAL user turns, not only the topics it fails at in self-play.</p>
   <div class="note"><strong>Tests:</strong> covered by <code>tests/test_frontier_reflection_targeting.py</code>.</div>
 
+  <h2>Cluster schema back-fill (2026-07-08)</h2>
+  <p>A cluster entry can be <em>created</em> by a writer with a partial shape — <code>note_reflection_failure</code> used to record into a bare <code>{}</code> — and older persisted files predate newer keys. <code>record_run</code>'s full-defaults <code>setdefault</code> silently no-ops on such an existing dict, so its direct reads (<code>cluster["runs"]</code>) raised <code>KeyError('runs')</code> and <strong>no run was ever recorded for that cluster</strong> (observed live: <code>python_general</code> existed with only <code>reflection_failures</code>, and every self-play run on it logged <code>Frontier record_run failed: 'runs'</code>). All cluster access now goes through <code>_ensure_cluster</code> — <code>setdefault</code> plus per-key back-fill from <code>_cluster_defaults()</code> — which normalizes partial/legacy entries in place while preserving extra keys like <code>reflection_failures</code>. No data migration needed; the state file heals on next write.</p>
+  <div class="note"><strong>Tests:</strong> <code>tests/test_frontier_tracker.py::TestPartialClusterSchemaBackfill</code> (reflection-created cluster, exact legacy on-disk shape, full-schema creation).</div>
+
   <h2>Tests</h2>
   <p>Frontier-tracker invariants are pinned by <code>tests/test_frontier_tracker.py</code>; the new frontier-weighted picker is covered by <code>tests/test_frontier_pick_frontier_seed.py</code> (fallback ladder + dict-shape contract) and the dream integration by <code>tests/test_dream_frontier_weighted.py</code> (real PRM + real <code>TrajectoryCollector</code>, mocked LLM/sandbox).</p>
 

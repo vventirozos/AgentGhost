@@ -2911,12 +2911,22 @@ class GhostAgent:
                             ),
                         )
                         pid = target.get("id")
-                        from .project_advancer import advance_once as _advance_once
+                        from .project_advancer import (
+                            advance_once as _advance_once,
+                            pinned_project_context as _pin_ctx,
+                        )
 
                         async def _aa_tool_runner(name, targs):
+                            # Build tools from a context whose
+                            # current_project_id is PINNED to the target
+                            # project: idle ticks have no conversation, so
+                            # the process-global id is parked (None) and
+                            # unpinned file writes land at the sandbox ROOT
+                            # — invisible to interactive sessions on the
+                            # project (observed live 2026-07-08, TinyAI).
                             try:
                                 from ..tools.registry import get_available_tools
-                                tmap = get_available_tools(ctx)
+                                tmap = get_available_tools(_pin_ctx(ctx, pid))
                             except Exception:
                                 tmap = None
                             handler = (tmap or {}).get(name)
@@ -4501,7 +4511,8 @@ class GhostAgent:
                     icon=Icons.WARN, level="WARNING",
                 )
                 return
-            self._record_late_verdict(v_result, trajectory_id, conv_fp)
+            self._record_late_verdict(v_result, trajectory_id, conv_fp,
+                                      last_tool=_lt)
 
         task.add_done_callback(_on_done)
 
@@ -4567,7 +4578,8 @@ class GhostAgent:
                 type(e).__name__, e,
             )
 
-    def _record_late_verdict(self, v_result, trajectory_id, conv_fp=""):
+    def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
+                             last_tool=None):
         """Apply the side effects of a verdict that lands AFTER its
         response shipped. Extracted from the done-callback so it is
         unit-testable. On a high-confidence REFUTED: log it, scrub any
@@ -4577,15 +4589,39 @@ class GhostAgent:
         counterpart of ``resolve_turn_outcome`` at record time).
         """
         if not v_result:
-            # The verdict pipeline produced nothing (verifier error or an
-            # inapplicable turn slipping through) — log it so a silently
-            # dead async path is visible in the stream.
-            pretty_log(
-                "Verifier",
-                "LATE verdict was empty (verifier returned no result) — "
-                "no side effects applied",
-                icon=Icons.BRAIN_THINK,
-            )
+            # Differentiate WHY the verdict is empty (2026-07-08 operator
+            # audit: one ambiguous line fired on every bookkeeping-only and
+            # sim turn, drowning the case it exists for — a genuinely dead
+            # verifier path).
+            if last_tool is None:
+                # No substantive evidence tool this turn — skipped by
+                # design (no evidence, no verdict). Routine; log quietly.
+                pretty_log(
+                    "Verifier",
+                    "no verdict — turn carried no verifiable evidence "
+                    "(bookkeeping-only tools); skipped by design",
+                    icon=Icons.BRAIN_THINK,
+                )
+            elif getattr(getattr(self.context, "verifier", None),
+                         "llm_client", None) is None:
+                # Sim/ablation contexts run without an attached verifier.
+                pretty_log(
+                    "Verifier",
+                    "no verdict — verifier not attached in this context "
+                    "(sim/ablation); skipped by design",
+                    icon=Icons.BRAIN_THINK,
+                )
+            else:
+                # Evidence existed AND a verifier is attached, yet no
+                # verdict came back — trivial-chat skip or a genuinely
+                # dead verifier path. THIS is the case worth watching.
+                pretty_log(
+                    "Verifier",
+                    "LATE verdict was EMPTY despite verifiable evidence — "
+                    "trivial-chat skip or a verifier error (investigate "
+                    "if frequent)",
+                    level="WARNING", icon=Icons.WARN,
+                )
             return
         try:
             from .verifier import VerifyVerdict
@@ -4728,6 +4764,668 @@ class GhostAgent:
         banner = getattr(self, "_active_correction", "") or ""
         self._active_correction = ""
         return banner
+
+    def _parse_assistant_tool_calls(self, content, msg):
+        """Parse the assistant's raw response into tool calls (extracted
+        verbatim from handle_chat, 2026-07-08 — step 1 of the hot-path
+        decomposition; behavior-identical by construction).
+
+        Handles every emission shape the upstream produces: the robust
+        XML parser with its normalization heals (bare <function>, sloppy
+        attribute syntax, CDATA bodies, unclosed parameters), the
+        truncation detector, degenerate-flood cap, native ``tool_calls``
+        with corruption repair, and the raw-JSON fallback.
+
+        Returns ``(tool_calls, ui_content, parse_failure_reason)``:
+        ``ui_content`` is the response with tool XML scrubbed (think
+        blocks NOT yet stripped — the caller owns that plus the leak
+        scrubbers); ``parse_failure_reason`` is ""/"truncated"/
+        "no_function_tag" for the recovery-message branch.
+        """
+        tool_calls = []
+        ui_content = content
+
+        # --- EXTRACT & LOG INTERNAL THINKING ---
+        think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', content, flags=re.DOTALL | re.IGNORECASE)
+        for think_text in think_matches:
+            clean_think = think_text.strip()
+            if clean_think:
+                ui_think = clean_think.replace('\n', ' | ')
+
+                # 1. Trigger UI Planner Monologue Box
+                logger.info(f"PLANNER MONOLOGUE: {ui_think}")
+
+                # 2. Print multiline thinking safely to the terminal (REMOVED - now handled via streaming)
+                # Timestamp and iterative printing to the console has been moved to the streaming block above.
+
+        # ---------------------------------------------------------
+        #   ROBUST XML TOOL PARSER
+        # ---------------------------------------------------------
+        # Isolate actual output from <think> blocks FIRST
+        parse_target = _strip_think_blocks(content)
+
+        # --- XML TAG NORMALIZATION ---
+        # Heal prompt-induced hallucinations (<tool> instead of <tool_call>)
+        parse_target = re.sub(r'<tool\b[^>]*>', '<tool_call>', parse_target, flags=re.IGNORECASE)
+        parse_target = re.sub(r'</tool>', '</tool_call>', parse_target, flags=re.IGNORECASE)
+
+        # Heal bare <function> tags missing the <tool_call> wrapper
+        if '<function' in parse_target and '<tool_call' not in parse_target:
+            parse_target = parse_target.replace('<function', '<tool_call>\n<function')
+
+        # Heal sloppy attribute syntax from newer Qwen variants
+        # (3.6+). They drop the `name` attribute and/or pad `=`
+        # with whitespace, producing shapes the downstream
+        # `<function(?:\s+name=|=)` regex never matched:
+        #   <function = "x">         → <function name="x">
+        #   <function name = "x">    → <function name="x">
+        #   <function_name = "x">    → <function name="x">
+        #   <function_name="x">      → <function name="x">
+        #   <parameter = "x">        → <parameter name="x">
+        #   <parameter name = "x">   → <parameter name="x">
+        # Runs AFTER the bare-<function> heal so the inserted
+        # wrapper doesn't get rewritten.
+        parse_target = re.sub(
+            r'<(function|parameter)(?:_name)?\s*=\s*(["\'])([^"\']+)\2',
+            r'<\1 name=\2\3\2',
+            parse_target, flags=re.IGNORECASE,
+        )
+        parse_target = re.sub(
+            r'<(function|parameter)\s+name\s*=\s*',
+            r'<\1 name=',
+            parse_target, flags=re.IGNORECASE,
+        )
+        # -----------------------------
+
+        has_tool_tag = re.search(r'<(?:tool_call|function)\b', parse_target, re.IGNORECASE) is not None
+
+        # Per-turn diagnosis of the parse reason. Populated when
+        # the parser fails so the recovery-message branch can
+        # surface a SPECIFIC cause (truncated output, no
+        # function tag, etc.) instead of the generic "your XML
+        # was invalid" — which sends the model guessing.
+        parse_failure_reason = ""
+
+        if has_tool_tag:
+            pretty_log("Agent Parser", "Extracting XML tool call...", icon=Icons.TOOL_CODE)
+
+            # --- UPSTREAM TRUNCATION DETECTOR ---
+            # If the assistant output opens a <tool_call> or
+            # <function> but never closes it, the upstream max
+            # tokens cap severed the stream mid-XML. We cannot
+            # recover a clean tool_call from a dangling header,
+            # but we CAN tell the model exactly what happened on
+            # the next turn — previously it got a generic "your
+            # XML is broken" and guessed at CDATA / heredoc /
+            # base64 while the actual problem was "your output
+            # was cut off, shorten it."
+            if _tool_call_truncated(parse_target):
+                parse_failure_reason = "truncated"
+                # Detailed truncation diagnostics. Previously we
+                # logged only the last 600 chars, which was not
+                # enough to diagnose e.g. "the model emitted a
+                # massive <parameter name='content'> Python body
+                # that hit the upstream token cap" vs. "the model
+                # opened a second <tool_call> and ran out of room
+                # in the second one's <function> tag." We now
+                # surface the total length, tool_call/function
+                # open/close counts, the head of the response, and
+                # the tail — enough signal to distinguish all the
+                # common truncation shapes from the log alone.
+                _tc_opens = len(re.findall(r'<tool_call\b', parse_target, re.IGNORECASE))
+                _tc_closes = len(re.findall(r'</tool_call\b', parse_target, re.IGNORECASE))
+                _fn_opens = len(re.findall(r'<function\b[^>]*>', parse_target, re.IGNORECASE))
+                _fn_closes = len(re.findall(r'</function\b', parse_target, re.IGNORECASE))
+                _param_opens = len(re.findall(r'<parameter\b[^>]*>', parse_target, re.IGNORECASE))
+                _param_closes = len(re.findall(r'</parameter\b', parse_target, re.IGNORECASE))
+                _tail_sample = parse_target[-600:].replace("\n", "\\n")
+                _head_sample = parse_target[:300].replace("\n", "\\n")
+                logger.warning(
+                    "Parse target truncated. len=%d chars. "
+                    "tool_call=%d/%d function=%d/%d parameter=%d/%d (open/close). "
+                    "HEAD: %s... TAIL: ...%s",
+                    len(parse_target),
+                    _tc_opens, _tc_closes,
+                    _fn_opens, _fn_closes,
+                    _param_opens, _param_closes,
+                    _head_sample, _tail_sample,
+                )
+                # Also surface the key numbers in the pretty stream
+                # so they show up in the live log the user watches,
+                # not just the file-based logger output.
+                pretty_log(
+                    "Upstream Truncation",
+                    f"len={len(parse_target)} chars | "
+                    f"tool_call open/close = {_tc_opens}/{_tc_closes} | "
+                    f"function = {_fn_opens}/{_fn_closes} | "
+                    f"parameter = {_param_opens}/{_param_closes}",
+                    level="WARNING", icon=Icons.WARN,
+                )
+
+            # Split by <tool_call> to handle missing closing tags, spaces, and markdown injections
+            # Heal <tool_call name="execute"> hallucinations before they are destroyed by re.split
+            parse_target = re.sub(r'<tool_call\s+(?:name|function)=["\']([^"\']+)["\'][^>]*>', r'<tool_call>\n<function name="\1">', parse_target, flags=re.IGNORECASE)
+            blocks = re.split(r'<tool_call.*?>', parse_target, flags=re.IGNORECASE)
+            # Cap parse attempts per response. A degenerate generation
+            # (Qwen has been observed looping on a truncated tool_call
+            # shape, producing thousands of malformed blocks in one
+            # reply — see the 4056-strike trace) would otherwise emit
+            # one system_parse_error per block and drain the strike
+            # counter into the thousands before the turn-level cap
+            # check runs. Five is plenty to recover a real call.
+            _MAX_TOOL_CALL_BLOCKS = 5
+            if len(blocks) > _MAX_TOOL_CALL_BLOCKS + 1:
+                logger.warning(
+                    "Degenerate response: %d <tool_call> openings; truncating to %d to prevent parser flood.",
+                    len(blocks) - 1, _MAX_TOOL_CALL_BLOCKS,
+                )
+                blocks = blocks[: _MAX_TOOL_CALL_BLOCKS + 1]
+            # Dedupe: when upstream cuts the response off mid
+            # tool_call, the split produces N fragments that all
+            # fail for the SAME root cause (truncation). Emitting
+            # one system_parse_error per fragment multiplies a
+            # single failure into N strikes on the execution
+            # counter — the model gets penalized N times for one
+            # mistake, and the truncation-specific recovery hint
+            # fires N times in the log. Track whether we've
+            # already emitted a truncation-reason error in this
+            # response and skip subsequent ones; non-truncation
+            # failures (no_function_tag, malformed) still emit
+            # normally because they're genuinely distinct.
+            emitted_truncation_error = False
+            for block in blocks[1:]:
+                # Strip out anything after the closing tag if it exists
+                block_content = re.split(r'</tool_call.*?>', block, flags=re.IGNORECASE)[0]
+
+                try:
+                    # Fallback: if it's pure JSON wrapped in <tool_call> without <function>
+                    t_data = None
+                    if '<function' not in block_content.lower():
+                        try:
+                            t_data = extract_json_from_text(block_content)
+                            if t_data and "name" in t_data:
+                                func_match = None  # skip XML path, use t_data directly
+                            else:
+                                t_data = None
+                        except Exception:
+                            t_data = None
+
+                    if t_data is None:
+                        func_match = re.search(r'<function(?:\s+name=|=)(.*?)>', block_content, re.IGNORECASE)
+                    else:
+                        func_match = None
+                    if func_match:
+                        func_name_raw = func_match.group(1).strip()
+                        func_name = func_name_raw.strip('"').strip("'").split()[0].strip('"').strip("'")
+                        args_val = {}
+
+                        # Extract stray attributes from the <function> tag itself
+                        attr_matches = re.finditer(r'([a-zA-Z0-9_-]+)=["\'](.*?)["\']', func_match.group(0))
+                        for a in attr_matches:
+                            if a.group(1).lower() not in ['name', 'function', 'tool_call']:
+                                args_val[a.group(1)] = a.group(2)
+
+                        # Format 0a: CDATA envelope — `<parameter name="x"><![CDATA[ANYTHING]]></parameter>`
+                        # The model can wrap content with `<![CDATA[...]]>` to embed
+                        # literal `</parameter>`, `<`, `>`, JSON, code, etc. without
+                        # the regex-based parser truncating early. Match these FIRST
+                        # and remove from the working block so subsequent regexes
+                        # don't double-parse the inner body. Strict — only fires when
+                        # the model actually emitted `<![CDATA[...]]>`, so it can never
+                        # corrupt non-CDATA tool calls.
+                        cdata_pattern = re.compile(
+                            r'<parameter(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_-]+)["\']?\s*>\s*<!\[CDATA\[(.*?)\]\]>\s*</parameter>',
+                            re.DOTALL | re.IGNORECASE,
+                        )
+                        cdata_hits = list(cdata_pattern.finditer(block_content))
+                        for cm in cdata_hits:
+                            args_val[cm.group(1).strip()] = cm.group(2)
+
+                        # Format 1: <parameter name="x">y</parameter> (Handles missing closing tags)
+                        # The lookahead also breaks on a stray *opening* `<function`
+                        # or `<tool_call` — when the model emits two tool calls in one
+                        # turn and uses a non-`</parameter>` close tag (e.g. `</path>`,
+                        # `</file_path>`) on the first call's last param, the lazy
+                        # `.*?` would otherwise consume past the first call's
+                        # `</function>` / `</tool_call>` pair (when block-splitting
+                        # already missed them) and latch onto the *second* call's
+                        # `</parameter>`, so a single param ends up holding both
+                        # tool calls' tag-soup as its value. The opening-tag stops
+                        # are belt-and-braces against block-split misses.
+                        param_matches = list(re.finditer(r'<parameter(?:\s+name=|=)([^>]+)>(.*?)(?=</parameter>|<parameter(?:\s+name=|=)|<function\b|</function>|<tool_call\b|</tool_call>|$)', block_content, re.DOTALL | re.IGNORECASE))
+                        for p in param_matches:
+                            p_name = p.group(1).split()[0].strip().strip('"').strip("'") # grab first token to avoid attribute bleed
+                            p_val = p.group(2).strip('\r\n')
+                            if p_name not in args_val:
+                                args_val[p_name] = p_val
+
+                        # Format 2: <parameter name="x" value="y" /> (Handles inner quotes)
+                        alt_matches = list(re.finditer(r'<parameter\s+name=["\']([^"\']+)["\']\s+value=(["\'])(.*?)\2\s*(?:/|>.*?</parameter>)', block_content, re.DOTALL | re.IGNORECASE))
+                        for p in alt_matches:
+                            args_val[p.group(1)] = p.group(3)
+
+                        # Format 3: Bare tags <action>check_health</action> (Handles missing closing tags)
+                        bare_tags = list(re.finditer(r'<([a-zA-Z0-9_-]+)>(.*?)(?=</\1>|<[a-zA-Z0-9_-]+>|<[a-zA-Z0-9_-]+ |</function>|</tool_call>|$)', block_content, re.DOTALL | re.IGNORECASE))
+                        for b in bare_tags:
+                            b_name = b.group(1).lower()
+                            if b_name not in ['function', 'tool_call', 'parameter', 'arguments', 'parameters', 'kwargs']: # ignore structural tags
+                                if b_name not in args_val: # don't overwrite explicit parameter tags
+                                    args_val[b_name] = b.group(2).strip('\r\n')
+
+                        # Format 4: Attribute tags <parameter action="check_health" /> (Handles inner quotes)
+                        attr_tags = list(re.finditer(r'<parameter\s+([a-zA-Z0-9_-]+)=(["\'])(.*?)\2\s*(?:/|>.*?</parameter>)', block_content, re.DOTALL | re.IGNORECASE))
+                        for a in attr_tags:
+                            if a.group(1).lower() != 'name' and a.group(1).lower() not in args_val:
+                                args_val[a.group(1)] = a.group(3)
+
+                        # Format 5: Direct attribute tags <action="check_health"> (Handles inner quotes)
+                        direct_attr = list(re.finditer(r'<([a-zA-Z0-9_-]+)=(["\'])(.*?)\2\s*(?:/|>.*?</\1>|>)', block_content, re.DOTALL | re.IGNORECASE))
+                        for d in direct_attr:
+                            if d.group(1).lower() not in ['function', 'tool_call', 'parameter', 'arguments', 'parameters', 'kwargs'] and d.group(1).lower() not in args_val:
+                                args_val[d.group(1)] = d.group(3)
+
+                        # Format 5b: Bounds-aware REPAIR pass — Format 1's non-greedy
+                        # regex truncates param bodies at the FIRST `</parameter>` it
+                        # finds, so any `</parameter>` literal inside a docstring or
+                        # string example silently mangles the content. This repair
+                        # walks `<parameter>` openings in order and uses the LAST
+                        # `</parameter>` before the next opening (or `</function>`)
+                        # as the body terminator. It runs AFTER Formats 1-5 and only
+                        # REPLACES a value when the repaired body is strictly longer
+                        # — so clean cases (Formats 1-5 extracted correctly) are never
+                        # perturbed, and CDATA-wrapped / self-closing / value= shapes
+                        # are untouched because their bodies are already populated.
+                        try:
+                            open_pattern = re.compile(
+                                r'<parameter(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_-]+)["\']?[^>]*>',
+                                re.IGNORECASE,
+                            )
+                            close_re = re.compile(r'</parameter>', re.IGNORECASE)
+                            # Mirror Format 1's boundary set: a stray `<function`
+                            # or `<tool_call` opening (block-split miss) terminates
+                            # the body just like a closing tag, so we never repair
+                            # a value past the start of the next tool call.
+                            end_func_re = re.compile(r'<function\b|</function>|<tool_call\b|</tool_call>', re.IGNORECASE)
+                            openings = list(open_pattern.finditer(block_content))
+                            # The FIRST `<function>` opening is the legitimate one
+                            # for this block — searching the boundary regex from
+                            # position 0 would latch onto it and pin `end_pos = 0`,
+                            # killing every parameter extraction. Start the search
+                            # AFTER the first `<function>` opening (if present), so
+                            # the next `<function>` / `<tool_call>` opening — which
+                            # only happens when block-split missed a boundary —
+                            # correctly terminates the function body.
+                            first_func = re.search(r'<function\b', block_content, re.IGNORECASE)
+                            search_start = first_func.end() if first_func else 0
+                            end_func = end_func_re.search(block_content, search_start)
+                            end_pos = end_func.start() if end_func else len(block_content)
+                            for i, op in enumerate(openings):
+                                p_name = op.group(1).strip().strip('"').strip("'")
+                                # Skip if the opening is inside a CDATA-wrapped body we
+                                # already consumed — would double-parse the inner text.
+                                in_cdata = any(cm.start() <= op.start() < cm.end() for cm in cdata_hits)
+                                if in_cdata:
+                                    continue
+                                # Self-closing `<parameter .../>` has no body — skip.
+                                if block_content[op.end() - 2:op.end()] == "/>":
+                                    continue
+                                body_start = op.end()
+                                next_open = openings[i + 1].start() if i + 1 < len(openings) else end_pos
+                                boundary = min(next_open, end_pos)
+                                candidates = [m for m in close_re.finditer(block_content, body_start, boundary)]
+                                if not candidates:
+                                    # No `</parameter>` in range — Format 1 handled this
+                                    # with its `|</function>|$` fallback. Don't second-
+                                    # guess it; leave existing value alone.
+                                    continue
+                                body_end = candidates[-1].start()
+                                if body_end <= body_start:
+                                    continue
+                                repaired = block_content[body_start:body_end].strip("\r\n")
+                                existing = args_val.get(p_name)
+                                # Only REPLACE when the repair is strictly longer AND
+                                # the existing value looks truncated (Format 1 stopped
+                                # at a literal `</parameter>` inside the body).
+                                if isinstance(existing, str) and len(repaired) > len(existing):
+                                    args_val[p_name] = repaired
+                                elif existing is None:
+                                    args_val[p_name] = repaired
+                        except Exception:
+                            # Repair pass is best-effort. Never let it crash the
+                            # outer parse path — Formats 1-5 already produced an
+                            # args_val and we still have the remaining fallbacks.
+                            pass
+
+                        if not args_val:
+                            # Format 6: Try JSON inside the block if XML parsing failed
+                            try:
+                                possible_json = extract_json_from_text(block_content)
+                                if possible_json and isinstance(possible_json, dict):
+                                    args_val = possible_json.get("arguments", possible_json)
+                            except Exception:
+                                pass
+
+                            # Format 7: Single-argument pure text fallback
+                            if not args_val and func_name in ["image_generation", "vision_analysis", "deep_research", "deep_think"]:
+                                        # Extract text between <function> and </function>
+                                        raw_content_match = re.search(r'<function[^>]*>(.*?)</function>', block_content, re.DOTALL | re.IGNORECASE)
+                                        if raw_content_match:
+                                            raw_text = raw_content_match.group(1).strip('\r\n')
+                                            if raw_text and not raw_text.startswith('<') and not raw_text.startswith('{'):
+                                                # Assign to the primary argument based on function name
+                                                if func_name == "image_generation":
+                                                    args_val["prompt"] = raw_text
+                                                elif func_name == "vision_analysis":
+                                                    args_val["target"] = raw_text
+                                                    args_val["action"] = "describe_picture"
+                                                elif func_name == "deep_research" or func_name == "deep_think":
+                                                    args_val["query"] = raw_text
+
+                        t_data = {"name": func_name, "arguments": args_val}
+                    else:
+                        t_data = extract_json_from_text(block_content)
+
+                    # Heal missing "name" if the JSON root key is the tool name
+                    if t_data and "name" not in t_data and isinstance(t_data, dict):
+                        keys = list(t_data.keys())
+                        available_tool_names = list(self.available_tools.keys()) if hasattr(self, 'available_tools') else []
+                        if len(keys) == 1 and keys[0] in available_tool_names:
+                            t_data = {"name": keys[0], "arguments": t_data[keys[0]]}
+
+                    # Fix for models that output OpenAI nested JSON inside XML
+                    if t_data and "function" in t_data and isinstance(t_data["function"], dict) and "name" in t_data["function"]:
+                        t_data = t_data["function"]
+
+                    if t_data and "name" in t_data:
+                        # Fix for models that stringify the arguments dict
+                        args_val = t_data.get("arguments", {})
+                        if isinstance(args_val, str):
+                            try: args_val = json.loads(args_val, strict=False)
+                            except Exception:
+                                # Never silently dispatch with empty args — the
+                                # tool's "missing argument" error reads like the
+                                # MODEL's mistake and can trap it in a retry loop.
+                                pretty_log(
+                                    "Agent Parser",
+                                    f"Unparseable JSON arguments for tool "
+                                    f"'{t_data.get('name')}' — dispatching empty "
+                                    f"args (raw head: {args_val[:120]!r})",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
+                                args_val = {}
+
+                        # Un-nest hallucinatory wrappers like <arguments> or <parameters>
+                        if isinstance(args_val, dict) and len(args_val) == 1:
+                            k = list(args_val.keys())[0].lower()
+                            if k in ["arguments", "parameters", "kwargs", "args"]:
+                                inner = args_val[list(args_val.keys())[0]]
+                                if isinstance(inner, str):
+                                    try:
+                                        parsed = extract_json_from_text(inner)
+                                        if parsed and isinstance(parsed, dict):
+                                            args_val = parsed
+                                    except: pass
+                                elif isinstance(inner, dict):
+                                    args_val = inner
+
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": t_data.get("name"),
+                                "arguments": json.dumps(args_val)
+                            }
+                        })
+                    else:
+                        # Fallback 1: Raw text to JSON didn't work. Check if the LLM hallucinated <tool_name>...</tool_name> tags instead of <function name="...">
+                        first_tag_match = re.search(r'<([a-zA-Z0-9_-]+)[^>]*>', block_content.strip(), re.IGNORECASE)
+                        available_tool_names = list(self.available_tools.keys()) if hasattr(self, 'available_tools') else []
+
+                        if first_tag_match and first_tag_match.group(1).lower() not in ['tool_call', 'function']:
+                            func_fallback = first_tag_match.group(1)
+
+                            # Only accept if it's a known tool OR if we don't have available_tools (just blindly try)
+                            if not available_tool_names or func_fallback in available_tool_names:
+                                args_fallback = {}
+
+                                inner_content = re.sub(f'^\\s*<{func_fallback}[^>]*>', '', block_content, flags=re.IGNORECASE)
+                                inner_content = re.sub(f'</{func_fallback}>\\s*$', '', inner_content, flags=re.IGNORECASE).strip()
+
+                                bare_tags = list(re.finditer(r'<([a-zA-Z0-9_-]+)>(.*?)</\1>', inner_content, re.DOTALL | re.IGNORECASE))
+                                for b in bare_tags:
+                                    if b.group(1).lower() not in [func_fallback.lower(), 'tool_call']:
+                                        args_fallback[b.group(1)] = b.group(2).strip('\r\n')
+
+                                if not args_fallback and func_fallback in ["image_generation", "vision_analysis", "deep_research", "deep_think"]:
+                                    if inner_content and not inner_content.startswith('<') and not inner_content.startswith('{'):
+                                        if func_fallback == "image_generation": args_fallback["prompt"] = inner_content
+                                        elif func_fallback == "vision_analysis":
+                                            args_fallback["target"] = inner_content
+                                            args_fallback["action"] = "describe_picture"
+                                        elif func_fallback in ["deep_research", "deep_think"]: args_fallback["query"] = inner_content
+
+                                t_data = {"name": func_fallback, "arguments": args_fallback}
+
+                        if t_data and "name" in t_data:
+                            # The fallback successfully mapped a tool!
+                            args_val = t_data.get("arguments", {})
+                            tool_calls.append({
+                                "id": f"call_{uuid.uuid4().hex[:8]}",
+                                "type": "function",
+                                "function": {
+                                    "name": t_data["name"],
+                                    "arguments": json.dumps(args_val) if isinstance(args_val, dict) else (args_val if isinstance(args_val, str) else json.dumps(args_val))
+                                }
+                            })
+                        else:
+                            # Extreme Regex Fallback for unescaped broken JSON (e.g. execute and file_system tools)
+                            name_match = re.search(r'<(?:name|tool_name)>(.*?)</(?:name|tool_name)>', block_content, re.IGNORECASE)
+                            if not name_match:
+                                name_match = re.search(r'(?:"|\')name(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
+                            tool_name_fallback = name_match.group(1).strip() if name_match else None
+
+                            if not tool_name_fallback and 'filename' in block_content:
+                                tool_name_fallback = 'execute'
+
+                            if tool_name_fallback == 'execute' and 'filename' in block_content and 'content' in block_content:
+                                f_match = re.search(r'(?:"|\')filename(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
+                                c_match = re.search(r'(?:"|\')content(?:"|\')\s*:\s*(?:"|\')(.*)', block_content, re.DOTALL)
+
+                                if f_match and c_match:
+                                    raw_content = c_match.group(1).strip('\r\n')
+                                    if raw_content.endswith('}'): raw_content = raw_content[:-1].strip('\r\n')
+                                    if raw_content.endswith('"""'): raw_content = raw_content[:-3].strip('\r\n')
+                                    elif raw_content.endswith('"') or raw_content.endswith("'"): raw_content = raw_content[:-1].strip('\r\n')
+
+                                    tool_calls.append({
+                                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "execute",
+                                            "arguments": json.dumps({"filename": f_match.group(1), "content": raw_content})
+                                        }
+                                    })
+                                    continue
+
+                            elif tool_name_fallback == 'file_system' and 'path' in block_content:
+                                op_match = re.search(r'(?:"|\')operation(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
+                                p_match = re.search(r'(?:"|\')path(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
+                                c_match = re.search(r'(?:"|\')content(?:"|\')\s*:\s*(?:"|\')(.*?)(?=(?:,\s*(?:"|\')replace_with(?:"|\')\s*:|$))', block_content, re.DOTALL)
+                                rw_match = re.search(r'(?:"|\')replace_with(?:"|\')\s*:\s*(?:"|\')(.*)', block_content, re.DOTALL)
+
+                                if op_match and p_match:
+                                    args_dict = {
+                                        "operation": op_match.group(1),
+                                        "path": p_match.group(1)
+                                    }
+                                    if c_match:
+                                        raw_content = c_match.group(1).strip('\r\n')
+                                        if raw_content.endswith('}'): raw_content = raw_content[:-1].strip('\r\n')
+                                        if raw_content.endswith(','): raw_content = raw_content[:-1].strip('\r\n')
+                                        if raw_content.endswith('"""'): raw_content = raw_content[:-3].strip('\r\n')
+                                        elif raw_content.endswith('"') or raw_content.endswith("'"): raw_content = raw_content[:-1].strip('\r\n')
+                                        args_dict["content"] = raw_content
+
+                                    if rw_match:
+                                        raw_rw = rw_match.group(1).strip('\r\n')
+                                        if raw_rw.endswith('}'): raw_rw = raw_rw[:-1].strip('\r\n')
+                                        if raw_rw.endswith(','): raw_rw = raw_rw[:-1].strip('\r\n')
+                                        if raw_rw.endswith('"""'): raw_rw = raw_rw[:-3].strip('\r\n')
+                                        elif raw_rw.endswith('"') or raw_rw.endswith("'"): raw_rw = raw_rw[:-1].strip('\r\n')
+                                        args_dict["replace_with"] = raw_rw
+
+                                    tool_calls.append({
+                                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "file_system",
+                                            "arguments": json.dumps(args_dict)
+                                        }
+                                    })
+                                    continue
+
+                            elif tool_name_fallback in ['vision_analysis', 'image_generation', 'deep_research', 'deep_think']:
+                                target_match = re.search(r'<(target|prompt|query)>(.*?)</\1>', block_content, re.DOTALL | re.IGNORECASE)
+                                if not target_match:
+                                    target_match = re.search(r'(?:"|\')(?:target|prompt|query)(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content, re.DOTALL)
+
+                                if target_match:
+                                    extracted_val = target_match.group(2) if len(target_match.groups()) > 1 else target_match.group(1)
+                                    arg_key = "target" if tool_name_fallback == "vision_analysis" else ("prompt" if tool_name_fallback == "image_generation" else "query")
+                                    args_dict = {arg_key: extracted_val.strip()}
+                                    if tool_name_fallback == "vision_analysis":
+                                        args_dict["action"] = "describe_picture"
+
+                                    tool_calls.append({
+                                        "id": f"call_{uuid.uuid4().hex[:8]}",
+                                        "type": "function",
+                                        "function": {
+                                            "name": tool_name_fallback,
+                                            "arguments": json.dumps(args_dict)
+                                        }
+                                    })
+                                    continue
+
+                            # Absolute failure, all syntax mangled. Log the first 4 KB
+                            # of the block so we can see WHY the parser rejected it
+                            # — selfplay sessions used to log only "tool syntax error"
+                            # with no diagnostic signal, making this regression class
+                            # impossible to debug from traces alone.
+                            try:
+                                logger.warning(
+                                    "Parser emitted system_parse_error. "
+                                    "Block content (truncated to 4 KB): %s",
+                                    block_content[:4096].replace("\n", "\\n"),
+                                )
+                            except Exception:
+                                pass
+
+                            # Stamp a specific failure reason so the
+                            # recovery-message branch can produce an
+                            # actionable hint ("no <function> tag
+                            # found — did you forget the XML header?").
+                            if not parse_failure_reason:
+                                if '<function' not in block_content.lower():
+                                    parse_failure_reason = "no_function_tag"
+                                elif re.search(r'<function[^>]*$', block_content, re.IGNORECASE):
+                                    parse_failure_reason = "truncated"
+                                else:
+                                    parse_failure_reason = "malformed"
+                            # Dedupe: fragments produced by a
+                            # single upstream truncation all share
+                            # `parse_failure_reason == "truncated"`.
+                            # Emit one synthetic error for the
+                            # whole response, skip the rest.
+                            if parse_failure_reason == "truncated" and emitted_truncation_error:
+                                continue
+                            if parse_failure_reason == "truncated":
+                                emitted_truncation_error = True
+                            tool_calls.append({
+                                "id": f"call_{uuid.uuid4().hex[:8]}",
+                                "type": "function",
+                                "function": {
+                                    "name": "system_parse_error",
+                                    "arguments": "{}"
+                                }
+                            })
+                except Exception as e:
+                    logger.debug(f"XML execution metadata parsing error: {type(e).__name__}")
+
+            # Scrub from the human-facing UI string. Three shapes
+            # can leak into the reply: `<tool_call>...</tool_call>`,
+            # `<tool>...</tool>`, and a bare `<function
+            # name="...">...</function>` (emitted without the outer
+            # wrapper — has_tool_tag still True via the `<function`
+            # branch, but the earlier regex only caught `<tool_call`
+            # / `<tool>` and left the bare function shape in the
+            # user-facing text). Backreference `\1` forces the close
+            # tag to match the same type as the open — otherwise a
+            # nested `</function>` inside `<tool_call>...</tool_call>`
+            # would terminate the outer match early and leave an
+            # orphan `</tool_call>` behind.
+            ui_content = re.sub(
+                # `\Z` (absolute EOS) instead of `$` — see the
+                # stream-wrapper pattern for the full rationale.
+                # The short version: `$` in non-MULTILINE mode
+                # matches before a trailing `\n`, letting the
+                # newline after `<tool_call>` escape the scrub.
+                r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+                '',
+                ui_content,
+                flags=re.DOTALL | re.IGNORECASE,
+            ).strip()
+        else:
+            # Fallback: honour native tool_calls if the model didn't use XML format
+            tool_calls = list(msg.get("tool_calls") or [])
+
+            # De-corrupt native tool_calls the upstream server
+            # mangled by merging a multi-tool reply into one
+            # call's arguments (see _repair_native_tool_calls).
+            # This is the fix for "introspect keeps erroring on a
+            # valid action" — the server leaked the following
+            # tool call's XML into the `action` value.
+            if tool_calls:
+                _avail = (list(self.available_tools.keys())
+                          if hasattr(self, 'available_tools') else None)
+                tool_calls, _repaired = _repair_native_tool_calls(tool_calls, _avail)
+                if _repaired:
+                    pretty_log(
+                        "Agent Parser",
+                        "Repaired corrupt native tool_call(s): upstream merged a "
+                        "multi-tool reply into one call's arguments — recovered the "
+                        "intended value and split the leaked calls.",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+
+            if not tool_calls and parse_target.strip().startswith('{'):
+                # Fallback: check if it outputted raw JSON instead of XML
+                try:
+                    possible_json = extract_json_from_text(parse_target)
+                    if possible_json and isinstance(possible_json, dict) and "name" in possible_json and "arguments" in possible_json:
+                        args_val = possible_json.get("arguments", {})
+                        if isinstance(args_val, str):
+                            try: args_val = json.loads(args_val)
+                            except Exception:
+                                pretty_log(
+                                    "Agent Parser",
+                                    f"Raw-JSON tool call for "
+                                    f"'{possible_json.get('name')}' has non-JSON "
+                                    f"arguments — passing the raw string through",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
+                        tool_calls.append({
+                            "id": f"call_{uuid.uuid4().hex[:8]}",
+                            "type": "function",
+                            "function": {
+                                "name": possible_json["name"],
+                                "arguments": json.dumps(args_val) if isinstance(args_val, dict) else (args_val if isinstance(args_val, str) else json.dumps(args_val))
+                            }
+                        })
+                        pretty_log("Agent Parser", "Recovered raw JSON tool call.", icon=Icons.TOOL_CODE)
+                except Exception:
+                    pass
+
+        return tool_calls, ui_content, parse_failure_reason
 
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
         req_id = request_id or str(uuid.uuid4())[:8]
@@ -5525,6 +6223,7 @@ class GhostAgent:
                 # dict lives on the StrikeLedger above; only the "already
                 # steered once" set is loop-local.
                 repeated_action_steered: set = set()
+                preflight_blocks_this_request = 0
 
                 # Self-play can cap a single attempt's turn count via
                 # `max_turns_override` on the GhostAgent instance, so a
@@ -6858,8 +7557,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             if not text:
                                 return
                             thinking_token_count += 1
-                            if not _glog.VERBOSE_MODE:
-                                return  # Silent — summary line is emitted post-stream.
+                            # NOT gated on VERBOSE_MODE (operator request
+                            # 2026-07-08): thinking flows through the same
+                            # pretty_log pipeline as every other line, so
+                            # non-verbose mode shows it truncated to the
+                            # standard LOG_TRUNCATE_LIMIT while verbose
+                            # still gets the full blocks. The post-stream
+                            # summary line is unchanged either way.
                             thinking_line_buf += text
                             while True:
                                 # Prefer paragraph boundary (blank line)
@@ -6875,7 +7579,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     block = thinking_line_buf[:para_idx].strip()
                                     thinking_line_buf = thinking_line_buf[para_idx + 2:]
                                     if block:
-                                        pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG")
+                                        pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
                                     continue
                                 # No paragraph boundary yet — flush only
                                 # when the buffer exceeds the budget,
@@ -6894,15 +7598,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         block = thinking_line_buf[:last_nl].strip()
                                         thinking_line_buf = thinking_line_buf[last_nl + 1:]
                                     if block:
-                                        pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG")
+                                        pretty_log("thinking", block, icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
                                     continue
                                 break
 
                         def _flush_thinking():
                             nonlocal thinking_line_buf
-                            if thinking_line_buf and _glog.VERBOSE_MODE:
+                            if thinking_line_buf:
                                 if thinking_line_buf.strip():
-                                    pretty_log("thinking", thinking_line_buf.strip(), icon=Icons.BRAIN_THINK, level="DEBUG")
+                                    pretty_log("thinking", thinking_line_buf.strip(), icon=Icons.BRAIN_THINK, level="DEBUG", no_truncate=True)
                                 thinking_line_buf = ""
 
                         stop_printing = False
@@ -7323,648 +8027,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     if msg.get("reasoning_content"):
                         content = f"<think>\n{msg.get('reasoning_content')}\n</think>\n" + content
 
-                    tool_calls = []
-                    ui_content = content
-
-                    # --- EXTRACT & LOG INTERNAL THINKING ---
-                    think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', content, flags=re.DOTALL | re.IGNORECASE)
-                    for think_text in think_matches:
-                        clean_think = think_text.strip()
-                        if clean_think:
-                            ui_think = clean_think.replace('\n', ' | ')
-
-                            # 1. Trigger UI Planner Monologue Box
-                            logger.info(f"PLANNER MONOLOGUE: {ui_think}")
-
-                            # 2. Print multiline thinking safely to the terminal (REMOVED - now handled via streaming)
-                            # Timestamp and iterative printing to the console has been moved to the streaming block above.
-
-                    # ---------------------------------------------------------
-                    #   ROBUST XML TOOL PARSER
-                    # ---------------------------------------------------------
-                    # Isolate actual output from <think> blocks FIRST
-                    parse_target = _strip_think_blocks(content)
-
-                    # --- XML TAG NORMALIZATION ---
-                    # Heal prompt-induced hallucinations (<tool> instead of <tool_call>)
-                    parse_target = re.sub(r'<tool\b[^>]*>', '<tool_call>', parse_target, flags=re.IGNORECASE)
-                    parse_target = re.sub(r'</tool>', '</tool_call>', parse_target, flags=re.IGNORECASE)
-
-                    # Heal bare <function> tags missing the <tool_call> wrapper
-                    if '<function' in parse_target and '<tool_call' not in parse_target:
-                        parse_target = parse_target.replace('<function', '<tool_call>\n<function')
-
-                    # Heal sloppy attribute syntax from newer Qwen variants
-                    # (3.6+). They drop the `name` attribute and/or pad `=`
-                    # with whitespace, producing shapes the downstream
-                    # `<function(?:\s+name=|=)` regex never matched:
-                    #   <function = "x">         → <function name="x">
-                    #   <function name = "x">    → <function name="x">
-                    #   <function_name = "x">    → <function name="x">
-                    #   <function_name="x">      → <function name="x">
-                    #   <parameter = "x">        → <parameter name="x">
-                    #   <parameter name = "x">   → <parameter name="x">
-                    # Runs AFTER the bare-<function> heal so the inserted
-                    # wrapper doesn't get rewritten.
-                    parse_target = re.sub(
-                        r'<(function|parameter)(?:_name)?\s*=\s*(["\'])([^"\']+)\2',
-                        r'<\1 name=\2\3\2',
-                        parse_target, flags=re.IGNORECASE,
-                    )
-                    parse_target = re.sub(
-                        r'<(function|parameter)\s+name\s*=\s*',
-                        r'<\1 name=',
-                        parse_target, flags=re.IGNORECASE,
-                    )
-                    # -----------------------------
-
-                    has_tool_tag = re.search(r'<(?:tool_call|function)\b', parse_target, re.IGNORECASE) is not None
-
-                    # Per-turn diagnosis of the parse reason. Populated when
-                    # the parser fails so the recovery-message branch can
-                    # surface a SPECIFIC cause (truncated output, no
-                    # function tag, etc.) instead of the generic "your XML
-                    # was invalid" — which sends the model guessing.
-                    parse_failure_reason = ""
-
-                    if has_tool_tag:
-                        pretty_log("Agent Parser", "Extracting XML tool call...", icon=Icons.TOOL_CODE)
-
-                        # --- UPSTREAM TRUNCATION DETECTOR ---
-                        # If the assistant output opens a <tool_call> or
-                        # <function> but never closes it, the upstream max
-                        # tokens cap severed the stream mid-XML. We cannot
-                        # recover a clean tool_call from a dangling header,
-                        # but we CAN tell the model exactly what happened on
-                        # the next turn — previously it got a generic "your
-                        # XML is broken" and guessed at CDATA / heredoc /
-                        # base64 while the actual problem was "your output
-                        # was cut off, shorten it."
-                        if _tool_call_truncated(parse_target):
-                            parse_failure_reason = "truncated"
-                            # Detailed truncation diagnostics. Previously we
-                            # logged only the last 600 chars, which was not
-                            # enough to diagnose e.g. "the model emitted a
-                            # massive <parameter name='content'> Python body
-                            # that hit the upstream token cap" vs. "the model
-                            # opened a second <tool_call> and ran out of room
-                            # in the second one's <function> tag." We now
-                            # surface the total length, tool_call/function
-                            # open/close counts, the head of the response, and
-                            # the tail — enough signal to distinguish all the
-                            # common truncation shapes from the log alone.
-                            _tc_opens = len(re.findall(r'<tool_call\b', parse_target, re.IGNORECASE))
-                            _tc_closes = len(re.findall(r'</tool_call\b', parse_target, re.IGNORECASE))
-                            _fn_opens = len(re.findall(r'<function\b[^>]*>', parse_target, re.IGNORECASE))
-                            _fn_closes = len(re.findall(r'</function\b', parse_target, re.IGNORECASE))
-                            _param_opens = len(re.findall(r'<parameter\b[^>]*>', parse_target, re.IGNORECASE))
-                            _param_closes = len(re.findall(r'</parameter\b', parse_target, re.IGNORECASE))
-                            _tail_sample = parse_target[-600:].replace("\n", "\\n")
-                            _head_sample = parse_target[:300].replace("\n", "\\n")
-                            logger.warning(
-                                "Parse target truncated. len=%d chars. "
-                                "tool_call=%d/%d function=%d/%d parameter=%d/%d (open/close). "
-                                "HEAD: %s... TAIL: ...%s",
-                                len(parse_target),
-                                _tc_opens, _tc_closes,
-                                _fn_opens, _fn_closes,
-                                _param_opens, _param_closes,
-                                _head_sample, _tail_sample,
-                            )
-                            # Also surface the key numbers in the pretty stream
-                            # so they show up in the live log the user watches,
-                            # not just the file-based logger output.
-                            pretty_log(
-                                "Upstream Truncation",
-                                f"len={len(parse_target)} chars | "
-                                f"tool_call open/close = {_tc_opens}/{_tc_closes} | "
-                                f"function = {_fn_opens}/{_fn_closes} | "
-                                f"parameter = {_param_opens}/{_param_closes}",
-                                level="WARNING", icon=Icons.WARN,
-                            )
-
-                        # Split by <tool_call> to handle missing closing tags, spaces, and markdown injections
-                        # Heal <tool_call name="execute"> hallucinations before they are destroyed by re.split
-                        parse_target = re.sub(r'<tool_call\s+(?:name|function)=["\']([^"\']+)["\'][^>]*>', r'<tool_call>\n<function name="\1">', parse_target, flags=re.IGNORECASE)
-                        blocks = re.split(r'<tool_call.*?>', parse_target, flags=re.IGNORECASE)
-                        # Cap parse attempts per response. A degenerate generation
-                        # (Qwen has been observed looping on a truncated tool_call
-                        # shape, producing thousands of malformed blocks in one
-                        # reply — see the 4056-strike trace) would otherwise emit
-                        # one system_parse_error per block and drain the strike
-                        # counter into the thousands before the turn-level cap
-                        # check runs. Five is plenty to recover a real call.
-                        _MAX_TOOL_CALL_BLOCKS = 5
-                        if len(blocks) > _MAX_TOOL_CALL_BLOCKS + 1:
-                            logger.warning(
-                                "Degenerate response: %d <tool_call> openings; truncating to %d to prevent parser flood.",
-                                len(blocks) - 1, _MAX_TOOL_CALL_BLOCKS,
-                            )
-                            blocks = blocks[: _MAX_TOOL_CALL_BLOCKS + 1]
-                        # Dedupe: when upstream cuts the response off mid
-                        # tool_call, the split produces N fragments that all
-                        # fail for the SAME root cause (truncation). Emitting
-                        # one system_parse_error per fragment multiplies a
-                        # single failure into N strikes on the execution
-                        # counter — the model gets penalized N times for one
-                        # mistake, and the truncation-specific recovery hint
-                        # fires N times in the log. Track whether we've
-                        # already emitted a truncation-reason error in this
-                        # response and skip subsequent ones; non-truncation
-                        # failures (no_function_tag, malformed) still emit
-                        # normally because they're genuinely distinct.
-                        emitted_truncation_error = False
-                        for block in blocks[1:]:
-                            # Strip out anything after the closing tag if it exists
-                            block_content = re.split(r'</tool_call.*?>', block, flags=re.IGNORECASE)[0]
-
-                            try:
-                                # Fallback: if it's pure JSON wrapped in <tool_call> without <function>
-                                t_data = None
-                                if '<function' not in block_content.lower():
-                                    try:
-                                        t_data = extract_json_from_text(block_content)
-                                        if t_data and "name" in t_data:
-                                            func_match = None  # skip XML path, use t_data directly
-                                        else:
-                                            t_data = None
-                                    except Exception:
-                                        t_data = None
-
-                                if t_data is None:
-                                    func_match = re.search(r'<function(?:\s+name=|=)(.*?)>', block_content, re.IGNORECASE)
-                                else:
-                                    func_match = None
-                                if func_match:
-                                    func_name_raw = func_match.group(1).strip()
-                                    func_name = func_name_raw.strip('"').strip("'").split()[0].strip('"').strip("'")
-                                    args_val = {}
-
-                                    # Extract stray attributes from the <function> tag itself
-                                    attr_matches = re.finditer(r'([a-zA-Z0-9_-]+)=["\'](.*?)["\']', func_match.group(0))
-                                    for a in attr_matches:
-                                        if a.group(1).lower() not in ['name', 'function', 'tool_call']:
-                                            args_val[a.group(1)] = a.group(2)
-
-                                    # Format 0a: CDATA envelope — `<parameter name="x"><![CDATA[ANYTHING]]></parameter>`
-                                    # The model can wrap content with `<![CDATA[...]]>` to embed
-                                    # literal `</parameter>`, `<`, `>`, JSON, code, etc. without
-                                    # the regex-based parser truncating early. Match these FIRST
-                                    # and remove from the working block so subsequent regexes
-                                    # don't double-parse the inner body. Strict — only fires when
-                                    # the model actually emitted `<![CDATA[...]]>`, so it can never
-                                    # corrupt non-CDATA tool calls.
-                                    cdata_pattern = re.compile(
-                                        r'<parameter(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_-]+)["\']?\s*>\s*<!\[CDATA\[(.*?)\]\]>\s*</parameter>',
-                                        re.DOTALL | re.IGNORECASE,
-                                    )
-                                    cdata_hits = list(cdata_pattern.finditer(block_content))
-                                    for cm in cdata_hits:
-                                        args_val[cm.group(1).strip()] = cm.group(2)
-
-                                    # Format 1: <parameter name="x">y</parameter> (Handles missing closing tags)
-                                    # The lookahead also breaks on a stray *opening* `<function`
-                                    # or `<tool_call` — when the model emits two tool calls in one
-                                    # turn and uses a non-`</parameter>` close tag (e.g. `</path>`,
-                                    # `</file_path>`) on the first call's last param, the lazy
-                                    # `.*?` would otherwise consume past the first call's
-                                    # `</function>` / `</tool_call>` pair (when block-splitting
-                                    # already missed them) and latch onto the *second* call's
-                                    # `</parameter>`, so a single param ends up holding both
-                                    # tool calls' tag-soup as its value. The opening-tag stops
-                                    # are belt-and-braces against block-split misses.
-                                    param_matches = list(re.finditer(r'<parameter(?:\s+name=|=)([^>]+)>(.*?)(?=</parameter>|<parameter(?:\s+name=|=)|<function\b|</function>|<tool_call\b|</tool_call>|$)', block_content, re.DOTALL | re.IGNORECASE))
-                                    for p in param_matches:
-                                        p_name = p.group(1).split()[0].strip().strip('"').strip("'") # grab first token to avoid attribute bleed
-                                        p_val = p.group(2).strip('\r\n')
-                                        if p_name not in args_val:
-                                            args_val[p_name] = p_val
-
-                                    # Format 2: <parameter name="x" value="y" /> (Handles inner quotes)
-                                    alt_matches = list(re.finditer(r'<parameter\s+name=["\']([^"\']+)["\']\s+value=(["\'])(.*?)\2\s*(?:/|>.*?</parameter>)', block_content, re.DOTALL | re.IGNORECASE))
-                                    for p in alt_matches:
-                                        args_val[p.group(1)] = p.group(3)
-
-                                    # Format 3: Bare tags <action>check_health</action> (Handles missing closing tags)
-                                    bare_tags = list(re.finditer(r'<([a-zA-Z0-9_-]+)>(.*?)(?=</\1>|<[a-zA-Z0-9_-]+>|<[a-zA-Z0-9_-]+ |</function>|</tool_call>|$)', block_content, re.DOTALL | re.IGNORECASE))
-                                    for b in bare_tags:
-                                        b_name = b.group(1).lower()
-                                        if b_name not in ['function', 'tool_call', 'parameter', 'arguments', 'parameters', 'kwargs']: # ignore structural tags
-                                            if b_name not in args_val: # don't overwrite explicit parameter tags
-                                                args_val[b_name] = b.group(2).strip('\r\n')
-
-                                    # Format 4: Attribute tags <parameter action="check_health" /> (Handles inner quotes)
-                                    attr_tags = list(re.finditer(r'<parameter\s+([a-zA-Z0-9_-]+)=(["\'])(.*?)\2\s*(?:/|>.*?</parameter>)', block_content, re.DOTALL | re.IGNORECASE))
-                                    for a in attr_tags:
-                                        if a.group(1).lower() != 'name' and a.group(1).lower() not in args_val:
-                                            args_val[a.group(1)] = a.group(3)
-
-                                    # Format 5: Direct attribute tags <action="check_health"> (Handles inner quotes)
-                                    direct_attr = list(re.finditer(r'<([a-zA-Z0-9_-]+)=(["\'])(.*?)\2\s*(?:/|>.*?</\1>|>)', block_content, re.DOTALL | re.IGNORECASE))
-                                    for d in direct_attr:
-                                        if d.group(1).lower() not in ['function', 'tool_call', 'parameter', 'arguments', 'parameters', 'kwargs'] and d.group(1).lower() not in args_val:
-                                            args_val[d.group(1)] = d.group(3)
-
-                                    # Format 5b: Bounds-aware REPAIR pass — Format 1's non-greedy
-                                    # regex truncates param bodies at the FIRST `</parameter>` it
-                                    # finds, so any `</parameter>` literal inside a docstring or
-                                    # string example silently mangles the content. This repair
-                                    # walks `<parameter>` openings in order and uses the LAST
-                                    # `</parameter>` before the next opening (or `</function>`)
-                                    # as the body terminator. It runs AFTER Formats 1-5 and only
-                                    # REPLACES a value when the repaired body is strictly longer
-                                    # — so clean cases (Formats 1-5 extracted correctly) are never
-                                    # perturbed, and CDATA-wrapped / self-closing / value= shapes
-                                    # are untouched because their bodies are already populated.
-                                    try:
-                                        open_pattern = re.compile(
-                                            r'<parameter(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_-]+)["\']?[^>]*>',
-                                            re.IGNORECASE,
-                                        )
-                                        close_re = re.compile(r'</parameter>', re.IGNORECASE)
-                                        # Mirror Format 1's boundary set: a stray `<function`
-                                        # or `<tool_call` opening (block-split miss) terminates
-                                        # the body just like a closing tag, so we never repair
-                                        # a value past the start of the next tool call.
-                                        end_func_re = re.compile(r'<function\b|</function>|<tool_call\b|</tool_call>', re.IGNORECASE)
-                                        openings = list(open_pattern.finditer(block_content))
-                                        # The FIRST `<function>` opening is the legitimate one
-                                        # for this block — searching the boundary regex from
-                                        # position 0 would latch onto it and pin `end_pos = 0`,
-                                        # killing every parameter extraction. Start the search
-                                        # AFTER the first `<function>` opening (if present), so
-                                        # the next `<function>` / `<tool_call>` opening — which
-                                        # only happens when block-split missed a boundary —
-                                        # correctly terminates the function body.
-                                        first_func = re.search(r'<function\b', block_content, re.IGNORECASE)
-                                        search_start = first_func.end() if first_func else 0
-                                        end_func = end_func_re.search(block_content, search_start)
-                                        end_pos = end_func.start() if end_func else len(block_content)
-                                        for i, op in enumerate(openings):
-                                            p_name = op.group(1).strip().strip('"').strip("'")
-                                            # Skip if the opening is inside a CDATA-wrapped body we
-                                            # already consumed — would double-parse the inner text.
-                                            in_cdata = any(cm.start() <= op.start() < cm.end() for cm in cdata_hits)
-                                            if in_cdata:
-                                                continue
-                                            # Self-closing `<parameter .../>` has no body — skip.
-                                            if block_content[op.end() - 2:op.end()] == "/>":
-                                                continue
-                                            body_start = op.end()
-                                            next_open = openings[i + 1].start() if i + 1 < len(openings) else end_pos
-                                            boundary = min(next_open, end_pos)
-                                            candidates = [m for m in close_re.finditer(block_content, body_start, boundary)]
-                                            if not candidates:
-                                                # No `</parameter>` in range — Format 1 handled this
-                                                # with its `|</function>|$` fallback. Don't second-
-                                                # guess it; leave existing value alone.
-                                                continue
-                                            body_end = candidates[-1].start()
-                                            if body_end <= body_start:
-                                                continue
-                                            repaired = block_content[body_start:body_end].strip("\r\n")
-                                            existing = args_val.get(p_name)
-                                            # Only REPLACE when the repair is strictly longer AND
-                                            # the existing value looks truncated (Format 1 stopped
-                                            # at a literal `</parameter>` inside the body).
-                                            if isinstance(existing, str) and len(repaired) > len(existing):
-                                                args_val[p_name] = repaired
-                                            elif existing is None:
-                                                args_val[p_name] = repaired
-                                    except Exception:
-                                        # Repair pass is best-effort. Never let it crash the
-                                        # outer parse path — Formats 1-5 already produced an
-                                        # args_val and we still have the remaining fallbacks.
-                                        pass
-
-                                    if not args_val:
-                                        # Format 6: Try JSON inside the block if XML parsing failed
-                                        try:
-                                            possible_json = extract_json_from_text(block_content)
-                                            if possible_json and isinstance(possible_json, dict):
-                                                args_val = possible_json.get("arguments", possible_json)
-                                        except Exception:
-                                            pass
-
-                                        # Format 7: Single-argument pure text fallback
-                                        if not args_val and func_name in ["image_generation", "vision_analysis", "deep_research", "deep_think"]:
-                                                    # Extract text between <function> and </function>
-                                                    raw_content_match = re.search(r'<function[^>]*>(.*?)</function>', block_content, re.DOTALL | re.IGNORECASE)
-                                                    if raw_content_match:
-                                                        raw_text = raw_content_match.group(1).strip('\r\n')
-                                                        if raw_text and not raw_text.startswith('<') and not raw_text.startswith('{'):
-                                                            # Assign to the primary argument based on function name
-                                                            if func_name == "image_generation":
-                                                                args_val["prompt"] = raw_text
-                                                            elif func_name == "vision_analysis":
-                                                                args_val["target"] = raw_text
-                                                                args_val["action"] = "describe_picture"
-                                                            elif func_name == "deep_research" or func_name == "deep_think":
-                                                                args_val["query"] = raw_text
-
-                                    t_data = {"name": func_name, "arguments": args_val}
-                                else:
-                                    t_data = extract_json_from_text(block_content)
-
-                                # Heal missing "name" if the JSON root key is the tool name
-                                if t_data and "name" not in t_data and isinstance(t_data, dict):
-                                    keys = list(t_data.keys())
-                                    available_tool_names = list(self.available_tools.keys()) if hasattr(self, 'available_tools') else []
-                                    if len(keys) == 1 and keys[0] in available_tool_names:
-                                        t_data = {"name": keys[0], "arguments": t_data[keys[0]]}
-
-                                # Fix for models that output OpenAI nested JSON inside XML
-                                if t_data and "function" in t_data and isinstance(t_data["function"], dict) and "name" in t_data["function"]:
-                                    t_data = t_data["function"]
-
-                                if t_data and "name" in t_data:
-                                    # Fix for models that stringify the arguments dict
-                                    args_val = t_data.get("arguments", {})
-                                    if isinstance(args_val, str):
-                                        try: args_val = json.loads(args_val, strict=False)
-                                        except Exception:
-                                            # Never silently dispatch with empty args — the
-                                            # tool's "missing argument" error reads like the
-                                            # MODEL's mistake and can trap it in a retry loop.
-                                            pretty_log(
-                                                "Agent Parser",
-                                                f"Unparseable JSON arguments for tool "
-                                                f"'{t_data.get('name')}' — dispatching empty "
-                                                f"args (raw head: {args_val[:120]!r})",
-                                                level="WARNING", icon=Icons.WARN,
-                                            )
-                                            args_val = {}
-
-                                    # Un-nest hallucinatory wrappers like <arguments> or <parameters>
-                                    if isinstance(args_val, dict) and len(args_val) == 1:
-                                        k = list(args_val.keys())[0].lower()
-                                        if k in ["arguments", "parameters", "kwargs", "args"]:
-                                            inner = args_val[list(args_val.keys())[0]]
-                                            if isinstance(inner, str):
-                                                try:
-                                                    parsed = extract_json_from_text(inner)
-                                                    if parsed and isinstance(parsed, dict):
-                                                        args_val = parsed
-                                                except: pass
-                                            elif isinstance(inner, dict):
-                                                args_val = inner
-
-                                    tool_calls.append({
-                                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": t_data.get("name"),
-                                            "arguments": json.dumps(args_val)
-                                        }
-                                    })
-                                else:
-                                    # Fallback 1: Raw text to JSON didn't work. Check if the LLM hallucinated <tool_name>...</tool_name> tags instead of <function name="...">
-                                    first_tag_match = re.search(r'<([a-zA-Z0-9_-]+)[^>]*>', block_content.strip(), re.IGNORECASE)
-                                    available_tool_names = list(self.available_tools.keys()) if hasattr(self, 'available_tools') else []
-
-                                    if first_tag_match and first_tag_match.group(1).lower() not in ['tool_call', 'function']:
-                                        func_fallback = first_tag_match.group(1)
-
-                                        # Only accept if it's a known tool OR if we don't have available_tools (just blindly try)
-                                        if not available_tool_names or func_fallback in available_tool_names:
-                                            args_fallback = {}
-
-                                            inner_content = re.sub(f'^\\s*<{func_fallback}[^>]*>', '', block_content, flags=re.IGNORECASE)
-                                            inner_content = re.sub(f'</{func_fallback}>\\s*$', '', inner_content, flags=re.IGNORECASE).strip()
-
-                                            bare_tags = list(re.finditer(r'<([a-zA-Z0-9_-]+)>(.*?)</\1>', inner_content, re.DOTALL | re.IGNORECASE))
-                                            for b in bare_tags:
-                                                if b.group(1).lower() not in [func_fallback.lower(), 'tool_call']:
-                                                    args_fallback[b.group(1)] = b.group(2).strip('\r\n')
-
-                                            if not args_fallback and func_fallback in ["image_generation", "vision_analysis", "deep_research", "deep_think"]:
-                                                if inner_content and not inner_content.startswith('<') and not inner_content.startswith('{'):
-                                                    if func_fallback == "image_generation": args_fallback["prompt"] = inner_content
-                                                    elif func_fallback == "vision_analysis":
-                                                        args_fallback["target"] = inner_content
-                                                        args_fallback["action"] = "describe_picture"
-                                                    elif func_fallback in ["deep_research", "deep_think"]: args_fallback["query"] = inner_content
-
-                                            t_data = {"name": func_fallback, "arguments": args_fallback}
-
-                                    if t_data and "name" in t_data:
-                                        # The fallback successfully mapped a tool!
-                                        args_val = t_data.get("arguments", {})
-                                        tool_calls.append({
-                                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                                            "type": "function",
-                                            "function": {
-                                                "name": t_data["name"],
-                                                "arguments": json.dumps(args_val) if isinstance(args_val, dict) else (args_val if isinstance(args_val, str) else json.dumps(args_val))
-                                            }
-                                        })
-                                    else:
-                                        # Extreme Regex Fallback for unescaped broken JSON (e.g. execute and file_system tools)
-                                        name_match = re.search(r'<(?:name|tool_name)>(.*?)</(?:name|tool_name)>', block_content, re.IGNORECASE)
-                                        if not name_match:
-                                            name_match = re.search(r'(?:"|\')name(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
-                                        tool_name_fallback = name_match.group(1).strip() if name_match else None
-
-                                        if not tool_name_fallback and 'filename' in block_content:
-                                            tool_name_fallback = 'execute'
-
-                                        if tool_name_fallback == 'execute' and 'filename' in block_content and 'content' in block_content:
-                                            f_match = re.search(r'(?:"|\')filename(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
-                                            c_match = re.search(r'(?:"|\')content(?:"|\')\s*:\s*(?:"|\')(.*)', block_content, re.DOTALL)
-
-                                            if f_match and c_match:
-                                                raw_content = c_match.group(1).strip('\r\n')
-                                                if raw_content.endswith('}'): raw_content = raw_content[:-1].strip('\r\n')
-                                                if raw_content.endswith('"""'): raw_content = raw_content[:-3].strip('\r\n')
-                                                elif raw_content.endswith('"') or raw_content.endswith("'"): raw_content = raw_content[:-1].strip('\r\n')
-
-                                                tool_calls.append({
-                                                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": "execute",
-                                                        "arguments": json.dumps({"filename": f_match.group(1), "content": raw_content})
-                                                    }
-                                                })
-                                                continue
-
-                                        elif tool_name_fallback == 'file_system' and 'path' in block_content:
-                                            op_match = re.search(r'(?:"|\')operation(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
-                                            p_match = re.search(r'(?:"|\')path(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content)
-                                            c_match = re.search(r'(?:"|\')content(?:"|\')\s*:\s*(?:"|\')(.*?)(?=(?:,\s*(?:"|\')replace_with(?:"|\')\s*:|$))', block_content, re.DOTALL)
-                                            rw_match = re.search(r'(?:"|\')replace_with(?:"|\')\s*:\s*(?:"|\')(.*)', block_content, re.DOTALL)
-
-                                            if op_match and p_match:
-                                                args_dict = {
-                                                    "operation": op_match.group(1),
-                                                    "path": p_match.group(1)
-                                                }
-                                                if c_match:
-                                                    raw_content = c_match.group(1).strip('\r\n')
-                                                    if raw_content.endswith('}'): raw_content = raw_content[:-1].strip('\r\n')
-                                                    if raw_content.endswith(','): raw_content = raw_content[:-1].strip('\r\n')
-                                                    if raw_content.endswith('"""'): raw_content = raw_content[:-3].strip('\r\n')
-                                                    elif raw_content.endswith('"') or raw_content.endswith("'"): raw_content = raw_content[:-1].strip('\r\n')
-                                                    args_dict["content"] = raw_content
-
-                                                if rw_match:
-                                                    raw_rw = rw_match.group(1).strip('\r\n')
-                                                    if raw_rw.endswith('}'): raw_rw = raw_rw[:-1].strip('\r\n')
-                                                    if raw_rw.endswith(','): raw_rw = raw_rw[:-1].strip('\r\n')
-                                                    if raw_rw.endswith('"""'): raw_rw = raw_rw[:-3].strip('\r\n')
-                                                    elif raw_rw.endswith('"') or raw_rw.endswith("'"): raw_rw = raw_rw[:-1].strip('\r\n')
-                                                    args_dict["replace_with"] = raw_rw
-
-                                                tool_calls.append({
-                                                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": "file_system",
-                                                        "arguments": json.dumps(args_dict)
-                                                    }
-                                                })
-                                                continue
-
-                                        elif tool_name_fallback in ['vision_analysis', 'image_generation', 'deep_research', 'deep_think']:
-                                            target_match = re.search(r'<(target|prompt|query)>(.*?)</\1>', block_content, re.DOTALL | re.IGNORECASE)
-                                            if not target_match:
-                                                target_match = re.search(r'(?:"|\')(?:target|prompt|query)(?:"|\')\s*:\s*(?:"|\')(.*?)(?:"|\')', block_content, re.DOTALL)
-
-                                            if target_match:
-                                                extracted_val = target_match.group(2) if len(target_match.groups()) > 1 else target_match.group(1)
-                                                arg_key = "target" if tool_name_fallback == "vision_analysis" else ("prompt" if tool_name_fallback == "image_generation" else "query")
-                                                args_dict = {arg_key: extracted_val.strip()}
-                                                if tool_name_fallback == "vision_analysis":
-                                                    args_dict["action"] = "describe_picture"
-
-                                                tool_calls.append({
-                                                    "id": f"call_{uuid.uuid4().hex[:8]}",
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": tool_name_fallback,
-                                                        "arguments": json.dumps(args_dict)
-                                                    }
-                                                })
-                                                continue
-
-                                        # Absolute failure, all syntax mangled. Log the first 4 KB
-                                        # of the block so we can see WHY the parser rejected it
-                                        # — selfplay sessions used to log only "tool syntax error"
-                                        # with no diagnostic signal, making this regression class
-                                        # impossible to debug from traces alone.
-                                        try:
-                                            logger.warning(
-                                                "Parser emitted system_parse_error. "
-                                                "Block content (truncated to 4 KB): %s",
-                                                block_content[:4096].replace("\n", "\\n"),
-                                            )
-                                        except Exception:
-                                            pass
-
-                                        # Stamp a specific failure reason so the
-                                        # recovery-message branch can produce an
-                                        # actionable hint ("no <function> tag
-                                        # found — did you forget the XML header?").
-                                        if not parse_failure_reason:
-                                            if '<function' not in block_content.lower():
-                                                parse_failure_reason = "no_function_tag"
-                                            elif re.search(r'<function[^>]*$', block_content, re.IGNORECASE):
-                                                parse_failure_reason = "truncated"
-                                            else:
-                                                parse_failure_reason = "malformed"
-                                        # Dedupe: fragments produced by a
-                                        # single upstream truncation all share
-                                        # `parse_failure_reason == "truncated"`.
-                                        # Emit one synthetic error for the
-                                        # whole response, skip the rest.
-                                        if parse_failure_reason == "truncated" and emitted_truncation_error:
-                                            continue
-                                        if parse_failure_reason == "truncated":
-                                            emitted_truncation_error = True
-                                        tool_calls.append({
-                                            "id": f"call_{uuid.uuid4().hex[:8]}",
-                                            "type": "function",
-                                            "function": {
-                                                "name": "system_parse_error",
-                                                "arguments": "{}"
-                                            }
-                                        })
-                            except Exception as e:
-                                logger.debug(f"XML execution metadata parsing error: {type(e).__name__}")
-
-                        # Scrub from the human-facing UI string. Three shapes
-                        # can leak into the reply: `<tool_call>...</tool_call>`,
-                        # `<tool>...</tool>`, and a bare `<function
-                        # name="...">...</function>` (emitted without the outer
-                        # wrapper — has_tool_tag still True via the `<function`
-                        # branch, but the earlier regex only caught `<tool_call`
-                        # / `<tool>` and left the bare function shape in the
-                        # user-facing text). Backreference `\1` forces the close
-                        # tag to match the same type as the open — otherwise a
-                        # nested `</function>` inside `<tool_call>...</tool_call>`
-                        # would terminate the outer match early and leave an
-                        # orphan `</tool_call>` behind.
-                        ui_content = re.sub(
-                            # `\Z` (absolute EOS) instead of `$` — see the
-                            # stream-wrapper pattern for the full rationale.
-                            # The short version: `$` in non-MULTILINE mode
-                            # matches before a trailing `\n`, letting the
-                            # newline after `<tool_call>` escape the scrub.
-                            r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
-                            '',
-                            ui_content,
-                            flags=re.DOTALL | re.IGNORECASE,
-                        ).strip()
-                    else:
-                        # Fallback: honour native tool_calls if the model didn't use XML format
-                        tool_calls = list(msg.get("tool_calls") or [])
-
-                        # De-corrupt native tool_calls the upstream server
-                        # mangled by merging a multi-tool reply into one
-                        # call's arguments (see _repair_native_tool_calls).
-                        # This is the fix for "introspect keeps erroring on a
-                        # valid action" — the server leaked the following
-                        # tool call's XML into the `action` value.
-                        if tool_calls:
-                            _avail = (list(self.available_tools.keys())
-                                      if hasattr(self, 'available_tools') else None)
-                            tool_calls, _repaired = _repair_native_tool_calls(tool_calls, _avail)
-                            if _repaired:
-                                pretty_log(
-                                    "Agent Parser",
-                                    "Repaired corrupt native tool_call(s): upstream merged a "
-                                    "multi-tool reply into one call's arguments — recovered the "
-                                    "intended value and split the leaked calls.",
-                                    level="WARNING", icon=Icons.WARN,
-                                )
-
-                        if not tool_calls and parse_target.strip().startswith('{'):
-                            # Fallback: check if it outputted raw JSON instead of XML
-                            try:
-                                possible_json = extract_json_from_text(parse_target)
-                                if possible_json and isinstance(possible_json, dict) and "name" in possible_json and "arguments" in possible_json:
-                                    args_val = possible_json.get("arguments", {})
-                                    if isinstance(args_val, str):
-                                        try: args_val = json.loads(args_val)
-                                        except Exception:
-                                            pretty_log(
-                                                "Agent Parser",
-                                                f"Raw-JSON tool call for "
-                                                f"'{possible_json.get('name')}' has non-JSON "
-                                                f"arguments — passing the raw string through",
-                                                level="WARNING", icon=Icons.WARN,
-                                            )
-                                    tool_calls.append({
-                                        "id": f"call_{uuid.uuid4().hex[:8]}",
-                                        "type": "function",
-                                        "function": {
-                                            "name": possible_json["name"],
-                                            "arguments": json.dumps(args_val) if isinstance(args_val, dict) else (args_val if isinstance(args_val, str) else json.dumps(args_val))
-                                        }
-                                    })
-                                    pretty_log("Agent Parser", "Recovered raw JSON tool call.", icon=Icons.TOOL_CODE)
-                            except Exception:
-                                pass
+                    tool_calls, ui_content, parse_failure_reason = self._parse_assistant_tool_calls(content, msg)
 
                     ui_content = _strip_think_blocks(ui_content).strip()
 
@@ -8866,7 +8929,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # and they carry no error to repeat).
                             if self._preflight_guard_enabled and not is_idempotent_setter:
                                 _pf_target = primary_target_from_args(t_args)
-                                _pf_err = self._failure_guard.would_repeat(fname, _pf_target)
+                                _pf_op = str(t_args.get("operation")
+                                             or t_args.get("action") or "")
+                                _pf_err = self._failure_guard.would_repeat(
+                                    fname, _pf_target, _pf_op)
                                 if _pf_err:
                                     pretty_log(
                                         "Pre-Flight Guard",
@@ -8875,18 +8941,37 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         + f" — already failed: {_pf_err}",
                                         level="WARNING", icon=Icons.STOP,
                                     )
+                                    preflight_blocks_this_request += 1
                                     _diag = (
                                         f"SYSTEM BLOCK — pre-flight guard: this exact "
                                         f"'{fname}' call"
+                                        + (f" (operation='{_pf_op}')" if _pf_op else "")
                                         + (f" on target '{_pf_target}'" if _pf_target else "")
                                         + f" already failed recently with: \"{_pf_err}\". "
-                                        f"Re-running it unchanged will fail the same way "
-                                        f"and waste the turn. Change your approach — fix "
-                                        f"the underlying cause, use a different tool or "
-                                        f"target, or ask the user. If you are certain the "
-                                        f"failure was transient, re-issue with an explicit "
-                                        f"modification."
+                                        f"Re-running it UNCHANGED will fail the same way. "
+                                        f"Legal ways forward: use a DIFFERENT operation of "
+                                        f"the same tool (e.g. operation='write' with the "
+                                        f"full file instead of 'replace'), a different "
+                                        f"tool, fix the underlying cause first, or ask "
+                                        f"the user."
                                     )
+                                    if preflight_blocks_this_request >= 2:
+                                        # Guard-block budget (2026-07-08): a
+                                        # model re-issuing known-identical
+                                        # failures twice is boxed in — force a
+                                        # final reply instead of letting it
+                                        # spin to the turn cap (observed live:
+                                        # 3 blocked turns x ~80 s of full-file
+                                        # generation each).
+                                        force_final_response = True
+                                        _diag += (
+                                            " FINAL: you have now been blocked "
+                                            f"{preflight_blocks_this_request} times on known-"
+                                            "identical failures. STOP calling tools. Write "
+                                            "your final reply: state what you tried, quote "
+                                            "the exact error, and ask the user for the one "
+                                            "thing you need to proceed."
+                                        )
                                     err_msg = {
                                         "role": "tool",
                                         "tool_call_id": tool["id"],
@@ -8907,7 +8992,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 _coro = self.available_tools[fname](**t_args)
                                 tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
                                 tool_durations.append(None)
-                                tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter))
+                                tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or "")))
                                 # The DURABLE idempotency hash is recorded at
                                 # the RESULT-processing site, and only when
                                 # the call actually SUCCEEDED. Recording it
@@ -8995,7 +9080,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # earlier failure can't latch the pivot prompt.
                         consecutive_parse_errors = 0
                         for i, result in enumerate(results):
-                            fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter = tool_call_metadata[i]
+                            fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op = tool_call_metadata[i]
                             str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
 
                             # Record this call's outcome uniformly (before the
@@ -9024,7 +9109,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # later iteration is intercepted before dispatch.
                             if _res_is_error:
                                 try:
-                                    self._failure_guard.record(fname, ptarget, str_res)
+                                    self._failure_guard.record(fname, ptarget, str_res, ptool_op)
                                 except Exception:
                                     pass
 
@@ -9243,9 +9328,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 ("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error")
                             ) or "Traceback" in str_res
                             if fname and not is_mutating and not _res_is_error:
+                                # threshold=2 (was 3): the SECOND identical
+                                # read is already zero-information — nudge
+                                # immediately, abort on the third (chess
+                                # session 2026-07-08: 5 identical re-reads of
+                                # index.html while theorizing about a URL one
+                                # probe would have settled).
                                 _asig, _acnt, _atrip = strikes.note_action(
                                     fname, ptarget,
                                     _action_result_fingerprint(str_res),
+                                    threshold=2,
                                 )
                                 if _atrip and (_noprogress_trip is None or _acnt > _noprogress_trip[1]):
                                     _noprogress_trip = (_asig, _acnt, fname, ptarget)
@@ -9378,7 +9470,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         if _noprogress_trip is not None and not force_stop and not force_final_response:
                             _asig, _acnt, _afname, _atarget = _noprogress_trip
                             _tgt_desc = f" on '{_atarget}'" if _atarget else ""
-                            if _acnt >= 5:
+                            if _acnt >= 3:
                                 pretty_log(
                                     "Loop Breaker",
                                     f"No-progress loop: '{_afname}'{_tgt_desc} repeated {_acnt}x "
@@ -9389,10 +9481,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     final_ai_content = (
                                         f"[ATTEMPT_ABORTED_NO_PROGRESS] I repeated the same "
                                         f"'{_afname}' action{_tgt_desc} {_acnt} times and got the "
-                                        "same result each time, so I stopped to avoid an endless "
-                                        "verification loop. The change I made is in place; I could "
-                                        "not confirm it by re-observing in this environment. Please "
-                                        "verify it directly (e.g. open it in a real browser)."
+                                        "same result each time, so I stopped instead of looping. "
+                                        "Any changes I made so far are in place. To move forward I "
+                                        "need one piece of real evidence I could not get from here: "
+                                        "the exact error text or failing URL from your side (e.g. "
+                                        "browser devtools), or the output of re-running the failing "
+                                        "step — send me that and I'll fix the actual cause instead "
+                                        "of guessing."
                                     )
                                 force_stop = True
                             elif _asig not in repeated_action_steered:
@@ -9424,30 +9519,36 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 if _readwrite_loop:
                                     messages.append({"role": "user", "content": (
                                         f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} "
-                                        "times and gotten the SAME result — you are RE-READING, not "
-                                        "making progress. STOP listing/reading. You already have the "
-                                        "current state; it is AUTHORITATIVE. If the task requires a "
-                                        f"CHANGE, call '{_afname}' ONCE NOW with the mutating action "
-                                        "(e.g. define/write/update/create) to apply it, then report "
-                                        "what you changed. If no change is needed, write your FINAL "
-                                        "answer from the state you already have. Do NOT issue another "
-                                        "read/list of this tool."
+                                        "times and gotten the SAME result — re-reading produces NO new "
+                                        "information. You already have the current state; it is "
+                                        "AUTHORITATIVE. Do ONE of these NOW instead:\n"
+                                        "1. GATHER NEW EVIDENCE: probe the thing you are theorizing "
+                                        "about — `execute` a curl/run of the exact URL/command/code in "
+                                        "question and read the actual response, instead of predicting "
+                                        "it from the source.\n"
+                                        f"2. APPLY THE CHANGE: if the task needs a change, call "
+                                        f"'{_afname}' ONCE with the mutating action "
+                                        "(write/update/create) and report what you changed.\n"
+                                        "3. ASK THE USER: if the failure is on THEIR side (their "
+                                        "browser, their process, their network), ask for the exact "
+                                        "error text/URL from their screen — one question beats "
+                                        "guessing.\n"
+                                        "Do NOT issue another read/list of this tool."
                                     )})
                                 else:
                                     force_final_response = True
                                     messages.append({"role": "user", "content": (
                                         f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
-                                        "and gotten the SAME result with no change. Repeating it will NOT "
-                                        "produce new information — STOP re-observing. The strongest "
-                                        "evidence you already have (a DOM/state inspection, the sandbox "
-                                        "file listing, the actual file contents, or a tool result you "
-                                        "already received) is AUTHORITATIVE; trust it instead of looking "
-                                        "again. Write your FINAL answer now: if you have already confirmed "
-                                        "the change via state/DOM/file inspection, report success and say "
-                                        "how you confirmed it; if this environment cannot show you the "
-                                        "result (e.g. a visual check that headless rendering won't "
-                                        "display), say so plainly and tell the user exactly how to verify "
-                                        "it themselves. Do NOT call this tool again."
+                                        "and gotten the SAME result with no change — re-observing "
+                                        "produces NO new information. The evidence you already have is "
+                                        "AUTHORITATIVE. Write your FINAL answer now: if you confirmed "
+                                        "the change via state/file inspection, report success and how "
+                                        "you confirmed it. If you are still UNSURE why something fails, "
+                                        "do not guess — say plainly what you verified, what you could "
+                                        "not verify from here, and ask the user for the ONE piece of "
+                                        "evidence that would settle it (the exact error text, the "
+                                        "failing URL from their devtools, or the output of a command "
+                                        "you give them). Do NOT call this tool again."
                                     )})
 
                         if turn_has_failure:

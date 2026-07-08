@@ -662,7 +662,18 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
 
 async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox_dir: Path):
     pretty_log("File Replace", filename, icon=Icons.TOOL_FILE_W)
-    if not old_text: return "Error: You must specify the exact 'content' to be replaced."
+    if not old_text:
+        # Name the legal alternative explicitly. Observed live 2026-07-08
+        # (chess session): two content-less replace calls put the model in a
+        # retry spiral because the error didn't tell it HOW to move forward —
+        # either the upstream native-args transport dropped `content` (the
+        # known corruption family below) or the model omitted it; either way
+        # the escape is the same.
+        return ("Error: You must specify the exact 'content' to be replaced. "
+                "If you meant to rewrite or extend the whole file instead, "
+                "call file_system with operation='write' and the FULL new "
+                "file in 'content' — do NOT retry 'replace' without the "
+                "exact existing text.")
 
     has_aider_blocks = "<<<< SEARCH" in str(old_text)
 

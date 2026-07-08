@@ -345,6 +345,48 @@ class FrontierTracker:
         tier = self.get_difficulty_tier(cluster_key)
         return DIFFICULTY_HINTS.get(tier, DIFFICULTY_HINTS["basic"])
 
+    @staticmethod
+    def _cluster_defaults() -> dict:
+        """Full schema for a cluster stats entry.
+
+        winning_solutions is a small ring buffer of recent winning
+        solution.py sources, used by `recent_winning_solutions` to feed the
+        novelty scorer; capped (WINNING_SOLUTIONS_KEEP) to avoid unbounded
+        JSON growth.
+        """
+        return {
+            "runs": 0,
+            "best_length": None,
+            "last_length": None,
+            "last_compression": 0.0,
+            "mastered": False,
+            "recent_outcomes": [],
+            "recent_hashes": [],
+            "total_first_try_wins": 0,
+            "unlocked_tier_index": 0,
+            "winning_solutions": [],
+            "winning_solution_hashes": [],
+        }
+
+    @classmethod
+    def _ensure_cluster(cls, clusters: dict, cluster_key: str) -> dict:
+        """setdefault + schema back-fill for a cluster entry.
+
+        A cluster can be CREATED by a writer with a partial shape
+        (note_reflection_failure records into a bare ``{}``), and older
+        persisted files predate newer keys — in both cases a plain
+        full-defaults ``setdefault`` no-ops on the existing dict and the
+        direct key reads (``cluster["runs"]``) raise KeyError. Observed
+        live 2026-07-08: ``python_general`` existed with only
+        ``reflection_failures``, so every ``record_run`` on that cluster
+        failed with ``'runs'`` and no run history was recorded. Back-fill
+        keeps extra keys (like ``reflection_failures``) untouched.
+        """
+        cluster = clusters.setdefault(cluster_key, {})
+        for k, v in cls._cluster_defaults().items():
+            cluster.setdefault(k, v)
+        return cluster
+
     def note_reflection_failure(self, cluster_key: str, *, diagnosis: str = "") -> None:
         """Record that the reflection phase critiqued a FAILED *interactive*
         turn belonging to ``cluster_key``.
@@ -361,7 +403,9 @@ class FrontierTracker:
             with self._crossproc_lock(), self._lock:
                 state = self._load()
                 clusters = state.setdefault("clusters", {})
-                cluster = clusters.setdefault(cluster_key, {})
+                # _ensure_cluster (not a bare {}): creating a partial
+                # cluster here is exactly what broke record_run live.
+                cluster = self._ensure_cluster(clusters, cluster_key)
                 failures = cluster.setdefault("reflection_failures", [])
                 failures.append({
                     "ts": datetime.now().isoformat(),
@@ -618,27 +662,7 @@ class FrontierTracker:
                 clusters = state.setdefault("clusters", {})
                 runs = state.setdefault("runs", [])
 
-                cluster = clusters.setdefault(
-                    cluster_key,
-                    {
-                        "runs": 0,
-                        "best_length": None,
-                        "last_length": None,
-                        "last_compression": 0.0,
-                        "mastered": False,
-                        "recent_outcomes": [],
-                        "recent_hashes": [],
-                        "total_first_try_wins": 0,
-                        "unlocked_tier_index": 0,
-                        # winning_solutions: small ring buffer of recent
-                        # winning solution.py sources for this cluster.
-                        # Used by `recent_winning_solutions` to feed the
-                        # novelty scorer. Capped to avoid unbounded JSON
-                        # growth; 5 prior wins is plenty for Jaccard.
-                        "winning_solutions": [],
-                        "winning_solution_hashes": [],
-                    },
-                )
+                cluster = self._ensure_cluster(clusters, cluster_key)
                 is_new_cluster = cluster["runs"] == 0
 
                 # Per-template outcome history (proposal H): rotate out

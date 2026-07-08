@@ -265,7 +265,7 @@ class RecentFailureGuard:
         # ERROR to recur means a post-fix re-run that now succeeds, or fails a
         # NEW way, never trips the guard — only a genuine stuck loop does.
         self.repeat_threshold = int(max(1, repeat_threshold))
-        # Each entry: ((tool, target), normalised-error).
+        # Each entry: ((tool, target, op), normalised-error).
         self._history: Deque[Tuple[Tuple[str, str], str]] = deque(maxlen=self.window)
 
     @staticmethod
@@ -275,15 +275,22 @@ class RecentFailureGuard:
         line up."""
         return (text or "").strip()[:80].lower()
 
-    def record(self, tool: str, target: str, error_text: str) -> None:
+    def record(self, tool: str, target: str, error_text: str,
+               op: str = "") -> None:
         """Remember one FAILED call. No-op for an empty tool or error (a
-        successful call has no error and must never seed the guard)."""
+        successful call has no error and must never seed the guard).
+
+        ``op`` is the tool's operation/action discriminator: for multi-op
+        tools (file_system, manage_projects, browser) two calls on the same
+        target with DIFFERENT operations are different actions — observed
+        live 2026-07-08: keying on (tool, target) alone blocked the model's
+        correct replace→write recovery three times in a row."""
         err = self._norm_err(error_text)
         if not tool or not err:
             return
-        self._history.append(((tool, target or ""), err))
+        self._history.append(((tool, target or "", op or ""), err))
 
-    def would_repeat(self, tool: str, target: str) -> Optional[str]:
+    def would_repeat(self, tool: str, target: str, op: str = "") -> Optional[str]:
         """If dispatching ``tool`` against ``target`` would re-run an action
         that has already failed identically at least ``repeat_threshold``
         times in the window, return the offending error text (for the
@@ -296,7 +303,7 @@ class RecentFailureGuard:
         """
         if not tool:
             return None
-        key = (tool, target or "")
+        key = (tool, target or "", op or "")
         last_err = None
         for k, err in reversed(self._history):
             if k == key:

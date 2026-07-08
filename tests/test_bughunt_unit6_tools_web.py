@@ -198,9 +198,18 @@ class TestDeepResearchFetch:
             query="q", anonymous=True, tor_proxy="socks5://user:pass@127.0.0.1:9050",
             llm_client=llm,
         )
-        # The per-query identity proxy is forwarded (normalised to socks5h so
-        # DNS also rides the proxy); global NEWNYM suppressed.
-        assert seen["proxy_override"] == "socks5h://user:pass@127.0.0.1:9050"
+        # Per-URL fetch racing (2026-07-08): the fetch now rides its OWN Tor
+        # circuit (host:port preserved, credentials replaced by a per-(query,
+        # url, attempt) tag) rather than the verbatim per-query proxy — so
+        # distinct URLs decorrelate and retries escape a bad exit. The
+        # incoming per-query identity ("user") is folded into the tag so the
+        # anonymity linkage survives. Global NEWNYM still suppressed.
+        px = seen["proxy_override"]
+        assert px.startswith("socks5h://")          # normalised for DNS-over-proxy
+        assert "@127.0.0.1:9050" in px              # host:port preserved
+        assert ":isolate@" in px                    # IsolateSOCKSAuth tag injected
+        assert "user:pass@" not in px               # verbatim creds replaced
+        assert "user" in px.split("@")[0]           # per-query identity folded in
         assert seen["renew_identity"] is False
 
 

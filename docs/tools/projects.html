@@ -212,6 +212,8 @@
 
   <p>Persistence model: see <a href="../memory/projects.html">memory.projects</a>.</p>
 
+  <h2>Constraint judgment gate on task_update→DONE (2026-07-08)</h2>
+  <p>The existing constraint DONE-gate is evidence-based — it only demands that result text <em>exists</em>. The chess session showed the model supplies compliant-sounding evidence while the artifact violates the constraint (it built a heuristic engine after restating "Ghost plays directly"). Marking a constrained task DONE now also runs <code>core/build_gates.constraint_gate</code> — one LLM audit of the project workspace files per call. A confirmed violation refuses the transition and returns <code>agent_instruction_violation</code> with the evidence; a user-approved exception can pass a <code>result</code> beginning with <code>CONSTRAINT-OVERRIDE:</code>. Fails open on infra errors.</p>
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

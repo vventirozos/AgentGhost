@@ -204,6 +204,37 @@ def _failure_category(msg: str) -> str:
 # the caller wait forever.
 _RACE_WAVE_GRACE = 4
 
+# deep_research page-fetch resilience (2026-07-08). Fetch reachability over
+# Tor is exit-node-dependent just like search: a URL that times out / 503s
+# on one exit often serves fine on the next. Each URL gets its own circuit
+# and a circuit-retryable failure is retried on a fresh exit.
+_FETCH_ATTEMPTS = 2
+# Above the curl_cffi client's own 20s timeout so the client's cleaner
+# error surfaces first; the old outer 15s < 20s killed slow-but-live Tor
+# fetches before the client could complete (the mojeek-timeout bug's twin).
+_FETCH_ATTEMPT_TIMEOUT = 22.0
+
+
+def _fetch_error_is_retryable(err: str) -> bool:
+    """Should a failed page fetch be retried on a FRESH Tor circuit?
+
+    True for exit-node-dependent failures (timeout, 503, connection error,
+    5xx) that a different exit can fix; False for definitive application /
+    content errors (binary file, 401/403, SSRF refusal, 4xx) where a new
+    circuit is wasted effort. Unknown errors default to retryable — the
+    cost is at most one extra circuit attempt."""
+    e = (err or "").lower()
+    _definitive = (
+        "binary file", "refusing to read", "(403)", "(401)",
+        "will not help", "not allowed", "internal address",
+        "loopback", "private address", "invalid url", "ssrf",
+    )
+    if any(m in e for m in _definitive):
+        return False
+    if "received status 4" in e:  # 4xx — client/application error
+        return False
+    return True
+
 
 async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                             max_results: int = 20) -> List[Dict]:
@@ -525,22 +556,57 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
 
     if not urls: return "ERROR: No search results found. The internet might be blocking your request. Try a different query."
 
-    sem = asyncio.Semaphore(2)
-    PER_URL_TIMEOUT = 25.0  # hard ceiling on a single page fetch + summarisation
+    # Page-fetch concurrency. Raised 2→3 (2026-07-08): with a distinct Tor
+    # circuit per URL (below) the fetches no longer share one exit, so more
+    # of them can run at once without correlated blocking. Kept modest so a
+    # research turn doesn't open a dozen Tor circuits + worker LLM calls at
+    # once on the RAM-tight box.
+    sem = asyncio.Semaphore(3)
+    PER_URL_TIMEOUT = 55.0  # ceiling on fetch (≤2 circuits) + LLM distillation
 
     async def _fetch_with_timeout(url):
+        # Resilient per-URL fetch: each URL rides its OWN Tor circuit, and a
+        # circuit-retryable failure (timeout / 503 / connection error) is
+        # retried on a FRESH exit — the same exit-node-dependence that made
+        # search unreliable applies to fetches, and the same fix (a distinct
+        # circuit per attempt, no global NEWNYM) recovers the lost sources.
+        # Definitive errors (binary, 401/403, SSRF, 4xx) are NOT retried.
+        last = f"Error: Fetch of {url} failed"
+        # Fold the incoming per-QUERY identity (the SOCKS username the
+        # anonymous path tagged onto tor_proxy) into the salt, so the final
+        # circuit is scoped per-(query, url, attempt): distinct URLs and
+        # retries get distinct exits (reliability), and the same URL across
+        # different research sessions still can't be linked to one exit
+        # (anonymity — the property the old verbatim-forward provided).
         try:
-            # Honour THIS research turn's (per-query identity) proxy, and don't
-            # fire a global Tor NEWNYM on 503/error — several of these fetches
-            # run concurrently and a global re-circuit would sabotage the siblings.
-            return await asyncio.wait_for(
-                helper_fetch_url_content(url, proxy_override=tor_proxy, renew_identity=False),
-                timeout=15.0,
-            )
-        except asyncio.TimeoutError:
-            return f"Error: Fetch of {url} timed out after 15s"
-        except Exception as e:
-            return f"Error: {e}"
+            from urllib.parse import urlparse as _urlparse
+            _qid = (_urlparse(tor_proxy).username or "") if tor_proxy else ""
+        except Exception:
+            _qid = ""
+        _fetch_salt = ("f" + _qid)[:16] if _qid else "fetch"
+        for attempt in range(_FETCH_ATTEMPTS):
+            proxy = _proxy_for_attempt(tor_proxy, url, attempt, salt=_fetch_salt)
+            try:
+                res = await asyncio.wait_for(
+                    helper_fetch_url_content(url, proxy_override=proxy,
+                                             renew_identity=False),
+                    # Outer budget ABOVE the client's own 20s timeout so the
+                    # client returns its (cleaner) error first — previously
+                    # 15s < 20s guillotined slow-but-live Tor fetches.
+                    timeout=_FETCH_ATTEMPT_TIMEOUT,
+                )
+                if isinstance(res, str) and not res.lstrip().startswith("Error"):
+                    return res
+                last = res if isinstance(res, str) else str(res)
+                if not _fetch_error_is_retryable(last):
+                    return last
+            except asyncio.TimeoutError:
+                last = f"Error: Fetch of {url} timed out after {_FETCH_ATTEMPT_TIMEOUT:.0f}s"
+            except Exception as e:
+                last = f"Error: {e}"
+            if attempt + 1 < _FETCH_ATTEMPTS:
+                await asyncio.sleep(0.5)
+        return last
 
     async def process_url(url):
         async with sem:

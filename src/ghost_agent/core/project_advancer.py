@@ -169,6 +169,53 @@ def _get_project_lock(project_id: str) -> "threading.Lock":
         return lk
 
 
+class _PinnedProjectContext:
+    """Context proxy that pins ``current_project_id`` to one project.
+
+    ``current_project_id`` is process-global and owned by the CONVERSATION
+    reconciler: idle autoadvance ticks carry no conversation, so the global
+    is typically parked (None) while they run — and even when it matches,
+    a concurrent conversation's reconcile can clear it MID-BUILD. Tools
+    built from this proxy resolve ``project_scoped_sandbox()`` against the
+    pinned id instead, so an autonomous build's file writes land in
+    ``projects/<id>/`` — the same workspace an interactive session on the
+    project sees. Observed live 2026-07-08: idle autoadvance built
+    TinyAI's model.py/train.py/evaluate.py at the sandbox ROOT, and the
+    follow-up interactive demo task (after ``switch``) couldn't see any of
+    them and recreated the deliverable from scratch, detached from the
+    trained checkpoint.
+
+    Attribute reads fall through to the base context; attribute WRITES are
+    forwarded to the base too, so tool side effects (scratchpads, budgets,
+    counters) still land on the real context.
+    """
+
+    __slots__ = ("_base", "_pinned_pid")
+
+    def __init__(self, base, project_id: str):
+        object.__setattr__(self, "_base", base)
+        object.__setattr__(self, "_pinned_pid", str(project_id or ""))
+
+    @property
+    def current_project_id(self) -> str:
+        return object.__getattribute__(self, "_pinned_pid")
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_base"), name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, "_base"), name, value)
+
+
+def pinned_project_context(context, project_id: str):
+    """Return ``context`` with ``current_project_id`` pinned to
+    ``project_id``, for building autoadvance tool runners. Falls back to
+    the raw context when ``project_id`` is empty."""
+    if not project_id:
+        return context
+    return _PinnedProjectContext(context, project_id)
+
+
 # Keyword buckets used by the lightweight classifier. The lists are
 # deliberately short and high-precision; anything not hitting one
 # bucket defaults to RESEARCH, which is the safer autonomy mode (no

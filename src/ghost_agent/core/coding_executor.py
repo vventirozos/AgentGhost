@@ -682,6 +682,29 @@ async def build_coding_task(
             feedback = vfail
             continue
 
+        # Post-build gates (2026-07-08, from the chess-session post-mortem).
+        # Smoke first (mechanical, cheap): py_compile every written .py and
+        # sweep Flask routes with test_client — three crash-on-first-touch
+        # bugs shipped in one session because no handler was ever exercised.
+        from .build_gates import constraint_gate, files_from_specs, smoke_gate
+        sfail = await smoke_gate(tool_runner, written)
+        if sfail:
+            last = sfail
+            feedback = sfail
+            continue
+        # Then the constraint audit (one background LLM call): the spec
+        # verify checks "does it run"; this checks "is it what the user
+        # ALLOWED" — the session's engine-instead-of-Ghost build passed
+        # every mechanical check while violating the stated constraint.
+        if constraints:
+            cok, creason = await constraint_gate(
+                context, constraints, files_from_specs(files),
+                is_background=is_background)
+            if not cok:
+                last = creason
+                feedback = creason
+                continue
+
         summary = (spec.get("summary") if isinstance(spec, dict) else "") or \
             f"wrote {', '.join(written)}"
         ledger_note = (spec.get("ledger") if isinstance(spec, dict) else "") or ""

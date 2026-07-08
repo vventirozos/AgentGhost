@@ -212,6 +212,13 @@
   unavailable executor, and the <code>advance_once</code> integration (DONE +
   artifacts + ledger on success, FAILED on a broken build), plus the
   classification fix that routes file/build leaves here.</p>
+  <h2>Post-build gates (2026-07-08)</h2>
+  <p>Two gates run after the spec's own <code>verify</code> succeeds, both feeding the build-retry loop on failure (chess-session post-mortem: a build passed every mechanical check while violating the user's core constraint and shipping three crash-on-first-touch bugs):</p>
+  <ul>
+    <li><strong>Smoke gate</strong> (<code>core/build_gates.smoke_gate</code>): <code>py_compile</code> every written <code>.py</code>; when a Flask app is detected, sweep its routes with <code>test_client</code> (no server process): parameterless GET routes must not 5xx, POST routes get an empty JSON body and may 4xx but must not 5xx. The generated script self-bounds with <code>SIGALRM(45s)</code> so an import that starts a blocking server can't wedge the sandbox exec.</li>
+    <li><strong>Constraint gate</strong> (<code>core/build_gates.constraint_gate</code>): one background LLM audit of the files the task produced (<code>files_from_specs</code>) against the project's stored constraints — <em>judgement</em>-based, unlike the evidence-based DONE-gate in <code>tools/projects.py</code>. A confirmed violation becomes retry feedback quoting the constraint + evidence. The same gate guards the interactive <code>manage_projects task_update→DONE</code> path (refusal with an explicit <code>CONSTRAINT-OVERRIDE:</code> escape hatch for user-approved exceptions).</li>
+  </ul>
+  <p>Both gates <strong>fail open</strong> on infrastructure errors — a broken gate must never block builds. Covered by <code>tests/test_build_gates.py</code> (including an end-to-end run of the real smoke script against a Flask app with a 500-ing route) and <code>tests/test_probe_before_hypothesis.py</code> (wiring pins).</p>
 </main>
 </body>
 </html>

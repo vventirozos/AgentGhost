@@ -124,6 +124,15 @@
     and mirrors every <code>pretty_log</code> into the file. <code>--daemon</code> suppresses the
     console handler (file only). <code>NO_COLOR</code> / a non-TTY sink disables ANSI so piped logs
     stay clean.
+    <br><br>
+    <strong>Thinking is never filtered — and never truncated (2026-07-08).</strong> Streamed 💭
+    thinking blocks used to be swallowed before they reached the logger unless <code>--verbose</code>
+    was set. The emit/flush closures are no longer gated on <code>VERBOSE_MODE</code>, and the three
+    thinking call sites pass <code>pretty_log(..., no_truncate=True)</code> — a per-call exemption
+    from the content budget (newline flattening, redaction and column wrapping still apply, so the
+    line format is identical). Result: the full reasoning stream is visible in EVERY mode; all other
+    lines keep the standard 60-char budget in non-verbose. The post-stream 🧠 summary line is
+    unchanged in both modes. Covered by <code>tests/test_logging_thinking_nonverbose.py</code>.
   </div>
 
   <h2>Stream redaction (anonymity)</h2>

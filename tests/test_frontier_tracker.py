@@ -310,3 +310,55 @@ class TestDedupPreservesSaturationSignal:
         outcomes = ft2.get_cluster_stats("sql")["recent_outcomes"]
         assert len(outcomes) == 2, "duplicate append must be persisted to disk"
         assert outcomes[-1].get("duplicate") is True
+
+
+class TestPartialClusterSchemaBackfill:
+    """Regression tests for the live 2026-07-08 failure: a cluster entry
+    created with a PARTIAL shape (note_reflection_failure writes into a
+    bare dict) made record_run's full-defaults setdefault no-op, so
+    cluster["runs"] raised KeyError('runs') and NO self-play run was ever
+    recorded for that cluster ("Frontier record_run failed: 'runs'")."""
+
+    def test_record_run_survives_reflection_created_cluster(self, tmp_path):
+        tracker = FrontierTracker(tmp_path)
+        # Reflection creates the cluster first — exactly the live ordering.
+        tracker.note_reflection_failure("python_general", diagnosis="failed turn")
+        result = tracker.record_run(
+            "python_general", "challenge text", 1, True, 100,
+            solution_source="print('x')",
+        )
+        assert result["is_new_cluster"] is True  # no *runs* recorded before
+        state = json.loads((tmp_path / "self_play_frontier.json").read_text())
+        cluster = state["clusters"]["python_general"]
+        assert cluster["runs"] == 1
+        # The reflection data survived the back-fill untouched.
+        assert len(cluster["reflection_failures"]) == 1
+
+    def test_record_run_backfills_legacy_partial_state_file(self, tmp_path):
+        # Simulate the exact on-disk shape observed in prod: a cluster with
+        # ONLY reflection_failures, predating the run-stats schema.
+        path = tmp_path / "self_play_frontier.json"
+        path.write_text(json.dumps({
+            "runs": [],
+            "clusters": {
+                "python_general": {
+                    "reflection_failures": [{"ts": "2026-07-08T10:00:00", "diagnosis": "x"}],
+                },
+            },
+        }))
+        tracker = FrontierTracker(tmp_path)
+        result = tracker.record_run("python_general", "c", 1, False, 80)
+        assert result["compression_delta"] == -1.0
+        state = json.loads(path.read_text())
+        cluster = state["clusters"]["python_general"]
+        assert cluster["runs"] == 1
+        assert cluster["recent_outcomes"][-1]["passed"] is False
+
+    def test_reflection_failure_now_creates_full_schema(self, tmp_path):
+        tracker = FrontierTracker(tmp_path)
+        tracker.note_reflection_failure("sql", diagnosis="bad join")
+        state = json.loads((tmp_path / "self_play_frontier.json").read_text())
+        cluster = state["clusters"]["sql"]
+        for key in ("runs", "recent_outcomes", "recent_hashes", "mastered",
+                    "total_first_try_wins", "unlocked_tier_index"):
+            assert key in cluster, f"missing {key}"

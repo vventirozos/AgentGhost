@@ -529,7 +529,7 @@ def _redact_log(s: str) -> str:
         return s
 
 
-def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None):
+def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None, no_truncate: bool = False):
     req_id = request_id_context.get()
     tag = _req_tag(req_id)
     rcol = _req_color(req_id)
@@ -604,10 +604,16 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     # Failures get a larger content budget so the *why* (exception text, the
     # cause) survives on the monitored stream — not just in --verbose / the
     # file. INFO/DEBUG stay tight (60) to keep the stream scannable.
-    _limit = LOG_TRUNCATE_LIMIT
-    if level.upper() in ("WARNING", "WARN", "ERROR", "CRITICAL"):
-        _limit = max(LOG_TRUNCATE_LIMIT, 240)
-    content_str = _truncate(content_str, _limit).replace("\n", " ").replace("\r", "")
+    # ``no_truncate`` exempts a line from the budget entirely — used for
+    # 💭 thinking blocks (operator request 2026-07-08: full reasoning on the
+    # stream in EVERY mode); newline-flattening, redaction and column
+    # wrapping still apply so the format stays identical.
+    if not no_truncate:
+        _limit = LOG_TRUNCATE_LIMIT
+        if level.upper() in ("WARNING", "WARN", "ERROR", "CRITICAL"):
+            _limit = max(LOG_TRUNCATE_LIMIT, 240)
+        content_str = _truncate(content_str, _limit)
+    content_str = content_str.replace("\n", " ").replace("\r", "")
     # Redact secrets / .onion / home-paths / PII from the monitored stream
     # (post-truncation so the regex cost is bounded to the visible line).
     content_str = _redact_log(content_str)

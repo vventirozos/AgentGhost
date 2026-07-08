@@ -1546,6 +1546,8 @@ async def tool_manage_projects(
             gated: List[str] = []
             gated_constraints: List[str] = []
             active_constraints: List[str] = []
+            judged_violations: List[str] = []
+            constraint_audit = None  # (ok, reason) — one audit per call
             for tid in target_ids:
                 if tid not in plan.tree.nodes:
                     missing.append(tid)
@@ -1578,6 +1580,33 @@ async def tool_manage_projects(
                         if c not in active_constraints:
                             active_constraints.append(c)
                     continue
+                # Constraint JUDGMENT gate (2026-07-08): the evidence gate
+                # above only checks that result text EXISTS — the chess
+                # session showed the model happily supplies evidence prose
+                # while the artifact violates the constraint (it built a
+                # heuristic engine after restating "Ghost plays directly").
+                # One background LLM audit of the project's workspace files
+                # per task_update call; refusal carries the evidence. Escape
+                # hatch for a user-approved exception: result text starting
+                # with "CONSTRAINT-OVERRIDE:". Fails open on infra errors.
+                if (st_enum == TaskStatus.DONE and task_constraints
+                        and not str(result or "").lstrip().upper()
+                                .startswith("CONSTRAINT-OVERRIDE:")):
+                    if constraint_audit is None:
+                        try:
+                            from ..core.build_gates import constraint_gate
+                            from ..core.project_advancer import _gather_project_files
+                            _files = _gather_project_files(store, project_id)
+                            constraint_audit = await constraint_gate(
+                                context, task_constraints, _files,
+                                is_background=False)
+                        except Exception:
+                            logger.debug("constraint judgment gate skipped",
+                                         exc_info=True)
+                            constraint_audit = (True, "")
+                    if not constraint_audit[0]:
+                        judged_violations.append(tid)
+                        continue
                 # Register deliverables BEFORE flipping the task to DONE.
                 # update_status can roll the whole project to DONE on this
                 # same call (when it's the last open task), which fires the
@@ -1640,6 +1669,19 @@ async def tool_manage_projects(
                                        "count": len(updated)}
             if missing:
                 payload["missing"] = missing
+            if judged_violations:
+                payload["constraint_violations"] = judged_violations
+                payload["agent_instruction_violation"] = (
+                    f"REFUSED to mark {len(judged_violations)} task(s) DONE: "
+                    "an audit of the project files found a violation of the "
+                    "user's stated constraints. "
+                    + (constraint_audit[1] if constraint_audit else "")
+                    + " Fix the deliverable so it actually honors the "
+                    "constraint, then re-call task_update. Only if the USER "
+                    "has explicitly approved this exception, re-call with a "
+                    "`result` beginning with 'CONSTRAINT-OVERRIDE:' and "
+                    "their reason."
+                )
             if gated_constraints:
                 payload["gated_constraints"] = gated_constraints
                 payload["constraints"] = active_constraints
@@ -1864,6 +1906,7 @@ async def tool_manage_projects(
                 return _err("no active project (pass project_id or switch first)")
             from ..core.project_advancer import (
                 advance_many, default_llm_classifier, default_code_generator,
+                pinned_project_context,
             )
             from ..core.coding_executor import build_coding_task
 
@@ -1871,7 +1914,13 @@ async def tool_manage_projects(
             tools_map = None
             try:
                 from .registry import get_available_tools
-                tools_map = get_available_tools(context)
+                # Pin the tool runner to the TARGET project: the process-
+                # global current_project_id can be cleared mid-batch by a
+                # concurrent conversation's reconcile (and need not equal
+                # the project being advanced), which would silently land
+                # this batch's file writes at the sandbox root.
+                tools_map = get_available_tools(
+                    pinned_project_context(context, project_id))
             except Exception:
                 tools_map = None
             if tools_map:

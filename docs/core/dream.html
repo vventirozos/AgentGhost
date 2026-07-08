@@ -63,6 +63,16 @@
   </ol>
   <p>Candidate variable names scanned (in order): <code>expected_output, expected_lines, expected, expected_text, expected_str, expected_result, golden_output, golden, correct_output, answer</code>. The gate is best-effort: unparseable validators or those without a matching <code>subprocess.run</code> skip cleanly.</p>
 
+  <h3>4. Reference-solution consistency gate (2026-07-08)</h3>
+  <p>The echo self-test (gate 3) only catches validators that <em>crash</em> on their own expected output. It cannot catch the unwinnable shape observed live: a validator whose <strong>hardcoded expectations disagree with the data the setup script actually wrote</strong> (validator expected <code>duration=10</code> while <code>tasks.json</code> yields 25) — the probe echoes the expected output back, so the validator happily passes it, and the solver then fails 3/3 attempts on <em>correct</em> code, records a bogus <code>-1.0</code> frontier delta on the cluster, and learns a misleading "you skimmed a constraint" lesson.</p>
+  <p>LLM-generated challenges now must emit a fourth XML block, <code>&lt;reference_solution&gt;</code> — a runnable <code>solution.py</code> that <em>computes</em> the answer from the setup files at runtime. Two checks enforce it:</p>
+  <ol>
+    <li><strong>Static</strong> (<code>validate_reference_solution</code>, gen loop): the reference must open at least one file the setup script creates (same literal/dynamic-path logic as gate 1) — a reference that prints hardcoded values would agree with an equally-hardcoded validator, making the sandbox check vacuous. Rejection feeds the regeneration loop.</li>
+    <li><strong>Sandbox</strong> (after the M5 snapshot restore, before the solver starts): write the reference as <code>solution.py</code>, run it, then run <code>.validator.py</code> against the real setup data. Any non-zero exit (reference crash or validator rejection) <strong>discards the challenge</strong> as internally inconsistent; the snapshot is restored and <code>solution.py</code> unlinked either way, so the solver always starts from a clean sandbox.</li>
+  </ol>
+  <p>Deterministic templates and journal-mined challenges are pre-verified shapes and skip this gate; an LLM generation that omits the block is accepted with a logged warning (soft requirement — the gate is skipped, not the challenge).</p>
+  <div class="note"><strong>Tests:</strong> <code>tests/test_selfplay_reference_gate.py</code> (static gate semantics + wiring pins).</div>
+
   <h2>Runtime crash detector (widened)</h2>
   <p>Even past the three gates, a validator can raise during comparison. The attempt-loop circuit breaker classifies a traceback as a <strong>validator crash</strong> when the tail frame is <code>.validator.py</code>, <code>solution.py</code> is absent from the feedback, and the exception type is one of:</p>
   <ul>

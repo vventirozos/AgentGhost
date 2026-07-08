@@ -261,6 +261,35 @@ def _extract_filename_literals(source: str) -> set:
     return found
 
 
+def validate_reference_solution(setup_script: str, reference_solution: str) -> tuple:
+    """Static gate on an LLM challenge's <reference_solution>.
+
+    A reference that never opens the setup's files is almost certainly
+    printing hardcoded values — which would make the sandbox
+    reference-consistency gate vacuous (a hardcoded reference agrees with
+    an equally-hardcoded validator even when BOTH contradict the data the
+    setup script actually wrote — the exact unwinnable shape observed live
+    2026-07-08). Same literal/dynamic-path logic as the validator check in
+    validate_challenge_quality. Returns ``(ok, reason)``.
+    """
+    if not reference_solution or not setup_script:
+        return True, ""
+    setup_files = _extract_filename_literals(setup_script or "")
+    ref_dynamic = any(
+        marker in reference_solution for marker in _DYNAMIC_PATH_MARKERS
+    )
+    if setup_files and not ref_dynamic and not (
+        setup_files & _extract_filename_literals(reference_solution)
+    ):
+        return False, (
+            f"reference_solution reads none of the files the setup_script "
+            f"creates ({sorted(setup_files)!r}) — it must COMPUTE the "
+            f"answer from those files at runtime, not print hardcoded "
+            f"values."
+        )
+    return True, ""
+
+
 def validate_challenge_quality(setup_script: str, validation_script: str) -> tuple:
     """Pre-flight sanity check on an LLM-generated challenge.
 
@@ -1824,7 +1853,7 @@ Return ONLY a JSON object with:
         system_message = SYNTHETIC_CHALLENGE_PROMPT
 
         # Add strict constraint to prevent token overflow
-        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags: <challenge_prompt>, <setup_script>, and <validation_script>. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements.\n11. F-STRING SAFETY: Inside f-string `{...}` braces, do NOT embed `[`, `(`, `'`, or `\"`. The Python parser frequently rejects these as 'closing parenthesis }' does not match opening parenthesis '['' or 'unterminated string'. Pre-compute the value into a local variable first and then interpolate the plain name. Example — bad: `print(f\"got {data['key'][0]}\")`; good: `v = data['key'][0]; print(f\"got {v}\")`. To print a literal brace, double it (`{{` / `}}`). This applies to BOTH setup_script and validation_script."
+        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags IN THIS ORDER: <challenge_prompt>, <setup_script>, <reference_solution>, and <validation_script> LAST. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </reference_solution>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements.\n11. F-STRING SAFETY: Inside f-string `{...}` braces, do NOT embed `[`, `(`, `'`, or `\"`. The Python parser frequently rejects these as 'closing parenthesis }' does not match opening parenthesis '['' or 'unterminated string'. Pre-compute the value into a local variable first and then interpolate the plain name. Example — bad: `print(f\"got {data['key'][0]}\")`; good: `v = data['key'][0]; print(f\"got {v}\")`. To print a literal brace, double it (`{{` / `}}`). This applies to BOTH setup_script and validation_script.\n12. REFERENCE SOLUTION: <reference_solution> is a complete, runnable solution.py that solves YOUR challenge by READING the mock files your setup_script wrote and COMPUTING the answer from them at runtime — NEVER print hardcoded expected values. It will be executed against your setup data and MUST pass your validator; if it does not, the entire challenge is discarded as internally inconsistent. Keep it under 40 lines."
 
         # Curiosity / frontier targeting: survey the FrontierTracker on the
         # real context (not the isolated one — this runs before isolation) to
@@ -2014,6 +2043,10 @@ Return ONLY a JSON object with:
         _tpl_source = "cluster"
         challenge_domains: list = []
         journal_source = False
+        # Only the LLM-generation path below populates this; deterministic
+        # templates and journal-mined challenges are pre-verified shapes and
+        # skip the reference-consistency gate.
+        reference_solution = ""
         # --- Journal-mined challenge path --------------------------------
         # Normally we sample a journal-mined challenge with low
         # probability — 0.25 is enough to anchor the curriculum to real
@@ -2279,7 +2312,7 @@ Return ONLY a JSON object with:
                     # Fallback: stop at the next OTHER top-level block opener
                     # (so a missing </tag> doesn't silently include the next
                     # section's body) or at end-of-string.
-                    next_block_re = r'<(?:challenge_prompt|setup_script|validation_script)\b'
+                    next_block_re = r'<(?:challenge_prompt|setup_script|reference_solution|validation_script)\b'
                     m = re.search(
                         rf'<{tag}[^>]*>(.*?)(?={next_block_re}|$)',
                         text, re.DOTALL | re.IGNORECASE
@@ -2301,6 +2334,7 @@ Return ONLY a JSON object with:
                 challenge = _extract_with_fallback("challenge_prompt")
                 validation_script = _extract_with_fallback("validation_script")
                 setup_script = _extract_with_fallback("setup_script")
+                reference_solution = _extract_with_fallback("reference_solution")
 
                 if validation_script:
                     validation_script = extract_code_from_markdown(validation_script)
@@ -2309,6 +2343,10 @@ Return ONLY a JSON object with:
                 if setup_script:
                     setup_script = extract_code_from_markdown(setup_script)
                     setup_script, _ = sanitize_code(setup_script, ".setup.py")
+
+                if reference_solution:
+                    reference_solution = extract_code_from_markdown(reference_solution)
+                    reference_solution, _ = sanitize_code(reference_solution, "solution.py")
 
             except Exception as e:
                 # C2: a single transient LLM exception used to kill the
@@ -2382,6 +2420,19 @@ Return ONLY a JSON object with:
             # Quality gate — catches unwinnable challenges at generation
             # time instead of after 20 minutes of pointless simulation.
             ok, reason = validate_challenge_quality(setup_script, validation_script)
+            if ok and reference_solution and setup_script:
+                ok, reason = validate_reference_solution(
+                    setup_script, reference_solution
+                )
+            if ok and not reference_solution:
+                # Soft requirement: the challenge is still usable, but the
+                # sandbox consistency gate will be skipped — surface that.
+                pretty_log(
+                    "Self-Play Quality Gate",
+                    "Model omitted <reference_solution> — accepting challenge "
+                    "but the validator-vs-data consistency gate will be SKIPPED.",
+                    level="WARNING", icon=Icons.WARN,
+                )
             if ok:
                 gen_ok = True
                 break
@@ -2988,35 +3039,96 @@ Return ONLY a JSON object with:
                 # setup snapshot to cancel those side effects before the
                 # solver starts. Also purge any stragglers the pre-
                 # flight created that weren't in the snapshot.
-                if setup_snapshot:
-                    def _preflight_restore(sandbox_path: Path, snap: dict):
-                        try:
-                            snap_names = set(snap.keys())
-                            for p in sandbox_path.iterdir():
-                                if p.name in {".setup.py", ".validator.py", ".preflight.py", "acquired_skills"}:
-                                    continue
-                                if p.name.startswith(".mount_sync_"):
-                                    continue
-                                if p.name in snap_names:
-                                    continue
-                                try:
-                                    if p.is_file() or p.is_symlink():
-                                        p.unlink()
-                                    elif p.is_dir():
-                                        import shutil as _shutil
-                                        _shutil.rmtree(p, ignore_errors=True)
-                                except Exception:
-                                    pass
-                        except Exception:
-                            pass
-                        for name, blob in snap.items():
+                def _preflight_restore(sandbox_path: Path, snap: dict):
+                    try:
+                        snap_names = set(snap.keys())
+                        for p in sandbox_path.iterdir():
+                            if p.name in {".setup.py", ".validator.py", ".preflight.py", "acquired_skills"}:
+                                continue
+                            if p.name.startswith(".mount_sync_"):
+                                continue
+                            if p.name in snap_names:
+                                continue
                             try:
-                                (sandbox_path / name).write_bytes(blob)
+                                if p.is_file() or p.is_symlink():
+                                    p.unlink()
+                                elif p.is_dir():
+                                    import shutil as _shutil
+                                    _shutil.rmtree(p, ignore_errors=True)
                             except Exception:
                                 pass
+                    except Exception:
+                        pass
+                    for name, blob in snap.items():
+                        try:
+                            (sandbox_path / name).write_bytes(blob)
+                        except Exception:
+                            pass
+
+                if setup_snapshot:
                     await asyncio.to_thread(
                         _preflight_restore, Path(temp_sandbox), setup_snapshot
                     )
+
+                # --- Reference-solution consistency gate (2026-07-08) ----
+                # The echo self-test above only catches validators that
+                # CRASH on their own expected output. It cannot catch the
+                # unwinnable-by-construction shape observed live: a
+                # validator whose hardcoded expectations disagree with the
+                # data setup_script actually wrote (validator expected
+                # duration=10 while tasks.json yields 25) — the solver then
+                # failed 3/3 attempts on CORRECT code, recorded a bogus
+                # -1.0 frontier delta on the cluster, and learned a
+                # misleading "you skimmed a constraint" lesson. LLM
+                # challenges now ship a <reference_solution> that computes
+                # the answer from the setup data; it must PASS the
+                # validator or the challenge is discarded before the
+                # solver wastes attempts on it.
+                if reference_solution and reference_solution.strip():
+                    ref_path = Path(temp_sandbox) / "solution.py"
+                    try:
+                        await asyncio.to_thread(ref_path.write_text, reference_solution)
+                        r_out, r_code = await asyncio.to_thread(
+                            isolated_context.sandbox_manager.execute,
+                            "python3 solution.py", 30,
+                        )
+                        rv_out, rv_code = ("", 0)
+                        if r_code == 0:
+                            rv_out, rv_code = await asyncio.to_thread(
+                                isolated_context.sandbox_manager.execute,
+                                "python3 .validator.py", 30,
+                            )
+                    finally:
+                        try:
+                            await asyncio.to_thread(ref_path.unlink)
+                        except Exception:
+                            pass
+                        if setup_snapshot:
+                            await asyncio.to_thread(
+                                _preflight_restore, Path(temp_sandbox), setup_snapshot
+                            )
+                    if r_code != 0 or rv_code != 0:
+                        _why = (
+                            f"the reference solution itself crashed (exit {r_code}):\n{(r_out or '')[-300:]}"
+                            if r_code != 0 else
+                            f"the validator REJECTED the reference solution (exit {rv_code}):\n{(rv_out or '')[-300:]}"
+                        )
+                        pretty_log(
+                            "Self-Play Consistency",
+                            "Challenge discarded: validator disagrees with its own "
+                            f"setup data — {_why}",
+                            level="ERROR", icon=Icons.STOP,
+                        )
+                        return (
+                            "Synthetic challenge generation failed: the challenge's "
+                            "own reference solution does not pass its validator "
+                            "against the data the setup script wrote — the challenge "
+                            "is internally inconsistent (unwinnable by construction) "
+                            f"and has been discarded.\nDetail: {_why}\n\n"
+                            "SYSTEM INSTRUCTION: The challenge was tested in a "
+                            "temporary sandbox that has now been destroyed. DO NOT "
+                            "call the self_play tool again automatically."
+                        )
 
                 temp_agent = GhostAgent(isolated_context)
                 # Any tool that writes to real, non-isolated state must
