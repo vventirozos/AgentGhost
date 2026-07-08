@@ -425,6 +425,46 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-08 — Tor web-search: per-engine circuit race (search.py)
+- **Trigger:** operator's live session showed searches failing wholesale ("ZERO results across all
+  engines and circuits", 74 s burned) and the model then hallucinating "research results" from its own
+  knowledge and marking the research task DONE.
+- **Measured first** (42 probes: 7 engines × 2 queries × 3 fresh circuits): per-(engine,circuit)
+  success **~10%** — brave 2/6, yahoo 1/6, mojeek 1/6, rest 0/6; even `python asyncio tutorial` got
+  1/21. Failures are exit-IP-driven, per my standing note (measure before touching the engine set).
+- **Root cause:** ddgs multi-backend mode runs all engines through the ONE proxy on the DDGS instance
+  → all engines shared a circuit per attempt → **correlated failure** (~10%, not breadth). Bonus: with
+  max_results=20, ddgs caps internal fan-out at 3 engine workers, so "5-engine breadth" was ~3-on-1-exit.
+- **Fix (`_race_search_wave`):** one single-engine ddgs call PER ENGINE, each on its OWN circuit
+  (per-engine salt in the SOCKS auth tag), first non-empty junk-filtered result wins, losers cancelled;
+  wave deadline = ddgs timeout + grace. web_search: 2 waves + 2 reformulation waves (~24 independent
+  tickets ≈ 90%+); deep_research: 2 waves. `yahoo` re-added (re-measured: fails fast ~1.4-2.2 s, no
+  longer hangs, won a probe); `grokipedia` stays out (typeahead API, 0/6). StopIteration from an engine
+  is converted to RuntimeError (PEP 479 would poison asyncio future chaining — surfaced by the suite).
+- **Live-validated over real Tor: 3/3 queries** (incl. both exact failing prod queries) **won wave 0 in
+  ~2 s** (yahoo ×2, duckduckgo ×1) vs 74 s → zero before. Tests: +4 `test_search_engine_race.py` (race
+  semantics) + updated contracts in hardening/resilience/enhancements/audit suites (nondeterministic
+  call order → query-keyed mocks; cache isolation). Docs: `docs/tools/search.html` rewritten (race
+  section). **Deploy note: prod needs a restart to pick this up.**
+- Residual (not code): the model *inventing* sources after a failed search is a separate honesty issue —
+  the error text already instructs "state that web search was unavailable"; watch whether the faster
+  successful path makes this moot.
+- **Post-restart follow-up (same day):** live tally after deploy: 9 searches → 5 won wave 0/1 (~2 s),
+  3 saved by reformulation waves, 1 total strike-out — an 11-word keyword-stuffed query (hallucinated
+  "postgresql 20"); residual failures are query-side. Three refinements shipped: (1) wave-failure log
+  groups engines by identical error + strips URLs (`_brief_engine_error` — fixes the cryptic `url (h`
+  truncation); (2) every wave log line carries a ‹query› tag (concurrent searches interleave — a
+  "won wave 10" next to "ZERO results" was two different searches); (3) `_reformulate_query` hard-trims
+  >6-word queries to the first 5 words of the broadened form instead of "how to {query}" (which kept
+  every rare term and failed identically). Tests: +3 (race log grouping/tagging, reformulation trim).
+- **Second live pass (post-restart eval + operator log feedback):** request 68 (PG20 deep research) went
+  10/10 searches, 0 strike-outs (5 wave-0/1 wins ~1-4 s, 4 reformulation rescues incl. the new hard-trim;
+  yahoo won 4 races). Operator asked for terser failure lines → wave failures now ONE categorized line
+  (`no winner — 5 empty; mojeek conn-error` via `_failure_category`; unknown errors keep a 48-char
+  snippet; full sanitized detail → logger.debug); URL-strip regex keeps closing punctuation. Correction:
+  "postgresql 20" is a real in-dev version (cycle opened 2026-06-29), so the earlier strike-out was pure
+  keyword stuffing. Known-slow residual: deep_research per-URL page fetches over Tor.
+
 ### 2026-07-07 — Correctness/security sweep + deeper B3 + #6/#7 closed
 - **7 headless fixes** shipped with tests + docs, suite 6528→**6587** green (0 fail): graph-compression
   expired-fact resurrection (temporal-safe node merge, +7); correction-lookup banner fingerprint

@@ -38,34 +38,33 @@
 </aside>
 <main>
   <h1>tools / search.py</h1>
-  <p class="subtitle">Anonymous web search via Tor, over a <strong>Tor-reliable backend set</strong>, with operator sanitization, a short result cache, reformulated fallbacks and multi-source synthesis.</p>
+  <p class="subtitle">Anonymous web search via Tor, racing a <strong>wide engine set with one Tor circuit per engine</strong>, with operator sanitization, a short result cache, reformulated fallbacks and multi-source synthesis.</p>
 
   <h2>Tools</h2>
   <table>
     <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>web_search</code></td><td>Search via <code>ddgs</code> over a Tor SOCKS proxy, against a curated backend set (<code>mojeek,duckduckgo,yandex,brave,google</code>). The query is sanitized first, then served from a short TTL cache on repeat. 3 attempts with a 1&nbsp;s backoff, <strong>each on a fresh Tor circuit</strong>; if all miss, two reformulated queries are tried before giving up. <strong>No <code>NEWNYM</code> rotation</strong> — per-attempt SOCKS circuit isolation handles freshness (see below).</td></tr>
-      <tr><td><code>deep_research</code></td><td>Same hardened search front-end (3 rotating attempts), then fetches the top URLs and synthesises results via the LLM. Falls back to <code>web_search</code> when synthesis fails. The per-URL fetch now forwards THIS turn's per-query identity proxy and <strong>suppresses the global <code>NEWNYM</code></strong> (2026-07-03): several fetches run concurrently, so a global Tor re-circuit from one fetch would sabotage its siblings. The per-source extract is sized to <code>max_context</code> (not a hardcoded 40k) so a small worker can't overflow, and the distill-failure fallback is <code>_clean_for_cpp</code>-scrubbed (raw surrogates/control chars could otherwise crash the downstream C++ JSON parser).</td></tr>
+      <tr><td><code>web_search</code></td><td>Search via <code>ddgs</code> over a Tor SOCKS proxy. The query is sanitized first, then served from a short TTL cache on repeat. 2 racing <em>waves</em>: each wave fires <strong>one single-engine call per engine, each on its own Tor circuit</strong>, first non-empty result wins and the losers are cancelled; if both waves miss, two reformulated queries get a wave each before giving up. <strong>No <code>NEWNYM</code> rotation</strong> — per-engine SOCKS circuit isolation handles freshness (see below).</td></tr>
+      <tr><td><code>deep_research</code></td><td>Same racing search front-end (2 waves, no reformulation), then fetches the top URLs and synthesises results via the LLM. Falls back to <code>web_search</code> when synthesis fails. The per-URL fetch forwards THIS turn's per-query identity proxy and <strong>suppresses the global <code>NEWNYM</code></strong> (2026-07-03): several fetches run concurrently, so a global Tor re-circuit from one fetch would sabotage its siblings. The per-source extract is sized to <code>max_context</code> (not a hardcoded 40k) so a small worker can't overflow, and the distill-failure fallback is <code>_clean_for_cpp</code>-scrubbed (raw surrogates/control chars could otherwise crash the downstream C++ JSON parser).</td></tr>
       <tr><td><code>fact_check</code></td><td>Verifies a claim by calling <code>deep_research</code> as a sub-process.</td></tr>
     </tbody>
   </table>
 
-  <h2>Backend set + circuit rotation (Tor reliability)</h2>
+  <h2>Engine race: one circuit per engine (Tor reliability, re-measured 2026-07-08)</h2>
   <p>
-    <code>ddgs&nbsp;&ge;&nbsp;9</code> defaults to <code>backend="auto"</code>, which fans every query across <em>all</em> text engines. Two are excluded:
-  </p>
-  <ul>
-    <li><code>wikipedia</code> — its engine reads <code>region="wt-wt"</code> as language <code>wt</code> and builds the host <code>wt.wikipedia.org</code>, which doesn't exist, so it <strong>always</strong> raises a <code>ConnectError</code> over Tor.</li>
-    <li><code>yahoo</code> — never returned useful results in testing and is a known hang-until-timeout offender; pure latency risk, no upside.</li>
-  </ul>
-  <p>
-    The current set is <code>_TOR_BACKENDS = "mojeek,duckduckgo,yandex,brave,google"</code>. The crucial empirical finding (measured directly over Tor): <strong>no single engine is reliable — reachability is exit-node-dependent.</strong> On one circuit <code>mojeek</code> and <code>yandex</code> return results while <code>duckduckgo</code>/<code>brave</code>/<code>google</code> are CAPTCHA/empty; on the next circuit it flips. The engines that fast-fail (&ldquo;No results found&rdquo; in ~1.5&nbsp;s) are cheap lottery tickets, so breadth is kept; only genuine hangers are excluded.
+    Re-measured over Tor on 2026-07-08 (42 probes: 7 engines × 2 queries × 3 fresh circuits each): <strong>per-(engine, circuit) success is ~10%</strong> — brave 2/6, yahoo 1/6, mojeek 1/6, everything else 0/6 — and <em>which</em> engine wins flips from circuit to circuit. Even the trivial query <code>python asyncio tutorial</code> scored 1/21. Failures are driven by the <strong>exit IP's reputation</strong>, not the engine.
   </p>
   <p>
-    Because reachability is per-exit, the real fix is <strong>rotating the Tor circuit on every attempt</strong>. <code>_proxy_for_attempt</code> folds the attempt index into the SOCKS <code>username:password</code>, so Tor's <code>IsolateSOCKSAuth</code> hands each attempt a different exit node (verified: distinct tags → distinct exit IPs). Previously every attempt reused the same per-query circuit, so a retry on a blocked exit was pointless — the most common reason a search would burn three tries and still return nothing. There are 3 primary attempts (1&nbsp;s backoff) plus 2 reformulations, every one on its own circuit. This replaces the old global <code>NEWNYM</code>, which re-circuited <em>all</em> of Tor and cost seconds per call.
+    That kills the previous design: ddgs's multi-backend mode (<code>backend="m,d,y,b,g"</code>) runs every engine through the <em>one</em> proxy set on the <code>DDGS</code> instance — so all engines shared a circuit and <strong>failed together</strong> whenever that exit was blocked (~90% of the time). Worse, with <code>max_results=20</code> ddgs caps its internal fan-out at 3 concurrent engine workers, so the "5-engine breadth" was really ~3 engines on 1 exit.
   </p>
   <p>
-    <strong>Per-request timeout — the dominant reliability lever (measured 2026-06-11).</strong> The ddgs request timeout is <code>_DDGS_TOR_TIMEOUT = 18&nbsp;s</code>. This was previously <code>8&nbsp;s</code>, and that single number was responsible for most search failures: measured directly over Tor, the engine that actually returns results (usually <code>mojeek</code>) responds in <strong>~10–18&nbsp;s</strong> through a circuit, while the others fail fast (~1–6&nbsp;s). At 8&nbsp;s, <code>mojeek</code> was <strong>killed mid-request</strong> (the production log filled with <code>error sending request for url (mojeek…)</code>), so every engine came back empty and the search failed <em>even on circuits where results were reachable</em> — the agent then looped for minutes on retries that could never win. Raising the ceiling to 18&nbsp;s lets a successful search complete in ~12–18&nbsp;s; the fast-failing engines still fail fast, so only an all-circuits-blocked search pays the full budget. Validated live: queries that returned zero in the field now return 8 sources. Covered by <code>tests/test_search_tor_timeout.py</code>.
+    <code>_race_search_wave</code> decorrelates the failures: one single-engine <code>ddgs</code> call <em>per engine</em>, each tagged onto its <strong>own Tor circuit</strong> (<code>_proxy_for_attempt</code> with a per-engine <code>salt</code> folded into the SOCKS <code>username:password</code>; Tor's <code>IsolateSOCKSAuth</code> maps distinct credentials to distinct exits). The first engine returning non-empty junk-filtered results wins the wave and pending losers are cancelled. That turns one correlated ~10% attempt into <code>len(_RACE_ENGINES)</code> independent tickets (~47% per wave); 2 waves + 2 reformulation waves ≈ 24 tickets ≈ 90%+ overall. A typical success now lands in ~2–5&nbsp;s (the fast engines win fast); only a fully-blocked wave pays the ddgs timeout + a small grace (<code>_RACE_WAVE_GRACE</code>).
+  </p>
+  <p>
+    The race set <code>_RACE_ENGINES = (mojeek, duckduckgo, yandex, brave, google, yahoo)</code> is deliberately <strong>wide</strong> — at ~10% per ticket every fast-failing engine is a cheap independent lottery ticket. <code>yahoo</code> is back in (re-measured 2026-07-08: fails fast at ~1.4–2.2&nbsp;s instead of hanging, and won a probe). Still excluded: <code>wikipedia</code> (reads <code>region="wt-wt"</code> as language <code>wt</code> and builds the non-existent host <code>wt.wikipedia.org</code> — always a <code>ConnectError</code>) and <code>grokipedia</code> (typeahead API, 0/6 on real queries). A per-engine <code>StopIteration</code> is converted to <code>RuntimeError</code> before it can cross the thread→Future boundary (PEP 479 corrupts asyncio future chaining).
+  </p>
+  <p>
+    <strong>Per-request timeout (measured 2026-06-11).</strong> The ddgs request timeout is <code>_DDGS_TOR_TIMEOUT = 18&nbsp;s</code>. This was previously <code>8&nbsp;s</code>, and that single number caused a wave of failures of its own: measured over Tor, <code>mojeek</code> responds in <strong>~10–18&nbsp;s</strong> through a circuit while the others fail fast (~1–6&nbsp;s). At 8&nbsp;s, <code>mojeek</code> was <strong>killed mid-request</strong> (<code>error sending request for url (mojeek…)</code>), so every engine came back empty even on circuits where results were reachable. With the engine race, the slow-but-real engine can win a wave without making anyone wait when a fast engine wins first. Covered by <code>tests/test_search_tor_timeout.py</code>.
   </p>
 
   <h2>Query sanitization</h2>
@@ -87,9 +86,17 @@
   <h2>Reformulation strategy</h2>
   <ol>
     <li>Drop years / version numbers / numbers from the query (broaden).</li>
-    <li>Convert to a question form (<code>"how to X"</code>).</li>
-    <li>Append <code>tutorial</code> / <code>guide</code> / <code>example</code>.</li>
+    <li><strong>Long queries (&gt;6 words): hard-trim to the first 5 words of the broadened form.</strong> A keyword-stuffed query has near-zero organic hits <em>anywhere</em>, so no circuit can save it — and <code>"how to {query}"</code> keeps every rare term and fails identically (observed live 2026-07-08: the only total strike-out of the session was an 11-word query whose reformulations both preserved all its rare terms). Short queries still get the question form (<code>"how to X"</code>).</li>
+    <li>Append <code>tutorial</code> / <code>guide</code> / <code>example</code> as padding when the above yield fewer than 2 variants.</li>
   </ol>
+
+  <h2>Wave logging</h2>
+  <p>
+    Several searches can race concurrently in one agent turn, so every wave log line — winner (<code>mojeek won wave 0 in 1.8s (10 results) ‹query…›</code>) and failure — carries a <strong>truncated-query tag</strong> to keep interleaved output readable (an apparent "won wave 10" right before "ZERO results" is two different searches finishing together).
+  </p>
+  <p>
+    A failed wave emits <strong>one terse categorized line</strong> (operator request 2026-07-08 — even grouped exception reprs were a wall of text): <code>wave 0 ‹postgresql 20 features…›: no winner — 5 empty; mojeek conn-error</code>. <code>_failure_category</code> collapses each losing engine into <code>empty</code> (bare count — it's the boring default), <code>conn-error</code>, or <code>timeout</code> (engines named); an <em>unknown</em> error keeps a 48-char snippet so a new failure shape is never hidden. The full sanitized per-engine detail (URLs stripped via <code>_brief_engine_error</code>) goes to <code>logger.debug</code> for forensics.
+  </p>
 
   <h2>Output cleaning</h2>
   <p><code>_clean_for_cpp</code> preserves valid JSON but strips control characters and structural braces from non-JSON text. This prevents the C++ JSON parser inside llama.cpp from crashing on stray <code>{…}</code> in scraped page bodies.</p>
@@ -109,15 +116,15 @@
     Under <code>--anonymous</code>, each search also rides a <strong>distinct Tor circuit</strong>: <code>helpers.socks_url_with_identity</code> injects a SOCKS <code>username:password</code> into the proxy URL, and Tor's <code>IsolateSOCKSAuth</code> (on by default) maps distinct credentials to distinct circuits — so a colluding set of exit nodes / sites can't trivially link a sequence of different searches into one session. No NEWNYM thrash, no control port needed. Covered by <code>tests/test_quick_wins.py</code>.
   </p>
   <p>
-    The search path takes this one step further: <code>_proxy_for_attempt</code> folds <em>both</em> a query hash and the <em>attempt index</em> into the SOCKS tag, so retries of the same query land on <em>different</em> exits. This serves reliability (escape a blocked exit) and anonymity (a single logical search isn't pinned to one exit) at once.
+    The search path takes this one step further: <code>_proxy_for_attempt</code> folds a query hash, the <em>wave index</em> <strong>and a per-engine salt</strong> into the SOCKS tag, so within one wave every engine rides its own exit, and every wave rotates all of them. This serves reliability (uncorrelated engine failures, escape from a blocked exit) and anonymity (a single logical search isn't pinned to one exit, and no single exit sees the query hit every engine) at once.
   </p>
   <p>
-    This is also <em>why the search retry path no longer calls <code>request_new_tor_identity()</code></em>: a global <code>NEWNYM</code> re-circuits all of Tor (slow) and fights the per-attempt isolation above. The previous behaviour — 3 attempts, each rotating the identity and sleeping 5&nbsp;s, then two reformulations — could stretch a single failing search past 200&nbsp;s. The retry path now pauses 1&nbsp;s and rotates to a fresh circuit instead. (Page <em>fetches</em> in <code>helpers.helper_fetch_url_content</code> still rotate on <code>503</code>, where the exit node itself is rate-limited — that's the right place for it.)
+    This is also <em>why the search path never calls <code>request_new_tor_identity()</code></em>: a global <code>NEWNYM</code> re-circuits all of Tor (slow) and fights the per-engine isolation above. The old behaviour — 3 attempts, each rotating the identity and sleeping 5&nbsp;s, then two reformulations — could stretch a single failing search past 200&nbsp;s. (Page <em>fetches</em> in <code>helpers.helper_fetch_url_content</code> still rotate on <code>503</code>, where the exit node itself is rate-limited — that's the right place for it.)
   </p>
 
   <h2>Tests</h2>
   <p>
-    The backend set, the query sanitizer, the result cache, and per-attempt circuit rotation (<code>_proxy_for_attempt</code>) are covered by <code>tests/test_search_tor_hardening.py</code>; the NEWNYM-free rotating-retry contract by <code>tests/test_tor_resilience.py</code>; the tool-description guidance and 3-attempt/2-reformulation counts by <code>tests/test_search_enhancements.py</code>.
+    The race set, the per-engine circuit tags, the query sanitizer and the result cache are covered by <code>tests/test_search_tor_hardening.py</code>; the race semantics (slow-valid beats fast-junk, first-winner short-circuit, wave deadline, <code>StopIteration</code> containment) by <code>tests/test_search_engine_race.py</code>; the NEWNYM-free within-wave escape contract by <code>tests/test_tor_resilience.py</code>; the wave/reformulation call tallies and per-call params by <code>tests/test_search_enhancements.py</code>; the 18&nbsp;s ddgs timeout by <code>tests/test_search_tor_timeout.py</code>.
   </p>
 
   <footer><a href="../index.html">← Back to index</a></footer>

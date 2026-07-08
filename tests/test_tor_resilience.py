@@ -104,12 +104,12 @@ async def test_helper_fetch_url_content_retry_503_renews_tor():
 
 @pytest.mark.asyncio
 async def test_tool_search_ddgs_retry():
-    """Tor-resilience redesign: the search path no longer calls a global
-    NEWNYM between attempts. A global re-circuit is slow; instead each
-    attempt rotates onto its OWN Tor circuit via _proxy_for_attempt, so a
-    retry escapes a bad exit node without the NEWNYM cost. On a transient
-    failure we just pause briefly (1s) and try the next circuit — NO
-    request_new_tor_identity call.
+    """Tor-resilience redesign: the search path never calls a global NEWNYM.
+    A global re-circuit is slow; instead every engine in a racing wave rides
+    its OWN Tor circuit (_race_search_wave + per-engine SOCKS salt), so a
+    bad exit node is escaped WITHIN the wave — one engine failing while a
+    sibling succeeds must produce a result with no inter-wave backoff and
+    NO request_new_tor_identity call.
     """
     mock_ddgs_module = MagicMock()
     mock_ddgs_class = MagicMock()
@@ -120,7 +120,9 @@ async def test_tool_search_ddgs_retry():
          patch("src.ghost_agent.utils.helpers.request_new_tor_identity") as mock_renew, \
          patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
 
-        # Fail once, then succeed on the second attempt (a fresh circuit).
+        # One engine's circuit is blocked; a sibling engine in the SAME
+        # wave returns results. (Which engine gets which outcome is up to
+        # thread scheduling — exactly one succeeds either way.)
         mock_ddgs_instance = MagicMock()
         mock_ddgs_class.return_value.__enter__.return_value = mock_ddgs_instance
 
@@ -129,10 +131,11 @@ async def test_tool_search_ddgs_retry():
         result = await tool_search_ddgs("test query", "socks5://127.0.0.1:9050")
 
         assert "1. t" in result
-        # NEWNYM thrash removed — rotation no longer happens on search retry.
+        # NEWNYM thrash removed — rotation never happens on search retry.
         assert mock_renew.call_count == 0
-        # Backoff between the two attempts is a short 1s pause, not 5s.
-        mock_sleep.assert_called_with(1)
+        # The sibling engine won wave 0, so the inter-wave 1s backoff was
+        # never needed.
+        assert not any(c.args == (1,) for c in mock_sleep.call_args_list)
 
 @pytest.mark.asyncio
 async def test_tool_deep_research_retry():
@@ -149,7 +152,8 @@ async def test_tool_deep_research_retry():
         mock_ddgs_instance = MagicMock()
         mock_ddgs_class.return_value.__enter__.return_value = mock_ddgs_instance
 
-        # Fail once, then valid results on the second attempt (fresh circuit).
+        # One engine's circuit fails; a sibling engine in the same wave
+        # returns a valid result — the wave wins with no inter-wave backoff.
         mock_ddgs_instance.text.side_effect = [Exception("Tor blocked deep")] + [[{"title": "t1", "body": "b1", "href": "http://example.com/good"}]]
 
         # mock semaphore and requests for deep research parsing
@@ -159,7 +163,7 @@ async def test_tool_deep_research_retry():
 
             assert "http://example.com/good" in result
             assert mock_renew.call_count == 0
-            mock_sleep.assert_called_with(1)
+            assert not any(c.args == (1,) for c in mock_sleep.call_args_list)
 
 
 from src.ghost_agent.tools.file_system import tool_download_file

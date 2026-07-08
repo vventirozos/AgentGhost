@@ -63,15 +63,18 @@ async def test_web_search_reformulation_survives_total_primary_failure():
          patch("asyncio.sleep", new_callable=AsyncMock):
         inst = MagicMock()
         cls.return_value.__enter__.return_value = inst
-        # All 3 primary attempts RAISE — the old code then hit the
-        # reformulation block with `junk` unbound (UnboundLocalError,
-        # swallowed) and lost the recovery path. The first reformulation
-        # returns a usable hit.
-        inst.text.side_effect = (
-            [Exception("Tor blocked")] * 3
-            + [[{"title": "Reformulated hit", "body": "b",
-                 "href": "http://example.com/good"}]]
-        )
+        # EVERY engine-circuit for the primary query RAISES — the old code
+        # then hit the reformulation block with `junk` unbound
+        # (UnboundLocalError, swallowed) and lost the recovery path. The
+        # reformulated query (year stripped) returns a usable hit. Keyed on
+        # the query (not call order) because the racing engines consume
+        # calls in nondeterministic thread order.
+        def _text_by_query(q, **kwargs):
+            if q == "some very specific query 2024":
+                raise Exception("Tor blocked")
+            return [{"title": "Reformulated hit", "body": "b",
+                     "href": "http://example.com/good"}]
+        inst.text.side_effect = _text_by_query
         result = await tool_search_ddgs("some very specific query 2024",
                                         "socks5://127.0.0.1:9050")
     assert "Reformulated query" in result, result

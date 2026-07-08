@@ -1,6 +1,7 @@
 import asyncio
 import importlib.util
 import json
+import logging
 import os
 import copy
 import re
@@ -23,24 +24,31 @@ _JUNK_DOMAINS = [
     "csdn.net", "sohu.com", "sina.com", "forums.att.com",
 ]
 
-# Search backends queried over Tor. ddgs>=9 defaults to backend="auto",
-# which fans EVERY query across all text engines. Two are actively
-# harmful here and are dropped:
-#   * wikipedia — its engine treats region="wt-wt" as language "wt" and
-#     builds `https://wt.wikipedia.org/...`, a host that doesn't exist, so
-#     it ALWAYS raises a ConnectError over Tor (observed in traces).
-#   * yahoo     — never returns useful results in testing and is a known
-#     hang-until-timeout offender over Tor; pure latency risk, no upside.
-# The rest are kept. Empirically (measured directly over Tor) NO single
-# engine is reliable — reachability is EXIT-NODE-dependent: `mojeek` and
-# `yandex` return results on one circuit while `duckduckgo`/`brave`/
-# `google` are CAPTCHA/empty, and on the next circuit it flips. Breadth +
-# per-attempt circuit rotation (see _proxy_for_attempt) is what actually
-# wins, so we keep a WIDE set rather than betting on one engine. The
-# fast-failing engines ("No results found" in ~1.5s) are cheap lottery
-# tickets; only genuine hangers are worth excluding. Order is advisory;
-# ddgs re-sorts by engine.priority internally.
-_TOR_BACKENDS = "mojeek,duckduckgo,yandex,brave,google"
+# Search engines raced over Tor. Engine reachability over Tor is
+# EXIT-NODE-dependent and BAD: measured 2026-07-08 (42 probes, 7 engines ×
+# 2 queries × 3 fresh circuits each) the per-(engine,circuit) success rate
+# was ~10% — brave 2/6, yahoo 1/6, mojeek 1/6, everything else 0/6 — and
+# WHICH engine wins flips from circuit to circuit. Two structural
+# consequences drive the design here:
+#   1. RACE, don't fan out on one circuit. ddgs's own multi-backend mode
+#      runs every engine through the ONE proxy set on the DDGS instance,
+#      so a blocked exit IP fails all engines TOGETHER (correlated
+#      failure — exactly what we can't afford at 10% per ticket). Instead
+#      _race_search_wave fires one single-engine ddgs call PER ENGINE,
+#      each tagged onto its OWN Tor circuit, first non-empty wins:
+#      6 independent ~10% tickets ≈ 47% per wave vs ~10% correlated.
+#   2. Keep the set WIDE; fast failures are cheap lottery tickets.
+#      yahoo is back (re-measured 2026-07-08: fails FAST, ~1.4-2.2s
+#      RequestError — the old "hangs until timeout" behaviour is gone —
+#      and it actually won a probe). Still excluded:
+#        * wikipedia  — treats region="wt-wt" as language "wt" and builds
+#          `https://wt.wikipedia.org/...`, which doesn't exist: always a
+#          ConnectError.
+#        * grokipedia — typeahead API, 0/6 on real queries.
+_RACE_ENGINES: Tuple[str, ...] = ("mojeek", "duckduckgo", "yandex", "brave", "google", "yahoo")
+# Legacy comma-joined form (kept for callers/docs that referenced the old
+# single-call multi-backend constant).
+_TOR_BACKENDS = ",".join(_RACE_ENGINES)
 
 # Per-request ddgs timeout, in seconds. CRITICAL for Tor reliability and
 # measured directly: the engine that actually returns results over Tor
@@ -111,7 +119,8 @@ def _cache_put(key: str, value: str) -> None:
     _SEARCH_CACHE[key] = (time.monotonic(), value)
 
 
-def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int) -> Optional[str]:
+def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int,
+                       salt: str = "") -> Optional[str]:
     """Return the SOCKS proxy URL for a given retry attempt, tagged so each
     attempt rides a DISTINCT Tor circuit (a fresh exit node).
 
@@ -124,6 +133,11 @@ def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int) -> O
     ``IsolateSOCKSAuth`` (on by default) maps each attempt to its own
     circuit. Cheap, control-port-free, and verified to yield different
     exit IPs per tag — the alternative to a slow global NEWNYM.
+
+    ``salt`` extends the tag for callers that need MORE isolation than
+    per-(query, attempt): the engine race folds the engine name in, so
+    every engine in a wave rides its own circuit (uncorrelated failures)
+    instead of all sharing one exit IP.
 
     Any credentials already on the incoming proxy are stripped and
     replaced: the ``tool_search`` wrapper may have applied a per-query
@@ -141,9 +155,154 @@ def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int) -> O
             return base_proxy
         bare = urlunparse((p.scheme, f"{p.hostname}:{p.port or 9050}", "", "", "", ""))
         qh = hashlib.md5((query or "").encode("utf-8", "ignore")).hexdigest()[:8]
-        return socks_url_with_identity(bare, f"{qh}a{attempt}") or base_proxy
+        return socks_url_with_identity(bare, f"{qh}{salt}a{attempt}") or base_proxy
     except Exception:
         return base_proxy
+
+
+def _filter_junk(raw_results) -> List[Dict]:
+    """Drop results with missing/relative URLs or junk-domain hosts."""
+    valid = []
+    for r in raw_results or []:
+        url = r.get('href', r.get('url', '')).lower()
+        if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
+            continue
+        valid.append(r)
+    return valid
+
+
+def _brief_engine_error(e: BaseException) -> str:
+    """One readable line per losing engine: URLs stripped (a Tor search URL
+    is long enough to swallow the whole log-line budget — the field symptom
+    was yahoo errors truncated to `url (h`), whitespace collapsed, capped."""
+    s = str(e) or e.__class__.__name__
+    # Closing quotes/brackets stay OUT of the match so a repr like
+    # "url (https://x.com/y)')" reads "url (<url>)')", not "url (<url>".
+    s = re.sub(r"""https?://[^\s'")\]]+""", "<url>", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:80]
+
+
+def _failure_category(msg: str) -> str:
+    """Collapse a losing engine's error into a terse category for the
+    operator stream. Over Tor the failure reprs are long but boring — the
+    operator only needs to know HOW an engine lost, not the exception
+    plumbing. Unknown errors stay category "error" and keep a snippet."""
+    m = (msg or "").lower()
+    if not m or m == "empty" or "no results found" in m:
+        return "empty"
+    if "timed out" in m or "timeout" in m:
+        return "timeout"
+    if ("connect" in m or "requesterror" in m or "ssl" in m
+            or "error sending request" in m):
+        return "conn-error"
+    return "error"
+
+
+# A failed wave is bounded by the slowest engine (ddgs per-request timeout)
+# plus a small grace for thread scheduling; a wedged thread must never make
+# the caller wait forever.
+_RACE_WAVE_GRACE = 4
+
+
+async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
+                            max_results: int = 20) -> List[Dict]:
+    """Race ALL engines in parallel, each on its OWN Tor circuit; the first
+    engine to return non-empty (junk-filtered) results wins the wave.
+
+    This is the core Tor-reliability mechanism (measured 2026-07-08, see
+    _RACE_ENGINES): per-(engine, circuit) success is ~10% and failures are
+    driven by the exit IP, so the engines must NOT share a circuit. One
+    single-engine ddgs call per engine, each with its own SOCKS-auth tag,
+    turns one correlated ~10% attempt into len(_RACE_ENGINES) independent
+    tickets (~47% per wave). Losers are cancelled as soon as a winner
+    lands; a fully-blocked wave costs at most the ddgs timeout + grace.
+    """
+    from ddgs import DDGS
+
+    def _run_engine(engine: str, proxy: Optional[str]) -> List[Dict]:
+        kwargs: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
+        if proxy:
+            kwargs["proxy"] = proxy
+        try:
+            with DDGS(**kwargs) as ddgs:
+                return list(ddgs.text(query, max_results=max_results, region="wt-wt",
+                                      safesearch="moderate", backend=engine))
+        except StopIteration as e:
+            # StopIteration cannot legally cross an asyncio Future boundary
+            # (PEP 479 — it corrupts the event loop's future chaining), and
+            # a generator-backed engine can surface one. Convert it.
+            raise RuntimeError(f"engine {engine} produced no result stream") from e
+
+    t0 = time.monotonic()
+    tasks: Dict[Any, str] = {}
+    for engine in _RACE_ENGINES:
+        proxy = _proxy_for_attempt(tor_proxy, query, wave, salt=engine[:4])
+        task = asyncio.ensure_future(asyncio.to_thread(_run_engine, engine, proxy))
+        tasks[task] = engine
+
+    # Several searches can race concurrently in one agent turn; the query
+    # tag on every wave log line keeps their interleaved output readable.
+    qtag = truncate_query(query, 28)
+    deadline = _DDGS_TOR_TIMEOUT + _RACE_WAVE_GRACE
+    pending = set(tasks)
+    failures: List[Tuple[str, str]] = []
+    timed_out = False
+    try:
+        while pending:
+            remaining = deadline - (time.monotonic() - t0)
+            if remaining <= 0:
+                timed_out = True
+                break
+            done, pending = await asyncio.wait(
+                pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                timed_out = True
+                break
+            for task in done:
+                engine = tasks[task]
+                try:
+                    valid = _filter_junk(task.result())
+                except Exception as e:  # noqa: BLE001 — a losing engine must never sink the wave
+                    failures.append((engine, _brief_engine_error(e)))
+                    continue
+                if valid:
+                    pretty_log("DDGS Search",
+                               f"{engine} won wave {wave} in {time.monotonic() - t0:.1f}s "
+                               f"({len(valid)} results) ‹{qtag}›", icon=Icons.TOOL_SEARCH)
+                    return valid
+                failures.append((engine, "empty"))
+    finally:
+        for task in pending:
+            task.cancel()
+    if failures or timed_out:
+        # Operator stream gets ONE terse line — categories, not reprs:
+        #   wave 0 ‹postgresql 20 features…›: no winner — 5 empty; mojeek conn-error
+        # "empty" is the boring default so it's a bare count; engines are
+        # named only where that carries signal. Unknown errors keep a short
+        # snippet (never hide a failure shape we haven't seen before). Full
+        # sanitized per-engine detail goes to logger.debug for forensics.
+        cats: Dict[str, List[Tuple[str, str]]] = {}
+        for engine, msg in failures:
+            cats.setdefault(_failure_category(msg), []).append((engine, msg))
+        parts: List[str] = []
+        if "empty" in cats:
+            parts.append(f"{len(cats['empty'])} empty")
+        for cat in ("conn-error", "timeout"):
+            if cat in cats:
+                parts.append(f"{'+'.join(e for e, _ in cats[cat])} {cat}")
+        if "error" in cats:
+            engines = "+".join(e for e, _ in cats["error"])
+            parts.append(f"{engines} error: {cats['error'][0][1][:48]}")
+        if timed_out:
+            parts.append(f"wave deadline {deadline}s")
+        pretty_log("Search Error",
+                   f"wave {wave} ‹{qtag}›: no winner — " + "; ".join(parts),
+                   level="WARNING", icon=Icons.WARN)
+        logging.getLogger(__name__).debug(
+            "search wave %s ‹%s› detail: %s", wave, qtag,
+            "; ".join(f"{e}: {m}" for e, m in failures))
+    return []
 
 
 def truncate_query(query: str, limit: int = 35) -> str:
@@ -154,7 +313,7 @@ def _reformulate_query(query: str) -> List[str]:
     """Generate 2 reformulated search queries when the original fails.
 
     Strategy 1: Broaden by removing specific terms (numbers, versions, dates).
-    Strategy 2: Convert to a question form.
+    Strategy 2: Hard-trim long queries; convert short ones to question form.
     """
     import re as _re
     reformulations = []
@@ -163,13 +322,23 @@ def _reformulate_query(query: str) -> List[str]:
     broader = _re.sub(r'\b\d{4}\b', '', query)       # Remove years
     broader = _re.sub(r'\bv?\d+\.\d+\b', '', broader)  # Remove version numbers
     broader = _re.sub(r'\b\d+\b', '', broader)         # Remove other numbers
-    broader = broader.strip()
+    broader = _re.sub(r'\s+', ' ', broader).strip()
     if broader and broader != query and len(broader) > 5:
         reformulations.append(broader)
 
-    # Strategy 2: Convert to question form
+    # Strategy 2: shorten, or convert to question form. A keyword-stuffed
+    # query (>6 words) has near-zero organic hits ANYWHERE, so no circuit
+    # can save it — and prepending "how to" keeps all the specificity and
+    # fails identically (observed live 2026-07-08: the only total strike-out
+    # of the session was an 11-word query whose reformulations both kept
+    # every rare term). Hard-trim the broadened form to its first 5 words
+    # instead; the question form only helps short queries.
     words = query.strip().split()
-    if words and words[0].lower() not in {"how", "what", "why", "when", "where", "who", "which", "is", "can", "does"}:
+    if len(words) > 6:
+        trimmed = " ".join((broader or query).split()[:5])
+        if trimmed and len(trimmed) > 5 and trimmed not in reformulations:
+            reformulations.append(trimmed)
+    elif words and words[0].lower() not in {"how", "what", "why", "when", "where", "who", "which", "is", "can", "does"}:
         question = f"how to {query}"
         reformulations.append(question)
     elif len(words) > 3:
@@ -242,77 +411,35 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
     if not importlib.util.find_spec("ddgs"):
         return "CRITICAL ERROR: 'ddgs' library is missing. Search is impossible."
 
-    from ddgs import DDGS
     # NOTE: we deliberately do NOT call request_new_tor_identity() between
-    # attempts. A global NEWNYM re-circuits all of Tor (slow). Instead each
-    # attempt rotates onto its OWN circuit via _proxy_for_attempt — search
-    # reachability over Tor is exit-node-dependent, so a fresh exit per try
-    # is what actually beats a block, and it's far cheaper than NEWNYM.
-    for attempt in range(3):
-        try:
-            attempt_proxy = _proxy_for_attempt(tor_proxy, query, attempt)
-            def run():
-                kwargs: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
-                if attempt_proxy:
-                    kwargs["proxy"] = attempt_proxy
-                with DDGS(**kwargs) as ddgs:
-                    res = list(ddgs.text(query, max_results=20, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS))
-                    if res: return res
-                return []
-            raw_results = await asyncio.to_thread(run)
-
-            valid_results = []
-            for r in raw_results:
-                url = r.get('href', r.get('url', '')).lower()
-                if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
-                    continue
-                valid_results.append(r)
-
-            if not valid_results:
-                raise ValueError("DuckDuckGo returned empty or CAPTCHA garbage.")
-
-            valid_results = valid_results[:8]  # type: ignore # Keep the top 8 relevant valid results
-
-            clean_output = format_search_results(valid_results)
+    # waves. A global NEWNYM re-circuits all of Tor (slow). Instead every
+    # engine in a wave rides its OWN circuit and every wave rotates ALL of
+    # them (_race_search_wave / _proxy_for_attempt) — search reachability
+    # over Tor is exit-node-dependent, so fresh independent exits are what
+    # actually beat a block, and it's far cheaper than NEWNYM.
+    for wave in range(2):
+        valid_results = await _race_search_wave(query, tor_proxy, wave)
+        if valid_results:
+            clean_output = format_search_results(valid_results[:8])
             _cache_put(_cache_key, clean_output)
             return clean_output
-        except Exception as e:
-            pretty_log("Search Error", str(e), level="WARNING", icon=Icons.WARN)
-            if attempt < 2:
-                await asyncio.sleep(1)
+        if wave == 0:
+            await asyncio.sleep(1)
 
     # --- QUERY REFORMULATION ---
-    # All 3 attempts with the original query failed. Before giving up,
-    # try 2 reformulated queries: one broader, one as a question. Each
-    # also rides its own fresh circuit (offset index so its tags don't
-    # collide with the primary attempts').
+    # Both waves with the original query failed (≈12 engine-circuit
+    # tickets). Before giving up, try 2 reformulated queries: one broader,
+    # one as a question. Each gets one wave of its own; the offset wave
+    # index keeps its circuit tags from colliding with the primary waves'.
     reformulations = _reformulate_query(query)
     for ridx, reformulated in enumerate(reformulations):
         pretty_log("Search Retry", f"Reformulated: {truncate_query(reformulated)}", icon=Icons.TOOL_SEARCH)
-        try:
-            attempt_proxy = _proxy_for_attempt(tor_proxy, reformulated, 10 + ridx)
-            def run_reformulated():
-                kwargs_r: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
-                if attempt_proxy:
-                    kwargs_r["proxy"] = attempt_proxy
-                with DDGS(**kwargs_r) as ddgs:
-                    res = list(ddgs.text(reformulated, max_results=20, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS))
-                    return res or []
-            raw_results = await asyncio.to_thread(run_reformulated)
-            valid_results = []
-            for r in raw_results:
-                url = r.get('href', r.get('url', '')).lower()
-                if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
-                    continue
-                valid_results.append(r)
-            if valid_results:
-                valid_results = valid_results[:8]
-                clean_output = format_search_results(valid_results)
-                result = f"[Reformulated query: '{reformulated}']\n\n{clean_output}"
-                _cache_put(_cache_key, result)
-                return result
-        except Exception:
-            continue
+        valid_results = await _race_search_wave(reformulated, tor_proxy, 10 + ridx)
+        if valid_results:
+            clean_output = format_search_results(valid_results[:8])
+            result = f"[Reformulated query: '{reformulated}']\n\n{clean_output}"
+            _cache_put(_cache_key, result)
+            return result
 
     return (
         "ERROR: web search returned ZERO results across all engines and "
@@ -383,43 +510,18 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     if not importlib.util.find_spec("ddgs"):
         return "CRITICAL ERROR: 'ddgs' library is missing. Search is impossible."
 
-    from ddgs import DDGS
-    # NEWNYM thrash removed; each attempt rotates onto its own Tor circuit
-    # via _proxy_for_attempt instead (see tool_search_ddgs for the why).
-    # Pinned backend set drops the broken `wikipedia` (wt-wt → bad host)
-    # and useless `yahoo` engines.
-    for attempt in range(3):
-        try:
-            attempt_proxy = _proxy_for_attempt(tor_proxy, query, attempt)
-            def run():
-                kwargs: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
-                if attempt_proxy:
-                    kwargs["proxy"] = attempt_proxy
-                with DDGS(**kwargs) as ddgs:
-                    res = list(ddgs.text(query, max_results=15, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS))
-                    if res: return res
-                return []
-            results = await asyncio.to_thread(run)
-            if not results:
-                raise ValueError("DuckDuckGo returned empty list (Likely Tor Block).")
-
-            valid_urls = []
-            for r in results:
-                url = r.get('href', r.get('url', '')).lower()
-                if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
-                    continue
-                valid_urls.append(r.get('href', r.get('url', '')))
-            if not valid_urls:
-                raise ValueError("DuckDuckGo returned empty or CAPTCHA garbage.")
-
-            urls = valid_urls[:8]  # type: ignore
-            break # Success, we have our URLs
-        except Exception as e:
-            pretty_log("Search Error", str(e), level="WARNING", icon=Icons.WARN)
-            if attempt < 2:
-                await asyncio.sleep(1)
-            else:
-                return f"CRITICAL ERROR: Deep Research search phase failed."
+    # NEWNYM thrash removed; the engine race gives every engine in a wave
+    # its own Tor circuit and rotates all of them between waves (see
+    # _race_search_wave / _RACE_ENGINES for the measured why).
+    for wave in range(2):
+        valid_results = await _race_search_wave(query, tor_proxy, wave, max_results=15)
+        if valid_results:
+            urls = [r.get('href', r.get('url', '')) for r in valid_results[:8]]
+            break
+        if wave == 0:
+            await asyncio.sleep(1)
+    else:
+        return "CRITICAL ERROR: Deep Research search phase failed."
 
     if not urls: return "ERROR: No search results found. The internet might be blocking your request. Try a different query."
 

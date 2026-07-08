@@ -145,6 +145,20 @@ class TestQueryReformulation:
             result = _reformulate_query(query)
             assert len(result) == 2
 
+    def test_reformulate_hard_trims_keyword_stuffed_query(self):
+        # The only total strike-out of the 2026-07-08 live session was an
+        # 11-word keyword-stuffed query: such queries have near-zero organic
+        # hits anywhere, so "how to {query}" (which keeps every rare term)
+        # fails identically. Long queries must be hard-trimmed to the first
+        # 5 words of the broadened (numbers-stripped) form instead.
+        from ghost_agent.tools.search import _reformulate_query
+        query = ("postgresql 20 features key joins qualify clause "
+                 "insert by name roadmap")
+        result = _reformulate_query(query)
+        assert len(result) == 2
+        assert "postgresql features key joins qualify" in result
+        assert not any(r.lower().startswith("how to") for r in result)
+
 
 # ============================================================
 # #5: Adaptive Sampling Parameters

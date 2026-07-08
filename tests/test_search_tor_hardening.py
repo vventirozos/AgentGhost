@@ -6,7 +6,8 @@ hanging over Tor, the model emitting `site:`/boolean queries the scraper
 backends ignore, and the same near-identical query being re-fired many
 times in one turn):
 
-  1. backend pinning  — yahoo/yandex are NOT queried anymore
+  1. engine race set  — structurally-broken engines excluded; every engine
+     in a wave rides its OWN Tor circuit (per-engine SOCKS salt)
   2. query sanitizer  — Google-style operators are stripped before the wire
   3. result cache      — a repeated successful query is served from memory
 """
@@ -15,6 +16,7 @@ from unittest.mock import patch, MagicMock
 
 from src.ghost_agent.tools.search import (
     _sanitize_query,
+    _RACE_ENGINES,
     _TOR_BACKENDS,
     _cache_get,
     _cache_put,
@@ -24,22 +26,36 @@ from src.ghost_agent.tools.search import (
 
 
 # --------------------------------------------------------------------------
-# 1. Backend set
+# 1. Engine race set
 # --------------------------------------------------------------------------
-def test_broken_and_useless_engines_excluded():
-    """`wikipedia` is excluded because region='wt-wt' makes its engine build
-    the non-existent host `wt.wikipedia.org` (always a ConnectError over
-    Tor); `yahoo` is excluded as a pure hang-risk with no useful results.
-    The engines that DO return results over Tor are kept — note `yandex`
-    is back IN: it was measured returning results, and per-attempt circuit
-    rotation (not exclusion) is how we handle its occasional bad exit."""
-    backends = [b.strip() for b in _TOR_BACKENDS.split(",")]
-    assert "wikipedia" not in backends
-    assert "yahoo" not in backends
-    # The engines empirically observed returning results over Tor.
-    assert "mojeek" in backends
-    assert "yandex" in backends
-    assert "duckduckgo" in backends
+def test_broken_engines_excluded_and_race_set_wide():
+    """`wikipedia` stays excluded: region='wt-wt' makes its engine build the
+    non-existent host `wt.wikipedia.org` (always a ConnectError over Tor).
+    `grokipedia` is a typeahead API — 0/6 on real queries. Everything else
+    is IN, including `yahoo` (re-measured 2026-07-08: it now fails FAST,
+    ~1.4-2.2s, instead of hanging, and actually won a probe). With ~10%
+    per-(engine, circuit) success measured over Tor, every fast-failing
+    engine is a cheap independent lottery ticket — exclusion is only for
+    engines that are structurally broken or hang."""
+    assert "wikipedia" not in _RACE_ENGINES
+    assert "grokipedia" not in _RACE_ENGINES
+    # The wide race set — each of these was observed winning over Tor on
+    # at least some circuit.
+    for engine in ("mojeek", "duckduckgo", "yandex", "brave", "google", "yahoo"):
+        assert engine in _RACE_ENGINES
+    # Legacy comma-joined constant stays derived from the race set.
+    assert _TOR_BACKENDS == ",".join(_RACE_ENGINES)
+
+
+def test_race_gives_each_engine_its_own_circuit():
+    """The core 2026-07-08 fix: within one wave, engines must NOT share a
+    circuit (a blocked exit fails them all together). The per-engine salt
+    must yield a distinct SOCKS identity per engine for the same
+    (query, wave) — and distinct across waves for the same engine."""
+    base = "socks5h://127.0.0.1:9050"
+    per_engine = {_proxy_for_attempt(base, "q", 0, salt=e[:4]) for e in _RACE_ENGINES}
+    assert len(per_engine) == len(_RACE_ENGINES)
+    assert _proxy_for_attempt(base, "q", 0, salt="moje") != _proxy_for_attempt(base, "q", 1, salt="moje")
 
 
 # --------------------------------------------------------------------------
@@ -129,12 +145,16 @@ async def test_operators_stripped_before_ddgs(mock_find_spec, mock_ddgs):
 
     await tool_search_ddgs('foo "bar" site:x.com or site:y.com', None)
 
-    # The query that actually hit DDGS must be the sanitized keyword form,
-    # and the backend must be the pinned Tor-reliable set.
-    inst.text.assert_called_once_with(
-        "foo bar", max_results=20, region="wt-wt",
-        safesearch="moderate", backend=_TOR_BACKENDS,
-    )
+    # The race fires one single-engine call per engine, so DDGS may be hit
+    # up to len(_RACE_ENGINES) times — but EVERY call must carry the
+    # sanitized keyword form and a backend drawn from the race set.
+    assert inst.text.call_count >= 1
+    for call in inst.text.call_args_list:
+        assert call.args[0] == "foo bar"
+        assert call.kwargs["max_results"] == 20
+        assert call.kwargs["region"] == "wt-wt"
+        assert call.kwargs["safesearch"] == "moderate"
+        assert call.kwargs["backend"] in _RACE_ENGINES
 
 
 # --------------------------------------------------------------------------
@@ -150,11 +170,14 @@ async def test_repeated_query_served_from_cache(mock_find_spec, mock_ddgs):
     inst.text.return_value = [{"title": "T", "body": "B", "href": "http://ok.com"}]
 
     r1 = await tool_search_ddgs("repeated query", None)
+    calls_after_first = inst.text.call_count
     r2 = await tool_search_ddgs("repeated query", None)
 
     assert r1 == r2
-    # DDGS was hit exactly once — the second call came from the cache.
-    assert inst.text.call_count == 1
+    # The race may hit several engines on the first search, but the second
+    # search must add ZERO ddgs calls — it came from the cache.
+    assert calls_after_first >= 1
+    assert inst.text.call_count == calls_after_first
 
 
 @pytest.mark.asyncio

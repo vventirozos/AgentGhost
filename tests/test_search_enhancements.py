@@ -43,10 +43,17 @@ async def test_tool_search_ddgs_params(mock_find_spec, mock_ddgs):
     # Audit fix #9: bumped DDGS request from max_results=10 to 20 (we
     # still keep only the top 8 valid results after junk-domain filtering;
     # over-fetching gives the filter more material to work with).
-    # Tor-resilience fix: backend is now PINNED to the engines that work
-    # over Tor (yahoo/yandex dropped — they hung until timeout).
-    from src.ghost_agent.tools.search import _TOR_BACKENDS
-    mock_ddgs_instance.text.assert_any_call("test param query", max_results=20, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS)
+    # Tor-race fix (2026-07-08): one single-engine call per engine, each on
+    # its own circuit — every call must use the race params and an engine
+    # from the race set.
+    from src.ghost_agent.tools.search import _RACE_ENGINES
+    assert mock_ddgs_instance.text.call_count >= 1
+    for call in mock_ddgs_instance.text.call_args_list:
+        assert call.args[0] == "test param query"
+        assert call.kwargs["max_results"] == 20
+        assert call.kwargs["region"] == "wt-wt"
+        assert call.kwargs["safesearch"] == "moderate"
+        assert call.kwargs["backend"] in _RACE_ENGINES
     assert "1. Test" in result
 
 @pytest.mark.asyncio
@@ -73,8 +80,12 @@ async def test_tool_deep_research_params_and_sorting(mock_find_spec, mock_fetch,
 
     result = await tool_deep_research("test query", False, None)
 
-    from src.ghost_agent.tools.search import _TOR_BACKENDS
-    mock_ddgs_instance.text.assert_any_call("test query", max_results=15, region="wt-wt", safesearch="moderate", backend=_TOR_BACKENDS)
+    from src.ghost_agent.tools.search import _RACE_ENGINES
+    assert mock_ddgs_instance.text.call_count >= 1
+    for call in mock_ddgs_instance.text.call_args_list:
+        assert call.args[0] == "test query"
+        assert call.kwargs["max_results"] == 15
+        assert call.kwargs["backend"] in _RACE_ENGINES
 
     # Junk domains should be filtered out
     assert "https://www.forbes.com" not in result
@@ -98,17 +109,20 @@ async def test_tool_search_ddgs_empty_list_triggers_tor_cycle(mock_find_spec, mo
     
     mock_ddgs_instance = MagicMock()
     mock_ddgs.return_value.__enter__.return_value = mock_ddgs_instance
-    mock_ddgs_instance.text.return_value = [] # Empty list to trigger ValueError
-    
-    # Empty results raise ValueError, swallowed in the except block (1s
-    # sleep, no NEWNYM — each attempt rotates circuits instead). After the
-    # primary attempts exhaust, query reformulation kicks in. Final tally:
-    # 3 primary attempts + 2 reformulation attempts = 5 calls, then the
-    # ZERO-results message.
+    mock_ddgs_instance.text.return_value = [] # Empty list — every engine strikes out
+
+    # Empty results across the board: every engine in every wave comes back
+    # empty (no winner, no early cancel), then query reformulation kicks in.
+    # Final tally: (2 primary waves + 2 reformulation waves) × the full race
+    # set, then the ZERO-results message. The module-level result cache is
+    # cleared first so a same-string success cached by an earlier test can't
+    # short-circuit this path.
+    from src.ghost_agent.tools.search import _RACE_ENGINES, _SEARCH_CACHE
+    _SEARCH_CACHE.clear()
     result = await tool_search_ddgs("test query", None)
 
     assert "ZERO results" in result
-    assert mock_ddgs_instance.text.call_count == 5
+    assert mock_ddgs_instance.text.call_count == 4 * len(_RACE_ENGINES)
 
 
 @pytest.mark.asyncio
@@ -124,9 +138,11 @@ async def test_tool_deep_research_empty_list_triggers_tor_cycle(mock_find_spec, 
     result = await tool_deep_research("test query", False, None)
 
     # Ensure it reaches the final failure block and the deep research fails gracefully.
-    # deep_research does 3 attempts (no reformulation stage), each on a fresh circuit.
+    # deep_research runs 2 racing waves (no reformulation stage), every
+    # engine on its own circuit.
+    from src.ghost_agent.tools.search import _RACE_ENGINES
     assert "CRITICAL ERROR: Deep Research search phase failed." in result
-    assert mock_ddgs_instance.text.call_count == 3
+    assert mock_ddgs_instance.text.call_count == 2 * len(_RACE_ENGINES)
 
 
 @pytest.mark.asyncio
@@ -143,11 +159,13 @@ async def test_tool_search_ddgs_exception_logging(mock_find_spec, mock_ddgs, moc
 
     await tool_search_ddgs("test params", None)
 
-    # 3 primary attempts + 2 reformulation attempts = 5 total calls
-    assert mock_ddgs_instance.text.call_count == 5
+    # (2 primary waves + 2 reformulation waves) × the full race set
+    from src.ghost_agent.tools.search import _RACE_ENGINES
+    assert mock_ddgs_instance.text.call_count == 4 * len(_RACE_ENGINES)
 
+    # The per-wave failure log aggregates every engine's error string.
     logs = [call.args[1] for call in mock_pretty_log.call_args_list]
-    assert "Simulated Search Crash" in logs
+    assert any("Simulated Search Crash" in l for l in logs)
 
 @pytest.mark.asyncio
 @patch("src.ghost_agent.tools.search.pretty_log")
@@ -163,12 +181,13 @@ async def test_tool_deep_research_exception_logging(mock_find_spec, mock_ddgs, m
 
     result = await tool_deep_research("test params", False, None)
 
-    assert mock_ddgs_instance.text.call_count == 3
+    from src.ghost_agent.tools.search import _RACE_ENGINES
+    assert mock_ddgs_instance.text.call_count == 2 * len(_RACE_ENGINES)
     assert "CRITICAL ERROR: Deep Research search phase failed." in result
-    
-    # Verify the exception string was logged as a warning
+
+    # Verify the exception string surfaced in the per-wave failure log
     logs = [call.args[1] for call in mock_pretty_log.call_args_list]
-    assert "Simulated DR Crash" in logs
+    assert any("Simulated DR Crash" in l for l in logs)
 
 from src.ghost_agent.utils.helpers import request_new_tor_identity
 
