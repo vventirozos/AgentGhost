@@ -207,3 +207,69 @@ deep-reason timeout bias — low):
 
 Caveat unchanged: fresh GHOST_HOME ⇒ cross-session layers (memory/selfhood/
 workspace/reflection) cannot help single-shot; judge those with Track B.
+
+## Track B4 — the grounded outcome battery (2026-07-09, journal §4D)
+
+Track B3 answered "do the idle loops PRODUCE anything?" (yes — lessons) but its
+fact-recall probes saturate at ~97% in every arm (memory is ON in both), so the
+outcome question stayed open. B4 replaces the probes with execution-grounded
+DOING tasks (`scripts/trackb4_tasks.py`): the harness writes deterministic
+fixture files into the arm's sandbox, the prompt drives the live agent to
+compute something and write a result artifact, and a pure-Python reference
+implementation computes the expected answer from the SAME fixtures — the
+verifier compares tokens (no LLM judge, no recall bottleneck). Every task is
+gated self-consistent by the test suite (`tests/test_trackb4_battery.py`), the
+same philosophy as self-play's reference-solution gate.
+
+What's new vs the B3 driver (`scripts/ablation_trackb4.py`):
+
+  * **Seeding phase (identical in all arms)** before the idle window — easy
+    tasks feed strong clusters, hard tasks produce real failures in the
+    pre-registered WEAK_CLUSTERS (sql, regex_parse, algo, concurrency):
+    reflection material + frontier variance.
+  * **`--smart-memory 0.9` in every arm.** B3's arms never passed the flag,
+    and the smart-memory consolidator is the only writer of the `type:"auto"`
+    fragments dream's ≥3-auto-memories entropy gate counts — dream was
+    unsatisfiable by construction. Gate state is instrumented from the arm log
+    (`Auto Memory Store` / `Not enough entropy to dream` line counts).
+  * **Mediation capture** — per probe, did any playbook lesson actually
+    surface? (retrieval-credit counters diffed around each request). An
+    outcomes-null is uninterpretable without this: mediation≈0 → fix retrieval
+    routing; mediation healthy → idle output doesn't transfer at this scale.
+  * **Task-stratified sign-flip test** next to the exact McNemar — repeats
+    within a task are correlated; (task,repeat)-independence over-narrows.
+  * **`--pilot` calibration**: one control-configured agent, `--pilot-repeats`
+    (default 3) passes over all candidates; keeps tasks that are neither
+    all-pass nor all-fail and emits `b4_battery.json` (the implementable form
+    of the [0.3, 0.7] difficulty band).
+  * Fixture seeds vary per repeat (`DEFAULT_SEED + rep`) so a memorised answer
+    can't carry across repeats, but stay identical across arms within a repeat
+    (matched pairs need matched fixtures).
+  * **Timeout-bleed guard (post-pilot 2026-07-09):** a client-side probe
+    timeout does NOT stop the agent's in-flight turn; the next request queues
+    behind the turn-serialization semaphore and burns its own budget waiting
+    (pilot #1: one genuine 300s overrun took the next two tasks to 0/3 without
+    ever measuring them). The driver now calls `_wait_arm_quiet` between every
+    task — poll the arm log's `Request Finished` count vs requests sent,
+    bounded grace — and every task has globally-unique fixture filenames
+    (same-name/different-content fixtures got swapped under the still-running
+    task). `--battery-file` also filters `--pilot` candidates so a re-pilot
+    measures only new/re-raced tasks.
+  * **Calibration lesson (pilot #1):** clean single-file shapes are CEILING
+    for this model (all sql/algo/pg 3/3 at 42-91s); the in-band lever is
+    messy MULTI-FILE data + fiddly-but-precise rules (all 4 data_analysis
+    tasks landed 2/3). The v2 candidates port that recipe into the ceiling
+    clusters.
+
+Run (operator, prod stopped — journal §2 supervisor gotcha applies):
+
+    PYTHONPATH=src python scripts/ablation_trackb4.py --pilot \
+        --report-dir ablation_out/b4-pilot            # ~1.5-2 h
+    PYTHONPATH=src python scripts/ablation_trackb4.py --repeats 3 \
+        --battery-file ablation_out/b4-pilot/b4_battery.json \
+        --report-dir ablation_out/b4-$(date +%Y%m%d)  # ~11-12 h overnight
+
+Pre-registered verdicts (journal §4D items 5-7): idle-loop outcome value =
+stratified p<0.05 with healthy mediation; frontier KEEP iff self-play yield ≥
+uniform in ≥2/3 repeats AND weak-cluster probe delta ≥ 0, else flip default to
+uniform (PRM stays either way); dream gate satisfied-but-silent = new bug.

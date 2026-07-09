@@ -226,7 +226,10 @@ def test_inline_request_path_summarizers_are_foreground():
     assert "is_background=False" in prune_src
     assert "is_background=True" not in prune_src
 
-    chat_src = inspect.getsource(GhostAgent.handle_chat)
+    # The shield call moved into _dispatch_and_process_tool_batch with
+    # the #5 step-2 extraction (2026-07-09) — inspect both.
+    chat_src = (inspect.getsource(GhostAgent.handle_chat)
+                + inspect.getsource(GhostAgent._dispatch_and_process_tool_batch))
     assert ("chat_completion(shield_payload, use_worker=True, "
             "is_background=False)") in chat_src
 
@@ -240,7 +243,9 @@ def test_perfect_it_inline_path_passes_foreground():
     import re
     from ghost_agent.core.agent import GhostAgent
 
-    src = inspect.getsource(GhostAgent.handle_chat)
+    # The Perfect-It block moved into _finalize_and_return with the #5
+    # step-3 extraction (2026-07-09) — inspect the method that has it now.
+    src = inspect.getsource(GhostAgent._finalize_and_return)
     assert re.search(
         r"_perfect_it_generate_and_learn\(\s*p_payload,\s*_pp_lesson_label,"
         r"\s*current_trajectory_id,\s*foreground=True",

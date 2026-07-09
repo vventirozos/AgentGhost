@@ -43,6 +43,41 @@ LESSON_SCHEMA_VERSION = 2
 # semantic neighbours while dropping weak-overlap noise.
 DEFAULT_RETRIEVAL_DISTANCE = 0.45
 
+# Domain-rescue admission bound for the playbook vector path. The strict
+# 0.45 floor demands near-verbatim similarity (~cosine 0.78 on the
+# L2-normalised MiniLM embeddings), which a GENERALIZED lesson can never
+# reach against a concrete task prompt — measured live on the B4 run
+# (2026-07-09): the arm's real self-play lesson sat at distance 1.056 from
+# a matching task probe, so the skill tier filtered it on every one of 96
+# probe turns (mediation ≈ 0; the whole learning loop was write-only).
+# A lesson whose DOMAINS explicitly contain the query's cluster is admitted
+# up to this relaxed bound instead — semantic near-match OR domain match,
+# never a blind dump.
+_DOMAIN_RELAXED_DISTANCE = 1.25
+
+
+def _explicit_query_cluster(query: str):
+    """The query's task cluster, ONLY on an explicit keyword hit — else
+    None. Deliberately NOT `classify_cluster` (its `python_general`
+    FALLBACK would make every small-talk turn "match" python_general
+    lessons and reopen the blind-dump path the redesign closed)."""
+    if not query:
+        return None
+    try:
+        from .frontier import CLUSTER_KEYWORDS
+    except Exception:
+        return None
+    lowered = str(query).lower()
+    for key, patterns in CLUSTER_KEYWORDS:
+        for pat in patterns:
+            if re.search(pat, lowered):
+                return key
+    # python_general has no patterns of its own in the table (it is the
+    # classifier's fallback) — accept it only on a literal signal.
+    if re.search(r"\bpython\b|\bscript\b", lowered):
+        return "python_general"
+    return None
+
 # Hard cap on playbook size. When a new lesson is written and the cap
 # is exceeded, we drop by utility (verified pinned, lowest-utility
 # unverified first) rather than plain FIFO — the old FIFO rule could
@@ -1196,13 +1231,30 @@ class SkillMemory:
                     vector_attempted = False
 
                 candidates = []  # (combined_score, distance, doc, meta)
+                query_cluster = _explicit_query_cluster(query)
                 if results and results.get("documents") and results["documents"][0]:
                     docs = results["documents"][0]
                     dists = results["distances"][0]
                     metas = (results.get("metadatas") or [[]])[0] if results.get("metadatas") else [{}] * len(docs)
                     for doc, dist, meta in zip(docs, dists, metas or [{}] * len(docs)):
                         if dist >= distance_threshold:
-                            continue
+                            # Domain rescue (see _DOMAIN_RELAXED_DISTANCE):
+                            # a lesson tagged with the query's explicit
+                            # cluster is admitted up to the relaxed bound.
+                            # Lessons without a domains tag (e.g. reflection
+                            # writes) derive one from their trigger text.
+                            _doms = {d.strip() for d in
+                                     str((meta or {}).get("domains", "")).split(",")
+                                     if d.strip()}
+                            if not _doms:
+                                _trig_dom = _explicit_query_cluster(
+                                    (meta or {}).get("trigger", ""))
+                                if _trig_dom:
+                                    _doms = {_trig_dom}
+                            if not (query_cluster
+                                    and query_cluster in _doms
+                                    and dist < _DOMAIN_RELAXED_DISTANCE):
+                                continue
                         trigger = (meta or {}).get("trigger", "") or _extract_trigger_from_doc(doc)
                         bm25 = _bm25_like_score(query, trigger or doc)
                         # Lower distance is better; higher bm25 is better.

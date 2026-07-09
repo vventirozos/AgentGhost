@@ -19,7 +19,7 @@ testing.
 """
 
 from .activity import WorkspaceActivity
-from .model import WorkspaceModel
+from .model import WorkspaceModel, pinned_event_project, set_event_project
 from .narrative import WorkspaceNarrative
 from .recognition import (
     WORKSPACE_PREFIX_CLOSE,
@@ -55,5 +55,7 @@ __all__ = [
     "WorkspaceState",
     "WorkspaceStateThread",
     "build_workspace_prefix",
+    "pinned_event_project",
+    "set_event_project",
     "strip_workspace_prefix",
 ]

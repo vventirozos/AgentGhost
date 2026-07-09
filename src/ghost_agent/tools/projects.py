@@ -1936,19 +1936,26 @@ async def tool_manage_projects(
             # the autonomous BATCH path. A single "proceed" the agent does
             # itself as a full turn; this is for "do the next N" / "all".
             max_tasks = _parse_advance_count(count)
-            batch = await advance_many(
-                context, project_id,
-                max_tasks=max_tasks,
-                tool_runner=tool_runner,
-                llm_classifier=default_llm_classifier(context),
-                code_generator=default_code_generator(context),
-                coding_executor=build_coding_task,
-                # Continue past an isolated failed task (apps are usually
-                # independent) and report all failures — a single flaky task
-                # shouldn't halt the whole batch. A circuit breaker still
-                # stops on repeated (systemic) failures.
-                stop_on_fail=False,
-            )
+            # Pin the EVENT stamp alongside the sandbox pin above: when the
+            # LLM passes an explicit project_id different from the currently
+            # switched project, record_* would otherwise stamp the batch's
+            # command/research outcomes with the CHAT turn's project. Scoped,
+            # so the turn's own stamp is restored after the batch.
+            from ..workspace import pinned_event_project as _pin_evt
+            with _pin_evt(project_id):
+                batch = await advance_many(
+                    context, project_id,
+                    max_tasks=max_tasks,
+                    tool_runner=tool_runner,
+                    llm_classifier=default_llm_classifier(context),
+                    code_generator=default_code_generator(context),
+                    coding_executor=build_coding_task,
+                    # Continue past an isolated failed task (apps are usually
+                    # independent) and report all failures — a single flaky task
+                    # shouldn't halt the whole batch. A circuit breaker still
+                    # stops on repeated (systemic) failures.
+                    stop_on_fail=False,
+                )
             return _ok({
                 "advanced": batch.advanced,
                 "count": batch.count,

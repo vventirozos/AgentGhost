@@ -250,11 +250,16 @@ class TestPerfectItRoleMapper:
         """
         import inspect
         from ghost_agent.core.agent import GhostAgent
-        source = inspect.getsource(GhostAgent.handle_chat)
+        # The Perfect-It block (incl. the role-mapper) moved into
+        # _finalize_and_return with the #5 step-3 extraction (2026-07-09).
+        # The mapper emits `<tool_response name="...">`, so match the open
+        # tag without the closing bracket.
+        source = inspect.getsource(GhostAgent._finalize_and_return)
         assert "p_req_messages" in source, (
-            "Perfect It role-mapper (p_req_messages) must be present in handle_chat"
+            "Perfect It role-mapper (p_req_messages) must be present in the "
+            "finalization chain"
         )
-        assert "<tool_response>" in source, (
+        assert "<tool_response" in source, (
             "Perfect It mapper must translate tool roles to <tool_response> user messages"
         )
 

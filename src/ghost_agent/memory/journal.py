@@ -7,6 +7,41 @@ from pathlib import Path
 
 logger = logging.getLogger("GhostAgent")
 
+# How many times a journal item that failed on an upstream-transient
+# error gets re-queued before it is dropped for good. Bounded so a
+# permanently-broken item can't pin the drain loop forever.
+JOURNAL_MAX_RETRIES = 2
+
+
+class RetryableConsolidationError(Exception):
+    """An upstream-transient failure (5xx / timeout / connection error)
+    inside a journal-drain task, raised AFTER the in-client retries
+    (worker-node failover + one 5xx retry) are exhausted and BEFORE any
+    memory write happened. The drain loop catches this and re-queues the
+    journal item (bounded by ``JOURNAL_MAX_RETRIES``) instead of losing
+    the consolidation — the item was already popped, so an ordinary
+    log-and-swallow made the drop permanent and invisible."""
+
+
+def is_upstream_transient(exc: BaseException) -> bool:
+    """True for failures worth re-running the same task against later:
+    timeouts, connection-level errors, and HTTP 5xx. A 4xx or a parsing
+    error would fail identically on retry, so it is NOT transient."""
+    try:
+        import httpx
+    except Exception:  # pragma: no cover - httpx is a hard dep in prod
+        return False
+    # TimeoutException subclasses TransportError in httpx, but name both:
+    # the timeout case is the one the in-client retry loop does NOT cover.
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        try:
+            return int(exc.response.status_code) >= 500
+        except Exception:
+            return False
+    return False
+
 
 def _redact_journal_data(data):
     """Best-effort redaction of secret-shaped strings in a journal entry

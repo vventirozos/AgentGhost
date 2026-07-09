@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import logging
+import math
+import re
 import threading
 from collections import deque
 from pathlib import Path
@@ -31,6 +33,15 @@ ACTIVITY_FILENAME = "activity.jsonl"
 # newest _COMPACT_KEEP_LINES events.
 _COMPACT_MAX_BYTES = 2 * 1024 * 1024
 _COMPACT_KEEP_LINES = 2000
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokenize(text: str) -> set:
+    """Lowercased alnum tokens longer than 2 chars. Splitting on
+    non-alnum means paths and URLs decompose into their components, so
+    a query like "train.py" matches the event that touched it."""
+    return {t for t in _TOKEN_RE.findall(str(text or "").lower()) if len(t) > 2}
 
 
 class WorkspaceActivity:
@@ -126,6 +137,50 @@ class WorkspaceActivity:
                 continue
             items.append(ev)
         return list(items)
+
+    def search(self, query: str, *, limit: int = 10) -> List[WorkspaceEvent]:
+        """Relevance-ranked keyword search over the whole log — same
+        zero-dependency IDF-weighted token overlap as selfhood's
+        ``search_my_past``, so a rare, distinctive query term (a
+        filename, a project word) dominates a common one. Best match
+        first, newest first on ties; no matched token → empty list.
+
+        The log is bounded by compaction (≤ ~2000 events), so a full
+        scan per query is cheap and needs no persistent index."""
+        if limit <= 0:
+            return []
+        q_tokens = _tokenize(query)
+        if not q_tokens:
+            return []
+        events: List[WorkspaceEvent] = []
+        haystacks: List[set] = []
+        doc_freq: dict = {}
+        for ev in self.iter_events():
+            hay = " ".join((
+                ev.summary or "",
+                ev.kind or "",
+                ev.project_id or "",
+                " ".join(str(v) for v in (ev.payload or {}).values()),
+            ))
+            toks = _tokenize(hay)
+            events.append(ev)
+            haystacks.append(toks)
+            for t in toks:
+                doc_freq[t] = doc_freq.get(t, 0) + 1
+        if not events:
+            return []
+        n = len(events)
+        idf = {
+            t: math.log((n + 1) / (doc_freq.get(t, 0) + 1)) + 1.0
+            for t in q_tokens
+        }
+        scored: List[tuple] = []
+        for ev, toks in zip(events, haystacks):
+            score = sum(idf[t] for t in q_tokens if t in toks)
+            if score > 0:
+                scored.append((score, ev.timestamp, ev))
+        scored.sort(key=lambda s: (s[0], s[1]), reverse=True)
+        return [ev for _, _, ev in scored[:limit]]
 
     def count(self, *, kind: Optional[str] = None) -> int:
         n = 0

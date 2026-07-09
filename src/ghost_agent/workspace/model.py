@@ -14,9 +14,11 @@ attaches a facade so call sites don't have to branch.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 from pathlib import Path
-from typing import Awaitable, Callable, List, Optional
+from typing import Awaitable, Callable, Iterator, List, Optional
 
 from .activity import WorkspaceActivity
 from .narrative import WorkspaceNarrative
@@ -35,6 +37,44 @@ logger = logging.getLogger("GhostWorkspace")
 
 
 CritiqueFn = Callable[[str], Awaitable[str]]
+
+# Task-local override for the project id stamped onto recorded events.
+# ``WorkspaceModel.current_project_id`` is ONE process-global attribute
+# owned by the chat turn's prompt assembly (serialized by the agent
+# semaphore) — but record_* callers also run OUTSIDE that serialization:
+# the idle autoadvance tick and the explicit-project autoadvance batch
+# both pinned ``context.current_project_id`` (the sandbox-scoping field)
+# while events kept stamping from the shared attribute, so an idle
+# build's command outcomes landed on whatever project the LAST chat turn
+# had open. A ContextVar is task-local under asyncio (and propagates
+# into ``asyncio.to_thread``), so each execution context carries its own
+# stamp; ``None`` means "no override — fall back to the shared attribute",
+# which keeps every existing single-context caller byte-identical.
+_EVENT_PROJECT_OVERRIDE: contextvars.ContextVar = contextvars.ContextVar(
+    "workspace_event_project", default=None,
+)
+
+
+def set_event_project(project_id: Optional[str]) -> None:
+    """Bind the event-stamp project id to the CURRENT asyncio task (and
+    everything it awaits). Used by the chat turn right where it syncs
+    ``workspace_model.current_project_id``, so a concurrent writer
+    mutating the shared attribute mid-turn can't mis-stamp this turn's
+    events."""
+    _EVENT_PROJECT_OVERRIDE.set(str(project_id or ""))
+
+
+@contextlib.contextmanager
+def pinned_event_project(project_id: Optional[str]) -> Iterator[None]:
+    """Scoped variant of :func:`set_event_project` for bounded work
+    (idle autoadvance tick, explicit-project autoadvance batch): events
+    recorded inside the ``with`` block stamp ``project_id``; the previous
+    binding is restored on exit."""
+    token = _EVENT_PROJECT_OVERRIDE.set(str(project_id or ""))
+    try:
+        yield
+    finally:
+        _EVENT_PROJECT_OVERRIDE.reset(token)
 
 
 class WorkspaceModel:
@@ -139,6 +179,15 @@ class WorkspaceModel:
     # Hot-path capture APIs
     # -----------------------------------------------------------------
 
+    def _stamp_project_id(self) -> str:
+        """Project id to stamp onto an event being recorded RIGHT NOW:
+        the task-local override when one is bound, else the shared
+        ``current_project_id`` attribute."""
+        override = _EVENT_PROJECT_OVERRIDE.get()
+        if override is not None:
+            return override
+        return self.current_project_id
+
     def record_task_outcome(
         self,
         *,
@@ -183,7 +232,7 @@ class WorkspaceModel:
                     f"task {task_name or job_id}: {outcome}"
                     if not error else f"task {task_name or job_id}: failed ({error[:80]})"
                 ),
-                project_id=self.current_project_id,
+                project_id=self._stamp_project_id(),
             ))
             return t
         except Exception as e:  # noqa: BLE001
@@ -223,7 +272,7 @@ class WorkspaceModel:
                 kind="research",
                 payload=art.to_dict(),
                 summary=f"pulled {url}"[:200],
-                project_id=self.current_project_id,
+                project_id=self._stamp_project_id(),
             ))
             if written is None:
                 return None  # append failed → don't poison the dedup set
@@ -305,7 +354,7 @@ class WorkspaceModel:
                 summary=(
                     f"ran `{(command or '')[:80]}` exit={exit_code}"
                 ),
-                project_id=self.current_project_id,
+                project_id=self._stamp_project_id(),
             ))
             return c
         except Exception as e:  # noqa: BLE001
@@ -324,7 +373,7 @@ class WorkspaceModel:
         try:
             ev = WorkspaceEvent(
                 kind="note", payload=dict(payload), summary=summary[:600],
-                project_id=self.current_project_id,
+                project_id=self._stamp_project_id(),
             )
             self.activity.append(ev)
             return ev
@@ -363,7 +412,7 @@ class WorkspaceModel:
                     # possible (a tracked file lives under projects/<id>/),
                     # else fall back to the active project.
                     _m = _PROJECTS_PATH_RE.search(str(ch.get("path", "")))
-                    _pid = _m.group(1).lower() if _m else self.current_project_id
+                    _pid = _m.group(1).lower() if _m else self._stamp_project_id()
                     self.activity.append(WorkspaceEvent(
                         kind="file_changed",
                         payload=ch,
@@ -432,6 +481,18 @@ class WorkspaceModel:
     # -----------------------------------------------------------------
     # Introspection
     # -----------------------------------------------------------------
+
+    def search_events(self, query: str, *, limit: int = 10) -> List["object"]:
+        """Relevance-ranked keyword search over the activity log — the
+        workspace counterpart to selfhood's ``search_my_past``. Empty on
+        disabled / no activity / no match. Never raises."""
+        if not self.enabled or self.activity is None:
+            return []
+        try:
+            return self.activity.search(query, limit=limit)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("search_events failed: %s", e)
+            return []
 
     def stats(self) -> dict:
         if not self.enabled:

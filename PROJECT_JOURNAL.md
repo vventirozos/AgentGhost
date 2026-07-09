@@ -163,18 +163,36 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 ## 4. WHAT REMAINS TO DO
 
 Everything below is open. Start here. Grouped: (A) improvement-review partials/blocked,
-(B) static-hunt deferred findings, (C) functional-hunt deferred findings.
+(B) static-hunt deferred findings, (C) functional-hunt deferred findings, (D) the B4
+outcome-battery design (the harder task battery #4/#27b are blocked on — designed
+2026-07-09, awaiting implementation).
 
 ### 4A. Improvement-review items not fully closed (from the 6-agent review)
 
-- **#5 — agent.py guard-seam refactor (PARTIAL, high value).** The seam is established
-  (`core/stream_guards.py` holds the pure streaming guards, re-exported). Remaining: the four big
-  `handle_chat` extractions (XML tool-call parser `~7142-7900` → finalization chain `~9420-10361` →
-  final-generation streamer closure `~6145-6632` → tool guard/dispatch/result pipeline `~8200-9200`)
-  and a `TurnState` dataclass replacing the shared loop locals + a `StreamGuard/TurnHook` pipeline
-  interface. Each needs live-driven hot-path validation (the unit suite alone can't catch a
-  parse/dispatch regression). #26 (test builders) de-risks it. **This is the single biggest
-  maintainability lever left** — agent.py is 11k+ lines and every hardening session appends to it.
+- **#5 — agent.py guard-seam refactor (PARTIAL, high value; steps 1-2 of 4 DONE).** The seam is
+  established (`core/stream_guards.py`); step 1 (tool-call parser → `_parse_assistant_tool_calls`)
+  shipped + live-validated 2026-07-08; **step 2 (tool guard/dispatch/result pipeline →
+  `_dispatch_and_process_tool_batch` + the `TurnState` dataclass) shipped 2026-07-09** — the
+  ~1,300-line region was extracted VERBATIM against a TurnState designed from an AST capture
+  analysis (16 MUTATED_FIELDS incl. cross-iteration latches like `_request_sys3_fired_once` that
+  previously survived between turns in handle_chat's frame; finally-based repack keeps state exact
+  on raising tool paths; the region was the turn-loop tail so its `continue`/`break` became a
+  boolean return). Suite 6795 green; direct tests `tests/test_dispatch_pipeline_extraction.py`;
+  3 stale source-inspection tests updated. **LIVE-VALIDATED 2026-07-09** (operator restarted prod):
+  a real file-write+read request dispatched through the new method — and the NATIVE tool_call
+  corruption repair fired mid-request and recovered (the hairiest branch, exercised live), verifier
+  CONFIRMED 100%, exact bytes on disk. **Step 3 (finalization chain → `_finalize_and_return` +
+  `FinalizeState`) shipped 2026-07-09 (later):** the ~950-line post-turn-loop tail (scrubbers →
+  deferred Perfect-It → verifier gate/calibration → competence+skill credit → episode recording →
+  correction stash → return) extracted VERBATIM with ZERO control-flow rewrites — the region ends
+  in handle_chat's own `return`, nothing after it reads locals, so FinalizeState is read-only (20
+  fields, no repack). One pre-bind added (`payload = None` before the turn loop) so FinalizeState
+  construction can't hit an unbound name on the deterministic-dispatch exit path. Suite 6801 green;
+  direct tests `tests/test_finalize_extraction.py` (6); 3 stale source-inspection tests updated.
+  **Live-validated on a throwaway agent** (same code path; file-write probe → exact bytes on disk,
+  verifier gate — which lives INSIDE the extracted chain — CONFIRMED 100%, zero errors); prod picks
+  it up at its next restart. Remaining: (4) final-generation streamer closure (~502 lines, heaviest
+  closure coupling — extend TurnState from a fresh capture analysis). Same protocol.
 - **#6 — `GHOST_PIN_TOOL_SCHEMAS` durable — DONE 2026-07-07.** Durability was already in place: the
   launcher (`bin/start-ghost-agent.sh` line 231) exports `GHOST_PIN_TOOL_SCHEMAS=1`, which launchd
   runs — so prod is durable across restarts. Confirmed the pin is **holding live**: a per-turn
@@ -200,13 +218,27 @@ Everything below is open. Start here. Grouped: (A) improvement-review partials/b
   contract; a blind cut is net-negative risk (same shape as #6's declined code-default flip). If ever
   revisited, it must be a live A/B (trim → battery of tool-selection/arg-filling prompts → compare),
   never a headless cut — but the operator has accepted the lean state, so this is CLOSED.
-- **#27b — PRM keep/delete verdict (STILL OPEN — frontier sub-arm ran, INCONCLUSIVE 2026-07-07).**
+- **#27b — CLOSED 2026-07-09 (23:30): default FLIPPED to uniform** (`--frontier-selfplay` now
+  opt-in) after frontier tied uniform in both instrumented ablations (B3 2v2; B4 equal in all 4
+  repeats). PRM STAYS — self-play productive in 3/4 repeats per arm; "delete PRM" never triggered.
+  Re-enable criterion: a run where frontier out-yields uniform. Original findings below for
+  history.
+- **#27b — PRM keep/delete verdict (frontier sub-arm ran, INCONCLUSIVE 2026-07-07).**
   The frontier-vs-uniform self-play sub-arm executed (deeper B3, 3 arms × 2 repeats). Result: on the
   metric that matters — *self-play* lesson yield — frontier and uniform **TIED (2 vs 2)**. Frontier's
   4-vs-2 total edge was entirely 2 *reflection* lessons, which are orthogonal to `--frontier-selfplay`.
   So at N=2 repeats the frontier selection is a **wash** — no evidence it out-yields uniform seeding.
   "Delete PRM" is still **not** triggered (self-play loop is productive either way), but "keep frontier
   BECAUSE it beats uniform" is **unproven**. Verdict needs more repeats + a HARDER task battery (see #4).
+  **→ Battery designed 2026-07-09 with a pre-registered frontier verdict: §4D.**
+- **#4 — UPDATE 2026-07-09 (B4 full run executed, §6): outcome question STILL open but now with a
+  diagnosed dependency chain — (a) battery difficulty unsolved for this model below expert tier
+  (re-ceilinged at 97% under run conditions; pilot difficulty was partly cross-pass memory
+  interference — pilots must boot fresh per pass); (b) mediation ≈ 0: playbook lessons never
+  surface in task-shaped probe turns → fix lesson RETRIEVAL ROUTING before any bigger run;
+  (c) dream definitively needs a trajectory-shaped seed source (code change, not protocol).
+  The next step on #4 is those two code changes + an expert-tier battery, NOT more repeats.
+  Original 2026-07-07 finding below for history.**
 - **#4 — B3 deeper run — EXECUTED 2026-07-07 (methodological result, not a clean win).** Ran 3 arms
   (treatment/frontier, treatment_uniform, control) × 2 repeats on 18 enriched seeds; added McNemar +
   frontier-yield to the harness. Findings: (1) **idle loops confirmed productive** — treatment 4
@@ -218,7 +250,9 @@ Everything below is open. Start here. Grouped: (A) improvement-review partials/b
   instrument. (3) **Dream STILL didn't fire** even with 18 richer seeds — fact-shaped seeds aren't
   enough; it likely needs failed/diverse *trajectories*, not stored facts. Report:
   `ablation_out/trackb3-20260707-191216/`. Remaining: harder-task probe suite + more repeats for a
-  real outcome-improvement + frontier verdict.
+  real outcome-improvement + frontier verdict. **→ The harder battery is now DESIGNED (2026-07-09):
+  see §4D for the full protocol; what remains is implementing `trackb4_tasks.py` +
+  `ablation_trackb4.py` and running the pilot + overnight run.**
 - **#1 — version control:** SKIPPED per operator (repo versioned on another server). No action.
 
 Also deferred within done items: #3 launchd supervisor plist in-repo (out-of-repo launcher);
@@ -239,10 +273,22 @@ model-behavior edges.
   test_upload_project_scope.py (6). Docs: file_system.html, api/routes.html. (Full per-conversation
   threading of every `record_*` call remains the deeper option, but the exploitable API surface is
   now closed.)
-- **workspace `current_project_id` event-stamping race** (high/likely, but see #22) — events recorded
-  mid-turn get stamped with whichever conversation last assembled a prompt. #22's serialization
-  should close the concurrent window; confirm, else thread the active project id through each
-  `record_*` call.
+- **workspace `current_project_id` event-stamping race** — **RESOLVED 2026-07-09 (and #22 was NOT
+  sufficient).** Root cause found on the confirm pass: there are TWO project-id fields —
+  `context.current_project_id` (sandbox scoping; what #22's serialization and the 2026-07-08
+  `pinned_project_context` protect) and `workspace_model.current_project_id` (what every `record_*`
+  actually stamps from). So (a) idle autoadvance mis-stamped its command outcomes with the LAST chat
+  turn's project **deterministically** (the pin covered the wrong field), plus a live race when a
+  user turn overlapped an in-flight tick; (b) dream self-play's temp agent (its OWN semaphore, so
+  unserialized) set the shared field to `""` mid-flight and recorded synthetic outcomes into the
+  real activity log; (c) `manage_projects autoadvance` with an explicit foreign project_id stamped
+  the chat's project. Fix: task-local ContextVar override in `workspace/model.py` read by every
+  stamp site (`set_event_project` bound by handle_chat at the stamp-sync site; `pinned_event_project(pid)`
+  wrapping the idle tick and the explicit-project batch); dream detaches the shared model entirely
+  (`isolated_context.workspace_model = None` — all record/prefix sites guard on None). Real chat
+  turns and the scheduler outcome write were already safe (serialization / no-await-gap). Tests:
+  test_workspace_event_stamping.py (8, incl. the reproduced interleave). Docs:
+  core/workspace_model.html, core/project_advancer.html, core/dream.html.
 - **memory projects metadata split-lock + skills cross-process lock** — **RESOLVED 2026-07-07.**
   `projects.py` is SQLite-backed, so the RMW (`append_ledger`/`set_ledger`/`set_config_value`) now
   routes through `_atomic_metadata_update`, which runs SELECT→mutate→UPDATE inside a single
@@ -365,9 +411,15 @@ model-behavior edges.
 
 ### 4C. Functional bug-hunt deferred findings (live behavior — still open)
 
-- **[affordance] `workspace` tool has no `search` action** (low, self-heals) — the model repeatedly
-  guesses `workspace{action:"search"}` → strike → recovers. Add a `search`/`recall` alias or clearer
-  description.
+- **[affordance] `workspace` tool has no `search` action** — **RESOLVED 2026-07-09.** The guess is
+  now a real action: `search` (alias `recall`, unadvertised to keep the schema lean per #7) does
+  IDF-weighted keyword search over the whole activity log (`WorkspaceActivity.search`, mirroring
+  selfhood's `search_my_past`; matches summaries, kinds, project ids AND payload values, so
+  filenames/URL components hit). Schema advertises `search` + a `query` param; near-miss arg names
+  (`q`/`text`/`keywords`) are absorbed instead of striking; the no-match reply redirects to the
+  `recall` tool / `manage_projects` (which also nudges the recall-routing item below). A consistency
+  test pins the schema enum ⊆ `_VALID_ACTIONS` (they are two sources of truth). Tests:
+  test_workspace_search.py (14). Docs: tools/workspace.html.
 - **[behavior] "project X" recall-routing variance** (low, model-dependent) — "when does project
   Kestrel ship?" made the model check the *projects* tool and give up, while "search your memory for
   Kestrel" recalled it (0.76). Storage correct; nudge via tool description or a recall-fallback on
@@ -379,12 +431,119 @@ model-behavior edges.
 - **[response] long skill-list truncated** (low) — "list all skills" tabulated 24 built-in tools and
   ran out of budget before acquired/composed; verifier LATE-REFUTED. Check whether truncated-answer
   auto-continuation fires here, or nudge to summarize not tabulate.
-- **[infra] smart-memory upstream 503 not retried** (low) — single occurrence (llama busy). Check
-  whether the background smart-memory task retries/degrades vs silently drops the injection.
+- **[infra] smart-memory upstream 503 not retried** — **RESOLVED 2026-07-09.** Checked first: the
+  HTTP layer DOES retry (worker-node failover, then one 2s retry on any 5xx in `_do_chat_completion`)
+  — but a main-node TIMEOUT was never retried (falls to the generic handler), and on final failure
+  the consolidation was lost **permanently and invisibly**: the journal item was already `pop_all`'d,
+  the task swallowed the exception with a bare `logger.error`, nothing re-queued, and the
+  adaptive-threshold observation was skipped too. Fix at the task level: `run_smart_memory_task` now
+  raises `RetryableConsolidationError` on upstream-transient failures (5xx/timeout/connection,
+  classified by `memory.journal.is_upstream_transient`) BEFORE any memory write; `process_journal_queue`
+  re-queues the item with a bounded `retries` counter (`JOURNAL_MAX_RETRIES=2`), with visible WARNING
+  lines on both re-queue (🔄) and final drop (🔶). Definitive failures (4xx/parse) keep log-and-drop —
+  a re-run would fail identically. Post-mortem items share the drain loop and could adopt the same
+  classification later (not done — scoped to the reported item). Tests: test_smart_memory_requeue.py
+  (8). Docs: memory/journal.html.
 - **[infra] torch leaked-semaphore at shutdown** (low, cosmetic) — `resource_tracker: 1 leaked
   semaphore` on every restart (the local embedder). Check the embedder subprocess/pool teardown.
 - **[coding] huge-reasoning no-file-spec** (reviewed, no fix) — model emits only prose reasoning, no
   spec; salvage logic already present. Genuine model-behavior edge.
+
+### 4D. B4 outcome-battery design (2026-07-09) — the harder task battery for #4/#27b
+
+> **IMPLEMENTED 2026-07-09 (same day):** `scripts/trackb4_tasks.py` (22 probe candidates across all
+> 7 seeded clusters + the held-out web_automation far ring; 8 seeding tasks, 4 easy / 4 hard on the
+> weak clusters; every task gated self-consistent) + `scripts/ablation_trackb4.py` (seeding phase,
+> mediation capture, task-stratified sign-flip test, log-based dream-gate instrumentation,
+> `--pilot` calibration mode emitting `b4_battery.json`; arms carry `--smart-memory 0.9`). Headless
+> tests: `tests/test_trackb4_battery.py` (74). Docs: `scripts/ABLATION.md` §Track B4. What remains
+> is OPERATOR EXECUTION: the ~2 h pilot, then the ~11 h overnight run (prod stopped, §2 gotchas).
+> Note the pilot band is implemented as "neither all-pass nor all-fail over `--pilot-repeats` (3)"
+> — the honest binary-sample version of the [0.3, 0.7] target below; extend the candidate pool if
+> fewer than ~18 survive.
+
+**Problem.** B3's probes are fact-recall string-matches; memory is ON in every arm, so both sit at
+97% and McNemar cannot see idle-loop value (§4A #4: ceiling artifact). The open questions — "does
+idle output improve OUTCOMES?" and "does frontier seeding beat uniform?" — need probes whose success
+depends on *competence the idle loops can change*, calibrated off the ceiling.
+
+**1. Task design.** ~36 candidate tasks across the self-play cluster families
+(`data_analysis, regex_parse, sql, algo, bash, python_general, concurrency` — the
+`classify_cluster` taxonomy) plus ONE held-out family (`web_automation`) that is never seeded, in
+three transfer rings: **near** (isomorphic to a `challenge_templates` shape, fresh surface data),
+**mid** (same cluster, new shape), **far** (held-out family). Every task is execution-grounded in
+the `eval/behavioral.py` style: the prompt drives the LIVE agent to compute something over fixture
+files in its sandbox and write a result artifact; a Python verifier checks the artifact
+(`BehavioralTask.verify` — no LLM judge, no prose string-match). Generate instances from the
+template bank at intermediate/advanced tier WITH twists (`na_rows`, `malformed_lines`,
+`negative_values` …) — the exact difficulty axes self-play trains on. Contamination guard: probe
+fixtures use a fixed harness seed; hash-compare each arm's generated challenge setups vs probe
+fixtures and log any collision.
+
+**2. Calibration pilot (the ceiling fix).** Run the candidate pool once against a CONTROL-configured
+agent; keep only tasks with baseline pass-rate in **[0.3, 0.7]** (target ≥18 survivors, ideally
+20–24); discard ceiling/floor tasks. This is the direct fix for p=1.0-by-saturation. Cost: one boot
++ ~36 probes ≈ 1.5–2 h.
+
+**3. Arm protocol per repeat** (same 3 arms as B3; control keeps memory ON, time-scale 1):
+- **Phase S — seeding (identical in ALL arms):** run ~8 seeding tasks picked to yield a mix of
+  passes and REAL failures (3–4 known-hard). Purpose: (a) failed trajectories → reflection material;
+  (b) auto-type memories → dream's entropy gate — **the arms must add `--smart-memory 0.9`**: B3's
+  arms never passed the flag, and `run_smart_memory_task` is the ONLY writer of `type:"auto"`
+  fragments, so dream's ≥3-auto-memories gate was unsatisfiable by construction (this, not seed
+  richness, is the first thing to fix); (c) frontier clusters with VARIANCE — without weak-vs-strong
+  cluster signal, `pick_frontier_seed` has nothing to exploit and frontier-vs-uniform is a coin flip
+  by construction. Instrument at end of S per arm: auto-fragment count, failed-trajectory count,
+  per-cluster stats.
+- **Phase I — idle window:** 8 epochs × 70 s at time-scale 60. Snapshot `skills_playbook.json`
+  before/after; count lessons by source.
+- **Phase P — probes:** the calibrated battery once per repeat via `agent_behavioral_runner`;
+  record passed, duration, steps, tool_calls, tool_errors (`trajectory_metrics`) + mediation
+  evidence (below).
+
+**4. Mediation instrumentation (the null-result differentiator).** An outcomes-null is
+uninterpretable unless we know whether lessons ever ENTERED the probe turns. Per probe: diff
+per-lesson `retrievals`/`last_retrieved_at` in `skills_playbook.json` around the request (the bus's
+retrieval credit) + count `Memory Bus … Hydrated context` lines in the arm log. Note the routing
+bias: the skill tier gets weight 2.0 only for procedural-intent queries — probe prompts must be
+phrased as DOING tasks (they are), else lessons are down-weighted 0.5 by design. Report
+`mediation_rate` = fraction of probe turns where ≥1 lesson surfaced. Pre-registered reading:
+outcomes-null + mediation≈0 → fix retrieval routing (don't re-run bigger); outcomes-null +
+mediation healthy → idle output genuinely doesn't transfer at this scale.
+
+**5. Stats.** Primary: treatment-vs-control paired outcomes per (task, repeat) — report exact
+McNemar as before BUT alongside a **task-stratified permutation test** (repeats within a task are
+correlated; the (task,repeat)-independence flaw is the same one §4B flags for the Wilson CIs).
+Power sketch: 20 tasks × 3 repeats = 60 pairs; at ~50% baseline a real +15–20 pp effect yields
+~12–18 discordant pairs — enough for a directional verdict; 2 repeats is NOT (B3 had 1/1
+discordant). Secondary: tool_errors/steps deltas (self-play lessons are often tool-idiom-shaped),
+lesson yield by source, per-cluster and per-transfer-ring outcomes.
+
+**6. Frontier verdict (#27b) — pre-registered.** Frontier's mechanism is picking WEAK clusters, so
+the verdict metric is (a) self-play lesson yield and (b) probe outcomes ON the seeded-weak clusters,
+frontier vs uniform. **KEEP frontier iff self-play yield ≥ uniform in ≥2/3 repeats AND weak-cluster
+probe delta ≥ 0; otherwise flip the default to uniform** (simpler, one less moving part). PRM stays
+either way — self-play productivity is already proven and the "delete PRM" trigger stays untripped.
+If Phase S can't produce cluster variance, frontier has no signal by construction → uniform by
+parsimony.
+
+**7. Dream sub-experiment (piggybacked, not a gate).** Log the entropy-gate state each idle epoch
+(auto-fragment count + dream's skip reason). Outcomes: gate satisfied + fired → dream lessons join
+the yield counts; gate satisfied + never fired → NEW BUG, file it; gate organically unsatisfiable
+even with `--smart-memory` on → journal decision on widening dream's seed source to trajectories
+(the 2026-07-07 hypothesis).
+
+**8. Budget / runtime.** Per arm-repeat: boot ~2 min + S ~16 min + I ~9 min + P ~20×2.5 min ≈
+75–80 min → 3 arms × 3 repeats ≈ **11–12 h: an overnight run with prod stopped** (launchd bootout →
+venv-python restore; §2 gotchas apply — sequential single throwaway agent, shared llama, probe
+timeout 300 s). Reduced option (~8 h): run `treatment_uniform` only in repeat 1 + decide frontier
+from yield-only mini-runs.
+
+**9. Deliverables (next focused session).** `scripts/trackb4_tasks.py` (fixture generator reusing
+`challenge_templates` + grounded verifiers in the `eval/behavioral.py` shape);
+`scripts/ablation_trackb4.py` (extends the trackb3 driver: seeding phase, mediation capture,
+stratified stats, `--pilot` mode); arm flags gain `--smart-memory 0.9`. Boot/teardown reuse
+`ablation_eval` as today (trackb3 already imports it).
 
 ---
 
@@ -424,6 +583,186 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-09 (23:30) — the three B4 verdicts ACTIONED (retrieval gate, frontier flip, dream seeds)
+- **(1) Lesson retrieval domain-rescue (the write-only-learning fix).** Forensic replay against the
+  B4 arm's REAL store: the arm's self-play lesson sat at embedding distance **1.056** from a
+  matching task probe vs the strict `DEFAULT_RETRIEVAL_DISTANCE = 0.45` floor (~cosine 0.78 on
+  normalized MiniLM) — a generalized lesson can never clear it against a concrete prompt, so the
+  skill tier filtered it on all 96 probe turns. Fix in `skills._playbook_items_and_branch`: a
+  candidate past the strict floor is admitted up to `_DOMAIN_RELAXED_DISTANCE = 1.25` when its
+  `domains` metadata contains the query's cluster per `_explicit_query_cluster()` — which requires
+  an explicit `CLUSTER_KEYWORDS` hit (NOT `classify_cluster`, whose python_general fallback would
+  let small talk "match"); untagged lessons (reflection) derive a domain from their trigger.
+  Semantic near-match OR domain match — never a blind dump. **Verified by replaying the real B4
+  store through the fixed path: the lesson now surfaces for a python-shaped probe; small talk
+  stays empty.** Tests: test_lesson_retrieval_domain_gate.py (8, incl. the forensic repro).
+  Docs: memory/skills.html.
+- **(2) `--frontier-selfplay` default flipped to OFF (#27b CLOSED).** Tied uniform on self-play
+  yield in both instrumented ablations (B3 2v2; B4 equal in all 4 repeats) — parsimony wins; the
+  machinery stays opt-in (re-enable criterion: a run where it out-yields uniform). getattr default
+  in dream.py matched. PRM STAYS (self-play productive 3/4 repeats per arm). 100 frontier tests
+  green unchanged. Docs: cli_reference.html, algorithms/dream_cycle.html.
+- **(3) Dream trajectory seeding.** `trajectory_dream_fragments(context)` digests the newest
+  trajectories (task/outcome/tools/first-error, `traj:` ids); `dream()` falls back to them when
+  the auto pool is <3 and the watchdog eligibility gate mirrors the fallback. Merge/delete
+  consolidation is DISABLED in trajectory mode (`traj:` ids must never reach collection.delete);
+  the value is the heuristics harvest (`source="dream"`). Idempotency guard unchanged. Tests:
+  test_dream_trajectory_seeds.py (8). Docs: core/dream.html.
+- Deploy note: prod needs a restart to pick these up.
+
+### 2026-07-09 (23:00) — B4 FULL RUN EXECUTED (3 arms × 4 repeats): triple-null, but every null is now DIAGNOSED
+- Ran 18:08-22:52, clean (no holds, no swap pressure, 12 arm-boots). Report:
+  `ablation_out/b4-20260709/`. Headline: outcomes p=1.0 — but unlike B3's ceiling artifact, the
+  instrumentation localizes each failure mode precisely:
+- **(1) The battery re-ceilinged at run time (97% all arms) despite pilot calibration at ~67%.**
+  Diagnosis: the pilot reuses ONE agent across its 3 passes (cheap), so pass-2/3 failures were
+  partly CROSS-PASS MEMORY INTERFERENCE (recalling pass-1's answer against pass-2's reseeded data);
+  the run boots FRESH arms per repeat → cold agents solve the tasks ~always. **Calibration-protocol
+  lesson: a pilot must match run conditions — boot fresh per pass.** Battery difficulty for this
+  model remains unsolved below expert tier (37 candidates, two pilots, 8 survivors, all ceiling
+  under run conditions).
+- **(2) Mediation ≈ 0** (1 of 96 probe turns surfaced any lesson, despite 16/16 bus hydrations per
+  arm): the ~1 self-play lesson per arm-run never entered a probe prompt. Per the §4D
+  pre-registered reading: before any bigger run, fix RETRIEVAL ROUTING of playbook lessons into
+  task-shaped turns (or accept that 1-lesson corpora can't mediate). Outcome transfer was
+  structurally unmeasurable this run: ceiling × zero mediation.
+- **(3) #27b frontier-vs-uniform: TIED AGAIN** — self-play yield per repeat treatment {1,0,1,1} vs
+  uniform {1,0,1,1}: equal in all 4 repeats (B3: 2v2). Rule-as-written (≥ in ≥2/3) technically
+  KEEPS frontier on ties, but two instrumented experiments now show zero separation — parsimony
+  argues flipping the default to uniform (--no-frontier-selfplay) and shelving the frontier
+  selection layer. OPERATOR DECISION pending; PRM stays either way (self-play fired 3/4 repeats
+  per arm).
+- **(4) Dream gate DEFINITIVELY adjudicated:** auto_memories=0 across all 12 arm-runs — the
+  smart-memory consolidator processed the seeding turns (journal drains ran) but stored ZERO
+  auto-facts, because task-shaped turns ("read sales.csv, compute X") contain nothing scoring ≥0.9
+  as a memorable fact. The §4D "--smart-memory feeds the gate" hypothesis is REFUTED for task
+  seeding; fact-shaped chat seeds (B3) don't fire it either. The 2026-07-07 hypothesis is now the
+  only live path: **dream needs a trajectory-shaped seed source (code change), not a better
+  seeding protocol (more runs).** Also: failed_traj=0 — the model passed even the seed_hard tasks,
+  so reflection had no material (reflection yield 0 everywhere, consistent).
+- Also observed: a `perfection_protocol` lesson source (Perfect-It internal learning) fired 1-2×
+  in several arms — balanced across frontier/uniform, first time it shows in an ablation.
+
+### 2026-07-09 (night) — B4 pilot #1: harness bug caught + battery recalibrated (pilot #2 running)
+- **Pilot #1 ran clean** (prod stopped by operator; 3 passes × 23 candidates, 12:38-14:40) and
+  earned its keep twice:
+- **(1) Timeout-bleed cascade (REAL harness bug, would have poisoned the overnight run).** A
+  client-side probe timeout does NOT stop the agent's in-flight turn — the agent keeps working it
+  (artifact appeared on disk minutes after the driver moved on), while the next probe queues behind
+  the #22 turn-serialization semaphore and burns its own 300s budget waiting. `conc_worker_sum`
+  (model writes deadlock-prone producer/consumer code, genuine 300s overrun ×3) took down
+  `web_table_sum` (0/3, never actually measured) and `web_pdf_links` (0/3 until the cascade drained
+  in pass 3) — confirmed by per-pass duration records (300/300/300 and 300/300/164). Bonus finding:
+  both web tasks shared the fixture filename `page.html`, so the overrunning task saw its file
+  swapped mid-flight ("The file has no table structure"). **Fixes:** driver `_wait_arm_quiet`
+  (poll the arm log's Request-Finished count vs requests sent, bounded grace, between every task);
+  globally-unique fixture filenames across ALL tasks (`_rename_fixture`/`_rekey_expected` wrappers)
+  + a uniqueness test.
+- **(2) Calibration verdict: clean single-file tasks are CEILING** — every sql/algo/pg task and
+  most bash/rp went 3/3 fast (42-91s); the model is stronger than the template-bank shapes at this
+  tier. In-band (7/23): all four data_analysis tasks + rp_5xx_count + bash_top_user (~2/3 each) —
+  the working difficulty lever is **messy multi-file data + fiddly-but-precise rules**, not
+  algorithmic complexity. Survivors gave ZERO weak-cluster coverage (sql/algo/conc), which #27b
+  needs. **12 v2 variants authored** porting the messy-data recipe into the ceiling clusters
+  (dirty joins in SQL, 3-table payout, interval gaps with boundary rules, second-mode with
+  tie-breaks, multi-condition log parsing, nested JSONL, ThreadPoolExecutor-named concurrency…).
+  Battery tests 102 green (self-consistency gate covers all 35 candidates). **Pilot #2** (12 new +
+  3 raced tasks, fixed driver, `--battery-file` subset support added to pilot mode) launched
+  ~15:3x; final battery = pilot-1 survivors + pilot-2 survivors.
+- **Pilot #2 (completed 17:57 after 3 harness iterations of its own):** (a) v2 crawled — my
+  wait-for-quiet counted "Request Finished" (title case) but the pretty-stream renders it
+  lowercase → every task burned the full 240s grace; fixed case-insensitive. (b) `conc_worker_sum`
+  wedged the arm 37+ min on its pass-2 seed (deadlocking queue code retried across turns, exit 124
+  each time) and the grace-then-PROCEED design re-created the cascade → task DROPPED as a
+  run-killer (two pilots of evidence) and wait-for-quiet hardened to grace-then-HOLD (900s grace,
+  1800s ceiling; a probe fired into a busy arm is a wasted probe). (c) A test I wrote for the old
+  proceed behavior then silently hung the relaunch chain — hold ceiling parameterized, test split
+  into case-insensitivity + hold-then-give-up (103 green). **Clean re-pilot verdict: the v2
+  "harder" tasks mostly ALSO went ceiling** (9/12 at 3/3 — the model absorbs messy single-concept
+  tasks too); survivors: algo_second_mode 2/3, web_table_sum 1/3 (its pilot-1 0/3 was cascade
+  contamination; conversely web_pdf_links' pilot-1 "1/3" was contamination — clean 3/3, dropped).
+  `sql_eng_payout`'s one fail was `7646.0` vs `7646` — a float-formatting artifact, so the verifier
+  now normalizes integer-valued floats and the task reclassifies as ceiling.
+- **FINAL BATTERY (`ablation_out/b4_battery_final.json`): 8 tasks** — da×4 (group_sum, join_gold,
+  revenue, top_region), bash_top_user, rp_5xx_count, algo_second_mode, web_table_sum. Honest power
+  note: at 8 tasks the stratified test only detects LARGE pass-rate effects; the run's mediation /
+  dream-gate / lesson-yield instrumentation is fully informative regardless. **Pre-registration
+  amendment (BEFORE the run):** weak-cluster in-band coverage ended at algo×1 + regex×1 (sql and
+  concurrency calibrated out entirely), so #27b's "weak-cluster probe delta ≥ 0" condition is
+  under-powered to meaninglessness — the frontier keep/flip verdict falls back to the YIELD
+  criterion alone (self-play yield ≥ uniform in ≥2/3 repeats), with the delta reported
+  descriptively only.
+
+### 2026-07-09 (night) — #5 step 3 SHIPPED (finalization chain → _finalize_and_return)
+- Same script-driven protocol as step 2 (content boundary asserts, dedent-safety, ast.parse +
+  symtable gates). This region was STRUCTURALLY simpler than the dispatch pipeline: it is the tail
+  of handle_chat inside the semaphore `async with` — single return, no nonlocal, no except handler
+  between region and function end (just the Request-Finished `finally`), and nothing after it reads
+  locals → **zero control-flow rewrites and zero repack** (`FinalizeState` = 20 read-only fields).
+  Capture-analysis nuances this time: except-`as` bindings and in-function `import`s masquerade as
+  unbound loads (same as step 2); `payload` was only bound inside the turn loop, so a `payload =
+  None` pre-bind was added for the deterministic-dispatch exit path (crash semantics preserved:
+  that theoretical path now AttributeErrors instead of NameErrors). handle_chat shrinks ~950 more
+  lines (steps 1-3 total: ~2,900 of the original 11k). Suite **6801 green**; +6 direct tests;
+  3 stale source-inspection tests repointed (one had a second latent staleness: it matched the
+  bare literal `<tool_response>` that only existed in an unrelated comment). Live-validated on a
+  throwaway agent (:8046, same code): probe file exact-bytes on disk, verifier gate (inside the
+  extracted chain) CONFIRMED 100%, zero errors in the log. Prod deploys on next restart.
+
+### 2026-07-09 (later) — B4 battery IMPLEMENTED + #5 step 2 SHIPPED (dispatch pipeline + TurnState)
+- **B4 outcome battery implemented** (§4D design → code, same day): `scripts/trackb4_tasks.py` — 22
+  probe candidates (7 seeded clusters + held-out web_automation far ring; unique-winner fixture
+  post-processing kills tie ambiguity) + 8 seeding tasks (4 easy strong-cluster / 4 hard on the
+  pre-registered weak clusters); every task self-consistency-gated (reference must verify, garbage
+  must not). `scripts/ablation_trackb4.py` — seeding phase, per-probe mediation capture (playbook
+  retrieval-credit diffs), task-stratified sign-flip test beside McNemar, log-based dream-gate
+  instrumentation, `--pilot` calibration emitting `b4_battery.json`, `--smart-memory 0.9` in every
+  arm, per-repeat fixture seeds (memorisation guard) identical across arms (pairing). +74 tests
+  (`test_trackb4_battery.py` — caught a real tokenizer bug: sentence-final `25.` ≠ `25`). Docs:
+  `scripts/ABLATION.md` §Track B4. Remaining: operator runs pilot (~2 h) + overnight (~11 h).
+- **#5 step 2 shipped:** `_dispatch_and_process_tool_batch` + `TurnState` (see §4A #5 for the full
+  contract). Method: script-driven surgery with content boundary asserts, dedent-safety check,
+  `ast.parse` + symtable free-name gates; the AST capture analysis found the naive contract would
+  have silently reset the cross-iteration SYSTEM-3 latch (`_request_sys3_fired_once`) — the exact
+  failure class the decomposition memory warned about. Also: the old `break`'s "exit the
+  enumerate(results) loop" comment was STALE — AST proves it broke the TURN loop.
+- Suite **6795 passed / 12 skipped / 0 failed** (+80 today). **Deployed + live-validated** (operator
+  restarted prod): (1) file-write+read request ran through `_dispatch_and_process_tool_batch` — the
+  native tool_call corruption repair fired and recovered live, verifier CONFIRMED 100%, exact bytes
+  on disk; (2) the model guessed `workspace action="search"` exactly as the §4C finding predicted
+  and got a real search + the no-match redirect instead of a strike (its "no record of step2_check"
+  answer is CORRECT — file_system writes don't record activity events; only commands/research/
+  notes/tracked files do). Today's earlier fixes (stamping ContextVar, journal re-queue) are live
+  in the same deploy.
+
+### 2026-07-09 — §4 sweep: stamping race actually closed, workspace search, journal re-queue, B4 design
+- **Event-stamping race (§4B): the "confirm #22 closes it" pass DISCONFIRMED it.** Two project-id
+  fields exist; #22 + the 2026-07-08 pinning protect `context.current_project_id` (sandbox scoping)
+  while every `record_*` stamps from `workspace_model.current_project_id`. Idle autoadvance was
+  mis-stamping deterministically; dream self-play (own semaphore) clobbered the shared field and
+  polluted the real activity log. Fixed with a task-local ContextVar override
+  (`set_event_project` / `pinned_event_project` in `workspace/model.py`) read first by every stamp
+  site, + `isolated_context.workspace_model = None` for self-play. +8 tests incl. the reproduced
+  interleave.
+- **`workspace` search action (§4C):** `action="search"` (alias `recall`) is now real —
+  IDF-weighted keyword search over the activity log (`WorkspaceActivity.search`, `search_my_past`
+  sibling); schema advertises `search`+`query`; near-miss arg names absorbed; no-match reply
+  redirects to `recall`/`manage_projects`; enum⊆dispatch consistency test. +14 tests.
+- **smart-memory 503 (§4C):** verified HTTP-layer retry exists but final failure silently+permanently
+  dropped the popped journal item (and timeouts got no retry at all). Added task-level bounded
+  re-queue: `RetryableConsolidationError` + `is_upstream_transient` (5xx/timeout/conn) in
+  `memory/journal.py`, drain loop re-queues with `retries` cap 2, visible WARNINGs. +8 tests.
+- **B4 outcome-battery DESIGNED (§4D)** for #4/#27b: behavioral-style grounded tasks over the
+  self-play cluster families in three transfer rings, a [0.3,0.7] calibration pilot (the ceiling
+  fix), an identical-in-all-arms seeding phase (real failures → reflection; `--smart-memory 0.9` →
+  dream's `type:"auto"` gate — B3's arms never passed the flag and the consolidation task is the
+  only auto-fragment writer, so dream was unsatisfiable by construction; cluster variance → frontier
+  signal), per-probe lesson-retrieval mediation instrumentation, task-stratified stats at 3 repeats,
+  and a pre-registered frontier keep/flip rule. Implementation = next focused session.
+- Suite: 6685→**6715 passed** (+30), 12 skipped, 0 failed. Docs: tools/workspace.html,
+  core/workspace_model.html, core/project_advancer.html, core/dream.html, memory/journal.html.
+  **Deploy note: prod needs a restart to pick up the fixes.**
 
 ### 2026-07-08 (night) — deep_research per-URL Tor fetch racing
 - Last leg of the Tor pipeline: the page-FETCH stage shared ONE circuit across all 8 URLs (the same

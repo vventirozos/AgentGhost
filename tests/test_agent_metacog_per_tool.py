@@ -138,8 +138,12 @@ def test_main_drains_background_tasks_on_shutdown():
 
 def test_context_shield_does_not_clobber_payload_variable():
     """The shield summarizer must bind `shield_payload`, never reassign
-    the loop-level `payload` (reused by the Perfect-It generation)."""
-    src = inspect.getsource(GhostAgent.handle_chat)
+    the loop-level `payload` (reused by the Perfect-It generation).
+
+    The shield block moved into `_dispatch_and_process_tool_batch` with
+    the #5 step-2 extraction (2026-07-09) — inspect both."""
+    src = (inspect.getsource(GhostAgent.handle_chat)
+           + inspect.getsource(GhostAgent._dispatch_and_process_tool_batch))
     assert "shield_payload = {" in src
     # The old clobbering assignment must be gone from the shield block.
     assert "Offloading" in src  # shield block still present

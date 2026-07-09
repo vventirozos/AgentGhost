@@ -198,12 +198,16 @@ def test_source_direct_summary_is_wired_before_force_final_response():
     assert block_start >= 0, (
         f"expected `{anchor}` section marker in agent.py"
     )
+    # The #5 step-2 extraction (2026-07-09) rewrote the block-ending
+    # turn-loop `break` into the method's boolean return (the old
+    # "exit the enumerate(results) loop" comment was stale — the AST
+    # shows it always broke the TURN loop).
     block_end = src.find(
-        "break  # exit the enumerate(results)", block_start
+        "return True  # was `break`", block_start
     )
     assert block_end > block_start, (
-        "expected `break  # exit the enumerate(results)` at end of "
-        "the direct-summary block"
+        "expected the rewritten turn-loop break (`return True`) at the "
+        "end of the direct-summary block"
     )
     branch = src[block_start:block_end]
 

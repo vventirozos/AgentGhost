@@ -172,7 +172,12 @@ def parse_args():
     # is untrained or the trajectory store is empty — falls through to
     # the existing pick_seed without behavioural drift. See
     # `core/frontier_selection.py` for the weighting math.
-    parser.add_argument("--frontier-selfplay", action=argparse.BooleanOptionalAction, default=True, help="Enable frontier-aware cluster selection in self-play (PRM uncertainty × trajectory rarity). Use --no-frontier-selfplay to revert to the legacy brittle-pool pick.")
+    # Default flipped to UNIFORM 2026-07-09 (#27b): frontier-aware selection
+    # tied uniform seeding on self-play lesson yield in BOTH instrumented
+    # experiments (B3: 2v2; B4: equal in all 4 repeats) — no measured
+    # advantage, so parsimony wins. The machinery stays for --frontier-selfplay
+    # opt-in (re-enable criterion: a run where it out-yields uniform).
+    parser.add_argument("--frontier-selfplay", action=argparse.BooleanOptionalAction, default=False, help="Enable frontier-aware cluster selection in self-play (PRM uncertainty × trajectory rarity). Default OFF since 2026-07-09: tied uniform seeding in two instrumented ablations (#27b).")
     parser.add_argument("--frontier-uniform-sample-prob", type=float, default=0.2, help="Probability per self-play tick that frontier-aware selection is bypassed in favour of the legacy pick_seed (uniform-sample sanity floor). Without this, a systematically wrong PRM could lock self-play onto a single cluster. Default 0.2.")
     # Selfhood / unified self. The five-piece module (autobiographical
     # log, self-state thread, recognition layer, narrative summariser,

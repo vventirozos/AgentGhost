@@ -17,6 +17,7 @@ import ctypes
 import platform
 import httpx
 from typing import List, Dict, Any, Optional
+from dataclasses import dataclass
 from pathlib import Path
 
 from .prompts import SYSTEM_PROMPT, SPECIALIST_SYSTEM_PROMPT, SMART_MEMORY_PROMPT, PLANNING_SYSTEM_PROMPT, SYSTEM_3_GENERATION_PROMPT, SYSTEM_3_EVALUATOR_PROMPT, THINK_BUDGET_TIGHT, THINK_BUDGET_EXTENDED
@@ -1682,6 +1683,91 @@ _CORRECTION_MAX = 3
 _CORRECTION_TTL = 900.0  # seconds
 
 
+@dataclass
+class TurnState:
+    """Turn-loop state crossing the `_dispatch_and_process_tool_batch`
+    boundary (#5 decomposition, step 2 — designed from an AST capture
+    analysis of handle_chat; see PROJECT_JOURNAL.md §4A #5).
+
+    Two kinds of fields:
+    * MUTATED_FIELDS — scalars the pipeline rebinds; the method repacks
+      them in a `finally` so handle_chat sees every update even when a
+      tool path raises. Several are cross-ITERATION state that never
+      leaves the region in one pass (e.g. `_request_sys3_fired_once`,
+      the once-per-request SYSTEM-3 latch): they live here because the
+      method frame dies per call, while handle_chat's frame used to
+      carry them between turns.
+    * the rest — read-only values and mutable containers (mutated
+      in place through the reference; never rebound).
+    """
+    _constraint_steer_pending: Any
+    _proj_task_closed_this_req: Any
+    _request_sys3_fired_once: Any
+    _request_sys3_prev_justification: Any
+    consecutive_parse_errors: Any
+    current_plan_json: Any
+    execution_failure_count: Any
+    final_ai_content: Any
+    fname: Any
+    force_final_response: Any
+    force_stop: Any
+    forget_was_called: Any
+    last_was_failure: Any
+    preflight_blocks_this_request: Any
+    request_sandbox_state: Any
+    transient_failure_count: Any
+    tool_calls: Any
+    msg: Any
+    ui_content: Any
+    parse_failure_reason: Any
+    model: Any
+    last_user_content: Any
+    char_budget: Any
+    strikes: Any
+    task_tree: Any
+    _user_batch_intent: Any
+    _request_constraints: Any
+    repeated_action_steered: Any
+    messages: Any
+    seen_tools: Any
+    executed_idempotent: Any
+    raw_tools_called: Any
+    tool_usage: Any
+    tools_run_this_turn: Any
+    request_state: Any
+
+    MUTATED_FIELDS = ('_constraint_steer_pending', '_proj_task_closed_this_req', '_request_sys3_fired_once', '_request_sys3_prev_justification', 'consecutive_parse_errors', 'current_plan_json', 'execution_failure_count', 'final_ai_content', 'fname', 'force_final_response', 'force_stop', 'forget_was_called', 'last_was_failure', 'preflight_blocks_this_request', 'request_sandbox_state', 'transient_failure_count')
+
+
+@dataclass
+class FinalizeState:
+    """Read-only inputs to `_finalize_and_return` (#5 decomposition,
+    step 3). Unlike `TurnState` there are NO mutated fields: the
+    finalization chain is the tail of handle_chat — nothing after it
+    reads these locals, and its own `return` is the method return.
+    """
+    body: Any
+    created_time: Any
+    current_trajectory_id: Any
+    execution_failure_count: Any
+    final_ai_content: Any
+    force_stop: Any
+    forget_was_called: Any
+    last_user_content: Any
+    last_was_failure: Any
+    lc: Any
+    messages: Any
+    model: Any
+    payload: Any
+    req_id: Any
+    thought_content: Any
+    tools_run_this_turn: Any
+    was_complex_task: Any
+    _stable_conv_fp: Any
+    _verdict_is_fresh: Any
+    _verifier_verdict_cache: Any
+
+
 class GhostAgent:
     def __init__(self, context: GhostContext):
         self.context = context
@@ -2395,7 +2481,24 @@ class GhostAgent:
                     # starve phases 2.5–3 for this idle session).
                     logger.debug("dream eligibility get() failed: %s", _cgx)
                     res = None
-                if res and len(res.get('ids', [])) >= 3:
+                _dream_eligible = bool(res and len(res.get('ids', [])) >= 3)
+                # isinstance gate: only consult the trajectory fallback when
+                # the auto-pool check ran against a REAL store (dict result) —
+                # a chroma error (res=None) shouldn't silently reroute to
+                # trajectories.
+                if not _dream_eligible and isinstance(res, dict):
+                    # Trajectory fallback (2026-07-09): the auto-memory pool
+                    # is organically unsatisfiable (0 across 12 instrumented
+                    # arm-runs — journal §6); dream() itself falls back to
+                    # trajectory digests, so the ELIGIBILITY gate must match
+                    # or the fallback is dead code. The probe is a cheap
+                    # line-count (no JSON parse) — this runs every tick.
+                    try:
+                        from .dream import trajectory_seed_available as _tsa
+                        _dream_eligible = await asyncio.to_thread(_tsa, ctx)
+                    except Exception as _tfx:
+                        logger.debug("dream trajectory eligibility failed: %s", _tfx)
+                if _dream_eligible:
                     if self._bio_roll(0.5):
                         from .dream import Dreamer
                         pretty_log("Biological Hook",
@@ -2990,12 +3093,21 @@ class GhostAgent:
                             kw.setdefault("is_background", True)
                             return await _bct(*a, **kw)
 
-                        result = await _advance_once(
-                            ctx, pid, tool_runner=_aa_tool_runner,
-                            llm_classifier=_aa_classify,
-                            code_generator=_aa_code_gen,
-                            coding_executor=_aa_build,
-                        )
+                        # Pin the EVENT stamp too: the pinned context above
+                        # only scopes sandbox writes (context.current_project_id);
+                        # record_command_outcome et al. stamp from the shared
+                        # workspace model, which still holds the LAST chat
+                        # turn's project during an idle tick. Without this,
+                        # every idle build's command outcomes land on the
+                        # wrong project's activity view.
+                        from ..workspace import pinned_event_project as _pin_evt
+                        with _pin_evt(pid):
+                            result = await _advance_once(
+                                ctx, pid, tool_runner=_aa_tool_runner,
+                                llm_classifier=_aa_classify,
+                                code_generator=_aa_code_gen,
+                                coding_executor=_aa_build,
+                            )
                         pretty_log(
                             "Autoadvance",
                             f"project={str(pid)[:8]} task={str(result.task_id)[:8]} "
@@ -3171,6 +3283,10 @@ class GhostAgent:
                             self._current_selfplay_cooldown = self._SELFPLAY_COOLDOWN
 
     async def process_journal_queue(self, *, respect_idle: bool = True):
+        from ..memory.journal import (
+            JOURNAL_MAX_RETRIES as _JRL_MAX,
+            RetryableConsolidationError as _RetryableConsolidation,
+        )
         if not hasattr(self.context, 'journal'): return
 
         items = await asyncio.to_thread(self.context.journal.pop_all)
@@ -3179,12 +3295,14 @@ class GhostAgent:
         pretty_log("Hippocampus", f"Waking up to process {len(items)} buffered memories...", icon=Icons.BRAIN_THINK)
 
         processed = 0
+        requeue = []  # items that failed upstream-transiently → back to the journal
         for i, item in enumerate(items):
             if respect_idle:
                 idle_secs = (datetime.datetime.now() - self.context.last_activity_time).total_seconds()
                 if idle_secs < 30:
                     pretty_log("Hippocampus", f"User returned! Suspending memory processing. ({len(items)-i} items left)", icon=Icons.STOP)
-                    await asyncio.to_thread(self.context.journal.push_front, items[i:])
+                    await asyncio.to_thread(self.context.journal.push_front, requeue + items[i:])
+                    requeue = []
                     break
 
             try:
@@ -3193,15 +3311,41 @@ class GhostAgent:
                 elif item["type"] == "post_mortem":
                     await self._execute_post_mortem(item["data"]["user"], item["data"]["tools"], item["data"]["ai"], item["data"]["model"])
                 processed += 1
+            except _RetryableConsolidation as e:
+                # The item was already popped, so dropping it here is
+                # PERMANENT — the fact never reaches memory and nothing
+                # downstream notices. Re-queue with a bounded retry count;
+                # the next drain runs after the journal cooldown, by which
+                # time a busy llama has usually recovered.
+                retries = int(item.get("retries", 0) or 0)
+                if retries < _JRL_MAX:
+                    item["retries"] = retries + 1
+                    requeue.append(item)
+                    pretty_log(
+                        "Hippocampus",
+                        f"Upstream transient — re-queued {item.get('type')} item "
+                        f"(attempt {retries + 1}/{_JRL_MAX}): {e}",
+                        level="WARNING", icon=Icons.RETRY,
+                    )
+                else:
+                    pretty_log(
+                        "Hippocampus",
+                        f"Dropping {item.get('type')} item after {_JRL_MAX} "
+                        f"failed re-queues: {e}",
+                        level="WARNING", icon=Icons.WARN,
+                    )
             except Exception as e:
                 import logging
                 logging.getLogger("GhostAgent").error(f"Journal processing error: {e}")
             await asyncio.sleep(0.5)
 
+        if requeue:
+            await asyncio.to_thread(self.context.journal.push_front, requeue)
         if processed > 0:
             pretty_log("Hippocampus", f"Successfully consolidated {processed} memories.", icon=Icons.OK)
 
     async def run_smart_memory_task(self, interaction_context: str, model_name: str, selectivity: float):
+        from ..memory.journal import RetryableConsolidationError as _RetryableConsolidation
         if not self.context.memory_system: return
 
         # --- ⚡ FAST-ABORT HEURISTIC (ZERO LLM COMPUTE) ---
@@ -3235,7 +3379,19 @@ class GhostAgent:
                 # json_object response_format (already used by the graph
                 # extractor) keeps the model from padding with prose.
                 payload = {"model": model_name, "messages": [{"role": "user", "content": final_prompt}], "stream": False, "temperature": 0.1, "max_tokens": 3072, "response_format": {"type": "json_object"}}
-                data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
+                try:
+                    data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
+                except Exception as _ue:
+                    # The in-client retries (worker failover + one 2s retry
+                    # on 5xx) are exhausted and NOTHING has been stored yet,
+                    # so the whole task is safe to re-run later. Signal the
+                    # drain loop to re-queue the journal item — the old
+                    # log-and-swallow path dropped the consolidation
+                    # permanently (the item was already popped).
+                    from ..memory.journal import is_upstream_transient as _iut
+                    if _iut(_ue):
+                        raise _RetryableConsolidation(f"{type(_ue).__name__}: {_ue}") from _ue
+                    raise
                 content = data["choices"][0]["message"]["content"]
                 # repair_truncated: a cap hit here used to drop the whole
                 # consolidation; salvaging the complete pairs keeps the fact.
@@ -3378,6 +3534,8 @@ class GhostAgent:
                         )
 
 
+            except _RetryableConsolidation:
+                raise  # handled by process_journal_queue (bounded re-queue)
             except Exception as e: logger.error(f"Smart memory task failed: {e}")
 
     async def _execute_post_mortem(self, last_user_content: str, tools_run: list, final_ai_content: str, model: str):
@@ -5427,6 +5585,2362 @@ class GhostAgent:
 
         return tool_calls, ui_content, parse_failure_reason
 
+    async def _dispatch_and_process_tool_batch(self, ts: "TurnState") -> bool:
+        """The tool guard / dispatch / result pipeline — one whole turn's
+        tool batch: preamble-rollback bookkeeping, per-tool pre-flight
+        guards (strike cap, disabled/unknown tool, idempotency dedupe,
+        recent-failure guard, participant/egress checks), parallel
+        dispatch, result pairing, failure classification/steering and
+        the SYSTEM-3 pivot. Extracted VERBATIM from handle_chat (#5
+        step 2) against `TurnState`; the only rewrites are the two
+        turn-loop control-flow statements (the region was the loop-body
+        tail): returns True to BREAK the turn loop, False to continue
+        with the next iteration. State repack happens in `finally` so a
+        raising tool path leaves ts as up-to-date as the old inline
+        code left handle_chat's locals.
+        """
+        _constraint_steer_pending = ts._constraint_steer_pending
+        _proj_task_closed_this_req = ts._proj_task_closed_this_req
+        _request_sys3_fired_once = ts._request_sys3_fired_once
+        _request_sys3_prev_justification = ts._request_sys3_prev_justification
+        consecutive_parse_errors = ts.consecutive_parse_errors
+        current_plan_json = ts.current_plan_json
+        execution_failure_count = ts.execution_failure_count
+        final_ai_content = ts.final_ai_content
+        fname = ts.fname
+        force_final_response = ts.force_final_response
+        force_stop = ts.force_stop
+        forget_was_called = ts.forget_was_called
+        last_was_failure = ts.last_was_failure
+        preflight_blocks_this_request = ts.preflight_blocks_this_request
+        request_sandbox_state = ts.request_sandbox_state
+        transient_failure_count = ts.transient_failure_count
+        tool_calls = ts.tool_calls
+        msg = ts.msg
+        ui_content = ts.ui_content
+        parse_failure_reason = ts.parse_failure_reason
+        model = ts.model
+        last_user_content = ts.last_user_content
+        char_budget = ts.char_budget
+        strikes = ts.strikes
+        task_tree = ts.task_tree
+        _user_batch_intent = ts._user_batch_intent
+        _request_constraints = ts._request_constraints
+        repeated_action_steered = ts.repeated_action_steered
+        messages = ts.messages
+        seen_tools = ts.seen_tools
+        executed_idempotent = ts.executed_idempotent
+        raw_tools_called = ts.raw_tools_called
+        tool_usage = ts.tool_usage
+        tools_run_this_turn = ts.tools_run_this_turn
+        request_state = ts.request_state
+        try:
+            # Capture the end-of-prior-iteration boundary so we
+            # can rollback this iteration's preamble flush if
+            # every tool_call below ends up synthetic (parse
+            # error, invalid JSON args, unknown/disabled tool,
+            # idempotency block, empty-write block). Without the
+            # rollback, a confused iteration's preamble
+            # ("Thank you for the kind words!") concatenates to
+            # the NEXT iteration's real response and the user
+            # sees a Frankenstein reply.
+            # Trace: 2026-05-01 dialog log turn 28.
+            _pre_flush_final_len = len(final_ai_content)
+
+            if ui_content:
+                ui_content = ui_content.replace("\r", "")
+                if final_ai_content and not final_ai_content.endswith("\n\n"):
+                    final_ai_content += "\n\n"
+                final_ai_content += ui_content
+
+            messages.append(msg)
+            last_was_failure = False
+
+            if tool_calls:
+                import html
+                def unescape_xml_values(val):
+                    if isinstance(val, str):
+                        return html.unescape(val).replace('\\"', '"').replace("\\'", "'")
+                    elif isinstance(val, dict):
+                        return {k: unescape_xml_values(v) for k, v in val.items()}
+                    elif isinstance(val, list):
+                        return [unescape_xml_values(v) for v in val]
+                    return val
+
+                for tc in tool_calls:
+                    try:
+                        args_dict = json.loads(tc["function"]["arguments"], strict=False)
+                        tc["function"]["arguments"] = json.dumps(unescape_xml_values(args_dict))
+                    except Exception:
+                        pretty_log(
+                            "Agent Parser",
+                            f"Arguments for tool "
+                            f"'{tc.get('function', {}).get('name')}' are not valid "
+                            f"JSON at the unescape step — leaving them raw",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+
+            # Reset the per-BATCH read budget before dispatching this
+            # assistant message's tool calls. Parallel whole-file reads
+            # were overflowing the window: each cleared the per-file cap,
+            # but together they didn't fit (observed: two 170+ KB JSONs →
+            # 136 K tokens vs a 131 K window → HTTP 400). The budget caps
+            # cumulative raw-read bytes for THIS batch; file_system reads
+            # charge against it via the registry closure.
+            try:
+                from ..tools.file_system import ReadBudget, read_byte_budget
+                _mc = int(getattr(self.context.args, "max_context", 8192) or 8192)
+                self.context._read_budget = ReadBudget(read_byte_budget(_mc))
+            except Exception:
+                self.context._read_budget = None
+
+            tool_tasks, tool_call_metadata = [], []
+            tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
+            # Idempotent setters dispatched in THIS batch. The guard
+            # checks it alongside `executed_idempotent` so two
+            # identical calls in one response still dedupe, while
+            # the durable hash only commits at result time on
+            # SUCCESS (a failed call must not block its own
+            # corrected retry on the next iteration).
+            pending_idempotent = set()
+            for _tc_idx, tool in enumerate(tool_calls):
+                # Strike cap inside the per-tool loop. The outer cap
+                # at the top of the turn loop only runs at turn
+                # boundaries, so without this a single response
+                # carrying many system_parse_error entries drains
+                # the whole list before the cap fires next turn.
+                if execution_failure_count >= 6:
+                    logger.warning(
+                        "Strike cap hit mid-loop (execution_failure_count=%d); skipping remaining %d tool_call(s).",
+                        execution_failure_count, len(tool_calls) - _tc_idx,
+                    )
+                    break
+                fname = tool["function"]["name"]
+                raw_tools_called.add(fname)
+                tool_usage[fname] = tool_usage.get(fname, 0) + 1
+
+
+
+                if fname == "forget":
+                    forget_was_called = True
+                elif fname == "knowledge_base":
+                    try:
+                        args = json.loads(tool["function"]["arguments"])
+                        if args.get("action") == "forget":
+                            forget_was_called = True
+                    except: pass
+
+                if hasattr(self, 'disabled_tools') and fname in self.disabled_tools:
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM ERROR: Tool '{fname}' is explicitly disabled in this context."}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    execution_failure_count += 1
+                    last_was_failure = True
+                    continue
+
+                if fname == "system_parse_error":
+                    consecutive_parse_errors += 1
+                    pretty_log(
+                        "Tool Syntax Error",
+                        f"Failed to parse tool call (consecutive={consecutive_parse_errors}, reason={parse_failure_reason or 'unknown'})",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+
+                    # Reason-specific recovery hints. The prior
+                    # implementation repeated the same generic "use
+                    # XML" reminder on every failure, which trapped
+                    # the model in a loop because it didn't say
+                    # WHAT broke. Match the hint to the detected
+                    # cause so the model can actually fix it.
+                    if parse_failure_reason == "truncated":
+                        # Most common failure in the self-play
+                        # trace: upstream max_tokens cap severed
+                        # the <tool_call> mid-content. The model
+                        # has no visibility into the cap; tell it.
+                        err_msg_content = (
+                            "SYSTEM ERROR: Your previous output was CUT OFF before the "
+                            "`<tool_call>` finished. The upstream server truncated your "
+                            "response mid-tag, so no closing `</parameter></function></tool_call>` "
+                            "ever arrived. This is NOT an XML-syntax problem — it is a "
+                            "length problem.\n\n"
+                            "FIX: shorten your output on the next turn. Pick ONE:\n"
+                            "  1. Write a SHORTER Python script (under 80 lines). Split "
+                            "work into multiple tool calls if needed.\n"
+                            "  2. Use `file_system` `operation=\"write\"` directly "
+                            "instead of cramming code into an `execute` `content` param.\n"
+                            "  3. Use `file_system` `operation=\"replace\"` to edit one "
+                            "chunk of an existing file rather than rewriting the whole thing.\n\n"
+                            "Stop trying CDATA / heredoc / base64 — those do not fix "
+                            "truncation."
+                        )
+                    elif parse_failure_reason == "no_function_tag":
+                        err_msg_content = (
+                            "SYSTEM ERROR: Your `<tool_call>` block was present but "
+                            "contained no `<function name=\"...\">` tag. Output the "
+                            "tool call with the exact shape:\n"
+                            "<tool_call>\n  <function name=\"the_tool_name\">\n"
+                            "    <parameter name=\"arg1\">value1</parameter>\n"
+                            "  </function>\n</tool_call>"
+                        )
+                    elif consecutive_parse_errors >= 2:
+                        # Switched-strategy hint only after the
+                        # second failure, and only for genuinely
+                        # malformed (not truncated) output.
+                        err_msg_content = (
+                            f"SYSTEM ESCAPE HATCH (parse failed {consecutive_parse_errors}x): "
+                            "STOP repeating the same shape — it does not parse.\n\n"
+                            "Pick ONE alternative:\n"
+                            "(A) CDATA envelope for content with literal `</parameter>` / `<` / `>` / JSON:\n"
+                            "    `<parameter name=\"content\"><![CDATA[...]]></parameter>`\n"
+                            "(B) `file_system` `operation=\"write\"` (native) instead of `execute`.\n"
+                            "(C) `file_system` `operation=\"replace\"` for small edits.\n\n"
+                            "Output ONE complete tool_call. Do not ask for clarification."
+                        )
+                    else:
+                        err_msg_content = (
+                            "SYSTEM ERROR: Your `<tool_call>` did not parse. Use strict XML:\n"
+                            "<tool_call>\n  <function name=\"the_tool_name\">\n"
+                            "    <parameter name=\"arg1\">value1</parameter>\n"
+                            "  </function>\n</tool_call>\n\n"
+                            "If a parameter body contains literal `</parameter>` / `<` / `>` / JSON, "
+                            "wrap it in `<![CDATA[ ... ]]>`."
+                        )
+
+                    err_msg = {
+                        "role": "tool",
+                        "tool_call_id": tool["id"],
+                        "name": "system",
+                        "content": err_msg_content,
+                    }
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    execution_failure_count += 1
+                    last_was_failure = True
+                    continue
+
+                try:
+                    t_args = json.loads(tool["function"]["arguments"], strict=False)
+
+                    is_sandbox_mutation = fname in ["execute", "image_generation"] or \
+                                          (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone"])
+
+                    if is_sandbox_mutation:
+                        # Invalidate both the legacy global and the
+                        # per-request local cache so the next turn
+                        # re-lists the workspace.
+                        self.context.cached_sandbox_state = None
+                        request_sandbox_state = None
+                        request_state.invalidate_sandbox()
+                    # Skill writes invalidate the playbook cache too.
+                    if fname == "learn_skill":
+                        request_state.invalidate_skill_playbook()
+                    # Acquired-skill registry mutations
+                    # (create_skill / manage_skills delete) change
+                    # the schema list the LLM sees. Without this
+                    # the new skill is unreachable until the next
+                    # user message — observed loop where the model
+                    # spent 11 min narrating "now invoking X" but
+                    # never emitting a real tool_call because the
+                    # cached schema didn't contain X yet.
+                    if fname == "create_skill" or (
+                        fname == "manage_skills"
+                        and (t_args.get("action") or "").lower() == "delete"
+                    ) or (
+                        fname == "manage_composed_skills"
+                        and (t_args.get("action") or "").lower() in ("define", "delete", "approve")
+                    ):
+                        request_state.invalidate_tool_defs()
+
+                    a_hash = f"{fname}:{json.dumps(t_args, sort_keys=True)}"
+                except Exception as e:
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Invalid JSON arguments - {str(e)}"}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    execution_failure_count += 1
+                    last_was_failure = True
+                    continue
+
+                is_mutating = fname in ["execute", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
+                              (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename"]) or \
+                              (fname == "knowledge_base" and t_args.get("action") in ["ingest_document", "forget", "reset_all", "insert_fact"]) or \
+                              (fname == "manage_composed_skills" and t_args.get("action") in ["define", "approve", "delete"])
+
+                # --- IDEMPOTENCY GUARD (production loop fix) ---
+                # Pure setters with no value in repetition. Re-issuing
+                # them with identical args is always a model loop, not
+                # a legitimate retry. `execute` and `file_system.write`
+                # are intentionally NOT in this set: rerunning a script
+                # after an external fix is legitimate.
+                is_idempotent_setter = (
+                    fname in ("update_profile", "learn_skill")
+                    or (fname == "knowledge_base"
+                        and t_args.get("action") in ("insert_fact", "forget"))
+                )
+                if is_idempotent_setter and (
+                        a_hash in executed_idempotent
+                        or a_hash in pending_idempotent):
+                    pretty_log(
+                        "Idempotency Guard",
+                        f"Blocked duplicate {fname} call (args already applied)",
+                        icon=Icons.STOP,
+                    )
+                    err_msg = {
+                        "role": "tool",
+                        "tool_call_id": tool["id"],
+                        "name": fname,
+                        "content": (
+                            f"SYSTEM IDEMPOTENCY: '{fname}' was already executed earlier in this "
+                            f"request with these exact arguments. The intended state is already "
+                            f"applied. DO NOT call it again — proceed to the next step or finalize "
+                            f"your response to the user."
+                        ),
+                    }
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    continue
+                # NB: `executed_idempotent.add(a_hash)` is deliberately
+                # deferred until AFTER the tool is actually dispatched
+                # (see the dispatch site) — recording it here marked the
+                # call "done" even when a downstream gate (metacog
+                # ask_user) aborted the dispatch, which then blocked the
+                # user's legitimate re-issue as a false duplicate.
+
+                seen_tools.add(a_hash)
+
+                if fname == "file_system":
+                    op = t_args.get("operation")
+                    if op == "write":
+                        content_val = t_args.get("content")
+                        if not content_val or not str(content_val).strip():
+                            # Allow empty writes for filenames that
+                            # legitimately have zero-byte bodies by
+                            # convention; block every other empty
+                            # write because it usually signals a
+                            # truncated/hallucinated tool call.
+                            # Allowlist (match on the filename, not
+                            # just the full path, so any subdir
+                            # variant is covered):
+                            #   __init__.py   — Python package marker
+                            #   py.typed      — PEP 561 inline-typing marker
+                            #   .gitkeep      — preserve empty directories in git
+                            #   .nojekyll     — GitHub Pages marker
+                            #   .gitignore    — sometimes written empty as placeholder
+                            #   conftest.py   — rare but legit empty pytest root marker
+                            _p_raw = str(t_args.get("path", ""))
+                            _basename = _p_raw.rsplit("/", 1)[-1]
+                            _ALLOW_EMPTY = {
+                                "__init__.py", "py.typed", ".gitkeep",
+                                ".nojekyll", ".gitignore", "conftest.py",
+                            }
+                            _is_allowed_empty = _basename in _ALLOW_EMPTY
+                            if not _is_allowed_empty:
+                                # Surface the path in the log so the
+                                # operator can tell a true hallucination
+                                # (`temp.py`, `output.txt`) from a
+                                # legitimate empty-file convention we
+                                # haven't whitelisted yet.
+                                pretty_log(
+                                    "Local Guard",
+                                    f"Blocked file_system write with empty content "
+                                    f"(path={_p_raw!r}, basename={_basename!r})",
+                                    icon=Icons.STOP,
+                                )
+                                err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM BLOCK: You invoked file_system operation='write' on path={_p_raw!r} but provided an empty or missing 'content' argument. This is completely useless and causes context bloat. Review your task and provide the ACTUAL FULL CONTENT when writing a file. (If you genuinely meant to create an empty file, only these basenames are allowed empty: __init__.py, py.typed, .gitkeep, .nojekyll, .gitignore, conftest.py.) The operation was aborted before execution."}
+                                messages.append(err_msg)
+                                tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                                execution_failure_count += 1
+                                last_was_failure = True
+                                continue
+                            else:
+                                # Normalise to an empty string so the
+                                # downstream write path doesn't
+                                # NoneType-crash; this is the actual
+                                # intended file body.
+                                pretty_log(
+                                    "Local Guard",
+                                    f"Allowed empty {_basename} write "
+                                    f"(path={_p_raw!r}) — conventional zero-byte file.",
+                                    icon=Icons.OK,
+                                )
+                                t_args["content"] = ""
+
+                    # PARTICIPANT-MODE ENGINE GUARD (deterministic).
+                    # Steers ask the model to reconsider; this guard
+                    # refuses. When the request carries a
+                    # participant constraint ("YOU play against
+                    # me"), a write/replace whose body embeds
+                    # move-selection logic is rejected BEFORE
+                    # dispatch — the 2026-07-05 chess session
+                    # shipped random.choice(legal_moves) past both
+                    # the system prompt and the post-write steer.
+                    if op in ("write", "replace"):
+                        from ..utils.constraints import (
+                            participant_write_violation,
+                        )
+                        _pv_msg = participant_write_violation(
+                            _request_constraints, t_args)
+                        if _pv_msg:
+                            _pv_path = str(t_args.get("path")
+                                           or t_args.get("filename")
+                                           or "?")
+                            pretty_log(
+                                "Local Guard",
+                                f"Blocked file_system {op} embedding "
+                                f"move-selection logic "
+                                f"(path={_pv_path!r}) — participant "
+                                f"constraint active",
+                                icon=Icons.STOP,
+                            )
+                            err_msg = {"role": "tool",
+                                       "tool_call_id": tool["id"],
+                                       "name": fname,
+                                       "content": _pv_msg}
+                            messages.append(err_msg)
+                            tools_run_this_turn.append(
+                                {**err_msg, "_synthetic": True})
+                            execution_failure_count += 1
+                            last_was_failure = True
+                            continue
+
+                        target_path = str(t_args.get("path", "")).lower()
+
+                if fname not in self.available_tools:
+                    self.available_tools = get_available_tools(self.context)
+
+                # --- TOOL NAME CANONICALIZATION ---
+                # Qwen 3.5 (and other models) hallucinates tool name
+                # variants like "filesystem", "update-profile",
+                # "knowledgebase". Without canonicalization the
+                # dispatcher silently 404s and the model wastes a
+                # whole turn before retrying.
+                if fname not in self.available_tools:
+                    canonical = self._canonicalise_tool_name(fname, list(self.available_tools.keys()))
+                    if canonical:
+                        pretty_log("Tool Alias", f"{fname} → {canonical}", icon=Icons.RETRY)
+                        fname = canonical
+
+                if fname in self.available_tools:
+                    # Metacog mid-turn arbiter gate (roadmap phase 3,
+                    # auto-route). Fires only when:
+                    #   * the bundle is enabled and arbiter wired,
+                    #   * the tool is in a mutating-host domain
+                    #     (shell/sql — the irrecoverable kind),
+                    #   * the last composite confidence reading
+                    #     was below threshold,
+                    #   * the per-request arbitration cap (1) is
+                    #     unspent.
+                    # All five gates live on the bundle; this site
+                    # just awaits the decision and acts on it.
+                    _mc_gate = getattr(self.context, "metacog", None)
+                    _gate_decision = None
+                    if (_METACOG_ARBITER_ENABLED and _mc_gate is not None
+                            and getattr(_mc_gate, "enabled", False)):
+                        try:
+                            _gate_decision = await _mc_gate.arbitrate_tool_calls(
+                                messages=messages, tool_name=fname,
+                            )
+                        except Exception as _gex:
+                            logger.debug(
+                                "metacog arbiter gate failed: %s", _gex,
+                            )
+                    if _gate_decision is not None:
+                        # Severity policy: `ask_user` is an
+                        # operational pause — surface as WARN
+                        # so it doesn't get lost in the INFO
+                        # stream. `execute` / `validate` are
+                        # routine.
+                        from .metacog_log import (
+                            emit as _mc_emit,
+                            Subsystem as _mc_ss,
+                            LEVEL_INFO, LEVEL_WARN,
+                        )
+                        _arb_lvl = (
+                            LEVEL_WARN
+                            if _gate_decision.action == "ask_user"
+                            else LEVEL_INFO
+                        )
+                        _mc_emit(
+                            _mc_ss.ARBITER,
+                            level=_arb_lvl,
+                            tool=fname,
+                            action=_gate_decision.action,
+                            sim=_gate_decision.similarity,
+                            candidates=len(_gate_decision.candidates),
+                            # Full reason — no 80-char truncation;
+                            # the helper auto-quotes the spaces.
+                            reason=_gate_decision.reason,
+                        )
+                        if _gate_decision.action == "ask_user":
+                            # Hard block: skip the dispatch and
+                            # replace it with a synthetic tool
+                            # result that surfaces the divergence
+                            # to the model. The model's next turn
+                            # will produce a clarification request
+                            # to the user instead of charging ahead.
+                            _diag = (
+                                f"SYSTEM PAUSE — metacog arbiter detected "
+                                f"ambiguous intent for a {fname} action. "
+                                f"Two candidate plans diverged "
+                                f"(sim={_gate_decision.similarity:.2f}) "
+                                f"and the rule-based validator could not "
+                                f"pick a clear winner. Reason: "
+                                f"{_gate_decision.reason}. Ask the user "
+                                f"to clarify what they want done before "
+                                f"re-emitting any {fname} call."
+                            )
+                            err_msg = {
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "name": fname,
+                                "content": _diag,
+                            }
+                            messages.append(err_msg)
+                            tools_run_this_turn.append(
+                                {**err_msg, "_synthetic": True},
+                            )
+                            last_was_failure = True
+                            continue
+
+                    # ── Pre-flight repeat-failure guard (feature 1A) ──
+                    # Before dispatch, ask whether this exact action
+                    # (tool + primary target) already failed the same
+                    # way in the recent window. If so, skip the call and
+                    # hand the model the prior error instead of burning
+                    # another turn re-running a known failure — the live
+                    # counterpart to the offline post-mortem repeated-
+                    # error fingerprint. Idempotent setters are exempt
+                    # (the idempotency guard above already covers them,
+                    # and they carry no error to repeat).
+                    if self._preflight_guard_enabled and not is_idempotent_setter:
+                        _pf_target = primary_target_from_args(t_args)
+                        _pf_op = str(t_args.get("operation")
+                                     or t_args.get("action") or "")
+                        _pf_err = self._failure_guard.would_repeat(
+                            fname, _pf_target, _pf_op)
+                        if _pf_err:
+                            pretty_log(
+                                "Pre-Flight Guard",
+                                f"Blocked repeat {fname}"
+                                + (f" on {_pf_target}" if _pf_target else "")
+                                + f" — already failed: {_pf_err}",
+                                level="WARNING", icon=Icons.STOP,
+                            )
+                            preflight_blocks_this_request += 1
+                            _diag = (
+                                f"SYSTEM BLOCK — pre-flight guard: this exact "
+                                f"'{fname}' call"
+                                + (f" (operation='{_pf_op}')" if _pf_op else "")
+                                + (f" on target '{_pf_target}'" if _pf_target else "")
+                                + f" already failed recently with: \"{_pf_err}\". "
+                                f"Re-running it UNCHANGED will fail the same way. "
+                                f"Legal ways forward: use a DIFFERENT operation of "
+                                f"the same tool (e.g. operation='write' with the "
+                                f"full file instead of 'replace'), a different "
+                                f"tool, fix the underlying cause first, or ask "
+                                f"the user."
+                            )
+                            if preflight_blocks_this_request >= 2:
+                                # Guard-block budget (2026-07-08): a
+                                # model re-issuing known-identical
+                                # failures twice is boxed in — force a
+                                # final reply instead of letting it
+                                # spin to the turn cap (observed live:
+                                # 3 blocked turns x ~80 s of full-file
+                                # generation each).
+                                force_final_response = True
+                                _diag += (
+                                    " FINAL: you have now been blocked "
+                                    f"{preflight_blocks_this_request} times on known-"
+                                    "identical failures. STOP calling tools. Write "
+                                    "your final reply: state what you tried, quote "
+                                    "the exact error, and ask the user for the one "
+                                    "thing you need to proceed."
+                                )
+                            err_msg = {
+                                "role": "tool",
+                                "tool_call_id": tool["id"],
+                                "name": fname,
+                                "content": _diag,
+                            }
+                            messages.append(err_msg)
+                            tools_run_this_turn.append(
+                                {**err_msg, "_synthetic": True},
+                            )
+                            last_was_failure = True
+                            continue
+                    try:
+                        # Wrap in a timing shim so each tool's wall-clock
+                        # duration lands in tool_durations[idx] (parallel to
+                        # results/metadata) — feeds the metacog runtime-budget
+                        # anomaly window.
+                        _coro = self.available_tools[fname](**t_args)
+                        tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
+                        tool_durations.append(None)
+                        tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or "")))
+                        # The DURABLE idempotency hash is recorded at
+                        # the RESULT-processing site, and only when
+                        # the call actually SUCCEEDED. Recording it
+                        # here (at dispatch) marked a call "applied"
+                        # even when the tool returned an Error —
+                        # observed live 2026-07-05: update_profile
+                        # rejected a missing-value call, the model's
+                        # corrected retry was then blocked as a
+                        # "duplicate (args already applied)", and the
+                        # turn finalised on a false "Done — removed".
+                        # The batch-local pending set below still
+                        # dedupes identical calls within THIS
+                        # response.
+                        if is_idempotent_setter:
+                            pending_idempotent.add(a_hash)
+                    except Exception as e:
+                        pretty_log("Tool Invocation Error", str(e), level="WARNING", icon=Icons.WARN)
+                        err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error invoking tool '{fname}' (Did you forget a required argument?): {str(e)}"}
+                        messages.append(err_msg)
+                        tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                        last_was_failure = True
+                else:
+                    err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Unknown tool '{fname}'"}
+                    messages.append(err_msg)
+                    tools_run_this_turn.append({**err_msg, "_synthetic": True})
+                    execution_failure_count += 1
+
+            # If every tool_call this iteration was rejected
+            # synthetically, the model's preamble text was a
+            # stale deflection — drop it so it does not bleed
+            # into the next iteration's real response. We keep
+            # `messages.append(msg)` and the synthetic tool
+            # entries intact so the LLM still sees its own
+            # confused attempt + the corrective system message
+            # on the next iteration.
+            if tool_calls and not tool_tasks:
+                if len(final_ai_content) > _pre_flush_final_len:
+                    final_ai_content = final_ai_content[:_pre_flush_final_len]
+
+            if tool_tasks:
+                # CRITICAL FIX: Run mutating tools (like file writes) BEFORE execution tools to prevent race conditions
+                results = [None] * len(tool_tasks)
+
+                # Phase 1: Mutations
+                mutation_coros = []
+                for i, (task, meta) in enumerate(zip(tool_tasks, tool_call_metadata)):
+                    if meta[0] == "file_system":
+                        mutation_coros.append((i, task))
+
+                if mutation_coros:
+                    mut_results = await asyncio.gather(*(c[1] for c in mutation_coros), return_exceptions=True)
+                    for (i, _), res in zip(mutation_coros, mut_results):
+                        results[i] = res
+
+                # Phase 2: Executions
+                exec_coros = []
+                for i, (task, meta) in enumerate(zip(tool_tasks, tool_call_metadata)):
+                    if meta[0] != "file_system":
+                        exec_coros.append((i, task))
+
+                if exec_coros:
+                    exec_results = await asyncio.gather(*(c[1] for c in exec_coros), return_exceptions=True)
+                    for (i, _), res in zip(exec_coros, exec_results):
+                        results[i] = res
+
+                turn_has_failure = False
+                last_error_res = ""
+                last_error_preview = "Unknown Error"
+
+                # Per-call outcomes for this turn. A multi-id command
+                # ("delete A and B") is N separate tool calls; tracking
+                # each one lets the failure path emit an explicit
+                # "X succeeded, Y failed" summary instead of collapsing
+                # a partial failure into a single generic strike.
+                op_outcomes = []
+
+                # Tracks the worst no-progress signature seen this
+                # turn (the same SUCCEEDING action+target+result
+                # repeating), handled once after the results loop.
+                _noprogress_trip = None
+
+                # We reached the parallel-execution path, which means
+                # at least one tool call parsed cleanly this turn.
+                # Drop the consecutive-parse-error streak so a single
+                # earlier failure can't latch the pivot prompt.
+                consecutive_parse_errors = 0
+                for i, result in enumerate(results):
+                    fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op = tool_call_metadata[i]
+                    str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
+
+                    # Record this call's outcome uniformly (before the
+                    # branch chain below) so a partial failure can be
+                    # summarised as "N ok / M failed" rather than
+                    # last-write-wins on last_error_*.
+                    _res_is_error = str_res.startswith((
+                        "Error:", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
+
+                    # Idempotency hash lands only on SUCCESS: a failed
+                    # setter was NOT applied, so an identical corrected
+                    # retry must be allowed through the guard.
+                    if _is_idem_setter and not _res_is_error:
+                        executed_idempotent.add(a_hash)
+                    op_outcomes.append({
+                        "tool": fname,
+                        "ok": not _res_is_error,
+                        "preview": (str_res.replace("Error:", "").strip()[:140]
+                                    if _res_is_error else None),
+                    })
+
+                    # Feed the pre-flight repeat-failure guard (feature
+                    # 1A): remember FAILED calls keyed by (tool, primary
+                    # target) — ``ptarget`` was computed at dispatch time
+                    # from the same args — so an identical re-issue on a
+                    # later iteration is intercepted before dispatch.
+                    if _res_is_error:
+                        try:
+                            self._failure_guard.record(fname, ptarget, str_res, ptool_op)
+                        except Exception:
+                            pass
+
+                    # One-task-per-turn gate: a manage_projects call that
+                    # actually closed a task to DONE ends the interactive
+                    # turn, so a single "start task 1" advances exactly
+                    # one task and stops. Skipped when the user asked for
+                    # a batch ("do the next 3" / "finish the project").
+                    if (not _proj_task_closed_this_req and not _user_batch_intent
+                            and _manage_projects_closed_a_task(fname, str_res)):
+                        _proj_task_closed_this_req = True
+                        force_final_response = True
+                        logger.info(
+                            "one-task-per-turn: project task closed DONE "
+                            "— forcing turn to wrap up and wait for the user")
+
+                    # One-shot constraint check after the FIRST
+                    # successful artifact write of a constrained
+                    # request. The chess incident showed the
+                    # constraint is dropped DURING generation (a
+                    # 183s monolith started seconds after the model
+                    # read "don't come up with some random AI"), so
+                    # the steer lands right after the write — the
+                    # earliest moment the model can still re-open
+                    # the file and fix a violation cheaply.
+                    if (_constraint_steer_pending and not _res_is_error
+                            and fname == "file_system" and is_mutating):
+                        _constraint_steer_pending = False
+                        # Participant-role constraints get the
+                        # architecture directive appended: the
+                        # 2026-07-04 chess session showed the generic
+                        # reminder alone is rationalised away ("the
+                        # evaluation function IS me") — the steer must
+                        # name the only two designs that satisfy the
+                        # constraint, including the /api/game/move
+                        # endpoint the model keeps forgetting exists.
+                        from ..utils.constraints import (
+                            PARTICIPANT_STEER,
+                            has_participant_constraint,
+                        )
+                        _steer_txt = (
+                            "SYSTEM ALERT (constraint check): you "
+                            "just wrote an artifact, and this "
+                            "request carries EXPLICIT USER "
+                            "CONSTRAINTS:\n"
+                            + "\n".join(f"- {c}" for c in
+                                        _request_constraints)
+                            + "\nBefore replying or marking "
+                            "anything done: re-read what you "
+                            "wrote and verify NONE of these are "
+                            "violated. A coded stand-in for a "
+                            "role the user assigned to YOU "
+                            "(e.g. an embedded AI opponent when "
+                            "the user said YOU will play) is a "
+                            "violation — fix the artifact NOW "
+                            "if so, then continue."
+                        )
+                        if has_participant_constraint(
+                                _request_constraints):
+                            _steer_txt += "\n\n" + PARTICIPANT_STEER
+                        messages.append({
+                            "role": "user",
+                            "content": _steer_txt,
+                        })
+                        pretty_log(
+                            "Constraint Check",
+                            f"steer injected after first write "
+                            f"({len(_request_constraints)} active "
+                            f"constraint(s))",
+                            icon=Icons.CONSTRAINT,
+                        )
+
+                    # Metacog per-tool outcome (roadmap phase 2.3):
+                    # record THIS result's tool keyed on its OWN
+                    # success — not (as before) a single post-loop call
+                    # using the last tool's name + the turn-wide failure
+                    # flag, which mis-attributed competence whenever a
+                    # turn dispatched multiple tools in parallel.
+                    _mc = getattr(self.context, "metacog", None)
+                    if _mc is not None and getattr(_mc, "enabled", False) and fname:
+                        _lstr = str_res.lstrip()
+                        # Any NON-ZERO exit code is a failure, not just
+                        # 1/2. The old substring check recorded codes
+                        # 3-9 and multi-digit (127, 130, ...) as
+                        # competence SUCCESS, poisoning the per-domain
+                        # profile. Reuse the same regex the execute
+                        # result-classification path below already uses.
+                        _mc_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
+                        _tool_failed = isinstance(result, Exception) or (
+                            _lstr.startswith(("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
+                            or "Traceback" in str_res
+                            or (_mc_exit is not None and int(_mc_exit.group(1)) != 0)
+                        )
+                        _dur = tool_durations[i] if i < len(tool_durations) else None
+                        _bus = getattr(_mc, "bus", None)
+                        # Trigger publishes are best-effort and MUST NOT
+                        # block the competence/budget record below — hence a
+                        # separate try. is_anomalous runs BEFORE record_outcome
+                        # so the current sample isn't compared against itself.
+                        try:
+                            # LoopDetected: observe the tool key; on a
+                            # repeat-streak trip publish a loop event (the
+                            # ReplanBridge can revise the active task), reset.
+                            _rep = getattr(_mc, "repetition", None)
+                            if _rep is not None and _bus is not None and hasattr(_rep, "observe"):
+                                _streak = _rep.observe(fname)
+                                if _rep.tripped():
+                                    from .triggers import loop_event as _loop_event
+                                    await _bus.publish(_loop_event(
+                                        f"tool '{fname}' repeated {_streak}x in a row",
+                                        key=fname, count=_streak,
+                                    ))
+                                    _rep.reset()
+                            # ExecutionAnomaly: this duration vs the learned p95×budget.
+                            _rb = getattr(_mc, "runtime_budget", None)
+                            if (_rb is not None and _bus is not None and _dur is not None
+                                    and hasattr(_rb, "is_anomalous") and _rb.is_anomalous(fname, _dur)):
+                                from .triggers import anomaly_event as _anom_event
+                                await _bus.publish(_anom_event(
+                                    f"tool '{fname}' ran {_dur:.1f}s (>budget)",
+                                    tool_name=fname, duration_s=_dur,
+                                    budget_s=(_rb.budget(fname) or 0.0),
+                                ))
+                        except Exception as _trexc:
+                            logger.debug("metacog trigger publish failed: %s", _trexc)
+                        try:
+                            # Feed the budget window + competence profile.
+                            _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
+                        except Exception as _mcexc:
+                            logger.debug("metacog outcome hook failed: %s", _mcexc)
+
+                    shield_limit = max(16000, int(char_budget * 0.1))
+                    if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base", "postgres_admin"]:
+                        # Use a DISTINCT variable, not `payload`: the
+                        # outer `payload` is reused later (e.g. the
+                        # Perfect-It optimization call), and rebinding
+                        # it here to this 300-token summarizer silently
+                        # capped that later generation's max_tokens.
+                        shield_payload = {
+                            "model": model,
+                            "messages": [{"role": "user", "content": f"The user asked: '{last_user_content}'. Summarize this tool output. If it contains facts relevant to the user, extract them. If it is a script error, state the root cause. Output: {str_res[:15000]}"}],
+                            "temperature": 0.0,
+                            "max_tokens": 300
+                        }
+                        try:
+                            pretty_log("Context Shield", f"Offloading {len(str_res)} chars from {fname} to Edge Worker...", icon=Icons.SHIELD)
+                            # FOREGROUND: awaited inline mid-turn. With
+                            # is_background=True this parked against its
+                            # own request in _wait_for_foreground_clear
+                            # (600s self-stall) on every oversized tool
+                            # output. use_worker still prefers a pool.
+                            summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=False)
+                            summary_content = summary_data["choices"][0]["message"].get("content", "").strip()
+                            if summary_content:
+                                str_res = f"[EDGE CONDENSED]: {summary_content}"
+                        except Exception as e:
+                            logger.debug(f"Context-Shield edge summarisation failed: {type(e).__name__}: {e}")
+
+                    trunc_limit = max(80000, int(char_budget * 0.4))
+                    half = trunc_limit // 2
+                    safe_res = str_res[:half] + "\n...[TRUNCATED]...\n" + str_res[-half:] if len(str_res) > trunc_limit else str_res
+
+                    # Make sure exit-code / error markers are NEVER
+                    # buried in the truncation. The model needs to
+                    # see "EXIT CODE: 1" or "Error:" reliably to
+                    # decide whether to retry or pivot.
+                    if fname == "execute":
+                        exit_match_full = re.search(r"EXIT CODE:\s*(\d+)", str_res)
+                        if exit_match_full and "EXIT CODE:" not in safe_res:
+                            safe_res = f"[FAILURE BANNER] EXIT CODE: {exit_match_full.group(1)}\n" + safe_res
+                    if (str_res.lstrip().startswith("Error")
+                            or "Traceback" in str_res
+                            or "SYSTEM ERROR" in str_res):
+                        first_err_line = next(
+                            (ln for ln in str_res.splitlines()
+                             if ln.strip().startswith(("Error", "SYSTEM ERROR"))
+                             or "Traceback" in ln),
+                            "",
+                        )
+                        if first_err_line and first_err_line[:120] not in safe_res[:300]:
+                            safe_res = f"[FAILURE BANNER] {first_err_line[:200]}\n" + safe_res
+
+                    # Per-tool fallback hint injection — when a tool
+                    # call fails with a known error pattern, append a
+                    # concrete remediation hint so the LLM has an
+                    # actionable next step instead of blindly retrying.
+                    _hint_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
+                    if (str_res.lstrip().startswith("Error")
+                            or "Traceback" in str_res
+                            or "SYSTEM ERROR" in str_res
+                            or (_hint_exit is not None and int(_hint_exit.group(1)) != 0)):
+                        try:
+                            from ..tools.tool_failure import get_fallback_hint
+                            hint = get_fallback_hint(fname, str_res)
+                            if hint:
+                                safe_res = safe_res + f"\n\n[FALLBACK HINT for {fname}] {hint}"
+                        except Exception:
+                            pass
+
+                    tool_msg = {"role": "tool", "tool_call_id": tool_id, "name": fname, "content": safe_res}
+                    messages.append(tool_msg)
+                    tools_run_this_turn.append(tool_msg)
+
+                    # No-progress (ungrounded-verification) loop
+                    # detection — ONLY on SUCCESSFUL, NON-MUTATING
+                    # calls. Errors are already handled by the strike
+                    # path + `_note_repeated_failure`; mutations
+                    # (file writes) are exempt so legitimate iterative
+                    # editing of one file is never mistaken for a loop.
+                    # What's left — repeated reads of the same file,
+                    # repeated browser interaction with the same
+                    # selector, repeated screenshots returning the same
+                    # view — is exactly the "succeeds but learns
+                    # nothing" thrash from the Browser-OS run.
+                    _res_is_error = isinstance(result, Exception) or str_res.lstrip().startswith(
+                        ("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error")
+                    ) or "Traceback" in str_res
+                    if fname and not is_mutating and not _res_is_error:
+                        # threshold=2 (was 3): the SECOND identical
+                        # read is already zero-information — nudge
+                        # immediately, abort on the third (chess
+                        # session 2026-07-08: 5 identical re-reads of
+                        # index.html while theorizing about a URL one
+                        # probe would have settled).
+                        _asig, _acnt, _atrip = strikes.note_action(
+                            fname, ptarget,
+                            _action_result_fingerprint(str_res),
+                            threshold=2,
+                        )
+                        if _atrip and (_noprogress_trip is None or _acnt > _noprogress_trip[1]):
+                            _noprogress_trip = (_asig, _acnt, fname, ptarget)
+
+                    # Escape-hatch tool: the solver has declared
+                    # the current task structurally unwinnable.
+                    # Stop the turn loop immediately and promote
+                    # the sentinel into `final_ai_content` so the
+                    # outer caller (e.g. dream.synthetic_self_play)
+                    # can detect "CHALLENGE_ABORTED_BY_SOLVER"
+                    # and skip remaining retry attempts. Firing
+                    # on the tool RESULT (not the call) means the
+                    # solver must have successfully run
+                    # `abort_attempt` — hallucinated or malformed
+                    # calls can't short-circuit the loop.
+                    if fname == "abort_attempt" and "CHALLENGE_ABORTED_BY_SOLVER" in str_res:
+                        pretty_log(
+                            "Attempt Aborted",
+                            "Solver declared task unwinnable — exiting turn loop",
+                            level="WARNING", icon=Icons.STOP,
+                        )
+                        final_ai_content = str_res
+                        force_stop = True
+                        break
+
+                    if fname == "execute":
+                        code_match = re.search(r"EXIT CODE:\s*(\d+)", str_res)
+                        if code_match:
+                            exit_code_val = int(code_match.group(1))
+                        else:
+                            if "Error" in str_res or "Exception" in str_res or "Traceback" in str_res:
+                                exit_code_val = 1
+                            else:
+                                exit_code_val = 0
+
+                        if exit_code_val != 0:
+                            turn_has_failure = True
+                            last_error_res = str_res
+                            if "STDOUT/STDERR:" in str_res:
+                                last_error_preview = str_res.split("STDOUT/STDERR:")[1].strip().replace("\n", " ")
+                            elif "SYSTEM ERROR:" in str_res:
+                                last_error_preview = str_res.split("SYSTEM ERROR:")[1].strip().split("\n")[0]
+                            else:
+                                last_error_preview = str_res[:60].replace("\n", " ")
+                        else:
+                            if is_mutating: seen_tools.clear()
+                            pretty_log("Execution Ok", "Script completed with exit code 0", icon=Icons.OK)
+
+                            # --- SIMULATION SHORT-CIRCUIT ---
+                            # In self-play (read-only skill memory
+                            # sentinel), when the solver has just
+                            # executed `solution.py` with exit=0 and
+                            # produced non-empty stdout, the inner
+                            # agent is done — the outer validator
+                            # will re-run solution.py directly and
+                            # ignore any further agent reasoning.
+                            # Without this gate, every successful
+                            # cycle burns one extra 15–25s "thinking"
+                            # turn to emit a "task complete" summary
+                            # that nobody reads (log-eval: turns 3→4
+                            # of every cycle were pure dead time).
+                            _is_sim = getattr(
+                                getattr(self.context, "skill_memory", None),
+                                "is_read_only",
+                                False,
+                            ) is True
+                            if _is_sim:
+                                # Pull the command text from the
+                                # assistant message that emitted this
+                                # tool_call — that's where the model
+                                # embedded `python3 solution.py` (or
+                                # `python3 -u solution.py`, or a
+                                # `bash -c "...solution.py..."`).
+                                _last_asst = ""
+                                for _m in reversed(messages):
+                                    if _m.get("role") == "assistant":
+                                        _tc = _m.get("tool_calls") or []
+                                        try:
+                                            _last_asst = json.dumps(_tc, default=str)
+                                        except Exception:
+                                            _last_asst = str(_tc)
+                                        _last_asst += str(_m.get("content") or "")
+                                        break
+                                _ran_solution = "solution.py" in _last_asst
+                                # Non-trivial stdout: strip the
+                                # EXECUTION RESULT header and check
+                                # the body has real content.
+                                _body = str_res.split("STDOUT/STDERR:", 1)[-1].strip()
+                                if _ran_solution and len(_body) > 0:
+                                    final_ai_content = (
+                                        "solution.py executed successfully (exit 0)."
+                                    )
+                                    force_stop = True
+                                    pretty_log(
+                                        "Self-Play Short-Circuit",
+                                        "Skipped confirmation turn — solution.py ran clean (sim mode).",
+                                        icon=Icons.STOP,
+                                    )
+                                    break  # exit the enumerate(results) loop
+
+                    elif str_res.startswith("Error:") or str_res.startswith("ERROR") or str_res.startswith("SYSTEM ERROR") or str_res.startswith("Critical Tool Error"):
+                        turn_has_failure = True
+                        last_error_res = str_res
+                        last_error_preview = str_res.replace("Error:", "").strip()
+                        pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN)
+
+                    elif fname in ["manage_tasks", "learn_skill", "update_profile"] and "SUCCESS" in str_res.upper():
+                        if is_mutating: seen_tools.clear()
+                        pass
+                    elif fname == "image_generation" and "SUCCESS" in str_res.upper():
+                        pass
+                    else:
+                        if is_mutating: seen_tools.clear()
+
+                # (Metacog per-tool outcomes are now recorded inside
+                # the enumerate(results) loop above, keyed per result.)
+
+                # No-progress loop breaker. When the same SUCCEEDING
+                # action on the same target returned the same result
+                # >=3x this request, the agent is in an ungrounded
+                # verification loop (it keeps re-observing instead of
+                # trusting evidence it already has). FIRST trip: force
+                # a grounded final answer (drop tools next turn via
+                # force_final_response) + tell it to trust the
+                # authoritative state and report how to verify if it
+                # cannot. If it somehow keeps looping to >=5, hard-stop.
+                # Independent of turn_has_failure — this path is for
+                # all-success thrash, which the strike machinery below
+                # never sees.
+                if _noprogress_trip is not None and not force_stop and not force_final_response:
+                    _asig, _acnt, _afname, _atarget = _noprogress_trip
+                    _tgt_desc = f" on '{_atarget}'" if _atarget else ""
+                    if _acnt >= 3:
+                        pretty_log(
+                            "Loop Breaker",
+                            f"No-progress loop: '{_afname}'{_tgt_desc} repeated {_acnt}x "
+                            "with no change — aborting turn loop.",
+                            level="WARNING", icon=Icons.STOP,
+                        )
+                        if not final_ai_content:
+                            final_ai_content = (
+                                f"[ATTEMPT_ABORTED_NO_PROGRESS] I repeated the same "
+                                f"'{_afname}' action{_tgt_desc} {_acnt} times and got the "
+                                "same result each time, so I stopped instead of looping. "
+                                "Any changes I made so far are in place. To move forward I "
+                                "need one piece of real evidence I could not get from here: "
+                                "the exact error text or failing URL from your side (e.g. "
+                                "browser devtools), or the output of re-running the failing "
+                                "step — send me that and I'll fix the actual cause instead "
+                                "of guessing."
+                            )
+                        force_stop = True
+                    elif _asig not in repeated_action_steered:
+                        repeated_action_steered.add(_asig)
+                        # Read/write tools (manage_composed_skills,
+                        # file_system, ...) get a SOFTER steer: the
+                        # loop is the agent re-READING to orient
+                        # itself, and the action it was asked to do is
+                        # a WRITE through the SAME tool. Forcing a
+                        # text-only final turn here would bar that
+                        # pending mutation forever — the agent would
+                        # "finish" having silently done nothing (the
+                        # reconfigure-a-composed-skill bug: looped on
+                        # action="list", force-finalised, never reached
+                        # action="define"). So we keep tools available
+                        # and tell it to perform the WRITE now instead
+                        # of reading again. The >=5 hard stop above is
+                        # the backstop if it keeps thrashing.
+                        _readwrite_loop = _is_readwrite_loop_exempt(_afname)
+                        pretty_log(
+                            "Loop Breaker",
+                            f"No-progress: '{_afname}'{_tgt_desc} repeated {_acnt}x with no "
+                            "new info — "
+                            + ("steering to the write action (tools kept)."
+                               if _readwrite_loop
+                               else "forcing a grounded conclusion."),
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                        if _readwrite_loop:
+                            messages.append({"role": "user", "content": (
+                                f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} "
+                                "times and gotten the SAME result — re-reading produces NO new "
+                                "information. You already have the current state; it is "
+                                "AUTHORITATIVE. Do ONE of these NOW instead:\n"
+                                "1. GATHER NEW EVIDENCE: probe the thing you are theorizing "
+                                "about — `execute` a curl/run of the exact URL/command/code in "
+                                "question and read the actual response, instead of predicting "
+                                "it from the source.\n"
+                                f"2. APPLY THE CHANGE: if the task needs a change, call "
+                                f"'{_afname}' ONCE with the mutating action "
+                                "(write/update/create) and report what you changed.\n"
+                                "3. ASK THE USER: if the failure is on THEIR side (their "
+                                "browser, their process, their network), ask for the exact "
+                                "error text/URL from their screen — one question beats "
+                                "guessing.\n"
+                                "Do NOT issue another read/list of this tool."
+                            )})
+                        else:
+                            force_final_response = True
+                            messages.append({"role": "user", "content": (
+                                f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
+                                "and gotten the SAME result with no change — re-observing "
+                                "produces NO new information. The evidence you already have is "
+                                "AUTHORITATIVE. Write your FINAL answer now: if you confirmed "
+                                "the change via state/file inspection, report success and how "
+                                "you confirmed it. If you are still UNSURE why something fails, "
+                                "do not guess — say plainly what you verified, what you could "
+                                "not verify from here, and ask the user for the ONE piece of "
+                                "evidence that would settle it (the exact error text, the "
+                                "failing URL from their devtools, or the output of a command "
+                                "you give them). Do NOT call this tool again."
+                            )})
+
+                if turn_has_failure:
+                    # Any failure (transient or structural) breaks the
+                    # consecutive-clean-success streak that unfreezes decay.
+                    strikes.reset_clean_streak()
+                    # Classify the failure to route to the right budget
+                    from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context, summarize_multi_op_outcomes
+                    failure_class, failure_match = classify_tool_failure(last_error_res or last_error_preview)
+                    # Partial-failure summary (empty unless this turn
+                    # mixed successes and failures across >=2 calls).
+                    multi_op_summary = summarize_multi_op_outcomes(op_outcomes)
+
+                    if failure_class == FailureClass.RETRYABLE:
+                        transient_failure_count += 1
+                        pretty_log("Transient Fail", f"Transient strike {transient_failure_count}/4 ({failure_match}) -> {last_error_preview[:100]}", icon=Icons.WARN)
+                        diagnostic_msg = format_failure_context(last_error_preview, failure_class)
+                    else:
+                        execution_failure_count += 1
+                        pretty_log("Execution Fail", f"Strike {execution_failure_count}/6 ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL)
+                        diagnostic_msg = format_failure_context(last_error_preview, failure_class)
+                        # Detect the SAME structural failure recurring.
+                        # At ≥3 repeats: freeze the success-decay (so the
+                        # cap can finally fire on this oscillating loop)
+                        # and tell the model ONCE to stop retrying — the
+                        # live tool result is authoritative over any stale
+                        # context/system-state hint that says otherwise.
+                        _sig, _cnt, _persist, _first_warn = strikes.note_failure(
+                            fname, last_error_preview
+                        )
+                        if _first_warn:
+                            pretty_log(
+                                "Loop Breaker",
+                                f"Same failure ×{_cnt} "
+                                f"({fname}) — freezing strike decay & redirecting.",
+                                level="WARNING", icon=Icons.STOP,
+                            )
+                            messages.append({"role": "user", "content": (
+                                f"SYSTEM ALERT: This exact action has now failed "
+                                f"{_cnt} times with the SAME error: "
+                                f"{str(last_error_preview)[:160]}. STOP repeating it — "
+                                "retrying will not change the result. The live tool "
+                                "result and the current sandbox listing are AUTHORITATIVE "
+                                "over any prior context, memory, workspace narrative, or "
+                                "DYNAMIC SYSTEM STATE hint that suggested otherwise. Pick a "
+                                "DIFFERENT action now: if a file is missing, CREATE it with "
+                                "file_system(operation='write', …) or choose an existing "
+                                "file from the listing; if an approach is wrong, change it."
+                            )})
+
+                    last_was_failure = True
+                    # strikes.note_failure already reset the clean-success
+                    # streak; this assignment is implicit in the ledger.
+
+                    # Check for tool fallback suggestions
+                    from ..tools.fallback_chains import get_fallback_hint
+                    fallback_hint = ""
+                    if fname:
+                        hint = get_fallback_hint(fname, last_error_res or last_error_preview)
+                        if hint:
+                            fallback_hint = f"\n\n{hint}"
+
+                    from ..tools.file_system import tool_list_files, project_scoped_sandbox
+                    sandbox_state = await tool_list_files(project_scoped_sandbox(self.context)[0], self.context.memory_system)
+                    messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {multi_op_summary}{diagnostic_msg}{fallback_hint}\n\n{sandbox_state}"})
+
+                    total_fail = execution_failure_count + transient_failure_count
+                    # System 3 Crisis Pivot — fires at structural strike 4
+                    # OR total strike 6. Can fire a SECOND time at strike 5
+                    # with results of the first pivot as extra context.
+                    sys3_trigger = (
+                        (execution_failure_count == 4 and not _request_sys3_fired_once)
+                        or (execution_failure_count == 5 and _request_sys3_fired_once)
+                    )
+                    if sys3_trigger:
+                        pivot_num = 2 if _request_sys3_fired_once else 1
+                        pretty_log(f"System 3 Crisis Intervention #{pivot_num}", "Engaging meta-cognitive pivot...", icon=Icons.BRAIN_THINK)
+
+                        # On second pivot, include first pivot's justification
+                        extra_context = ""
+                        if pivot_num == 2:
+                            prev_just = _request_sys3_prev_justification
+                            extra_context = f"\n\n### PREVIOUS PIVOT (failed):\n{prev_just[:500]}"
+
+                        sys3_result = await self._run_system_3_pivot(
+                            task_context=last_user_content,
+                            error_context=(last_error_res or '') + extra_context,
+                            sandbox_state=str(sandbox_state),
+                            model=model
+                        )
+                        if sys3_result.get("tree_update"):
+                            task_tree.load_from_json(sys3_result["tree_update"])
+                            current_plan_json = task_tree.to_json()
+                            execution_failure_count = max(0, execution_failure_count - 2)
+                            transient_failure_count = 0
+                            last_was_failure = False
+                            _request_sys3_fired_once = True
+                            _request_sys3_prev_justification = sys3_result.get('justification', '')
+                            messages.append({"role": "user", "content": f"SYSTEM 3 PIVOT #{pivot_num}: The previous approach failed. The strategy has been entirely rewritten. Justification: {sys3_result.get('justification')}. Follow the new plan."})
+                            return False  # was `continue` — the region is the loop-body tail
+
+                    if execution_failure_count >= 6 or total_fail >= 8:
+                        pretty_log("Loop Breaker", "Forcing final response", icon=Icons.STOP)
+                        messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed. Provide a final response explaining the situation."})
+                        force_final_response = True
+                else:
+                    # Only reset transient failures on success; structural
+                    # failures require consecutive successes to decay.
+                    transient_failure_count = 0
+                    # Record a clean success. The ledger freezes decay once
+                    # a SAME-failure loop is detected (otherwise an
+                    # interleaved success — e.g. the auto sandbox-listing
+                    # after a failed read — cancels the strike and the cap
+                    # never fires). The freeze is NOT permanent: 3
+                    # consecutive clean successes mean a genuine pivot, so
+                    # note_clean_success unfreezes it. Signature counts are
+                    # kept, so the same failure re-freezes on recurrence.
+                    if strikes.note_clean_success():
+                        pretty_log(
+                            "Loop Breaker",
+                            "Strike decay unfrozen after 3 consecutive clean successes.",
+                            icon=Icons.OK,
+                        )
+                    if execution_failure_count > 0 and not strikes.decay_frozen:
+                        execution_failure_count = max(0, execution_failure_count - 1)
+
+                    # Terminal tools: `self_play` and `dream_mode`
+                    # are self-contained cycles. Once they return,
+                    # the expected next turn is a conversational
+                    # summary to the user — NEVER another call.
+                    # Without this gate, the main LLM (seeing the
+                    # system prompt's "Call this tool EVERY TIME
+                    # the user requests it" alongside the original
+                    # user intent still in history) re-fires the
+                    # same tool 2–3x per user ask and burns minutes
+                    # per extra run. Setting force_final_response
+                    # routes the next turn through the text-only
+                    # streaming path; the tool_call suppressor
+                    # above catches any stragglers in non-stream
+                    # mode. The directive message is belt-and-
+                    # suspenders for the model's benefit.
+                    terminal_names = {"self_play", "dream_mode"}
+                    just_ran_terminal = any(
+                        t.get("name") in terminal_names
+                        for t in tools_run_this_turn[-len(results):]
+                    )
+                    if just_ran_terminal and not force_final_response:
+                        # --- DIRECT-FROM-TOOL SUMMARY ---
+                        # We used to set force_final_response=True
+                        # here and let the LLM summarise the tool
+                        # result on a follow-up turn. That worked on
+                        # the first invocation but deterministically
+                        # failed from the second invocation onward:
+                        # the conversation window now contained a
+                        # repeated `user → <tool_call name="self_play">
+                        # → tool result` pattern, and the model's
+                        # attention attractor beat the "text-only"
+                        # directive — it emitted yet another
+                        # <tool_call> for the same tool, which the
+                        # stream scrub stripped, which left the user
+                        # with a generic fallback message instead of
+                        # a real summary.
+                        #
+                        # The fix is to stop running the summary LLM
+                        # turn at all. self_play / dream_mode already
+                        # return a structured, user-readable string;
+                        # we format it deterministically here and
+                        # assign it straight to `final_ai_content`,
+                        # then flip `force_stop` so the turn loop
+                        # exits before any further LLM call runs.
+                        # No LLM summary = no pattern priming = no
+                        # tool_call leak = no scrub = no fallback.
+                        _terminal_result = ""
+                        _terminal_name = ""
+                        for _t in reversed(tools_run_this_turn[-len(results):]):
+                            if _t.get("name") in terminal_names:
+                                _terminal_result = str(_t.get("content", "")).strip()
+                                _terminal_name = _t.get("name")
+                                break
+                        # Distill the raw tool output into a short
+                        # user-facing summary. The raw blob mixes
+                        # user-relevant status with internal
+                        # telemetry (`CURIOSITY: ...`) and an LLM-
+                        # facing `SYSTEM INSTRUCTION:` trailer —
+                        # the helper strips those and extracts
+                        # the 1-3 key facts (cluster, status,
+                        # skill-gate or learned lesson).
+                        _summary_body = _distill_terminal_tool_summary(
+                            _terminal_name, _terminal_result
+                        )
+                        _prefix = {
+                            "self_play": "Self-play complete.",
+                            "dream_mode": "Dream cycle complete.",
+                        }.get(_terminal_name, f"`{_terminal_name}` complete.")
+                        final_ai_content = (
+                            f"{_prefix}\n\n{_summary_body}"
+                            if _summary_body else _prefix
+                        )
+                        force_stop = True
+                        pretty_log(
+                            "Terminal Tool",
+                            f"Bypassed summary LLM — direct result displayed ({_terminal_name})",
+                            icon=Icons.STOP,
+                        )
+                        return True  # was `break` — exit the turn loop
+            return False  # loop-body tail: fall through to the next turn
+        finally:
+            ts._constraint_steer_pending = _constraint_steer_pending
+            ts._proj_task_closed_this_req = _proj_task_closed_this_req
+            ts._request_sys3_fired_once = _request_sys3_fired_once
+            ts._request_sys3_prev_justification = _request_sys3_prev_justification
+            ts.consecutive_parse_errors = consecutive_parse_errors
+            ts.current_plan_json = current_plan_json
+            ts.execution_failure_count = execution_failure_count
+            ts.final_ai_content = final_ai_content
+            ts.fname = fname
+            ts.force_final_response = force_final_response
+            ts.force_stop = force_stop
+            ts.forget_was_called = forget_was_called
+            ts.last_was_failure = last_was_failure
+            ts.preflight_blocks_this_request = preflight_blocks_this_request
+            ts.request_sandbox_state = request_sandbox_state
+            ts.transient_failure_count = transient_failure_count
+
+    async def _finalize_and_return(self, fs: "FinalizeState"):
+        """The post-turn-loop finalization chain — output scrubbers,
+        deferred Perfect-It, the final verifier gate + calibration
+        write, competence/skill credit, workspace/selfhood episode
+        recording, correction stash, and the response return.
+        Extracted VERBATIM from handle_chat (#5 step 3) — zero
+        control-flow rewrites: the region ends in handle_chat's own
+        `return final_ai_content, created_time, req_id`, which is now
+        simply this method's return; the call site returns it. Runs
+        inside the agent semaphore (the call site sits in the same
+        `async with`). Raising here propagates to the same outer
+        try/finally it always reached — there are no mutated locals
+        to repack (nothing executes after the region).
+        """
+        body = fs.body
+        created_time = fs.created_time
+        current_trajectory_id = fs.current_trajectory_id
+        execution_failure_count = fs.execution_failure_count
+        final_ai_content = fs.final_ai_content
+        force_stop = fs.force_stop
+        forget_was_called = fs.forget_was_called
+        last_user_content = fs.last_user_content
+        last_was_failure = fs.last_was_failure
+        lc = fs.lc
+        messages = fs.messages
+        model = fs.model
+        payload = fs.payload
+        req_id = fs.req_id
+        thought_content = fs.thought_content
+        tools_run_this_turn = fs.tools_run_this_turn
+        was_complex_task = fs.was_complex_task
+        _stable_conv_fp = fs._stable_conv_fp
+        _verdict_is_fresh = fs._verdict_is_fresh
+        _verifier_verdict_cache = fs._verifier_verdict_cache
+        # --- FINAL OUTPUT SCRUBBER ---
+        # Apply scrubbers FIRST so we don't accidentally scrub our own manual fallback injections
+        bleed_markers = [
+            "# Tools", "<tools>", "CRITICAL INSTRUCTION:", "You may call one or more functions",
+            '{"type": "function"', "SPECIALIST SUBSYSTEM ACTIVATED", "ENGINEERING STANDARDS",
+            "DYNAMIC SYSTEM STATE", "[SYSTEM STATE UPDATE]"
+        ]
+        for bleed_marker in bleed_markers:
+            if bleed_marker in final_ai_content:
+                final_ai_content = final_ai_content.split(bleed_marker)[0]
+
+        # Last-resort scrub on final_ai_content. Must match the
+        # widened mid-flow ui_content scrub (agent.py:~3149) shape
+        # for shape — that path runs under `if has_tool_tag:` so
+        # anything that bypasses it (perfect-it follow-up LLM call,
+        # a fallback branch that writes straight to final_ai_content,
+        # a turn where has_tool_tag was False but content still had
+        # a bare <function>) reaches the user raw unless we also
+        # strip it here. Three widenings vs. the old pattern:
+        #   1. `function` added to the alternation — catches bare
+        #      `<function name="...">...</function>` blocks the
+        #      model sometimes emits without an outer <tool_call>
+        #      wrapper (the exact shape the user reported as
+        #      leaking verbatim after a successful self_play run).
+        #   2. Backreference `\1` — the close tag must match the
+        #      open tag type, so a nested `</function>` inside
+        #      `<tool_call>...</tool_call>` can't terminate the
+        #      outer match early and leave an orphan close tag.
+        #   3. `[^>]*>` in the open tag tolerates attributes
+        #      (`<tool_call name="...">`) without being fooled by
+        #      a stray `>` in the body.
+        final_ai_content = re.sub(
+            # `\Z` (absolute EOS) instead of `$` so trailing
+            # newlines after a tool_call don't escape the scrub.
+            r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
+            '',
+            final_ai_content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        final_ai_content = re.sub(r'<tool_response.*?>.*?(?:</tool_response.*?>|\Z)', '', final_ai_content, flags=re.DOTALL | re.IGNORECASE)
+        final_ai_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', final_ai_content, flags=re.DOTALL)
+        final_ai_content = re.sub(r'(?m)^\s*(?:🔄|🟢|⏳|✅|❌|🛑|➖)\s*\[.*?\].*?\n?', '', final_ai_content)
+        final_ai_content = re.sub(r'(?m)^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*\n?', '', final_ai_content)
+        final_ai_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', final_ai_content)
+        final_ai_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', final_ai_content)
+        # Strip leaked Qwen Generative-Reward-Model JSON. These keys
+        # are not produced anywhere in Ghost — verified via grep,
+        # zero hits across the codebase. They are an upstream
+        # training artifact: meta-prompts that ask the model to
+        # rate or score itself pull it into evaluator mode and it
+        # emits the GRM schema instead of an answer. Conservative
+        # match requires both c_relevance_to_query AND
+        # c_correctness_of_content, so a legitimate response that
+        # happens to mention one key in isolation is not clobbered.
+        final_ai_content = re.sub(
+            r'\{\{?\s*"c_relevance_to_query"\s*:\s*\d+\s*,\s*"c_correctness_of_content"\s*:.*?\}\}?',
+            '',
+            final_ai_content,
+            flags=re.DOTALL,
+        )
+        final_ai_content = final_ai_content.strip()
+
+        # Collapse consecutive duplicate paragraphs. When the
+        # model emits its final answer as a preamble alongside
+        # a tool_call AND then again after the tool returns, the
+        # accumulator stores the same paragraph twice in a row
+        # ("Your name is X.\n\nYour name is X."). Users see a
+        # stutter. Cheap fix: split on blank-line boundaries and
+        # drop a paragraph that exactly matches its predecessor
+        # after whitespace normalisation. Non-adjacent repeats
+        # are left alone — they're usually intentional (e.g.
+        # quoting the user's question and then answering it).
+        if "\n\n" in final_ai_content:
+            parts = final_ai_content.split("\n\n")
+            deduped: list[str] = []
+            prev_key = None
+            for p in parts:
+                key = re.sub(r"\s+", " ", p).strip()
+                if key and key == prev_key:
+                    continue
+                deduped.append(p)
+                prev_key = key
+            final_ai_content = "\n\n".join(deduped)
+
+        # --- THE "PERFECT IT" PROTOCOL INJECTION ---
+        # Only trigger proactive optimization for heavy engineering/research tasks
+        heavy_tools_used = any(t.get('name') in ['execute', 'deep_research'] for t in tools_run_this_turn)
+
+        # Skip the whole Perfect-It block during self-play: the
+        # isolated context's `ReadOnlySkillMemory.learn_lesson`
+        # is a no-op, so the write at the bottom lands in
+        # /dev/null — but before we realised that, every single
+        # self-play cycle was burning ~15s on a follow-up LLM
+        # call to generate an "optimisation strategy" that was
+        # silently discarded, and the misleading
+        # `"Saved optimization strategy to playbook"` log line
+        # was firing on the inner sub-agent's request ID
+        # (production trace 16:36, request C6). The marker
+        # lives on the ReadOnlySkillMemory class set up by
+        # dream.py's isolation code. We check `is True`
+        # explicitly (not `bool(...)`) so a MagicMock used in
+        # production-agent unit tests doesn't accidentally
+        # trigger the guard — MagicMock.is_read_only returns
+        # another MagicMock (truthy), but not the sentinel.
+        is_simulation = getattr(getattr(self.context, "skill_memory", None), "is_read_only", False) is True
+
+        if not is_simulation and tools_run_this_turn and heavy_tools_used and execution_failure_count == 0 and not last_was_failure and (not final_ai_content or len(final_ai_content) < 50):
+            # Whether the optimization is part of the user-facing
+            # response. When the flag is OFF the generation is pure
+            # internal learning — so it runs as a tracked background
+            # task instead of blocking the reply (observed: a 24s
+            # task delivered at +271s because the response waited on
+            # this call, which also let the watchdog cross its 120s
+            # idle threshold and pile hippocampus consolidation onto
+            # the same single-slot upstream).
+            _pp_show_to_user = getattr(self.context.args, 'perfect_it', False) is True
+            pretty_log(
+                "Perfect It Protocol",
+                "Generating an optimization suggestion to append to the reply..."
+                if _pp_show_to_user else
+                "Generating an optimization suggestion in the background "
+                "(internal learning — not shown to the user)...",
+                icon=Icons.IDEA,
+            )
+            # Heartbeat: end-of-turn post-processing is outside the
+            # turn loop's heartbeats; without this, a long inline
+            # generation makes the biological watchdog think the
+            # system is idle MID-REQUEST and wake the hippocampus.
+            self.context.last_activity_time = datetime.datetime.now()
+            perfect_it_prompt = f"Task completed successfully. Final tool output:\n\n{tools_run_this_turn[-1]['content']}\n\n<system_directive>First, succinctly present the tool output/result to the user. Then, based on your Perfection Protocol, analyze the result and proactively suggest one concrete way to optimize, scale, secure, or automate this work further. RESPOND IN PLAIN TEXT ONLY. DO NOT USE TOOLS.</system_directive>"
+
+            p_req_messages = []
+            # Snapshot — deliberately NOT messages.append(): the
+            # synthetic directive must not leak into the trajectory
+            # record or any later consumer of `messages`.
+            for m in messages + [{"role": "user", "content": perfect_it_prompt}]:
+                if m.get("role") == "tool":
+                    p_req_messages.append({"role": "user", "content": f"<tool_response name=\"{m.get('name', 'unknown')}\">\n{m.get('content')}\n</tool_response>"})
+                elif m.get("role") == "assistant":
+                    p_req_messages.append({"role": "assistant", "content": m.get("content", "")})
+                else:
+                    content_val = m.get("content", "")
+                    if isinstance(content_val, list):
+                        text_parts = []
+                        for item in content_val:
+                            if isinstance(item, dict):
+                                if item.get("type") == "text":
+                                    text_parts.append(item.get("text", ""))
+                                elif item.get("type") == "image_url":
+                                    if bool(getattr(self.context.llm_client, 'vision_clients', None)):
+                                        text_parts.append("[Image attached and passed to vision node]")
+                                    else:
+                                        text_parts.append(item) # Keep image dict
+                        content_val = "\n".join(text_parts) if all(isinstance(x, str) for x in text_parts) else text_parts
+                    p_req_messages.append({"role": m.get("role", "user"), "content": content_val})
+
+            # Build a payload COPY: the original is left untouched
+            # for anything downstream, and the deferred task must
+            # not share mutable state with the live request.
+            # 🔴 Physically remove tools so it cannot hallucinate a tool call
+            p_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
+            p_payload["messages"] = p_req_messages
+            p_payload["stream"] = False  # Prevent SSE streaming leak from the main loop
+            _pp_lesson_label = f"Optimization Analysis: {last_user_content[:50]}..."
+
+            if _pp_show_to_user:
+                # --perfect-it: the optimization IS part of the
+                # reply, so it must block the response path —
+                # foreground=True, or the call self-stalls waiting
+                # for its own request to clear.
+                try:
+                    p_msg = await self._perfect_it_generate_and_learn(
+                        p_payload, _pp_lesson_label, current_trajectory_id,
+                        foreground=True,
+                    )
+                    if p_msg:
+                        if final_ai_content:
+                            final_ai_content += "\n\n" + p_msg
+                        else:
+                            final_ai_content = p_msg
+                except Exception:
+                    # Only report failure to user if they expected to see it
+                    if not final_ai_content:
+                        final_ai_content = "Task finished successfully, but optimization generation failed."
+            else:
+                # Internal-learning only: fire-and-forget, tracked in
+                # the context-level set (strong ref — bare tasks can
+                # be GC'd — and drained by the lifespan shutdown).
+                # The background queue in llm.py yields to any
+                # foreground call, so the verifier below still gets
+                # upstream priority.
+                async def _deferred_perfect_it(
+                    _payload=p_payload,
+                    _label=_pp_lesson_label,
+                    _tid=current_trajectory_id,
+                ):
+                    try:
+                        await self._perfect_it_generate_and_learn(_payload, _label, _tid)
+                    except Exception as _e:
+                        logger.debug(
+                            "Deferred Perfect-It skipped: %s: %s",
+                            type(_e).__name__, _e,
+                        )
+                _bg = getattr(self.context, "_pending_background_tasks", None)
+                if _bg is None:
+                    _bg = set()
+                    self.context._pending_background_tasks = _bg
+                _pp_task = asyncio.create_task(_deferred_perfect_it())
+                _bg.add(_pp_task)
+                _pp_task.add_done_callback(_bg.discard)
+
+        if tools_run_this_turn and not final_ai_content:
+            # Walk back to the last *real* tool output. Reading
+            # `tools_run_this_turn[-1]` blindly would wrap a
+            # synthetic agent-loop error ("SYSTEM ERROR: Your
+            # <tool_call> did not parse...") in a "Process
+            # finished successfully" banner — silent error to
+            # false-success leak.
+            fallback_tool = _find_substantive_tool_for_verifier(
+                tools_run_this_turn
+            )
+            if fallback_tool is not None:
+                last_out = str(fallback_tool.get('content', ''))
+
+                if "![Image]" in last_out:
+                    final_ai_content = last_out.strip()
+                else:
+                    # Extract just the pure STDOUT so the UI fallback is clean
+                    if "STDOUT/STDERR:" in last_out:
+                        last_out = last_out.split("STDOUT/STDERR:")[1].strip()
+                        if "DIAGNOSTIC HINT" in last_out:
+                            last_out = last_out.split("DIAGNOSTIC HINT")[0].strip().strip("-").strip()
+
+                    preview = (last_out[:2000] + '\n...[Truncated]') if len(last_out) > 2000 else last_out
+                    final_ai_content = f"Process finished successfully.\n\n### Final Output:\n```text\n{preview}\n```"
+
+        if not final_ai_content:
+            final_ai_content = "Task executed successfully."
+
+        # --- VERIFIER GATE (reflection before finalising) ---
+        # Run the claim/output verifier on the final answer when the
+        # turn produced tool output — catches silent-error answers
+        # ("Process finished successfully" when the tool actually
+        # failed), wrong-unit answers, and empty results. The module
+        # was orphaned (initialised but never called) before this
+        # wiring. Skipped for pure-conversational turns (no tools
+        # run) and when no verifier is installed.
+        #
+        # Failure mode on REFUTED: we append an auditor note to the
+        # reply rather than silently regenerating. This keeps the
+        # user in the loop (they can see what the verifier disagreed
+        # with) without doubling latency by rerunning the whole turn.
+        # Selfhood outcome backfill (proposal item #3): the verifier
+        # verdict computed below is the first reliable signal of
+        # whether this turn actually succeeded. Captured here and
+        # applied AFTER `_record_turn_trajectory` writes the
+        # autobiographical record (which is born `outcome="unknown"`
+        # on the hot path). `(outcome, failure_reason)` or None.
+        verifier_backfill: tuple | None = None
+        try:
+            # Heartbeat: the verifier completion can run for a minute
+            # on a cold prefill; without refreshing the activity
+            # clock here the biological watchdog (idle > 120s) wakes
+            # the hippocampus MID-REQUEST and its consolidation LLM
+            # calls compete with this one on the same upstream.
+            self.context.last_activity_time = datetime.datetime.now()
+            verifier = getattr(self.context, "verifier", None)
+            # Gate: any tool-using turn is worth verifying. The old
+            # `was_complex_task` constraint (turn > 2) silently
+            # skipped the common 1–2 turn tool path, so the verifier
+            # almost never fired. `tools_run_this_turn` alone is
+            # sufficient — trivial greetings already have no tools.
+            # Reuse the verdict the in-loop AUTO-REPAIR finalisation
+            # already computed for THIS final answer (one verifier
+            # pass per clean success — same cost as before the gate
+            # was split). Recompute only when the loop exited without
+            # a fresh in-loop verdict (error / abort / terminal path,
+            # or repair budget spent on a non-5851 exit).
+            if _verdict_is_fresh and _verifier_verdict_cache is not None:
+                v_result, last_tool = _verifier_verdict_cache
+            else:
+                # Non-blocking gate: with a dedicated --critic-nodes
+                # pool the (slower) verdict runs in the background and
+                # the response ships without waiting on it; without
+                # one this awaits inline exactly as before. `messages`
+                # is snapshotted because the background verdict task
+                # iterates it while the turn keeps mutating the live
+                # list.
+                v_result, last_tool = await self._compute_verifier_verdict_gated(
+                    tools_run_this_turn=tools_run_this_turn,
+                    messages=list(messages),
+                    final_ai_content=final_ai_content,
+                    last_user_content=last_user_content,
+                    lc=lc,
+                    trajectory_id=current_trajectory_id,
+                    conv_fp=_stable_conv_fp,
+                )
+            from .verifier import VerifyVerdict
+            # Consumption guard mirrors the original gate exactly: only
+            # annotate / backfill / retract when the verifier was
+            # actually applicable (installed, a substantive tool ran,
+            # not strict trivial chat). `_compute_verifier_verdict`
+            # returns `last_tool` even when it produces no verdict, so
+            # the unverified-mutation branch below still fires.
+            if (
+                verifier is not None
+                and verifier.llm_client is not None
+                and last_tool is not None
+                and final_ai_content
+                and not self._is_strict_trivial_chat(lc)
+            ):
+                # Record the verdict for the selfhood backfill that
+                # runs after the autobiographical record is written.
+                if v_result and v_result.confidence >= 0.7:
+                    if v_result.verdict == VerifyVerdict.CONFIRMED:
+                        verifier_backfill = ("passed", "")
+                    elif v_result.verdict == VerifyVerdict.REFUTED:
+                        _vr_reason = (
+                            "; ".join(v_result.issues[:2])
+                            if v_result.issues else v_result.reasoning
+                        )
+                        verifier_backfill = ("failed", _vr_reason or "")
+                if v_result and v_result.verdict == VerifyVerdict.REFUTED and v_result.confidence >= 0.7:
+                    issues_str = "; ".join(v_result.issues[:3]) if v_result.issues else v_result.reasoning
+                    note = f"\n\n---\n**Verifier note:** {issues_str}"
+                    if note[:60] not in final_ai_content:
+                        final_ai_content = f"{final_ai_content}{note}"
+                    pretty_log(
+                        "Verifier",
+                        f"REFUTED ({v_result.confidence:.0%}): {issues_str[:120]}",
+                        icon=Icons.BRAIN_THINK,
+                    )
+                    # Verifier-driven retraction: the
+                    # Perfection-Protocol's `learn_lesson`
+                    # runs BEFORE this gate, so by the time
+                    # we get here a poisoned lesson tagged
+                    # with `current_trajectory_id` may
+                    # already be on disk. The verifier just
+                    # said the response was REFUTED with
+                    # high confidence — scrub anything that
+                    # turn produced before the user even
+                    # sees the response, so the next user
+                    # query can't retrieve a lesson born
+                    # from a turn we just disagreed with.
+                    # Belt-and-braces with the user-
+                    # correction retraction path: the user
+                    # may never go on to correct, and we
+                    # shouldn't depend on them noticing.
+                    try:
+                        _sm = getattr(self.context, "skill_memory", None)
+                        if _sm is not None and current_trajectory_id:
+                            # to_thread: retraction takes a file lock,
+                            # rewrites the playbook and does a sync
+                            # Chroma delete — run it off the event
+                            # loop like every other SkillMemory call
+                            # on this path.
+                            await asyncio.to_thread(
+                                _sm.retract_lessons_from_trajectory,
+                                current_trajectory_id,
+                                memory_system=getattr(
+                                    self.context, "memory_system", None
+                                ),
+                            )
+                    except Exception as _e:
+                        logger.debug(
+                            "verifier-driven retraction skipped: %s: %s",
+                            type(_e).__name__, _e,
+                        )
+                else:
+                    if v_result:
+                        pretty_log(
+                            "Verifier",
+                            f"{v_result.verdict.value} ({v_result.confidence:.0%})",
+                            icon=Icons.VERIFIER_LAB,
+                        )
+                    else:
+                        # v_result is None → the verifier pipeline FAILED
+                        # (e.g. LLM error); it did NOT pass. Don't show ✅.
+                        #
+                        # Unverified-mutation guard: when the gate is
+                        # skipped AND the turn's final substantive action
+                        # was a successful file write/replace, the agent
+                        # is finalising on an UNTESTED change — the exact
+                        # req_C0 failure (33-min build that "finished"
+                        # right after a write that was never run, yet
+                        # reported C=0.96). Treat that as a failed outcome
+                        # so confidence drops below threshold and the turn
+                        # is recorded as unverified rather than success.
+                        if _is_unverified_mutation(last_tool):
+                            verifier_backfill = (
+                                "failed",
+                                "unverified mutation — finalised on an "
+                                "untested file write/replace; the change "
+                                "was never run or screenshotted",
+                            )
+                            note = (
+                                "\n\n---\n**⚠ Unverified:** the final action "
+                                "was a file write that was never executed or "
+                                "rendered, so I cannot confirm it works. Treat "
+                                "this as INCOMPLETE — run/preview it before "
+                                "relying on it."
+                            )
+                            if note[:40] not in final_ai_content:
+                                final_ai_content = f"{final_ai_content}{note}"
+                            pretty_log(
+                                "Verifier",
+                                "finalised on an UNVERIFIED file write (never "
+                                "run/rendered) — flagged INCOMPLETE "
+                                "(outcome=failed)",
+                                icon=Icons.WARN, level="WARNING",
+                            )
+                        elif getattr(getattr(self.context, "args", None),
+                                     "no_verifier", False) is True:
+                            # Ablated, not deferred. This branch used to
+                            # fall into the async "deferred" message
+                            # below, which claimed a verdict was running
+                            # that was never spawned — the live log
+                            # showed days of "verdict deferred" while
+                            # --no-verifier (an ablation leftover in the
+                            # launcher) had the whole subsystem off, and
+                            # nothing ever contradicted it.
+                            pretty_log(
+                                "Verifier",
+                                "no verdict — verifier is ABLATED "
+                                "(--no-verifier); nothing will land late",
+                                icon=Icons.WARN, level="WARNING",
+                            )
+                        elif self._critic_async_enabled():
+                            # Async mode: the verdict was deliberately
+                            # deferred, not missing — it's running on the
+                            # critic node now and will land as LATE …
+                            pretty_log(
+                                "Verifier",
+                                "verdict deferred — verifying asynchronously "
+                                "after the reply (off the critical path)",
+                                icon=Icons.VERIFIER_LAB,
+                            )
+                        else:
+                            pretty_log(
+                                "Verifier",
+                                "no verdict produced — gate skipped",
+                                icon=Icons.WARN, level="WARNING",
+                            )
+        except Exception as e:
+            logger.debug(f"Verifier gate skipped: {e}")
+
+        # Plan postcondition gate (proposal item #10). If the
+        # strategic planner produced a plan whose ROOT task
+        # declared postconditions, hold the final response to
+        # them — the plan stops being internal bookkeeping and
+        # becomes a success contract on the answer itself. A
+        # response that misses a declared postcondition gets a
+        # visible note rather than passing silently. Non-fatal.
+        try:
+            _plan_json = locals().get('current_plan_json')
+            if _plan_json and final_ai_content:
+                from .planning import TaskTree as _PlanTree
+                _ptree = _PlanTree()
+                _ptree.load_from_json(_plan_json)
+                _unsat = _ptree.root_postconditions_unsatisfied(
+                    final_ai_content
+                )
+                if _unsat:
+                    _pnote = (
+                        "**Plan check:** this response may not yet "
+                        "satisfy: " + "; ".join(_unsat[:3])
+                    )
+                    if _pnote[:48] not in final_ai_content:
+                        final_ai_content = (
+                            f"{final_ai_content}\n\n---\n{_pnote}"
+                        )
+                    pretty_log(
+                        "Plan Gate",
+                        f"{len(_unsat)} unsatisfied postcondition(s)",
+                        icon=Icons.BRAIN_PLAN,
+                    )
+        except Exception as e:
+            logger.debug(f"plan postcondition gate skipped: {e}")
+
+        # --- AUTOMATED POST-MORTEM (AUTO-LEARNING) ---
+        if was_complex_task or execution_failure_count > 0:
+            is_complete_failure = (execution_failure_count >= 3)
+            is_valid_success = (not force_stop or "READY TO FINALIZE" in thought_content.upper())
+
+            if is_valid_success or is_complete_failure:
+                # Gated on `--smart-memory > 0.0` to honour the
+                # contract in CLAUDE.md ("Memory writes are gated
+                # on --smart-memory / --no-memory"). The streaming
+                # producer has the same gate; both must agree.
+                if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0 and not forget_was_called:
+
+                    await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
+                    await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)
+
+        # Retrieval feedback: a clean, non-failing turn credits
+        # any lesson surfaced in the last ~5min. Hoisted out of
+        # the `was_complex_task` gate above — simple successful
+        # turns are exactly where retrieved lessons are most
+        # likely to be paying off, and excluding them biased
+        # the utility signal toward complex tasks only.
+        # `credit_recent_retrievals` is idempotent and no-ops
+        # when nothing was retrieved, so running it on every
+        # clean-exit turn is safe.
+        sm = getattr(self.context, 'skill_memory', None)
+        if sm is not None and execution_failure_count == 0:
+            try:
+                if hasattr(sm, 'credit_recent_retrievals'):
+                    await asyncio.to_thread(sm.credit_recent_retrievals, 300)
+            except Exception:
+                pass
+
+        # Calibration spine (roadmap phase 2.5): pair THIS turn's
+        # last composite-confidence reading with the realized
+        # outcome (clean turn → 1.0; any structural tool failure
+        # → 0.0). This is the loop that finally makes "the agent
+        # is 80% confident" mean the turn succeeds ~80% of the
+        # time — the JSONL it appends feeds the idle Brier/ECE
+        # refit (phase 2.7c). Runs on BOTH clean and failed turns
+        # (outside the credit gate above) so both outcome classes
+        # are represented. `_calib_pending` is set only when a
+        # reading was computed this turn, so we never record a
+        # stale cross-turn pair.
+        try:
+            _ct = getattr(self.context, "calibration_tracker", None)
+            _pending = getattr(self.context, "_calib_pending", None)
+            # Finalization fallback (the load-bearing path in practice):
+            # most turns never enter the streaming
+            # is_final_generation+stream_response branch where the
+            # entropy/confidence path lives, so _pending is usually None
+            # here. Compute the reading NOW — logprob-optional: neutral
+            # entropy term, competence + verbalised uncertainty drive it
+            # — so calibration records on EVERY full-loop metacog turn
+            # (and the arbiter bundle gets a reading via record_confidence).
+            if _pending is None and _ct is not None:
+                try:
+                    _mc = getattr(self.context, "metacog", None)
+                    if (_mc is not None and getattr(_mc, "enabled", False)
+                            and getattr(_mc, "confidence", None) is not None
+                            and getattr(_mc, "competence", None) is not None):
+                        _last_tool = ""
+                        for _t in reversed(tools_run_this_turn or []):
+                            if isinstance(_t, dict) and _t.get("name"):
+                                _last_tool = _t["name"]
+                                break
+                        from .metacog import _domain_for_tool
+                        _dom = _domain_for_tool(_last_tool or "")
+                        _p = _mc.competence.estimate(_dom, _last_tool or None)
+                        _n = _mc.competence.observations(_dom, _last_tool or None)
+                        _upress = 0.0
+                        try:
+                            _ut = getattr(self.context, "uncertainty_tracker", None)
+                            if _ut is not None:
+                                _upress = _ut.pressure()
+                        except Exception:
+                            _upress = 0.0
+                        # Objective outcome penalty: a REFUTED verdict or
+                        # an unverified mutation (both surface as
+                        # verifier_backfill[0]=="failed") is ground truth
+                        # that THIS answer is wrong/unconfirmed. Without
+                        # it the reading is ≈ competence, so a historically
+                        # strong domain reports high confidence on a build
+                        # the verifier just rejected (the req_44/C0
+                        # "below=no on broken work" failure). 0.8 reliably
+                        # pulls a 0.92–0.96 competence reading below the
+                        # 0.89 threshold.
+                        _outcome_penalty = (
+                            0.8 if (verifier_backfill
+                                    and verifier_backfill[0] == "failed")
+                            else 0.0
+                        )
+                        _pending = _mc.confidence.score(
+                            normalised_entropy=0.5,
+                            competence_p_success=_p,
+                            n_observations=_n,
+                            uncertainty_pressure=_upress,
+                            outcome_penalty=_outcome_penalty,
+                        )
+                        self.context.last_confidence = _pending
+                        try:
+                            _mc.record_confidence(_pending)
+                            _mc.count(confidence_total=True,
+                                      confidence_below=_pending.below_threshold)
+                        except Exception:
+                            pass
+                        from .metacog_log import (
+                            emit as _mc_emit, Subsystem as _mc_ss,
+                            LEVEL_INFO, LEVEL_DEBUG,
+                        )
+                        _mc_emit(
+                            _mc_ss.CONF,
+                            level=(LEVEL_INFO if _pending.below_threshold else LEVEL_DEBUG),
+                            below=_pending.below_threshold, C=_pending.composite,
+                            entropy=_pending.entropy_component,
+                            competence=_pending.competence_component,
+                            n=_n, domain=_dom, tool=_last_tool or None,
+                            src="finalize", threshold=_pending.threshold,
+                        )
+                except Exception as _cfx:
+                    logger.debug("finalize confidence compute failed: %s", _cfx)
+            if _ct is not None and _pending is not None:
+                # Outcome from the signals available THIS turn: a
+                # structural tool failure OR a verifier REFUTED verdict
+                # (≥0.7 → verifier_backfill[0]=="failed") is a negative.
+                # Without a real negative source, free-form chat turns
+                # are almost all "clean" → single-class → the fit bails;
+                # the verifier verdict is what gives calibration its
+                # "confidently wrong" examples.
+                _verifier_failed = bool(
+                    verifier_backfill and verifier_backfill[0] == "failed"
+                )
+                _calib_outcome = (
+                    0.0 if (execution_failure_count > 0 or _verifier_failed)
+                    else 1.0
+                )
+                await asyncio.to_thread(
+                    _ct.record,
+                    composite=_pending.composite,
+                    entropy_component=_pending.entropy_component,
+                    competence_component=_pending.competence_component,
+                    uncertainty_pressure=getattr(_pending, "uncertainty_pressure", 0.0),
+                    outcome=_calib_outcome,
+                )
+                # Stash the components keyed by this response's
+                # fingerprint so a NEXT-turn user-correction can record
+                # a (C, 0.0) negative for this turn — the strongest
+                # "confidently wrong" calibration signal (the user is
+                # the cheapest supervisor for free-form chat).
+                try:
+                    from collections import OrderedDict as _OD
+                    _cc = getattr(self.context, "_recent_calib_for_correction", None)
+                    if _cc is None:
+                        _cc = _OD()
+                        self.context._recent_calib_for_correction = _cc
+                    _cc[self._response_fingerprint(final_ai_content or "")] = {
+                        "composite": _pending.composite,
+                        "entropy_component": _pending.entropy_component,
+                        "competence_component": _pending.competence_component,
+                        "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
+                    }
+                    while len(_cc) > 32:
+                        _cc.popitem(last=False)
+                except Exception:
+                    pass
+                self.context._calib_pending = None
+        except Exception as _calx:
+            logger.debug("calibration record failed: %s", _calx)
+
+        # Surface critical unknowns/assumptions tracked during this
+        # turn. The UncertaintyTracker is a shared per-process
+        # instance — appending the risk summary lets the user see
+        # what the agent is uncertain about WITHOUT the LLM having
+        # to remember to mention it. Skipped silently when the
+        # tracker isn't wired or has no risks.
+        try:
+            tracker = getattr(self.context, 'uncertainty_tracker', None)
+            if tracker is not None:
+                # Auto-populate from the agent's own output: any
+                # explicit first-person hedge ("I'm assuming…",
+                # "I couldn't verify…") becomes a tracked, persisted
+                # assumption — so the tracker is load-bearing even
+                # when the LLM never calls flag_uncertainty.
+                try:
+                    for _hedge in tracker.scan_text_for_uncertainty(
+                        final_ai_content or ""
+                    ):
+                        tracker.flag_assumption(
+                            _hedge, confidence=0.4,
+                            basis="auto-detected hedge in response",
+                        )
+                except Exception:
+                    pass
+                # Resolve unknowns the agent answered for ITSELF this
+                # turn: when an info-gathering tool ran successfully and
+                # an unknown's resolution pointed at that path, mark it
+                # resolved so it drops out of the clarifying-question gate
+                # and the risk footer below. (The resolve-side of the
+                # uncertainty lifecycle was previously never called, so
+                # self-answered unknowns kept re-surfacing to the user.)
+                try:
+                    _info_tools = {"web_search", "deep_research", "recall",
+                                   "fact_check", "browser", "file_system", "knowledge_base"}
+                    _ran_info = any(
+                        isinstance(t, dict) and t.get("name") in _info_tools
+                        and not str(t.get("content", "")).lstrip().startswith(("Error", "ERROR", "SYSTEM ERROR"))
+                        for t in (tools_run_this_turn or [])
+                    )
+                    if _ran_info:
+                        for _u in list(tracker.unknowns):
+                            if getattr(_u, "resolved", False):
+                                continue
+                            _resn = (getattr(_u, "resolution", "") or "").lower()
+                            if any(k in _resn for k in ("search", "web", "read", "file", "look", "fetch", "recall", "research")):
+                                tracker.resolve_unknown(_u, "resolved via tool output this turn")
+                except Exception:
+                    pass
+                # Verify-side of the lifecycle (previously unwired): if the
+                # turn completed cleanly (a response, no error/failure
+                # markers), treat the assumptions the agent proceeded on as
+                # borne out (was_correct=True). Conservative — only confirms
+                # on a clean turn, never marks them wrong.
+                try:
+                    _turn_clean = bool(final_ai_content) and "error" not in final_ai_content[:80].lower()
+                    if _turn_clean:
+                        for _a in list(tracker.assumptions):
+                            if not getattr(_a, "verified", False):
+                                tracker.verify_assumption(_a, True)
+                except Exception:
+                    pass
+                # Metacognitive gate (proposal item #6): if a
+                # critical unknown still needs the user, surface
+                # the clarifying question at the TOP of the reply
+                # — a real gate on the response, not a footer.
+                try:
+                    question = tracker.should_ask_user()
+                except Exception:
+                    question = None
+                if (question and final_ai_content
+                        and question[:40] not in final_ai_content):
+                    final_ai_content = (
+                        f"**{question}**\n\n"
+                        f"(Answering with my current understanding below "
+                        f"— correct me if that clarification changes "
+                        f"things.)\n\n---\n\n{final_ai_content}"
+                    )
+                risk = tracker.get_risk_summary()
+                if risk and final_ai_content and risk[:60] not in final_ai_content:
+                    final_ai_content = f"{final_ai_content}\n\n---\n{risk}"
+                # Reset in-memory turn state; the durable persisted
+                # log is untouched so recurring blind-spots survive.
+                tracker.reset()
+        except Exception as e:
+            logger.debug(f"Uncertainty surfacing skipped: {e}")
+
+        # Value-alignment gate (opt-in --principle-gate). If the
+        # agent has authored operating principles (selfhood/values),
+        # an independent LLM check flags a response that contradicts
+        # one and appends a brief self-note — turning the principles
+        # from prompt decoration into an actual behavioural check.
+        # Default off (adds one LLM call to final turns); never
+        # blocks, only annotates.
+        try:
+            if (getattr(getattr(self.context, "args", None), "principle_gate", False) is True
+                    and final_ai_content):
+                _sm = getattr(self.context, "self_model", None)
+                if _sm is not None and getattr(_sm, "enabled", False) and _sm.principles():
+                    async def _pg_critique(p):
+                        _r = await self.context.llm_client.chat_completion({
+                            "model": self.context.args.model,
+                            "messages": [{"role": "user", "content": p}],
+                            "temperature": 0.0, "max_tokens": 512, "stream": False,
+                        })
+                        return ((_r or {}).get("choices", [{}])[0]
+                                .get("message", {}).get("content", "") or "")
+                    _aligned, _note = await _sm.evaluate_response_alignment(
+                        final_ai_content, critique_fn=_pg_critique,
+                    )
+                    if not _aligned:
+                        final_ai_content = (
+                            f"{final_ai_content}\n\n---\n"
+                            f"**Self-check (principle):** {_note}"
+                        )
+                        pretty_log("Principle Gate",
+                                   f"response flagged: {_note[:80]}",
+                                   icon=Icons.SHIELD)
+        except Exception as e:
+            logger.debug(f"principle gate skipped: {e}")
+
+        # Autonomous-progress digest — closes the user-facing half of
+        # phase 2.95. If projects were advanced in the background (by
+        # the idle autoadvance phase, the tool, or the HTTP route)
+        # since the user last saw a digest, surface a concise "while
+        # you were away" header on this turn, flagging the items that
+        # now need their input. Watermark-gated on the monotonic
+        # project-event id so each batch shows exactly once; the first
+        # run baselines silently (no historical backlog dump).
+        # Header-prepended so needs-user items lead the reply.
+        try:
+            _ps = getattr(self.context, "project_store", None)
+            if _ps is not None and final_ai_content:
+                from pathlib import Path as _Path
+                from .project_digest import (
+                    summarize_since, render_digest,
+                    load_watermark, save_watermark,
+                )
+                _wm_path = (_Path(str(self.context.memory_dir)).parent
+                            / "projects_digest.json")
+                _wm = load_watermark(_wm_path)
+                if _wm is None:
+                    # First run: baseline to the current high-water mark.
+                    _base = await asyncio.to_thread(summarize_since, _ps, 0)
+                    save_watermark(_wm_path, _base.new_event_id)
+                else:
+                    _dg = await asyncio.to_thread(summarize_since, _ps, _wm)
+                    if _dg.has_content:
+                        _digest = render_digest(_dg)
+                        if _digest and _digest[:40] not in final_ai_content:
+                            final_ai_content = f"{_digest}\n\n---\n\n{final_ai_content}"
+                            pretty_log(
+                                "Autoadvance Digest",
+                                f"{_dg.advanced} advanced, "
+                                f"{len(_dg.needs_user)} need-user, "
+                                f"{_dg.projects_touched} project(s)",
+                                icon=Icons.BRAIN_PLAN,
+                            )
+                    if _dg.new_event_id > _wm:
+                        save_watermark(_wm_path, _dg.new_event_id)
+        except Exception as _dgx:
+            logger.debug(f"autoadvance digest skipped: {_dgx}")
+
+        # Chat→project promotion suggestion (advisory; previously unwired).
+        # When a free-chat session accumulates enough turns / sandbox
+        # work, gently suggest promoting it to a tracked project — ONCE
+        # (suppressed via a scratchpad flag so we don't nag). Only the
+        # explicit manage_projects(promote_from_context) tool actually
+        # creates a project; this is just a one-line footer offer.
+        try:
+            if getattr(self.context, "current_project_id", None) is None and final_ai_content:
+                _sp = getattr(self.context, "scratchpad", None)
+                _already = False
+                try:
+                    _already = bool(_sp and _sp.get("_promotion_suggested"))
+                except Exception:
+                    _already = False
+                if not _already:
+                    from .project_safety import should_suggest_promotion as _ssp
+                    _uturns = [
+                        m.get("content") for m in messages
+                        if isinstance(m, dict) and m.get("role") == "user"
+                        and isinstance(m.get("content"), str)
+                    ]
+                    _aturns = [
+                        m.get("content") for m in messages
+                        if isinstance(m, dict) and m.get("role") == "assistant"
+                        and isinstance(m.get("content"), str)
+                    ]
+                    _writes = sum(
+                        1 for t in (tools_run_this_turn or [])
+                        if isinstance(t, dict) and t.get("name") == "file_system"
+                    )
+                    # If the user is administering the project system
+                    # itself this turn (list / delete / switch / ...),
+                    # don't nudge them to create one — they obviously
+                    # know about projects (reported: nudge fired right
+                    # after a `delete project`).
+                    _managing = any(
+                        isinstance(t, dict) and t.get("name") == "manage_projects"
+                        for t in (tools_run_this_turn or [])
+                    )
+                    _sugg = _ssp(
+                        user_turns=_uturns, assistant_turns=_aturns,
+                        sandbox_writes=_writes, plan_node_count=0,
+                        already_in_project=False,
+                        managing_projects=_managing,
+                    )
+                    if getattr(_sugg, "should_suggest", False):
+                        final_ai_content = (
+                            f"{final_ai_content}\n\n---\n"
+                            f"💡 This looks like ongoing work ({_sugg.reason}). "
+                            f"Want me to promote it to a tracked project "
+                            f"(“{_sugg.suggested_title}”)? Just say the word."
+                        )
+                        try:
+                            if _sp:
+                                _sp.set("_promotion_suggested", "1")
+                        except Exception:
+                            pass
+        except Exception as _pexc:
+            logger.debug(f"promotion suggestion skipped: {_pexc}")
+
+        # Sync the locally-evolved `messages` list back to the caller's
+        # `body`. `messages` was rebound (by `process_rolling_window`,
+        # `_prune_context`, and recovery paths) into a new list object
+        # partway through the run, so subsequent tool-call / tool-
+        # result appends only landed on the local copy. Callers that
+        # inspect `body["messages"]` after `handle_chat` (the Slack
+        # bot, the web UI, and several regression tests) expect to
+        # see the full trace, including tool calls and results.
+        try:
+            body["messages"] = messages
+        except Exception:
+            pass
+
+        # Stage-1 self-improvement: append the turn's trajectory
+        # to the distill log. No-op when the collector isn't
+        # wired. Deliberately non-fatal — trajectory logging
+        # must never break a user turn.
+        try:
+            self._record_turn_trajectory(
+                messages=messages,
+                final_content=final_ai_content,
+                req_id=req_id,
+                model=model,
+                trajectory_id=current_trajectory_id,
+                user_request=last_user_content,
+                # Consolidate the corpus outcome with the same signals
+                # calibration + selfhood use (was heuristics-only here).
+                verifier=(verifier_backfill[0] if verifier_backfill else None),
+                execution_failed=(execution_failure_count > 0),
+            )
+        except Exception as e:
+            # Debug-level: a turn-logging failure must never be
+            # noisy in production. When diagnosing, bump to
+            # warning temporarily.
+            logger.debug(f"trajectory logging skipped: {type(e).__name__}: {e}")
+
+        # Selfhood reference-count (rest of H12): bump the reference
+        # counter for the prior experiences the agent actually echoed
+        # this turn (wake-up prefix it was shown vs. the response it
+        # produced). Previously note_referenced_experiences had no
+        # caller, so the "which memories did I reach for" signal was
+        # always empty. Non-fatal.
+        try:
+            _sm = getattr(self.context, "self_model", None)
+            if _sm is not None and getattr(_sm, "enabled", False):
+                _wp = locals().get("wakeup_prefix", "") or ""
+                if _wp and final_ai_content:
+                    await asyncio.to_thread(
+                        _sm.note_referenced_experiences,
+                        prefix_text=_wp, response_text=final_ai_content,
+                    )
+        except Exception as _refexc:
+            logger.debug(f"selfhood reference-count skipped: {_refexc}")
+
+        # Selfhood outcome backfill (proposal item #3): the
+        # autobiographical record was just written `outcome=
+        # "unknown"` by `_record_turn_trajectory`. If the verifier
+        # produced a high-confidence verdict, propagate it into
+        # the agent's self-memory so its recall of its own past
+        # is verdict-aware. Non-fatal — backfill is secondary.
+        if verifier_backfill is not None and current_trajectory_id:
+            try:
+                from ..selfhood import SelfModel as _SelfModelBF
+                _sm_bf = getattr(self.context, 'self_model', None)
+                if isinstance(_sm_bf, _SelfModelBF) and getattr(_sm_bf, 'enabled', False):
+                    _bf_outcome, _bf_reason = verifier_backfill
+                    _sm_bf.record_outcome(
+                        current_trajectory_id, _bf_outcome,
+                        failure_reason=_bf_reason,
+                    )
+            except Exception as e:
+                logger.debug(
+                    "selfhood outcome backfill skipped: %s: %s",
+                    type(e).__name__, e,
+                )
+
+        # Deterministically prepend any deferred async-verdict
+        # correction staged at turn start (GHOST_CRITIC_ASYNC).
+        final_ai_content = self._take_active_correction() + (final_ai_content or "")
+        return final_ai_content, created_time, req_id
+
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
@@ -5735,6 +8249,14 @@ class GhostAgent:
                         _active_pid = getattr(self.context, 'current_project_id', None) or ""
                         try:
                             workspace_model.current_project_id = _active_pid
+                            # Also bind the TASK-LOCAL event stamp: record_*
+                            # calls later in this turn read the ContextVar
+                            # first, so a concurrent writer (idle autoadvance
+                            # tick, self-play temp agent) mutating the shared
+                            # attribute mid-turn can't mis-stamp this turn's
+                            # events with another context's project.
+                            from ..workspace import set_event_project as _set_evt_pid
+                            _set_evt_pid(_active_pid)
                         except Exception:
                             pass
                         # Gate the workspace wake-up prefix on an ACTIVE project:
@@ -6134,6 +8656,10 @@ class GhostAgent:
                 fname = ""
                 forget_was_called = False
                 thought_content = ""
+                # Pre-bind: `payload` is (re)built each LLM iteration, but a
+                # deterministic-dispatch exit can reach finalization without one;
+                # FinalizeState construction must never hit an unbound name.
+                payload = None
                 was_complex_task = False
 
                 task_tree = TaskTree()
@@ -8451,2259 +10977,95 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': model})
                         break
 
-                    # Capture the end-of-prior-iteration boundary so we
-                    # can rollback this iteration's preamble flush if
-                    # every tool_call below ends up synthetic (parse
-                    # error, invalid JSON args, unknown/disabled tool,
-                    # idempotency block, empty-write block). Without the
-                    # rollback, a confused iteration's preamble
-                    # ("Thank you for the kind words!") concatenates to
-                    # the NEXT iteration's real response and the user
-                    # sees a Frankenstein reply.
-                    # Trace: 2026-05-01 dialog log turn 28.
-                    _pre_flush_final_len = len(final_ai_content)
-
-                    if ui_content:
-                        ui_content = ui_content.replace("\r", "")
-                        if final_ai_content and not final_ai_content.endswith("\n\n"):
-                            final_ai_content += "\n\n"
-                        final_ai_content += ui_content
-
-                    messages.append(msg)
-                    last_was_failure = False
-
-                    if tool_calls:
-                        import html
-                        def unescape_xml_values(val):
-                            if isinstance(val, str):
-                                return html.unescape(val).replace('\\"', '"').replace("\\'", "'")
-                            elif isinstance(val, dict):
-                                return {k: unescape_xml_values(v) for k, v in val.items()}
-                            elif isinstance(val, list):
-                                return [unescape_xml_values(v) for v in val]
-                            return val
-
-                        for tc in tool_calls:
-                            try:
-                                args_dict = json.loads(tc["function"]["arguments"], strict=False)
-                                tc["function"]["arguments"] = json.dumps(unescape_xml_values(args_dict))
-                            except Exception:
-                                pretty_log(
-                                    "Agent Parser",
-                                    f"Arguments for tool "
-                                    f"'{tc.get('function', {}).get('name')}' are not valid "
-                                    f"JSON at the unescape step — leaving them raw",
-                                    level="WARNING", icon=Icons.WARN,
-                                )
-
-                    # Reset the per-BATCH read budget before dispatching this
-                    # assistant message's tool calls. Parallel whole-file reads
-                    # were overflowing the window: each cleared the per-file cap,
-                    # but together they didn't fit (observed: two 170+ KB JSONs →
-                    # 136 K tokens vs a 131 K window → HTTP 400). The budget caps
-                    # cumulative raw-read bytes for THIS batch; file_system reads
-                    # charge against it via the registry closure.
-                    try:
-                        from ..tools.file_system import ReadBudget, read_byte_budget
-                        _mc = int(getattr(self.context.args, "max_context", 8192) or 8192)
-                        self.context._read_budget = ReadBudget(read_byte_budget(_mc))
-                    except Exception:
-                        self.context._read_budget = None
-
-                    tool_tasks, tool_call_metadata = [], []
-                    tool_durations = []  # parallel to tool_tasks; filled by the timing shim (metacog anomaly window)
-                    # Idempotent setters dispatched in THIS batch. The guard
-                    # checks it alongside `executed_idempotent` so two
-                    # identical calls in one response still dedupe, while
-                    # the durable hash only commits at result time on
-                    # SUCCESS (a failed call must not block its own
-                    # corrected retry on the next iteration).
-                    pending_idempotent = set()
-                    for _tc_idx, tool in enumerate(tool_calls):
-                        # Strike cap inside the per-tool loop. The outer cap
-                        # at the top of the turn loop only runs at turn
-                        # boundaries, so without this a single response
-                        # carrying many system_parse_error entries drains
-                        # the whole list before the cap fires next turn.
-                        if execution_failure_count >= 6:
-                            logger.warning(
-                                "Strike cap hit mid-loop (execution_failure_count=%d); skipping remaining %d tool_call(s).",
-                                execution_failure_count, len(tool_calls) - _tc_idx,
-                            )
-                            break
-                        fname = tool["function"]["name"]
-                        raw_tools_called.add(fname)
-                        tool_usage[fname] = tool_usage.get(fname, 0) + 1
-
-
-
-                        if fname == "forget":
-                            forget_was_called = True
-                        elif fname == "knowledge_base":
-                            try:
-                                args = json.loads(tool["function"]["arguments"])
-                                if args.get("action") == "forget":
-                                    forget_was_called = True
-                            except: pass
-
-                        if hasattr(self, 'disabled_tools') and fname in self.disabled_tools:
-                            err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM ERROR: Tool '{fname}' is explicitly disabled in this context."}
-                            messages.append(err_msg)
-                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
-                            execution_failure_count += 1
-                            last_was_failure = True
-                            continue
-
-                        if fname == "system_parse_error":
-                            consecutive_parse_errors += 1
-                            pretty_log(
-                                "Tool Syntax Error",
-                                f"Failed to parse tool call (consecutive={consecutive_parse_errors}, reason={parse_failure_reason or 'unknown'})",
-                                level="WARNING", icon=Icons.WARN,
-                            )
-
-                            # Reason-specific recovery hints. The prior
-                            # implementation repeated the same generic "use
-                            # XML" reminder on every failure, which trapped
-                            # the model in a loop because it didn't say
-                            # WHAT broke. Match the hint to the detected
-                            # cause so the model can actually fix it.
-                            if parse_failure_reason == "truncated":
-                                # Most common failure in the self-play
-                                # trace: upstream max_tokens cap severed
-                                # the <tool_call> mid-content. The model
-                                # has no visibility into the cap; tell it.
-                                err_msg_content = (
-                                    "SYSTEM ERROR: Your previous output was CUT OFF before the "
-                                    "`<tool_call>` finished. The upstream server truncated your "
-                                    "response mid-tag, so no closing `</parameter></function></tool_call>` "
-                                    "ever arrived. This is NOT an XML-syntax problem — it is a "
-                                    "length problem.\n\n"
-                                    "FIX: shorten your output on the next turn. Pick ONE:\n"
-                                    "  1. Write a SHORTER Python script (under 80 lines). Split "
-                                    "work into multiple tool calls if needed.\n"
-                                    "  2. Use `file_system` `operation=\"write\"` directly "
-                                    "instead of cramming code into an `execute` `content` param.\n"
-                                    "  3. Use `file_system` `operation=\"replace\"` to edit one "
-                                    "chunk of an existing file rather than rewriting the whole thing.\n\n"
-                                    "Stop trying CDATA / heredoc / base64 — those do not fix "
-                                    "truncation."
-                                )
-                            elif parse_failure_reason == "no_function_tag":
-                                err_msg_content = (
-                                    "SYSTEM ERROR: Your `<tool_call>` block was present but "
-                                    "contained no `<function name=\"...\">` tag. Output the "
-                                    "tool call with the exact shape:\n"
-                                    "<tool_call>\n  <function name=\"the_tool_name\">\n"
-                                    "    <parameter name=\"arg1\">value1</parameter>\n"
-                                    "  </function>\n</tool_call>"
-                                )
-                            elif consecutive_parse_errors >= 2:
-                                # Switched-strategy hint only after the
-                                # second failure, and only for genuinely
-                                # malformed (not truncated) output.
-                                err_msg_content = (
-                                    f"SYSTEM ESCAPE HATCH (parse failed {consecutive_parse_errors}x): "
-                                    "STOP repeating the same shape — it does not parse.\n\n"
-                                    "Pick ONE alternative:\n"
-                                    "(A) CDATA envelope for content with literal `</parameter>` / `<` / `>` / JSON:\n"
-                                    "    `<parameter name=\"content\"><![CDATA[...]]></parameter>`\n"
-                                    "(B) `file_system` `operation=\"write\"` (native) instead of `execute`.\n"
-                                    "(C) `file_system` `operation=\"replace\"` for small edits.\n\n"
-                                    "Output ONE complete tool_call. Do not ask for clarification."
-                                )
-                            else:
-                                err_msg_content = (
-                                    "SYSTEM ERROR: Your `<tool_call>` did not parse. Use strict XML:\n"
-                                    "<tool_call>\n  <function name=\"the_tool_name\">\n"
-                                    "    <parameter name=\"arg1\">value1</parameter>\n"
-                                    "  </function>\n</tool_call>\n\n"
-                                    "If a parameter body contains literal `</parameter>` / `<` / `>` / JSON, "
-                                    "wrap it in `<![CDATA[ ... ]]>`."
-                                )
-
-                            err_msg = {
-                                "role": "tool",
-                                "tool_call_id": tool["id"],
-                                "name": "system",
-                                "content": err_msg_content,
-                            }
-                            messages.append(err_msg)
-                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
-                            execution_failure_count += 1
-                            last_was_failure = True
-                            continue
-
-                        try:
-                            t_args = json.loads(tool["function"]["arguments"], strict=False)
-
-                            is_sandbox_mutation = fname in ["execute", "image_generation"] or \
-                                                  (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone"])
-
-                            if is_sandbox_mutation:
-                                # Invalidate both the legacy global and the
-                                # per-request local cache so the next turn
-                                # re-lists the workspace.
-                                self.context.cached_sandbox_state = None
-                                request_sandbox_state = None
-                                request_state.invalidate_sandbox()
-                            # Skill writes invalidate the playbook cache too.
-                            if fname == "learn_skill":
-                                request_state.invalidate_skill_playbook()
-                            # Acquired-skill registry mutations
-                            # (create_skill / manage_skills delete) change
-                            # the schema list the LLM sees. Without this
-                            # the new skill is unreachable until the next
-                            # user message — observed loop where the model
-                            # spent 11 min narrating "now invoking X" but
-                            # never emitting a real tool_call because the
-                            # cached schema didn't contain X yet.
-                            if fname == "create_skill" or (
-                                fname == "manage_skills"
-                                and (t_args.get("action") or "").lower() == "delete"
-                            ) or (
-                                fname == "manage_composed_skills"
-                                and (t_args.get("action") or "").lower() in ("define", "delete", "approve")
-                            ):
-                                request_state.invalidate_tool_defs()
-
-                            a_hash = f"{fname}:{json.dumps(t_args, sort_keys=True)}"
-                        except Exception as e:
-                            err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Invalid JSON arguments - {str(e)}"}
-                            messages.append(err_msg)
-                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
-                            execution_failure_count += 1
-                            last_was_failure = True
-                            continue
-
-                        is_mutating = fname in ["execute", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
-                                      (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename"]) or \
-                                      (fname == "knowledge_base" and t_args.get("action") in ["ingest_document", "forget", "reset_all", "insert_fact"]) or \
-                                      (fname == "manage_composed_skills" and t_args.get("action") in ["define", "approve", "delete"])
-
-                        # --- IDEMPOTENCY GUARD (production loop fix) ---
-                        # Pure setters with no value in repetition. Re-issuing
-                        # them with identical args is always a model loop, not
-                        # a legitimate retry. `execute` and `file_system.write`
-                        # are intentionally NOT in this set: rerunning a script
-                        # after an external fix is legitimate.
-                        is_idempotent_setter = (
-                            fname in ("update_profile", "learn_skill")
-                            or (fname == "knowledge_base"
-                                and t_args.get("action") in ("insert_fact", "forget"))
-                        )
-                        if is_idempotent_setter and (
-                                a_hash in executed_idempotent
-                                or a_hash in pending_idempotent):
-                            pretty_log(
-                                "Idempotency Guard",
-                                f"Blocked duplicate {fname} call (args already applied)",
-                                icon=Icons.STOP,
-                            )
-                            err_msg = {
-                                "role": "tool",
-                                "tool_call_id": tool["id"],
-                                "name": fname,
-                                "content": (
-                                    f"SYSTEM IDEMPOTENCY: '{fname}' was already executed earlier in this "
-                                    f"request with these exact arguments. The intended state is already "
-                                    f"applied. DO NOT call it again — proceed to the next step or finalize "
-                                    f"your response to the user."
-                                ),
-                            }
-                            messages.append(err_msg)
-                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
-                            continue
-                        # NB: `executed_idempotent.add(a_hash)` is deliberately
-                        # deferred until AFTER the tool is actually dispatched
-                        # (see the dispatch site) — recording it here marked the
-                        # call "done" even when a downstream gate (metacog
-                        # ask_user) aborted the dispatch, which then blocked the
-                        # user's legitimate re-issue as a false duplicate.
-
-                        seen_tools.add(a_hash)
-
-                        if fname == "file_system":
-                            op = t_args.get("operation")
-                            if op == "write":
-                                content_val = t_args.get("content")
-                                if not content_val or not str(content_val).strip():
-                                    # Allow empty writes for filenames that
-                                    # legitimately have zero-byte bodies by
-                                    # convention; block every other empty
-                                    # write because it usually signals a
-                                    # truncated/hallucinated tool call.
-                                    # Allowlist (match on the filename, not
-                                    # just the full path, so any subdir
-                                    # variant is covered):
-                                    #   __init__.py   — Python package marker
-                                    #   py.typed      — PEP 561 inline-typing marker
-                                    #   .gitkeep      — preserve empty directories in git
-                                    #   .nojekyll     — GitHub Pages marker
-                                    #   .gitignore    — sometimes written empty as placeholder
-                                    #   conftest.py   — rare but legit empty pytest root marker
-                                    _p_raw = str(t_args.get("path", ""))
-                                    _basename = _p_raw.rsplit("/", 1)[-1]
-                                    _ALLOW_EMPTY = {
-                                        "__init__.py", "py.typed", ".gitkeep",
-                                        ".nojekyll", ".gitignore", "conftest.py",
-                                    }
-                                    _is_allowed_empty = _basename in _ALLOW_EMPTY
-                                    if not _is_allowed_empty:
-                                        # Surface the path in the log so the
-                                        # operator can tell a true hallucination
-                                        # (`temp.py`, `output.txt`) from a
-                                        # legitimate empty-file convention we
-                                        # haven't whitelisted yet.
-                                        pretty_log(
-                                            "Local Guard",
-                                            f"Blocked file_system write with empty content "
-                                            f"(path={_p_raw!r}, basename={_basename!r})",
-                                            icon=Icons.STOP,
-                                        )
-                                        err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"SYSTEM BLOCK: You invoked file_system operation='write' on path={_p_raw!r} but provided an empty or missing 'content' argument. This is completely useless and causes context bloat. Review your task and provide the ACTUAL FULL CONTENT when writing a file. (If you genuinely meant to create an empty file, only these basenames are allowed empty: __init__.py, py.typed, .gitkeep, .nojekyll, .gitignore, conftest.py.) The operation was aborted before execution."}
-                                        messages.append(err_msg)
-                                        tools_run_this_turn.append({**err_msg, "_synthetic": True})
-                                        execution_failure_count += 1
-                                        last_was_failure = True
-                                        continue
-                                    else:
-                                        # Normalise to an empty string so the
-                                        # downstream write path doesn't
-                                        # NoneType-crash; this is the actual
-                                        # intended file body.
-                                        pretty_log(
-                                            "Local Guard",
-                                            f"Allowed empty {_basename} write "
-                                            f"(path={_p_raw!r}) — conventional zero-byte file.",
-                                            icon=Icons.OK,
-                                        )
-                                        t_args["content"] = ""
-
-                            # PARTICIPANT-MODE ENGINE GUARD (deterministic).
-                            # Steers ask the model to reconsider; this guard
-                            # refuses. When the request carries a
-                            # participant constraint ("YOU play against
-                            # me"), a write/replace whose body embeds
-                            # move-selection logic is rejected BEFORE
-                            # dispatch — the 2026-07-05 chess session
-                            # shipped random.choice(legal_moves) past both
-                            # the system prompt and the post-write steer.
-                            if op in ("write", "replace"):
-                                from ..utils.constraints import (
-                                    participant_write_violation,
-                                )
-                                _pv_msg = participant_write_violation(
-                                    _request_constraints, t_args)
-                                if _pv_msg:
-                                    _pv_path = str(t_args.get("path")
-                                                   or t_args.get("filename")
-                                                   or "?")
-                                    pretty_log(
-                                        "Local Guard",
-                                        f"Blocked file_system {op} embedding "
-                                        f"move-selection logic "
-                                        f"(path={_pv_path!r}) — participant "
-                                        f"constraint active",
-                                        icon=Icons.STOP,
-                                    )
-                                    err_msg = {"role": "tool",
-                                               "tool_call_id": tool["id"],
-                                               "name": fname,
-                                               "content": _pv_msg}
-                                    messages.append(err_msg)
-                                    tools_run_this_turn.append(
-                                        {**err_msg, "_synthetic": True})
-                                    execution_failure_count += 1
-                                    last_was_failure = True
-                                    continue
-
-                                target_path = str(t_args.get("path", "")).lower()
-
-                        if fname not in self.available_tools:
-                            self.available_tools = get_available_tools(self.context)
-
-                        # --- TOOL NAME CANONICALIZATION ---
-                        # Qwen 3.5 (and other models) hallucinates tool name
-                        # variants like "filesystem", "update-profile",
-                        # "knowledgebase". Without canonicalization the
-                        # dispatcher silently 404s and the model wastes a
-                        # whole turn before retrying.
-                        if fname not in self.available_tools:
-                            canonical = self._canonicalise_tool_name(fname, list(self.available_tools.keys()))
-                            if canonical:
-                                pretty_log("Tool Alias", f"{fname} → {canonical}", icon=Icons.RETRY)
-                                fname = canonical
-
-                        if fname in self.available_tools:
-                            # Metacog mid-turn arbiter gate (roadmap phase 3,
-                            # auto-route). Fires only when:
-                            #   * the bundle is enabled and arbiter wired,
-                            #   * the tool is in a mutating-host domain
-                            #     (shell/sql — the irrecoverable kind),
-                            #   * the last composite confidence reading
-                            #     was below threshold,
-                            #   * the per-request arbitration cap (1) is
-                            #     unspent.
-                            # All five gates live on the bundle; this site
-                            # just awaits the decision and acts on it.
-                            _mc_gate = getattr(self.context, "metacog", None)
-                            _gate_decision = None
-                            if (_METACOG_ARBITER_ENABLED and _mc_gate is not None
-                                    and getattr(_mc_gate, "enabled", False)):
-                                try:
-                                    _gate_decision = await _mc_gate.arbitrate_tool_calls(
-                                        messages=messages, tool_name=fname,
-                                    )
-                                except Exception as _gex:
-                                    logger.debug(
-                                        "metacog arbiter gate failed: %s", _gex,
-                                    )
-                            if _gate_decision is not None:
-                                # Severity policy: `ask_user` is an
-                                # operational pause — surface as WARN
-                                # so it doesn't get lost in the INFO
-                                # stream. `execute` / `validate` are
-                                # routine.
-                                from .metacog_log import (
-                                    emit as _mc_emit,
-                                    Subsystem as _mc_ss,
-                                    LEVEL_INFO, LEVEL_WARN,
-                                )
-                                _arb_lvl = (
-                                    LEVEL_WARN
-                                    if _gate_decision.action == "ask_user"
-                                    else LEVEL_INFO
-                                )
-                                _mc_emit(
-                                    _mc_ss.ARBITER,
-                                    level=_arb_lvl,
-                                    tool=fname,
-                                    action=_gate_decision.action,
-                                    sim=_gate_decision.similarity,
-                                    candidates=len(_gate_decision.candidates),
-                                    # Full reason — no 80-char truncation;
-                                    # the helper auto-quotes the spaces.
-                                    reason=_gate_decision.reason,
-                                )
-                                if _gate_decision.action == "ask_user":
-                                    # Hard block: skip the dispatch and
-                                    # replace it with a synthetic tool
-                                    # result that surfaces the divergence
-                                    # to the model. The model's next turn
-                                    # will produce a clarification request
-                                    # to the user instead of charging ahead.
-                                    _diag = (
-                                        f"SYSTEM PAUSE — metacog arbiter detected "
-                                        f"ambiguous intent for a {fname} action. "
-                                        f"Two candidate plans diverged "
-                                        f"(sim={_gate_decision.similarity:.2f}) "
-                                        f"and the rule-based validator could not "
-                                        f"pick a clear winner. Reason: "
-                                        f"{_gate_decision.reason}. Ask the user "
-                                        f"to clarify what they want done before "
-                                        f"re-emitting any {fname} call."
-                                    )
-                                    err_msg = {
-                                        "role": "tool",
-                                        "tool_call_id": tool["id"],
-                                        "name": fname,
-                                        "content": _diag,
-                                    }
-                                    messages.append(err_msg)
-                                    tools_run_this_turn.append(
-                                        {**err_msg, "_synthetic": True},
-                                    )
-                                    last_was_failure = True
-                                    continue
-
-                            # ── Pre-flight repeat-failure guard (feature 1A) ──
-                            # Before dispatch, ask whether this exact action
-                            # (tool + primary target) already failed the same
-                            # way in the recent window. If so, skip the call and
-                            # hand the model the prior error instead of burning
-                            # another turn re-running a known failure — the live
-                            # counterpart to the offline post-mortem repeated-
-                            # error fingerprint. Idempotent setters are exempt
-                            # (the idempotency guard above already covers them,
-                            # and they carry no error to repeat).
-                            if self._preflight_guard_enabled and not is_idempotent_setter:
-                                _pf_target = primary_target_from_args(t_args)
-                                _pf_op = str(t_args.get("operation")
-                                             or t_args.get("action") or "")
-                                _pf_err = self._failure_guard.would_repeat(
-                                    fname, _pf_target, _pf_op)
-                                if _pf_err:
-                                    pretty_log(
-                                        "Pre-Flight Guard",
-                                        f"Blocked repeat {fname}"
-                                        + (f" on {_pf_target}" if _pf_target else "")
-                                        + f" — already failed: {_pf_err}",
-                                        level="WARNING", icon=Icons.STOP,
-                                    )
-                                    preflight_blocks_this_request += 1
-                                    _diag = (
-                                        f"SYSTEM BLOCK — pre-flight guard: this exact "
-                                        f"'{fname}' call"
-                                        + (f" (operation='{_pf_op}')" if _pf_op else "")
-                                        + (f" on target '{_pf_target}'" if _pf_target else "")
-                                        + f" already failed recently with: \"{_pf_err}\". "
-                                        f"Re-running it UNCHANGED will fail the same way. "
-                                        f"Legal ways forward: use a DIFFERENT operation of "
-                                        f"the same tool (e.g. operation='write' with the "
-                                        f"full file instead of 'replace'), a different "
-                                        f"tool, fix the underlying cause first, or ask "
-                                        f"the user."
-                                    )
-                                    if preflight_blocks_this_request >= 2:
-                                        # Guard-block budget (2026-07-08): a
-                                        # model re-issuing known-identical
-                                        # failures twice is boxed in — force a
-                                        # final reply instead of letting it
-                                        # spin to the turn cap (observed live:
-                                        # 3 blocked turns x ~80 s of full-file
-                                        # generation each).
-                                        force_final_response = True
-                                        _diag += (
-                                            " FINAL: you have now been blocked "
-                                            f"{preflight_blocks_this_request} times on known-"
-                                            "identical failures. STOP calling tools. Write "
-                                            "your final reply: state what you tried, quote "
-                                            "the exact error, and ask the user for the one "
-                                            "thing you need to proceed."
-                                        )
-                                    err_msg = {
-                                        "role": "tool",
-                                        "tool_call_id": tool["id"],
-                                        "name": fname,
-                                        "content": _diag,
-                                    }
-                                    messages.append(err_msg)
-                                    tools_run_this_turn.append(
-                                        {**err_msg, "_synthetic": True},
-                                    )
-                                    last_was_failure = True
-                                    continue
-                            try:
-                                # Wrap in a timing shim so each tool's wall-clock
-                                # duration lands in tool_durations[idx] (parallel to
-                                # results/metadata) — feeds the metacog runtime-budget
-                                # anomaly window.
-                                _coro = self.available_tools[fname](**t_args)
-                                tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
-                                tool_durations.append(None)
-                                tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or "")))
-                                # The DURABLE idempotency hash is recorded at
-                                # the RESULT-processing site, and only when
-                                # the call actually SUCCEEDED. Recording it
-                                # here (at dispatch) marked a call "applied"
-                                # even when the tool returned an Error —
-                                # observed live 2026-07-05: update_profile
-                                # rejected a missing-value call, the model's
-                                # corrected retry was then blocked as a
-                                # "duplicate (args already applied)", and the
-                                # turn finalised on a false "Done — removed".
-                                # The batch-local pending set below still
-                                # dedupes identical calls within THIS
-                                # response.
-                                if is_idempotent_setter:
-                                    pending_idempotent.add(a_hash)
-                            except Exception as e:
-                                pretty_log("Tool Invocation Error", str(e), level="WARNING", icon=Icons.WARN)
-                                err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error invoking tool '{fname}' (Did you forget a required argument?): {str(e)}"}
-                                messages.append(err_msg)
-                                tools_run_this_turn.append({**err_msg, "_synthetic": True})
-                                last_was_failure = True
-                        else:
-                            err_msg = {"role": "tool", "tool_call_id": tool["id"], "name": fname, "content": f"Error: Unknown tool '{fname}'"}
-                            messages.append(err_msg)
-                            tools_run_this_turn.append({**err_msg, "_synthetic": True})
-                            execution_failure_count += 1
-
-                    # If every tool_call this iteration was rejected
-                    # synthetically, the model's preamble text was a
-                    # stale deflection — drop it so it does not bleed
-                    # into the next iteration's real response. We keep
-                    # `messages.append(msg)` and the synthetic tool
-                    # entries intact so the LLM still sees its own
-                    # confused attempt + the corrective system message
-                    # on the next iteration.
-                    if tool_calls and not tool_tasks:
-                        if len(final_ai_content) > _pre_flush_final_len:
-                            final_ai_content = final_ai_content[:_pre_flush_final_len]
-
-                    if tool_tasks:
-                        # CRITICAL FIX: Run mutating tools (like file writes) BEFORE execution tools to prevent race conditions
-                        results = [None] * len(tool_tasks)
-
-                        # Phase 1: Mutations
-                        mutation_coros = []
-                        for i, (task, meta) in enumerate(zip(tool_tasks, tool_call_metadata)):
-                            if meta[0] == "file_system":
-                                mutation_coros.append((i, task))
-
-                        if mutation_coros:
-                            mut_results = await asyncio.gather(*(c[1] for c in mutation_coros), return_exceptions=True)
-                            for (i, _), res in zip(mutation_coros, mut_results):
-                                results[i] = res
-
-                        # Phase 2: Executions
-                        exec_coros = []
-                        for i, (task, meta) in enumerate(zip(tool_tasks, tool_call_metadata)):
-                            if meta[0] != "file_system":
-                                exec_coros.append((i, task))
-
-                        if exec_coros:
-                            exec_results = await asyncio.gather(*(c[1] for c in exec_coros), return_exceptions=True)
-                            for (i, _), res in zip(exec_coros, exec_results):
-                                results[i] = res
-
-                        turn_has_failure = False
-                        last_error_res = ""
-                        last_error_preview = "Unknown Error"
-
-                        # Per-call outcomes for this turn. A multi-id command
-                        # ("delete A and B") is N separate tool calls; tracking
-                        # each one lets the failure path emit an explicit
-                        # "X succeeded, Y failed" summary instead of collapsing
-                        # a partial failure into a single generic strike.
-                        op_outcomes = []
-
-                        # Tracks the worst no-progress signature seen this
-                        # turn (the same SUCCEEDING action+target+result
-                        # repeating), handled once after the results loop.
-                        _noprogress_trip = None
-
-                        # We reached the parallel-execution path, which means
-                        # at least one tool call parsed cleanly this turn.
-                        # Drop the consecutive-parse-error streak so a single
-                        # earlier failure can't latch the pivot prompt.
-                        consecutive_parse_errors = 0
-                        for i, result in enumerate(results):
-                            fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op = tool_call_metadata[i]
-                            str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
-
-                            # Record this call's outcome uniformly (before the
-                            # branch chain below) so a partial failure can be
-                            # summarised as "N ok / M failed" rather than
-                            # last-write-wins on last_error_*.
-                            _res_is_error = str_res.startswith((
-                                "Error:", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
-
-                            # Idempotency hash lands only on SUCCESS: a failed
-                            # setter was NOT applied, so an identical corrected
-                            # retry must be allowed through the guard.
-                            if _is_idem_setter and not _res_is_error:
-                                executed_idempotent.add(a_hash)
-                            op_outcomes.append({
-                                "tool": fname,
-                                "ok": not _res_is_error,
-                                "preview": (str_res.replace("Error:", "").strip()[:140]
-                                            if _res_is_error else None),
-                            })
-
-                            # Feed the pre-flight repeat-failure guard (feature
-                            # 1A): remember FAILED calls keyed by (tool, primary
-                            # target) — ``ptarget`` was computed at dispatch time
-                            # from the same args — so an identical re-issue on a
-                            # later iteration is intercepted before dispatch.
-                            if _res_is_error:
-                                try:
-                                    self._failure_guard.record(fname, ptarget, str_res, ptool_op)
-                                except Exception:
-                                    pass
-
-                            # One-task-per-turn gate: a manage_projects call that
-                            # actually closed a task to DONE ends the interactive
-                            # turn, so a single "start task 1" advances exactly
-                            # one task and stops. Skipped when the user asked for
-                            # a batch ("do the next 3" / "finish the project").
-                            if (not _proj_task_closed_this_req and not _user_batch_intent
-                                    and _manage_projects_closed_a_task(fname, str_res)):
-                                _proj_task_closed_this_req = True
-                                force_final_response = True
-                                logger.info(
-                                    "one-task-per-turn: project task closed DONE "
-                                    "— forcing turn to wrap up and wait for the user")
-
-                            # One-shot constraint check after the FIRST
-                            # successful artifact write of a constrained
-                            # request. The chess incident showed the
-                            # constraint is dropped DURING generation (a
-                            # 183s monolith started seconds after the model
-                            # read "don't come up with some random AI"), so
-                            # the steer lands right after the write — the
-                            # earliest moment the model can still re-open
-                            # the file and fix a violation cheaply.
-                            if (_constraint_steer_pending and not _res_is_error
-                                    and fname == "file_system" and is_mutating):
-                                _constraint_steer_pending = False
-                                # Participant-role constraints get the
-                                # architecture directive appended: the
-                                # 2026-07-04 chess session showed the generic
-                                # reminder alone is rationalised away ("the
-                                # evaluation function IS me") — the steer must
-                                # name the only two designs that satisfy the
-                                # constraint, including the /api/game/move
-                                # endpoint the model keeps forgetting exists.
-                                from ..utils.constraints import (
-                                    PARTICIPANT_STEER,
-                                    has_participant_constraint,
-                                )
-                                _steer_txt = (
-                                    "SYSTEM ALERT (constraint check): you "
-                                    "just wrote an artifact, and this "
-                                    "request carries EXPLICIT USER "
-                                    "CONSTRAINTS:\n"
-                                    + "\n".join(f"- {c}" for c in
-                                                _request_constraints)
-                                    + "\nBefore replying or marking "
-                                    "anything done: re-read what you "
-                                    "wrote and verify NONE of these are "
-                                    "violated. A coded stand-in for a "
-                                    "role the user assigned to YOU "
-                                    "(e.g. an embedded AI opponent when "
-                                    "the user said YOU will play) is a "
-                                    "violation — fix the artifact NOW "
-                                    "if so, then continue."
-                                )
-                                if has_participant_constraint(
-                                        _request_constraints):
-                                    _steer_txt += "\n\n" + PARTICIPANT_STEER
-                                messages.append({
-                                    "role": "user",
-                                    "content": _steer_txt,
-                                })
-                                pretty_log(
-                                    "Constraint Check",
-                                    f"steer injected after first write "
-                                    f"({len(_request_constraints)} active "
-                                    f"constraint(s))",
-                                    icon=Icons.CONSTRAINT,
-                                )
-
-                            # Metacog per-tool outcome (roadmap phase 2.3):
-                            # record THIS result's tool keyed on its OWN
-                            # success — not (as before) a single post-loop call
-                            # using the last tool's name + the turn-wide failure
-                            # flag, which mis-attributed competence whenever a
-                            # turn dispatched multiple tools in parallel.
-                            _mc = getattr(self.context, "metacog", None)
-                            if _mc is not None and getattr(_mc, "enabled", False) and fname:
-                                _lstr = str_res.lstrip()
-                                # Any NON-ZERO exit code is a failure, not just
-                                # 1/2. The old substring check recorded codes
-                                # 3-9 and multi-digit (127, 130, ...) as
-                                # competence SUCCESS, poisoning the per-domain
-                                # profile. Reuse the same regex the execute
-                                # result-classification path below already uses.
-                                _mc_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                                _tool_failed = isinstance(result, Exception) or (
-                                    _lstr.startswith(("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error"))
-                                    or "Traceback" in str_res
-                                    or (_mc_exit is not None and int(_mc_exit.group(1)) != 0)
-                                )
-                                _dur = tool_durations[i] if i < len(tool_durations) else None
-                                _bus = getattr(_mc, "bus", None)
-                                # Trigger publishes are best-effort and MUST NOT
-                                # block the competence/budget record below — hence a
-                                # separate try. is_anomalous runs BEFORE record_outcome
-                                # so the current sample isn't compared against itself.
-                                try:
-                                    # LoopDetected: observe the tool key; on a
-                                    # repeat-streak trip publish a loop event (the
-                                    # ReplanBridge can revise the active task), reset.
-                                    _rep = getattr(_mc, "repetition", None)
-                                    if _rep is not None and _bus is not None and hasattr(_rep, "observe"):
-                                        _streak = _rep.observe(fname)
-                                        if _rep.tripped():
-                                            from .triggers import loop_event as _loop_event
-                                            await _bus.publish(_loop_event(
-                                                f"tool '{fname}' repeated {_streak}x in a row",
-                                                key=fname, count=_streak,
-                                            ))
-                                            _rep.reset()
-                                    # ExecutionAnomaly: this duration vs the learned p95×budget.
-                                    _rb = getattr(_mc, "runtime_budget", None)
-                                    if (_rb is not None and _bus is not None and _dur is not None
-                                            and hasattr(_rb, "is_anomalous") and _rb.is_anomalous(fname, _dur)):
-                                        from .triggers import anomaly_event as _anom_event
-                                        await _bus.publish(_anom_event(
-                                            f"tool '{fname}' ran {_dur:.1f}s (>budget)",
-                                            tool_name=fname, duration_s=_dur,
-                                            budget_s=(_rb.budget(fname) or 0.0),
-                                        ))
-                                except Exception as _trexc:
-                                    logger.debug("metacog trigger publish failed: %s", _trexc)
-                                try:
-                                    # Feed the budget window + competence profile.
-                                    _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
-                                except Exception as _mcexc:
-                                    logger.debug("metacog outcome hook failed: %s", _mcexc)
-
-                            shield_limit = max(16000, int(char_budget * 0.1))
-                            if len(str_res) > shield_limit and fname not in ["file_system", "recall", "deep_research", "web_search", "knowledge_base", "postgres_admin"]:
-                                # Use a DISTINCT variable, not `payload`: the
-                                # outer `payload` is reused later (e.g. the
-                                # Perfect-It optimization call), and rebinding
-                                # it here to this 300-token summarizer silently
-                                # capped that later generation's max_tokens.
-                                shield_payload = {
-                                    "model": model,
-                                    "messages": [{"role": "user", "content": f"The user asked: '{last_user_content}'. Summarize this tool output. If it contains facts relevant to the user, extract them. If it is a script error, state the root cause. Output: {str_res[:15000]}"}],
-                                    "temperature": 0.0,
-                                    "max_tokens": 300
-                                }
-                                try:
-                                    pretty_log("Context Shield", f"Offloading {len(str_res)} chars from {fname} to Edge Worker...", icon=Icons.SHIELD)
-                                    # FOREGROUND: awaited inline mid-turn. With
-                                    # is_background=True this parked against its
-                                    # own request in _wait_for_foreground_clear
-                                    # (600s self-stall) on every oversized tool
-                                    # output. use_worker still prefers a pool.
-                                    summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=False)
-                                    summary_content = summary_data["choices"][0]["message"].get("content", "").strip()
-                                    if summary_content:
-                                        str_res = f"[EDGE CONDENSED]: {summary_content}"
-                                except Exception as e:
-                                    logger.debug(f"Context-Shield edge summarisation failed: {type(e).__name__}: {e}")
-
-                            trunc_limit = max(80000, int(char_budget * 0.4))
-                            half = trunc_limit // 2
-                            safe_res = str_res[:half] + "\n...[TRUNCATED]...\n" + str_res[-half:] if len(str_res) > trunc_limit else str_res
-
-                            # Make sure exit-code / error markers are NEVER
-                            # buried in the truncation. The model needs to
-                            # see "EXIT CODE: 1" or "Error:" reliably to
-                            # decide whether to retry or pivot.
-                            if fname == "execute":
-                                exit_match_full = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                                if exit_match_full and "EXIT CODE:" not in safe_res:
-                                    safe_res = f"[FAILURE BANNER] EXIT CODE: {exit_match_full.group(1)}\n" + safe_res
-                            if (str_res.lstrip().startswith("Error")
-                                    or "Traceback" in str_res
-                                    or "SYSTEM ERROR" in str_res):
-                                first_err_line = next(
-                                    (ln for ln in str_res.splitlines()
-                                     if ln.strip().startswith(("Error", "SYSTEM ERROR"))
-                                     or "Traceback" in ln),
-                                    "",
-                                )
-                                if first_err_line and first_err_line[:120] not in safe_res[:300]:
-                                    safe_res = f"[FAILURE BANNER] {first_err_line[:200]}\n" + safe_res
-
-                            # Per-tool fallback hint injection — when a tool
-                            # call fails with a known error pattern, append a
-                            # concrete remediation hint so the LLM has an
-                            # actionable next step instead of blindly retrying.
-                            _hint_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                            if (str_res.lstrip().startswith("Error")
-                                    or "Traceback" in str_res
-                                    or "SYSTEM ERROR" in str_res
-                                    or (_hint_exit is not None and int(_hint_exit.group(1)) != 0)):
-                                try:
-                                    from ..tools.tool_failure import get_fallback_hint
-                                    hint = get_fallback_hint(fname, str_res)
-                                    if hint:
-                                        safe_res = safe_res + f"\n\n[FALLBACK HINT for {fname}] {hint}"
-                                except Exception:
-                                    pass
-
-                            tool_msg = {"role": "tool", "tool_call_id": tool_id, "name": fname, "content": safe_res}
-                            messages.append(tool_msg)
-                            tools_run_this_turn.append(tool_msg)
-
-                            # No-progress (ungrounded-verification) loop
-                            # detection — ONLY on SUCCESSFUL, NON-MUTATING
-                            # calls. Errors are already handled by the strike
-                            # path + `_note_repeated_failure`; mutations
-                            # (file writes) are exempt so legitimate iterative
-                            # editing of one file is never mistaken for a loop.
-                            # What's left — repeated reads of the same file,
-                            # repeated browser interaction with the same
-                            # selector, repeated screenshots returning the same
-                            # view — is exactly the "succeeds but learns
-                            # nothing" thrash from the Browser-OS run.
-                            _res_is_error = isinstance(result, Exception) or str_res.lstrip().startswith(
-                                ("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error")
-                            ) or "Traceback" in str_res
-                            if fname and not is_mutating and not _res_is_error:
-                                # threshold=2 (was 3): the SECOND identical
-                                # read is already zero-information — nudge
-                                # immediately, abort on the third (chess
-                                # session 2026-07-08: 5 identical re-reads of
-                                # index.html while theorizing about a URL one
-                                # probe would have settled).
-                                _asig, _acnt, _atrip = strikes.note_action(
-                                    fname, ptarget,
-                                    _action_result_fingerprint(str_res),
-                                    threshold=2,
-                                )
-                                if _atrip and (_noprogress_trip is None or _acnt > _noprogress_trip[1]):
-                                    _noprogress_trip = (_asig, _acnt, fname, ptarget)
-
-                            # Escape-hatch tool: the solver has declared
-                            # the current task structurally unwinnable.
-                            # Stop the turn loop immediately and promote
-                            # the sentinel into `final_ai_content` so the
-                            # outer caller (e.g. dream.synthetic_self_play)
-                            # can detect "CHALLENGE_ABORTED_BY_SOLVER"
-                            # and skip remaining retry attempts. Firing
-                            # on the tool RESULT (not the call) means the
-                            # solver must have successfully run
-                            # `abort_attempt` — hallucinated or malformed
-                            # calls can't short-circuit the loop.
-                            if fname == "abort_attempt" and "CHALLENGE_ABORTED_BY_SOLVER" in str_res:
-                                pretty_log(
-                                    "Attempt Aborted",
-                                    "Solver declared task unwinnable — exiting turn loop",
-                                    level="WARNING", icon=Icons.STOP,
-                                )
-                                final_ai_content = str_res
-                                force_stop = True
-                                break
-
-                            if fname == "execute":
-                                code_match = re.search(r"EXIT CODE:\s*(\d+)", str_res)
-                                if code_match:
-                                    exit_code_val = int(code_match.group(1))
-                                else:
-                                    if "Error" in str_res or "Exception" in str_res or "Traceback" in str_res:
-                                        exit_code_val = 1
-                                    else:
-                                        exit_code_val = 0
-
-                                if exit_code_val != 0:
-                                    turn_has_failure = True
-                                    last_error_res = str_res
-                                    if "STDOUT/STDERR:" in str_res:
-                                        last_error_preview = str_res.split("STDOUT/STDERR:")[1].strip().replace("\n", " ")
-                                    elif "SYSTEM ERROR:" in str_res:
-                                        last_error_preview = str_res.split("SYSTEM ERROR:")[1].strip().split("\n")[0]
-                                    else:
-                                        last_error_preview = str_res[:60].replace("\n", " ")
-                                else:
-                                    if is_mutating: seen_tools.clear()
-                                    pretty_log("Execution Ok", "Script completed with exit code 0", icon=Icons.OK)
-
-                                    # --- SIMULATION SHORT-CIRCUIT ---
-                                    # In self-play (read-only skill memory
-                                    # sentinel), when the solver has just
-                                    # executed `solution.py` with exit=0 and
-                                    # produced non-empty stdout, the inner
-                                    # agent is done — the outer validator
-                                    # will re-run solution.py directly and
-                                    # ignore any further agent reasoning.
-                                    # Without this gate, every successful
-                                    # cycle burns one extra 15–25s "thinking"
-                                    # turn to emit a "task complete" summary
-                                    # that nobody reads (log-eval: turns 3→4
-                                    # of every cycle were pure dead time).
-                                    _is_sim = getattr(
-                                        getattr(self.context, "skill_memory", None),
-                                        "is_read_only",
-                                        False,
-                                    ) is True
-                                    if _is_sim:
-                                        # Pull the command text from the
-                                        # assistant message that emitted this
-                                        # tool_call — that's where the model
-                                        # embedded `python3 solution.py` (or
-                                        # `python3 -u solution.py`, or a
-                                        # `bash -c "...solution.py..."`).
-                                        _last_asst = ""
-                                        for _m in reversed(messages):
-                                            if _m.get("role") == "assistant":
-                                                _tc = _m.get("tool_calls") or []
-                                                try:
-                                                    _last_asst = json.dumps(_tc, default=str)
-                                                except Exception:
-                                                    _last_asst = str(_tc)
-                                                _last_asst += str(_m.get("content") or "")
-                                                break
-                                        _ran_solution = "solution.py" in _last_asst
-                                        # Non-trivial stdout: strip the
-                                        # EXECUTION RESULT header and check
-                                        # the body has real content.
-                                        _body = str_res.split("STDOUT/STDERR:", 1)[-1].strip()
-                                        if _ran_solution and len(_body) > 0:
-                                            final_ai_content = (
-                                                "solution.py executed successfully (exit 0)."
-                                            )
-                                            force_stop = True
-                                            pretty_log(
-                                                "Self-Play Short-Circuit",
-                                                "Skipped confirmation turn — solution.py ran clean (sim mode).",
-                                                icon=Icons.STOP,
-                                            )
-                                            break  # exit the enumerate(results) loop
-
-                            elif str_res.startswith("Error:") or str_res.startswith("ERROR") or str_res.startswith("SYSTEM ERROR") or str_res.startswith("Critical Tool Error"):
-                                turn_has_failure = True
-                                last_error_res = str_res
-                                last_error_preview = str_res.replace("Error:", "").strip()
-                                pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN)
-
-                            elif fname in ["manage_tasks", "learn_skill", "update_profile"] and "SUCCESS" in str_res.upper():
-                                if is_mutating: seen_tools.clear()
-                                pass
-                            elif fname == "image_generation" and "SUCCESS" in str_res.upper():
-                                pass
-                            else:
-                                if is_mutating: seen_tools.clear()
-
-                        # (Metacog per-tool outcomes are now recorded inside
-                        # the enumerate(results) loop above, keyed per result.)
-
-                        # No-progress loop breaker. When the same SUCCEEDING
-                        # action on the same target returned the same result
-                        # >=3x this request, the agent is in an ungrounded
-                        # verification loop (it keeps re-observing instead of
-                        # trusting evidence it already has). FIRST trip: force
-                        # a grounded final answer (drop tools next turn via
-                        # force_final_response) + tell it to trust the
-                        # authoritative state and report how to verify if it
-                        # cannot. If it somehow keeps looping to >=5, hard-stop.
-                        # Independent of turn_has_failure — this path is for
-                        # all-success thrash, which the strike machinery below
-                        # never sees.
-                        if _noprogress_trip is not None and not force_stop and not force_final_response:
-                            _asig, _acnt, _afname, _atarget = _noprogress_trip
-                            _tgt_desc = f" on '{_atarget}'" if _atarget else ""
-                            if _acnt >= 3:
-                                pretty_log(
-                                    "Loop Breaker",
-                                    f"No-progress loop: '{_afname}'{_tgt_desc} repeated {_acnt}x "
-                                    "with no change — aborting turn loop.",
-                                    level="WARNING", icon=Icons.STOP,
-                                )
-                                if not final_ai_content:
-                                    final_ai_content = (
-                                        f"[ATTEMPT_ABORTED_NO_PROGRESS] I repeated the same "
-                                        f"'{_afname}' action{_tgt_desc} {_acnt} times and got the "
-                                        "same result each time, so I stopped instead of looping. "
-                                        "Any changes I made so far are in place. To move forward I "
-                                        "need one piece of real evidence I could not get from here: "
-                                        "the exact error text or failing URL from your side (e.g. "
-                                        "browser devtools), or the output of re-running the failing "
-                                        "step — send me that and I'll fix the actual cause instead "
-                                        "of guessing."
-                                    )
-                                force_stop = True
-                            elif _asig not in repeated_action_steered:
-                                repeated_action_steered.add(_asig)
-                                # Read/write tools (manage_composed_skills,
-                                # file_system, ...) get a SOFTER steer: the
-                                # loop is the agent re-READING to orient
-                                # itself, and the action it was asked to do is
-                                # a WRITE through the SAME tool. Forcing a
-                                # text-only final turn here would bar that
-                                # pending mutation forever — the agent would
-                                # "finish" having silently done nothing (the
-                                # reconfigure-a-composed-skill bug: looped on
-                                # action="list", force-finalised, never reached
-                                # action="define"). So we keep tools available
-                                # and tell it to perform the WRITE now instead
-                                # of reading again. The >=5 hard stop above is
-                                # the backstop if it keeps thrashing.
-                                _readwrite_loop = _is_readwrite_loop_exempt(_afname)
-                                pretty_log(
-                                    "Loop Breaker",
-                                    f"No-progress: '{_afname}'{_tgt_desc} repeated {_acnt}x with no "
-                                    "new info — "
-                                    + ("steering to the write action (tools kept)."
-                                       if _readwrite_loop
-                                       else "forcing a grounded conclusion."),
-                                    level="WARNING", icon=Icons.WARN,
-                                )
-                                if _readwrite_loop:
-                                    messages.append({"role": "user", "content": (
-                                        f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} "
-                                        "times and gotten the SAME result — re-reading produces NO new "
-                                        "information. You already have the current state; it is "
-                                        "AUTHORITATIVE. Do ONE of these NOW instead:\n"
-                                        "1. GATHER NEW EVIDENCE: probe the thing you are theorizing "
-                                        "about — `execute` a curl/run of the exact URL/command/code in "
-                                        "question and read the actual response, instead of predicting "
-                                        "it from the source.\n"
-                                        f"2. APPLY THE CHANGE: if the task needs a change, call "
-                                        f"'{_afname}' ONCE with the mutating action "
-                                        "(write/update/create) and report what you changed.\n"
-                                        "3. ASK THE USER: if the failure is on THEIR side (their "
-                                        "browser, their process, their network), ask for the exact "
-                                        "error text/URL from their screen — one question beats "
-                                        "guessing.\n"
-                                        "Do NOT issue another read/list of this tool."
-                                    )})
-                                else:
-                                    force_final_response = True
-                                    messages.append({"role": "user", "content": (
-                                        f"SYSTEM ALERT: You have run '{_afname}'{_tgt_desc} {_acnt} times "
-                                        "and gotten the SAME result with no change — re-observing "
-                                        "produces NO new information. The evidence you already have is "
-                                        "AUTHORITATIVE. Write your FINAL answer now: if you confirmed "
-                                        "the change via state/file inspection, report success and how "
-                                        "you confirmed it. If you are still UNSURE why something fails, "
-                                        "do not guess — say plainly what you verified, what you could "
-                                        "not verify from here, and ask the user for the ONE piece of "
-                                        "evidence that would settle it (the exact error text, the "
-                                        "failing URL from their devtools, or the output of a command "
-                                        "you give them). Do NOT call this tool again."
-                                    )})
-
-                        if turn_has_failure:
-                            # Any failure (transient or structural) breaks the
-                            # consecutive-clean-success streak that unfreezes decay.
-                            strikes.reset_clean_streak()
-                            # Classify the failure to route to the right budget
-                            from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context, summarize_multi_op_outcomes
-                            failure_class, failure_match = classify_tool_failure(last_error_res or last_error_preview)
-                            # Partial-failure summary (empty unless this turn
-                            # mixed successes and failures across >=2 calls).
-                            multi_op_summary = summarize_multi_op_outcomes(op_outcomes)
-
-                            if failure_class == FailureClass.RETRYABLE:
-                                transient_failure_count += 1
-                                pretty_log("Transient Fail", f"Transient strike {transient_failure_count}/4 ({failure_match}) -> {last_error_preview[:100]}", icon=Icons.WARN)
-                                diagnostic_msg = format_failure_context(last_error_preview, failure_class)
-                            else:
-                                execution_failure_count += 1
-                                pretty_log("Execution Fail", f"Strike {execution_failure_count}/6 ({failure_class.value}) -> {last_error_preview[:150]}", icon=Icons.FAIL)
-                                diagnostic_msg = format_failure_context(last_error_preview, failure_class)
-                                # Detect the SAME structural failure recurring.
-                                # At ≥3 repeats: freeze the success-decay (so the
-                                # cap can finally fire on this oscillating loop)
-                                # and tell the model ONCE to stop retrying — the
-                                # live tool result is authoritative over any stale
-                                # context/system-state hint that says otherwise.
-                                _sig, _cnt, _persist, _first_warn = strikes.note_failure(
-                                    fname, last_error_preview
-                                )
-                                if _first_warn:
-                                    pretty_log(
-                                        "Loop Breaker",
-                                        f"Same failure ×{_cnt} "
-                                        f"({fname}) — freezing strike decay & redirecting.",
-                                        level="WARNING", icon=Icons.STOP,
-                                    )
-                                    messages.append({"role": "user", "content": (
-                                        f"SYSTEM ALERT: This exact action has now failed "
-                                        f"{_cnt} times with the SAME error: "
-                                        f"{str(last_error_preview)[:160]}. STOP repeating it — "
-                                        "retrying will not change the result. The live tool "
-                                        "result and the current sandbox listing are AUTHORITATIVE "
-                                        "over any prior context, memory, workspace narrative, or "
-                                        "DYNAMIC SYSTEM STATE hint that suggested otherwise. Pick a "
-                                        "DIFFERENT action now: if a file is missing, CREATE it with "
-                                        "file_system(operation='write', …) or choose an existing "
-                                        "file from the listing; if an approach is wrong, change it."
-                                    )})
-
-                            last_was_failure = True
-                            # strikes.note_failure already reset the clean-success
-                            # streak; this assignment is implicit in the ledger.
-
-                            # Check for tool fallback suggestions
-                            from ..tools.fallback_chains import get_fallback_hint
-                            fallback_hint = ""
-                            if fname:
-                                hint = get_fallback_hint(fname, last_error_res or last_error_preview)
-                                if hint:
-                                    fallback_hint = f"\n\n{hint}"
-
-                            from ..tools.file_system import tool_list_files, project_scoped_sandbox
-                            sandbox_state = await tool_list_files(project_scoped_sandbox(self.context)[0], self.context.memory_system)
-                            messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {multi_op_summary}{diagnostic_msg}{fallback_hint}\n\n{sandbox_state}"})
-
-                            total_fail = execution_failure_count + transient_failure_count
-                            # System 3 Crisis Pivot — fires at structural strike 4
-                            # OR total strike 6. Can fire a SECOND time at strike 5
-                            # with results of the first pivot as extra context.
-                            sys3_trigger = (
-                                (execution_failure_count == 4 and not _request_sys3_fired_once)
-                                or (execution_failure_count == 5 and _request_sys3_fired_once)
-                            )
-                            if sys3_trigger:
-                                pivot_num = 2 if _request_sys3_fired_once else 1
-                                pretty_log(f"System 3 Crisis Intervention #{pivot_num}", "Engaging meta-cognitive pivot...", icon=Icons.BRAIN_THINK)
-
-                                # On second pivot, include first pivot's justification
-                                extra_context = ""
-                                if pivot_num == 2:
-                                    prev_just = _request_sys3_prev_justification
-                                    extra_context = f"\n\n### PREVIOUS PIVOT (failed):\n{prev_just[:500]}"
-
-                                sys3_result = await self._run_system_3_pivot(
-                                    task_context=last_user_content,
-                                    error_context=(last_error_res or '') + extra_context,
-                                    sandbox_state=str(sandbox_state),
-                                    model=model
-                                )
-                                if sys3_result.get("tree_update"):
-                                    task_tree.load_from_json(sys3_result["tree_update"])
-                                    current_plan_json = task_tree.to_json()
-                                    execution_failure_count = max(0, execution_failure_count - 2)
-                                    transient_failure_count = 0
-                                    last_was_failure = False
-                                    _request_sys3_fired_once = True
-                                    _request_sys3_prev_justification = sys3_result.get('justification', '')
-                                    messages.append({"role": "user", "content": f"SYSTEM 3 PIVOT #{pivot_num}: The previous approach failed. The strategy has been entirely rewritten. Justification: {sys3_result.get('justification')}. Follow the new plan."})
-                                    continue
-
-                            if execution_failure_count >= 6 or total_fail >= 8:
-                                pretty_log("Loop Breaker", "Forcing final response", icon=Icons.STOP)
-                                messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed. Provide a final response explaining the situation."})
-                                force_final_response = True
-                        else:
-                            # Only reset transient failures on success; structural
-                            # failures require consecutive successes to decay.
-                            transient_failure_count = 0
-                            # Record a clean success. The ledger freezes decay once
-                            # a SAME-failure loop is detected (otherwise an
-                            # interleaved success — e.g. the auto sandbox-listing
-                            # after a failed read — cancels the strike and the cap
-                            # never fires). The freeze is NOT permanent: 3
-                            # consecutive clean successes mean a genuine pivot, so
-                            # note_clean_success unfreezes it. Signature counts are
-                            # kept, so the same failure re-freezes on recurrence.
-                            if strikes.note_clean_success():
-                                pretty_log(
-                                    "Loop Breaker",
-                                    "Strike decay unfrozen after 3 consecutive clean successes.",
-                                    icon=Icons.OK,
-                                )
-                            if execution_failure_count > 0 and not strikes.decay_frozen:
-                                execution_failure_count = max(0, execution_failure_count - 1)
-
-                            # Terminal tools: `self_play` and `dream_mode`
-                            # are self-contained cycles. Once they return,
-                            # the expected next turn is a conversational
-                            # summary to the user — NEVER another call.
-                            # Without this gate, the main LLM (seeing the
-                            # system prompt's "Call this tool EVERY TIME
-                            # the user requests it" alongside the original
-                            # user intent still in history) re-fires the
-                            # same tool 2–3x per user ask and burns minutes
-                            # per extra run. Setting force_final_response
-                            # routes the next turn through the text-only
-                            # streaming path; the tool_call suppressor
-                            # above catches any stragglers in non-stream
-                            # mode. The directive message is belt-and-
-                            # suspenders for the model's benefit.
-                            terminal_names = {"self_play", "dream_mode"}
-                            just_ran_terminal = any(
-                                t.get("name") in terminal_names
-                                for t in tools_run_this_turn[-len(results):]
-                            )
-                            if just_ran_terminal and not force_final_response:
-                                # --- DIRECT-FROM-TOOL SUMMARY ---
-                                # We used to set force_final_response=True
-                                # here and let the LLM summarise the tool
-                                # result on a follow-up turn. That worked on
-                                # the first invocation but deterministically
-                                # failed from the second invocation onward:
-                                # the conversation window now contained a
-                                # repeated `user → <tool_call name="self_play">
-                                # → tool result` pattern, and the model's
-                                # attention attractor beat the "text-only"
-                                # directive — it emitted yet another
-                                # <tool_call> for the same tool, which the
-                                # stream scrub stripped, which left the user
-                                # with a generic fallback message instead of
-                                # a real summary.
-                                #
-                                # The fix is to stop running the summary LLM
-                                # turn at all. self_play / dream_mode already
-                                # return a structured, user-readable string;
-                                # we format it deterministically here and
-                                # assign it straight to `final_ai_content`,
-                                # then flip `force_stop` so the turn loop
-                                # exits before any further LLM call runs.
-                                # No LLM summary = no pattern priming = no
-                                # tool_call leak = no scrub = no fallback.
-                                _terminal_result = ""
-                                _terminal_name = ""
-                                for _t in reversed(tools_run_this_turn[-len(results):]):
-                                    if _t.get("name") in terminal_names:
-                                        _terminal_result = str(_t.get("content", "")).strip()
-                                        _terminal_name = _t.get("name")
-                                        break
-                                # Distill the raw tool output into a short
-                                # user-facing summary. The raw blob mixes
-                                # user-relevant status with internal
-                                # telemetry (`CURIOSITY: ...`) and an LLM-
-                                # facing `SYSTEM INSTRUCTION:` trailer —
-                                # the helper strips those and extracts
-                                # the 1-3 key facts (cluster, status,
-                                # skill-gate or learned lesson).
-                                _summary_body = _distill_terminal_tool_summary(
-                                    _terminal_name, _terminal_result
-                                )
-                                _prefix = {
-                                    "self_play": "Self-play complete.",
-                                    "dream_mode": "Dream cycle complete.",
-                                }.get(_terminal_name, f"`{_terminal_name}` complete.")
-                                final_ai_content = (
-                                    f"{_prefix}\n\n{_summary_body}"
-                                    if _summary_body else _prefix
-                                )
-                                force_stop = True
-                                pretty_log(
-                                    "Terminal Tool",
-                                    f"Bypassed summary LLM — direct result displayed ({_terminal_name})",
-                                    icon=Icons.STOP,
-                                )
-                                break  # exit the enumerate(results) loop
-
-                # --- FINAL OUTPUT SCRUBBER ---
-                # Apply scrubbers FIRST so we don't accidentally scrub our own manual fallback injections
-                bleed_markers = [
-                    "# Tools", "<tools>", "CRITICAL INSTRUCTION:", "You may call one or more functions",
-                    '{"type": "function"', "SPECIALIST SUBSYSTEM ACTIVATED", "ENGINEERING STANDARDS",
-                    "DYNAMIC SYSTEM STATE", "[SYSTEM STATE UPDATE]"
-                ]
-                for bleed_marker in bleed_markers:
-                    if bleed_marker in final_ai_content:
-                        final_ai_content = final_ai_content.split(bleed_marker)[0]
-
-                # Last-resort scrub on final_ai_content. Must match the
-                # widened mid-flow ui_content scrub (agent.py:~3149) shape
-                # for shape — that path runs under `if has_tool_tag:` so
-                # anything that bypasses it (perfect-it follow-up LLM call,
-                # a fallback branch that writes straight to final_ai_content,
-                # a turn where has_tool_tag was False but content still had
-                # a bare <function>) reaches the user raw unless we also
-                # strip it here. Three widenings vs. the old pattern:
-                #   1. `function` added to the alternation — catches bare
-                #      `<function name="...">...</function>` blocks the
-                #      model sometimes emits without an outer <tool_call>
-                #      wrapper (the exact shape the user reported as
-                #      leaking verbatim after a successful self_play run).
-                #   2. Backreference `\1` — the close tag must match the
-                #      open tag type, so a nested `</function>` inside
-                #      `<tool_call>...</tool_call>` can't terminate the
-                #      outer match early and leave an orphan close tag.
-                #   3. `[^>]*>` in the open tag tolerates attributes
-                #      (`<tool_call name="...">`) without being fooled by
-                #      a stray `>` in the body.
-                final_ai_content = re.sub(
-                    # `\Z` (absolute EOS) instead of `$` so trailing
-                    # newlines after a tool_call don't escape the scrub.
-                    r'<(tool_call|tool|function)\b[^>]*>.*?(?:</\1\b[^>]*>|\Z)',
-                    '',
-                    final_ai_content,
-                    flags=re.DOTALL | re.IGNORECASE,
-                )
-                final_ai_content = re.sub(r'<tool_response.*?>.*?(?:</tool_response.*?>|\Z)', '', final_ai_content, flags=re.DOTALL | re.IGNORECASE)
-                final_ai_content = re.sub(r'--- EXECUTION RESULT ---.*?(?:------------------------|$)', '', final_ai_content, flags=re.DOTALL)
-                final_ai_content = re.sub(r'(?m)^\s*(?:🔄|🟢|⏳|✅|❌|🛑|➖)\s*\[.*?\].*?\n?', '', final_ai_content)
-                final_ai_content = re.sub(r'(?m)^.*?\((?:IN_PROGRESS|READY|PENDING|DONE|FAILED|BLOCKED)\)\s*\n?', '', final_ai_content)
-                final_ai_content = re.sub(r'(?m)^\s*(?:\[)?task_\d+(?:\])?\s*\n?', '', final_ai_content)
-                final_ai_content = re.sub(r'(?m)^\s*(?:FOCUS TASK|ACTIVE STRATEGY & PLAN|PLAN|THOUGHT):\s*', '', final_ai_content)
-                # Strip leaked Qwen Generative-Reward-Model JSON. These keys
-                # are not produced anywhere in Ghost — verified via grep,
-                # zero hits across the codebase. They are an upstream
-                # training artifact: meta-prompts that ask the model to
-                # rate or score itself pull it into evaluator mode and it
-                # emits the GRM schema instead of an answer. Conservative
-                # match requires both c_relevance_to_query AND
-                # c_correctness_of_content, so a legitimate response that
-                # happens to mention one key in isolation is not clobbered.
-                final_ai_content = re.sub(
-                    r'\{\{?\s*"c_relevance_to_query"\s*:\s*\d+\s*,\s*"c_correctness_of_content"\s*:.*?\}\}?',
-                    '',
-                    final_ai_content,
-                    flags=re.DOTALL,
-                )
-                final_ai_content = final_ai_content.strip()
-
-                # Collapse consecutive duplicate paragraphs. When the
-                # model emits its final answer as a preamble alongside
-                # a tool_call AND then again after the tool returns, the
-                # accumulator stores the same paragraph twice in a row
-                # ("Your name is X.\n\nYour name is X."). Users see a
-                # stutter. Cheap fix: split on blank-line boundaries and
-                # drop a paragraph that exactly matches its predecessor
-                # after whitespace normalisation. Non-adjacent repeats
-                # are left alone — they're usually intentional (e.g.
-                # quoting the user's question and then answering it).
-                if "\n\n" in final_ai_content:
-                    parts = final_ai_content.split("\n\n")
-                    deduped: list[str] = []
-                    prev_key = None
-                    for p in parts:
-                        key = re.sub(r"\s+", " ", p).strip()
-                        if key and key == prev_key:
-                            continue
-                        deduped.append(p)
-                        prev_key = key
-                    final_ai_content = "\n\n".join(deduped)
-
-                # --- THE "PERFECT IT" PROTOCOL INJECTION ---
-                # Only trigger proactive optimization for heavy engineering/research tasks
-                heavy_tools_used = any(t.get('name') in ['execute', 'deep_research'] for t in tools_run_this_turn)
-
-                # Skip the whole Perfect-It block during self-play: the
-                # isolated context's `ReadOnlySkillMemory.learn_lesson`
-                # is a no-op, so the write at the bottom lands in
-                # /dev/null — but before we realised that, every single
-                # self-play cycle was burning ~15s on a follow-up LLM
-                # call to generate an "optimisation strategy" that was
-                # silently discarded, and the misleading
-                # `"Saved optimization strategy to playbook"` log line
-                # was firing on the inner sub-agent's request ID
-                # (production trace 16:36, request C6). The marker
-                # lives on the ReadOnlySkillMemory class set up by
-                # dream.py's isolation code. We check `is True`
-                # explicitly (not `bool(...)`) so a MagicMock used in
-                # production-agent unit tests doesn't accidentally
-                # trigger the guard — MagicMock.is_read_only returns
-                # another MagicMock (truthy), but not the sentinel.
-                is_simulation = getattr(getattr(self.context, "skill_memory", None), "is_read_only", False) is True
-
-                if not is_simulation and tools_run_this_turn and heavy_tools_used and execution_failure_count == 0 and not last_was_failure and (not final_ai_content or len(final_ai_content) < 50):
-                    # Whether the optimization is part of the user-facing
-                    # response. When the flag is OFF the generation is pure
-                    # internal learning — so it runs as a tracked background
-                    # task instead of blocking the reply (observed: a 24s
-                    # task delivered at +271s because the response waited on
-                    # this call, which also let the watchdog cross its 120s
-                    # idle threshold and pile hippocampus consolidation onto
-                    # the same single-slot upstream).
-                    _pp_show_to_user = getattr(self.context.args, 'perfect_it', False) is True
-                    pretty_log(
-                        "Perfect It Protocol",
-                        "Generating an optimization suggestion to append to the reply..."
-                        if _pp_show_to_user else
-                        "Generating an optimization suggestion in the background "
-                        "(internal learning — not shown to the user)...",
-                        icon=Icons.IDEA,
-                    )
-                    # Heartbeat: end-of-turn post-processing is outside the
-                    # turn loop's heartbeats; without this, a long inline
-                    # generation makes the biological watchdog think the
-                    # system is idle MID-REQUEST and wake the hippocampus.
-                    self.context.last_activity_time = datetime.datetime.now()
-                    perfect_it_prompt = f"Task completed successfully. Final tool output:\n\n{tools_run_this_turn[-1]['content']}\n\n<system_directive>First, succinctly present the tool output/result to the user. Then, based on your Perfection Protocol, analyze the result and proactively suggest one concrete way to optimize, scale, secure, or automate this work further. RESPOND IN PLAIN TEXT ONLY. DO NOT USE TOOLS.</system_directive>"
-
-                    p_req_messages = []
-                    # Snapshot — deliberately NOT messages.append(): the
-                    # synthetic directive must not leak into the trajectory
-                    # record or any later consumer of `messages`.
-                    for m in messages + [{"role": "user", "content": perfect_it_prompt}]:
-                        if m.get("role") == "tool":
-                            p_req_messages.append({"role": "user", "content": f"<tool_response name=\"{m.get('name', 'unknown')}\">\n{m.get('content')}\n</tool_response>"})
-                        elif m.get("role") == "assistant":
-                            p_req_messages.append({"role": "assistant", "content": m.get("content", "")})
-                        else:
-                            content_val = m.get("content", "")
-                            if isinstance(content_val, list):
-                                text_parts = []
-                                for item in content_val:
-                                    if isinstance(item, dict):
-                                        if item.get("type") == "text":
-                                            text_parts.append(item.get("text", ""))
-                                        elif item.get("type") == "image_url":
-                                            if bool(getattr(self.context.llm_client, 'vision_clients', None)):
-                                                text_parts.append("[Image attached and passed to vision node]")
-                                            else:
-                                                text_parts.append(item) # Keep image dict
-                                content_val = "\n".join(text_parts) if all(isinstance(x, str) for x in text_parts) else text_parts
-                            p_req_messages.append({"role": m.get("role", "user"), "content": content_val})
-
-                    # Build a payload COPY: the original is left untouched
-                    # for anything downstream, and the deferred task must
-                    # not share mutable state with the live request.
-                    # 🔴 Physically remove tools so it cannot hallucinate a tool call
-                    p_payload = {k: v for k, v in payload.items() if k not in ("tools", "tool_choice")}
-                    p_payload["messages"] = p_req_messages
-                    p_payload["stream"] = False  # Prevent SSE streaming leak from the main loop
-                    _pp_lesson_label = f"Optimization Analysis: {last_user_content[:50]}..."
-
-                    if _pp_show_to_user:
-                        # --perfect-it: the optimization IS part of the
-                        # reply, so it must block the response path —
-                        # foreground=True, or the call self-stalls waiting
-                        # for its own request to clear.
-                        try:
-                            p_msg = await self._perfect_it_generate_and_learn(
-                                p_payload, _pp_lesson_label, current_trajectory_id,
-                                foreground=True,
-                            )
-                            if p_msg:
-                                if final_ai_content:
-                                    final_ai_content += "\n\n" + p_msg
-                                else:
-                                    final_ai_content = p_msg
-                        except Exception:
-                            # Only report failure to user if they expected to see it
-                            if not final_ai_content:
-                                final_ai_content = "Task finished successfully, but optimization generation failed."
-                    else:
-                        # Internal-learning only: fire-and-forget, tracked in
-                        # the context-level set (strong ref — bare tasks can
-                        # be GC'd — and drained by the lifespan shutdown).
-                        # The background queue in llm.py yields to any
-                        # foreground call, so the verifier below still gets
-                        # upstream priority.
-                        async def _deferred_perfect_it(
-                            _payload=p_payload,
-                            _label=_pp_lesson_label,
-                            _tid=current_trajectory_id,
-                        ):
-                            try:
-                                await self._perfect_it_generate_and_learn(_payload, _label, _tid)
-                            except Exception as _e:
-                                logger.debug(
-                                    "Deferred Perfect-It skipped: %s: %s",
-                                    type(_e).__name__, _e,
-                                )
-                        _bg = getattr(self.context, "_pending_background_tasks", None)
-                        if _bg is None:
-                            _bg = set()
-                            self.context._pending_background_tasks = _bg
-                        _pp_task = asyncio.create_task(_deferred_perfect_it())
-                        _bg.add(_pp_task)
-                        _pp_task.add_done_callback(_bg.discard)
-
-                if tools_run_this_turn and not final_ai_content:
-                    # Walk back to the last *real* tool output. Reading
-                    # `tools_run_this_turn[-1]` blindly would wrap a
-                    # synthetic agent-loop error ("SYSTEM ERROR: Your
-                    # <tool_call> did not parse...") in a "Process
-                    # finished successfully" banner — silent error to
-                    # false-success leak.
-                    fallback_tool = _find_substantive_tool_for_verifier(
-                        tools_run_this_turn
-                    )
-                    if fallback_tool is not None:
-                        last_out = str(fallback_tool.get('content', ''))
-
-                        if "![Image]" in last_out:
-                            final_ai_content = last_out.strip()
-                        else:
-                            # Extract just the pure STDOUT so the UI fallback is clean
-                            if "STDOUT/STDERR:" in last_out:
-                                last_out = last_out.split("STDOUT/STDERR:")[1].strip()
-                                if "DIAGNOSTIC HINT" in last_out:
-                                    last_out = last_out.split("DIAGNOSTIC HINT")[0].strip().strip("-").strip()
-
-                            preview = (last_out[:2000] + '\n...[Truncated]') if len(last_out) > 2000 else last_out
-                            final_ai_content = f"Process finished successfully.\n\n### Final Output:\n```text\n{preview}\n```"
-
-                if not final_ai_content:
-                    final_ai_content = "Task executed successfully."
-
-                # --- VERIFIER GATE (reflection before finalising) ---
-                # Run the claim/output verifier on the final answer when the
-                # turn produced tool output — catches silent-error answers
-                # ("Process finished successfully" when the tool actually
-                # failed), wrong-unit answers, and empty results. The module
-                # was orphaned (initialised but never called) before this
-                # wiring. Skipped for pure-conversational turns (no tools
-                # run) and when no verifier is installed.
-                #
-                # Failure mode on REFUTED: we append an auditor note to the
-                # reply rather than silently regenerating. This keeps the
-                # user in the loop (they can see what the verifier disagreed
-                # with) without doubling latency by rerunning the whole turn.
-                # Selfhood outcome backfill (proposal item #3): the verifier
-                # verdict computed below is the first reliable signal of
-                # whether this turn actually succeeded. Captured here and
-                # applied AFTER `_record_turn_trajectory` writes the
-                # autobiographical record (which is born `outcome="unknown"`
-                # on the hot path). `(outcome, failure_reason)` or None.
-                verifier_backfill: tuple | None = None
-                try:
-                    # Heartbeat: the verifier completion can run for a minute
-                    # on a cold prefill; without refreshing the activity
-                    # clock here the biological watchdog (idle > 120s) wakes
-                    # the hippocampus MID-REQUEST and its consolidation LLM
-                    # calls compete with this one on the same upstream.
-                    self.context.last_activity_time = datetime.datetime.now()
-                    verifier = getattr(self.context, "verifier", None)
-                    # Gate: any tool-using turn is worth verifying. The old
-                    # `was_complex_task` constraint (turn > 2) silently
-                    # skipped the common 1–2 turn tool path, so the verifier
-                    # almost never fired. `tools_run_this_turn` alone is
-                    # sufficient — trivial greetings already have no tools.
-                    # Reuse the verdict the in-loop AUTO-REPAIR finalisation
-                    # already computed for THIS final answer (one verifier
-                    # pass per clean success — same cost as before the gate
-                    # was split). Recompute only when the loop exited without
-                    # a fresh in-loop verdict (error / abort / terminal path,
-                    # or repair budget spent on a non-5851 exit).
-                    if _verdict_is_fresh and _verifier_verdict_cache is not None:
-                        v_result, last_tool = _verifier_verdict_cache
-                    else:
-                        # Non-blocking gate: with a dedicated --critic-nodes
-                        # pool the (slower) verdict runs in the background and
-                        # the response ships without waiting on it; without
-                        # one this awaits inline exactly as before. `messages`
-                        # is snapshotted because the background verdict task
-                        # iterates it while the turn keeps mutating the live
-                        # list.
-                        v_result, last_tool = await self._compute_verifier_verdict_gated(
-                            tools_run_this_turn=tools_run_this_turn,
-                            messages=list(messages),
-                            final_ai_content=final_ai_content,
-                            last_user_content=last_user_content,
-                            lc=lc,
-                            trajectory_id=current_trajectory_id,
-                            conv_fp=_stable_conv_fp,
-                        )
-                    from .verifier import VerifyVerdict
-                    # Consumption guard mirrors the original gate exactly: only
-                    # annotate / backfill / retract when the verifier was
-                    # actually applicable (installed, a substantive tool ran,
-                    # not strict trivial chat). `_compute_verifier_verdict`
-                    # returns `last_tool` even when it produces no verdict, so
-                    # the unverified-mutation branch below still fires.
-                    if (
-                        verifier is not None
-                        and verifier.llm_client is not None
-                        and last_tool is not None
-                        and final_ai_content
-                        and not self._is_strict_trivial_chat(lc)
-                    ):
-                        # Record the verdict for the selfhood backfill that
-                        # runs after the autobiographical record is written.
-                        if v_result and v_result.confidence >= 0.7:
-                            if v_result.verdict == VerifyVerdict.CONFIRMED:
-                                verifier_backfill = ("passed", "")
-                            elif v_result.verdict == VerifyVerdict.REFUTED:
-                                _vr_reason = (
-                                    "; ".join(v_result.issues[:2])
-                                    if v_result.issues else v_result.reasoning
-                                )
-                                verifier_backfill = ("failed", _vr_reason or "")
-                        if v_result and v_result.verdict == VerifyVerdict.REFUTED and v_result.confidence >= 0.7:
-                            issues_str = "; ".join(v_result.issues[:3]) if v_result.issues else v_result.reasoning
-                            note = f"\n\n---\n**Verifier note:** {issues_str}"
-                            if note[:60] not in final_ai_content:
-                                final_ai_content = f"{final_ai_content}{note}"
-                            pretty_log(
-                                "Verifier",
-                                f"REFUTED ({v_result.confidence:.0%}): {issues_str[:120]}",
-                                icon=Icons.BRAIN_THINK,
-                            )
-                            # Verifier-driven retraction: the
-                            # Perfection-Protocol's `learn_lesson`
-                            # runs BEFORE this gate, so by the time
-                            # we get here a poisoned lesson tagged
-                            # with `current_trajectory_id` may
-                            # already be on disk. The verifier just
-                            # said the response was REFUTED with
-                            # high confidence — scrub anything that
-                            # turn produced before the user even
-                            # sees the response, so the next user
-                            # query can't retrieve a lesson born
-                            # from a turn we just disagreed with.
-                            # Belt-and-braces with the user-
-                            # correction retraction path: the user
-                            # may never go on to correct, and we
-                            # shouldn't depend on them noticing.
-                            try:
-                                _sm = getattr(self.context, "skill_memory", None)
-                                if _sm is not None and current_trajectory_id:
-                                    # to_thread: retraction takes a file lock,
-                                    # rewrites the playbook and does a sync
-                                    # Chroma delete — run it off the event
-                                    # loop like every other SkillMemory call
-                                    # on this path.
-                                    await asyncio.to_thread(
-                                        _sm.retract_lessons_from_trajectory,
-                                        current_trajectory_id,
-                                        memory_system=getattr(
-                                            self.context, "memory_system", None
-                                        ),
-                                    )
-                            except Exception as _e:
-                                logger.debug(
-                                    "verifier-driven retraction skipped: %s: %s",
-                                    type(_e).__name__, _e,
-                                )
-                        else:
-                            if v_result:
-                                pretty_log(
-                                    "Verifier",
-                                    f"{v_result.verdict.value} ({v_result.confidence:.0%})",
-                                    icon=Icons.VERIFIER_LAB,
-                                )
-                            else:
-                                # v_result is None → the verifier pipeline FAILED
-                                # (e.g. LLM error); it did NOT pass. Don't show ✅.
-                                #
-                                # Unverified-mutation guard: when the gate is
-                                # skipped AND the turn's final substantive action
-                                # was a successful file write/replace, the agent
-                                # is finalising on an UNTESTED change — the exact
-                                # req_C0 failure (33-min build that "finished"
-                                # right after a write that was never run, yet
-                                # reported C=0.96). Treat that as a failed outcome
-                                # so confidence drops below threshold and the turn
-                                # is recorded as unverified rather than success.
-                                if _is_unverified_mutation(last_tool):
-                                    verifier_backfill = (
-                                        "failed",
-                                        "unverified mutation — finalised on an "
-                                        "untested file write/replace; the change "
-                                        "was never run or screenshotted",
-                                    )
-                                    note = (
-                                        "\n\n---\n**⚠ Unverified:** the final action "
-                                        "was a file write that was never executed or "
-                                        "rendered, so I cannot confirm it works. Treat "
-                                        "this as INCOMPLETE — run/preview it before "
-                                        "relying on it."
-                                    )
-                                    if note[:40] not in final_ai_content:
-                                        final_ai_content = f"{final_ai_content}{note}"
-                                    pretty_log(
-                                        "Verifier",
-                                        "finalised on an UNVERIFIED file write (never "
-                                        "run/rendered) — flagged INCOMPLETE "
-                                        "(outcome=failed)",
-                                        icon=Icons.WARN, level="WARNING",
-                                    )
-                                elif getattr(getattr(self.context, "args", None),
-                                             "no_verifier", False) is True:
-                                    # Ablated, not deferred. This branch used to
-                                    # fall into the async "deferred" message
-                                    # below, which claimed a verdict was running
-                                    # that was never spawned — the live log
-                                    # showed days of "verdict deferred" while
-                                    # --no-verifier (an ablation leftover in the
-                                    # launcher) had the whole subsystem off, and
-                                    # nothing ever contradicted it.
-                                    pretty_log(
-                                        "Verifier",
-                                        "no verdict — verifier is ABLATED "
-                                        "(--no-verifier); nothing will land late",
-                                        icon=Icons.WARN, level="WARNING",
-                                    )
-                                elif self._critic_async_enabled():
-                                    # Async mode: the verdict was deliberately
-                                    # deferred, not missing — it's running on the
-                                    # critic node now and will land as LATE …
-                                    pretty_log(
-                                        "Verifier",
-                                        "verdict deferred — verifying asynchronously "
-                                        "after the reply (off the critical path)",
-                                        icon=Icons.VERIFIER_LAB,
-                                    )
-                                else:
-                                    pretty_log(
-                                        "Verifier",
-                                        "no verdict produced — gate skipped",
-                                        icon=Icons.WARN, level="WARNING",
-                                    )
-                except Exception as e:
-                    logger.debug(f"Verifier gate skipped: {e}")
-
-                # Plan postcondition gate (proposal item #10). If the
-                # strategic planner produced a plan whose ROOT task
-                # declared postconditions, hold the final response to
-                # them — the plan stops being internal bookkeeping and
-                # becomes a success contract on the answer itself. A
-                # response that misses a declared postcondition gets a
-                # visible note rather than passing silently. Non-fatal.
-                try:
-                    _plan_json = locals().get('current_plan_json')
-                    if _plan_json and final_ai_content:
-                        from .planning import TaskTree as _PlanTree
-                        _ptree = _PlanTree()
-                        _ptree.load_from_json(_plan_json)
-                        _unsat = _ptree.root_postconditions_unsatisfied(
-                            final_ai_content
-                        )
-                        if _unsat:
-                            _pnote = (
-                                "**Plan check:** this response may not yet "
-                                "satisfy: " + "; ".join(_unsat[:3])
-                            )
-                            if _pnote[:48] not in final_ai_content:
-                                final_ai_content = (
-                                    f"{final_ai_content}\n\n---\n{_pnote}"
-                                )
-                            pretty_log(
-                                "Plan Gate",
-                                f"{len(_unsat)} unsatisfied postcondition(s)",
-                                icon=Icons.BRAIN_PLAN,
-                            )
-                except Exception as e:
-                    logger.debug(f"plan postcondition gate skipped: {e}")
-
-                # --- AUTOMATED POST-MORTEM (AUTO-LEARNING) ---
-                if was_complex_task or execution_failure_count > 0:
-                    is_complete_failure = (execution_failure_count >= 3)
-                    is_valid_success = (not force_stop or "READY TO FINALIZE" in thought_content.upper())
-
-                    if is_valid_success or is_complete_failure:
-                        # Gated on `--smart-memory > 0.0` to honour the
-                        # contract in CLAUDE.md ("Memory writes are gated
-                        # on --smart-memory / --no-memory"). The streaming
-                        # producer has the same gate; both must agree.
-                        if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0 and not forget_was_called:
-
-                            await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
-                            await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)
-
-                # Retrieval feedback: a clean, non-failing turn credits
-                # any lesson surfaced in the last ~5min. Hoisted out of
-                # the `was_complex_task` gate above — simple successful
-                # turns are exactly where retrieved lessons are most
-                # likely to be paying off, and excluding them biased
-                # the utility signal toward complex tasks only.
-                # `credit_recent_retrievals` is idempotent and no-ops
-                # when nothing was retrieved, so running it on every
-                # clean-exit turn is safe.
-                sm = getattr(self.context, 'skill_memory', None)
-                if sm is not None and execution_failure_count == 0:
-                    try:
-                        if hasattr(sm, 'credit_recent_retrievals'):
-                            await asyncio.to_thread(sm.credit_recent_retrievals, 300)
-                    except Exception:
-                        pass
-
-                # Calibration spine (roadmap phase 2.5): pair THIS turn's
-                # last composite-confidence reading with the realized
-                # outcome (clean turn → 1.0; any structural tool failure
-                # → 0.0). This is the loop that finally makes "the agent
-                # is 80% confident" mean the turn succeeds ~80% of the
-                # time — the JSONL it appends feeds the idle Brier/ECE
-                # refit (phase 2.7c). Runs on BOTH clean and failed turns
-                # (outside the credit gate above) so both outcome classes
-                # are represented. `_calib_pending` is set only when a
-                # reading was computed this turn, so we never record a
-                # stale cross-turn pair.
-                try:
-                    _ct = getattr(self.context, "calibration_tracker", None)
-                    _pending = getattr(self.context, "_calib_pending", None)
-                    # Finalization fallback (the load-bearing path in practice):
-                    # most turns never enter the streaming
-                    # is_final_generation+stream_response branch where the
-                    # entropy/confidence path lives, so _pending is usually None
-                    # here. Compute the reading NOW — logprob-optional: neutral
-                    # entropy term, competence + verbalised uncertainty drive it
-                    # — so calibration records on EVERY full-loop metacog turn
-                    # (and the arbiter bundle gets a reading via record_confidence).
-                    if _pending is None and _ct is not None:
-                        try:
-                            _mc = getattr(self.context, "metacog", None)
-                            if (_mc is not None and getattr(_mc, "enabled", False)
-                                    and getattr(_mc, "confidence", None) is not None
-                                    and getattr(_mc, "competence", None) is not None):
-                                _last_tool = ""
-                                for _t in reversed(tools_run_this_turn or []):
-                                    if isinstance(_t, dict) and _t.get("name"):
-                                        _last_tool = _t["name"]
-                                        break
-                                from .metacog import _domain_for_tool
-                                _dom = _domain_for_tool(_last_tool or "")
-                                _p = _mc.competence.estimate(_dom, _last_tool or None)
-                                _n = _mc.competence.observations(_dom, _last_tool or None)
-                                _upress = 0.0
-                                try:
-                                    _ut = getattr(self.context, "uncertainty_tracker", None)
-                                    if _ut is not None:
-                                        _upress = _ut.pressure()
-                                except Exception:
-                                    _upress = 0.0
-                                # Objective outcome penalty: a REFUTED verdict or
-                                # an unverified mutation (both surface as
-                                # verifier_backfill[0]=="failed") is ground truth
-                                # that THIS answer is wrong/unconfirmed. Without
-                                # it the reading is ≈ competence, so a historically
-                                # strong domain reports high confidence on a build
-                                # the verifier just rejected (the req_44/C0
-                                # "below=no on broken work" failure). 0.8 reliably
-                                # pulls a 0.92–0.96 competence reading below the
-                                # 0.89 threshold.
-                                _outcome_penalty = (
-                                    0.8 if (verifier_backfill
-                                            and verifier_backfill[0] == "failed")
-                                    else 0.0
-                                )
-                                _pending = _mc.confidence.score(
-                                    normalised_entropy=0.5,
-                                    competence_p_success=_p,
-                                    n_observations=_n,
-                                    uncertainty_pressure=_upress,
-                                    outcome_penalty=_outcome_penalty,
-                                )
-                                self.context.last_confidence = _pending
-                                try:
-                                    _mc.record_confidence(_pending)
-                                    _mc.count(confidence_total=True,
-                                              confidence_below=_pending.below_threshold)
-                                except Exception:
-                                    pass
-                                from .metacog_log import (
-                                    emit as _mc_emit, Subsystem as _mc_ss,
-                                    LEVEL_INFO, LEVEL_DEBUG,
-                                )
-                                _mc_emit(
-                                    _mc_ss.CONF,
-                                    level=(LEVEL_INFO if _pending.below_threshold else LEVEL_DEBUG),
-                                    below=_pending.below_threshold, C=_pending.composite,
-                                    entropy=_pending.entropy_component,
-                                    competence=_pending.competence_component,
-                                    n=_n, domain=_dom, tool=_last_tool or None,
-                                    src="finalize", threshold=_pending.threshold,
-                                )
-                        except Exception as _cfx:
-                            logger.debug("finalize confidence compute failed: %s", _cfx)
-                    if _ct is not None and _pending is not None:
-                        # Outcome from the signals available THIS turn: a
-                        # structural tool failure OR a verifier REFUTED verdict
-                        # (≥0.7 → verifier_backfill[0]=="failed") is a negative.
-                        # Without a real negative source, free-form chat turns
-                        # are almost all "clean" → single-class → the fit bails;
-                        # the verifier verdict is what gives calibration its
-                        # "confidently wrong" examples.
-                        _verifier_failed = bool(
-                            verifier_backfill and verifier_backfill[0] == "failed"
-                        )
-                        _calib_outcome = (
-                            0.0 if (execution_failure_count > 0 or _verifier_failed)
-                            else 1.0
-                        )
-                        await asyncio.to_thread(
-                            _ct.record,
-                            composite=_pending.composite,
-                            entropy_component=_pending.entropy_component,
-                            competence_component=_pending.competence_component,
-                            uncertainty_pressure=getattr(_pending, "uncertainty_pressure", 0.0),
-                            outcome=_calib_outcome,
-                        )
-                        # Stash the components keyed by this response's
-                        # fingerprint so a NEXT-turn user-correction can record
-                        # a (C, 0.0) negative for this turn — the strongest
-                        # "confidently wrong" calibration signal (the user is
-                        # the cheapest supervisor for free-form chat).
-                        try:
-                            from collections import OrderedDict as _OD
-                            _cc = getattr(self.context, "_recent_calib_for_correction", None)
-                            if _cc is None:
-                                _cc = _OD()
-                                self.context._recent_calib_for_correction = _cc
-                            _cc[self._response_fingerprint(final_ai_content or "")] = {
-                                "composite": _pending.composite,
-                                "entropy_component": _pending.entropy_component,
-                                "competence_component": _pending.competence_component,
-                                "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
-                            }
-                            while len(_cc) > 32:
-                                _cc.popitem(last=False)
-                        except Exception:
-                            pass
-                        self.context._calib_pending = None
-                except Exception as _calx:
-                    logger.debug("calibration record failed: %s", _calx)
-
-                # Surface critical unknowns/assumptions tracked during this
-                # turn. The UncertaintyTracker is a shared per-process
-                # instance — appending the risk summary lets the user see
-                # what the agent is uncertain about WITHOUT the LLM having
-                # to remember to mention it. Skipped silently when the
-                # tracker isn't wired or has no risks.
-                try:
-                    tracker = getattr(self.context, 'uncertainty_tracker', None)
-                    if tracker is not None:
-                        # Auto-populate from the agent's own output: any
-                        # explicit first-person hedge ("I'm assuming…",
-                        # "I couldn't verify…") becomes a tracked, persisted
-                        # assumption — so the tracker is load-bearing even
-                        # when the LLM never calls flag_uncertainty.
-                        try:
-                            for _hedge in tracker.scan_text_for_uncertainty(
-                                final_ai_content or ""
-                            ):
-                                tracker.flag_assumption(
-                                    _hedge, confidence=0.4,
-                                    basis="auto-detected hedge in response",
-                                )
-                        except Exception:
-                            pass
-                        # Resolve unknowns the agent answered for ITSELF this
-                        # turn: when an info-gathering tool ran successfully and
-                        # an unknown's resolution pointed at that path, mark it
-                        # resolved so it drops out of the clarifying-question gate
-                        # and the risk footer below. (The resolve-side of the
-                        # uncertainty lifecycle was previously never called, so
-                        # self-answered unknowns kept re-surfacing to the user.)
-                        try:
-                            _info_tools = {"web_search", "deep_research", "recall",
-                                           "fact_check", "browser", "file_system", "knowledge_base"}
-                            _ran_info = any(
-                                isinstance(t, dict) and t.get("name") in _info_tools
-                                and not str(t.get("content", "")).lstrip().startswith(("Error", "ERROR", "SYSTEM ERROR"))
-                                for t in (tools_run_this_turn or [])
-                            )
-                            if _ran_info:
-                                for _u in list(tracker.unknowns):
-                                    if getattr(_u, "resolved", False):
-                                        continue
-                                    _resn = (getattr(_u, "resolution", "") or "").lower()
-                                    if any(k in _resn for k in ("search", "web", "read", "file", "look", "fetch", "recall", "research")):
-                                        tracker.resolve_unknown(_u, "resolved via tool output this turn")
-                        except Exception:
-                            pass
-                        # Verify-side of the lifecycle (previously unwired): if the
-                        # turn completed cleanly (a response, no error/failure
-                        # markers), treat the assumptions the agent proceeded on as
-                        # borne out (was_correct=True). Conservative — only confirms
-                        # on a clean turn, never marks them wrong.
-                        try:
-                            _turn_clean = bool(final_ai_content) and "error" not in final_ai_content[:80].lower()
-                            if _turn_clean:
-                                for _a in list(tracker.assumptions):
-                                    if not getattr(_a, "verified", False):
-                                        tracker.verify_assumption(_a, True)
-                        except Exception:
-                            pass
-                        # Metacognitive gate (proposal item #6): if a
-                        # critical unknown still needs the user, surface
-                        # the clarifying question at the TOP of the reply
-                        # — a real gate on the response, not a footer.
-                        try:
-                            question = tracker.should_ask_user()
-                        except Exception:
-                            question = None
-                        if (question and final_ai_content
-                                and question[:40] not in final_ai_content):
-                            final_ai_content = (
-                                f"**{question}**\n\n"
-                                f"(Answering with my current understanding below "
-                                f"— correct me if that clarification changes "
-                                f"things.)\n\n---\n\n{final_ai_content}"
-                            )
-                        risk = tracker.get_risk_summary()
-                        if risk and final_ai_content and risk[:60] not in final_ai_content:
-                            final_ai_content = f"{final_ai_content}\n\n---\n{risk}"
-                        # Reset in-memory turn state; the durable persisted
-                        # log is untouched so recurring blind-spots survive.
-                        tracker.reset()
-                except Exception as e:
-                    logger.debug(f"Uncertainty surfacing skipped: {e}")
-
-                # Value-alignment gate (opt-in --principle-gate). If the
-                # agent has authored operating principles (selfhood/values),
-                # an independent LLM check flags a response that contradicts
-                # one and appends a brief self-note — turning the principles
-                # from prompt decoration into an actual behavioural check.
-                # Default off (adds one LLM call to final turns); never
-                # blocks, only annotates.
-                try:
-                    if (getattr(getattr(self.context, "args", None), "principle_gate", False) is True
-                            and final_ai_content):
-                        _sm = getattr(self.context, "self_model", None)
-                        if _sm is not None and getattr(_sm, "enabled", False) and _sm.principles():
-                            async def _pg_critique(p):
-                                _r = await self.context.llm_client.chat_completion({
-                                    "model": self.context.args.model,
-                                    "messages": [{"role": "user", "content": p}],
-                                    "temperature": 0.0, "max_tokens": 512, "stream": False,
-                                })
-                                return ((_r or {}).get("choices", [{}])[0]
-                                        .get("message", {}).get("content", "") or "")
-                            _aligned, _note = await _sm.evaluate_response_alignment(
-                                final_ai_content, critique_fn=_pg_critique,
-                            )
-                            if not _aligned:
-                                final_ai_content = (
-                                    f"{final_ai_content}\n\n---\n"
-                                    f"**Self-check (principle):** {_note}"
-                                )
-                                pretty_log("Principle Gate",
-                                           f"response flagged: {_note[:80]}",
-                                           icon=Icons.SHIELD)
-                except Exception as e:
-                    logger.debug(f"principle gate skipped: {e}")
-
-                # Autonomous-progress digest — closes the user-facing half of
-                # phase 2.95. If projects were advanced in the background (by
-                # the idle autoadvance phase, the tool, or the HTTP route)
-                # since the user last saw a digest, surface a concise "while
-                # you were away" header on this turn, flagging the items that
-                # now need their input. Watermark-gated on the monotonic
-                # project-event id so each batch shows exactly once; the first
-                # run baselines silently (no historical backlog dump).
-                # Header-prepended so needs-user items lead the reply.
-                try:
-                    _ps = getattr(self.context, "project_store", None)
-                    if _ps is not None and final_ai_content:
-                        from pathlib import Path as _Path
-                        from .project_digest import (
-                            summarize_since, render_digest,
-                            load_watermark, save_watermark,
-                        )
-                        _wm_path = (_Path(str(self.context.memory_dir)).parent
-                                    / "projects_digest.json")
-                        _wm = load_watermark(_wm_path)
-                        if _wm is None:
-                            # First run: baseline to the current high-water mark.
-                            _base = await asyncio.to_thread(summarize_since, _ps, 0)
-                            save_watermark(_wm_path, _base.new_event_id)
-                        else:
-                            _dg = await asyncio.to_thread(summarize_since, _ps, _wm)
-                            if _dg.has_content:
-                                _digest = render_digest(_dg)
-                                if _digest and _digest[:40] not in final_ai_content:
-                                    final_ai_content = f"{_digest}\n\n---\n\n{final_ai_content}"
-                                    pretty_log(
-                                        "Autoadvance Digest",
-                                        f"{_dg.advanced} advanced, "
-                                        f"{len(_dg.needs_user)} need-user, "
-                                        f"{_dg.projects_touched} project(s)",
-                                        icon=Icons.BRAIN_PLAN,
-                                    )
-                            if _dg.new_event_id > _wm:
-                                save_watermark(_wm_path, _dg.new_event_id)
-                except Exception as _dgx:
-                    logger.debug(f"autoadvance digest skipped: {_dgx}")
-
-                # Chat→project promotion suggestion (advisory; previously unwired).
-                # When a free-chat session accumulates enough turns / sandbox
-                # work, gently suggest promoting it to a tracked project — ONCE
-                # (suppressed via a scratchpad flag so we don't nag). Only the
-                # explicit manage_projects(promote_from_context) tool actually
-                # creates a project; this is just a one-line footer offer.
-                try:
-                    if getattr(self.context, "current_project_id", None) is None and final_ai_content:
-                        _sp = getattr(self.context, "scratchpad", None)
-                        _already = False
-                        try:
-                            _already = bool(_sp and _sp.get("_promotion_suggested"))
-                        except Exception:
-                            _already = False
-                        if not _already:
-                            from .project_safety import should_suggest_promotion as _ssp
-                            _uturns = [
-                                m.get("content") for m in messages
-                                if isinstance(m, dict) and m.get("role") == "user"
-                                and isinstance(m.get("content"), str)
-                            ]
-                            _aturns = [
-                                m.get("content") for m in messages
-                                if isinstance(m, dict) and m.get("role") == "assistant"
-                                and isinstance(m.get("content"), str)
-                            ]
-                            _writes = sum(
-                                1 for t in (tools_run_this_turn or [])
-                                if isinstance(t, dict) and t.get("name") == "file_system"
-                            )
-                            # If the user is administering the project system
-                            # itself this turn (list / delete / switch / ...),
-                            # don't nudge them to create one — they obviously
-                            # know about projects (reported: nudge fired right
-                            # after a `delete project`).
-                            _managing = any(
-                                isinstance(t, dict) and t.get("name") == "manage_projects"
-                                for t in (tools_run_this_turn or [])
-                            )
-                            _sugg = _ssp(
-                                user_turns=_uturns, assistant_turns=_aturns,
-                                sandbox_writes=_writes, plan_node_count=0,
-                                already_in_project=False,
-                                managing_projects=_managing,
-                            )
-                            if getattr(_sugg, "should_suggest", False):
-                                final_ai_content = (
-                                    f"{final_ai_content}\n\n---\n"
-                                    f"💡 This looks like ongoing work ({_sugg.reason}). "
-                                    f"Want me to promote it to a tracked project "
-                                    f"(“{_sugg.suggested_title}”)? Just say the word."
-                                )
-                                try:
-                                    if _sp:
-                                        _sp.set("_promotion_suggested", "1")
-                                except Exception:
-                                    pass
-                except Exception as _pexc:
-                    logger.debug(f"promotion suggestion skipped: {_pexc}")
-
-                # Sync the locally-evolved `messages` list back to the caller's
-                # `body`. `messages` was rebound (by `process_rolling_window`,
-                # `_prune_context`, and recovery paths) into a new list object
-                # partway through the run, so subsequent tool-call / tool-
-                # result appends only landed on the local copy. Callers that
-                # inspect `body["messages"]` after `handle_chat` (the Slack
-                # bot, the web UI, and several regression tests) expect to
-                # see the full trace, including tool calls and results.
-                try:
-                    body["messages"] = messages
-                except Exception:
-                    pass
-
-                # Stage-1 self-improvement: append the turn's trajectory
-                # to the distill log. No-op when the collector isn't
-                # wired. Deliberately non-fatal — trajectory logging
-                # must never break a user turn.
-                try:
-                    self._record_turn_trajectory(
-                        messages=messages,
-                        final_content=final_ai_content,
-                        req_id=req_id,
+                    # #5 step 2: the tool guard/dispatch/result pipeline lives in
+                    # _dispatch_and_process_tool_batch (verbatim extraction against
+                    # TurnState). The try/finally copy-back mirrors the method's own
+                    # finally-repack: even if a tool path raises, this frame's locals
+                    # match what the inline code would have left behind.
+                    _ts = TurnState(
+                        _constraint_steer_pending=_constraint_steer_pending,
+                        _proj_task_closed_this_req=_proj_task_closed_this_req,
+                        _request_sys3_fired_once=_request_sys3_fired_once,
+                        _request_sys3_prev_justification=_request_sys3_prev_justification,
+                        consecutive_parse_errors=consecutive_parse_errors,
+                        current_plan_json=current_plan_json,
+                        execution_failure_count=execution_failure_count,
+                        final_ai_content=final_ai_content,
+                        fname=fname,
+                        force_final_response=force_final_response,
+                        force_stop=force_stop,
+                        forget_was_called=forget_was_called,
+                        last_was_failure=last_was_failure,
+                        preflight_blocks_this_request=preflight_blocks_this_request,
+                        request_sandbox_state=request_sandbox_state,
+                        transient_failure_count=transient_failure_count,
+                        tool_calls=tool_calls,
+                        msg=msg,
+                        ui_content=ui_content,
+                        parse_failure_reason=parse_failure_reason,
                         model=model,
-                        trajectory_id=current_trajectory_id,
-                        user_request=last_user_content,
-                        # Consolidate the corpus outcome with the same signals
-                        # calibration + selfhood use (was heuristics-only here).
-                        verifier=(verifier_backfill[0] if verifier_backfill else None),
-                        execution_failed=(execution_failure_count > 0),
+                        last_user_content=last_user_content,
+                        char_budget=char_budget,
+                        strikes=strikes,
+                        task_tree=task_tree,
+                        _user_batch_intent=_user_batch_intent,
+                        _request_constraints=_request_constraints,
+                        repeated_action_steered=repeated_action_steered,
+                        messages=messages,
+                        seen_tools=seen_tools,
+                        executed_idempotent=executed_idempotent,
+                        raw_tools_called=raw_tools_called,
+                        tool_usage=tool_usage,
+                        tools_run_this_turn=tools_run_this_turn,
+                        request_state=request_state,
                     )
-                except Exception as e:
-                    # Debug-level: a turn-logging failure must never be
-                    # noisy in production. When diagnosing, bump to
-                    # warning temporarily.
-                    logger.debug(f"trajectory logging skipped: {type(e).__name__}: {e}")
-
-                # Selfhood reference-count (rest of H12): bump the reference
-                # counter for the prior experiences the agent actually echoed
-                # this turn (wake-up prefix it was shown vs. the response it
-                # produced). Previously note_referenced_experiences had no
-                # caller, so the "which memories did I reach for" signal was
-                # always empty. Non-fatal.
-                try:
-                    _sm = getattr(self.context, "self_model", None)
-                    if _sm is not None and getattr(_sm, "enabled", False):
-                        _wp = locals().get("wakeup_prefix", "") or ""
-                        if _wp and final_ai_content:
-                            await asyncio.to_thread(
-                                _sm.note_referenced_experiences,
-                                prefix_text=_wp, response_text=final_ai_content,
-                            )
-                except Exception as _refexc:
-                    logger.debug(f"selfhood reference-count skipped: {_refexc}")
-
-                # Selfhood outcome backfill (proposal item #3): the
-                # autobiographical record was just written `outcome=
-                # "unknown"` by `_record_turn_trajectory`. If the verifier
-                # produced a high-confidence verdict, propagate it into
-                # the agent's self-memory so its recall of its own past
-                # is verdict-aware. Non-fatal — backfill is secondary.
-                if verifier_backfill is not None and current_trajectory_id:
                     try:
-                        from ..selfhood import SelfModel as _SelfModelBF
-                        _sm_bf = getattr(self.context, 'self_model', None)
-                        if isinstance(_sm_bf, _SelfModelBF) and getattr(_sm_bf, 'enabled', False):
-                            _bf_outcome, _bf_reason = verifier_backfill
-                            _sm_bf.record_outcome(
-                                current_trajectory_id, _bf_outcome,
-                                failure_reason=_bf_reason,
-                            )
-                    except Exception as e:
-                        logger.debug(
-                            "selfhood outcome backfill skipped: %s: %s",
-                            type(e).__name__, e,
-                        )
+                        _dispatch_should_break = await self._dispatch_and_process_tool_batch(_ts)
+                    finally:
+                        _constraint_steer_pending = _ts._constraint_steer_pending
+                        _proj_task_closed_this_req = _ts._proj_task_closed_this_req
+                        _request_sys3_fired_once = _ts._request_sys3_fired_once
+                        _request_sys3_prev_justification = _ts._request_sys3_prev_justification
+                        consecutive_parse_errors = _ts.consecutive_parse_errors
+                        current_plan_json = _ts.current_plan_json
+                        execution_failure_count = _ts.execution_failure_count
+                        final_ai_content = _ts.final_ai_content
+                        fname = _ts.fname
+                        force_final_response = _ts.force_final_response
+                        force_stop = _ts.force_stop
+                        forget_was_called = _ts.forget_was_called
+                        last_was_failure = _ts.last_was_failure
+                        preflight_blocks_this_request = _ts.preflight_blocks_this_request
+                        request_sandbox_state = _ts.request_sandbox_state
+                        transient_failure_count = _ts.transient_failure_count
+                    if _dispatch_should_break:
+                        break
 
-                # Deterministically prepend any deferred async-verdict
-                # correction staged at turn start (GHOST_CRITIC_ASYNC).
-                final_ai_content = self._take_active_correction() + (final_ai_content or "")
-                return final_ai_content, created_time, req_id
+                # #5 step 3: the finalization chain lives in _finalize_and_return
+                # (verbatim extraction; FinalizeState is read-only inputs — see the
+                # method docstring). Its return IS the old inline return.
+                return await self._finalize_and_return(FinalizeState(
+                    body=body,
+                    created_time=created_time,
+                    current_trajectory_id=current_trajectory_id,
+                    execution_failure_count=execution_failure_count,
+                    final_ai_content=final_ai_content,
+                    force_stop=force_stop,
+                    forget_was_called=forget_was_called,
+                    last_user_content=last_user_content,
+                    last_was_failure=last_was_failure,
+                    lc=lc,
+                    messages=messages,
+                    model=model,
+                    payload=payload,
+                    req_id=req_id,
+                    thought_content=thought_content,
+                    tools_run_this_turn=tools_run_this_turn,
+                    was_complex_task=was_complex_task,
+                    _stable_conv_fp=_stable_conv_fp,
+                    _verdict_is_fresh=_verdict_is_fresh,
+                    _verifier_verdict_cache=_verifier_verdict_cache,
+                ))
 
         finally:
             if 'messages' in locals(): del messages

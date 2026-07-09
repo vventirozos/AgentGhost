@@ -27,7 +27,10 @@ logger = logging.getLogger("GhostAgent")
 
 _VALID_ACTIONS = frozenset(
     {"summary", "stats", "files", "changes", "tasks",
-     "research", "commands", "narrative", "recent"}
+     "research", "commands", "narrative", "recent",
+     # Models repeatedly guessed action='search' (a strike, then a
+     # recovery turn) — make the guess correct. 'recall' is an alias.
+     "search", "recall"}
 )
 
 _DEFAULT_LIMIT = 10
@@ -174,6 +177,7 @@ def _render_summary(workspace_model) -> str:
 async def tool_workspace(
     action: str = None,
     limit: int = None,
+    query: str = None,
     workspace_model=None,
     **kwargs,
 ) -> str:
@@ -229,6 +233,35 @@ async def tool_workspace(
                 _clamp_limit(limit, _DEFAULT_LIMIT),
                 label="command outcomes",
             )
+
+        if raw_action in ("search", "recall"):
+            # Accept the common near-miss arg names too — the point of
+            # this action is to absorb guessed calls, not strike on them.
+            q = str(query or kwargs.get("q") or kwargs.get("text")
+                    or kwargs.get("keywords") or "").strip()
+            if not q:
+                return (
+                    "SYSTEM ERROR: action='search' needs a 'query' string — "
+                    "keywords to look for in the workspace activity log."
+                )
+            hits = workspace_model.search_events(
+                q, limit=_clamp_limit(limit, _DEFAULT_LIMIT),
+            )
+            if not hits:
+                return (
+                    f"No workspace events match '{q}'. This searches only my "
+                    "activity log (file changes, task/command outcomes, "
+                    "research pulls, notes). For stored facts or ingested "
+                    "documents use the recall tool; for project state use "
+                    "manage_projects."
+                )
+            lines = [f"Workspace events matching '{q}':"]
+            for ev in hits:
+                proj = f" (project {ev.project_id})" if ev.project_id else ""
+                lines.append(
+                    f"  - [{ev.timestamp}] [{ev.kind}] {ev.summary or ev.kind}{proj}"
+                )
+            return "\n".join(lines)
 
         if raw_action == "recent":
             if workspace_model.activity is None:

@@ -474,6 +474,92 @@ def validate_challenge_quality(setup_script: str, validation_script: str) -> tup
 
     return True, ""
 
+def trajectory_seed_available(context, min_count: int = 3) -> bool:
+    """Cheap watchdog-tick eligibility probe: are there at least
+    ``min_count`` trajectories on disk? Counts non-blank JSONL lines
+    (newest day partitions first) WITHOUT parsing — the watchdog runs
+    every 60s and must not pay `iter_trajectories`' full JSON cost, nor
+    poke a MagicMock collector in the tick tests (real `Path` ops fail
+    closed on mocks). Never raises."""
+    try:
+        collector = getattr(context, "trajectory_collector", None)
+        root = getattr(collector, "root", None)
+        if root is None:
+            return False
+        from pathlib import Path
+        root = Path(root)
+        if not root.exists():
+            return False
+        n = 0
+        for day in sorted((p for p in root.iterdir() if p.is_dir()),
+                          reverse=True):
+            for f in day.glob("*.jsonl"):
+                try:
+                    with f.open("r", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            if line.strip():
+                                n += 1
+                                if n >= int(min_count):
+                                    return True
+                except OSError:
+                    continue
+        return False
+    except Exception:
+        return False
+
+
+def trajectory_dream_fragments(context, limit: int = 40):
+    """Digest the newest trajectories into REM seed fragments.
+
+    Dream's entropy gate counted only ``type:"auto"`` vector fragments,
+    which nothing feeds in practice: B3's fact-chat seeding AND B4's
+    task seeding both left the pool at 0 across 12 instrumented arm-runs
+    (journal §6 2026-07-09) — the smart-memory consolidator only stores
+    facts scoring ≥0.9, which task-shaped turns never produce. Trajectories
+    are the substrate the agent ALWAYS produces, and a one-line digest per
+    trajectory (task, outcome, tools, first error) is exactly the
+    "repeating errors" material the REM prompt mines for heuristics.
+
+    Returns ``(ids, docs)`` — ids are ``traj:<id>`` (NOT vector-store ids;
+    the caller must not run the merge/delete consolidation pass against
+    them). Never raises."""
+    try:
+        collector = getattr(context, "trajectory_collector", None)
+        if collector is None:
+            return [], []
+        trajs = list(collector.iter_trajectories())
+    except Exception:
+        return [], []
+    ids, docs = [], []
+    for t in trajs[-int(limit):]:
+        try:
+            tools = ",".join(dict.fromkeys(
+                str(getattr(tc, "name", "") or "") for tc in (t.tool_calls or [])
+                if getattr(tc, "name", "")
+            )) or "none"
+            first_error = ""
+            for tc in (t.tool_calls or []):
+                err = str(getattr(tc, "error", "") or "")
+                if err:
+                    first_error = " ".join(err.split())[:160]
+                    break
+            doc = (
+                f"TASK: {' '.join(str(t.user_request or '').split())[:200]}"
+                f" | OUTCOME: {t.outcome or 'UNKNOWN'}"
+                f" | TOOLS: {tools}"
+            )
+            if first_error:
+                doc += f" | FIRST_ERROR: {first_error}"
+            reason = str(getattr(t, "failure_reason", "") or "")
+            if reason:
+                doc += f" | WHY: {' '.join(reason.split())[:160]}"
+            ids.append(f"traj:{t.id}")
+            docs.append(doc)
+        except Exception:
+            continue
+    return ids, docs
+
+
 def detect_tool_patterns(skill_memory) -> list:
     """Scan the skill playbook for recurring tool-call sequences.
 
@@ -1007,11 +1093,27 @@ class Dreamer:
 
         ids = results['ids']
         documents = results['documents']
+        seeded_from_trajectories = False
 
         if len(documents) < 3:
-            msg = "Not enough entropy to dream. (Need > 3 auto-memories to form heuristics)"
-            pretty_log("Dream Mode", msg, icon=Icons.DREAM)
-            return msg
+            # Trajectory fallback (2026-07-09): the auto-memory pool is
+            # organically unsatisfiable — see trajectory_dream_fragments.
+            t_ids, t_docs = await asyncio.to_thread(
+                trajectory_dream_fragments, self.context)
+            if len(t_docs) >= 3:
+                seeded_from_trajectories = True
+                ids, documents = t_ids, t_docs
+                pretty_log(
+                    "Dream Mode",
+                    f"Auto-memory pool thin ({len(results['ids'])}) — "
+                    f"dreaming over {len(t_docs)} trajectory digests instead",
+                    icon=Icons.DREAM,
+                )
+            else:
+                msg = ("Not enough entropy to dream. (Need ≥3 auto-memories "
+                       "or ≥3 trajectories to form heuristics)")
+                pretty_log("Dream Mode", msg, icon=Icons.DREAM)
+                return msg
 
         # Idempotency guard: if the auto-memory set hasn't changed since
         # the last REM cycle, a re-run will at best produce the same
@@ -1080,6 +1182,12 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             # the synthesis. If compression ratio < 5%, the consolidation
             # didn't actually compress anything meaningful.
             consolidations = result_json.get("consolidations", [])
+            if seeded_from_trajectories:
+                # Trajectory digests are not vector fragments: there is
+                # nothing to merge and the `traj:` ids must never reach
+                # collection.delete. The trajectory path's whole value is
+                # the heuristics harvested below.
+                consolidations = []
             applied_consolidations = 0
             skipped_low_compression = 0
 
@@ -1881,7 +1989,9 @@ Return ONLY a JSON object with:
                 from ..prm import PRMScorer as _PRMScorerCls
                 from ..distill.collector import TrajectoryCollector as _TrajColCls
                 _args = getattr(self.context, 'args', None)
-                _frontier_enabled = bool(getattr(_args, 'frontier_selfplay', True))
+                # getattr default matches the CLI default (flipped to False
+                # 2026-07-09, #27b: frontier tied uniform in both ablations)
+                _frontier_enabled = bool(getattr(_args, 'frontier_selfplay', False))
                 _raw_uniform = getattr(_args, 'frontier_uniform_sample_prob', 0.2)
                 _uniform_prob = float(_raw_uniform) if isinstance(_raw_uniform, (int, float)) else 0.2
                 _prm_scorer = getattr(self.context, 'prm_scorer', None)
@@ -2695,6 +2805,15 @@ Return ONLY a JSON object with:
             # judge ("can't open file '/workspace/solution.py'"). Clear it so
             # the worker stays unscoped at the sandbox root.
             isolated_context.current_project_id = None
+            # Detach the SHARED workspace model entirely. The shallow copy
+            # kept the real WorkspaceModel, so the temp agent's turns (a) set
+            # the process-global event-stamp pointer to "" mid-flight — the
+            # temp agent has its OWN semaphore, so this raced a concurrent
+            # real turn's stamping — and (b) recorded synthetic self-play
+            # command/browser outcomes into the REAL activity log. Every
+            # record/prefix site guards on `workspace_model is None`, so None
+            # is the supported "no workspace" state (same as --no-memory).
+            isolated_context.workspace_model = None
             isolated_context.args = copy.copy(self.context.args)
             isolated_context.args.perfect_it = False
             isolated_context.args.smart_memory = 0.0
