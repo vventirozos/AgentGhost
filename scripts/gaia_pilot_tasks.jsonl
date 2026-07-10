@@ -1,0 +1,8 @@
+{"task_id": "pilot-eiffel", "Level": 1, "Question": "What year was the Eiffel Tower in Paris completed?", "Final answer": "1889"}
+{"task_id": "pilot-austen", "Level": 1, "Question": "Who wrote the novel Pride and Prejudice? Give the author's full name.", "Final answer": "Jane Austen"}
+{"task_id": "pilot-tungsten", "Level": 1, "Question": "What is the atomic number of the chemical element tungsten?", "Final answer": "74"}
+{"task_id": "pilot-canberra", "Level": 1, "Question": "What is the capital city of Australia?", "Final answer": "Canberra"}
+{"task_id": "pilot-rgb", "Level": 1, "Question": "List the three additive primary colors of light in alphabetical order, as a comma separated list.", "Final answer": "blue, green, red"}
+{"task_id": "pilot-piano", "Level": 1, "Question": "How many keys are on a standard modern piano?", "Final answer": "88"}
+{"task_id": "pilot-rio", "Level": 2, "Question": "In which city were the 2016 Summer Olympic Games held?", "Final answer": "Rio de Janeiro"}
+{"task_id": "pilot-booker", "Level": 2, "Question": "The author who won the very first Booker Prize, which was awarded in 1969, was born in what year?", "Final answer": "1918"}

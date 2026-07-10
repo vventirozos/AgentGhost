@@ -38,45 +38,14 @@ import httpx
 try:
     from datasets import load_dataset
 except ImportError:
-    print("ERROR: pip install datasets huggingface_hub", file=sys.stderr)
-    sys.exit(1)
+    # Only the gated-HF path needs `datasets`; --tasks-file (offline pilot)
+    # does not. Defer the hard error to the point of actual use.
+    load_dataset = None
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from gaia_scorer import question_scorer
-
-
-GAIA_SYSTEM_PROMPT = (
-    "You are a general AI assistant. I will ask you a question. Report your "
-    "thoughts, and finish your answer with the following template: FINAL "
-    "ANSWER: [YOUR FINAL ANSWER]. YOUR FINAL ANSWER should be a number OR as "
-    "few words as possible OR a comma separated list of numbers and/or "
-    "strings. If you are asked for a number, don't use comma to write your "
-    "number neither use units such as $ or percent sign unless specified "
-    "otherwise. If you are asked for a string, don't use articles, neither "
-    "abbreviations (e.g. for cities), and write the digits in plain text "
-    "unless specified otherwise. If you are asked for a comma separated "
-    "list, apply the above rules depending of whether the element to be put "
-    "in the list is a number or a string."
-)
-
-# MULTILINE (not DOTALL): each "FINAL ANSWER:" line is its own match ending at
-# the end of THAT line, so `matches[-1]` genuinely selects the LAST occurrence.
-# With DOTALL + `$`(=end-of-string) the lazy group spanned from the FIRST
-# occurrence to the end, collapsing finditer to a single match — so a model
-# that emitted a preliminary answer then a corrected final one was scored on
-# the preliminary. (The downstream `.split("\n")[0]` already keeps one line.)
-FINAL_ANSWER_RE = re.compile(r"FINAL ANSWER:\s*(.+?)\s*$", re.IGNORECASE | re.MULTILINE)
-
-
-def extract_final_answer(text: str) -> str | None:
-    if not text:
-        return None
-    matches = list(FINAL_ANSWER_RE.finditer(text))
-    if not matches:
-        return None
-    answer = matches[-1].group(1).strip().split("\n")[0].strip()
-    answer = answer.strip("\"' []")
-    return answer or None
+# Prompt, extraction, and scoring all live in the dep-free scorer module (the
+# single source of truth, unit-tested in tests/test_gaia_scorer.py).
+from gaia_scorer import GAIA_SYSTEM_PROMPT, extract_final_answer, question_scorer
 
 
 def upload_file(client: httpx.Client, url: str, headers: dict, file_path: Path) -> bool:
@@ -101,10 +70,16 @@ def ask_agent(client: httpx.Client, url: str, headers: dict, model: str,
             f"`{attached_filename}`. Use your tools to read it as needed.\n\n"
             f"Question: {question}"
         )
+    # The GAIA protocol rides in the USER message, not a system message: the
+    # agent merges incoming system content into its own (very large) composed
+    # system prompt, where the FINAL-ANSWER format mandate loses all salience
+    # — the readiness pilot measured 8/8 substantively-correct replies and
+    # 0/8 template compliance that way. In-user-message instruction is the
+    # standard pattern for benchmarking agents that own their system prompt.
+    user_content = f"{GAIA_SYSTEM_PROMPT}\n\nQuestion: {user_content}"
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": GAIA_SYSTEM_PROMPT},
             {"role": "user", "content": user_content},
         ],
         "stream": False,
@@ -132,6 +107,26 @@ def main() -> int:
     p.add_argument("--config", default="2023_all", help="HF dataset config")
     p.add_argument("--skip-files", action="store_true",
                    help="Skip tasks that require file attachments")
+    p.add_argument("--tasks-file", default=None,
+                   help="Run a local JSONL of GAIA-shaped tasks "
+                        "(keys: task_id, Question, Level, 'Final answer', "
+                        "optional file_name/file_path) INSTEAD of the gated HF "
+                        "dataset. Used by the offline readiness pilot.")
+    p.add_argument("--boot", action="store_true",
+                   help="Boot an ISOLATED throwaway agent (fresh GHOST_HOME) "
+                        "and run against it, then tear it down — instead of "
+                        "targeting an already-running server. Keeps prod "
+                        "untouched and tasks uncontaminated.")
+    p.add_argument("--boot-port", type=int, default=8046)
+    p.add_argument("--boot-timeout", type=float, default=300.0)
+    p.add_argument("--boot-upstream", default="http://127.0.0.1:8088",
+                   help="Upstream LLM for the booted agent (shared with prod).")
+    p.add_argument("--memory", action=argparse.BooleanOptionalAction, default=False,
+                   help="Booted agent's memory system. Default OFF: GAIA tasks "
+                        "are independent, so cross-session memory can only leak "
+                        "across tasks — disabling preempts contamination "
+                        "criticism and costs nothing (no cross-task benefit "
+                        "exists within the benchmark).")
     args = p.parse_args()
 
     api_key = os.environ.get("GHOST_API_KEY", "")
@@ -140,10 +135,22 @@ def main() -> int:
               file=sys.stderr)
     headers = {"X-Ghost-Key": api_key}
 
-    print(f"[gaia] loading gaia-benchmark/GAIA config={args.config} split={args.split}")
-    ds = load_dataset("gaia-benchmark/GAIA", args.config, split=args.split)
+    if args.tasks_file:
+        print(f"[gaia] loading LOCAL tasks from {args.tasks_file} (offline pilot)")
+        rows = []
+        with open(args.tasks_file) as tf:
+            for line in tf:
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+    else:
+        if load_dataset is None:
+            print("ERROR: pip install datasets huggingface_hub", file=sys.stderr)
+            return 1
+        print(f"[gaia] loading gaia-benchmark/GAIA config={args.config} split={args.split}")
+        ds = load_dataset("gaia-benchmark/GAIA", args.config, split=args.split)
+        rows = list(ds)
 
-    rows = list(ds)
     if args.level is not None:
         rows = [r for r in rows if int(r.get("Level", 0)) == args.level]
     if args.limit is not None:
@@ -152,6 +159,45 @@ def main() -> int:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(args.out_dir) / ts
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optional isolated boot: stand up a throwaway agent, run against it, tear
+    # it down. Keeps prod untouched and lets us control the exact config.
+    proc = lf = ghost_home = None
+    if args.boot:
+        import tempfile
+        from ablation_eval import _boot, _wait_ready
+        ghost_home = Path(tempfile.mkdtemp(prefix="ghost-gaia-"))
+        boot_flags = [
+            "--port", str(args.boot_port),
+            "--upstream-url", args.boot_upstream,
+            "--api-key", "",
+            "--deep-reason", "--enable-metacog",
+        ]
+        # Faithful to prod's egress posture (Tor is up); anonymous search is
+        # the agent's default. Memory per --memory (default off, see help).
+        boot_flags += (["--memory"] if args.memory else ["--no-memory"])
+        args.ghost_url = f"http://127.0.0.1:{args.boot_port}"
+        args.ghost_model = args.ghost_model if args.ghost_model != "default" else "qwen-3.6-35b-a3"
+        print(f"[gaia] booting isolated agent on :{args.boot_port} "
+              f"(GHOST_HOME={ghost_home}, memory={'on' if args.memory else 'off'})")
+        proc, lf = _boot(boot_flags, ghost_home, out_dir / "agent.log")
+        if not _wait_ready(args.ghost_url, args.boot_timeout):
+            print("ERROR: booted agent never became ready — see agent.log",
+                  file=sys.stderr)
+            from ablation_eval import _teardown, _container_name
+            _teardown(proc, lf, _container_name(ghost_home / "sandbox"))
+            return 1
+
+    try:
+        rc = _run(args, rows, headers, out_dir)
+    finally:
+        if proc is not None:
+            from ablation_eval import _teardown, _container_name
+            _teardown(proc, lf, _container_name(ghost_home / "sandbox"))
+    return rc
+
+
+def _run(args, rows, headers, out_dir):
     submission_path = out_dir / "answers.jsonl"
     details_path = out_dir / "details.jsonl"
     summary_path = out_dir / "summary.json"

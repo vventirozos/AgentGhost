@@ -584,6 +584,35 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-10 — public benchmark: GAIA harness hardened + readiness pilot PASSED (full run gated on HF token)
+- **Goal:** post a real, representative public number (the "convert quality into credibility" move
+  §1/§4 keeps circling). **Chose GAIA over SWE-bench**: GAIA (web-research + tools + files + short
+  exact-match answers) matches this agent's built surface; SWE-bench is pure code-patching (the
+  documented weakness) and its per-repo `pip install` fights the mandatory-Tor egress guard on a
+  36GB box. GAIA has a public-answer validation split (165 q, 3 levels) to measure honestly before
+  the held-out leaderboard.
+- **Found existing May scaffolding** (`scripts/gaia_scorer.py` + `gaia_eval.py`) — hardened rather
+  than rebuilt. (1) Consolidated the exactness-critical logic (official `question_scorer` + canonical
+  prompt + `FINAL ANSWER:` extraction) into the dep-free scorer as the single source of truth; +23
+  tests (`tests/test_gaia_scorer.py`) pinning number/list/string normalization, units/commas,
+  last-marker-wins, and the empty-answer guard against the test-split "?" placeholder. (2) Added
+  `--boot` (isolated throwaway agent, fresh GHOST_HOME, torn down after — prod untouched) and
+  `--tasks-file` (offline pilot, no gated dataset) to `gaia_eval.py`; `--no-memory` default
+  (defensible: GAIA tasks are independent, so cross-session memory can only leak across tasks).
+- **Readiness pilot (8 GAIA-shaped known-answer q, isolated on :8046, prod up):** pilot #1 scored
+  **0/8 despite 8/8 substantively-correct replies** — caught a real harness bug: the GAIA protocol
+  was sent as a SYSTEM message, which the agent merges into its own large composed system prompt
+  where the FINAL-ANSWER mandate loses salience → the model answered correctly in prose, never in
+  template, extraction returned empty. **Fix: carry the protocol in the USER message** (standard for
+  agents that own their system prompt). Pilot #2: **8/8 clean** (incl. list case-normalization and
+  the multi-hop Booker question researched over Tor in 28.9s → 1918). Pipeline proven end-to-end:
+  isolated boot → drive → Tor web research → FINAL-ANSWER extraction → official scoring → per-level
+  report → teardown. Pilot measures pipeline health, NOT GAIA score (hand-picked stable facts).
+- **BLOCKED on operator:** the real `gaia-benchmark/GAIA` validation set is gated —
+  `huggingface-cli login` with a token that has accepted the agreement unblocks the 165-q run
+  (`python scripts/gaia_eval.py --split validation --boot`). Then report by level; if strong, prep
+  the held-out test-split leaderboard submission. Suite unaffected (+23 GAIA tests, all green).
+
 ### 2026-07-09 (23:30) — the three B4 verdicts ACTIONED (retrieval gate, frontier flip, dream seeds)
 - **(1) Lesson retrieval domain-rescue (the write-only-learning fix).** Forensic replay against the
   B4 arm's REAL store: the arm's self-play lesson sat at embedding distance **1.056** from a
