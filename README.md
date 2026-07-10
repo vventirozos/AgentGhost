@@ -1,41 +1,18 @@
 # Ghost Agent
 
-An autonomous FastAPI-based AI agent service with multi-tier memory, Docker-isolated tool execution, swarm inference, and biological-rhythm self-play.
+Ghost Agent is a self-hosted AI agent. You send it a message — through the web UI, Slack, voice, or a plain HTTP API — and it plans, recalls relevant memories, runs whatever tools it needs (code, shell, web) inside a Docker sandbox, checks its own answer with a second model, and replies.
 
-## What it is
+## What it does
 
-Ghost Agent is a self-contained reasoning runtime that wraps an upstream LLM with:
+- **Chats and executes tasks** — answers questions and carries out multi-step work using tools that run in isolated Docker containers.
+- **Remembers** — a six-tier memory (facts, relationships, your profile, learned skills, journal, past episodes) is retrieved and fused into every turn.
+- **Verifies itself** — a second-model verifier judges each final answer and repairs it in-loop if it doesn't hold up.
+- **Improves itself while idle** — a dream/self-play loop consolidates experience into reusable skills and tunes its own prompts, entirely locally.
+- **Stays anonymous** — every outbound network request goes through Tor; the agent refuses to start without it.
 
-- **Six-tier memory** — vector, graph, profile, skill, journal, and episodic stores, fused per turn via reciprocal rank fusion.
-- **Docker-isolated tool execution** — every tool call runs in a managed container with mounts and resource limits.
-- **Grounded verify-and-repair** — a second-model verifier judges the final answer and drives a bounded in-loop repair of REFUTED/unverified answers. (The older MCTS turn-start hint and dual-solver arbiter are default-OFF since the 2026-06 cognitive-layer redesign proved them advisory/ungrounded — see `COGNITIVE_LAYER_REDESIGN.md`.)
-- **Dream / self-play loop** — idle-time consolidation, reflection, and passive skill mining from validator-passing trajectories.
-- **Local-only self-improvement** — DSPy/GEPA prompt optimisation, redacted trajectory distillation, and reflection-driven skill writes. No external teacher, no weight updates.
+## Install
 
-### Runtime stance
-
-Ghost is designed and tuned around an **uncensored Qwen 3.6 35B-A3** upstream model. Every outbound network request the agent issues is mandated through **Tor**: the agent fails closed if `TOR_PROXY` is unset or the Tor daemon is unreachable. A silently-cleartext agent is worse than a stalled one.
-
-## Documentation
-
-**The authoritative reference is published at <https://vventirozos.github.io/AgentGhost/>.**
-
-Every module in `src/ghost_agent/` and `interface/` has a dedicated page. HTML sources live in [`docs/`](docs/) on the default branch — treat this `README.md` and `CLAUDE.md` as orienting documents; the published site is the source of truth.
-
-| Entry point | What's there |
-| --- | --- |
-| [Home](https://vventirozos.github.io/AgentGhost/) | Overview, runtime stance, source map, conceptual model |
-| [Capabilities](https://vventirozos.github.io/AgentGhost/capabilities.html) | What the agent can do, with example prompts |
-| [System Architecture](https://vventirozos.github.io/AgentGhost/architecture.html) | End-to-end diagram of interfaces, API, core, memory, sandbox |
-| [Install & Run](https://vventirozos.github.io/AgentGhost/installation.html) | Prerequisites, env vars, boot sequence, process commands |
-| [CLI Reference](https://vventirozos.github.io/AgentGhost/cli_reference.html) | Every flag on `python -m src.ghost_agent.main` |
-| [Anonymity & Tor routing](https://vventirozos.github.io/AgentGhost/#anonymity) | Fetch pipeline, identity rotation, routing table |
-| [Request lifecycle](https://vventirozos.github.io/AgentGhost/algorithms/request_lifecycle.html) | What happens when a message hits `/api/chat` |
-| [Memory hydration (RRF)](https://vventirozos.github.io/AgentGhost/algorithms/memory_hydration.html) | How the six memory tiers are fused per turn |
-| [Dream / self-play](https://vventirozos.github.io/AgentGhost/algorithms/dream_cycle.html) | Idle-time consolidation and skill extraction |
-| [Docker sandbox](https://vventirozos.github.io/AgentGhost/sandbox/docker.html) | Container lifecycle, mounts, resource limits |
-
-## Quick start
+You need: Python 3, a running Docker daemon, a Tor daemon, and an upstream LLM server (Ghost is tuned for Qwen 3.6 35B-A3).
 
 ```bash
 python -m venv venv && source venv/bin/activate
@@ -48,55 +25,14 @@ export GHOST_MODEL="qwen-3.6-35b-a3"
 export GHOST_SANDBOX_DIR="$GHOST_HOME/sandbox"
 export TOR_PROXY="socks5h://127.0.0.1:9050"   # required — agent fails closed without it
 
-# Core agent (needs a running upstream LLM, Docker daemon, and Tor)
+# Start the agent
 python -m src.ghost_agent.main \
     --upstream-url "http://127.0.0.1:8080" \
     --host 0.0.0.0 --port 8000 --verbose
 ```
 
-Companion processes (web UI, Slack bot, voice, image-gen) are documented under [Install & Run → process commands](https://vventirozos.github.io/AgentGhost/installation.html#process-commands).
+Companion processes (web UI, Slack bot, voice, image-gen) are covered in [Install & Run](https://vventirozos.github.io/AgentGhost/installation.html).
 
-## Repository layout
+## Documentation
 
-| Path | Purpose |
-| --- | --- |
-| `src/ghost_agent/core/` | Reasoning loop, planning, dream cycle, verifier + async-critic repair, memory bus, context compression (MCTS/arbiter present but default-OFF — see `COGNITIVE_LAYER_REDESIGN.md`) |
-| `src/ghost_agent/memory/` | Vector + graph + profile + skill + journal + episodic stores |
-| `src/ghost_agent/tools/` | Tool registry and per-tool implementations |
-| `src/ghost_agent/sandbox/` | Docker container manager |
-| `src/ghost_agent/api/` | FastAPI routes |
-| `src/ghost_agent/utils/` | Logging, sanitiser, token counter, Tor helpers |
-| `src/ghost_agent/_env.py` | Telemetry-hardening import-time side-effects (PostHog / Chroma / HF Hub opt-outs) |
-| `src/ghost_agent/eval/` | Local-only outcome-eval harness (default + post-learning suites, baseline freeze/diff, network guard) |
-| `src/ghost_agent/distill/` | Redacted trajectory logging + N-sample self-consistency for downstream training |
-| `src/ghost_agent/router/` | Hand-crafted-feature complexity classifier (numpy-only logistic regression, JSON weights) |
-| `src/ghost_agent/optim/` | DSPy / GEPA prompt optimisation, scoped to `{planning, tool_selection, reflection}` |
-| `src/ghost_agent/skills_auto/` | Passive skill mining over validator-passing trajectories |
-| `src/ghost_agent/reflection/` | Idle-time self-critique loop; failures distilled into reusable lessons |
-| `interface/` | Web UI, Slack bot, voice / image servers, desktop client |
-| `docs/` | **HTML source for the published reference** (served at [vventirozos.github.io/AgentGhost](https://vventirozos.github.io/AgentGhost/)) |
-| `tests/` | Behaviour-organised pytest suite (`asyncio_mode=auto`) |
-| `scripts/` | Eval / GEPA / sandbox-image / token-load helper scripts |
-
-The `eval / distill / router / optim / skills_auto / reflection` modules together form Ghost's local-only stage-1 self-improvement substrate. Reflections close the loop by writing into `SkillMemory` so a fresh user turn retrieves the corrected plan via the existing memory bus.
-
-## Tests & lint
-
-```bash
-scripts/ci.sh                                                   # local CI gate: full pytest suite (hard) + black drift (advisory)
-scripts/ci.sh --fix                                            # auto-format with black, then run the suite
-scripts/ci.sh --fast                                          # tests only (skip black)
-
-GHOST_API_KEY=test-key pytest                                   # full suite (key required at collection time — interface/server.py raises on missing key)
-GHOST_API_KEY=test-key pytest tests/test_agent_planning.py      # single file
-GHOST_API_KEY=test-key pytest -k "memory and not slack"         # filter
-black src interface tests
-pylint src/ghost_agent
-```
-
-There is no hosted CI against this repo (the canonical git remote lives on another machine), so `scripts/ci.sh` is the pre-push gate.
-
-## Telemetry
-
-Telemetry from PostHog, ChromaDB, and Hugging Face Hub is disabled at import time. Don't reintroduce libraries that re-enable it without matching opt-outs.
-
+**Full reference: <https://vventirozos.github.io/AgentGhost/>** — architecture, capabilities, CLI flags, request lifecycle, memory internals, and a page for every module. HTML sources live in [`docs/`](docs/).
