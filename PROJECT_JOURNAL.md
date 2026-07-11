@@ -606,8 +606,16 @@ skills_auto graduation wiring). Residuals in §4C.
   12/hour rate limit (a runaway loop must not page a phone), and an **honesty contract** — the
   confirmation names only the channels actually live (push configured? Slack consumer ever polled?).
   Delegated sub-agents deliberately CANNOT reach it (not in the delegate allowlist — the main agent
-  reports). Slack renders it :speech_balloon:. Tests: test_notify_operator.py (14). Suite **7131
-  passed / 12 skipped / 0 failed**. Prod restart required to advertise the tool (plain kill = deploy).
+  reports). Slack renders it :speech_balloon:.
+- **LIVE-TESTED on restarted prod, first try:** a real /api/chat request → the model selected
+  notify_operator unprompted (and self-corrected to the requested exact wording), record → ledger →
+  bot poller fetched + acked → owner DM delivered. The test exposed one rough edge, fixed
+  immediately: the finalize digest echoed the notification back in the SAME reply's "while you were
+  away" banner (the records were unseen-by-digest). Fix: notify_operator stamps `meta.req_id` from
+  `request_id_context` and `render_activity_digest(current_req_id=…)` skips records the current turn
+  authored — other turns' records still surface (that's the no-push fallback delivery).
+  Tests: test_notify_operator.py (18). Suite **7135 passed / 12 skipped / 0 failed**. NOTE: prod is
+  running the PRE-echo-fix build — the echo-skip lands at its next restart (cosmetic only).
 
 ### 2026-07-11 (later) — Slack bot REVIVED + OWNER-LOCKED (rewritten; replies to the operator only)
 - The bot (`interface/externals/slack_bot/main.py`) had rotted while unused. Review found, beyond the

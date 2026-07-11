@@ -146,3 +146,49 @@ class TestWiring:
             ts=_t.time(), phase=PHASE, summary="report text",
             severity=SEVERITY_NOTIFY)])
         assert "message from the agent" in out and "report text" in out
+
+
+class TestNoSameTurnEcho:
+    """Regression from the first live test: the digest banner echoed the
+    notification the SAME reply had just sent ("Background activity while
+    you were away: [message from the agent] …" on top of the turn that
+    sent it)."""
+
+    def test_record_stamped_with_request_id(self, tmp_path):
+        from ghost_agent.utils.logging import request_id_context
+        ctx = _ctx(tmp_path)
+        token = request_id_context.set("reqABC12")
+        try:
+            asyncio.run(tool_notify_operator(message="hi", context=ctx))
+        finally:
+            request_id_context.reset(token)
+        recs, _ = ctx.activity_log.read_since(0)
+        assert recs[0].meta.get("req_id") == "reqABC12"
+
+    def test_system_context_not_stamped(self, tmp_path):
+        # Default contextvar value is "SYSTEM" — must not stamp that.
+        ctx = _ctx(tmp_path)
+        asyncio.run(tool_notify_operator(message="hi", context=ctx))
+        recs, _ = ctx.activity_log.read_since(0)
+        assert "req_id" not in recs[0].meta
+
+    def test_digest_skips_current_turns_records(self, tmp_path):
+        from ghost_agent.core.autonomous_activity import (
+            ActivityRecord, render_activity_digest,
+        )
+        import time as _t
+        mine = ActivityRecord(ts=_t.time(), phase=PHASE, summary="my own",
+                              severity=SEVERITY_NOTIFY,
+                              meta={"req_id": "reqABC12"})
+        older = ActivityRecord(ts=_t.time(), phase=PHASE, summary="earlier",
+                               severity=SEVERITY_NOTIFY,
+                               meta={"req_id": "reqOLD99"})
+        out = render_activity_digest([mine, older],
+                                     current_req_id="reqABC12")
+        assert "my own" not in out       # no same-turn echo
+        assert "earlier" in out          # other turns still surface
+
+    def test_finalize_passes_current_req_id(self):
+        src = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
+               / "core" / "agent.py").read_text()
+        assert "current_req_id=str(fs.req_id" in src

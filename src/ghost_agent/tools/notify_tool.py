@@ -88,7 +88,18 @@ async def tool_notify_operator(message: str = None, context=None, **kwargs):
                 f"({_MAX_PER_HOUR}/hour) — the message was NOT sent. "
                 f"Batch your updates into fewer notifications.")
 
-    ok = log.record(PHASE, message, severity=SEVERITY_NOTIFY)
+    # Stamp the writing turn's request id so the finalize digest can skip
+    # records THIS turn authored — without it, the "while you were away"
+    # banner echoes the notification the same reply just sent (observed on
+    # the first live test).
+    try:
+        from ..utils.logging import request_id_context
+        req_id = request_id_context.get()
+    except Exception:  # noqa: BLE001
+        req_id = ""
+    ok = log.record(PHASE, message, severity=SEVERITY_NOTIFY,
+                    **({"req_id": req_id} if req_id and req_id != "SYSTEM"
+                       else {}))
     if not ok:
         return "Error: failed to write the notification record."
 

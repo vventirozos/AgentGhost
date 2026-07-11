@@ -7886,7 +7886,11 @@ class GhostAgent:
                     _act_save(_act_wm_path, _alog.current_offset())
                 else:
                     _recs, _new_off = _alog.read_since(_act_wm)
-                    _adg = _render_adg(_recs)
+                    # current_req_id: don't echo records THIS turn wrote
+                    # (e.g. its own notify_operator call) back at the
+                    # operator as "while you were away".
+                    _adg = _render_adg(_recs,
+                                       current_req_id=str(fs.req_id or ""))
                     if _adg and _adg[:40] not in final_ai_content:
                         final_ai_content = (
                             f"{_adg}\n\n---\n\n{final_ai_content}")

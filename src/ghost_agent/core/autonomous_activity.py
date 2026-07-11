@@ -275,12 +275,17 @@ def save_consumer_offset(path, consumer: str, offset: int) -> None:
 
 def render_activity_digest(records: List[ActivityRecord], *,
                            max_items: int = 6,
-                           exclude_phases=DIGEST_EXCLUDED_PHASES) -> str:
+                           exclude_phases=DIGEST_EXCLUDED_PHASES,
+                           current_req_id: str = "") -> str:
     """Render unseen records as a short markdown header block. Empty string
     when nothing digest-worthy. Notify-severity items lead (stable order
-    otherwise)."""
+    otherwise). ``current_req_id`` filters out records THIS turn authored
+    (a notify_operator call mid-turn must not be echoed back as "while you
+    were away" in the same reply)."""
     items = [r for r in (records or [])
-             if r.summary and r.phase not in (exclude_phases or ())]
+             if r.summary and r.phase not in (exclude_phases or ())
+             and not (current_req_id
+                      and r.meta.get("req_id") == current_req_id)]
     if not items:
         return ""
     items.sort(key=lambda r: 0 if r.severity == SEVERITY_NOTIFY else 1)
