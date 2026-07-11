@@ -104,6 +104,18 @@ def note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 
 READWRITE_LOOP_TOOLS = frozenset({
     "manage_composed_skills",
     "manage_tasks",
+    # `manage_projects` is the SAME read-then-write shape (2026-07-11): the
+    # agent orients with action=status/list/task_next and mutates with
+    # action=task_update/task_decompose/autoadvance — through the one tool.
+    # Omitting it meant a no-progress READ loop force-stopped the turn into a
+    # text-only final response, which BARRED the pending write forever. Seen
+    # live twice in one session: (a) two identical action=status calls →
+    # force-stop → the model emitted a tool call instead of prose → the stream
+    # scrub consumed the entire response → the user got a fallback message
+    # instead of their project status; (b) a task_update blocked twice by the
+    # constraint gate → force-stop → the task could never be closed. Exactly
+    # the "reconfigure-a-composed-skill" bug this set exists to prevent.
+    "manage_projects",
     "file_system",
     "knowledge_base",
     "update_profile",

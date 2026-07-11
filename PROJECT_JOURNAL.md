@@ -596,6 +596,75 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-11 (latest) — ghost-agent.log audit: THREE project deadlocks found live and fixed
+- Audited a real session (project 6051abfb21b8, "Meta"). One request burned **189 s and made zero
+  progress**; two replies were replaced by fallback text. Three distinct bugs, each independently
+  capable of deadlocking project work — all now fixed with regressions
+  (`tests/test_log_audit_project_deadlocks.py`, 16).
+- **(1) Constraint judgment gate audited the WHOLE PROJECT on every task close — a permanent
+  deadlock.** `tools/projects.py` task_update passed `_gather_project_files(store, project_id)` — a
+  collector written for the coding executor's NON-REGRESSION guard (which legitimately needs every
+  file). So closing task #12 was judged on `context_boundary.md` — task #1's artifact, already DONE —
+  which contained a verbatim quote violating the project constraint. The gate blocked task #12
+  forever; **no amount of fixing #12's own artifact could ever clear it**, and every later task_update
+  would hit the identical wall. The model even reasoned its way to the truth ("the audit may be
+  stale… that quote is NOT in the current file") before the loop breaker killed the turn. Fix: new
+  `_files_for_task()` scopes the audit to the files THIS task produced (the `deliverables=[...]` of
+  this very call, then the task's registered artifacts; path-contained). **No attributable files ⇒
+  skip the judgment gate** — the evidence gate still applies, and auditing another task's artifact is
+  precisely the bug. Also makes the gate cheaper (it is a BLOCKING LLM call on the user's turn).
+- **(2) `add_task` never reopened a DONE project → new tasks unreachable forever.** It only bumped
+  `updated_at`, while `advance_once` hard-refuses a non-ACTIVE project ("project is DONE, not
+  ACTIVE"). Live: 20 tasks added to a DONE project, 8 PENDING, autoadvance reported "all tasks are
+  complete" and returned 0 — the model wasted turns trying to reconcile a contradiction that was
+  real. Fix (in `memory/projects.py`, so EVERY path benefits): adding a non-DONE task to a DONE
+  project flips it back to ACTIVE in the same transaction + logs a `project_reopened` event. ARCHIVED
+  is deliberately NOT resurrected (the cleanup sweep has already run).
+- **(3) `manage_projects` was missing from `READWRITE_LOOP_TOOLS` → force-stop ate the reply.** That
+  set exists so a no-progress READ loop does NOT force a text-only final response *when the same tool
+  is how the agent performs the pending WRITE* — and `manage_projects` is exactly that shape (reads:
+  status/list/task_next; writes: task_update/task_decompose/autoadvance). Omitted, so: two identical
+  `action=status` calls → hard force-stop → the model emitted a tool call instead of prose → **the
+  stream scrub consumed the entire response** → the user got a fallback instead of their project
+  status (this is the source of BOTH `Scrub consumed entire response` warnings in the log). Same
+  mechanism barred the blocked task_update in (1) from ever completing. Fix: add `manage_projects` to
+  the set — it now gets the soft steer (tools kept, steered toward the write), which is the very
+  behaviour the set was created for.
+- Suite **7151 passed / 12 skipped / 0 failed**. Prod restart required. Also confirmed healthy in the
+  same log: prefill KV pin holding (stable-prefix hash constant across a request's turns), hippocampus
+  consolidation, PRM/router/calibration idle retrains all firing.
+
+### 2026-07-11 (latest) — llama-server log audit: 11 shutdown crashes diagnosed + dead `/slots` config removed
+- Audited 291k lines / 35 MB of `Logs/llama-server.log`. **The inference path is HEALTHY** — 0 context
+  shifts (no silent token loss), and the 2,472 scary-looking `n_past` lines are context-checkpoint
+  **restores**, i.e. the prompt cache working. The 4 model-load failures are from an abandoned
+  `mtp_apex/v2` experiment whose path no longer exists (stale, not live). Three real findings:
+- **(1) 11 crashes, all shutdown-path, all the same signature — and self-inflicted.** Every one:
+  `Received second interrupt, terminating immediately.` →
+  `ggml-metal-device.m:622: GGML_ASSERT([rsets->data count] == 0) failed`. Cause: unloading a ~22.6 GB
+  mlocked model + Metal teardown is SLOW; the first signal looks like a hang, a second signal arrives
+  (impatient repeat `kill`, or `kill` then `launchctl kickstart -k`), and llama.cpp's
+  second-interrupt path terminates immediately, tripping a Metal assert. Shutdown-only (the process
+  was exiting anyway) but it skips clean teardown AND makes every restart look like a crash, burying
+  real failures. **Fixes:** `ExitTimeOut=120` in the plist (launchd default is 20s — far too short for
+  this unload, so launchd itself was pressuring the escalation) + new **`bin/restart-llama-server.sh`**:
+  sends EXACTLY ONE SIGTERM, polls for clean exit, then waits on `/health` for the KeepAlive respawn;
+  on timeout it explicitly REFUSES to send a second signal and tells the operator to escalate to
+  SIGKILL deliberately (uncatchable → no assert).
+- **(2) The `/slots` save+restore API was DEAD but advertised.** `start-llama-server.sh` did
+  `mkdir -p .../slots` and carried a comment claiming it enabled "the /slots save+restore API for the
+  warm-preamble approach" — but **`--slot-save-path` was never passed**, and nothing in the agent
+  calls `/slots` anyway. Pure cruft that misleads a future reader (and a misplaced comment sat above
+  `--n-gpu-layers`, describing something else entirely). Removed, with a note naming the exact flag to
+  add if the warm-preamble idea is ever revived.
+- **(3) `--metrics` enabled.** §4A #6 parked the KV-prefix-pin quantification *precisely because*
+  `--metrics` was off and nobody wanted to restart the OOM-protected LLM just to turn it on. Adding it
+  to the launcher costs nothing and takes effect on the next natural restart — so that measurement is
+  now unblocked for free.
+- **Nothing was restarted.** Both changes take effect at the next llama-server start (verified: pid
+  45996 untouched, `/health` ok, agent serving). Deliberate — a reload means a multi-minute 22 GB
+  reload with prod's inference down.
+
 ### 2026-07-11 (latest) — `notify_operator` tool: the agent can now DELIBERATELY report back
 - Closes the last gap in the outbound pipeline: the ledger/push/Slack legs existed but only AUTOMATIC
   producers wrote notify-severity records (needs-user events, scheduled-turn conclusions) — the MODEL

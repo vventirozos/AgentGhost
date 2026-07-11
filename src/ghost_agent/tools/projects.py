@@ -14,8 +14,10 @@ Actions:
 
 import json
 import logging
+import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from ..memory.projects import ProjectStore, ProjectKind, ProjectStatus
@@ -58,6 +60,62 @@ _ACTIONS = {
 
 def _err(msg: str) -> str:
     return f"ERROR: {msg}"
+
+
+# Cap on what the constraint judgment gate reads per task (it is one blocking
+# LLM call on the user's turn). The gate itself re-truncates; this just keeps
+# the read cheap.
+_TASK_FILE_MAX_CHARS = 20000
+
+
+def _files_for_task(store, project_id: str, task_id: str,
+                    deliverables=None) -> Dict[str, str]:
+    """``{rel_path: content}`` for the files THIS task produced — the only
+    correct input to the constraint judgment gate.
+
+    Sources, in order: the ``deliverables=[...]`` passed to this very
+    ``task_update`` call, then the file artifacts already registered against
+    the task. Returns ``{}`` when the task has no attributable files, which
+    the caller treats as "skip the judgment gate" — auditing files that some
+    OTHER task wrote is precisely the deadlock this replaced (see the call
+    site). Never raises.
+    """
+    rels: List[str] = []
+    for rel in (deliverables or []):
+        rel = str(rel or "").strip().replace("\\", "/").lstrip("./")
+        if rel and rel not in rels:
+            rels.append(rel)
+    try:
+        for art in store.list_artifacts(task_id=task_id) or []:
+            if (art.get("kind") or "") != "file":
+                continue
+            rel = str(art.get("payload") or "").strip().replace("\\", "/")
+            rel = rel.lstrip("./")
+            if rel and rel not in rels:
+                rels.append(rel)
+    except Exception:
+        logger.debug("artifact lookup failed for task %s", task_id,
+                     exc_info=True)
+
+    root = getattr(store, "sandbox_root", None)
+    pid = str(project_id or "").strip().lower()
+    if not root or not pid or not rels:
+        return {}
+    base = (Path(root) / "projects" / pid).resolve()
+    out: Dict[str, str] = {}
+    for rel in rels[:8]:
+        try:
+            p = (base / rel).resolve()
+            # Containment: a registered path is model-supplied text.
+            if not str(p).startswith(str(base) + os.sep):
+                continue
+            if not p.is_file():
+                continue
+            out[rel] = p.read_text(encoding="utf-8",
+                                   errors="replace")[:_TASK_FILE_MAX_CHARS]
+        except Exception:
+            continue
+    return out
 
 
 def _ok(payload: Any) -> str:
@@ -1592,19 +1650,44 @@ async def tool_manage_projects(
                 if (st_enum == TaskStatus.DONE and task_constraints
                         and not str(result or "").lstrip().upper()
                                 .startswith("CONSTRAINT-OVERRIDE:")):
-                    if constraint_audit is None:
+                    # Audit ONLY the files THIS task produced.
+                    #
+                    # This used to pass the project-wide file collector from
+                    # core.project_advancer — every text file in the project
+                    # workspace. That collector exists for the coding executor's
+                    # non-regression guard (which must see all files); using it
+                    # here made the gate judge the WHOLE PROJECT on every task
+                    # close, which is a permanent deadlock: one violating file
+                    # written by an early task blocks the DONE transition of
+                    # every OTHER task forever, and no amount of fixing the
+                    # current task's own artifact can clear it. Observed live
+                    # 2026-07-11 (project 6051abfb21b8): closing task #12 was
+                    # blocked by a verbatim quote in context_boundary.md — task
+                    # #1's artifact, already DONE — so the model re-read that
+                    # file, correctly concluded "the audit may be stale",
+                    # retried, tripped the no-progress loop breaker, and the
+                    # request died after 189s with zero progress. Every later
+                    # task_update would have hit the identical wall.
+                    #
+                    # Scoping to this task's own files makes the gate
+                    # actionable ("fix what you just wrote"), cheaper, and
+                    # non-deadlocking. When a task has NO attributable files
+                    # we skip the judgment gate — the evidence gate above
+                    # still applies, and auditing someone else's artifact is
+                    # exactly the bug.
+                    _task_files = _files_for_task(store, project_id, tid,
+                                                  deliverables)
+                    if _task_files and constraint_audit is None:
                         try:
                             from ..core.build_gates import constraint_gate
-                            from ..core.project_advancer import _gather_project_files
-                            _files = _gather_project_files(store, project_id)
                             constraint_audit = await constraint_gate(
-                                context, task_constraints, _files,
+                                context, task_constraints, _task_files,
                                 is_background=False)
                         except Exception:
                             logger.debug("constraint judgment gate skipped",
                                          exc_info=True)
                             constraint_audit = (True, "")
-                    if not constraint_audit[0]:
+                    if constraint_audit is not None and not constraint_audit[0]:
                         judged_violations.append(tid)
                         continue
                 # Register deliverables BEFORE flipping the task to DONE.

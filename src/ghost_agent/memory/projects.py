@@ -528,13 +528,41 @@ class ProjectStore:
                  json.dumps(constraints or []), json.dumps(depends_on_canon),
                  "", "", 0, None, estimated_cost, 0.0, depth, position, now, now),
             )
-            conn.execute(
-                "UPDATE projects SET updated_at = ? WHERE id = ?",
-                (now, project_id),
-            )
+            # REOPEN a finished project when new work is added (2026-07-11).
+            #
+            # Previously this only bumped `updated_at`, so a project that had
+            # rolled to DONE stayed DONE — while `advance_once` hard-refuses a
+            # non-ACTIVE project ("project is DONE, not ACTIVE"). Adding tasks
+            # to a completed project therefore created work that autoadvance
+            # could NEVER reach: the tool reported "all tasks are complete"
+            # while N tasks sat PENDING, and the model burned turns trying to
+            # reconcile the contradiction (observed live 2026-07-11, project
+            # 6051abfb21b8: 20 tasks added to a DONE project, 8 pending,
+            # autoadvance returned 0). Adding work to a finished project
+            # un-finishes it — that is the only coherent semantic.
+            #
+            # Only DONE reopens. ARCHIVED is a deliberate end-state (the
+            # cleanup sweep has already run); silently resurrecting it would
+            # be a surprise, and the caller can un-archive explicitly.
+            reopened = False
+            if str(status).upper() != "DONE":
+                cur = conn.execute(
+                    "UPDATE projects SET updated_at = ?, status = 'ACTIVE' "
+                    "WHERE id = ? AND status = 'DONE'",
+                    (now, project_id),
+                )
+                reopened = cur.rowcount > 0
+            if not reopened:
+                conn.execute(
+                    "UPDATE projects SET updated_at = ? WHERE id = ?",
+                    (now, project_id),
+                )
             conn.commit()
         self.log_event(project_id, task_id, "task_added",
                        {"description": description, "parent_id": parent_id})
+        if reopened:
+            self.log_event(project_id, task_id, "project_reopened",
+                           {"reason": "new task added to a DONE project"})
         return task_id
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
