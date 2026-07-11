@@ -596,6 +596,78 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-11 (latest) — worker node LIVE-TESTED: two real bugs found (LAN hostname → Tor; wrong GGUF)
+- Testing the new worker offload against a real node (`--worker-nodes http://nova:8088|Nova`, a Gemma
+  on a spare M4 Mini) uncovered **two independent bugs, both of which made offloading silently do
+  nothing.** Suite **7201 passed / 12 skipped / 0 failed**.
+- **(1) THE BUG — a bare LAN hostname was forced through Tor.** `compute_tor_proxy` (core/llm.py)
+  exempted `localhost`, `*.local` and IP literals — but **not a dotless hostname**. So `nova` was
+  classified as a public destination and every worker call went through the SOCKS proxy, which of
+  course cannot resolve a LAN name: **`ProxyError` → "All worker nodes failed, falling back to main
+  upstream"** on every single call. The failure was *maximally deceptive*: `/api/health` showed the
+  node wired, and the log said "Routing background task to Worker Node (Nova)" immediately before the
+  failure — offloading LOOKED configured while doing nothing. The image-gen node `http://ghost:8000`
+  had the identical hole. Fix: a **dotless hostname cannot be a public DNS name** (a globally
+  resolvable name needs a TLD) → treat as LAN, go direct; plus `_LAN_SUFFIXES` (.local/.lan/.home/
+  .internal/.arpa), kept in sync with `utils/notify.py`'s `url_needs_tor`. The IP branch already
+  covered Tailscale/RFC1918 *addresses*; hostnames were the remaining hole.
+  **Security regression caught by the existing suite while fixing this:** a public **IPv6** literal
+  (`2606:4700:4700::1111`) has colons and NO dots, so the naive dotless rule would have leaked it
+  outside Tor. IP literals are now parsed FIRST; the dotless rule only applies to non-IP names.
+  Dotted public names are never resolved (that would leak a cleartext DNS query — exactly what
+  mandatory-tor prevents), so a LAN node on a dotted custom domain must be an IP or a LAN suffix.
+  Tests: `tests/test_lan_hostname_no_tor.py` (29).
+- **(2) The node was serving the BASE model, not the instruction-tuned one.** `gemma-4-E4B.Q8_0.gguf`
+  (`general.name: "Gemma 4 E4B"`, no `-it`) ships **no chat template**, so llama.cpp fell back to a
+  generic ChatML placeholder; the model then emitted `<|im_end|>` as literal TEXT (not an EOG token),
+  never stopped (`finish_reason: length` on every call), and hallucinated fabricated conversations.
+  No serving flag can fix a base model. Operator re-downloaded `ggml-org/gemma-4-E4B-it-GGUF`
+  (+ matching mmproj) → now `finish_reason: stop`, 2 tokens, clean output.
+- **Verified end-to-end under the exact prod config** (tor_proxy set, node by hostname): the real
+  `LLMClient` routes DIRECT to nova, the call lands there (confirmed by polling nova's `/slots` for
+  `is_processing`), and `example.com` still egresses via Tor. **Prod restart required** to pick the
+  fix up — until then every offloaded call keeps falling back to the main model.
+- **Instrument lesson (cost ~20 min):** two of my own probes were invalid and produced confident false
+  negatives — llama-server's `/slots` does NOT retain `prompt` after a request (so "nothing landed"
+  was wrong), and `pretty_log` renders titles LOWERCASE, so `grep "Worker Compute"` found 0 lines
+  while `grep -i` found 10. **Validate the instrument against a known-positive before trusting a
+  negative result.**
+
+### 2026-07-11 (latest) — Tier-2 node offload: auxiliary LLM calls moved off the single main slot
+- **Framing (the operator asked how to use a small Gemma on a spare M4 Mini — it is neither faster nor
+  smarter than the 35B).** The value is NOT capability, it is **a second inference SLOT**: llama runs
+  `-np 1` and turns are `Semaphore(1)`, so every auxiliary call either blocks the user's turn, queues
+  behind it, or disturbs the main model's KV prefix cache (the llama log's thousands of "restored
+  context checkpoint" lines each cost real time). A small model doesn't need to be good at the hard
+  work — only at the *small* work that is currently stealing the big model's slot.
+- **Already opt-in (zero code, activate with `--worker-nodes url|model`):** conversation
+  compaction/summarization (INLINE — the most painful blocking call on a 240k agent), the mid-turn
+  shield summarizer, smart-memory consolidation, and follow-up query expansion — the last is
+  **entirely disabled without a worker pool** (returns the legacy fallback), so a worker node
+  switches a dormant feature ON. `--critic-nodes` moves the verifier off-box (caveat recorded: a weak
+  judge degrades lesson-scrubbing + calibration; watch CONFIRMED/REFUTED + Brier).
+- **Newly offloaded:** (1) the **constraint gate** — it was `is_background=False`, i.e. a full LLM
+  audit BLOCKING the user's turn on every task close; (2) the **autoadvance task classifier** — a
+  one-word bucket call with a keyword fallback, absurd to spend the 35B on.
+- **Screen-then-confirm (the design that makes offloading a GATE safe).** The constraint gate's false
+  positive BLOCKS work — that exact failure mode deadlocked a real project earlier today — so handing
+  its veto to a small model would make it worse. Now: **screen on the worker** (the common "no
+  violation" case is answered off-main and costs the 35B nothing), and a **"violates" verdict is
+  re-confirmed on the MAIN model before it blocks anything** (the rare positive is the only expensive
+  call; the main model's evidence text is what the agent sees). A false negative needs no confirmation
+  — it just passes, matching the gate's existing fail-open posture. With no worker pool the screen
+  already WAS the main model, so the confirm pass is skipped → byte-identical behaviour, no double call.
+- **Deliberately NOT offloaded: reflection critique + post-mortem analysis.** They WRITE lessons and
+  classify defects (a weak judge poisons the learning stack) and run at idle, when the main model is
+  free anyway. Offload rule, pinned by a test: a call qualifies only when the small model is competent
+  at it AND it currently costs the user latency. Idle-time quality-critical work fails both halves.
+- **Observability:** `GET /api/health` now returns a `nodes` map (worker/critic/swarm/coding/vision/
+  image_gen → URLs). There was previously NO way to confirm from outside that a node was wired — you
+  had to read the boot log.
+- Tests: `tests/test_worker_offload.py` (20). Suite **7171 passed / 12 skipped / 0 failed**. Docs:
+  `algorithms/node_offload.html` (new) + `api/routes.html`. Every selector falls back to the main node
+  when its pool is empty, so all of this is inert until `--worker-nodes` is passed.
+
 ### 2026-07-11 (latest) — ghost-agent.log audit: THREE project deadlocks found live and fixed
 - Audited a real session (project 6051abfb21b8, "Meta"). One request burned **189 s and made zero
   progress**; two replies were replaced by fallback text. Three distinct bugs, each independently

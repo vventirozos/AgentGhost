@@ -186,6 +186,22 @@ async def api_health(request: Request):
     except Exception:
         sched_jobs = None
 
+    # Off-main node pools (2026-07-11). Auxiliary LLM work (verifier,
+    # conversation compaction, constraint audit, task classification…) can be
+    # offloaded to secondary boxes so it never occupies the single main
+    # inference slot. Without this block there was NO WAY to confirm from
+    # outside whether a configured node was actually wired — you'd have to
+    # read the boot log. Empty pool = that work runs on the main model.
+    _pool_names = ("worker", "critic", "swarm", "coding", "vision", "image_gen")
+    nodes = {}
+    for _p in _pool_names:
+        try:
+            _clients = getattr(llm, f"{_p}_clients", None) or []
+            nodes[_p] = [str(c.get("url") or "") for c in _clients
+                         if isinstance(c, dict)]
+        except Exception:  # noqa: BLE001 — health must never raise
+            nodes[_p] = []
+
     return JSONResponse({
         "status": "ok",
         "rss_mb": rss_mb,
@@ -197,6 +213,7 @@ async def api_health(request: Request):
         "biological_watchdog_alive": (bio_task is not None and not bio_task.done()),
         "memory_system_loaded": getattr(context, "memory_system", None) is not None,
         "scheduler_jobs": sched_jobs,
+        "nodes": nodes,
         "config": getattr(app.state, "resolved_config", {}),
     })
 

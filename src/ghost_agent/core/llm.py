@@ -26,6 +26,17 @@ _STREAM_FIRST_BYTE_TIMEOUT = float(os.getenv("GHOST_STREAM_FIRST_BYTE_TIMEOUT", 
 _STREAM_IDLE_TIMEOUT = float(os.getenv("GHOST_STREAM_IDLE_TIMEOUT", "60"))
 
 
+# Hostname suffixes that denote LAN infrastructure (never globally routable).
+# Kept in sync with utils/notify.py's `url_needs_tor`, which makes the same
+# call for outbound push targets.
+_LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".arpa")
+
+
+def _socks5h(tor_proxy: str) -> str:
+    """socks5h → DNS resolves inside Tor, never on the host."""
+    return tor_proxy.replace("socks5://", "socks5h://")
+
+
 def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
     """Decide whether traffic to ``url`` must egress via Tor.
 
@@ -56,15 +67,45 @@ def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
         # `http://localhost.attacker.example/` (real-IP leak).
         hostname = (urllib.parse.urlparse(url).hostname or "").lower()
         if hostname:
-            if hostname == "localhost" or hostname.endswith(".local"):
+            if hostname == "localhost" or hostname.endswith(_LAN_SUFFIXES):
                 return None  # local name → bypass Tor (can't route via exit anyway)
+            # IP literals are classified by the address itself. This MUST be
+            # tried before the dotless-hostname rule below: an IPv6 literal
+            # (`2606:4700:4700::1111`) has colons and no dots, and would
+            # otherwise be misread as a LAN name and leak OUTSIDE Tor.
             try:
                 ip = ipaddress.ip_address(hostname)
-                if not ip.is_global:
-                    return None  # loopback / private / link-local → bypass Tor
             except ValueError:
-                # Non-IP public hostname: route via Tor.
                 pass
+            else:
+                # loopback / RFC1918 / CGNAT-Tailscale / link-local / ULA
+                return None if not ip.is_global else _socks5h(tor_proxy)
+
+            # Not an IP literal. A DOTLESS hostname cannot be a public DNS
+            # name — a globally resolvable name needs a TLD. So `nova`,
+            # `ghost`, `raspberrypi` are LAN infrastructure resolved via
+            # /etc/hosts, mDNS or the LAN search domain, and a Tor exit can no
+            # more route to them than to a 192.168.x address.
+            #
+            # This was a REAL, SILENT bug (found live 2026-07-11): a worker
+            # node configured as `--worker-nodes http://nova:8088|Nova` was
+            # forced through the SOCKS proxy, so EVERY offloaded call died with
+            # `ProxyError` and fell back to the main model — the log said
+            # "Routing background task to Worker Node (Nova)" and then "All
+            # worker nodes failed", so offloading appeared configured while
+            # silently doing nothing. Same for an image-gen node at
+            # `http://ghost:8000`. The IP branch above already covered this
+            # class for Tailscale/RFC1918 ADDRESSES; bare hostnames were the
+            # remaining hole.
+            if "." not in hostname:
+                return None
+
+            # A dotted, non-IP hostname: assume PUBLIC → route via Tor. We
+            # deliberately do NOT resolve it to check for a private answer:
+            # that would leak a cleartext DNS query for every node URL, which
+            # is exactly what mandatory-tor exists to prevent. A LAN node on a
+            # dotted custom domain must be given as an IP or a _LAN_SUFFIXES
+            # name.
     except Exception:
         pass
     return tor_proxy.replace("socks5://", "socks5h://")

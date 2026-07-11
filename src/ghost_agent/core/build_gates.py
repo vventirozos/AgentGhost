@@ -62,6 +62,20 @@ def files_from_specs(file_specs: list) -> Dict[str, str]:
     return out
 
 
+def _parse_verdict(content: str) -> Optional[dict]:
+    """First parseable ``{"violates": ...}`` object in an auditor reply, or
+    None when there is none (the caller fails open)."""
+    for m in re.finditer(r'\{[^{}]*"violates"[^{}]*\}', content or "",
+                         re.DOTALL):
+        try:
+            v = json.loads(m.group(0))
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(v, dict) and "violates" in v:
+            return v
+    return None
+
+
 async def constraint_gate(context, constraints: List[str],
                           files: Dict[str, str], *,
                           is_background: bool = True,
@@ -104,43 +118,83 @@ async def constraint_gate(context, constraints: List[str],
         'or empty>", "evidence": "<file + the specific code that violates '
         'it, or empty>"}'
     )
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt + "\n\n/no_think"}],
+        "chat_template_kwargs": {"enable_thinking": False},
+        "temperature": 0.0,
+        "max_tokens": 400,
+        "stream": False,
+    }
+
+    # SCREEN-THEN-CONFIRM (2026-07-11). This gate is a BLOCKING LLM call on the
+    # user's turn (projects.py passes is_background=False), so it is a prime
+    # candidate for an off-host worker node — but it is also a gate whose FALSE
+    # POSITIVE blocks work (that failure mode deadlocked a real project; see
+    # tools/projects.py). Handing the veto to a small model would make that
+    # worse. So:
+    #   * SCREEN on the worker pool (cheap, off the main slot). The common case
+    #     — "no violation" — is answered there and costs the 35B nothing.
+    #   * A "violates" verdict is NOT trusted on its own: it is CONFIRMED on
+    #     the main model before it blocks anything. The expensive call only
+    #     happens on the rare positive.
+    # A false NEGATIVE needs no confirmation: it just passes the gate, which is
+    # the same fail-open posture this function already has everywhere else.
+    # With no worker pool configured, `use_worker=True` falls back to the main
+    # node (see LLMClient.chat_completion) and the confirm pass is skipped —
+    # so behaviour is byte-identical to before.
+    screened_off_main = bool(getattr(llm, "worker_clients", None))
+
+    async def _ask(use_worker: bool) -> str:
+        data = await llm.chat_completion(
+            dict(payload), use_worker=use_worker, is_background=is_background)
+        return (data.get("choices", [{}])[0].get("message", {})
+                .get("content") or "")
+
     try:
-        data = await llm.chat_completion({
-            "model": model,
-            "messages": [{"role": "user", "content": prompt + "\n\n/no_think"}],
-            "chat_template_kwargs": {"enable_thinking": False},
-            "temperature": 0.0,
-            "max_tokens": 400,
-            "stream": False,
-        }, is_background=is_background)
-        content = (data.get("choices", [{}])[0].get("message", {})
-                   .get("content") or "")
+        content = await _ask(use_worker=True)
     except Exception as e:  # noqa: BLE001 — gate must fail open on infra errors
         logger.debug("constraint_gate LLM call failed (fail-open): %s", e)
         return True, ""
 
-    for m in re.finditer(r'\{[^{}]*"violates"[^{}]*\}', content, re.DOTALL):
+    verdict = _parse_verdict(content)
+    if verdict is None:
+        # Unparseable reply → fail open.
+        logger.debug("constraint_gate: unparseable auditor reply (fail-open)")
+        return True, ""
+    if verdict.get("violates") is not True:
+        return True, ""
+
+    if screened_off_main:
+        # A small screening model wants to BLOCK work. Confirm on the main
+        # model first — an unconfirmed veto is how a weak judge deadlocks a
+        # project.
         try:
-            verdict = json.loads(m.group(0))
-        except Exception:
-            continue
-        if isinstance(verdict, dict) and verdict.get("violates") is True:
-            constraint = str(verdict.get("constraint") or "").strip()
-            evidence = str(verdict.get("evidence") or "").strip()
-            reason = (
-                "CONSTRAINT VIOLATION: the build violates the user's stated "
-                f"constraint: \"{constraint}\". Evidence: {evidence}. "
-                "Rework the implementation so it honors the constraint — do "
-                "NOT just reword comments."
-            )
-            pretty_log("Constraint Gate", reason[:200], level="WARNING",
-                       icon=Icons.WARN)
-            return False, reason
-        if isinstance(verdict, dict) and verdict.get("violates") is False:
+            confirm = _parse_verdict(await _ask(use_worker=False))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("constraint_gate confirm failed (fail-open): %s", e)
             return True, ""
-    # Unparseable reply → fail open.
-    logger.debug("constraint_gate: unparseable auditor reply (fail-open)")
-    return True, ""
+        if confirm is None or confirm.get("violates") is not True:
+            pretty_log(
+                "Constraint Gate",
+                "worker flagged a violation; main model did NOT confirm — "
+                "passing (screen-then-confirm).",
+                level="INFO", icon=Icons.SKIP,
+            )
+            return True, ""
+        verdict = confirm   # block on the MAIN model's evidence, not the screen's
+
+    constraint = str(verdict.get("constraint") or "").strip()
+    evidence = str(verdict.get("evidence") or "").strip()
+    reason = (
+        "CONSTRAINT VIOLATION: the build violates the user's stated "
+        f"constraint: \"{constraint}\". Evidence: {evidence}. "
+        "Rework the implementation so it honors the constraint — do "
+        "NOT just reword comments."
+    )
+    pretty_log("Constraint Gate", reason[:200], level="WARNING",
+               icon=Icons.WARN)
+    return False, reason
 
 
 # The smoke script self-bounds with SIGALRM so a module that starts a

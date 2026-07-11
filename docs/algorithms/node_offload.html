@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Off-main node offload — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Algorithms</h3>
+    <a class="current" href="node_offload.html">node offload</a>
+    <a href="metacognition.html">metacognition</a>
+    <h3>Related</h3>
+    <a href="../core/llm.html">core.llm</a>
+    <a href="../cli_reference.html">CLI reference</a>
+  </nav>
+</aside>
+<main>
+  <h1>Off-main node offload</h1>
+  <p class="subtitle">A second box is a second inference SLOT — not a smarter
+  or faster model. That is the whole value, and it is substantial.</p>
+
+  <h2>The constraint</h2>
+  <p>llama-server runs with <code>-np 1</code> (ONE inference slot) and agent
+  turns are serialized behind <code>Semaphore(1)</code>. So every auxiliary LLM
+  call the agent makes — verifier, conversation compaction, constraint audit,
+  task classification, memory consolidation — does one of three bad things:</p>
+  <ul>
+    <li><strong>blocks the user's turn</strong> (an inline, awaited call);</li>
+    <li><strong>queues behind it</strong> (a background call waiting on
+    <code>foreground_tasks == 0</code>);</li>
+    <li><strong>disturbs the main model's KV prefix cache</strong>, so the next
+    user turn pays a re-prefill (the llama log is full of "restored context
+    checkpoint" lines — each restore costs real time).</li>
+  </ul>
+  <p>A secondary node — even a SMALL, SLOWER model — removes that work from the
+  critical path entirely. It does not need to be good at the hard work; it needs
+  to be good enough at the <em>small</em> work that is currently stealing the big
+  model's slot.</p>
+
+  <h2>Pools</h2>
+  <p><code>LLMClient</code> carries six pools, selected per call via
+  <code>chat_completion(..., use_worker=/use_critic=/use_coding=/…)</code>.
+  <strong>Every selector falls back to the main node when its pool is empty</strong>,
+  so opting a call site in is a safe no-op until a node is configured.</p>
+  <table>
+    <thead><tr><th>Flag</th><th>Carries</th></tr></thead>
+    <tbody>
+      <tr><td><code>--worker-nodes url|model</code></td><td>Conversation compaction/summarization (inline — the most painful blocking call on a 240k-context agent), the mid-turn "shield" summarizer, follow-up query expansion (<strong>entirely disabled without a worker pool</strong>), smart-memory consolidation, the constraint-gate screen, the autoadvance task classifier.</td></tr>
+      <tr><td><code>--critic-nodes url|model</code></td><td>The self-evaluation verifier; the post-response gate becomes non-blocking. <em>Caveat: verdicts feed lesson-scrubbing and calibration, so a weak judge degrades those signals — enable, then watch CONFIRMED/REFUTED rates and the calibration Brier.</em></td></tr>
+      <tr><td><code>--swarm-nodes</code></td><td><code>delegate_to_swarm</code> fan-out (stateless, tool-less workers).</td></tr>
+      <tr><td><code>--coding-nodes</code> · <code>--visual-nodes</code> · <code>--image-gen-nodes</code></td><td>Self-play coding, vision, image generation.</td></tr>
+    </tbody>
+  </table>
+  <p>LAN / Tailscale nodes work with <code>--mandatory-tor</code> on: the egress
+  guard exempts loopback, RFC1918 and the CGNAT range (100.64.0.0/10).</p>
+
+  <h2>Screen-then-confirm (the constraint gate, 2026-07-11)</h2>
+  <p>The constraint gate is the ideal offload target — it is a
+  <strong>blocking</strong> LLM call on the user's turn — but it is also a gate
+  whose <strong>false positive blocks work</strong> (an over-broad version of it
+  deadlocked a real project; see <code>tools/projects.py</code>). Handing a veto
+  to a small model makes that failure mode worse. So the gate splits the
+  decision:</p>
+  <ul>
+    <li><strong>Screen</strong> on the worker pool. The common case — "no
+    violation" — is answered off-main and costs the 35B <em>nothing</em>.</li>
+    <li>A <strong>"violates" verdict is not trusted on its own</strong>: it is
+    re-run and CONFIRMED on the main model before it blocks anything, and the
+    main model's constraint/evidence text is what the agent sees. The expensive
+    call happens only on the rare positive.</li>
+    <li>A false NEGATIVE needs no confirmation — it simply passes the gate,
+    which matches this function's fail-open posture everywhere else.</li>
+  </ul>
+  <p>With no worker pool, the screen already <em>was</em> the main model, so the
+  confirm pass is skipped and behaviour is byte-identical to before (no wasteful
+  double call).</p>
+
+  <h2>Deliberately NOT offloaded</h2>
+  <p><strong>Reflection critique</strong> and <strong>post-mortem analysis</strong>
+  stay on the main model. They WRITE lessons and classify defects, so a weak
+  judge poisons the learning stack — and they run at idle, when the main model is
+  free anyway. The offload rule: a call is a candidate only when the small model
+  is competent at it <em>and</em> it currently costs the user latency. Idle-time,
+  quality-critical work fails both halves. Pinned by a test.</p>
+
+  <h2>Verifying it works</h2>
+  <p><code>GET /api/health</code> now reports a <code>nodes</code> map (per pool
+  → configured URLs). Without it there was no way to confirm from outside that a
+  node was actually wired — you had to read the boot log. An empty pool means
+  that work runs on the main model.</p>
+  <pre>curl -s localhost:8000/api/health | jq .nodes
+# {"worker": ["http://mini:8088"], "critic": [], …}</pre>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_worker_offload.py</code> (20) — verdict parsing;
+  no-worker-pool behaviour byte-identical (incl. NO double call on a violation);
+  screen-then-confirm (clean screen never touches main; unconfirmed veto passes;
+  confirmed veto blocks using the main model's evidence; both fail-open paths);
+  the offloaded call sites; that reflection/post-mortem stay on main; and the
+  health <code>nodes</code> map.</p>
+</main>
+</body>
+</html>

@@ -3090,6 +3090,12 @@ class GhostAgent:
                             # and fall back to the heuristic on any failure.
                             from .project_advancer import classify_task as _kw
                             try:
+                                # One-word bucket classification: the cheapest
+                                # possible LLM call, with a keyword fallback
+                                # right below if it fails. Offloaded to the
+                                # worker pool (2026-07-11) so it never occupies
+                                # the single 35B slot; falls back to the main
+                                # node when no worker node is configured.
                                 _r = await ctx.llm_client.chat_completion({
                                     "model": getattr(ctx.args, 'model', 'default'),
                                     "messages": [{"role": "user", "content": (
@@ -3100,7 +3106,7 @@ class GhostAgent:
                                         "Output ONLY the one word.\n\nTASK: "
                                         + str(description)[:500])}],
                                     "temperature": 0.0, "max_tokens": 8, "stream": False,
-                                }, is_background=True)
+                                }, use_worker=True, is_background=True)
                                 out = ((_r or {}).get("choices", [{}])[0]
                                        .get("message", {}).get("content", "") or "").strip().lower()
                                 for label in ("needs_user", "coding", "research"):
