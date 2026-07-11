@@ -13,6 +13,7 @@
     <a href="../index.html">← Home</a>
     <h3>Sandbox</h3>
     <a class="current" href="docker.html">Docker</a>
+    <a href="services.html">services</a>
     <h3>Related</h3>
     <a href="../tools/execute.html">execute tool</a>
     <a href="../tools/file_system.html">file_system tool</a>
@@ -92,6 +93,9 @@
     <dt>output cap</dt><dd>256 KB per execute call</dd>
     <dt>install time</dt><dd>~60 s on first boot (+ ~2 min Chromium on the first-ever boot), cached thereafter</dd>
   </div>
+
+  <h2>Service ports (2026-07-11)</h2>
+  <p>Supervised long-lived services (see <a href="services.html">sandbox.services</a> / the <code>manage_services</code> tool) run detached inside this container. In <strong>bridge</strong> mode (the macOS default) they'd be unreachable from the host, so container creation publishes a small loopback-bound range — <code>GHOST_SANDBOX_SERVICE_PORTS</code>, default <code>8100-8104</code>, empty string disables — letting the OPERATOR open <code>http://127.0.0.1:&lt;port&gt;</code> in their own browser. <strong>Host</strong> mode (the Linux default) needs no publishing (the service binds host ports directly). Ports <code>8000/8080/8088/9050</code> are never publishable (agent API / NetMon / upstream LLM / Tor). Publishing is a convenience, not a dependency: if a host process already owns one of the ports, <code>containers.run</code> is retried <em>without</em> published ports (warning logged) rather than failing the sandbox — in-sandbox consumers (<code>browser</code>, <code>execute</code>) reach the service on the container's own loopback regardless. Only takes effect when the container is (re)created.</p>
 
   <h2>Tor</h2>
   <p>If <code>tor_proxy</code> is set in the constructor, the container starts a <code>tor</code> daemon and outbound HTTP from inside the sandbox is routed through it. The spawn is attempted <strong>once per container generation</strong> and verified: under host networking (the Linux default) the in-container tor can never bind — the host tor already owns <code>:9050</code> in the shared netns — so the code logs one explicit warning instead of silently re-attempting the doomed spawn on every command (which flooded the log with per-command "Environment Ready" lines). The native <code>browser</code> tool additionally forces DNS-over-SOCKS via Chromium's <code>--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost"</code> and disables non-proxied WebRTC (<code>--webrtc-ip-handling-policy=disable_non_proxied_udp</code>), so the browser path cannot leak DNS or the host IP even if the LLM forgets to configure the proxy correctly.</p>

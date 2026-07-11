@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.autonomous_activity — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a class="current" href="autonomous_activity.html">autonomous_activity</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <a href="agent.html">agent</a>
+    <a href="../api/routes.html">api.routes</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / autonomous_activity.py <span class="mono">+ utils/notify.py</span></h1>
+  <p class="subtitle">The agent's "mouth" (2026-07-11): a structured ledger of
+  autonomous outcomes + an all-phase "Background activity" digest + outbound
+  push notifications. Closes the biggest open loop of the 2026-07 feature
+  survey — the agent did real work while idle but had no way to tell anyone.</p>
+
+  <h2>Why</h2>
+  <p>Before this module, 12 of the 13 idle phases surfaced their outcomes only
+  as <code>pretty_log</code> lines on the console; the post-mortem defect queue
+  had <em>no</em> surfacing at all; and scheduled turns (cron jobs that fire a
+  full <code>handle_chat</code>) <strong>discarded their final content</strong>
+  — only pass/fail reached the workspace ledger. Only project autoadvance had
+  a user-facing digest (<code>core.project_digest</code>), and even that was
+  pull-only. Blocked <em>needs-user</em> project tasks accumulated silently
+  until the operator happened to open a chat.</p>
+
+  <h2>The ledger</h2>
+  <p><code>ActivityLog</code> — append-only JSONL at
+  <code>$GHOST_HOME/system/autonomous_activity.jsonl</code>. One record per
+  operator-relevant autonomous outcome:
+  <code>{ts, phase, summary, severity, meta}</code>. Two severities:</p>
+  <ul>
+    <li><code>info</code> — digest-only (dream ran, PRM refit, …).</li>
+    <li><code>notify</code> — digest <em>plus</em> immediate push + the
+    external-consumer feed (needs-user project tasks, scheduled-turn
+    conclusions).</li>
+  </ul>
+  <p>Fail-safe by contract: <code>record()</code>/<code>read_since()</code>
+  never raise into a caller — a broken ledger must never break a turn or an
+  idle phase. <code>read_since(offset)</code> is byte-offset watermarked,
+  only consumes complete lines (a partially-written tail is left for the next
+  read), skips corrupt lines, and silently re-baselines on a stale offset.</p>
+
+  <h2>Producers</h2>
+  <ul>
+    <li><strong>Idle phases</strong> — <code>GhostAgent._record_autonomous_activity</code>
+    is called at each phase's completion point in <code>_biological_tick</code>:
+    dream, reflection, post-mortem (when defects were queued), skills_auto
+    (when something graduated), PRM/router/calibration (on successful
+    hot-swap), stale open questions, self-play.</li>
+    <li><strong>Project advancer</strong> — <code>_record_needs_user_activity</code>
+    pushes <code>severity=notify</code> records for
+    <code>autoadvance_needs_user</code> / <code>human_gate_triggered</code>
+    outcomes (all three sites). The digest renderer <em>excludes</em> the
+    <code>project</code> phase (<code>DIGEST_EXCLUDED_PHASES</code>) because the
+    project digest already renders those — the record exists purely for push.</li>
+    <li><strong>Scheduled turns</strong> — <code>main._run_proactive_task</code>
+    now captures <code>handle_chat</code>'s returned content and sinks it via
+    <code>record_scheduled_result()</code> (severity=notify — a cron job's whole
+    point is "tell me what you found"). Failures are recorded too.</li>
+  </ul>
+
+  <h2>Consumers</h2>
+  <ol>
+    <li><strong>Next-turn digest</strong> — <code>_finalize_and_return</code>
+    renders unseen records as a <em>"Background activity while you were
+    away:"</em> header (after the project digest), watermarked at
+    <code>$GHOST_HOME/system/activity_digest.json</code>; first run baselines
+    silently. Each item is clamped to 140 chars so the whole block stays under
+    the 1500-char bound <code>_strip_leading_banners</code> peels — a longer
+    block would break the correction-fingerprint peel (the 2026-07-07 bug
+    class). The banner-peel loop allows up to 5 stacked blocks now
+    (correction + clarifying + project digest + activity digest + headroom).</li>
+    <li><strong>Outbound push</strong> — <code>utils.notify.OutboundNotifier</code>,
+    wired as the ledger's <code>on_notify</code> callback in <code>main.py</code>.
+    Transports: <code>--notify-webhook</code> (JSON POST) and/or
+    <code>--notify-ntfy</code> (ntfy text POST), env fallbacks
+    <code>GHOST_NOTIFY_WEBHOOK</code>/<code>GHOST_NOTIFY_NTFY</code>.
+    <strong>Egress posture:</strong> loopback/RFC1918/Tailscale-CGNAT/LAN-suffix
+    targets connect directly (the egress guard allows them); PUBLIC targets are
+    only reached through the Tor SOCKS proxy (upgraded to <code>socks5h://</code>
+    so DNS resolves inside Tor); with mandatory-tor and no proxy, a public
+    target is skipped outright. Best-effort: one retry per transport, failures
+    logged and swallowed — the durable record is already in the ledger.</li>
+    <li><strong>External deliverers</strong> —
+    <code>GET /api/notifications/pending?consumer=NAME</code> returns undelivered
+    <code>notify</code>-severity records + a watermark;
+    <code>POST /api/notifications/ack</code> advances the per-consumer watermark
+    (stored in <code>$GHOST_HOME/system/notify_consumers.json</code>). A consumer
+    that never acked is baselined to end-of-ledger (no historical replay).
+    The Slack bot (<code>interface/externals/slack_bot</code>) runs a
+    <code>notification_poller</code> when <code>GHOST_NOTIFY_SLACK_CHANNEL</code>
+    is set — poll → <code>chat_postMessage</code> → ack, so a crash re-serves
+    rather than drops.</li>
+  </ol>
+
+  <h2>Internal-request gate</h2>
+  <p>Turns the agent fires at itself (req_id prefixes <code>sched-</code>,
+  <code>job-</code>, <code>sub-</code>; see
+  <code>INTERNAL_REQUEST_PREFIXES</code>) skip BOTH digest blocks — an internal
+  turn consuming the watermark would silently eat the operator's next "while
+  you were away" report. This also fixed a latent bug where a cron turn
+  consumed the <em>project</em> digest watermark.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_autonomous_activity.py</code> (64) — ledger roundtrip /
+  offsets / corruption / partial-tail, watermark + consumer semantics, digest
+  rendering incl. the banner-strip contract, scheduled-turn capture, notifier
+  egress routing + MockTransport delivery, the /api/notifications endpoints,
+  and source-inspection wiring checks for main.py / agent.py /
+  project_advancer.py / the Slack poller.</p>
+</main>
+</body>
+</html>

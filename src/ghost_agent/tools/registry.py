@@ -8,6 +8,13 @@ from .system import tool_system_utility
 from .memory import tool_knowledge_base, tool_recall, tool_unified_forget, tool_update_profile, tool_learn_skill, tool_scratchpad
 from .execute import tool_execute
 from .browser import tool_browser
+from .sandbox_services import (
+    tool_manage_services, MANAGE_SERVICES_TOOL_DEFINITION,
+)
+from .delegate import (
+    tool_delegate, tool_jobs,
+    DELEGATE_TOOL_DEFINITION, JOBS_TOOL_DEFINITION,
+)
 from .swarm import tool_delegate_to_swarm
 from .acquired_skills import tool_create_skill, tool_manage_skills, AcquiredSkillManager
 from .composed_skills import (
@@ -175,6 +182,9 @@ TOOL_DEFINITIONS = [
             }
         }
     },
+    MANAGE_SERVICES_TOOL_DEFINITION,
+    DELEGATE_TOOL_DEFINITION,
+    JOBS_TOOL_DEFINITION,
     {"type": "function", "function": {"name": "learn_skill", "description": "MANDATORY when you solve a complex bug or task after initial failure. Save the lesson so you don't repeat the mistake.", "parameters": {"type": "object", "properties": {"task": {"type": "string"}, "mistake": {"type": "string"}, "solution": {"type": "string"}}, "required": ["task", "mistake", "solution"]}}},
     {"type": "function", "function": {"name": "flag_uncertainty", "description": "Register what you DON'T know or are unsure about with your metacognitive tracker. Call action='unknown' when you need a fact you don't have (set impact 1-5 — 4+ means it materially affects correctness; resolution tells how to get it: 'ask user', 'search web', 'read file'). Call action='assumption' when you are proceeding on a belief you have NOT verified (set confidence 0.0-1.0). action='list' shows what is currently flagged plus recurring blind-spots from past turns. A critical unknown (impact>=4, resolution='ask user') triggers a clarification prompt before your answer is finalized — so flag honestly rather than guessing. Everything flagged persists, so questions you keep hitting become visible as recurring blind-spots.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["unknown", "assumption", "list"]}, "text": {"type": "string", "description": "For action='unknown': what you don't know. For action='assumption': the unverified belief."}, "impact": {"type": "integer", "minimum": 1, "maximum": 5, "description": "For action='unknown': how much not knowing this affects correctness (1 minor, 5 critical)."}, "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "For action='assumption': how confident you are in the belief (0.0-1.0)."}, "resolution": {"type": "string", "description": "For action='unknown': how to resolve it — 'ask user', 'search web', 'read file', etc."}, "basis": {"type": "string", "description": "For action='assumption': why you believe it."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "workspace", "description": "READ-ONLY view of the user's WORKSPACE state — what's outside of you (files, scheduled-task outcomes, research artifacts you've pulled, commands you ran). This is the world-model counterpart to introspect (which reads your selfhood). Use this when the user asks 'what changed since yesterday?', 'what did my scheduled task do?', 'have I already pulled this URL?', 'show me what you've been doing in my project'. Distinct from: introspect (your own selfhood), file_system (one-shot reads of the filesystem), recall (vector search over ingested docs). Actions: 'summary' (default; stats + narrative + recent changes + recent tasks/research); 'stats' (counts); 'files' (the watchlist); 'changes' (diff tracked files against last-seen snapshot); 'tasks' (recent scheduled-task outcomes); 'research' (URLs you've already pulled); 'commands' (significant command outcomes); 'narrative' (the running workspace summary); 'recent' (the activity log, mixed kinds); 'search' (keyword search over the activity log — pass 'query').", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "files", "changes", "tasks", "research", "commands", "narrative", "recent", "search"], "description": "Default 'summary' if omitted."}, "limit": {"type": "integer", "description": "For tasks/research/commands/recent/search: how many entries to return. Defaults to 10; capped at 50."}, "query": {"type": "string", "description": "For action='search': keywords to find in past workspace events (filenames, commands, URLs, task names)."}}, "required": []}}},
@@ -384,8 +394,11 @@ TOOL_DEFINITIONS.append({
             "is a TOP-LEVEL TOOL you invoke by its name like any built-in — its steps "
             "run and the combined results come back for you to synthesise. Default "
             "mode='parallel' fans the steps out concurrently (ideal for independent "
-            "read-only steps); use mode='sequential' only when a later step depends "
-            "on an earlier one. NOTE: a macro's steps may only call built-in tools "
+            "read-only steps); use mode='sequential' when a later step depends "
+            "on an earlier one — a sequential step can bind its result with "
+            "'save_as' and a later step can consume it as \"$name\", which is how "
+            "you express a real pipeline (fetch → transform → act on the value). "
+            "NOTE: a macro's steps may only call built-in tools "
             "or acquired skills — NOT other composed skills (no nesting). The dream "
             "cycle auto-proposes macros from recurring tool sequences in your history; "
             "they stay inert until you 'approve' them."
@@ -447,9 +460,24 @@ TOOL_DEFINITIONS.append({
                                 "type": "object",
                                 "description": (
                                     "Arguments to pass to that tool (e.g. "
-                                    "{\"action\": \"check_weather\"}). Use a value "
-                                    "of \"$varname\" to pull from the macro's own "
-                                    "runtime parameters at call time."
+                                    "{\"action\": \"check_weather\"}). Use "
+                                    "\"$varname\" to pull from the macro's own "
+                                    "runtime parameters at call time, OR from a "
+                                    "value an EARLIER step bound with 'save_as'. "
+                                    "$var also interpolates inside text, e.g. "
+                                    "\"Summarise this: $page_text\"."
+                                ),
+                            },
+                            "save_as": {
+                                "type": "string",
+                                "description": (
+                                    "Bind THIS step's result to a name that later "
+                                    "steps can use as \"$name\" — this is how you "
+                                    "build a real pipeline (fetch → transform → act "
+                                    "on the fetched value) instead of a list of "
+                                    "independent calls. Requires mode='sequential' "
+                                    "(parallel steps can't see each other's "
+                                    "results). Bindings only flow FORWARD."
                                 ),
                             },
                             "optional": {
@@ -729,12 +757,17 @@ def get_available_tools(context):
         # cleared it mid-request — desyncing the host dir from the container
         # workdir, exactly what the single-call unpack prevents.
         host_dir, workdir = _proj_ws()
+        # Loopback ports of supervised sandbox services (manage_services) are
+        # admitted through the browser SSRF guard so the agent can drive an
+        # app it is hosting. Registry-driven; empty when none are running.
+        from ..sandbox.services import active_service_ports
         return await tool_browser(
             sandbox_dir=host_dir,
             container_workdir=workdir,
             sandbox_manager=context.sandbox_manager,
             tor_proxy=context.tor_proxy,
             workspace_model=getattr(context, "workspace_model", None),
+            allowed_local_ports=active_service_ports(context.sandbox_manager),
             **kwargs,
         )
 
@@ -761,6 +794,9 @@ def get_available_tools(context):
     tools = {
         "system_utility": lambda **kwargs: tool_system_utility(tor_proxy=context.tor_proxy, profile_memory=context.profile_memory, context=context, **kwargs),
         "file_system": lambda **kwargs: tool_file_system(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, read_budget=getattr(context, "_read_budget", None), **kwargs),
+        "manage_services": lambda **kwargs: tool_manage_services(sandbox_manager=context.sandbox_manager, **kwargs),
+        "delegate": lambda **kwargs: tool_delegate(context=context, **kwargs),
+        "jobs": lambda **kwargs: tool_jobs(context=context, **kwargs),
         "knowledge_base": lambda **kwargs: tool_knowledge_base(sandbox_dir=_proj_ws()[0], memory_system=context.memory_system, profile_memory=context.profile_memory, graph_memory=getattr(context, "graph_memory", None), llm_client=context.llm_client, model_name=getattr(context.args, "model", "default"), memory_bus=getattr(context, "memory_bus", None), **kwargs),
         "recall": lambda **kwargs: tool_recall(memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), **kwargs),
         "execute": _run_execute,
@@ -789,7 +825,7 @@ def get_available_tools(context):
         "replan": _replan,
         "abort_attempt": _abort_attempt,
         "postgres_admin": lambda **kwargs: tool_postgres_admin(default_uri=getattr(context.args, 'default_db', 'postgresql://ghost@127.0.0.1:5432/agent'), _metacog_bundle=getattr(context, "metacog", None), **kwargs),
-        "delegate_to_swarm": lambda **kwargs: tool_delegate_to_swarm(llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), scratchpad=context.scratchpad, **kwargs),
+        "delegate_to_swarm": lambda **kwargs: tool_delegate_to_swarm(llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), scratchpad=context.scratchpad, context=context, **kwargs),
         "create_skill": lambda **kwargs: tool_create_skill(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, sandbox_manager=context.sandbox_manager, **kwargs),
         "manage_skills": lambda **kwargs: tool_manage_skills(sandbox_dir=context.sandbox_dir, memory_dir=getattr(context, "memory_dir", None), memory_system=context.memory_system, **kwargs),
         "manage_composed_skills": lambda **kwargs: tool_manage_composed_skills(

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sessions & turn cancellation — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a class="current" href="sessions.html">sessions &amp; turns</a>
+    <a href="delegation.html">delegation &amp; jobs</a>
+    <a href="autonomous_activity.html">autonomous_activity</a>
+    <a href="agent.html">agent</a>
+    <a href="../api/routes.html">api.routes</a>
+  </nav>
+</aside>
+<main>
+  <h1>Durable sessions &amp; real turn cancellation</h1>
+  <p class="subtitle">core/sessions.py · core/turns.py — 2026-07-11. The two
+  things that stood between this agent and being a daily driver: conversations
+  that survive a device switch, and a way out of a wedged turn that doesn't
+  involve restarting the process.</p>
+
+  <h2>1. Durable server-side conversations</h2>
+  <p><strong>The gap.</strong> History was entirely CLIENT-carried — the web
+  UI's <code>localStorage</code>, a Slack thread, or a manual
+  <code>workspace/save</code> zip. Switch device or clear the cache and the
+  conversation was gone; each client held a <em>different</em> fragment, so a
+  conversation started in Slack could not be continued in the web UI. Ironic,
+  given cross-session MEMORY is this agent's proven strength (Track B: 98%
+  recall vs 0% control) — the memory substrate persisted while the
+  conversations themselves did not.</p>
+
+  <p><strong>The shape.</strong> One JSON file per session under
+  <code>$GHOST_HOME/system/sessions/</code>:
+  <code>{id, title, created_at, updated_at, messages}</code>. Sessions live
+  entirely in the <strong>API layer</strong> — the chat route merges stored
+  history into the request before <code>handle_chat</code> and appends the turn
+  after it returns — so the agent's turn logic is untouched by this feature.</p>
+
+  <h3>The merge contract (<code>merge_history</code>)</h3>
+  <p>Pass <code>session_id</code> in the <code>/api/chat</code> body and the
+  SERVER becomes the source of truth for history. It tolerates both client
+  styles, which is what makes adoption incremental:</p>
+  <ul>
+    <li>a <strong>thin</strong> client sends only the new message →
+    <code>stored + incoming</code>;</li>
+    <li>a <strong>fat</strong> client (today's web UI) replays the whole
+    conversation → the incoming list already carries the stored history as its
+    prefix, so it is used <em>as-is</em> rather than appended. This is the
+    check that stops a fat client from <strong>doubling the conversation on
+    every turn</strong>.</li>
+  </ul>
+  <p>Everything past the stored prefix is what this turn adds, and that slice
+  (plus the assistant's reply) is what gets appended — <em>after</em> the turn
+  completes, so a failed turn never leaves a dangling user message with no
+  reply. <strong>Omit <code>session_id</code> and behaviour is exactly as
+  before</strong> (fully client-carried), so every existing client keeps
+  working untouched.</p>
+
+  <h3>Bounds &amp; safety</h3>
+  <ul>
+    <li>Session ids are opaque tokens (<code>[A-Za-z0-9_-]{1,64}</code>) — a
+    <strong>path-traversal guard</strong>, since the id names a file.</li>
+    <li>200 sessions (least-recently-updated evicted); 400 messages per session
+    (leading system messages + the newest tail kept, mirroring the agent's own
+    500-message cap).</li>
+    <li>Malformed messages are dropped rather than persisted (a corrupt session
+    would otherwise poison every future turn that loads it); tool-call plumbing
+    (<code>tool_calls</code> / <code>tool_call_id</code> / <code>name</code>) IS
+    preserved so a resumed conversation's tool pairing stays intact.</li>
+    <li>Every method degrades (None / [] / False) rather than raising into a
+    request; a corrupt file reads as absent.</li>
+    <li>The streamed-final-generation path bypasses the finalize tail, so the
+    route reconstructs what the user saw from the SSE deltas
+    (<code>_sse_delta_text</code>) — without it a session would record the
+    user's message and no reply.</li>
+  </ul>
+
+  <h3>Endpoints</h3>
+  <table>
+    <tbody>
+      <tr><td><code>GET /api/sessions</code></td><td>summaries (id / title / timestamps / message_count), newest first — no bodies, so the list stays cheap</td></tr>
+      <tr><td><code>POST /api/sessions</code></td><td>create (optional <code>title</code>); a client may equally just POST <code>/api/chat</code> with a fresh <code>session_id</code></td></tr>
+      <tr><td><code>GET /api/sessions/{id}</code></td><td>full conversation — this is how a session is RESUMED on a different client than the one that started it</td></tr>
+      <tr><td><code>DELETE /api/sessions/{id}</code></td><td>delete</td></tr>
+    </tbody>
+  </table>
+
+  <h2>2. Real turn cancellation</h2>
+  <p><strong>The gap.</strong> Turns are globally serialized
+  (<code>agent_semaphore = Semaphore(1)</code>, #22), so ONE wedged turn blocks
+  the web UI, Slack, <em>and</em> the autonomous project-advance ticks at once —
+  and there was no way out: the interface's <code>/api/chat/cancel</code> only
+  cancels the <em>proxy's</em> buffered stream, so the agent kept working and
+  kept the lock. The only real remedy was restarting the process.</p>
+
+  <p><strong>The registry.</strong> <code>core.turns.TurnRegistry</code> gives
+  every in-flight turn an identity (its <code>req_id</code>), a handle on its
+  asyncio task, and a cooperative cancel flag. A turn registers itself
+  <strong>before</strong> acquiring the semaphore, so a request QUEUED behind a
+  runaway turn is cancellable too.</p>
+
+  <table>
+    <tbody>
+      <tr><td><code>GET /api/turns</code></td><td>what is running and for how long, plus anything queued behind it — this is how you see WHY the agent appears unresponsive</td></tr>
+      <tr><td><code>POST /api/turn/cancel</code></td><td><code>{request_id?, hard?}</code> — <code>request_id</code> defaults to the running turn</td></tr>
+    </tbody>
+  </table>
+
+  <h3>Cooperative vs hard</h3>
+  <ul>
+    <li><strong>Cooperative (default).</strong> The flag is set; the turn loop
+    notices at its next boundary, raises <code>TurnCancelled</code>, and
+    <code>handle_chat</code> catches it and returns whatever partial work exists
+    (a clean stop, not a crash). Exiting through there unwinds the
+    <code>async with self.agent_semaphore</code>, so <strong>the global turn
+    lock is released</strong> — which is the entire point.</li>
+    <li><strong>Hard (<code>hard=true</code>).</strong> The asyncio task is
+    cancelled outright. This is the guaranteed release for a turn wedged
+    <em>inside</em> a long upstream call that never reaches a boundary.</li>
+    <li>A <strong>queued</strong> turn is always hard-cancelled — it has no
+    partial work and no boundary to reach, and killing it is strictly better
+    than letting it start.</li>
+  </ul>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_sessions_and_cancel.py</code> (48) — the merge contract
+  (incl. the fat-client no-doubling property), store CRUD / append / title
+  derivation / path-traversal / corrupt-file / message-cap / tool-plumbing
+  preservation; the turn registry (cooperative / hard / queued-always-hard /
+  defaults-to-current); the load-bearing property that a cancel leaves the
+  semaphore free; the handle_chat wiring points; and every endpoint, including
+  that a request WITHOUT <code>session_id</code> stores nothing and behaves
+  exactly as before.</p>
+</main>
+</body>
+</html>

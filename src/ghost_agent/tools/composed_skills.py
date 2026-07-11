@@ -53,6 +53,68 @@ def _validate_composed_name(name: str) -> str:
 # step; across a handful of steps the macro's total stays context-safe.
 MAX_STEP_RESULT_CHARS = 4000
 
+# `$var` / `${var}` templates (see SkillManager._resolve_args). _WHOLE_VAR_RE
+# matches a param whose ENTIRE value is one reference (substitute as-is);
+# _VAR_RE finds references embedded in surrounding text (interpolate).
+_WHOLE_VAR_RE = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+_VAR_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+
+# Cap a value BOUND via save_as. Larger than the display cap (a downstream
+# step may legitimately need a big fetched body) but still bounded so a
+# runaway step can't blow the next tool's args.
+MAX_BOUND_VALUE_CHARS = 16000
+
+_BIND_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _validate_dataflow(steps, mode: str):
+    """Reject a macro whose `save_as`/`$var` wiring can't work at runtime.
+    Returns an error string, or None when the data-flow is sound.
+
+    Two authoring mistakes are caught here rather than silently resolving
+    to "" at execution time:
+      * a step referencing a name bound by a LATER step (or by itself) —
+        bindings only flow forward;
+      * any step-produced binding in a PARALLEL macro — steps start
+        simultaneously, so no sibling can observe another's result.
+    A name that is never produced by any step is fine: it's a runtime
+    param the caller supplies (that's the pre-existing contract).
+    """
+    produced_at = {}
+    for i, st in enumerate(steps):
+        if st.save_as:
+            if st.save_as in produced_at:
+                return (f"Error: step {i + 1} re-binds 'save_as' name "
+                        f"{st.save_as!r} already bound by step "
+                        f"{produced_at[st.save_as] + 1} — use a distinct name.")
+            produced_at[st.save_as] = i
+    if not produced_at:
+        return None
+    if mode == "parallel":
+        return ("Error: 'save_as' data-flow requires mode='sequential' — "
+                "parallel steps start simultaneously, so a step cannot "
+                "consume a sibling's result.")
+    for i, st in enumerate(steps):
+        if not isinstance(st.param_template, dict):
+            continue
+        for key, v in st.param_template.items():
+            if not isinstance(v, str) or "$" not in v:
+                continue
+            for mo in _VAR_RE.finditer(v):
+                nm = mo.group(1) or mo.group(2)
+                src = produced_at.get(nm)
+                if src is None:
+                    continue  # runtime param — supplied by the caller
+                if src == i:
+                    return (f"Error: step {i + 1} param {key!r} references "
+                            f"${nm}, which the SAME step produces — a step "
+                            f"cannot consume its own output.")
+                if src > i:
+                    return (f"Error: step {i + 1} param {key!r} references "
+                            f"${nm}, but step {src + 1} produces it — "
+                            f"bindings only flow forward. Reorder the steps.")
+    return None
+
 
 def _cap_step_result(result_str: str, limit: int = MAX_STEP_RESULT_CHARS) -> str:
     """Bound a single step's result body, marking any truncation EXPLICITLY.
@@ -110,6 +172,13 @@ class SkillStep:
     branch_condition: str = ""  # e.g., "error" means branch if result contains error
     branch_target: str = ""     # Name of the alternative step sequence to follow
     optional: bool = False      # If True, failure doesn't abort the macro
+    # DATA-FLOW (2026-07-11): bind this step's result to a name that LATER
+    # steps can interpolate as `$name`. Without it a macro could only ever
+    # substitute the macro's INITIAL params, so a step could never consume
+    # the previous step's output — "fetch → transform → act on the fetched
+    # value" was inexpressible and every real pipeline had to be driven
+    # turn-by-turn by the main model.
+    save_as: str = ""
 
     def to_dict(self) -> dict:
         d = {
@@ -122,6 +191,8 @@ class SkillStep:
             d["branch_target"] = self.branch_target
         if self.optional:
             d["optional"] = True
+        if self.save_as:
+            d["save_as"] = self.save_as
         return d
 
 
@@ -332,12 +403,23 @@ class ComposedSkillRegistry:
             # the LLM — they await user approval first.
             if skill.status != "active":
                 continue
+            # Referenced names minus names BOUND by an earlier step's
+            # `save_as`: an internally-produced value is not a runtime
+            # param, so advertising it would ask the LLM to supply
+            # something the pipeline computes for itself.
             param_keys: set = set()
+            produced: set = set()
             for step in skill.steps:
                 if isinstance(step.param_template, dict):
                     for v in step.param_template.values():
-                        if isinstance(v, str) and v.startswith("$"):
-                            param_keys.add(v[1:])
+                        if isinstance(v, str) and "$" in v:
+                            for mo in _VAR_RE.finditer(v):
+                                nm = mo.group(1) or mo.group(2)
+                                if nm not in produced:
+                                    param_keys.add(nm)
+                if step.save_as:
+                    produced.add(step.save_as)
+            param_keys -= produced
             properties = {
                 k: {"type": "string", "description": f"Runtime value for ${k}."}
                 for k in sorted(param_keys)
@@ -363,16 +445,38 @@ class ComposedSkillRegistry:
 
     @staticmethod
     def _resolve_args(step: "SkillStep", params: Dict[str, Any]) -> Dict[str, Any]:
-        """Resolve a step's `$variable` param templates against runtime params."""
+        """Resolve a step's `$variable` param templates.
+
+        ``params`` is the live binding scope: the macro's initial runtime
+        params PLUS any earlier step's result bound via its ``save_as``
+        (see ``_execute_sequential``) — that union is what makes real
+        pipelines expressible ("fetch → transform → act on the fetched
+        value"). Two forms:
+
+        * whole-value  — ``"$var"`` substitutes the binding as-is;
+        * interpolated — ``"summarize: $var"`` / ``"${var}"`` substitutes
+          into surrounding text (so a step can wrap a prior result in a
+          prompt or a shell command).
+
+        An UNresolved name becomes ``""`` (a missing value), never the
+        literal ``"$var"`` — otherwise the tool receives ``location="$city"``.
+        """
         resolved_args = {}
         for k, v in step.param_template.items():
-            if isinstance(v, str) and v.startswith("$"):
-                # Resolve $var against runtime params. An UNresolved template
-                # must become "" (a missing value), not the literal "$var" —
-                # otherwise the step tool receives e.g. location="$city".
-                resolved_args[k] = params.get(v[1:], "")
-            else:
+            if not isinstance(v, str) or "$" not in v:
                 resolved_args[k] = v
+                continue
+            m = _WHOLE_VAR_RE.fullmatch(v.strip())
+            if m:
+                # Whole-value: keep the binding's native type (a step could
+                # bind a non-str via save_as in a future caller).
+                resolved_args[k] = params.get(m.group(1), "")
+            else:
+                def _sub(mo):
+                    # Two alternations (${var} | $var) — exactly one group hits.
+                    name = mo.group(1) or mo.group(2)
+                    return str(params.get(name, ""))
+                resolved_args[k] = _VAR_RE.sub(_sub, v)
         return resolved_args
 
     async def execute(self, skill_name: str,
@@ -408,9 +512,22 @@ class ComposedSkillRegistry:
     async def _execute_sequential(self, skill: "ComposedSkill",
                                   executor: Callable,
                                   params: Dict[str, Any]) -> Dict[str, Any]:
-        """Run steps in order, honouring conditional branches and optional steps."""
+        """Run steps in order, honouring conditional branches and optional steps.
+
+        Maintains a live BINDING SCOPE (`scope`): the macro's initial params
+        plus every completed step's result bound under its ``save_as`` name.
+        Later steps interpolate those as ``$name`` — this is what makes a
+        macro a real pipeline rather than a fixed list of independent calls
+        (2026-07-11). A step's own args are resolved against the scope as it
+        stands when that step runs, so bindings only ever flow FORWARD.
+        """
         results = []
         success = True
+
+        # Copy: never mutate the caller's params dict (the same dict can be
+        # reused across executions of the same macro).
+        scope = dict(params)
+        bound: List[str] = []
 
         active_steps = list(skill.steps)
         step_idx = 0
@@ -431,18 +548,27 @@ class ComposedSkillRegistry:
                 break
             _executions += 1
             step = active_steps[step_idx]
-            resolved_args = self._resolve_args(step, params)
+            resolved_args = self._resolve_args(step, scope)
 
             try:
                 result = await executor(step.tool_name, resolved_args)
                 result_str = str(result)
                 # Classify from the RESULT (tools return error strings, not raises).
                 step_ok = _step_result_ok(result_str)
+                # Bind BEFORE the failure branch so an `optional` step that
+                # failed still exposes its (error) output to later steps that
+                # deliberately reference it — and a downstream step gets ""
+                # rather than a stale binding from a previous execution.
+                if step.save_as:
+                    scope[step.save_as] = result_str[:MAX_BOUND_VALUE_CHARS]
+                    if step.save_as not in bound:
+                        bound.append(step.save_as)
                 results.append({
                     "step": step.description,
                     "tool": step.tool_name,
                     "result": _cap_step_result(result_str),
                     "success": step_ok,
+                    **({"saved_as": step.save_as} if step.save_as else {}),
                 })
                 if not step_ok:
                     if not step.optional:
@@ -472,13 +598,16 @@ class ComposedSkillRegistry:
             step_idx += 1
 
         self.record_usage(skill.name, success)
-        return {
+        out = {
             "success": success,
             "results": results,
             "steps_completed": len(results),
             "total_steps": len(skill.steps),
             "mode": "sequential",
         }
+        if bound:
+            out["bound"] = bound
+        return out
 
     async def _execute_parallel(self, skill: "ComposedSkill",
                                 executor: Callable,
@@ -490,6 +619,13 @@ class ComposedSkillRegistry:
         ignored. Every step runs even if a sibling fails; a non-optional
         step failing marks the whole macro failed but never aborts the
         fan-out (we want the briefing's other panels regardless).
+
+        `save_as` DATA-FLOW likewise does not apply: steps start
+        simultaneously, so no step can observe a sibling's result. Bindings
+        are ignored here rather than silently resolving to "" — the
+        validation path (`_validate_dataflow`) rejects a parallel macro that
+        references a step-produced name, so this can't be authored by
+        accident.
         """
         async def _run_step(step: "SkillStep") -> Dict[str, Any]:
             resolved_args = self._resolve_args(step, params)
@@ -831,12 +967,22 @@ async def tool_manage_composed_skills(context=None, action: str = None,
             params = raw.get("params") or raw.get("param_template") or {}
             if not isinstance(params, dict):
                 return f"Error: step {i + 1} 'params' must be an object."
+            save_as = (raw.get("save_as") or raw.get("saveAs") or "").strip()
+            if save_as and not _BIND_NAME_RE.fullmatch(save_as):
+                return (f"Error: step {i + 1} 'save_as' must be a plain "
+                        f"identifier (letters/digits/underscore), got "
+                        f"{save_as!r}.")
             skill_steps.append(SkillStep(
                 tool_name=tool,
                 description=(raw.get("description") or f"Step {i + 1}"),
                 param_template=params,
                 optional=bool(raw.get("optional", False)),
+                save_as=save_as,
             ))
+
+        df_err = _validate_dataflow(skill_steps, mode)
+        if df_err:
+            return df_err
 
         skill = ComposedSkill(
             name=name,

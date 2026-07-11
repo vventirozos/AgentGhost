@@ -49,6 +49,38 @@ def _mark_foreground(agent, delta: int) -> None:
         pass
 
 
+def _sse_delta_text(chunk) -> str:
+    """Extract the assistant text from one SSE chunk the agent's streamer
+    emitted (``data: {"choices":[{"delta":{"content": "..."}}]}``).
+
+    Used to reconstruct what the user saw on the streamed-final-generation
+    path, which bypasses the finalize tail — without this a session would
+    record the user's message and no reply. Anything unparseable (the
+    ``[DONE]`` sentinel, an SSE comment, an error frame) contributes "".
+    """
+    try:
+        if isinstance(chunk, (bytes, bytearray)):
+            chunk = chunk.decode("utf-8", "replace")
+        if not isinstance(chunk, str):
+            return ""
+        out = []
+        for line in chunk.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            d = json.loads(payload)
+            for choice in (d.get("choices") or []):
+                text = (choice.get("delta") or {}).get("content")
+                if isinstance(text, str):
+                    out.append(text)
+        return "".join(out)
+    except Exception:  # noqa: BLE001 — accounting must never break the stream
+        return ""
+
+
 def get_agent(request: Request):
     return request.app.state.agent
 
@@ -380,10 +412,45 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         )
     model = requested_model or configured_model
     stream = body.get("stream", False)
-    
+
     # Extract Request ID if provided (for Slack Bot correlation)
     request_id = request.headers.get("X-Request-ID")
-    
+
+    # ---- durable sessions (2026-07-11) --------------------------------
+    # With `session_id`, the SERVER is the source of truth for history: the
+    # stored conversation is merged into this request, and the turn is
+    # appended after it completes. `merge_history` tolerates both client
+    # styles — a thin client sending only the new message, and a fat client
+    # (today's web UI) replaying the whole conversation — so a fat client
+    # can't double the history. Absent `session_id`, behaviour is exactly as
+    # before (fully client-carried), so every existing client keeps working.
+    _session_id = body.get("session_id")
+    _sess_store = None
+    _new_msgs = []
+    if _session_id:
+        from ..core.sessions import get_session_store, merge_history
+        _sess_store = get_session_store(agent.context)
+        if _sess_store is not None:
+            _existing = _sess_store.get(str(_session_id))
+            _stored = _existing.messages if _existing is not None else []
+            _merged = merge_history(_stored, messages)
+            # Everything past the stored prefix is what THIS turn adds.
+            _new_msgs = _merged[len(_stored):]
+            body["messages"] = _merged
+            messages = _merged
+
+    def _persist_session(assistant_text: str) -> None:
+        """Append this turn (new user messages + the reply) to the session.
+        Runs AFTER the turn, so a failed turn never leaves a dangling user
+        message with no reply. Never raises into the response path."""
+        if _sess_store is None or not _session_id or not _new_msgs:
+            return
+        try:
+            _sess_store.append_turn(str(_session_id), _new_msgs,
+                                    str(assistant_text or ""))
+        except Exception:  # noqa: BLE001
+            _log_internal_error("session append")
+
     if stream:
         headers = {
             "Cache-Control": "no-cache",
@@ -413,10 +480,18 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
                 content, created_time, req_id = await agent.handle_chat(body, background_tasks, request_id=request_id)
 
                 if hasattr(content, '__aiter__'):
+                    # Streamed final generation: accumulate the deltas so the
+                    # session records what the user actually saw (this path
+                    # bypasses the finalize tail, so nothing else knows the
+                    # text). Parse-failure of a chunk just contributes nothing.
+                    _acc = []
                     async for chunk in content:
                         content_started = True
+                        _acc.append(_sse_delta_text(chunk))
                         yield chunk
+                    _persist_session("".join(_acc))
                 else:
+                    _persist_session(content)
                     async for chunk in agent.context.llm_client.stream_openai(model, content, created_time, req_id):
                         content_started = True
                         yield chunk
@@ -474,6 +549,8 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         )
     finally:
         _mark_foreground(agent, -1)
+
+    _persist_session(content)
 
     return JSONResponse({
         "id": f"chatcmpl-{req_id}", "object": "chat.completion", "created": created_time, "model": model,
@@ -720,6 +797,182 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
         # Don't leak internal exception text to the client.
         _eid = _log_internal_error("workspace/load")
         raise HTTPException(status_code=500, detail=f"Workspace load failed (error id {_eid}).")
+
+@router.get("/api/sessions", dependencies=[Security(verify_api_key)])
+async def sessions_list(request: Request, limit: int = 50):
+    """Durable server-side conversations, most recently updated first.
+
+    Summaries only (id / title / timestamps / message_count) — a session list
+    must stay cheap. Fetch bodies with GET /api/sessions/{id}."""
+    agent = get_agent(request)
+    from ..core.sessions import get_session_store
+    store = get_session_store(agent.context)
+    if store is None:
+        return JSONResponse({"enabled": False, "sessions": []})
+    return JSONResponse({"enabled": True, "sessions": store.list(limit=limit)})
+
+
+@router.post("/api/sessions", status_code=201,
+             dependencies=[Security(verify_api_key)])
+async def sessions_create(request: Request):
+    """Create an empty session; returns its id. Optional body {"title": ...}.
+    (Clients may also just POST /api/chat with a fresh `session_id` — the
+    session is created on first append.)"""
+    agent = get_agent(request)
+    from ..core.sessions import get_session_store
+    store = get_session_store(agent.context)
+    if store is None:
+        raise HTTPException(status_code=503, detail="sessions are not enabled")
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    title = (body or {}).get("title") if isinstance(body, dict) else ""
+    sess = store.create(title=str(title or ""))
+    if sess is None:
+        raise HTTPException(status_code=500, detail="session create failed")
+    return JSONResponse(sess.summary(), status_code=201)
+
+
+@router.get("/api/sessions/{session_id}", dependencies=[Security(verify_api_key)])
+async def sessions_get(request: Request, session_id: str):
+    """Full conversation (including messages) — used to RESUME a session on a
+    different client than the one that started it."""
+    agent = get_agent(request)
+    from ..core.sessions import get_session_store
+    store = get_session_store(agent.context)
+    if store is None:
+        raise HTTPException(status_code=503, detail="sessions are not enabled")
+    sess = store.get(session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return JSONResponse(sess.to_dict())
+
+
+@router.delete("/api/sessions/{session_id}", dependencies=[Security(verify_api_key)])
+async def sessions_delete(request: Request, session_id: str):
+    agent = get_agent(request)
+    from ..core.sessions import get_session_store
+    store = get_session_store(agent.context)
+    if store is None:
+        raise HTTPException(status_code=503, detail="sessions are not enabled")
+    if not store.delete(session_id):
+        raise HTTPException(status_code=404, detail="session not found")
+    return JSONResponse({"deleted": True, "id": session_id})
+
+
+@router.get("/api/turns", dependencies=[Security(verify_api_key)])
+async def turns_list(request: Request):
+    """In-flight turns — the one holding the global turn lock plus anything
+    queued behind it. Turns are serialized (Semaphore(1)), so this is how you
+    see WHY the agent appears unresponsive."""
+    agent = get_agent(request)
+    from ..core.turns import get_turn_registry
+    reg = get_turn_registry(agent)
+    turns = reg.list()
+    current = reg.current()
+    return JSONResponse({
+        "turns": [t.to_dict() for t in turns],
+        "running": current.req_id if current is not None else None,
+        "queued": sum(1 for t in turns if not t.running),
+    })
+
+
+@router.post("/api/turn/cancel", dependencies=[Security(verify_api_key)])
+async def turn_cancel(request: Request):
+    """Cancel an in-flight turn and RELEASE the global turn lock.
+
+    Body: ``{"request_id": "...", "hard": false}`` — ``request_id`` defaults
+    to the currently-running turn. Cooperative by default (the turn stops at
+    its next boundary and returns partial work); ``hard=true`` cancels the
+    asyncio task outright, which is the guaranteed release for a turn wedged
+    inside a long upstream call. A QUEUED turn is always hard-cancelled.
+
+    This is the real thing: the interface's /api/chat/cancel only stops the
+    proxy's buffered stream, leaving the agent working and the lock held.
+    """
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            body = {}
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        body = {}
+    from ..core.turns import get_turn_registry
+    result = get_turn_registry(agent).cancel(
+        body.get("request_id") or None,
+        hard=bool(body.get("hard", False)),
+    )
+    return JSONResponse(result, status_code=200 if result.get("cancelled")
+                        else 404)
+
+
+@router.get("/api/notifications/pending", dependencies=[Security(verify_api_key)])
+async def notifications_pending(request: Request, consumer: str = "default",
+                                limit: int = 50):
+    """Undelivered notify-severity autonomous-activity records for an
+    external deliverer (e.g. the Slack bot), watermarked per ``consumer``.
+
+    Contract: poll this, deliver the records, then POST the returned
+    ``watermark`` to ``/api/notifications/ack`` — records are only
+    considered delivered once acked, so a deliverer crash re-serves them.
+    A consumer that has never acked is BASELINED to end-of-ledger (no
+    historical replay on first contact — mirrors the digest's silent
+    first-run baseline)."""
+    agent = get_agent(request)
+    from ..core.autonomous_activity import (
+        get_activity_log, load_consumer_offset, SEVERITY_NOTIFY,
+    )
+    log = get_activity_log(agent.context)
+    if log is None:
+        return JSONResponse({"enabled": False, "records": [], "watermark": 0})
+    from pathlib import Path as _Path
+    consumers_path = (_Path(str(agent.context.memory_dir)).parent
+                      / "notify_consumers.json")
+    offset = load_consumer_offset(consumers_path, consumer)
+    if offset is None:
+        # First contact: baseline silently. The caller acks this watermark
+        # and subsequent polls return only NEW records.
+        return JSONResponse({"enabled": True, "records": [],
+                             "watermark": log.current_offset(),
+                             "baseline": True})
+    try:
+        limit = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    records, new_offset = log.read_since(offset, limit=limit,
+                                         severity=SEVERITY_NOTIFY)
+    return JSONResponse({
+        "enabled": True,
+        "records": [r.to_dict() for r in records],
+        "watermark": new_offset,
+    })
+
+
+@router.post("/api/notifications/ack", dependencies=[Security(verify_api_key)])
+async def notifications_ack(request: Request):
+    """Advance a consumer's delivery watermark (see /api/notifications/pending)."""
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+        consumer = str(body.get("consumer") or "default")
+        watermark = int(body.get("watermark"))
+    except (json.JSONDecodeError, ValueError, TypeError, KeyError) as e:
+        return JSONResponse(
+            {"error": {"message": f"invalid ack body: {e}",
+                       "type": "InvalidRequestShape"}},
+            status_code=400,
+        )
+    from ..core.autonomous_activity import save_consumer_offset
+    from pathlib import Path as _Path
+    consumers_path = (_Path(str(agent.context.memory_dir)).parent
+                      / "notify_consumers.json")
+    save_consumer_offset(consumers_path, consumer, watermark)
+    return JSONResponse({"ok": True, "consumer": consumer,
+                         "watermark": watermark})
+
 
 @router.post("/api/memory/correct", dependencies=[Security(verify_api_key)])
 async def memory_correct(request: Request):

@@ -21,34 +21,88 @@
 </aside>
 <main>
   <h1>interface / externals / slack_bot / main.py</h1>
-  <p class="subtitle">Async Slack bot using <code>slack_bolt</code> Socket Mode. Maintains per-thread context, downloads user files into the sandbox, posts emoji status updates while streaming.</p>
+  <p class="subtitle"><strong>OWNER-LOCKED</strong> async Slack client
+  (<code>slack_bolt</code> Socket Mode), rewritten 2026-07-11. Replies to
+  exactly ONE Slack user, fail-closed; also the delivery leg for the agent's
+  outbound notifications. Tests:
+  <code>tests/test_slack_bot_owner_lock.py</code> (31).</p>
+
+  <h2>Owner lock (2026-07-11)</h2>
+  <p>The bot previously answered <em>any</em> workspace member — full agent
+  (and tool) access for anyone who could DM it. Now:</p>
+  <ul>
+    <li><strong>Startup is fail-closed.</strong> The owner is resolved from
+    <code>GHOST_SLACK_OWNER</code> (a Slack user id, <code>U…</code>) or
+    looked up from <code>GHOST_SLACK_OWNER_EMAIL</code> via
+    <code>users.lookupByEmail</code> (needs the <code>users:read.email</code>
+    scope). With neither resolvable the bot <strong>refuses to start</strong> —
+    an unlocked bot must never run by accident.</li>
+    <li><strong>Every event passes <code>is_owner_message</code></strong>:
+    authored by the owner, not bot-authored, not a message subtype
+    (edits/deletes/joins carry mutated payloads). Everyone else is
+    <strong>ignored silently</strong> — a reply would confirm the bot exists
+    and invite probing; attempts are logged (user + channel) as the audit
+    trail.</li>
+    <li><strong>Thread context is owner-filtered too</strong> — only the
+    owner's messages and the bot's own replies are forwarded to the agent.
+    This is part of the authorization boundary, not a convenience: without it
+    a third party could seed a shared-channel thread with prompt content (or
+    file attachments) that the owner's next mention would forward as trusted
+    history. Files are ingested from the OWNER only.</li>
+  </ul>
 
   <h2>Event handlers</h2>
   <table>
     <thead><tr><th>Event</th><th>Behaviour</th></tr></thead>
     <tbody>
-      <tr><td><code>app_mention</code></td><td>Build full thread context, run <code>_process_message()</code>.</td></tr>
-      <tr><td><code>message</code> (DM only)</td><td>Same flow, filtered to non-bot DMs.</td></tr>
+      <tr><td><code>app_mention</code></td><td>Owner gate → owner-filtered thread context → <code>_process_message()</code>.</td></tr>
+      <tr><td><code>message</code> (DM only)</td><td>Same flow; <code>channel_type == "im"</code> plus the owner gate.</td></tr>
     </tbody>
   </table>
 
   <h2>Per-message flow</h2>
   <ol>
-    <li>Generate an 8-char <code>request_id</code>.</li>
-    <li>Spawn <code>tail_logs</code> task to monitor the agent log file for matching <code>request_id</code> markers and update emoji status.</li>
-    <li>Download any file attachments via <code>download_slack_file()</code> into <code>$GHOST_SANDBOX_DIR</code>; inject system notes about the new files.</li>
-    <li>POST to <code>$GHOST_API_URL</code> with <code>X-Ghost-Key</code>.</li>
-    <li>Strip image-markdown from the response and re-upload extracted images via <code>files_upload_v2()</code>.</li>
-    <li>Cancel <code>tail_logs</code> on completion.</li>
+    <li>Generate an 8-char <code>request_id</code>, sent as <code>X-Request-ID</code>.</li>
+    <li>Spawn <code>tail_logs</code> for live emoji status (below).</li>
+    <li>Ingest the owner's attachments via <strong><code>POST /api/upload</code></strong>
+    (multipart, <code>X-Ghost-Key</code>) — the old path wrote directly into a
+    locally-mounted sandbox dir, which required the bot to share a filesystem
+    (and exact path) with the agent; the API enforces its own containment and
+    project scoping. Slack filenames are <code>basename()</code>d as
+    defense-in-depth (attacker-controlled metadata).</li>
+    <li>POST to <code>$GHOST_API_URL</code>. <strong>No <code>model</code>
+    field</strong> — the agent 404s any mismatched name (the old pinned model
+    name broke every request after a model upgrade); omitting it always
+    matches the configured model.</li>
+    <li>Strip image-markdown from the reply, fetch each image via
+    <code>/api/download</code> (authed), upload to Slack with
+    <code>files_upload_v2</code> from memory (no local temp files).</li>
   </ol>
 
-  <h2>State</h2>
-  <ul>
-    <li><code>USER_CACHE</code> — user_id → real_name mapping.</li>
-    <li><code>BOT_USER_ID</code> — cached bot identity.</li>
-    <li><code>MAINTENANCE_MODE</code> — flag to skip processing (set with <code>--maintenance</code> CLI flag).</li>
-    <li><code>LOG_FILE_PATH</code> — agent log path (<code>--log-file</code>).</li>
-  </ul>
+  <h2>Live status (fixed 2026-07-11)</h2>
+  <p>The old tailer grepped for <code>[{request_id}]</code>, which the pretty
+  stream never prints — the full id appears ONLY on the request's BEGIN frame
+  (then a 2-char tag), so the status feature had never matched a single line.
+  <code>scan_log_line</code> (pure, tested) now <strong>arms</strong> on the
+  BEGIN frame carrying our 8-char id, attributes emoji lines to our request
+  until the END frame, and disarms — sound because agent turns are globally
+  serialized (exactly one foreground request per BEGIN/END window). Default
+  log path corrected to the agent's live stream
+  (<code>/Users/vasilis/Data/AI/Logs/ghost-agent.log</code>; override with
+  <code>GHOST_AGENT_LOG</code> or <code>--log-file</code>). The emoji map is
+  synced to the current <code>Icons</code> set.</p>
+
+  <h2>Outbound notifications</h2>
+  <p><code>notification_poller</code> polls
+  <code>/api/notifications/pending</code> (consumer <code>"slack"</code>) and
+  posts notify-severity autonomous events (needs-user project tasks,
+  scheduled-turn conclusions — see
+  <a href="../core/autonomous_activity.html">core.autonomous_activity</a>),
+  acking AFTER <code>chat_postMessage</code> so a mid-delivery crash re-serves
+  rather than drops. Destination: <code>GHOST_NOTIFY_SLACK_CHANNEL</code> if
+  set (<code>C…</code>/<code>U…</code>; <code>off</code> disables), otherwise
+  <strong>a DM to the owner</strong> — push works out of the box on an
+  owner-locked bot.</p>
 
   <h2>Slash command router</h2>
   <p><code>interface/slack_project_commands.py</code> is a stateless <code>shlex</code>-based router for <code>/project ...</code> commands:</p>
@@ -58,14 +112,52 @@
     <li><code>advance</code> — async-only; the placeholder response triggers <code>advance_async()</code> in the bot handler, which calls <code>core.project_advancer.advance_once()</code>.</li>
   </ul>
 
+  <h2>Launcher (<code>run.sh</code>, fixed 2026-07-11)</h2>
+  <p>Runs the bot on the <strong>agent venv's python</strong> (the bare
+  homebrew <code>python3</code> lacks <code>slack_bolt</code>/<code>httpx</code>
+  — same class of gotcha as the agent launcher's uvicorn; override with
+  <code>GHOST_BOT_PYTHON</code>). Loads <code>.env</code> from the
+  <em>script's</em> directory via <code>set&nbsp;-a</code> + source (the old
+  <code>export $(cat .env | xargs)</code> word-split any value containing
+  spaces, and resolved <code>.env</code> against whatever directory you
+  invoked it from). Pre-flights every hard requirement — both Slack tokens,
+  <code>GHOST_API_KEY</code>, and the <strong>owner lock</strong> — so a
+  misconfigured launch fails with instructions instead of a traceback, and
+  <code>exec</code>s python so supervisor signals reach the bot directly.</p>
+
   <h2>Environment</h2>
   <div class="kv">
     <dt>SLACK_BOT_TOKEN</dt><dd>bot token for API calls.</dd>
     <dt>SLACK_APP_TOKEN</dt><dd>app-level token for Socket Mode.</dd>
+    <dt>GHOST_SLACK_OWNER</dt><dd><strong>the owner lock</strong> — your Slack user id (<code>U…</code>; profile → ⋯ → "Copy member ID"). Required unless the email fallback resolves.</dd>
+    <dt>GHOST_SLACK_OWNER_EMAIL</dt><dd>email fallback for the owner lock (needs <code>users:read.email</code>).</dd>
     <dt>GHOST_API_URL</dt><dd>Default <code>http://localhost:8000/api/chat</code>.</dd>
-    <dt>GHOST_API_KEY</dt><dd>Same value the agent expects.</dd>
-    <dt>GHOST_SANDBOX_DIR</dt><dd>Where uploads land (default <code>/tmp/sandbox</code>).</dd>
+    <dt>GHOST_API_KEY</dt><dd>Same value the agent expects. Must be SET (no default), but may be <strong>explicitly empty</strong> (<code>GHOST_API_KEY=</code>) when the agent runs with auth disabled (<code>--api-key ""</code>) — then no <code>X-Ghost-Key</code> header is sent at all. Do NOT pad it with a space: whitespace reaches httpx as an illegal header value and breaks every call (<code>Illegal header value b' '</code> — observed live 2026-07-11, now stripped + guarded).</dd>
+    <dt>GHOST_AGENT_LOG</dt><dd>agent pretty-log stream for live status (default <code>/Users/vasilis/Data/AI/Logs/ghost-agent.log</code>).</dd>
+    <dt>GHOST_NOTIFY_SLACK_CHANNEL</dt><dd>notification destination; default = owner DM; <code>off</code> disables.</dd>
+    <dt>GHOST_NOTIFY_POLL_SECONDS</dt><dd>poll cadence (default 30).</dd>
   </div>
+
+  <h2>Autostart (launchd, 2026-07-11)</h2>
+  <p><code>com.local.ghost-slackbot.plist</code> ships next to the bot
+  (template; <code>plutil -lint</code> clean). It runs <code>run.sh</code>
+  under a user LaunchAgent with <code>KeepAlive</code> — the same ops model
+  as the prod agent: a plain <code>kill</code> of the bot process is a
+  restart/deploy; to actually stop it, <code>bootout</code> the job.
+  Secrets live in the sibling <code>.env</code> (<code>chmod 600</code>,
+  start from <code>.env.example</code>, never commit it), NOT in the plist.
+  <code>ThrottleInterval=30</code> keeps a misconfigured launch (pre-flight
+  exit 1) from tight-looping. Install:</p>
+  <pre>cp .env.example .env &amp;&amp; $EDITOR .env &amp;&amp; chmod 600 .env
+cp com.local.ghost-slackbot.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.ghost-slackbot.plist</pre>
+  <p>Status: <code>launchctl print gui/$(id -u)/com.local.ghost-slackbot</code> ·
+  deploy: <code>launchctl kickstart -k gui/$(id -u)/com.local.ghost-slackbot</code> ·
+  stop: <code>launchctl bootout gui/$(id -u)/com.local.ghost-slackbot</code>.
+  Note: a <em>user</em> LaunchAgent runs while you are logged in; the prod
+  agent's root-installed job survives without a login session — mirror that
+  setup (sudo, <code>/Library/LaunchAgents</code>) only if the bot must run
+  headless.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

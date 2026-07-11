@@ -414,6 +414,28 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                          f"code build failed: {cres.summary}", None)
 
 
+def _record_needs_user_activity(context, project_id, description, kind) -> None:
+    """Push a needs-user/human-gate outcome into the autonomous-activity
+    ledger (severity=notify → immediate outbound push when configured).
+    The next-turn DIGEST already renders these via core.project_digest —
+    the activity-digest renderer therefore EXCLUDES the "project" phase
+    (DIGEST_EXCLUDED_PHASES); this record exists purely so a blocked
+    project can reach the operator without them opening a chat.
+    Fail-safe: never raises."""
+    try:
+        from .autonomous_activity import get_activity_log, SEVERITY_NOTIFY
+        log = get_activity_log(context)
+        if log is not None:
+            log.record(
+                "project",
+                f"project task needs your input: {str(description)[:160]}",
+                severity=SEVERITY_NOTIFY,
+                kind=str(kind), project_id=str(project_id),
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("needs-user activity record skipped: %s", e)
+
+
 async def advance_once(
     context,
     project_id: str,
@@ -523,6 +545,8 @@ async def advance_once(
                            result="flagged for human review")
         store.log_event(project_id, nxt.id, "autoadvance_needs_user",
                         {"description": nxt.description})
+        _record_needs_user_activity(context, project_id, nxt.description,
+                                    "autoadvance_needs_user")
         _increment_budget(store, project_id)
         return AdvanceResult(True, nxt.id, "needs_user",
                              "task requires human input")
@@ -538,6 +562,8 @@ async def advance_once(
                            result=f"human gate: {_gate_reason}")
         store.log_event(project_id, nxt.id, "human_gate_triggered",
                         {"reason": _gate_reason})
+        _record_needs_user_activity(context, project_id, nxt.description,
+                                    "human_gate_triggered")
         _increment_budget(store, project_id)
         return AdvanceResult(True, nxt.id, "needs_user",
                              f"human gate: {_gate_reason}")
@@ -675,6 +701,8 @@ async def advance_once(
         )
         store.log_event(project_id, nxt.id, "human_gate_triggered",
                         {"reason": gate_reason, "tool": tool_name})
+        _record_needs_user_activity(context, project_id, nxt.description,
+                                    "human_gate_triggered")
         _increment_budget(store, project_id)
         return AdvanceResult(True, nxt.id, "needs_user",
                              f"human gate: {gate_reason}", artifact_id)

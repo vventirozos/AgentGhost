@@ -2375,6 +2375,20 @@ class GhostAgent:
             return True
         return random.random() < p
 
+    def _record_autonomous_activity(self, phase, summary,
+                                    severity: str = "info", **meta) -> None:
+        """Best-effort sink of an idle-phase outcome into the
+        autonomous-activity ledger (core.autonomous_activity) so it reaches
+        the operator via the next-turn digest and, for severity="notify",
+        the outbound push transports. Fail-safe by contract: activity
+        logging must never break a phase."""
+        try:
+            log = getattr(self.context, "activity_log", None)
+            if log is not None:
+                log.record(phase, summary, severity=severity, **meta)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("autonomous-activity record skipped: %s", e)
+
     async def _biological_tick(self):
         """One pass of the biological hook state machine. Extracted from the
         loop for direct unit testing."""
@@ -2514,6 +2528,9 @@ class GhostAgent:
                         self._last_dream_at = datetime.datetime.now()
                         try:
                             await dreamer.dream(model_name=getattr(ctx.args, 'model', 'default'))
+                            self._record_autonomous_activity(
+                                "dream",
+                                "REM cycle ran (memory consolidation / heuristic harvest)")
                         finally:
                             # Do NOT reset ctx.last_activity_time here —
                             # see the comment in phase 1. Resetting it
@@ -2578,6 +2595,9 @@ class GhostAgent:
                             f"Reflection complete: {report.summary()}",
                             icon=Icons.BRAIN_THINK,
                         )
+                        if getattr(report, 'outcomes', None):
+                            self._record_autonomous_activity(
+                                "reflection", report.summary())
                         # Reflection → self-play curriculum (proposal
                         # item #7): record which clusters the reflected
                         # failures belong to, so phase-3 self-play can
@@ -2654,6 +2674,11 @@ class GhostAgent:
                             pm_report.summary(),
                             icon=Icons.BRAIN_THINK,
                         )
+                        if getattr(pm_report, 'queued', 0):
+                            self._record_autonomous_activity(
+                                "postmortem",
+                                f"{pm_report.queued} defect report(s) filed "
+                                f"for review: {pm_report.summary()}")
                     except Exception as e:
                         logger.warning(f"Post-mortem phase failed: {e}")
                     finally:
@@ -2767,6 +2792,12 @@ class GhostAgent:
                                     f"(from {report.n_trajectories_seen} trajectories)",
                                     icon=Icons.BRAIN_PLAN,
                                 )
+                                if _graduated:
+                                    self._record_autonomous_activity(
+                                        "skills_auto",
+                                        f"graduated {_graduated} proven skill(s) "
+                                        f"from {report.n_trajectories_seen} "
+                                        f"trajectories")
                     except Exception as e:
                         logger.warning(f"Skills auto-extraction failed: {e}")
                     finally:
@@ -2856,6 +2887,10 @@ class GhostAgent:
                                 f"value model refit on idle: {report.summary()}{mcts_note}",
                                 icon=Icons.BRAIN_PLAN,
                             )
+                            self._record_autonomous_activity(
+                                "prm_train",
+                                f"value model refit: {report.summary()}"
+                                f"{mcts_note}")
                         else:
                             logger.debug(
                                 "PRM idle retrain skipped: %s",
@@ -2915,6 +2950,9 @@ class GhostAgent:
                                 f"router now routing (was escalate-all)",
                                 icon=Icons.BRAIN_PLAN,
                             )
+                            self._record_autonomous_activity(
+                                "router_train",
+                                f"complexity router refit: {report.summary()}")
                         elif _new_clf is not None and not _new_clf.is_finite():
                             logger.warning(
                                 "Router idle retrain produced a non-finite model "
@@ -2972,6 +3010,12 @@ class GhostAgent:
                             lam=params.lambda_uncertainty,
                             brier=params.brier, n=params.n_samples,
                         )
+                        self._record_autonomous_activity(
+                            "calibration",
+                            f"confidence recalibrated "
+                            f"(τ={params.threshold:.2f}, "
+                            f"Brier={params.brier:.3f}, "
+                            f"n={params.n_samples})")
                     else:
                         logger.debug("calibration refit produced no fit (thin/single-class)")
                 except Exception as e:
@@ -3203,6 +3247,10 @@ class GhostAgent:
                                 f"{len(stale)} stale open question(s) carried >3d — re-engage: {preview}",
                                 icon=Icons.SELF_STATE,
                             )
+                            self._record_autonomous_activity(
+                                "open_questions",
+                                f"{len(stale)} open question(s) carried "
+                                f">3 days: {preview}")
                     except Exception as e:
                         logger.debug(f"stale-question surfacing failed: {e}")
                     finally:
@@ -3268,6 +3316,10 @@ class GhostAgent:
                         model_name=getattr(ctx.args, 'model', 'default'),
                         is_background=True
                     )
+                    self._record_autonomous_activity(
+                        "self_play",
+                        "synthetic self-play session ran (new lessons land "
+                        "in the skills playbook)")
                 finally:
                     ctx.last_activity_time = datetime.datetime.now()
                     self._last_selfplay_at = datetime.datetime.now()
@@ -7768,8 +7820,14 @@ class GhostAgent:
         # run baselines silently (no historical backlog dump).
         # Header-prepended so needs-user items lead the reply.
         try:
+            from .autonomous_activity import is_internal_request as _is_internal_req
             _ps = getattr(self.context, "project_store", None)
-            if _ps is not None and final_ai_content:
+            # Internal turns (cron jobs / delegated sub-agents firing
+            # handle_chat with a "sched-"/"job-"/"sub-" req_id) must not
+            # consume the digest watermark — that would silently eat the
+            # operator's next "while you were away" report.
+            if (_ps is not None and final_ai_content
+                    and not _is_internal_req(fs.req_id)):
                 from pathlib import Path as _Path
                 from .project_digest import (
                     summarize_since, render_digest,
@@ -7799,6 +7857,48 @@ class GhostAgent:
                         save_watermark(_wm_path, _dg.new_event_id)
         except Exception as _dgx:
             logger.debug(f"autoadvance digest skipped: {_dgx}")
+
+        # Background-activity digest — the ALL-PHASE companion of the
+        # project digest above (2026-07-11). Idle-phase outcomes (dream /
+        # reflection / post-mortem / skills graduation / PRM / router /
+        # calibration / self-play) and scheduled-turn conclusions recorded
+        # in core.autonomous_activity surface here, byte-offset
+        # watermarked so each batch shows exactly once; the first run
+        # baselines silently. Project-phase records are excluded from the
+        # render (the project digest above already covers them). Same
+        # internal-request gate as the project digest.
+        try:
+            from .autonomous_activity import (
+                get_activity_log as _get_alog,
+                is_internal_request as _is_internal_req2,
+                render_activity_digest as _render_adg,
+                load_offset as _act_load, save_offset as _act_save,
+            )
+            _alog = _get_alog(self.context)
+            if (_alog is not None and final_ai_content
+                    and not _is_internal_req2(fs.req_id)):
+                from pathlib import Path as _Path
+                _act_wm_path = (_Path(str(self.context.memory_dir)).parent
+                                / "activity_digest.json")
+                _act_wm = _act_load(_act_wm_path)
+                if _act_wm is None:
+                    # First run: baseline to EOF, show nothing.
+                    _act_save(_act_wm_path, _alog.current_offset())
+                else:
+                    _recs, _new_off = _alog.read_since(_act_wm)
+                    _adg = _render_adg(_recs)
+                    if _adg and _adg[:40] not in final_ai_content:
+                        final_ai_content = (
+                            f"{_adg}\n\n---\n\n{final_ai_content}")
+                        pretty_log(
+                            "Activity Digest",
+                            f"{len(_recs)} background record(s) surfaced",
+                            icon=Icons.ACTIVITY,
+                        )
+                    if _new_off > _act_wm:
+                        _act_save(_act_wm_path, _new_off)
+        except Exception as _adx:
+            logger.debug(f"activity digest skipped: {_adx}")
 
         # Chat→project promotion suggestion (advisory; previously unwired).
         # When a free-chat session accumulates enough turns / sandbox
@@ -7965,8 +8065,27 @@ class GhostAgent:
         except Exception:
             pass
 
+        # Register this turn BEFORE acquiring the semaphore (2026-07-11):
+        # turns are globally serialized, so a request QUEUED behind a runaway
+        # turn must be cancellable too — otherwise the only way out of a
+        # wedged turn is a restart. See core/turns.py.
+        from .turns import get_turn_registry, TurnCancelled
+        _turn_reg = get_turn_registry(self)
+        _active_turn = _turn_reg.register(
+            req_id,
+            preview=str((body.get("messages") or [{}])[-1].get("content") or "")
+            if isinstance(body.get("messages"), list) else "",
+            session_id=str(body.get("session_id") or ""),
+        )
+
         try:
             async with self.agent_semaphore:
+                _turn_reg.mark_running(req_id)
+                # A cancel that landed while we were queued: stop before doing
+                # any work (the flag is set; the task may not have been killed
+                # if it was already at the head of the queue).
+                if _turn_reg.is_cancelled(req_id):
+                    raise TurnCancelled(req_id, _active_turn.reason)
                 char_budget = int(self.context.args.max_context * 3.5)
                 pretty_log("Request Initialized", special_marker="BEGIN")
                 messages, model, stream_response = body.get("messages", []), body.get("model", "qwen-3.6-35b-a3"), body.get("stream", False)
@@ -8756,6 +8875,14 @@ class GhostAgent:
                 # runaway simulation can't silently chew through 40 turns.
                 effective_max_turns = getattr(self, "max_turns_override", None) or 40
                 for turn in range(effective_max_turns):
+                    # Cooperative cancellation boundary (2026-07-11). A user
+                    # who cancels gets a clean stop with whatever work is
+                    # already done, rather than a killed task — and the
+                    # semaphore is released either way. A turn wedged INSIDE a
+                    # long upstream call never reaches this line; that is what
+                    # `hard=true` (task.cancel()) is for. See core/turns.py.
+                    if _turn_reg.is_cancelled(req_id):
+                        raise TurnCancelled(req_id, _active_turn.reason)
                     self.context.last_activity_time = datetime.datetime.now() # Heartbeat
                     # Per-turn auto-repair bookkeeping: the verdict cache is
                     # only "fresh" for the post-loop gate if THIS turn reached
@@ -11067,7 +11194,27 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _verifier_verdict_cache=_verifier_verdict_cache,
                 ))
 
+        except TurnCancelled as _tc:
+            # Clean stop, not a crash: return whatever the turn produced
+            # before the cancel landed. Exiting through here unwinds the
+            # `async with self.agent_semaphore`, so the global turn lock is
+            # RELEASED — which is the whole point of cancellation (#22 made
+            # one wedged turn block the UI, Slack, and the idle loops alike).
+            pretty_log("Turn Cancelled",
+                       f"{req_id}: {_tc.reason}", icon=Icons.STOP)
+            _partial = ""
+            try:
+                _partial = str(locals().get("final_ai_content") or "")
+            except Exception:  # noqa: BLE001
+                _partial = ""
+            _note = f"_(Turn cancelled: {_tc.reason}.)_"
+            _content = (f"{_partial}\n\n{_note}" if _partial.strip()
+                        else f"{_note} No output was produced before the "
+                             f"cancellation.")
+            return _content, int(datetime.datetime.now().timestamp()), req_id
+
         finally:
+            _turn_reg.unregister(req_id)
             if 'messages' in locals(): del messages
             if 'tools_run_this_turn' in locals(): del tools_run_this_turn
             if 'sandbox_state' in locals(): del sandbox_state
@@ -11101,7 +11248,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             return text
         sep = GhostAgent._BANNER_SEP
         body = text
-        for _ in range(4):   # correction + digest + clarifying can co-occur
+        for _ in range(5):   # correction + clarifying + project digest +
+                             # activity digest can co-occur (+1 headroom)
             idx = body.find(sep)
             if 0 <= idx <= GhostAgent._BANNER_MAX_BLOCK:
                 body = body[idx + len(sep):]

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sandbox.services — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Sandbox</h3>
+    <a href="docker.html">docker</a>
+    <a class="current" href="services.html">services</a>
+    <a href="../tools/browser.html">tools.browser</a>
+    <a href="../tools/execute.html">tools.execute</a>
+  </nav>
+</aside>
+<main>
+  <h1>sandbox / services.py <span class="mono">+ tools/sandbox_services.py</span></h1>
+  <p class="subtitle">Supervised long-lived services inside the sandbox
+  container (2026-07-11): the <code>manage_services</code> tool lets the
+  agent start a web server or daemon that SURVIVES across turns — closing
+  the "can build an app, can't host it" gap.</p>
+
+  <h2>Why</h2>
+  <p><code>execute</code> wraps every command in <code>timeout -k 5s</code>
+  (600 s cap) and the container is PID-isolated, so anything the agent
+  started died with its exec. Yet the toolset strongly implies hosting:
+  it can write web apps (<code>file_system</code>), drive a browser at
+  them, and the container itself is persistent. The 2026-07 feature survey
+  flagged "build and host me a dashboard" as implied-but-impossible.</p>
+
+  <h2>How it works</h2>
+  <p>The command ships as a script via the bind mount
+  (<code>/workspace/.services/&lt;name&gt;.cmd.sh</code> — no quoting
+  hazards), then launches with <code>setsid nohup … &amp;</code>: the exec
+  shell exits immediately (satisfying the timeout wrapper) and the detached
+  process re-parents to the container's PID 1, surviving the exec, the
+  turn, and agent restarts (the container outlives the agent process).
+  <code>setsid</code> makes it a process-group leader so <code>stop</code>
+  can kill the whole tree (<code>kill -TERM -- -pid</code>, escalating to
+  KILL). Per-service pid, log (<code>&lt;name&gt;.log</code>), and a
+  host-side <code>registry.json</code> live under
+  <code>.services/</code>.</p>
+
+  <h2>Tool surface</h2>
+  <ul>
+    <li><code>start</code> — name + foreground command (+ recommended
+    <code>port</code>): launches, verifies liveness after ~1 s (an
+    immediate exit returns the log tail instead of registering), probes
+    the TCP port for up to ~6 s, registers, and reports the in-sandbox
+    URL.</li>
+    <li><code>stop</code> / <code>restart</code> — group-kill; restart
+    re-launches from the registered command/port/workdir.</li>
+    <li><code>status</code> — liveness (<code>kill -0</code>) + port
+    listening state + uptime for every registered service; a recreated
+    container shows them DEAD (pids don't survive re-provisioning).</li>
+    <li><code>logs</code> — host-side tail (default 60 lines, 8 KB cap).</li>
+  </ul>
+
+  <h2>Rails</h2>
+  <ul>
+    <li>Max <strong>5</strong> concurrent services; names
+    <code>[A-Za-z][A-Za-z0-9_-]{0,31}</code>.</li>
+    <li><strong>Ports 8000 / 8088 / 8080 / 9050 are refused</strong>
+    (agent API / upstream LLM — the sandbox-loopback blind spot and its
+    mock-server pathology — plus NetMon and Tor on a host-network Linux
+    box), as is any command referencing
+    <code>127.0.0.1:8000/:8088</code>. Suggested ports:
+    <strong>8100-8104</strong>.</li>
+  </ul>
+
+  <h2>Reachability</h2>
+  <ul>
+    <li><strong>In-sandbox</strong> (the browser tool's embedded runner,
+    <code>execute</code>): <code>http://127.0.0.1:&lt;port&gt;</code>.
+    The browser SSRF guard (host-side <code>_browser_blocked_url</code> AND
+    the in-runner interceptor) admits <em>explicit-loopback</em> URLs whose
+    port is in the service registry (<code>active_service_ports</code>,
+    threaded through the op payload as <code>allowed_local_ports</code>) —
+    literal hosts only, so no DNS/rebind surface; every other loopback /
+    internal target stays blocked.</li>
+    <li><strong>From the host (operator)</strong>: in <code>host</code>
+    network mode (Linux default) the service binds host ports directly. In
+    <code>bridge</code> mode (macOS default) docker.py publishes the
+    <code>GHOST_SANDBOX_SERVICE_PORTS</code> range (default
+    <code>8100-8104</code>, loopback-bound; empty disables) when the
+    container is (re)created — an existing container picks this up on its
+    next re-provision.</li>
+  </ul>
+
+  <p class="note"><strong>Fixed host ports must assume ≥2 agent instances.</strong>
+  A second sandbox container — a throwaway agent for an ablation, or the test
+  suite — cannot publish the same fixed host ports as the instance already
+  running. Two compounding failures made this bite (caught by the suite, now
+  fixed): <code>containers.run</code> fails outright on the taken port, AND a
+  port-bind failure leaves the container <strong>created-but-not-started</strong>,
+  so a naive retry-without-ports died with a 409 name-in-use — which propagated
+  and bricked the sandbox entirely. So: <code>publishable_service_ports()</code>
+  bind-checks each port on the host and publishes only the FREE ones (a second
+  agent silently gets no published ports — the right degradation, since
+  in-sandbox consumers reach the service on the container's own loopback
+  regardless), and the residual bind-race retry <strong>removes the stale
+  container before re-running</strong>.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_sandbox_services.py</code> (37) — port-spec parsing,
+  validation rails, lifecycle (start/immediate-exit/stop-group-kill/restart/
+  status/logs), registry-driven browser allowlist (host guard + the runner
+  guard exec'd functionally with playwright stubbed), tool arg-healing, and
+  docker.py publish + conflict-retry wiring.</p>
+</main>
+</body>
+</html>

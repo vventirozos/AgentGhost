@@ -130,6 +130,8 @@ def parse_args():
     parser.add_argument("--smart-memory", type=float, default=0.0)
     parser.add_argument("--anonymous", action="store_true", default=True, help="Always use anonymous search (Tor + DuckDuckGo)")
     parser.add_argument("--mandatory-tor", action=argparse.BooleanOptionalAction, default=_mandatory_tor_env_default(), help="Fail-closed Tor (DEFAULT ON): probe Tor liveness at boot (abort if unreachable) and install a process-wide guard that blocks any DIRECT connection to a public address. Anonymised traffic (via the loopback SOCKS proxy) and loopback/LAN infra are unaffected — only Tor-bypassing public egress is blocked. Makes the README's fail-closed promise real. Also forces HF offline (HF_HUB_OFFLINE/TRANSFORMERS_OFFLINE) so the local-only embedder loads from cache without the cleartext model-resolution call the guard would otherwise block — the embedding model must be pre-cached (it is after one normal run; on a cold install boot once with --no-mandatory-tor to download it). Opt out with --no-mandatory-tor or GHOST_MANDATORY_TOR=0.")
+    parser.add_argument("--notify-webhook", default=os.getenv("GHOST_NOTIFY_WEBHOOK", ""), help="Outbound push-notification webhook URL — one JSON POST ({title, body, severity, phase, ts}) per notify-severity autonomous event (needs-user project tasks, scheduled-turn conclusions, ...). Loopback/LAN/Tailscale targets connect directly; PUBLIC targets are only ever reached through the Tor SOCKS proxy (fail-closed: skipped when Tor is unavailable). Env fallback: GHOST_NOTIFY_WEBHOOK.")
+    parser.add_argument("--notify-ntfy", default=os.getenv("GHOST_NOTIFY_NTFY", ""), help="ntfy topic URL for outbound push (plain-text POST with Title/Priority headers), e.g. http://ghost.lan:8090/ghost-agent. Same egress rules as --notify-webhook. Env fallback: GHOST_NOTIFY_NTFY.")
     parser.add_argument("--no-redact-logs", action="store_true", default=False, help="Disable redaction of the monitored log stream. By default secrets / API keys / .onion addresses / home paths / PII are masked in the live console + file logs (the operator watches the stream, historically the largest cleartext sink). Pass this to see raw content while debugging.")
     parser.add_argument("--enable-preflight-guard", action=argparse.BooleanOptionalAction, default=True, help="Pre-flight repeat-failure guard (DEFAULT ON): before dispatching a tool call, block it if the same (tool, primary target) already failed the same way in the recent window, handing the model the prior error instead of re-running a known failure. The live counterpart to the offline post-mortem repeated-error fingerprint; idempotent setters are exempt. Disable with --no-enable-preflight-guard.")
     parser.add_argument("--perfect-it", action="store_true", help="Enable proactive optimization suggestions after successful heavy tasks")
@@ -449,6 +451,51 @@ async def lifespan(app):
             icon=Icons.WARN,
         )
 
+    # Autonomous-activity ledger + outbound notifier — the agent's "mouth"
+    # (2026-07-11). The ledger records idle-phase / scheduled-turn outcomes
+    # for the next-turn digest; notify-severity records additionally push
+    # through the notifier when a transport is configured (--notify-webhook
+    # / --notify-ntfy). Fail-safe: a broken ledger must never block boot.
+    try:
+        from .core.autonomous_activity import ActivityLog
+        from .utils.notify import notifier_from_config
+        _notifier = notifier_from_config(args, tor_proxy=context.tor_proxy)
+        context.outbound_notifier = _notifier
+        context.activity_log = ActivityLog(
+            Path(str(context.memory_dir)).parent / "autonomous_activity.jsonl",
+            on_notify=_notifier.send_soon if _notifier.configured else None,
+        )
+        pretty_log(
+            "Activity Ledger",
+            "autonomous-activity ledger ready"
+            + (" · outbound push ENABLED" if _notifier.configured
+               else " · no push transport (digest-only; set --notify-webhook"
+                    " / --notify-ntfy to enable)"),
+            icon=Icons.ACTIVITY,
+        )
+    except Exception as e:
+        pretty_log("Activity Ledger Failed", f"{type(e).__name__}: {e}",
+                   level="WARNING", icon=Icons.WARN)
+
+    # Durable server-side conversations (2026-07-11). History was previously
+    # client-carried only (browser localStorage / a Slack thread), so it was
+    # lost on a device switch and no two clients shared it. Sessions live in
+    # the API layer — the chat route merges stored history in and appends the
+    # turn after — so the agent's turn logic is untouched.
+    try:
+        from .core.sessions import SessionStore
+        context.session_store = SessionStore(
+            Path(str(context.memory_dir)).parent / "sessions")
+        pretty_log(
+            "Sessions",
+            "durable server-side conversations ready "
+            "(pass session_id to /api/chat; manage via /api/sessions)",
+            icon=Icons.MEM_SCRATCH,
+        )
+    except Exception as e:
+        pretty_log("Sessions Failed", f"{type(e).__name__}: {e}",
+                   level="WARNING", icon=Icons.WARN)
+
     # APScheduler — user-facing cron/interval scheduler for `manage_tasks`.
     # The agent's own biological rhythms (dream, skill-graduation, etc.)
     # still run on the native asyncio biological_watchdog; this scheduler
@@ -508,7 +555,20 @@ async def lifespan(app):
                 # work, so an empty shim is safe.
                 from fastapi import BackgroundTasks
                 bg = BackgroundTasks()
-                await context.agent.handle_chat(body, bg, request_id=f"sched-{job_id}")
+                _content, _, _ = await context.agent.handle_chat(
+                    body, bg, request_id=f"sched-{job_id}")
+                # The turn's CONCLUSION now reaches the operator via the
+                # activity ledger (next-turn digest + outbound push) —
+                # previously the final content was DISCARDED and only
+                # pass/fail landed in the workspace ledger, leaving the
+                # one genuinely end-to-end autonomous loop mute
+                # (2026-07-11 feature).
+                from .core.autonomous_activity import record_scheduled_result
+                record_scheduled_result(
+                    getattr(context, "activity_log", None),
+                    job_id=job_id, task_name=task_name, content=_content,
+                    ok=True, duration_s=_time.time() - started,
+                )
                 # Sink the success into workspace continuity.
                 try:
                     _ws = getattr(context, "workspace_model", None)
@@ -527,6 +587,16 @@ async def lifespan(app):
                     f"{job_id}: {type(e).__name__}: {e}",
                     level="WARNING", icon=Icons.WARN,
                 )
+                try:
+                    from .core.autonomous_activity import record_scheduled_result
+                    record_scheduled_result(
+                        getattr(context, "activity_log", None),
+                        job_id=job_id, task_name=task_name,
+                        content=f"{type(e).__name__}: {e}",
+                        ok=False, duration_s=_time.time() - started,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
                 try:
                     _ws = getattr(context, "workspace_model", None)
                     if _ws is not None and getattr(_ws, "enabled", False):

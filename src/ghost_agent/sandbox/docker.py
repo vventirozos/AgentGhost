@@ -266,6 +266,32 @@ class DockerSandbox:
                     if not is_mac:
                         run_kwargs["extra_hosts"] = {"host.docker.internal": "host-gateway"}
 
+                # Service-port publishing (sandbox/services.py, 2026-07-11).
+                # In bridge mode a supervised in-sandbox service (e.g. a dev
+                # server the agent hosts) is unreachable from the host; we
+                # publish a small loopback-bound range so the OPERATOR can
+                # open http://127.0.0.1:<port> in their own browser. Range
+                # via GHOST_SANDBOX_SERVICE_PORTS ("8100-8104" default;
+                # empty string disables). Host mode needs none (the service
+                # binds host ports directly). Only takes effect when the
+                # container is (re)created.
+                if run_kwargs.get("network_mode") == "bridge":
+                    try:
+                        from .services import publishable_service_ports
+                        # Only ports actually FREE on the host: a second agent
+                        # (a throwaway for an ablation, the test suite) can't
+                        # publish the same fixed host ports as the instance
+                        # already running, and must degrade to no-published-
+                        # ports rather than fail to get a sandbox at all.
+                        _svc_ports = publishable_service_ports()
+                        if _svc_ports:
+                            run_kwargs["ports"] = {
+                                f"{p}/tcp": ("127.0.0.1", p)
+                                for p in _svc_ports
+                            }
+                    except Exception as _spx:
+                        logger.debug(f"service-port publish skipped: {_spx}")
+
                 # Check for cached environment image for instant boot.
                 # NB: never mutate self.image — it must stay the pullable
                 # base image. Pinning the cached tag on self.image meant
@@ -324,12 +350,39 @@ class DockerSandbox:
                 try:
                     self.container = self.client.containers.run(**run_kwargs)
                 except self.APIError as run_err:
-                    # Another process (sharing this docker daemon and the
-                    # workspace-derived container name) won the race
-                    # between our remove and run — a 409 "name already in
-                    # use". Adopt the existing container instead of dying.
                     msg = str(run_err).lower()
-                    if getattr(run_err, "status_code", None) == 409 or "already in use" in msg:
+                    if "port is already allocated" in msg and run_kwargs.get("ports"):
+                        # Lost the race between publishable_service_ports()'s
+                        # bind-check and this run (another container grabbed
+                        # the port in between). Published ports are an
+                        # operator convenience, NOT worth a bricked sandbox —
+                        # retry once without them.
+                        #
+                        # CRITICAL: a port-bind failure leaves the container
+                        # CREATED-but-not-started, so it must be REMOVED first
+                        # or the retry dies with a 409 name-in-use (observed:
+                        # the retry's own 409 propagated and killed the
+                        # sandbox entirely).
+                        run_kwargs.pop("ports", None)
+                        pretty_log(
+                            "Sandbox Ports",
+                            "service-port publish conflicted with another "
+                            "process — container created WITHOUT published "
+                            "ports (in-sandbox services are still reachable "
+                            "by browser/execute).",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                        try:
+                            self.client.containers.get(
+                                self.container_name).remove(force=True)
+                        except Exception:  # noqa: BLE001 — nothing to clean
+                            pass
+                        self.container = self.client.containers.run(**run_kwargs)
+                    elif getattr(run_err, "status_code", None) == 409 or "already in use" in msg:
+                        # Another process (sharing this docker daemon and the
+                        # workspace-derived container name) won the race
+                        # between our remove and run — a 409 "name already in
+                        # use". Adopt the existing container instead of dying.
                         self.container = self.client.containers.get(self.container_name)
                     else:
                         raise

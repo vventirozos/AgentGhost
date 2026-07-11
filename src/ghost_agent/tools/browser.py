@@ -120,6 +120,20 @@ from urllib.parse import urlparse, unquote
 
 from playwright.async_api import async_playwright
 
+# Loopback ports of SUPERVISED sandbox services (sandbox/services.py) —
+# populated from the op payload in main(). A service the agent itself
+# started (e.g. a dev server it is building) must be reachable at
+# http://127.0.0.1:<port> or the whole "host an app, drive it with the
+# browser" capability is dead; everything else loopback stays blocked.
+ALLOWED_LOCAL_PORTS = set()
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+
+
+def _is_allowed_local_service(host, port):
+    return (str(host or "").lower() in _LOOPBACK_HOSTS
+            and port in ALLOWED_LOCAL_PORTS)
+
 
 # ── SSRF guard (runner side) ──────────────────────────────────────────
 # The host-side guard (_browser_blocked_url) only vets the INITIAL url, but
@@ -220,10 +234,15 @@ def _ssrf_should_block(url, sandbox_root=None, anonymous=False):
     if scheme not in ("http", "https"):
         return False
     host = p.hostname
+    port = p.port or (443 if scheme == "https" else 80)
+    # Narrow allowance: explicit-loopback URLs whose port belongs to a
+    # supervised sandbox service (registry-driven, agent-opened). Literal
+    # hosts only — no DNS involved, so no rebind surface.
+    if _is_allowed_local_service(host, port):
+        return False
     if _host_is_internal(host):
         return True
     if not anonymous:
-        port = p.port or (443 if scheme == "https" else 80)
         if _resolves_internal(host, port):
             return True
     return False
@@ -1081,6 +1100,11 @@ async def main():
         _emit_err(f"unknown op {op_name!r}; valid: {sorted(OPS)}")
         return 1
     try:
+        ALLOWED_LOCAL_PORTS.update(
+            int(x) for x in (op.get("allowed_local_ports") or []))
+    except (TypeError, ValueError):
+        pass
+    try:
         result = await OPS[op_name](op)
         _emit_ok(result)
         return 0
@@ -1113,6 +1137,7 @@ def _build_op_payload(
     stop_on_error: Optional[bool] = None,
     click_center: Optional[bool] = None,
     settle_ms: Optional[int] = None,
+    allowed_local_ports=None,
 ) -> dict:
     """Assemble the op dict the runner expects.
 
@@ -1165,6 +1190,9 @@ def _build_op_payload(
         payload["click_center"] = bool(click_center)
     if settle_ms is not None:
         payload["settle_ms"] = int(settle_ms)
+    if allowed_local_ports:
+        payload["allowed_local_ports"] = sorted(
+            int(p) for p in allowed_local_ports)
     return payload
 
 
@@ -1286,7 +1314,8 @@ _VALID_OPS = {"navigate", "extract_text", "click", "screenshot", "close", "inter
 _BROWSER_ALLOWED_SCHEMES = frozenset({"http", "https", "file", "about", "data"})
 
 
-def _browser_blocked_url(u: Optional[str], *, anonymous: bool = False) -> Optional[str]:
+def _browser_blocked_url(u: Optional[str], *, anonymous: bool = False,
+                         allowed_local_ports=frozenset()) -> Optional[str]:
     """SSRF guard for the browser: block http(s) navigation to internal /
     loopback / link-local / metadata hosts (which the host-network sandbox
     can otherwise reach), while ALLOWING file:// (self-play fixtures render
@@ -1296,12 +1325,19 @@ def _browser_blocked_url(u: Optional[str], *, anonymous: bool = False) -> Option
     (getaddrinfo would leak the DNS query for the site we're about to visit,
     defeating the browser's DNS-over-SOCKS hardening). Tor can't route to an
     internal address anyway, so skipping resolution loses no protection there;
-    literal-IP internal targets are still blocked without resolving."""
+    literal-IP internal targets are still blocked without resolving.
+
+    ``allowed_local_ports`` — loopback ports of SUPERVISED sandbox services
+    (sandbox/services.py registry). An explicit-loopback URL on one of these
+    ports is admitted (the agent hosting an app must be able to drive it);
+    literal hosts only, so no DNS/rebind surface. Everything else loopback
+    stays blocked."""
     if not u:
         return None
     from urllib.parse import urlparse
     try:
-        scheme = (urlparse(str(u)).scheme or "").lower()
+        parsed = urlparse(str(u))
+        scheme = (parsed.scheme or "").lower()
     except Exception:
         # Fail CLOSED: an unparseable URL is refused, not allowed. (A security
         # guard should not fail open.)
@@ -1309,6 +1345,15 @@ def _browser_blocked_url(u: Optional[str], *, anonymous: bool = False) -> Option
     if scheme not in _BROWSER_ALLOWED_SCHEMES:
         return f"refused disallowed scheme {scheme!r} (only http/https/file/about/data)."
     if scheme in ("http", "https"):
+        if allowed_local_ports:
+            try:
+                host = (parsed.hostname or "").lower()
+                port = parsed.port or (443 if scheme == "https" else 80)
+                if host in ("127.0.0.1", "localhost", "::1") \
+                        and port in allowed_local_ports:
+                    return None
+            except ValueError:
+                pass  # invalid port literal → let the SSRF guard refuse it
         from ..utils.helpers import url_ssrf_reason
         return url_ssrf_reason(u, resolve=not anonymous)
     return None
@@ -1406,6 +1451,7 @@ async def tool_browser(
     tor_proxy: Optional[str] = None,
     workspace_model=None,
     container_workdir: Optional[str] = None,
+    allowed_local_ports=None,
     **kwargs,
 ):
     """Run a single browser operation inside the sandbox.
@@ -1460,15 +1506,23 @@ async def tool_browser(
         return _err("Sandbox is not initialised — cannot run browser.")
 
     # SSRF guard: refuse http(s) navigation to internal/metadata hosts.
-    # (file:// fixtures and about:/data: are allowed.) In Tor mode we skip
-    # host-side DNS resolution so the guard itself can't leak the DNS query.
+    # (file:// fixtures and about:/data: are allowed; loopback ports of
+    # supervised sandbox services are admitted — see sandbox/services.py.)
+    # In Tor mode we skip host-side DNS resolution so the guard itself
+    # can't leak the DNS query.
     _anon = bool(tor_proxy)
-    _b = _browser_blocked_url(url, anonymous=_anon)
+    try:
+        _svc_ports = frozenset(int(p) for p in (allowed_local_ports or ()))
+    except (TypeError, ValueError):
+        _svc_ports = frozenset()
+    _b = _browser_blocked_url(url, anonymous=_anon,
+                              allowed_local_ports=_svc_ports)
     if _b:
         return _err(f"Refused navigation: {_b}")
     for _a in (actions or []):
         if isinstance(_a, dict) and _a.get("action") == "goto":
-            _b = _browser_blocked_url(_a.get("url"), anonymous=_anon)
+            _b = _browser_blocked_url(_a.get("url"), anonymous=_anon,
+                                      allowed_local_ports=_svc_ports)
             if _b:
                 return _err(f"Refused goto: {_b}")
 
@@ -1559,6 +1613,7 @@ async def tool_browser(
         stop_on_error=stop_on_error,
         click_center=kwargs.get("click_center"),
         settle_ms=kwargs.get("settle_ms"),
+        allowed_local_ports=_svc_ports,
     )
 
     # For interact, the timeout budget grows with the number of actions —

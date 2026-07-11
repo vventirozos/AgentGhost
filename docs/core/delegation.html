@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Delegation, jobs & pipelines — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a class="current" href="delegation.html">delegation &amp; jobs</a>
+    <a href="autonomous_activity.html">autonomous_activity</a>
+    <a href="dream.html">dream</a>
+    <h3>Tools</h3>
+    <a href="../tools/composed_skills.html">composed_skills</a>
+    <a href="../tools/swarm.html">swarm</a>
+  </nav>
+</aside>
+<main>
+  <h1>Delegation, jobs &amp; pipelines</h1>
+  <p class="subtitle">core/subagent.py · core/jobs.py · tools/delegate.py ·
+  the <code>save_as</code> data-flow in tools/composed_skills.py — 2026-07-11.
+  Three gaps, one theme: the agent could dispatch work but never COMPOSE it.</p>
+
+  <h2>The gap</h2>
+  <p>The 2026-07 feature survey found that <strong>no orchestration primitive
+  could pass a value from one step to the next</strong>:</p>
+  <ul>
+    <li><code>composed_skills._resolve_args</code> resolved <code>$var</code>
+    only against the macro's <em>initial</em> params — a step could never
+    consume the previous step's output, so "fetch → transform → act on the
+    fetched value" was inexpressible and the skill-graduation loop minted
+    macros that were structurally incapable of being pipelines.</li>
+    <li><code>delegate_to_swarm</code>'s workers are stateless single
+    completions with <strong>no tools</strong> — delegation could summarise
+    text you already had, never go and get it.</li>
+    <li>Fire-and-forget work (swarm ids, scheduled tasks) had <strong>no status
+    surface</strong>: results appeared only if the model remembered to read a
+    specific scratchpad key.</li>
+  </ul>
+
+  <h2>1. Composed-skill data-flow (<code>save_as</code>)</h2>
+  <p>A sequential step may bind its result to a name:
+  <code>{"tool": "browser", "save_as": "page"}</code>. Later steps interpolate
+  it as <code>$page</code> — either as a whole value
+  (<code>{"text": "$page"}</code>, substituted with its native type) or inside
+  surrounding text (<code>{"prompt": "Summarise: $page"}</code>,
+  <code>${page}</code> also accepted).</p>
+  <p><code>_execute_sequential</code> keeps a live <strong>binding scope</strong>
+  — the initial params plus every completed step's <code>save_as</code> —
+  and resolves each step against the scope as it stands when that step runs, so
+  bindings only flow FORWARD. The caller's params dict is copied, never mutated.
+  A bound value is capped at <code>MAX_BOUND_VALUE_CHARS</code> (16 KB — larger
+  than the 4 KB display cap, since a downstream step may legitimately need a big
+  fetched body). An <code>optional</code> step that FAILED still binds, so a
+  later step can deliberately inspect the error text.</p>
+  <p><strong>Authoring is validated, not silently degraded</strong>
+  (<code>_validate_dataflow</code>, run at <code>define</code> time): a forward
+  reference, a self-reference, a duplicate binding, or any <code>save_as</code>
+  in a <code>parallel</code> macro is REJECTED with an explanatory error —
+  parallel steps start simultaneously, so no sibling can observe another's
+  result. A name that no step produces is fine: that's a runtime param the
+  caller supplies (the pre-existing contract). The advertised schema subtracts
+  step-produced names from the macro's parameter list, so the LLM is never asked
+  to supply a value the pipeline computes for itself.</p>
+
+  <h2>2. Tool-using sub-agents (<code>delegate</code>)</h2>
+  <p><code>core.subagent.run_subagent</code> runs the REAL agent loop (tools,
+  sandbox, memory reads) in an isolated context, bounded by a tool allowlist and
+  a turn cap, and returns its final answer as a job result. Isolation follows the
+  pattern dream's self-play temp agent established — for the same reasons, with
+  the same failure modes already paid for:</p>
+  <ul>
+    <li><code>workspace_model = None</code> — a sub-agent runs under its OWN
+    semaphore; leaving the shared model attached would let it clobber the live
+    turn's event-stamp pointer and write synthetic outcomes into the real
+    activity log (the 2026-07-09 stamping race).</li>
+    <li><code>trajectory_collector</code> / <code>episodic_memory</code> /
+    <code>journal</code> = None — a sub-agent's turns must not be mined for
+    auto-macros or reflected on as if they were user work.</li>
+    <li>Memory stores wrapped <strong>read-only</strong>
+    (<a href="../memory/readonly.html">memory.readonly</a>) and
+    <code>memory_bus = None</code> so the bus rebuilds over the wrapped stores —
+    a delegate researches; it does not rewrite the operator's memory.</li>
+    <li>The LLM client is forced to <strong>background mode</strong>, so a
+    delegated job can never starve a live user turn of the single upstream slot.</li>
+  </ul>
+  <p><strong>Rails.</strong> <code>FORBIDDEN_TOOLS</code> is absolute — a
+  sub-agent can never delegate (no recursive fan-out), schedule
+  (<code>manage_tasks</code>), run daemons (<code>manage_services</code>), mutate
+  projects, author selfhood, or write profile memory. Turn cap
+  <code>MAX_SUBAGENT_TURNS</code> (12), wall-clock timeout, and at most 4
+  parallel delegates (they share one upstream slot — more is slower, not
+  faster). Its sandbox is a per-job subdir under the REAL sandbox
+  (<code>delegated/&lt;job-id&gt;/</code>), not a temp dir like self-play: the
+  point of delegation is to produce artifacts the main agent can then read.</p>
+
+  <h2>3. The job registry (<code>jobs</code>)</h2>
+  <p><code>core.jobs.JobRegistry</code> is the status surface every
+  fire-and-forget mechanism was missing. <code>delegate</code> and
+  <code>delegate_to_swarm</code> both register into it, so the <code>jobs</code>
+  tool reports them together: <code>status</code> (running + recently finished),
+  <code>collect</code> (a finished job's full result — or every unread result),
+  <code>cancel</code>. In-memory by design: jobs are per-process (their asyncio
+  tasks die with the process), so persisting them would only resurrect zombies.
+  Completed jobs are retained (bounded at 50, FIFO-evicted, running jobs never
+  evicted) so a later turn can still collect a result the model never read.
+  Tasks are spawned via <code>spawn_bg</code> — the codebase's one
+  fire-and-forget primitive (strong ref + contextvar propagation + exception
+  logging), never a bare <code>create_task</code>.</p>
+
+  <h2>Why this matters beyond convenience</h2>
+  <p>It is the fix for the deepest finding of the ablation program: "recalled
+  skills are prose never executed", and B4's mediation ≈ 0. A learned lesson
+  injected as advisory text measurably does nothing; a learned skill that is an
+  <em>executable pipeline</em> is load-bearing by construction. Data-flow turns
+  the learning stack's output from advice into capability.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_delegation_and_dataflow.py</code> (55) — arg resolution
+  (whole-value / interpolated / braced / unresolved), multi-stage chains,
+  params-not-mutated, bound-value cap, optional-failure binding, disk round-trip,
+  schema subtraction, all four validation rejections; job registry (success /
+  exception / cancel / eviction / idempotent finish); sub-agent tool policy
+  (incl. no-recursive-delegation); the <code>delegate</code> and
+  <code>jobs</code> tools; and the sub-agent isolation contract.</p>
+</main>
+</body>
+</html>

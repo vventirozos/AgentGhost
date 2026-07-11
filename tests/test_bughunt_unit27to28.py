@@ -102,11 +102,18 @@ class TestConstantTimeCompare:
 # ══════════════════════════════════════════════════════════════════════
 
 class TestSlackTraversal:
-    def test_download_uses_basename(self):
-        import inspect
-        import interface.externals.slack_bot.main as m
-        src = inspect.getsource(m.download_slack_file)
-        assert "os.path.basename(filename)" in src
+    def test_file_ingestion_uses_basename(self):
+        """2026-07-11 rewrite: download_slack_file became
+        upload_file_to_agent (files now go through /api/upload, which does
+        its own containment) — the Slack-filename basename() hardening this
+        test pins must survive as defense-in-depth, since the Slack `name`
+        is attacker-controlled metadata. Behavioural coverage lives in
+        tests/test_slack_bot_owner_lock.py::TestUploadHardening."""
+        from pathlib import Path
+        src = (Path(__file__).resolve().parents[1] / "interface" /
+               "externals" / "slack_bot" / "main.py").read_text()
+        assert "upload_file_to_agent" in src
+        assert 'os.path.basename(file_info.get("name")' in src
 
 
 # ══════════════════════════════════════════════════════════════════════

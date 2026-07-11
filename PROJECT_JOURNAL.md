@@ -15,7 +15,19 @@ Structure:
 
 ---
 
-## 1. Current state (2026-07-07)
+## 1. Current state (2026-07-11)
+
+- **Four capability features shipped 2026-07-11** (§6) from a three-agent capability survey: the agent
+  now (1) has a **mouth** — an autonomous-activity ledger feeding an all-phase next-turn digest + outbound
+  push (webhook/ntfy/Slack), with scheduled-turn conclusions no longer discarded; (2) can **host** —
+  supervised long-lived sandbox services it can drive with its own browser; (3) can **compose** —
+  `save_as` data-flow between composed-skill steps, bounded tool-using sub-agent `delegate`, and a `jobs`
+  status surface; (4) has **durable server-side sessions** + real turn cancellation that releases the
+  global turn lock. Suite **7077 passed / 12 skipped / 0 failed**. *Prod needs a restart to pick these up.*
+- The three surveyed gaps are now closed; the remaining open work in §4 is unchanged (GAIA run, #5 step 4,
+  the #4/#27b outcome battery).
+
+## 1b. Prior state (2026-07-07)
 
 - **Static bug hunt (source review): COMPLETE.** All 28 units CLEAR (`utils` → `core/agent.py`
   → `scripts`), 2026-07-03/04. Every subsystem reviewed for concrete-failure bugs; confirmed
@@ -583,6 +595,128 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-11 (later) — Slack bot REVIVED + OWNER-LOCKED (rewritten; replies to the operator only)
+- The bot (`interface/externals/slack_bot/main.py`) had rotted while unused. Review found, beyond the
+  requested lock: (1) **revival blocker** — the payload pinned `model: qwen-3.5-9b`, which the agent
+  404s (model name is validated), so every request would fail; now OMITTED so the configured model
+  always matches. (2) **The live-status feature had never worked**: it grepped for `[{request_id}]`,
+  but the pretty stream prints the full id only on the BEGIN frame (2-char tag afterwards, never
+  brackets) — zero lines ever matched; also tailed the wrong default path. Now a pure `scan_log_line`
+  arms on our BEGIN frame and attributes emoji lines until the END frame (sound because turns are
+  globally serialized), default path fixed to the live stream, emoji map synced to current Icons.
+  (3) File ingestion wrote into a locally-mounted `GHOST_SANDBOX_DIR` (required sharing the agent's
+  filesystem + exact path) — now goes through `POST /api/upload` (authed, containment enforced
+  server-side; Slack filename still basename()d as defense-in-depth).
+- **Owner lock (the ask), fail-closed:** owner resolved at startup from `GHOST_SLACK_OWNER` (U… id)
+  or `GHOST_SLACK_OWNER_EMAIL` (via users.lookupByEmail, needs users:read.email); **refuses to start
+  with neither**. Every mention/DM passes `is_owner_message` (owner-authored, not a bot, no message
+  subtype); everyone else is **ignored silently** (a reply would confirm the bot exists) with a
+  logged audit line. **Thread context is owner-filtered too** — only owner + bot messages are
+  forwarded, and only the OWNER's attachments are ingested: without this, a third party could seed a
+  shared-channel thread with prompt content/files that the owner's next mention would forward as
+  trusted history (indirect injection). Outbound notifications now default to a **DM to the owner**
+  when `GHOST_NOTIFY_SLACK_CHANNEL` is unset (`off` disables).
+- **`run.sh` fixed too:** ran on bare `python3` (no slack_bolt — the uvicorn-class gotcha) → now the
+  agent venv's python (`GHOST_BOT_PYTHON` overrides); `export $(cat .env | xargs)` word-split any
+  value with spaces and read `.env` from the CALLER'S cwd → now `set -a` + source, anchored to the
+  script dir; pre-flights ALL hard requirements incl. the owner lock (fails with instructions, not a
+  traceback); `exec`s python for supervisor signal propagation; dropped the pointless PYTHONPATH.
+  Verified live: missing-env → exit 1 with all four messages; configured `--help` → execs venv python.
+- **Live-caught follow-up: `Illegal header value b' '`.** First live run surfaced it in the poller —
+  prod runs `--api-key ""` (authless) while the bot HARD-REQUIRED a non-empty key, so the operator's
+  whitespace placeholder reached httpx verbatim (leading/trailing whitespace is illegal in a header
+  value). Fix: an EXPLICITLY-EMPTY key is now valid and means authless — the key is stripped and all
+  agent-API calls route through one `AUTH_HEADERS` source of truth (`{}` when empty, so no header is
+  sent at all); unset still refuses to start (the no-default-secret rule). `run.sh` checks SET-ness
+  (`${GHOST_API_KEY+set}`), not non-emptiness, and warns against padding with a space.
+- Tests: `tests/test_slack_bot_owner_lock.py` (40 — gate edges, silent-ignore handlers, thread
+  filtering incl. stranger-file exclusion, status scanner, owner resolution, upload short-circuits,
+  auth-header variants incl. the whitespace-key repro, source regressions, launcher pins); 1 stale
+  bug-hunt source-inspection test repointed (unit-27 traversal pin → the new ingestion function).
+  Docs: `interfaces/slack_bot.html` rewritten. Suite **7117 passed / 12 skipped / 0 failed**.
+  Deploy: restart the bot via `run.sh` with `GHOST_SLACK_OWNER=<U…>` set (or in its `.env`);
+  with authless prod use `GHOST_API_KEY=` (empty), NEVER a space.
+- **Autostart shipped:** `com.local.ghost-slackbot.plist` (user LaunchAgent template next to the bot,
+  plutil-lint clean; KeepAlive = same plain-kill-equals-deploy ops model as prod, ThrottleInterval 30
+  so a pre-flight failure can't tight-loop) + `.env.example` (secrets in a chmod-600 `.env` the
+  launcher sources — never in the plist, never committed). Install: bootstrap into `gui/$(id -u)`.
+
+### 2026-07-11 — FOUR CAPABILITY FEATURES shipped (the agent gets a mouth, pipelines, a host, and a memory of its own conversations)
+- **Origin:** a three-agent capability survey (tool surface / autonomy chain / interface+context) asked
+  "what 3 features would make a big difference". All three converged on the same diagnosis: the agent's
+  *acting* was in far better shape than its *reporting and composing*. Operator picked all 3 + the
+  runner-up. Suite **6870 → 7077 passed** (+207 tests, 12 skipped, 0 failed) across the four.
+- **(1) The agent had no mouth — outbound notifications + all-phase digest + scheduled-turn capture.**
+  Zero proactive transport existed anywhere (grep for ntfy/smtp/webhook/chat_postMessage = 0). The
+  "while you were away" digest covered ONLY project autoadvance and was pull-only; **12 of the 13 idle
+  phases surfaced solely as `pretty_log` lines**; the postmortem defect queue had NO surfacing at all;
+  and scheduled turns — the one genuinely end-to-end autonomous loop — **DISCARDED their final content**
+  (only pass/fail reached the workspace ledger). New `core/autonomous_activity.py`: an append-only JSONL
+  ledger (`$GHOST_HOME/system/autonomous_activity.jsonl`) every idle phase records into
+  (`GhostAgent._record_autonomous_activity`, 9 phases), rendered as a byte-offset-watermarked
+  "Background activity" header on the next turn, with `severity="notify"` items ALSO pushed immediately
+  via `utils/notify.py` (`--notify-webhook` / `--notify-ntfy`; public targets only ever via Tor —
+  fail-closed, skipped when Tor is unavailable; LAN/Tailscale direct). `/api/notifications/pending` +
+  `/ack` give external deliverers a durable per-consumer watermark (records re-serve until acked); the
+  Slack bot gained a `notification_poller` (set `GHOST_NOTIFY_SLACK_CHANNEL`) — the reactive-only bot can
+  now speak first. Latent bug found + fixed on the way: internal turns (cron / delegated) were consuming
+  the PROJECT digest watermark — `is_internal_request` (req_id prefixes `sched-`/`job-`/`sub-`) now gates
+  both digests. Digest items are clamped so the block stays under the 1500-char `_strip_leading_banners`
+  bound (a longer block would resurrect the 2026-07-07 correction-fingerprint bug). Tests: 64.
+- **(2) Supervised long-lived sandbox services (the runner-up).** `execute` wraps everything in
+  `timeout -k 5s` (600 s) and the container is PID-isolated, so the agent could BUILD a web app but never
+  HOST one. New `sandbox/services.py` + `manage_services` tool: the command ships as a script via the bind
+  mount, then launches `setsid nohup … &` — the exec shell exits (satisfying the timeout wrapper) and the
+  process re-parents to the container's PID 1, surviving the exec, the turn, and agent restarts.
+  start/stop/restart/status/logs with liveness (`kill -0`) + TCP port probes; `setsid` makes stop a
+  group-kill. Rails: max 5 services, and **ports 8000/8088/8080/9050 refused** (the agent's own API /
+  upstream LLM — the sandbox-loopback blind spot and its mock-server pathology — plus NetMon and Tor).
+  Reachability: the browser SSRF guard (BOTH the host-side check and the in-runner interceptor) now admits
+  *explicit-loopback* URLs whose port is in the service registry — literal hosts only, no DNS/rebind
+  surface — so the agent can drive an app it is hosting; docker.py publishes `GHOST_SANDBOX_SERVICE_PORTS`
+  (default 8100-8104, loopback-bound) in bridge mode for the OPERATOR. Tests: 39.
+  **Port-publishing gotcha (caught by the suite, then FIXED — worth remembering).** Publishing FIXED host
+  ports means a SECOND sandbox container (a throwaway agent for an ablation, or the test suite) collides
+  with the one already running. Two compounding failures: (a) `containers.run` fails outright on the taken
+  port, and (b) a port-bind failure leaves the container **CREATED-but-not-started**, so the
+  retry-without-ports then died with a 409 name-in-use — which propagated and **bricked the sandbox
+  entirely** (it broke an unrelated dream test intermittently). Fix: `publishable_service_ports()`
+  bind-checks each port on the host and only publishes the FREE ones (so a second agent silently gets no
+  published ports — the right degradation), and the residual-race retry now **removes the stale container
+  before re-running**. Lesson: any fixed host-port binding in this project must assume ≥2 agent instances.
+- **(3) Real pipelines: composed-skill data-flow + tool-using delegation + job status.** THE structural
+  gap: no orchestration primitive could pass a value between steps. (a) `SkillStep.save_as` binds a step's
+  result to a name later steps interpolate as `$var` (whole-value or inside text); `_execute_sequential`
+  keeps a live binding scope; `_validate_dataflow` REJECTS forward/self/duplicate references and any
+  `save_as` in a parallel macro at define-time rather than silently resolving to `""`; the advertised
+  schema subtracts step-produced names. This is what makes a graduated macro capable of being a *pipeline*
+  — and is the real answer to the ablation program's "recalled skills are prose never executed". (b)
+  `core/subagent.py`: a bounded tool-using sub-agent (the real agent loop, isolated exactly as dream's
+  self-play temp agent is — `workspace_model=None` per the 2026-07-09 stamping race, no trajectory/journal
+  pollution, read-only memory via the new `memory/readonly.py`, background-only LLM so a delegate can never
+  starve a user turn) exposed as `delegate`; `FORBIDDEN_TOOLS` makes recursive delegation, scheduling,
+  daemons, and memory writes impossible. Swarm workers, by contrast, were stateless completions with NO
+  tools — delegation in name only. (c) `core/jobs.py` + the `jobs` tool: the status surface all three
+  fire-and-forget mechanisms lacked (swarm now registers there too). Tests: 55. (The convention guard
+  caught a bare `asyncio.create_task` → switched to `spawn_bg`.)
+- **(4) Durable sessions + real turn cancellation.** History was client-carried only (localStorage / a
+  Slack thread), so it died with the device and no two clients shared it — ironic next to the *proven*
+  cross-session memory. `core/sessions.py` + `/api/sessions` CRUD + `session_id` on `/api/chat`: the server
+  becomes the source of truth, with `merge_history` tolerating BOTH a thin client (sends only the new
+  message) and a fat client (replays everything — NOT doubled). Sessions live entirely in the API layer, so
+  the turn logic is untouched; omit `session_id` and behaviour is byte-identical to before. And
+  `core/turns.py`: turns are globally serialized (#22), so one wedged turn blocked the web UI, Slack AND
+  the idle loops with **no way out but a restart** — the interface's cancel only stopped the proxy's
+  stream. Now a turn registers before acquiring the semaphore (so QUEUED turns are cancellable too);
+  `POST /api/turn/cancel` is cooperative by default (the loop stops at its next boundary, returns partial
+  work, and unwinding the `async with` **releases the lock**) with `hard=true` cancelling the asyncio task
+  outright for a turn wedged inside a long upstream call. `GET /api/turns` shows what's running and why.
+  Tests: 48.
+- **Deploy note: prod needs a restart to pick all four up.** New flags are opt-in (`--notify-webhook` /
+  `--notify-ntfy`); everything else activates on restart. Docs: `core/autonomous_activity.html`,
+  `core/delegation.html`, `core/sessions.html`, `sandbox/services.html`, + updates to `api/routes.html`,
+  `cli_reference.html`, `tools/browser.html`, `tools/composed_skills.html`, `sandbox/docker.html`.
 
 ### 2026-07-10 — public benchmark: GAIA harness hardened + readiness pilot PASSED (full run gated on HF token)
 - **Goal:** post a real, representative public number (the "convert quality into credibility" move

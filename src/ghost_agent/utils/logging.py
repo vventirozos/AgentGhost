@@ -250,6 +250,8 @@ class Icons:
     SKILL_GRADUATE = "🎓" # a lesson graduates into a reusable skill
     DREAM        = "🌙"   # REM / dream consolidation cycle (NOT 💤 — that's SYSTEM_SHUT)
     SKIP         = "⏩"   # a step/cycle deliberately skipped
+    ACTIVITY     = "📡"   # autonomous-activity ledger / background digest surfaced
+    NOTIFY_OUT   = "📣"   # outbound push notification to the operator
 
     # --- Status ---
     OK           = "✅"

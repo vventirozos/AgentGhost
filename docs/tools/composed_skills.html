@@ -25,13 +25,22 @@
   <table>
     <thead><tr><th>Type</th><th>Fields</th></tr></thead>
     <tbody>
-      <tr><td><code>SkillStep</code></td><td>tool_name · description · param_template · branch_condition · branch_target · optional</td></tr>
+      <tr><td><code>SkillStep</code></td><td>tool_name · description · param_template · branch_condition · branch_target · optional · <strong>save_as</strong></td></tr>
       <tr><td><code>ComposedSkill</code></td><td>name · trigger_description · steps · branches · <strong>execution_mode</strong> · <strong>status</strong> · usage_count · success_count · last_used · created_at</td></tr>
     </tbody>
   </table>
 
-  <h2>Templates</h2>
-  <p><code>param_template</code> uses <code>$variable</code> syntax; resolved against the runtime params when the macro is dispatched.</p>
+  <h2>Templates &amp; data-flow (<code>save_as</code>, 2026-07-11)</h2>
+  <p><code>param_template</code> uses <code>$variable</code> syntax, resolved when the macro is dispatched against a live <strong>binding scope</strong>: the macro's runtime params PLUS any earlier step's result bound via that step's <code>save_as</code>. Two forms — whole-value (<code>"$page"</code>, substituted as-is) and interpolated (<code>"Summarise: $page"</code> / <code>"${page}"</code>). An unresolved name becomes <code>""</code>, never the literal <code>"$var"</code>.</p>
+  <p><strong>Why it exists.</strong> Before this, <code>$var</code> resolved <em>only</em> against the initial params, so a step could never consume the previous step's output — "fetch → transform → act on the fetched value" was inexpressible, and every real pipeline had to be driven turn-by-turn by the main model (the biggest structural gap of the 2026-07 feature survey). It also meant the skill-graduation loop minted macros that <em>structurally could not</em> be pipelines.</p>
+  <p><strong>Rules</strong> (enforced at <code>define</code> time by <code>_validate_dataflow</code> — rejected with an explanatory error, never silently degraded to <code>""</code>):</p>
+  <ul>
+    <li>Bindings flow <strong>forward only</strong> — referencing a name a LATER step produces is an error; so is a step referencing its own <code>save_as</code>.</li>
+    <li><code>save_as</code> requires <code>mode="sequential"</code> — parallel steps start simultaneously, so no sibling can observe another's result.</li>
+    <li>Two steps may not bind the same name.</li>
+    <li>A name no step produces is a runtime param the caller supplies (the pre-existing contract) — the advertised schema subtracts step-produced names, so the LLM is never asked for a value the pipeline computes itself.</li>
+  </ul>
+  <p>A bound value is capped at <code>MAX_BOUND_VALUE_CHARS</code> (16 KB — larger than the 4 KB per-step <em>display</em> cap, since a downstream step may legitimately need a big fetched body). An <code>optional</code> step that FAILED still binds, so a later step can deliberately inspect the error text. The caller's params dict is copied, never mutated. See <a href="../core/delegation.html">Delegation, jobs &amp; pipelines</a>.</p>
 
   <h2>Registry</h2>
   <ul>

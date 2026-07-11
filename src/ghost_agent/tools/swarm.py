@@ -1,6 +1,9 @@
 import asyncio
+import logging
 import uuid
 from ..utils.logging import Icons, pretty_log
+
+logger = logging.getLogger("GhostAgent")
 
 # Keep strong references to background tasks to prevent aggressive garbage collection
 _swarm_tasks = set()
@@ -96,7 +99,7 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
     scratchpad.set(output_key, f"SYSTEM ALERT: Swarm execution failed after {MAX_RETRIES + 1} attempts ({last_error}). The edge node is offline. You must process this data yourself synchronously.")
     return False
 
-async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks: list = None, instruction: str = None, input_data: str = None, output_key: str = None, worker_persona: str = None, await_results: bool = False, **kwargs):
+async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks: list = None, instruction: str = None, input_data: str = None, output_key: str = None, worker_persona: str = None, await_results: bool = False, context=None, **kwargs):
     """Dispatch tasks to the background swarm.
 
     By default (``await_results=False``) this is fire-and-forget: each task
@@ -195,6 +198,22 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
         # subsequent turn. The id is reported back in the return string.
         task_id = f"swarm-{uuid.uuid4().hex[:8]}"
         _register_task(task_id, task)
+
+        # Also surface in the unified job registry (2026-07-11) so the
+        # `jobs` tool can report swarm work alongside delegated sub-agents.
+        # Best-effort: the swarm tool is callable without a context (tests,
+        # direct use), and job visibility must never break dispatch.
+        try:
+            if context is not None:
+                from ..core.jobs import get_job_registry
+                _jreg = get_job_registry(context)
+                _job = _jreg.register(
+                    "swarm", t_instruction or t_output_key,
+                    output_key=t_output_key, swarm_id=task_id,
+                )
+                _jreg.attach(_job.id, task)
+        except Exception as _jx:  # noqa: BLE001
+            logger.debug("swarm job registration skipped: %s", _jx)
 
         # Best-effort: also stash on context.scratchpad if available so the
         # poll surface is the same as for swarm output.
