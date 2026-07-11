@@ -596,6 +596,19 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-11 (latest) — `notify_operator` tool: the agent can now DELIBERATELY report back
+- Closes the last gap in the outbound pipeline: the ledger/push/Slack legs existed but only AUTOMATIC
+  producers wrote notify-severity records (needs-user events, scheduled-turn conclusions) — the MODEL
+  had no affordance, so "…and report back in Slack" was an instruction it could not follow (worst
+  case: claiming a delivery it can't make). New `tools/notify_tool.py` → `notify_operator(message)`:
+  writes severity=notify phase=`agent_message`; every configured leg (webhook/ntfy push, Slack bot
+  poller → owner DM, next-turn digest) delivers with zero new plumbing. Rails: 500-char clamp,
+  12/hour rate limit (a runaway loop must not page a phone), and an **honesty contract** — the
+  confirmation names only the channels actually live (push configured? Slack consumer ever polled?).
+  Delegated sub-agents deliberately CANNOT reach it (not in the delegate allowlist — the main agent
+  reports). Slack renders it :speech_balloon:. Tests: test_notify_operator.py (14). Suite **7131
+  passed / 12 skipped / 0 failed**. Prod restart required to advertise the tool (plain kill = deploy).
+
 ### 2026-07-11 (later) — Slack bot REVIVED + OWNER-LOCKED (rewritten; replies to the operator only)
 - The bot (`interface/externals/slack_bot/main.py`) had rotted while unused. Review found, beyond the
   requested lock: (1) **revival blocker** — the payload pinned `model: qwen-3.5-9b`, which the agent
@@ -637,10 +650,24 @@ skills_auto graduation wiring). Residuals in §4C.
   Docs: `interfaces/slack_bot.html` rewritten. Suite **7117 passed / 12 skipped / 0 failed**.
   Deploy: restart the bot via `run.sh` with `GHOST_SLACK_OWNER=<U…>` set (or in its `.env`);
   with authless prod use `GHOST_API_KEY=` (empty), NEVER a space.
-- **Autostart shipped:** `com.local.ghost-slackbot.plist` (user LaunchAgent template next to the bot,
-  plutil-lint clean; KeepAlive = same plain-kill-equals-deploy ops model as prod, ThrottleInterval 30
-  so a pre-flight failure can't tight-loop) + `.env.example` (secrets in a chmod-600 `.env` the
-  launcher sources — never in the plist, never committed). Install: bootstrap into `gui/$(id -u)`.
+- **Autostart shipped + LIVE (2026-07-11).** `com.local.ghost-slackbot.plist` — a **system
+  LaunchDaemon** (`/Library/LaunchDaemons/`, starts at BOOT with no login session, like the prod
+  agent) that runs as `vasilis` via `UserName`, **never root** (venv/.env/logs are user-owned; the
+  bot needs no privileges). KeepAlive = same plain-kill-equals-deploy ops model; ThrottleInterval 30.
+  Secrets in a chmod-600 `.env` the launcher sources (+ `.env.example`), never in the plist.
+  **Verified live: bot up as vasilis, Bolt connected, notification poller polling, a real
+  `/api/chat` turn served.**
+- **⚠ launchd trap, cost ~15 min live — worth remembering.** A `UserName` daemon whose
+  `StandardOutPath`/`StandardErrorPath` are NOT writable by that user (here: `root:staff 644` logs
+  left by an earlier root-run install) **cannot have its stderr opened by launchd → exits
+  `EX_CONFIG (78)` before producing ANY output, then respawns forever.** Symptom is maximally
+  confusing: bot "never starts", log file gains no new lines, no error anywhere. The ONLY tell is
+  `launchctl print system/<label> | grep -E 'runs|last exit'` → `runs = 10, last exit code = 78`.
+  Fix: `sudo chown vasilis:staff` the log files. Generalizes: **whenever a launchd job runs as a
+  non-root UserName, its log files must be chowned to that user first.**
+- Also fixed live: the operator's `GHOST_API_KEY=" "` (a literal space) was the source of the
+  `Illegal header value b' '` warning — now `GHOST_API_KEY=` (truly empty) in `.env`, which the
+  rewritten bot correctly reads as "agent is authless, send no auth header".
 
 ### 2026-07-11 — FOUR CAPABILITY FEATURES shipped (the agent gets a mouth, pipelines, a host, and a memory of its own conversations)
 - **Origin:** a three-agent capability survey (tool surface / autonomy chain / interface+context) asked

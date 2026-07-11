@@ -535,6 +535,7 @@ _poller_task = None  # strong ref — a bare create_task result can be GC'd
 _PHASE_EMOJI = {
     "project": ":raising_hand:",
     "scheduled_task": ":alarm_clock:",
+    "agent_message": ":speech_balloon:",
     "service": ":gear:",
     "job": ":package:",
 }

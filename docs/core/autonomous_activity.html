@@ -69,6 +69,18 @@
     now captures <code>handle_chat</code>'s returned content and sinks it via
     <code>record_scheduled_result()</code> (severity=notify — a cron job's whole
     point is "tell me what you found"). Failures are recorded too.</li>
+    <li><strong>The model itself</strong> — the <code>notify_operator</code>
+    tool (<code>tools/notify_tool.py</code>, added later on 2026-07-11) lets
+    the agent DELIBERATELY push one short line (severity=notify, phase
+    <code>agent_message</code>) when asked to "report back in Slack" / "notify
+    me" or when long background work concludes. Rails: 500-char clamp,
+    12/hour rate limit, and an <em>honesty contract</em> — the confirmation
+    names only the delivery channels that are actually live (push transport
+    configured? has the Slack consumer ever polled?) instead of claiming
+    "sent to Slack" blindly. Delegated sub-agents can NOT reach this tool
+    (not in their allowlist — the main agent reports; a delegate paging the
+    operator is spam surface). Tests:
+    <code>tests/test_notify_operator.py</code> (14).</li>
   </ul>
 
   <h2>Consumers</h2>

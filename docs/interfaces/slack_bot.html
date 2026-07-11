@@ -138,26 +138,43 @@
     <dt>GHOST_NOTIFY_POLL_SECONDS</dt><dd>poll cadence (default 30).</dd>
   </div>
 
-  <h2>Autostart (launchd, 2026-07-11)</h2>
-  <p><code>com.local.ghost-slackbot.plist</code> ships next to the bot
-  (template; <code>plutil -lint</code> clean). It runs <code>run.sh</code>
-  under a user LaunchAgent with <code>KeepAlive</code> — the same ops model
-  as the prod agent: a plain <code>kill</code> of the bot process is a
-  restart/deploy; to actually stop it, <code>bootout</code> the job.
-  Secrets live in the sibling <code>.env</code> (<code>chmod 600</code>,
-  start from <code>.env.example</code>, never commit it), NOT in the plist.
-  <code>ThrottleInterval=30</code> keeps a misconfigured launch (pre-flight
-  exit 1) from tight-looping. Install:</p>
+  <h2>Autostart (launchd, 2026-07-11) — LIVE</h2>
+  <p><code>com.local.ghost-slackbot.plist</code> ships next to the bot and is
+  installed as a <strong>system LaunchDaemon</strong>
+  (<code>/Library/LaunchDaemons/</code>), so it starts at <strong>boot</strong>
+  with no login session — matching the prod agent's job — but runs as
+  <code>vasilis</code> via <code>UserName</code>, <strong>never root</strong>
+  (the venv, <code>.env</code> and logs are all user-owned; the bot needs no
+  privileges). <code>KeepAlive</code> gives the same ops model as the agent:
+  a plain <code>kill</code> is a restart/deploy; to truly stop it,
+  <code>bootout</code>. <code>ThrottleInterval=30</code> stops a misconfigured
+  launch from tight-looping. Secrets live in the sibling <code>.env</code>
+  (<code>chmod 600</code>, from <code>.env.example</code>) — never in the
+  plist, never committed.</p>
   <pre>cp .env.example .env &amp;&amp; $EDITOR .env &amp;&amp; chmod 600 .env
-cp com.local.ghost-slackbot.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.ghost-slackbot.plist</pre>
-  <p>Status: <code>launchctl print gui/$(id -u)/com.local.ghost-slackbot</code> ·
-  deploy: <code>launchctl kickstart -k gui/$(id -u)/com.local.ghost-slackbot</code> ·
-  stop: <code>launchctl bootout gui/$(id -u)/com.local.ghost-slackbot</code>.
-  Note: a <em>user</em> LaunchAgent runs while you are logged in; the prod
-  agent's root-installed job survives without a login session — mirror that
-  setup (sudo, <code>/Library/LaunchAgents</code>) only if the bot must run
-  headless.</p>
+sudo cp com.local.ghost-slackbot.plist /Library/LaunchDaemons/
+sudo chown root:wheel /Library/LaunchDaemons/com.local.ghost-slackbot.plist
+sudo chmod 644       /Library/LaunchDaemons/com.local.ghost-slackbot.plist
+# logs MUST be writable by UserName — see the trap below
+sudo touch /Users/vasilis/Data/AI/Logs/ghost-slack-bot.{log,err}
+sudo chown vasilis:staff /Users/vasilis/Data/AI/Logs/ghost-slack-bot.{log,err}
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.plist</pre>
+  <p>Status: <code>sudo launchctl print system/com.local.ghost-slackbot</code> ·
+  deploy: <code>sudo launchctl kickstart -k system/com.local.ghost-slackbot</code> ·
+  stop: <code>sudo launchctl bootout system/com.local.ghost-slackbot</code>.</p>
+
+  <p class="note"><strong>Trap: root-owned log files silently kill a
+  <code>UserName</code> daemon.</strong> If
+  <code>StandardOutPath</code>/<code>StandardErrorPath</code> are not
+  <em>writable by the <code>UserName</code> user</em> (e.g. left
+  <code>root:staff&nbsp;644</code> by an earlier root-run install), launchd
+  cannot open stderr for the job and it exits <code>EX_CONFIG (78)</code>
+  — <strong>before producing any output</strong>, then respawns forever.
+  Diagnosis is otherwise baffling: the bot appears never to start, the log
+  shows nothing new, and only
+  <code>launchctl print … | grep -E 'runs|last exit'</code> reveals
+  <code>runs = 10, last exit code = 78</code>. Bit us live on this exact
+  install. Fix: <code>sudo chown vasilis:staff</code> the two log files.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

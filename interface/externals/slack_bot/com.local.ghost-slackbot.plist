@@ -2,13 +2,31 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!-- Ghost Agent Slack bot (owner-locked) — launchd supervisor.
-         Install:  cp <this file> ~/Library/LaunchAgents/
-                   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.local.ghost-slackbot.plist
-         Secrets live in run.sh's sibling .env (chmod 600), NOT here —
-         see .env.example. KeepAlive matches the prod agent's ops model:
-         a plain kill of the bot process = restart (deploy); to actually
-         stop it, bootout the job. -->
+    <!-- Ghost Agent Slack bot (owner-locked) — system LaunchDaemon.
+         Installed at /Library/LaunchDaemons/com.local.ghost-slackbot.plist,
+         so it starts at BOOT (no login session needed — matching the prod
+         agent's job) but runs as `vasilis`, NEVER root: the venv, .env and
+         logs are all user-owned and the bot needs no privileges.
+
+         Install / replace:
+           sudo cp <this> /Library/LaunchDaemons/com.local.ghost-slackbot.plist
+           sudo chown root:wheel /Library/LaunchDaemons/com.local.ghost-slackbot.plist
+           sudo chmod 644       /Library/LaunchDaemons/com.local.ghost-slackbot.plist
+           # ⚠ The log files MUST be writable by UserName below, or launchd
+           #   cannot open stderr for it and the job dies with EX_CONFIG (78)
+           #   — silently, before producing ANY output, respawning forever.
+           #   (Bit us live 2026-07-11: root-owned logs from an earlier
+           #   root-run install; runs=10, no log lines, no clue.)
+           sudo touch /Users/vasilis/Data/AI/Logs/ghost-slack-bot.{log,err}
+           sudo chown vasilis:staff /Users/vasilis/Data/AI/Logs/ghost-slack-bot.{log,err}
+           sudo launchctl bootstrap system /Library/LaunchDaemons/com.local.ghost-slackbot.plist
+
+         Ops (same model as the prod agent): a plain kill of the bot process
+         = restart (deploy). To actually STOP it:
+           sudo launchctl bootout system/com.local.ghost-slackbot
+         Status:  sudo launchctl print system/com.local.ghost-slackbot
+         Deploy:  sudo launchctl kickstart -k system/com.local.ghost-slackbot
+         Secrets live in run.sh's sibling .env (chmod 600), NOT here. -->
     <key>Label</key>
     <string>com.local.ghost-slackbot</string>
 
@@ -17,6 +35,12 @@
         <string>/bin/bash</string>
         <string>/Users/vasilis/Data/AI/Agent/interface/externals/slack_bot/run.sh</string>
     </array>
+
+    <!-- Run as the user, not root. -->
+    <key>UserName</key>
+    <string>vasilis</string>
+    <key>GroupName</key>
+    <string>staff</string>
 
     <key>WorkingDirectory</key>
     <string>/Users/vasilis/Data/AI/Agent/interface/externals/slack_bot</string>
@@ -27,8 +51,8 @@
     <key>KeepAlive</key>
     <true/>
 
-    <!-- A misconfigured launch (missing .env) exits 1 immediately; without
-         a throttle launchd would tight-loop the pre-flight failure. -->
+    <!-- A misconfigured launch (bad .env, unwritable logs) exits immediately;
+         without a throttle launchd would tight-loop the failure. -->
     <key>ThrottleInterval</key>
     <integer>30</integer>
 

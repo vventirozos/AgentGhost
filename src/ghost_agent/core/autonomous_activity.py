@@ -61,6 +61,7 @@ _PHASE_LABELS = {
     "calibration": "calibration",
     "self_play": "self-play",
     "scheduled_task": "scheduled task",
+    "agent_message": "message from the agent",
     "open_questions": "open questions",
     "project": "project",
     "service": "service",
