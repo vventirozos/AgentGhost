@@ -891,6 +891,13 @@ pre:hover .render-code-btn {
     border-radius: 50%;
     width: 52px;
     height: 52px;
+    /* Hold-to-talk on touch: the long-press must belong to the recording
+       gesture, not to text-selection / the iOS callout / scroll. */
+    touch-action: none;
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
     display: flex;
     align-items: center;
     justify-content: center;

@@ -190,6 +190,20 @@ expansion"; it was actually DECOMPOSE_QUERY — label now derives from the task.
 and the smart-memory journal appends on both finalize paths (also stops chess FENs polluting
 memory). **Needs prod restart.**
 
+**Interface server audit (2026-07-12) — the web UI's live-log stream was DEAD in prod.** server.py's
+default agent-log path was `/Users/vasilis/AI/Logs/…` (missing `Data/`) and the prod deployment
+(`uvicorn server:app` via start-ghost-client.sh) never passes `--agent-log` (uvicorn owns argv) — so
+`tail -F` followed a nonexistent file forever and the UI's face pulses / planner monologue never
+fired. Fixed: correct default + `GHOST_AGENT_LOG` env override; log_streamer wrapped in a
+restart-with-backoff loop (a dead tail used to end the stream until server restart); stream-cap hit
+now CLOSES the upstream (was draining a discarded stream up to 30 min); `/api/stt` text-field-named
+"file" → clean 400. Interface restarted + verified live on an emulated phone over TLS: 0 h-overflow,
+SYSTEM ONLINE, 16 live log frames received. Mobile hardening: mic hold-to-talk gets
+`touch-action:none`/callout suppression (JS already had the full touch lifecycle). SECURITY FLAG:
+the launchd plist sets GHOST_API_KEY=**ghost-secret-123** — the exact guessable default the code
+banned; the UI is TLS on 0.0.0.0:8080, so anyone on the LAN who guesses it gets full agent access →
+operator should rotate it (bookmarks use `?key=`).
+
 **Sandbox image baked to v4 (2026-07-12):** added `iproute2` (the `ss` port inspector) to apt and
 `flask` + `python-chess` to pip in BOTH `sandbox/docker.py` (runtime provisioner) and
 `sandbox/Dockerfile` (build-time), marker `.supercharged.v3`→`.v4`. "Host a web app / chess

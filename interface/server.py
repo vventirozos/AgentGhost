@@ -82,9 +82,17 @@ def _err_json(status: int, msg: str) -> JSONResponse:
     every client-side retry/backoff loop."""
     return JSONResponse({"error": msg}, status_code=status)
 
-# Parse arguments
+# Parse arguments.
+# NB: in the production deployment this module is loaded BY UVICORN
+# (`uvicorn server:app …`), so sys.argv belongs to uvicorn and --agent-log
+# can never actually arrive here — the env var is the real override. The
+# old default was ALSO wrong (`/Users/vasilis/AI/…`, missing `Data/`), so
+# the live-log tail followed a nonexistent file and the UI's log stream
+# (face pulses, planner monologue) was silently dead in prod.
+_DEFAULT_AGENT_LOG = os.environ.get(
+    "GHOST_AGENT_LOG", "/Users/vasilis/Data/AI/Logs/ghost-agent.log")
 parser = argparse.ArgumentParser(description="Ghost Interface Server")
-parser.add_argument("--agent-log", default="/Users/vasilis/AI/Logs/ghost-agent.log", help="Path to the agent log file")
+parser.add_argument("--agent-log", default=_DEFAULT_AGENT_LOG, help="Path to the agent log file")
 args, unknown = parser.parse_known_args()
 AGENT_LOG_PATH = args.agent_log
 
@@ -125,7 +133,27 @@ app.add_middleware(
 connected_websockets = set()
 
 async def log_streamer():
-    """Reads agent logs and broadcasts them to connected clients."""
+    """Reads agent logs and broadcasts them to connected clients.
+
+    Wrapped in a restart loop: if the tail subprocess ever EXITS (killed,
+    binary error, resource pressure), `readline()` returns b'' and the old
+    version just returned — the live log stream stayed dead until the whole
+    interface server was restarted. Now it logs and respawns with backoff.
+    """
+    while True:
+        try:
+            await _log_streamer_once()
+            logger.warning(
+                "log tail for %s exited — restarting in 5s", AGENT_LOG_PATH)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("log streamer error (%s) — restarting in 5s", e)
+        await asyncio.sleep(5)
+
+
+async def _log_streamer_once():
+    """One tail lifetime: spawn, broadcast lines until the process exits."""
     # stderr → DEVNULL: tail -F writes rotation notices ("file truncated",
     # "has appeared") to stderr, and nothing ever drains that pipe — once
     # the 64KB buffer fills, tail blocks and the live log stream freezes.
@@ -372,9 +400,14 @@ async def chat_proxy(request: Request):
                             # further chunks and flag the task as truncated.
                             chunk_len = len(chunk) if chunk else 0
                             if t["buffer_size"] + chunk_len > t["stream_cap"]:
+                                # break, not continue: continuing kept draining
+                                # the upstream for the rest of the turn (up to
+                                # 30 min) while throwing every byte away.
+                                # Breaking exits the `async with`, which closes
+                                # the upstream connection promptly.
                                 t["truncated"] = True
                                 t["new_data_event"].set()
-                                continue
+                                break
                             t["buffer"].append(chunk)
                             t["buffer_size"] += chunk_len
                             t["new_data_event"].set()
@@ -673,6 +706,11 @@ async def stt_proxy(request: Request):
         file = form.get("file")
         if file is None:
             return _err_json(400, "Missing 'file' part")
+        # A text form field named "file" arrives as a plain str — calling
+        # .read() on it raised AttributeError and surfaced as a misleading
+        # 502. It's a client error: say so.
+        if not hasattr(file, "read"):
+            return _err_json(400, "'file' must be an uploaded file, not a text field")
         file_content = await _read_capped_upload(file)
         async with httpx.AsyncClient() as client:
             files = {"file": (file.filename, file_content, file.content_type)}

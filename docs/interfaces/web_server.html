@@ -88,6 +88,32 @@
     <li>Background tasks for upstream polling + log streaming.</li>
   </ul>
 
+  <h2>Live log stream — path + resilience (2026-07-12)</h2>
+  <p>The tail target defaults to <code>/Users/vasilis/Data/AI/Logs/ghost-agent.log</code>,
+  overridable via the <strong><code>GHOST_AGENT_LOG</code> env var</strong> — the
+  <code>--agent-log</code> flag can never arrive in the prod deployment because
+  <code>uvicorn server:app</code> owns <code>sys.argv</code>. The previous default was
+  missing the <code>Data/</code> segment, so the live-log stream (face pulses, planner
+  monologue) tailed a nonexistent file and was <em>silently dead in production</em>
+  (<code>tail&nbsp;-F</code> retries forever without erroring). The streamer is also now a
+  restart loop: if the tail subprocess ever exits, it respawns after 5&nbsp;s instead of
+  ending the stream until the next server restart. Hardening in the same pass: the
+  stream-buffer cap now <em>closes the upstream connection</em> when hit (it previously
+  kept draining a discarded stream for up to 30&nbsp;min), and a text form field named
+  <code>file</code> on <code>/api/stt</code> is a clean 400 instead of an
+  <code>AttributeError</code>&nbsp;502. Regression-guarded by
+  <code>tests/test_interface_log_and_mobile.py</code>.</p>
+
+  <h2>Mobile / touch</h2>
+  <p>The UI is touch-ready: <code>100dvh</code> layout (no Safari address-bar jump),
+  ≥16&nbsp;px inputs (no iOS zoom-on-focus), 44–52&nbsp;px touch targets, hold-to-talk
+  with the full <code>touchstart/touchend/touchcancel</code> lifecycle +
+  <code>touch-action:none</code> on the mic (the long-press belongs to the recording
+  gesture, not text-selection or the iOS callout), <code>wss:</code> auto-selected under
+  TLS, and an iOS <code>getUserMedia</code> permission timeout. Note: the service worker
+  does not register over a <em>self-signed</em> cert (browser policy) — harmless, it only
+  provides PWA caching.</p>
+
   <h2>Static assets</h2>
   <p><code>interface/static/</code> holds <code>index.html</code> (three.js, marked, dompurify, mermaid, papaparse, chart.js via CDN), <code>app.js</code> (auth wrapper that injects <code>X-Ghost-Key</code> on every <code>/api/</code> fetch, voice queue management, monologue display, renderer iframes), <code>style.css</code> (cyan/magenta cyber theme — directional message entrances, streaming edge-pulse, animated input glow, gradient hero wordmark), <code>matrix_graph.js</code> (the background "face" — a three.js particle system with depth-faded nodes/links, electric-blue↔cyan hue variation, a slow orbit, and pulse-reactive bloom; state-reactive via <code>setWorkingState/triggerSpike/triggerPulse/setAudioLevel</code>), <code>cyber_face.png</code> (the notification icon), and <code>sw.js</code> (service worker). All decorative motion (CSS animations and the 3D sphere's orbit/morph) is damped under <code>prefers-reduced-motion</code>. CDN failures degrade gracefully: <code>marked</code>/<code>DOMPurify</code> fall back to escaped plain text, and a missing <code>mermaid</code> only disables diagram rendering rather than breaking the page.</p>
 
