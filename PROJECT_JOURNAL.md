@@ -202,6 +202,16 @@ the Jetson's 393k-px budget. Fixed: steps omitted by default (node default wins)
 ladder (512x768…768x512), seed/negative_prompt passthrough, schema/prompts now teach weight syntax
 + no-truncation, 503-aware image retry (8s for node warmup). **Agent side needs prod restart.**
 
+**Sandbox image v5 + chess engine-opponent mode (2026-07-12).** Baked `stockfish` into the sandbox
+image (docker.py apt + Dockerfile, marker `.v4`→`.v5`, base rebuilt; pinned tests bumped) for the
+chess project's new engine mode. The chess side-project (app.py in the sandbox workspace) now lets
+Black be Ghost (LLM, original "plays directly" mode) OR Stockfish at 8 difficulty levels — Ghost
+always coaches: engine moves return instantly and the coach note streams async via
+`/api/game/coach`, plus `/api/game/hint` (Ghost suggests the user's White move) in both modes. Flask
+now `threaded=True` + `_state_lock`. Verified live: v5 recreate on prod restart brought PID 1 =
+docker-init (tini/zombie fix now LIVE too) + stockfish baked; engine replies instant, coach gives
+real Alekhine coaching, all endpoints 200 in the user's live session.
+
 **Chat→project promotion nudge retuned (2026-07-12).** The "💡 promote to a tracked project" footer
 (agent.py finalize → `project_safety.should_suggest_promotion`) fired on 12 turns of pure chat and
 titled the project "hello" (the first user turn). Fixes: promotion now needs turns AND ≥3 sandbox

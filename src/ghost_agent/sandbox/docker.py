@@ -445,14 +445,18 @@ class DockerSandbox:
         #                `pip install torch` mid-task (observed live: the
         #                PetAI training task), often tripping the execute
         #                timeout. v2 images re-provision to pick torch up.
-        #   v4 (now):    .supercharged.v4 — adds `iproute2` (the `ss`
+        #   v4:          .supercharged.v4 — adds `iproute2` (the `ss`
         #                socket/port inspector) and preinstalls `flask` +
         #                `python-chess`. "Host a web app / chess service"
         #                requests otherwise `pip install flask python-chess`
         #                mid-task (~24 s serial thrash, observed live on the
         #                chess-hosting flow). v3 images re-provision to pick
         #                these up.
-        marker_path = "/root/.supercharged.v4"
+        #   v5 (now):    .supercharged.v5 — adds `stockfish` (the chess
+        #                project's engine-opponent mode; a recreate must
+        #                not silently drop the engine). v4 images
+        #                re-provision to pick it up.
+        marker_path = "/root/.supercharged.v5"
 
         # The marker/chromium probes are two docker execs; running them
         # before EVERY command added latency for nothing. Verify once per
@@ -497,7 +501,7 @@ class DockerSandbox:
             # unbounded mirror/CDN stall would wedge every concurrent tool
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
-            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2'"
+            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish'"
             code, out = self.container.exec_run(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"

@@ -94,7 +94,7 @@ class TestProvisionCommitAndTimeouts:
             return (0, b"")
 
         sb.container.exec_run.side_effect = _ready_exec_map({
-            "test -f /root/.supercharged.v4": (1, b""),   # marker missing
+            "test -f /root/.supercharged.v5": (1, b""),   # marker missing
             "find /root/.cache/ms-playwright": _find,
             "playwright install": _pw,
         })
@@ -118,7 +118,7 @@ class TestProvisionCommitAndTimeouts:
             seen.append(cmd)
             if "find /root/.cache/ms-playwright" in cmd:
                 return (0, b"/root/.cache/ms-playwright/chromium-1/x/headless_shell\n")
-            if "test -f /root/.supercharged.v4" in cmd:
+            if "test -f /root/.supercharged.v5" in cmd:
                 return (1, b"")
             return (0, b"")
 
@@ -189,7 +189,7 @@ class TestProvisionBackoff:
             return (1, b"mirror down")
 
         sb.container.exec_run.side_effect = _ready_exec_map({
-            "test -f /root/.supercharged.v4": (1, b""),
+            "test -f /root/.supercharged.v5": (1, b""),
             "apt-get install": _apt,
         })
 
@@ -341,7 +341,7 @@ class TestExecuteSingleProbe:
         sb._is_container_ready = MagicMock(return_value=True)
 
         def _exec_run(cmd, *args, **kwargs):
-            if "test -f /root/.supercharged.v4" in cmd:
+            if "test -f /root/.supercharged.v5" in cmd:
                 return (0, b"")
             if "find /root/.cache/ms-playwright" in cmd:
                 return (0, b"/root/.cache/ms-playwright/chromium-1/x/headless_shell\n")

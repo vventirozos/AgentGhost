@@ -57,7 +57,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         sudo coreutils nodejs npm g++ curl wget git procps \
-        postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 \
+        postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish \
  && rm -rf /var/lib/apt/lists/*
 
 # Passwordless sudo — the sandbox runs as root by default, but the
@@ -99,7 +99,7 @@ RUN python3 -m playwright install --with-deps chromium
 # tag (and the corresponding string in docker.py) whenever this
 # Dockerfile's install surface changes in a way that prior images
 # can't be trusted to match.
-RUN touch /root/.supercharged.v4
+RUN touch /root/.supercharged.v5
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]
