@@ -53,10 +53,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
 #                 as the debian-tor user when --tor-proxy is configured)
 # ripgrep       : fast code search
 # sqlite3       : lightweight data-analysis tasks
+# iproute2      : `ss` — socket/port inspection (what's listening)
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         sudo coreutils nodejs npm g++ curl wget git procps \
-        postgresql-client libpq-dev tor ripgrep sqlite3 \
+        postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 \
  && rm -rf /var/lib/apt/lists/*
 
 # Passwordless sudo — the sandbox runs as root by default, but the
@@ -72,7 +73,8 @@ RUN pip install --no-cache-dir \
         pylint black mypy bandit dill ipykernel jupyter_client \
         pytest pytest-asyncio \
         psycopg2-binary asyncpg sqlalchemy tabulate sqlglot \
-        playwright html2text lxml pysocks
+        playwright html2text lxml pysocks \
+        flask python-chess
 
 # PyTorch — CPU wheel only (the default GPU wheels pull ~2 GB of unusable
 # CUDA). Preinstalled so "train a model" projects don't `pip install torch`
@@ -97,7 +99,7 @@ RUN python3 -m playwright install --with-deps chromium
 # tag (and the corresponding string in docker.py) whenever this
 # Dockerfile's install surface changes in a way that prior images
 # can't be trusted to match.
-RUN touch /root/.supercharged.v3
+RUN touch /root/.supercharged.v4
 
 WORKDIR /workspace
 CMD ["sleep", "infinity"]

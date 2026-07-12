@@ -99,13 +99,17 @@ def test_briefing_surfaces_done_tasks_with_results(store):
                        result="wrote parser.py; parse_csv(path) -> list[dict]")
 
     b = build_project_briefing(store, pid)
-    # match the SECTION HEADER, not the mention inside the ONE TASK rule text
-    assert "DONE SO FAR (" in b
+    # Match the SECTION HEADER, not the mention inside the ONE TASK rule text.
+    # The header was "DONE SO FAR (N of M…)" until 2026-07-11 — that parses as
+    # a PROGRESS FRACTION ("N of M tasks done") rather than the display
+    # truncation it actually is, and the model misread it live. It now leads
+    # with the completed count: "DONE SO FAR — M task(s) complete…".
+    assert "DONE SO FAR — 1 task(s) complete" in b
     assert "parser.py" in b
     assert "parse_csv(path)" in b
     # the still-open task's id must NOT appear as a DONE digest bullet. Isolate
     # the DONE block (header → next section) to avoid matching RECENT EVENTS.
-    done_block = b.split("DONE SO FAR (")[1].split("RECENT EVENTS")[0]
+    done_block = b.split("DONE SO FAR —")[1].split("RECENT EVENTS")[0]
     assert f"[{t1}]" in done_block
     assert f"[{t2}]" not in done_block
 
@@ -113,7 +117,7 @@ def test_briefing_surfaces_done_tasks_with_results(store):
 def test_briefing_omits_done_section_when_nothing_done(store):
     pid = store.create_project("P")
     ProjectPlan(store, pid).add_task("only task")
-    assert "DONE SO FAR (" not in build_project_briefing(store, pid)
+    assert "DONE SO FAR —" not in build_project_briefing(store, pid)
 
 
 # --------------------------------------------------------------- tool: ledger action

@@ -51,7 +51,7 @@ k = 60  (rrf_k default)</code></pre>
 
   <h2>Step-by-step</h2>
   <ol>
-    <li><strong>Decompose</strong> the user query into 2-3 sub-queries (LLM call or "and also" / "as well as" heuristic).</li>
+    <li><strong>Decompose</strong> the user query into 2-3 sub-queries (LLM call or "and also" / "as well as" heuristic). <em>Internal requests</em> (<code>sub-</code>/<code>sched-</code>/<code>job-</code> request-ids — machine sub-calls like chess-app moves or scheduled jobs) skip the LLM call: their prompts are self-contained, and the <code>DECOMPOSE_QUERY</code> worker round-trip sat on their critical path (8&nbsp;s ReadTimeout at request start, observed live 2026-07-12). They get plain vector recall, and their turns are also excluded from the smart-memory write path (machine prompts must not pollute retrieval).</li>
     <li><strong>Fan-out</strong>: <code>asyncio.gather</code> hits each available memory tier with each sub-query.</li>
     <li><strong>Per-source ranking</strong>: each tier returns its own ordered list (cross-encoder re-rank for vector; spreading-activation BFS for graph; BM25-augmented vector for skills; trigger-similarity for episodes).</li>
     <li><strong>Fuse</strong>: RRF scores each candidate across rankers; intent weights bias the sum.</li>

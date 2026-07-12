@@ -202,9 +202,21 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         done_tasks = sorted(done_tasks, key=lambda t: (t.get("updated_at") or 0),
                             reverse=True)
         shown = done_tasks[:max_done_tasks]
-        lines.append(
-            f"DONE SO FAR ({len(shown)} of {len(done_tasks)}, most recent first):"
-        )
+        # Label the TRUNCATION explicitly. This used to read
+        # "DONE SO FAR (5 of 31, most recent first)", which is a display
+        # truncation ("showing 5 of the 31 completed tasks") but parses far
+        # more naturally as a PROGRESS FRACTION ("5 of 31 tasks are done").
+        # The model read it that way (observed live 2026-07-11): with all 31
+        # tasks actually DONE it saw "5 of 31", concluded the system state
+        # "seems to be out of sync with the actual task_list", and burned ~5
+        # turns re-checking status before deciding it was "a display issue".
+        # State the completed count first, then the truncation.
+        if len(shown) < len(done_tasks):
+            hdr = (f"DONE SO FAR — {len(done_tasks)} task(s) complete "
+                   f"(showing the {len(shown)} most recent):")
+        else:
+            hdr = f"DONE SO FAR — {len(done_tasks)} task(s) complete:"
+        lines.append(hdr)
         for t in shown:
             desc = (t.get("description") or "")[:55]
             res = " ".join((t.get("result_summary") or "").split())

@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 
+from ..utils.logging import Icons, pretty_log
+
 logger = logging.getLogger("GhostAgent")
 
 
@@ -414,6 +416,80 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                          f"code build failed: {cres.summary}", None)
 
 
+# A task is INTROSPECTIVE when it asks the agent to analyse itself. The open
+# web cannot answer these — the agent is the primary source. Deliberately
+# NARROW: it must not swallow genuine research ("research how transformers
+# handle attention" stays a web search; "analyse where YOUR attention would
+# fail" does not).
+_COGNITION = (r"(memory|attention|architecture|weights|training|reasoning|"
+              r"output|tokens?|tools?|responses?|mistakes?|processing|"
+              r"decisions?|decision-making|behaviou?r|context|guardrails|"
+              r"predictions?|biases|limits?)")
+
+_SELF_REF_RE = re.compile(
+    # Second person — the operator asking the agent about itself.
+    r"\b(your own|yourself|your " + _COGNITION + r"|your context window|"
+    r"when you output|do you relate|are you serving)\b"
+    # Explicit self-* vocabulary.
+    r"|\b(self-reflection|self-reflect|self-analysis|self-awareness|"
+    r"self-consciousness|self-critique|introspect\w*)\b"
+    r"|\bthe pronoun ['\"]?i['\"]?\b"
+    # FIRST person — the agent's own task descriptions are written this way
+    # ("Evaluate whether I truly 'choose' responses or merely predict them"),
+    # and the second-person patterns above miss them entirely. Anchored on an
+    # introspective QUESTION form or a possessive over a cognition noun, so
+    # "Analyze the data I uploaded" / "the report I need" do NOT match.
+    r"|\b(whether i|do i|am i|can i|what i|how i)\b"
+    r"|\bmy own\b|\bmy " + _COGNITION + r"\b",
+    re.IGNORECASE,
+)
+
+_SELF_ANALYSIS_PROMPT = (
+    "You are analysing YOUR OWN functional reality as an AI system. Answer "
+    "from your actual architecture and observable behaviour — NOT from "
+    "generic commentary about AI. No sci-fi tropes, no pleasantries, no "
+    "hedging about consciousness. Be concrete, technical and falsifiable; "
+    "where you are uncertain about your own internals, say so and explain "
+    "what would settle it.\n\nWrite a rigorous markdown analysis of:\n\n"
+)
+
+
+def is_self_referential(description) -> bool:
+    """True when the task asks the agent to analyse ITSELF (see _SELF_REF_RE)."""
+    return bool(_SELF_REF_RE.search(str(description or "")))
+
+
+async def _generate_self_analysis(context, description: str) -> str:
+    """Let the agent answer an introspective task from its own knowledge
+    instead of web-searching it. Returns "" on any failure, so the caller
+    silently degrades to the normal research path. Never raises."""
+    llm = getattr(context, "llm_client", None)
+    if llm is None:
+        return ""
+    try:
+        data = await llm.chat_completion({
+            "model": getattr(getattr(context, "args", None), "model", "default"),
+            "messages": [{"role": "user",
+                          "content": _SELF_ANALYSIS_PROMPT + str(description)[:800]}],
+            "temperature": 0.4,
+            "max_tokens": 2048,
+            "stream": False,
+        }, is_background=True)
+        text = ((data or {}).get("choices", [{}])[0]
+                .get("message", {}).get("content") or "").strip()
+        if text:
+            pretty_log(
+                "Self-Analysis",
+                f"introspective task answered from own knowledge "
+                f"(no web search): {str(description)[:60]}…",
+                icon=Icons.SELF_STATE,
+            )
+        return text
+    except Exception as e:  # noqa: BLE001 — degrade to the web-search path
+        logger.debug("self-analysis generation failed: %s", e)
+        return ""
+
+
 def _record_needs_user_activity(context, project_id, description, kind) -> None:
     """Push a needs-user/human-gate outcome into the autonomous-activity
     ledger (severity=notify → immediate outbound push when configured).
@@ -540,6 +616,34 @@ async def advance_once(
             classification = classify_task(nxt.description, default=_default_bucket)
     classification = (classification or _default_bucket).lower()
 
+    # An INTROSPECTIVE task can never need a human DECISION (2026-07-12).
+    #
+    # `_NEEDS_USER_KEYWORDS` matches bare substrings like "choose"/"decide", so
+    # a task ABOUT decision-making is mistaken for a task REQUIRING a decision.
+    # Observed live: "Illusion of Agency: Evaluate whether I truly 'choose'
+    # responses or merely predict them. Analyze decision-making as
+    # probabilistic sampling vs deterministic selection." → the word "choose"
+    # → NEEDS_USER. The task then JAMMED: autoadvance skips NEEDS_USER, so it
+    # could never be advanced, and the agent burned THREE user requests (~4
+    # min) investigating before telling the operator "I just need you to say
+    # proceed" — an answer that was both useless and wrong. The LLM classifier
+    # mis-fires the same way on this wording, so the guard lives here (where
+    # BOTH classifier paths converge) rather than in `classify_task` alone.
+    #
+    # There is nothing for a human to decide in "analyse your own X" — the
+    # agent is the only possible source. An EXPLICIT `[HUMAN_GATE: …]`
+    # postcondition still wins: `enforce_human_gate` is checked separately,
+    # below, and is untouched by this.
+    if classification == "needs_user" and is_self_referential(nxt.description):
+        pretty_log(
+            "Autoadvance",
+            f"introspective task was classified needs_user (keyword "
+            f"false-positive) — treating as self-analysis: "
+            f"{str(nxt.description)[:60]}…",
+            icon=Icons.SELF_STATE,
+        )
+        classification = "research"
+
     if classification == "needs_user":
         plan.update_status(nxt.id, TaskStatus.NEEDS_USER,
                            result="flagged for human review")
@@ -642,7 +746,24 @@ async def advance_once(
 
     output = ""
     artifact_id: Optional[str] = None
-    if tool_runner is not None:
+
+    # INTROSPECTIVE tasks must not be web-searched (2026-07-11). A task that
+    # asks the agent to analyse ITSELF — its own memory architecture, what the
+    # pronoun "I" maps to, where its attention would fail — has no answer on
+    # the open web. Observed live: a self-reflection project autoadvanced 10
+    # such tasks, burned ~85s on DuckDuckGo/Yandex queries like "the definition
+    # of 'i': when outputting the pronoun 'i'…", and produced briefs the model
+    # itself dismissed ("summaries from web searches — they're brief and
+    # somewhat generic"). The agent IS the primary source here, so generate the
+    # analysis directly and feed it to the SAME research-brief persistence.
+    # Degrades to the web search if no LLM client is attached.
+    if classification == "research" and is_self_referential(nxt.description):
+        _analysis = await _generate_self_analysis(context, nxt.description)
+        if _analysis:
+            tool_name = "self_analysis"
+            output = _analysis
+
+    if not output and tool_runner is not None:
         try:
             output = await tool_runner(tool_name, tool_args)
         except Exception as e:
@@ -739,7 +860,8 @@ async def advance_once(
     # just a transient tool_call artifact. Reuses the output already in
     # hand — no second search. Best-effort: never breaks the tick.
     research_path: Optional[str] = None
-    if classification == "research" and output and tool_name == "web_search":
+    if (classification == "research" and output
+            and tool_name in ("web_search", "self_analysis")):
         try:
             from .project_research import persist_research_from_output
             rr = await persist_research_from_output(

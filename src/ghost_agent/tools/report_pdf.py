@@ -105,6 +105,46 @@ def _split_markdown_into_sections(md: str) -> list[dict]:
     return sections
 
 
+_HINT_MAX_FILES = 40
+
+
+def _available_files_hint(sandbox_dir: Path) -> str:
+    """List the text files that DO exist, so a caller that guessed a filename
+    can fix it in ONE retry instead of guessing again.
+
+    Mirrors ``file_system._missing_file_message``, which exists for exactly
+    this reason. Without it, ``report_pdf`` said only "24 source file(s) could
+    not be read and were skipped: [...]" — naming the misses but never what was
+    actually there. Observed live 2026-07-11: the model had invented filenames
+    from task descriptions, then regenerated the PDF THREE times and listed the
+    sandbox tree TWICE (~50s of a user-facing turn) to discover the real files
+    lived under ``research/`` with different names. Never raises.
+    """
+    try:
+        root = Path(sandbox_dir).resolve()
+        if not root.is_dir():
+            return ""
+        rels = []
+        for p in sorted(root.rglob("*")):
+            if len(rels) >= _HINT_MAX_FILES:
+                break
+            if not p.is_file() or p.suffix.lower() not in (".md", ".txt", ".rst"):
+                continue
+            if any(part.startswith(".") for part in p.parts):
+                continue
+            rels.append(str(p.relative_to(root)))
+        if not rels:
+            return ""
+        more = ("\n  …(list truncated)" if len(rels) >= _HINT_MAX_FILES else "")
+        return (
+            "\n\nFILES THAT DO EXIST in this workspace (use these EXACT paths — "
+            "do not guess names from task descriptions):\n  "
+            + "\n  ".join(rels) + more
+        )
+    except Exception:  # noqa: BLE001 — a hint must never break the tool
+        return ""
+
+
 def _sections_from_files(sandbox_dir: Path, files: Any) -> tuple[list[dict], list[str]]:
     """Build report sections by reading sandbox markdown/text files.
 
@@ -138,6 +178,8 @@ def _sections_from_files(sandbox_dir: Path, files: Any) -> tuple[list[dict], lis
         from .file_system import _get_safe_path
     except Exception:
         _get_safe_path = None
+    # (see _available_files_hint — a bare "skipped: [...]" list made the model
+    # GUESS filenames across three PDF regenerations)
     _MAX_SOURCE_FILE_BYTES = 25 * 1024 * 1024  # 25 MB per source file
     _sb_root = Path(sandbox_dir).resolve()
     for p in paths:
@@ -466,7 +508,9 @@ async def tool_generate_pdf(
         return f"SYSTEM ERROR: PDF render reported success but the file is missing ({e})."
     _miss_note = (
         f"\n\n(Note: {len(file_missing)} source file(s) could not be read and "
-        f"were skipped: {file_missing}.)" if file_missing else ""
+        f"were skipped: {file_missing}.)"
+        + _available_files_hint(Path(sandbox_dir))
+        if file_missing else ""
     )
     _trunc_note = (
         "\n\n⚠️ The document exceeded the 200-page safety cap and was TRUNCATED — "

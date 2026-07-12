@@ -135,6 +135,35 @@ def _is_allowed_local_service(host, port):
             and port in ALLOWED_LOCAL_PORTS)
 
 
+def _proxy_bypass_for_ports(ports):
+    """Chromium proxy-bypass value so a supervised loopback service is reached
+    DIRECTLY instead of through the SOCKS/Tor proxy.
+
+    Returns the ``<loopback>`` token when any service port is allowed, else "".
+
+    Why `<loopback>` and not a `host:port` list: EMPIRICALLY VERIFIED
+    (2026-07-12, Playwright/Chromium against a dead SOCKS proxy) —
+
+        no bypass                                     -> ERR_PROXY (loopback IS proxied)
+        "127.0.0.1:PORT,localhost:PORT,[::1]:PORT"   -> ERR_PROXY (IGNORED)
+        "127.0.0.1"                                   -> REACHED
+        "<loopback>"                                  -> REACHED
+
+    Chromium's `--proxy-bypass-list` does NOT honour `host:port` entries for
+    the direct-vs-proxy decision — the first version of this fix (host:port)
+    silently did nothing, so every navigate to a hosted service still died
+    with ERR_SOCKS_CONNECTION_FAILED. `<loopback>` bypasses all loopback,
+    which is SAFE: loopback traffic never leaves the box (no Tor anonymity
+    concern), public traffic still goes through Tor, and PORT-LEVEL access is
+    still enforced by the in-runner SSRF interceptor (`_ssrf_should_block`,
+    installed on `ctx.route("**/*")`), which blocks any loopback request whose
+    port is not in ALLOWED_LOCAL_PORTS. So the proxy layer decides "direct vs
+    Tor" and the SSRF layer decides "allowed vs blocked" — two independent
+    gates, not one relying on the other.
+    """
+    return "<loopback>" if ports else ""
+
+
 # ── SSRF guard (runner side) ──────────────────────────────────────────
 # The host-side guard (_browser_blocked_url) only vets the INITIAL url, but
 # the sandbox runs under HOST networking, so a page navigated to an untrusted
@@ -370,10 +399,13 @@ def _chromium_args(proxy):
     """
     args = ["--no-sandbox", "--disable-dev-shm-usage"]
     if proxy:
-        # EXCLUDE localhost so the self-play fixture server (and any
-        # in-container service) is reachable without routing through Tor,
-        # AND exclude the proxy's own host so Chromium can actually reach
-        # the SOCKS server. Everything else is forced through SOCKS DNS.
+        # `--host-resolver-rules` governs DNS RESOLUTION only. EXCLUDE
+        # localhost keeps a bare "localhost" name from being NOTFOUND-mapped,
+        # and the proxy host must be excluded so Chromium can reach the SOCKS
+        # server itself (else every navigation is ERR_PROXY_CONNECTION_FAILED).
+        # NOTE: this does NOT stop loopback traffic from being sent THROUGH the
+        # proxy — that is the launch-time `proxy.bypass` list (see
+        # _with_context), needed for supervised in-container services.
         excludes = ["EXCLUDE localhost"]
         try:
             from urllib.parse import urlparse
@@ -478,6 +510,29 @@ async def _with_context(profile_dir, proxy, timeout_ms, op_fn):
         )
         if proxy:
             launch_kwargs["proxy"] = {"server": proxy}
+            # PROXY BYPASS for supervised sandbox services (2026-07-12).
+            #
+            # `--proxy-server` routes EVERY http(s) request through SOCKS —
+            # including `http://127.0.0.1:<port>`. Tor cannot route loopback,
+            # so navigating to a service the agent itself started died with
+            # `net::ERR_SOCKS_CONNECTION_FAILED`, which broke the whole
+            # "host an app, then drive it with the browser" capability under
+            # --mandatory-tor (observed live: the chess-coach service came up
+            # on :8100 and every navigate failed).
+            #
+            # `--host-resolver-rules=… EXCLUDE localhost` did NOT cover this:
+            # that flag governs DNS RESOLUTION only, never proxy routing. (The
+            # self-play fixtures appeared to work solely because they are
+            # file:// URLs, which never touch the proxy.)
+            #
+            # Bypass the proxy for loopback when a supervised service is
+            # running, so the browser can reach it directly (Tor can't route
+            # loopback). Port-level access stays enforced by the in-runner
+            # SSRF interceptor — see _proxy_bypass_for_ports for the empirical
+            # reason `<loopback>` is used rather than a host:port list.
+            _bypass = _proxy_bypass_for_ports(ALLOWED_LOCAL_PORTS)
+            if _bypass:
+                launch_kwargs["proxy"]["bypass"] = _bypass
         ctx = await p.chromium.launch_persistent_context(**launch_kwargs)
         # Install the redirect/subresource SSRF guard BEFORE any navigation so
         # it covers the very first goto (and its redirect chain). The sandbox

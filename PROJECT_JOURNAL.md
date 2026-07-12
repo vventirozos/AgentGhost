@@ -113,6 +113,92 @@ for ablations. Swap stays ~950MB free once a throwaway is up; abort a run if swa
 `malloc_trim` is Linux-only (no-op on Darwin). RSS watchdog (#3) is opt-in via `GHOST_MAX_RSS_MB`
 (default off).
 
+**Reach an agent-hosted service remotely (2026-07-12).** An in-sandbox service is trapped behind
+two walls. Wall 1 (automatic): it must run on a *published* port (`GHOST_SANDBOX_SERVICE_PORTS`,
+default `8100-8104`) AND bind `0.0.0.0` inside the container — `services.py` `start()` now exports
+`HOST=0.0.0.0`/`GHOST_SERVICE_HOST` next to `PORT`, so docker's bridge-publish forwards host
+`127.0.0.1:<port>` → the app (a loopback-bound app is reachable in-sandbox but NOT from the host).
+Wall 2 (operator, one command): published ports bind host loopback only (authless API on this
+host), so expose one to the tailnet with `/Users/vasilis/Data/AI/bin/serve-remote.sh <port>` →
+`https://eva.taila2b1d.ts.net:<port>/` (tailnet-only, real TLS; teardown `unserve-remote.sh
+<port>`|`all`). `manage_services` surfaces the exact command + URL when a service comes up on a
+published port. The agent can't run `tailscale serve` itself (sandboxed; exposure is an operator
+action). See `docs/sandbox/services.html#remote-access`. **Needs a prod restart** (env in `start()`).
+
+**Two fixes from the live chess-hosting functional test (2026-07-12).** (1) `manage_services`
+accepted a `workdir` param end-to-end (handler → `start()` → `cd`) but it was MISSING from the
+tool JSON schema, so the model couldn't see it and burned ~50s baking `cd` into the command
+(tripping the loop-breaker) when hosting a subdirectory app — added `workdir` to the schema
+`properties`. (2) Boot-only `warm_up_workers()` was insufficient: on a request whose worker idled
+~105s during sandbox work, BOTH the front-of-request query expansion AND the finalize route
+ReadTimeout'd at 5s — added `LLMClient.keepalive_workers()` (spawn_bg loop, pings each off-main
+node every 45s, tunable via `GHOST_WORKER_KEEPALIVE_S`, ≤0 disables). The timeouts were harmless
+to correctness but silently downgraded query expansion to legacy string-concat every request. Both
+**need a prod restart**.
+
+**Service manager leaked orphaned processes — root-caused + fixed (2026-07-12).** `manage_services`
+launched with `setsid nohup sh cmd.sh & echo $!`, but `$!` was a TRANSIENT wrapper pid: under
+`setsid` the real service (re-parented to the container's PID 1) had a different pid, so
+`stop`/`restart` killed the wrong one and **orphaned the real process** (hung processes accumulated
+across restarts; live evidence — registry said `chess-v4` pid=817 while `ss` showed the real
+listener was pid=625). Fix: the generated `cmd.sh` now records its own pid (`echo $$ > <name>.pid`
+as its first line; under setsid that shell is the session/group leader, so `kill -- -<pid>` reaps
+the tree) and `start` registers THAT. Plus: a new `stop-all` action (stop every service + reclaim
+ports + clear registry — the one-shot cleanup), a port-reclaim fallback in `stop` (kill the port's
+listener via the now-baked `ss` when the tracked pid is dead but the port is still held), and a
+`status` hint when dead entries exist. **Verified live 2026-07-12:** a restart cycle leaves exactly
+ONE process (the old one reclaimed via the port fallback), no orphan. Refinement: the launched
+`cmd.sh` now `exec`s a simple command so the recorded `$$` is the EXACT service pid (the shell
+becomes it) rather than a wrapper the shell forks-then-exits (which left status() showing DEAD while
+the service ran + made stop() rely on the port fallback). Compound commands can't be exec'd — they
+keep the fallback. The exec refinement lands on the NEXT restart; the orphan fix itself is already
+live.
+
+**ZOMBIES were the deeper mechanism (2026-07-12, 137s-request postmortem).** Container PID 1 was
+`sleep infinity` — it never wait()s, so every dead orphan became a PERMANENT zombie (`[sh]`, `[tor]`,
+`[headless_shell]` `<defunct>` all accumulating), and **zombies pass `kill -0`** — so dead service
+launchers looked "already running (pid N)", stop() no-op'd against them, and start()'s
+exited-immediately+log-tail diagnostic never fired. Compounding it, the model passed
+`workdir='/projects/<id>'` (missing /workspace) and the launch's `cd` failed INVISIBLY inside the
+async subshell (the log redirection opens after the cd — nothing written anywhere) → 3 identical
+failed launches → model worked around via `execute … &` (an unsupervised orphan served the chess
+game). Fixes: (1) `run_kwargs["init"] = True` — tini as PID 1 reaps zombies (effective on container
+recreate); (2) `_pid_alive` also rejects `/proc/<pid>/stat` state Z (works in old containers);
+(3) start() VALIDATES workdir exists before launching, heals `/projects/…`→`/workspace/projects/…`,
+anchors relative paths at /workspace, and strips a redundant `cd X &&` when workdir covers it.
+**Needs prod restart; init needs a container recreate.**
+
+**Keepalive log spam + hidden fallback bug (2026-07-12).** The 45s `keepalive → Worker Node (Nova)`
+line spammed the live stream. Fix: heartbeats log TRANSITIONS, not ticks — healthy pings silent,
+node-down = ONE warning, recovery = ONE line (per-ping traffic at debug, gated on
+`task_label == "keepalive"`). Found underneath: keepalive didn't pass `off_main_only=True`, so every
+failed ping FELL BACK TO THE MAIN 35B (max_tokens=1 on the single slot every 45s while a node was
+down) — now raises `OffMainNodeUnavailable` instead, caught as the down-signal. Chess-app wonkiness
+same day: move calls through /api/chat did tool gymnastics (bash-echo'd its JSON → quote-mangling →
+verifier REFUTED repair; then WROTE chess_move.py to print JSON) at 37-57s/move — fixed app-side
+(no-tools plain-text directive in the prompt + `X-Request-ID: sub-chess-…` marks moves internal,
+suppressing the activity banner); verified 24s single-turn clean-JSON moves. **Keepalive fix needs a
+prod restart; chess fix is live** (service restarted).
+
+**4th ReadTimeout cause — internal requests loading nova (2026-07-12).** Chess-move (`sub-chess-`)
+requests still ran the FULL memory pipeline: RAG-fusion DECOMPOSE_QUERY on the worker at request
+start (critical path — the "+0.00s → 8s ReadTimeout" lines) and the smart-memory extract
+(max_tokens=3072) at finalize — consecutive moves saturated nova so the next move's routing call hit
+the ceiling. (Diagnosis was initially misdirected because route() hardcoded its log label as "query
+expansion"; it was actually DECOMPOSE_QUERY — label now derives from the task.) Fix:
+`is_internal_request(req_id)` gates hydration's `llm_client` (→ plain vector recall, no worker call)
+and the smart-memory journal appends on both finalize paths (also stops chess FENs polluting
+memory). **Needs prod restart.**
+
+**Sandbox image baked to v4 (2026-07-12):** added `iproute2` (the `ss` port inspector) to apt and
+`flask` + `python-chess` to pip in BOTH `sandbox/docker.py` (runtime provisioner) and
+`sandbox/Dockerfile` (build-time), marker `.supercharged.v3`→`.v4`. "Host a web app / chess
+service" requests were `pip install flask python-chess` mid-task (~24s serial thrash on the
+critical path). The `ghost-agent-base:latest` cache was rebuilt to v4 already (incremental build on
+the v3 base); a `v3` container re-provisions to v4 on next recreate. Sync guarded by
+`test_provisioning_bakes_ss_flask_chess_and_stays_in_sync`. Takes effect on the next sandbox
+container **recreate** (next prod restart).
+
 **Conventions.** Prefer closing loops over new modules. A "bug" needs a concrete failure scenario;
 an "inefficiency" needs measured before/after. Any change adds tests in `tests/` + updates HTML
 docs in `docs/`. Flag/env changes need a manual relaunch. Logging: `pretty_log` + distinct icons;
@@ -595,6 +681,198 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-12 (later 4) — the `Nova: ReadTimeout` spam is a TAILSCALE cold-path issue, not threads
+- Operator asked why worker ReadTimeouts keep appearing "even though nova runs 4 threads." Diagnosed
+  empirically (measured nova + the full LLMClient path; did NOT theorize):
+  - **nova runs `-np 4` (4 slots), `-t 10` (10 threads) — parallelism WORKS**: 4 concurrent calls
+    finished in 1.0s wall-clock. The "threads" intuition was a red herring; concurrency was never the
+    bottleneck.
+  - **nova's inference is FAST**: the exact query-expansion payload returns in **0.6s** warm through
+    the full `LLMClient.route()` path (6 consecutive runs, 0.6-0.9s).
+  - **Only `route()` (query expansion) has a short timeout** (3s); all other worker calls use the
+    1200s default, so every ReadTimeout in the logs is a route call — and its fallback is FREE, so
+    they were functionally harmless but noisy + wasteful.
+  - **Root cause: nova is a TAILSCALE peer** (`100.83.184.117`, CGNAT range). The first request after
+    the agent (co-)restarts pays Tailscale path-establishment (DERP relay → direct upgrade, ~1-3s),
+    which the tight 3s timeout clipped → fell back for no reason. Because the operator restarts
+    constantly while iterating, that first-call miss showed up on essentially every session — hence
+    "I keep seeing this."
+- **Fixes:** (1) `LLMClient.warm_up_workers()` — fires tiny thinking-off `max_tokens=1` calls at each
+  worker/critic node (3 per node, for the `-np` slots) so the Tailscale path + TCP + slot KV are hot
+  BEFORE the first user call; spawned NON-BLOCKING at boot via `spawn_bg` (guarded on the pools being
+  non-empty lists so a mocked client is a no-op). Verified live: warmup 0.7s, subsequent route 0.6s.
+  (2) `_ROUTE_TIMEOUT_S` 3s → 5s — ~8x the 0.6s warm latency, absorbs a cold path re-established after
+  an idle period, still fails fast on a genuinely dead node (circuit breaker then trips after 3).
+- Tests: `test_worker_warmup.py` (8). Suite **7278 passed / 12 skipped / 0 failed**. Prod restart
+  required. Residual (not built): a periodic keepalive would also cover mid-session idle cool-down —
+  deferred unless it recurs after these fixes.
+
+### 2026-07-12 (later 3) — service manager: surface bind-failure logs + export the assigned PORT
+- **The browser proxy-bypass fix is CONFIRMED WORKING live:** the failure went from
+  `ERR_SOCKS_CONNECTION_FAILED` (proxied, unreachable) to `ERR_CONNECTION_REFUSED` (reached loopback
+  directly, refused because the app had crashed on a missing dep), and the FINAL navigate succeeded —
+  verifier CONFIRMED 95%, the agent saw the board. Feature 4 end-to-end works.
+- **Two `manage_services` improvements** (the remaining thrash was our-side UX, ~50s wasted):
+  - **(1) Surface the log on a bind failure.** `start()` handled process-died-immediately (log tail)
+    but NOT process-alive-yet-port-never-binds — it returned a vague "NOT listening yet". That is
+    exactly the crash-on-import / missing-dep / wrong-bind-port case, and the cause
+    (`ModuleNotFoundError: No module named 'chess'`) was sitting in the service log. It now returns the
+    log tail + a restart hint, and does NOT falsely say "RUNNING". Turns browse→fail→install→restart
+    into see-the-error→install→restart.
+  - **(2) Export the assigned port.** The operator had already changed the chess app to read
+    `os.environ.get("PORT", "5055")` — but `manage_services` never SET `PORT`, so the app fell back to
+    its default and only matched the probe by luck. `start()` now exports `PORT` (the Flask/gunicorn/
+    Heroku convention) + `GHOST_SERVICE_PORT` into the launched script, and the tool description tells
+    the model to bind it. So `port=8100` → the app binds 8100 → probe + browser all agree; the
+    port-mismatch class is gone for well-behaved apps. The chess app needed no further change (it
+    already reads PORT).
+- Tests: `test_sandbox_services.py` (+4). Suite **7272 passed / 12 skipped / 0 failed**. Prod restart
+  required. Docs: `sandbox/services.html`.
+
+### 2026-07-12 (later 2) — the browser proxy-bypass fix was WRONG; verified the right one empirically
+- My previous fix (Playwright `proxy.bypass` = `host:port` list) shipped and **still failed live** —
+  same `net::ERR_SOCKS_CONNECTION_FAILED` on the chess-coach service. I had guessed the Chromium
+  bypass format and guessed wrong. This time I **tested it** (Playwright/Chromium against a dead SOCKS
+  proxy, then the REAL runner code against a REAL local server):
+  ```
+  no bypass                                  -> ERR_PROXY   (loopback IS proxied — the bug)
+  "127.0.0.1:PORT,localhost:PORT,[::1]:PORT" -> ERR_PROXY   (IGNORED — what I had shipped)
+  "127.0.0.1"                                -> REACHED
+  "<loopback>"                               -> REACHED
+  ```
+  **Chromium's `--proxy-bypass-list` does NOT honour `host:port` entries** for the direct-vs-proxy
+  decision, so my port-specific bypass silently did nothing. Fixed to `<loopback>` (bypass all
+  loopback), which is SAFE: loopback never leaves the box (no Tor concern), public traffic still goes
+  through Tor, and **port-level access is still enforced by the in-runner SSRF interceptor**
+  (`_ssrf_should_block` on `ctx.route("**/*")`, which blocks any loopback port not in
+  ALLOWED_LOCAL_PORTS — pinned by a test). Two independent gates: proxy = direct-vs-Tor, SSRF =
+  allowed-vs-blocked. **Verified end-to-end**: the real runner navigating a real local server through
+  a dead proxy now returns HTTP 200 with content (was ERR_SOCKS_CONNECTION_FAILED). This was the root
+  cause of the whole failed chess session — the verifier correctly LATE-REFUTED it.
+- **LESSON: do not guess Chromium/proxy/network behaviour — reproduce it.** Playwright + Chromium is
+  in the venv; a 30-line script settles it in seconds. I burned a full restart cycle shipping a
+  guessed format.
+- Tests: `test_browser_service_proxy_bypass.py` updated (8) incl. the SSRF-still-enforces-ports pin.
+  Suite **7269 passed / 12 skipped / 0 failed**. Prod restart required.
+- Also seen, NOT fixed (out of scope / not our bug): (a) the chess app hardcodes `port=5055` and
+  ignores the service manager's assigned port — real thrashing, but app-code, not manage_services;
+  (b) the metacog shell validator blocked `curl … | python3 -m json.tool` as a `curl|shell` RCE
+  pattern — arguably a false positive, but it is a deliberately-conservative security control and the
+  agent had non-piped alternatives.
+
+### 2026-07-12 (later) — browser couldn't reach a hosted sandbox service (Tor-proxied loopback)
+- Fifth log audit, and it caught the ONE remaining hole in Feature 4 (supervised sandbox services).
+  Prior fixes all confirmed live (introspective tasks completed cleanly, no NEEDS_USER jam, worker
+  offload working). Suite **7270 passed / 12 skipped / 0 failed**.
+- **THE BUG — the browser routed a hosted-service URL through Tor.** The agent started the chess-coach
+  Flask service on :8100 (correctly — service came up, pip install worked, restart worked), then every
+  `navigate http://127.0.0.1:8100/…` failed with **`net::ERR_SOCKS_CONNECTION_FAILED`**. Chromium's
+  `--proxy-server=socks5://…` routes EVERY http(s) request through SOCKS, including loopback — and Tor
+  cannot route `127.0.0.1`. So the whole "host an app, then drive it with the browser" capability was
+  DEAD under `--mandatory-tor`. The existing `--host-resolver-rules … EXCLUDE localhost` did NOT cover
+  it (that flag governs DNS RESOLUTION only, never proxy ROUTING — and the code comment CLAIMED it made
+  in-container services "reachable without routing through Tor", which was flatly wrong; the self-play
+  fixtures only ever "worked" because they are `file://` URLs that never touch the proxy). Fix:
+  Playwright launch-time `proxy.bypass`, scoped to the EXACT allowed service ports
+  (`_proxy_bypass_for_ports` in the runner — 127.0.0.1 / localhost / [::1] per port), NOT all of
+  loopback, so a non-service loopback target (e.g. Tor control on 9051) still goes to the proxy and
+  fails — the SSRF interceptor stays defence-in-depth rather than the sole guard.
+- Tests: `test_browser_service_proxy_bypass.py` (9) — the bypass-list builder + a functional test that
+  exec's the REAL runner string with playwright stubbed and asserts the launch config carries the
+  bypass (and does NOT when no service is running / no proxy). Corrected the stale `_chromium_args`
+  comment. **Prod restart required.**
+- Noted, not changed: the 6×1s port-probe after a service start is normal startup polling, not a bug.
+
+### 2026-07-12 — "choose" jammed a task in NEEDS_USER; cold-worker latency bounded
+- Fourth log audit. **Both prior fixes CONFIRMED live:** zero web searches on the self-reflection
+  project (tasks wrote real analysis files), and **zero `upstream fatal`** — the `off_main_only` guard
+  held when the worker timed out. Suite **7261 passed / 12 skipped / 0 failed**.
+- **(1) THE BUG — a bare keyword jammed a task in NEEDS_USER, permanently.** `_NEEDS_USER_KEYWORDS`
+  substring-matches `"choose"`, so *"Illusion of Agency: Evaluate whether I truly **'choose'**
+  responses or merely predict them. Analyze **decision-making** as probabilistic sampling…"* was read
+  as a task REQUIRING a human decision rather than one ABOUT decision-making. Autoadvance SKIPS
+  NEEDS_USER tasks, so it could never be advanced — the agent burned **three user requests (~4 min)**
+  investigating, correctly sensed something was wrong ("it's a self-reflection task that I should be
+  able to complete on my own"), and finally told the operator *"I just need you to say proceed"* —
+  useless and wrong. Fix: an INTROSPECTIVE task can never need a human decision, applied where BOTH
+  classifier paths converge (the LLM classifier mis-fires on this wording too). An explicit
+  `[HUMAN_GATE: …]` postcondition still wins — `enforce_human_gate` is separate and untouched.
+- **(2) The introspection detector missed FIRST-PERSON phrasing.** The agent writes its own task list
+  in the first person ("whether **I** truly choose **responses**"), which the second-person patterns
+  ("your memory", "your attention") never matched. Widened to catch introspective question forms
+  (`whether i` / `do i` / `am i` / `how i`) and possessives over cognition nouns (`my own`, `my
+  reasoning`, `my mistakes`) — anchored so that *"Analyze the data **I** uploaded"* and *"the report
+  I need"* are NOT hijacked (pinned by adversarial tests).
+- **(3) Cold-worker latency bounded: `_ROUTE_TIMEOUT_S` 6s → 3s.** The first request after a restart
+  hit a cold worker and burned **6.1s of dead user latency** (call at +0.01s, timeout at +6.10s,
+  hydration only at +6.18s) before falling back to the free string-concat. The worker box also runs
+  ONE slot, so a user's query expansion can queue behind an autoadvance classifier call. 3s is 6x the
+  warm measurement (0.5s) and bounds both cases.
+- **(4) Fixed a log line that LIES.** With `off_main_only` the worker-failure path printed "falling
+  back to main upstream" — but it doesn't; the caller uses its local fallback. That text cost real
+  debugging time while reading this very log. It now says what actually happens.
+- Tests: `test_introspective_needs_user.py` (10) + adversarial first-person cases added to
+  `test_introspective_no_websearch.py`. **Prod restart required.**
+
+### 2026-07-11 (latest) — node timeout leaked onto the MAIN model; introspective tasks were web-searched
+- Third log audit. The thinking fix landed (hydration +13.8s → +3.7s), which exposed the next layer.
+  Suite **7247 passed / 12 skipped / 0 failed**.
+- **(1) A NODE-sized timeout was applied to the MAIN-model fallback.** The operator's trace:
+  `worker compute → Nova: ReadTimeout (at the 6s worker budget) → falling back to main upstream →
+  upstream fatal ReadTimeout('') (6s later)`. `_do_chat_completion` passed the caller's `timeout`
+  straight through to the main upstream — but that budget was sized for a small, fast worker
+  (route()=6s; measured 0.5s on the node), while the 35B is slower BY CONSTRUCTION. So **one slow
+  worker call turned into a HARD `upstream fatal` error.** Pre-existing (the same shape appears at 15s
+  in the earlier log); tightening the route timeout just made it frequent. Fix: a node timeout is
+  DROPPED when falling back to main (the main client's own 1200s default applies); a direct
+  main call still honours an explicitly-passed timeout. The `fell_back_from_node` flag is a LOCAL —
+  as instance state it would have poisoned concurrent calls.
+- **(2) `route()` fell back to the MAIN model — contradicting its own docstring** ("We do NOT want a
+  router call to ever fall back to the foreground model"). That intent was enforced only for the
+  no-pool case; when a pool existed and every node FAILED, it re-ran the sub-task on the 35B. New
+  `off_main_only=True` + `OffMainNodeUnavailable` → route() now returns its free fallback instead.
+- **(3) Introspective tasks were WEB-SEARCHED.** The self-reflection project autoadvanced 10 tasks
+  like *"the definition of 'I': when outputting the pronoun 'I', what technical reality does it map
+  to?"* — each fired a DuckDuckGo/Yandex query (**~85s total**), and the model itself dismissed the
+  result: *"The research files are summaries from web searches — they're brief and somewhat generic."*
+  The open web cannot answer a question about THIS agent's own architecture; the agent is the primary
+  source. Now `is_self_referential()` routes such tasks to `_generate_self_analysis()` (answered from
+  the agent's own knowledge, off the foreground slot) and feeds the result to the SAME research-brief
+  persistence. The regex is deliberately NARROW — "how transformer attention works" stays a web
+  search; "where YOUR attention would fail" does not. Degrades to the web search if no LLM client.
+- Tests: `test_node_fallback_timeout.py` (10), `test_introspective_no_websearch.py` (20).
+  **Prod restart required.**
+
+### 2026-07-11 (latest) — worker calls were THINKING: a 14x latency regression that also didn't work
+- Second log audit after the worker node went live. Three bugs, all costing real user time. Suite
+  **7217 passed / 12 skipped / 0 failed**.
+- **(1) THE BIG ONE — worker-routed calls left chain-of-thought ON.** The worker pool runs a REASONING
+  model (Gemma 4 E4B, thinking on by default) and `route()` never disabled it. Measured on the live
+  node for the exact query-expansion call: **7.0s, 128/128 tokens burned on hidden reasoning, and
+  `content == ""`** — so the caller got nothing and fell back to its legacy string-concat anyway.
+  In prod this was worse: the worker call fires at **+0.01s** and the memory bus doesn't hydrate until
+  **+13.8s** — ~13.7s added to the FRONT of every request, for ZERO benefit, periodically tripping the
+  15s timeout (`Nova: ReadTimeout`). A 14x latency regression on a feature that wasn't even working.
+  Fix: `_disable_thinking()` injected into the worker `node_payload` copy (so a main-model fallback
+  keeps the caller's payload intact; `setdefault` so an explicit caller preference wins).
+  **Measured after: 0.5s, 5 tokens, correct answer** — verified live end-to-end (`route()` → 0.53s →
+  'Ada Lovelace birthplace'). Note `reasoning_effort="none"` was ALSO measured and does NOT suppress
+  thinking on this template — only the chat-template kwarg does. Also tightened `route()`'s timeout
+  15s → 6s: it is awaited on the user's CRITICAL PATH (before hydration) and its fallback is free, so
+  a sick worker must degrade fast rather than stall the user.
+- **(2) "DONE SO FAR (5 of 31)" read as a PROGRESS FRACTION, not a truncation.** It means "showing 5
+  of the 31 completed tasks", but with all 31 actually DONE the model saw "5 of 31", concluded the
+  system state "seems to be out of sync with the actual task_list", and burned ~5 turns re-checking
+  before deciding it was "a display issue". Now leads with the count:
+  `DONE SO FAR — 31 task(s) complete (showing the 5 most recent):`.
+- **(3) `report_pdf` named the files it SKIPPED but never what EXISTED.** The model had invented
+  filenames from task descriptions → 24 misses → it regenerated the PDF **three times** and listed the
+  sandbox tree **twice** (~50s of a user-facing turn) to discover the real files lived under
+  `research/`. Added `_available_files_hint()` — the same affordance `file_system._missing_file_message`
+  already provides — so a wrong path is correctable in ONE retry.
+- Tests: `tests/test_worker_thinking_and_prompt_clarity.py` (16); 1 stale assertion repointed
+  (`test_project_working_memory` pinned the old ambiguous label). **Prod restart required.**
 
 ### 2026-07-11 (latest) — worker node LIVE-TESTED: two real bugs found (LAN hostname → Tor; wrong GGUF)
 - Testing the new worker offload against a real node (`--worker-nodes http://nova:8088|Nova`, a Gemma

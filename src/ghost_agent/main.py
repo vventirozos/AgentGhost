@@ -356,7 +356,31 @@ async def lifespan(app):
         )
 
     context.llm_client = LLMClient(args.upstream_url, context.tor_proxy, args.swarm_nodes_parsed, args.worker_nodes_parsed, getattr(args, 'visual_nodes_parsed', None), getattr(args, 'coding_nodes_parsed', None), getattr(args, 'image_gen_nodes_parsed', None), getattr(args, 'critic_nodes_parsed', None))
-    
+
+    # Pre-warm off-main nodes in the BACKGROUND so the first user-critical-path
+    # worker call (query expansion) doesn't eat a cold-start timeout (nova is a
+    # Tailscale peer; the first request after a restart pays path-establishment
+    # latency the tight route timeout would clip). Non-blocking: boot proceeds
+    # immediately; a slow/dead node warms or gives up on its own. Guard on the
+    # actual client pools being non-empty LISTS (not args) so a mocked client
+    # in tests is a clean no-op. See LLMClient.warm_up_workers.
+    _wc = getattr(context.llm_client, "worker_clients", None)
+    _cc = getattr(context.llm_client, "critic_clients", None)
+    if (isinstance(_wc, list) and _wc) or (isinstance(_cc, list) and _cc):
+        from .utils.logging import spawn_bg as _spawn_bg
+        _spawn_bg(context.llm_client.warm_up_workers(), name="node-warmup")
+        # Boot warmup only covers the FIRST request; a Tailscale peer's path
+        # re-cools when the node idles between requests or during a long
+        # tool phase, so keep it warm with a periodic ping. Tunable via
+        # GHOST_WORKER_KEEPALIVE_S (≤0 disables). See keepalive_workers.
+        try:
+            _ka = float(os.environ.get("GHOST_WORKER_KEEPALIVE_S", "45"))
+        except (TypeError, ValueError):
+            _ka = 45.0
+        if _ka > 0:
+            _spawn_bg(context.llm_client.keepalive_workers(interval_s=_ka),
+                      name="node-keepalive")
+
     pretty_log("System Boot", "Initializing components", icon=Icons.BOOT_AWAKE)
 
     if importlib.util.find_spec("docker"):

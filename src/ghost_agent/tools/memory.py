@@ -131,7 +131,7 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
                         prompt = f"Extract explicit entity relationships from this fact into a 'graph_triplets' array as objects with 'subject', 'predicate', and 'object' keys. Predicates MUST be uppercase verbs. Return ONLY JSON. Fact: {_payload_text}"
                         payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Graph Extractor. Output JSON."}, {"role": "user", "content": prompt}], "temperature": 0.0, "response_format": {"type": "json_object"}}
                         data = await asyncio.wait_for(
-                            llm_client.chat_completion(payload, use_worker=True, is_background=True),
+                            llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="smart-memory"),
                             timeout=_GRAPH_EXTRACT_TIMEOUT_S,
                         )
                         res = extract_json_from_text(data["choices"][0]["message"].get("content", ""), repair_truncated=True)
@@ -159,7 +159,7 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
                     from ..core.agent import extract_json_from_text
                     prompt = f"Extract explicit entity relationships from this fact into a 'graph_triplets' array as objects with 'subject', 'predicate', and 'object' keys. Predicates MUST be uppercase verbs. Return ONLY JSON. Fact: {text}"
                     payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Graph Extractor. Output JSON."}, {"role": "user", "content": prompt}], "temperature": 0.0, "response_format": {"type": "json_object"}}
-                    data = await llm_client.chat_completion(payload, use_worker=True, is_background=True)
+                    data = await llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="smart-memory")
                     res = extract_json_from_text(data["choices"][0]["message"].get("content", ""), repair_truncated=True)
                     triplets = res.get("graph_triplets", [])
                     if triplets:

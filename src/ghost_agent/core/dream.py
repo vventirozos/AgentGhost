@@ -1170,7 +1170,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 "temperature": 0.0,
                 "max_tokens": 4096,
             }
-            data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=180.0)
+            data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=180.0, task_label="self-play")
             content_text = data["choices"][0]["message"]["content"]
             
             result_json = extract_json_from_text(content_text)
@@ -1537,7 +1537,7 @@ Return ONLY a JSON object with:
                     "response_format": {"type": "json_object"}
                 }
                 data = await self.context.llm_client.chat_completion(
-                    payload, use_worker=True, is_background=True
+                    payload, use_worker=True, is_background=True, task_label="dream"
                 )
                 result = extract_json_from_text(data["choices"][0]["message"]["content"])
 
@@ -1805,7 +1805,7 @@ Return ONLY a JSON object with:
         }
         try:
             data = await self.context.llm_client.chat_completion(
-                payload, use_worker=True, timeout=120.0
+                payload, use_worker=True, timeout=120.0, task_label="dream"
             )
             raw = data["choices"][0]["message"].get("content", "")
             parsed = extract_json_from_text(raw) or {}

@@ -37,6 +37,72 @@ def _socks5h(tor_proxy: str) -> str:
     return tor_proxy.replace("socks5://", "socks5h://")
 
 
+# Ceiling for a `route()` call. It is awaited on the user's CRITICAL PATH
+# (query expansion runs before the memory bus hydrates) and its fallback is
+# free — a legacy string concat — so it must fail fast.
+#
+# Sizing (measured 2026-07-12 on the live Gemma-4-E4B worker, an M4 Mini):
+# a WARM query-expansion call is ~2.3s uncontended. Two earlier causes are now
+# handled elsewhere: COLD START (co-restart) by `warm_up_workers()` at boot, and
+# a re-cooling network path by `keepalive_workers()`. What's LEFT is SLOT
+# CONTENTION: the worker runs a small `-np` (measured -np 2 — 4 concurrent calls
+# returned [2.7, 2.8, 5.3, 5.3]s), so a route() call that queues behind one other
+# worker call (query expansion + classifiers/gates fire together at request
+# start/finalize) lands at ~5.3s — just over a 5s ceiling, producing the residual
+# `Nova: ReadTimeout` lines even on the LAN. 8s absorbs ONE queued call while
+# still failing fast on a genuinely sick node (the circuit breaker trips after 3
+# strikes). The real fix is more worker slots (operator: bump nova's -np); this
+# is the margin that keeps the value flowing until then. Losing the expansion
+# only costs a slightly cruder retrieval query, never correctness.
+_ROUTE_TIMEOUT_S = 8.0
+
+
+class OffMainNodeUnavailable(Exception):
+    """Every off-main node for this call failed AND the caller forbade the
+    main-model fallback (``off_main_only=True``).
+
+    Raised instead of silently re-running the request on the foreground model
+    — see `route()`, whose whole purpose is to keep small sub-tasks OFF the
+    single main inference slot.
+    """
+
+
+def _disable_thinking(node_payload: Dict[str, Any]) -> None:
+    """Turn OFF chain-of-thought for a WORKER-routed call (2026-07-11).
+
+    Worker-pool work is mechanical by definition — rewrite a query, classify a
+    task into one word, extract JSON, summarise. Hidden reasoning buys nothing
+    and costs everything.
+
+    MEASURED on the live worker (Gemma 4 E4B, a reasoning model with thinking
+    ON by default) for the exact query-expansion call ``route`` makes:
+
+        as sent before this fix : 7.0s, 128/128 tokens, 472 chars of hidden
+                                  reasoning, and **content == ""**
+        enable_thinking=False   : 0.5s, 5 tokens, correct answer
+
+    i.e. the model burned its ENTIRE token budget thinking, returned an EMPTY
+    answer, and the caller fell back to its legacy path anyway — so the offload
+    was adding ~13.7s to the front of every user request (measured in prod: the
+    worker call fires at +0.01s and the memory bus doesn't hydrate until
+    +13.8s) in exchange for NOTHING, and periodically tripped the 15s timeout
+    (`Nova: ReadTimeout`). A 14x latency regression that also didn't work.
+
+    Applied to ``node_payload`` (a copy), so a fallback to the main model keeps
+    the caller's original payload untouched. ``setdefault`` semantics: an
+    explicit caller preference always wins. NOTE: ``reasoning_effort="none"``
+    was also measured and does NOT suppress thinking on this template — only
+    the chat-template kwarg does.
+    """
+    kw = node_payload.get("chat_template_kwargs")
+    if not isinstance(kw, dict):
+        kw = {}
+    else:
+        kw = dict(kw)
+    kw.setdefault("enable_thinking", False)
+    node_payload["chat_template_kwargs"] = kw
+
+
 def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
     """Decide whether traffic to ``url`` must egress via Tor.
 
@@ -378,6 +444,16 @@ class LLMClient:
         # Worker pool absent → cheap fallback. We do NOT want a router
         # call to ever fall back to the foreground model: that would
         # inflate latency on the very tasks routing was meant to avoid.
+        #
+        # That intent was only ENFORCED for the no-pool case. When a pool
+        # existed but every node FAILED, `_do_chat_completion` fell through to
+        # the main upstream — carrying this call's short worker timeout — so
+        # the 35B got a 6s budget and died (observed live 2026-07-11):
+        #     worker node failed  Nova: ReadTimeout
+        #     falling back to main upstream
+        #     upstream fatal      ReadTimeout('')
+        # `off_main_only=True` below now makes the failure path raise
+        # OffMainNodeUnavailable, which we catch → the free fallback.
         if not getattr(self, "worker_clients", None):
             return fallback
 
@@ -391,8 +467,26 @@ class LLMClient:
                 sized_payload,
                 use_worker=True,
                 is_background=True,
-                timeout=15.0,
+                # A routing call is AWAITED ON THE USER'S CRITICAL PATH (query
+                # expansion runs before the memory bus hydrates) and its
+                # fallback is free — a legacy string concat. So a slow worker
+                # must degrade FAST rather than stall the user. The old 15s
+                # ceiling meant a thinking-happy worker added ~13.7s to every
+                # request and still timed out (`Nova: ReadTimeout`); with
+                # thinking disabled the same call takes 0.5s, so 6s is a
+                # generous ceiling that bounds the damage if a node is sick.
+                timeout=_ROUTE_TIMEOUT_S,
+                # NEVER re-run a routing sub-task on the main model.
+                off_main_only=True,
+                # The log label is the ACTUAL routed task ("decompose query",
+                # "expand query", …). A hardcoded "query expansion" here made
+                # a DECOMPOSE_QUERY timeout read as the anaphora expander and
+                # sent the debugging down the wrong path (2026-07-12).
+                task_label=str(task).replace("_", " ").lower(),
             )
+        except OffMainNodeUnavailable:
+            logger.debug(f"route({task}): worker pool down — using fallback")
+            return fallback
         except Exception as e:
             logger.debug(f"route({task}) worker call failed: {e}")
             return fallback
@@ -402,6 +496,126 @@ class LLMClient:
             return content if content else fallback
         except Exception:
             return fallback
+
+    async def warm_up_workers(self) -> None:
+        """Fire a tiny throwaway generation at every worker/critic node so its
+        model weights + Metal/CUDA state and per-slot KV are hot BEFORE the
+        first real (user-critical-path) call (2026-07-12).
+
+        Why: measured on the live worker (Gemma 4 E4B on an M4 Mini) — a warm
+        query-expansion call is ~1.9s, but the FIRST call after a (co-)restart
+        pays model-load / prefill latency, blowing the short `route()` timeout
+        and falling back for no reason. That cold miss happens on EVERY restart
+        (and the operator restarts a lot while iterating), which is the bulk of
+        the `Nova: ReadTimeout` lines. Paying it here, in the BACKGROUND at
+        startup, moves the cost off the user's first request. Best-effort:
+        never raises, and each node warms with a per-slot request so all
+        `-np` slots (not just one) get hot.
+        """
+        for pool_attr, label in (("worker_clients", "worker"),
+                                  ("critic_clients", "critic")):
+            clients = getattr(self, pool_attr, None) or []
+            for node in clients:
+                # One warmup per slot: with -np N the first call only hydrates
+                # one slot; fire a few so the pool is broadly hot. Bounded so a
+                # dead node can't stall startup.
+                for _ in range(3):
+                    try:
+                        payload = {
+                            "model": node.get("model", "default"),
+                            "messages": [{"role": "user", "content": "ok"}],
+                            "max_tokens": 1, "temperature": 0.0,
+                            "stream": False,
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        }
+                        await self.chat_completion(
+                            payload, use_worker=(label == "worker"),
+                            use_critic=(label == "critic"),
+                            is_background=True, timeout=30.0,
+                            task_label="warmup",
+                        )
+                    except Exception as e:  # noqa: BLE001 — warmup is best-effort
+                        logger.debug("warm_up %s %s failed: %s",
+                                     label, node.get("url"), e)
+                        break  # node unreachable — don't hammer it
+                if clients:
+                    pretty_log(
+                        "Node Warmup",
+                        f"{label} node {node.get('model')} pre-warmed",
+                        icon=Icons.NODE_WORKER,
+                    )
+
+    async def keepalive_workers(self, interval_s: float = 45.0) -> None:
+        """Long-lived loop that keeps each worker/critic node's network path
+        warm (2026-07-12). ``warm_up_workers`` only covers the FIRST request
+        after boot; a Tailscale/WireGuard peer's direct path re-cools after an
+        idle period, so a node that sits idle between requests — OR during a
+        long tool-execution phase WITHIN a request — pays path-establishment
+        again and trips the short ``route()`` timeout at BOTH ends of a request
+        (observed: front-of-request query expansion AND the finalize route both
+        ReadTimeout at exactly 5s, on a request whose worker sat idle ~105s
+        during sandbox work). A tiny ping every ``interval_s`` keeps the path
+        (and one slot) hot so ``route()`` stays on its ~0.6-1.9s warm path.
+
+        Best-effort and self-contained: a per-node failure is logged at debug
+        and never escapes the loop; a task cancel (shutdown) ends it cleanly.
+        No worker/critic pool ⇒ returns immediately (no idle spin, no main-node
+        traffic — this only ever touches off-main nodes). Interval is tunable
+        via ``GHOST_WORKER_KEEPALIVE_S`` (≤0 disables; wired in main.py)."""
+        if not (getattr(self, "worker_clients", None)
+                or getattr(self, "critic_clients", None)):
+            return
+        # Heartbeats log TRANSITIONS, not ticks (a ping line every 45s was
+        # pure spam in the live stream): one WARNING when a node stops
+        # answering, one line when it comes back — silence in between.
+        down: set = set()
+        while True:
+            try:
+                await asyncio.sleep(interval_s)
+            except asyncio.CancelledError:
+                return
+            for pool_attr, label in (("worker_clients", "worker"),
+                                     ("critic_clients", "critic")):
+                for node in getattr(self, pool_attr, None) or []:
+                    url = node.get("url")
+                    try:
+                        payload = {
+                            "model": node.get("model", "default"),
+                            "messages": [{"role": "user", "content": "ok"}],
+                            "max_tokens": 1, "temperature": 0.0,
+                            "stream": False,
+                            "chat_template_kwargs": {"enable_thinking": False},
+                        }
+                        await self.chat_completion(
+                            payload, use_worker=(label == "worker"),
+                            use_critic=(label == "critic"),
+                            is_background=True, timeout=30.0,
+                            # A failed ping must NEVER burn the single main
+                            # slot as a "fallback" — a max_tokens=1 hit on the
+                            # 35B every 45s for as long as a node stays down.
+                            off_main_only=True,
+                            task_label="keepalive",
+                        )
+                    except Exception as e:  # noqa: BLE001 — best-effort
+                        logger.debug("keepalive %s %s failed: %s",
+                                     label, url, e)
+                        if url not in down:
+                            down.add(url)
+                            pretty_log(
+                                "Node Keepalive",
+                                f"{label} node {node.get('model')} stopped "
+                                f"answering ({type(e).__name__}) — pings "
+                                f"continue silently; recovery will be logged",
+                                level="WARNING", icon=Icons.WARN,
+                            )
+                    else:
+                        if url in down:
+                            down.discard(url)
+                            pretty_log(
+                                "Node Keepalive",
+                                f"{label} node {node.get('model')} recovered",
+                                icon=Icons.NODE_WORKER,
+                            )
 
     async def close(self):
         await self.http_client.aclose()
@@ -598,7 +812,7 @@ class LLMClient:
                 else:
                     raise Exception(f"Image generation failed after 3 attempts: {str(e)}")
 
-    async def _do_chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def _do_chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "") -> Dict[str, Any]:
         """
         Sends a chat completion request to the upstream LLM with robust retry logic.
         """
@@ -609,6 +823,13 @@ class LLMClient:
         # it can be flipped off globally, and being explicit documents
         # intent for the reader.
         payload.setdefault("cache_prompt", True)
+        # True once an off-main pool was tried and every node in it failed.
+        # LOCAL, not instance state — concurrent calls must not see each
+        # other's fallback status.
+        fell_back_from_node = False
+        # Heartbeat traffic logs transitions, not ticks (see keepalive_workers)
+        # — its per-ping routing/failure lines stay at debug.
+        _quiet = task_label == "keepalive"
         if use_vision:
             if getattr(self, 'vision_clients', None):
                 target_model = payload.get("model")
@@ -693,10 +914,14 @@ class LLMClient:
 
                     tried_nodes.append(node)
 
-                    pretty_log("Worker Compute", f"Routing background task to Worker Node ({node['model']})", level="INFO", icon=Icons.NODE_WORKER)
+                    if _quiet:
+                        logger.debug("keepalive → worker node %s", node.get("model"))
+                    else:
+                        pretty_log("Worker Compute", f"{task_label or 'background task'} → Worker Node ({node['model']})", level="INFO", icon=Icons.NODE_WORKER)
                     try:
                         node_payload = payload.copy()
                         node_payload["model"] = node["model"]
+                        _disable_thinking(node_payload)
 
                         import json
 
@@ -711,12 +936,30 @@ class LLMClient:
                         return resp.json()
                     except Exception as e:
                         self.circuit_breaker.record_failure(node["url"])
-                        pretty_log("Worker Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
+                        if _quiet:
+                            logger.debug("keepalive worker %s failed: %s",
+                                         node.get("model"), type(e).__name__)
+                        else:
+                            pretty_log("Worker Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_worker_node(target_model)
                         continue
 
-                pretty_log("Worker Compute Failed", "All worker nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
+                # Say what will ACTUALLY happen. With off_main_only (route()),
+                # there is no main-model fallback — the caller degrades to its
+                # own cheap fallback. The old unconditional "falling back to
+                # main upstream" text was a lie in that case and cost real
+                # debugging time when reading the live log.
+                if not _quiet:
+                    pretty_log(
+                        "Worker Compute Failed",
+                        "All worker nodes failed — "
+                        + ("caller will use its local fallback (no main-model "
+                           "retry)" if off_main_only
+                           else "falling back to main upstream"),
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                fell_back_from_node = True
 
         elif use_critic and getattr(self, 'critic_clients', None):
             target_model = payload.get("model")
@@ -766,6 +1009,7 @@ class LLMClient:
                         continue
 
                 pretty_log("Critic Compute Failed", "All critic nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
+                fell_back_from_node = True
 
         elif use_coding and getattr(self, 'coding_clients', None):
             target_model = payload.get("model")
@@ -815,6 +1059,7 @@ class LLMClient:
                         continue
 
                 pretty_log("Coding Compute Failed", "All coding nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
+                fell_back_from_node = True
 
         elif use_swarm and self.swarm_clients:
             target_model = payload.get("model")
@@ -867,6 +1112,32 @@ class LLMClient:
                         continue
 
                 pretty_log("Edge Compute Failed", "All swarm nodes failed, falling back to main upstream", level="WARNING", icon=Icons.WARN)
+                fell_back_from_node = True
+
+        # ---- main-upstream fallback -------------------------------------
+        # Reached either because no off-main pool was requested/configured, or
+        # because every node in the requested pool FAILED.
+        if fell_back_from_node:
+            if off_main_only:
+                # The caller (e.g. `route()`) exists precisely to keep this
+                # work OFF the single main slot. Re-running it on the 35B is
+                # worse than not doing it at all — the caller has a free
+                # fallback. Raise; the caller degrades silently.
+                raise OffMainNodeUnavailable(
+                    "all off-main nodes failed; main-model fallback is "
+                    "disabled for this call")
+            # A node-sized timeout MUST NOT be applied to the main model
+            # (2026-07-11). `timeout` here was sized for a small, fast worker
+            # (route() uses 6s; measured 0.5s on the worker). The main model is
+            # slower BY CONSTRUCTION — a 35B answering a real prompt takes tens
+            # of seconds — so handing it the worker's budget guarantees a
+            # ReadTimeout. Observed live: a worker hiccup produced
+            #   worker node failed  Nova: ReadTimeout      (at the 6s budget)
+            #   falling back to main upstream
+            #   upstream fatal      ReadTimeout('')        (6s later — the 35B)
+            # i.e. one slow worker call turned into a HARD upstream error. Let
+            # the main client use its own (1200s) default instead.
+            timeout = None
 
         for attempt in range(2):
             try:
@@ -967,7 +1238,7 @@ class LLMClient:
             await asyncio.sleep(1.0)
             waited += 1.0
 
-    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def chat_completion(self, payload: Dict[str, Any], use_swarm: bool = False, use_worker: bool = False, use_vision: bool = False, use_coding: bool = False, use_critic: bool = False, is_background: bool = False, timeout: Optional[float] = None, off_main_only: bool = False, task_label: str = "") -> Dict[str, Any]:
         if is_background:
             # The foreground wait protects exactly one resource: the MAIN
             # inference slot. A call that will be served by an off-main
@@ -989,12 +1260,12 @@ class LLMClient:
             if targets_main_node:
                 await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
-                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout)
+                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
         else:
             async with self._foreground_lock:
                 self.foreground_tasks += 1
             try:
-                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout)
+                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
             finally:
                 async with self._foreground_lock:
                     self.foreground_tasks -= 1

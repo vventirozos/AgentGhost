@@ -147,7 +147,8 @@ async def constraint_gate(context, constraints: List[str],
 
     async def _ask(use_worker: bool) -> str:
         data = await llm.chat_completion(
-            dict(payload), use_worker=use_worker, is_background=is_background)
+            dict(payload), use_worker=use_worker, is_background=is_background,
+            task_label="constraint gate")
         return (data.get("choices", [{}])[0].get("message", {})
                 .get("content") or "")
 

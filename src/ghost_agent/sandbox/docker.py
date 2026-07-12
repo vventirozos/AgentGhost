@@ -239,6 +239,17 @@ class DockerSandbox:
                 except (TypeError, ValueError):
                     run_kwargs["pids_limit"] = 1024
 
+                # tini as PID 1 (2026-07-12). The container command is
+                # `sleep infinity`, which never wait()s — every orphaned dead
+                # child became a PERMANENT ZOMBIE ([sh]/[tor]/[headless_shell]
+                # <defunct> accumulated in prod). Zombies pass `kill -0`, so
+                # dead service launchers looked "already running", stop() was
+                # a no-op against them, and the service manager's
+                # exited-immediately diagnostic never fired (a 137s live
+                # request burned 3 failed launches on this). init=true makes
+                # docker run tini as PID 1, which reaps orphans on arrival.
+                run_kwargs["init"] = True
+
                 # Optional capability hardening — OFF by default because the
                 # sandbox provisions passwordless sudo (setuid) for in-container
                 # apt installs, which `no-new-privileges` / `cap_drop=ALL` would
@@ -428,13 +439,20 @@ class DockerSandbox:
         #   v2:          .supercharged.v2 — ensures `--with-deps` ran.
         #                Images without the v2 marker are treated as
         #                un-provisioned and go through a full install.
-        #   v3 (now):    .supercharged.v3 — preinstalls the CPU PyTorch
+        #   v3:          .supercharged.v3 — preinstalls the CPU PyTorch
         #                wheel. Without it, every "train a model" project
         #                hit `ModuleNotFoundError: torch` and ran a ~300 s
         #                `pip install torch` mid-task (observed live: the
         #                PetAI training task), often tripping the execute
         #                timeout. v2 images re-provision to pick torch up.
-        marker_path = "/root/.supercharged.v3"
+        #   v4 (now):    .supercharged.v4 — adds `iproute2` (the `ss`
+        #                socket/port inspector) and preinstalls `flask` +
+        #                `python-chess`. "Host a web app / chess service"
+        #                requests otherwise `pip install flask python-chess`
+        #                mid-task (~24 s serial thrash, observed live on the
+        #                chess-hosting flow). v3 images re-provision to pick
+        #                these up.
+        marker_path = "/root/.supercharged.v4"
 
         # The marker/chromium probes are two docker execs; running them
         # before EVERY command added latency for nothing. Verify once per
@@ -479,7 +497,7 @@ class DockerSandbox:
             # unbounded mirror/CDN stall would wedge every concurrent tool
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
-            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3'"
+            apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2'"
             code, out = self.container.exec_run(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
@@ -499,7 +517,8 @@ class DockerSandbox:
                 "scikit-learn yfinance beautifulsoup4 networkx requests "
                 "pylint black mypy bandit dill ipykernel jupyter_client "
                 "pytest pytest-asyncio "
-                "psycopg2-binary asyncpg sqlalchemy tabulate sqlglot playwright html2text lxml"
+                "psycopg2-binary asyncpg sqlalchemy tabulate sqlglot playwright html2text lxml "
+                "flask python-chess"
             )
             code, out = self.container.exec_run(install_cmd, environment=env_vars)
             if code != 0:

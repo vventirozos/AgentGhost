@@ -707,7 +707,7 @@ async def tool_darkweb_research(
                     "max_tokens": 2048,
                 }
                 try:
-                    summary_data = await llm_client.chat_completion(payload, use_worker=True)
+                    summary_data = await llm_client.chat_completion(payload, use_worker=True, task_label="web summary")
                     pretty_log("Worker Compute", f"Distilling facts from {short_url}", icon=Icons.TOOL_DEEP)
                     preview = "[EDGE EXTRACTED FACTS]:\n" + (summary_data["choices"][0]["message"].get("content") or "").strip()
                 except Exception:

@@ -15,7 +15,7 @@ from ..sandbox.services import get_service_supervisor, SUGGESTED_PORTS
 
 logger = logging.getLogger("GhostAgent")
 
-_VALID_ACTIONS = ("start", "stop", "restart", "status", "logs")
+_VALID_ACTIONS = ("start", "stop", "restart", "status", "logs", "stop-all")
 
 
 async def tool_manage_services(action: str = None, name: str = None,
@@ -36,6 +36,9 @@ async def tool_manage_services(action: str = None, name: str = None,
         action = "status"
     if action == "log":
         action = "logs"
+    if action in ("stop_all", "stopall", "cleanup", "kill-all", "killall",
+                  "stop-services", "reap"):
+        action = "stop-all"
     if action not in _VALID_ACTIONS:
         return (f"Error: unknown action {action!r}. "
                 f"Valid: {', '.join(_VALID_ACTIONS)}.")
@@ -52,6 +55,8 @@ async def tool_manage_services(action: str = None, name: str = None,
             return await asyncio.to_thread(sup.stop, name)
         if action == "restart":
             return await asyncio.to_thread(sup.restart, name)
+        if action == "stop-all":
+            return await asyncio.to_thread(sup.stop_all)
         if action == "logs":
             return await asyncio.to_thread(
                 sup.logs, name, lines if lines is not None else 60)
@@ -77,8 +82,13 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "stop", "restart", "status", "logs"],
-                    "description": "status lists all services + liveness.",
+                    "enum": ["start", "stop", "restart", "status", "logs",
+                             "stop-all"],
+                    "description": ("status lists all services + liveness. "
+                                    "stop-all stops EVERY service, reclaims "
+                                    "their ports, and clears the registry — "
+                                    "the one-shot cleanup for accumulated or "
+                                    "orphaned services."),
                 },
                 "name": {
                     "type": "string",
@@ -98,7 +108,21 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                         "start only (recommended): TCP port the service "
                         f"listens on — enables the health probe and browser "
                         f"access. Use {SUGGESTED_PORTS} "
-                        "(8000/8080/8088/9050 are reserved)."
+                        "(8000/8080/8088/9050 are reserved). This value is "
+                        "also exported to the command as the PORT env var, so "
+                        "the app should bind it "
+                        "(`port=int(os.environ.get('PORT', <default>))`) rather "
+                        "than hardcoding a port that would mismatch this one."
+                    ),
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": (
+                        "start only: directory the command runs IN, relative "
+                        "to /workspace (e.g. 'projects/30d5d5b65c38'). Defaults "
+                        "to /workspace. Use this to run an app that lives in a "
+                        "subdirectory — pass workdir instead of prefixing the "
+                        "command with 'cd <dir> &&'."
                     ),
                 },
                 "lines": {

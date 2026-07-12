@@ -52,14 +52,70 @@
     <code>port</code>): launches, verifies liveness after ~1 s (an
     immediate exit returns the log tail instead of registering), probes
     the TCP port for up to ~6 s, registers, and reports the in-sandbox
-    URL.</li>
+    URL. <strong>The assigned <code>port</code> is exported to the command
+    as <code>PORT</code> (and <code>GHOST_SERVICE_PORT</code>)</strong> so a
+    well-behaved app binds it
+    (<code>port=int(os.environ.get("PORT", …))</code>) rather than hardcoding
+    one that would mismatch the probe (2026-07-12). <strong>If the process
+    stays alive but the port never binds</strong> — a crash on import, a
+    missing dependency, or a hardcoded wrong port — <code>start</code> now
+    returns the <em>log tail</em> with the actual cause (e.g.
+    <code>ModuleNotFoundError</code>) and a restart hint, instead of a vague
+    "not listening yet"; before this the agent would browse the URL, hit
+    <code>ERR_CONNECTION_REFUSED</code>, and only then discover the missing
+    dep — a whole browse→fail→install→restart cycle for an error already
+    captured.</li>
+    <li><code>workdir</code> — <strong>start only: the directory the command
+    runs IN</strong>, relative to <code>/workspace</code> (e.g.
+    <code>projects/30d5d5b65c38</code>; defaults to <code>/workspace</code>).
+    Pass this to run an app that lives in a subdirectory instead of prefixing
+    the command with <code>cd &lt;dir&gt; &amp;&amp;</code>. The handler and
+    supervisor always accepted it, but it was <em>missing from the tool schema</em>
+    until 2026-07-12 — so the model couldn't see it and burned ~50 s hacking a
+    path into the command (tripping the loop-breaker) when hosting a subdirectory
+    app.</li>
     <li><code>stop</code> / <code>restart</code> — group-kill; restart
-    re-launches from the registered command/port/workdir.</li>
+    re-launches from the registered command/port/workdir. If the tracked pid
+    is dead but the port is still held (a mis-tracked orphan), <code>stop</code>
+    reclaims it by killing the port's listener, found via <code>ss</code>
+    (iproute2, baked into the image).</li>
+    <li><code>stop-all</code> — <strong>the one-shot cleanup</strong>
+    (2026-07-12): stops EVERY service, reclaims their ports, and clears the
+    registry. For when services have accumulated or orphaned.</li>
     <li><code>status</code> — liveness (<code>kill -0</code>) + port
     listening state + uptime for every registered service; a recreated
-    container shows them DEAD (pids don't survive re-provisioning).</li>
+    container shows them DEAD (pids don't survive re-provisioning), and the
+    listing points at <code>stop-all</code> when any dead entry is present.</li>
     <li><code>logs</code> — host-side tail (default 60 lines, 8 KB cap).</li>
   </ul>
+  <p class="note"><strong>Reliable pid tracking (2026-07-12).</strong> The
+  launcher's <code>&amp; echo $!</code> captured a <em>transient wrapper</em>
+  pid, not the real service — so under <code>setsid</code> the actual process
+  (re-parented to the container's PID&nbsp;1) had a different pid, and
+  <code>stop</code>/<code>restart</code> killed the wrong one, <strong>orphaning
+  the real service</strong> (hung processes piled up across restarts). Now the
+  generated <code>cmd.sh</code> records its own pid — <code>echo $$ &gt;
+  &lt;name&gt;.pid</code> as its first action; under <code>setsid</code> that
+  shell is the session/group leader, so <code>kill -- -&lt;pid&gt;</code> reaps
+  the whole tree — and <code>start</code> registers <em>that</em> pid. The
+  port-reclaim fallback above is the belt-and-suspenders for any pre-existing
+  orphan.</p>
+  <p class="note"><strong>Zombies + workdir validation (2026-07-12, from a live
+  137s postmortem).</strong> The container's original PID&nbsp;1
+  (<code>sleep infinity</code>) never reaped orphans, so every dead launcher
+  became a permanent <em>zombie</em> — and zombies pass <code>kill -0</code>.
+  A service that never started looked "already running", <code>stop</code>
+  no-op'd against it, and the exited-immediately diagnostic never fired.
+  Fixes: docker.py now runs the container with <code>init=true</code> (tini
+  reaps), and <code>_pid_alive</code> additionally rejects state
+  <code>Z</code> from <code>/proc/&lt;pid&gt;/stat</code>. Separately,
+  <code>start</code> now <em>validates the workdir exists</em> before
+  launching (a cd failure inside the async launcher was invisible — not even
+  the service log got written), heals the common
+  <code>/projects/&lt;id&gt;</code> → <code>/workspace/projects/&lt;id&gt;</code>
+  mistake, anchors relative paths at <code>/workspace</code>, and strips a
+  redundant leading <code>cd X &amp;&amp;</code> when <code>workdir</code>
+  already covers it.</p>
 
   <h2>Rails</h2>
   <ul>
@@ -89,7 +145,15 @@
     <code>GHOST_SANDBOX_SERVICE_PORTS</code> range (default
     <code>8100-8104</code>, loopback-bound; empty disables) when the
     container is (re)created — an existing container picks this up on its
-    next re-provision.</li>
+    next re-provision. The service must bind <code>0.0.0.0</code> inside the
+    container for the bridge-publish to forward — the manager exports
+    <code>HOST=0.0.0.0</code> (and <code>GHOST_SERVICE_HOST</code>) alongside
+    <code>PORT</code> for exactly this. An app bound to the container's own
+    loopback is reachable by the in-sandbox browser but NOT from the host.</li>
+    <li><strong>From another device (tailnet)</strong>: a published port lands
+    on host <code>127.0.0.1</code> only (by design — it's an agent sandbox).
+    Put it on your tailnet with <code>tailscale serve</code> — see
+    <a href="#remote-access">Remote access</a> below.</li>
   </ul>
 
   <p class="note"><strong>Fixed host ports must assume ≥2 agent instances.</strong>
@@ -106,12 +170,49 @@
   regardless), and the residual bind-race retry <strong>removes the stale
   container before re-running</strong>.</p>
 
+  <h2 id="remote-access">Remote access — reach a hosted service from another device (2026-07-12)</h2>
+  <p>"The agent hosts something and I reach it remotely" needs two things, one
+  automatic and one operator-run:</p>
+  <ol>
+    <li><strong>Escape the container (automatic).</strong> Host on a
+    <em>published</em> port (the <code>8100-8104</code> range) and bind
+    <code>0.0.0.0</code> — the manager exports <code>HOST=0.0.0.0</code> and
+    <code>PORT=&lt;port&gt;</code> into the service command, so a well-behaved
+    app (<code>uvicorn --host $HOST</code>, <code>flask run</code>, most Node
+    servers, or <code>app.run(host=os.environ["HOST"], …)</code>) binds the
+    forwarding interface. Docker then publishes it to host
+    <code>127.0.0.1:&lt;port&gt;</code>.</li>
+    <li><strong>Put it on the tailnet (operator, one command).</strong>
+    Published ports bind host loopback only — deliberately, since the agent's
+    own API runs authless on this host. Expose one to your tailnet with:
+    <pre><code>bin/serve-remote.sh 8100
+# → https://&lt;this-host&gt;.&lt;tailnet&gt;.ts.net:8100/  →  127.0.0.1:8100
+bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)</code></pre>
+    The helper self-discovers the <code>tailscale</code> CLI (including the
+    macOS GUI app bundle, where it is <em>not</em> on <code>PATH</code>), maps
+    the tailnet HTTPS port 1:1 onto the local port, and prints the URL.
+    <code>tailscale serve</code> keeps it authenticated to your tailnet with a
+    real TLS cert and nothing exposed publicly (that would be
+    <code>tailscale funnel</code>).</li>
+  </ol>
+  <p class="note">The exposure step is a <strong>host</strong> action, run by
+  the operator — the agent lives in the sandbox and can't (and shouldn't) flip
+  network exposure itself. The <code>manage_services</code> report surfaces the
+  exact <code>serve-remote.sh</code> command + URL whenever a service comes up
+  on a published port, so the operator never has to remember the recipe.</p>
+
   <h2>Tests</h2>
-  <p><code>tests/test_sandbox_services.py</code> (37) — port-spec parsing,
+  <p><code>tests/test_sandbox_services.py</code> (59) — port-spec parsing,
   validation rails, lifecycle (start/immediate-exit/stop-group-kill/restart/
   status/logs), registry-driven browser allowlist (host guard + the runner
-  guard exec'd functionally with playwright stubbed), tool arg-healing, and
-  docker.py publish + conflict-retry wiring.</p>
+  guard exec'd functionally with playwright stubbed), tool arg-healing,
+  docker.py publish + conflict-retry wiring, the <code>HOST=0.0.0.0</code>
+  export, remote-access hint gating (published vs. unpublished port), the
+  <code>workdir</code> schema exposure + tool→supervisor passthrough, and the
+  reliable-pid tracking + <code>stop-all</code> + orphaned-port reclaim.
+  <code>tests/test_remote_serve_scripts.py</code> guards the
+  <code>serve-remote.sh</code>/<code>unserve-remote.sh</code> host helpers
+  (1:1 HTTPS map, CLI discovery incl. the macOS app bundle, targeted teardown).</p>
 </main>
 </body>
 </html>

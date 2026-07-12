@@ -22,6 +22,12 @@ def _make_ctx(*, idle_secs: float, reflector=None, collector=None):
     agent plumbing is short-circuited by missing attributes.
     """
     ctx = MagicMock()
+    # memory_dir must NOT be a bare MagicMock: the reflection phase persists
+    # its reflected-id set to <memory_dir>/reflected_ids.json, and str(a
+    # MagicMock) is a bogus name that mkdir would litter into the CWD. This
+    # unit test doesn't exercise persistence, so pin it to None (the source
+    # also guards non-path values — see agent._reflected_ids_path).
+    ctx.memory_dir = None
     ctx.memory_system = MagicMock()
     # llm_client must report zero foreground tasks so the tick proceeds
     ctx.llm_client = SimpleNamespace(foreground_tasks=0)

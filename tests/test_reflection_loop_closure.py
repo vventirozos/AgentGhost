@@ -15,6 +15,7 @@ live agent — see docs/self_improvement.md for the A/B protocol):
 
 import json
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -121,3 +122,16 @@ class TestReflectedIdsPersistence:
         # Second call returns the SAME cached set (not a reload from disk).
         assert a._get_reflected_ids() is first
         assert "only-in-memory" in a._get_reflected_ids()
+
+    def test_mock_memory_dir_creates_no_directory(self, tmp_path, monkeypatch):
+        # Regression (2026-07-12): a context whose memory_dir is a Mock (or any
+        # non-path object) must NOT litter a "<MagicMock name='mock.memory_dir'
+        # …>" directory into the CWD — str(a Mock) is a bogus path and the
+        # persist mkdir would create it. Persist must be a safe no-op instead.
+        monkeypatch.chdir(tmp_path)          # isolate any accidental CWD write
+        a = _agent(MagicMock())
+        assert a._reflected_ids_path() is None
+        ids = a._get_reflected_ids()         # empty set, no disk read
+        ids.add("traj-x")
+        a._persist_reflected_ids()           # no path → no-op, must not raise
+        assert list(tmp_path.iterdir()) == []   # nothing written anywhere

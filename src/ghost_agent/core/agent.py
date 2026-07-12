@@ -2106,7 +2106,7 @@ class GhostAgent:
             # _wait_for_foreground_clear against its OWN request — a
             # deterministic stall up to the 600s ceiling before the turn
             # could continue. use_worker still offloads it when a pool exists.
-            summary_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=False)
+            summary_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=False, task_label="compaction")
             summary += str(summary_data["choices"][0]["message"].get("content") or "No summary generated.")
 
             from ..utils.helpers import get_utc_timestamp
@@ -3106,7 +3106,7 @@ class GhostAgent:
                                         "Output ONLY the one word.\n\nTASK: "
                                         + str(description)[:500])}],
                                     "temperature": 0.0, "max_tokens": 8, "stream": False,
-                                }, use_worker=True, is_background=True)
+                                }, use_worker=True, is_background=True, task_label="classifier")
                                 out = ((_r or {}).get("choices", [{}])[0]
                                        .get("message", {}).get("content", "") or "").strip().lower()
                                 for label in ("needs_user", "coding", "research"):
@@ -3438,7 +3438,7 @@ class GhostAgent:
                 # extractor) keeps the model from padding with prose.
                 payload = {"model": model_name, "messages": [{"role": "user", "content": final_prompt}], "stream": False, "temperature": 0.1, "max_tokens": 3072, "response_format": {"type": "json_object"}}
                 try:
-                    data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
+                    data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="memory extract")
                 except Exception as _ue:
                     # The in-client retries (worker failover + one 2s retry
                     # on 5xx) are exhausted and NOTHING has been stored yet,
@@ -3554,7 +3554,7 @@ class GhostAgent:
                         if old_facts:
                             eval_prompt = f"NEW FACT:\n{fact}\n\nOLD FACTS:\n" + "\n".join([f"ID: {f['id']} | TEXT: {f['text']}" for f in old_facts]) + "\n\nAnalyze if the NEW FACT contradicts, updates, or supersedes any OLD FACTS. Return ONLY a JSON object with a list of 'ids' to delete. If they safely coexist (e.g. they refer to different topics/projects), return an empty list.\n\nExample: {{\"ids\": [\"ID:123\"]}}"
                             eval_payload = {"model": model_name, "messages": [{"role": "system", "content": "You are a Belief Revision Engine. Output JSON."}, {"role": "user", "content": eval_prompt}], "temperature": 0.0, "max_tokens": 1024}
-                            eval_data = await self.context.llm_client.chat_completion(eval_payload, use_worker=True, is_background=True)
+                            eval_data = await self.context.llm_client.chat_completion(eval_payload, use_worker=True, is_background=True, task_label="self-eval")
                             eval_res = extract_json_from_text(eval_data["choices"][0]["message"]["content"])
 
                             raw_ids = eval_res.get("ids", [])
@@ -3615,7 +3615,7 @@ class GhostAgent:
             learn_prompt = f"### TASK POST-MORTEM\nReview this interaction. The agent either struggled and succeeded, OR failed completely. Identify the core technical error, hallucination, or bad strategy. Extract a concrete rule to fix or avoid this in the future.\n\nHISTORY:\n{history_summary}\n\nFINAL AI: {final_ai_content[:500]}\n\nReturn ONLY a JSON object with 'task', 'mistake', and 'solution' (what to do instead next time/the anti-pattern to avoid). If no unique technical lesson is found, return null."
 
             payload = {"model": model, "messages": [{"role": "system", "content": "You are a Meta-Cognitive Analyst. Output JSON."}, {"role": "user", "content": learn_prompt}], "temperature": 0.1, "max_tokens": 1024}
-            l_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True)
+            l_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="postmortem")
             l_content = str(l_data["choices"][0]["message"].get("content") or "")
             if l_content and "null" not in l_content.lower():
                 l_json = extract_json_from_text(l_content)
@@ -6503,7 +6503,7 @@ class GhostAgent:
                             # own request in _wait_for_foreground_clear
                             # (600s self-stall) on every oversized tool
                             # output. use_worker still prefers a pool.
-                            summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=False)
+                            summary_data = await self.context.llm_client.chat_completion(shield_payload, use_worker=True, is_background=False, task_label="shield")
                             summary_content = summary_data["choices"][0]["message"].get("content", "").strip()
                             if summary_content:
                                 str_res = f"[EDGE CONDENSED]: {summary_content}"
@@ -8662,9 +8662,23 @@ class GhostAgent:
                             # relevance gating now governing inclusion (see bus.py),
                             # a tighter budget surfaces the relevant items and drops
                             # the noise instead of padding to a fixed section quota.
+                            # INTERNAL requests (sub-/sched-/job- — machine
+                            # sub-calls like chess moves or scheduled jobs)
+                            # skip the LLM-assisted RAG-Fusion decomposition:
+                            # their prompts are self-contained and machine-
+                            # generated, and the DECOMPOSE_QUERY worker round-
+                            # trip sat on the critical path (observed live
+                            # 2026-07-12: 8s ReadTimeout at +0.00s of every
+                            # chess move while nova chewed the previous move's
+                            # background extracts). Plain vector recall still
+                            # runs — llm_client=None is the bus's no-LLM path.
+                            from .autonomous_activity import (
+                                is_internal_request as _is_int_req_h)
                             fetched_context = await bus.hydrate_context(
                                 search_query,
-                                llm_client=getattr(self.context, "llm_client", None),
+                                llm_client=(None if _is_int_req_h(req_id)
+                                            else getattr(self.context,
+                                                         "llm_client", None)),
                                 context_budget=4000,
                             )
                             if fetched_context:
@@ -10111,7 +10125,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 except Exception as _erx:
                                     logger.debug("entropy stash failed: %s", _erx)
 
-                            if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure:
+                            # Internal (sub-/sched-) requests never feed smart
+                            # memory: machine-generated prompts (chess FENs,
+                            # job payloads) polluted retrieval AND their
+                            # worker-side extract/scoring calls (max_tokens
+                            # 3072) kept nova busy enough to time out the next
+                            # request's routing calls (2026-07-12).
+                            from .autonomous_activity import (
+                                is_internal_request as _is_int_req_m1)
+                            if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id):
                                 micro_msgs = []
                                 for m in [msg for msg in stream_messages_snapshot if msg.get("role") in ["user", "assistant"]][-4:]:
                                     role = m.get("role", "user").upper()
@@ -11102,7 +11124,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 )
                                 continue
 
-                        if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure:
+                        # Internal requests never feed smart memory (same
+                        # rationale as the streaming-path gate above).
+                        from .autonomous_activity import (
+                            is_internal_request as _is_int_req_m2)
+                        if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m2(req_id):
                             micro_msgs = []
                             for m in [msg for msg in messages if msg.get("role") in ["user", "assistant"]][-4:]:
                                 role = m.get("role", "user").upper()
@@ -11358,8 +11384,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         md = getattr(self.context, "memory_dir", None)
         if md is None:
             return None
+        # memory_dir must be a real path. If a test (or a misconfigured
+        # context) leaves it a Mock, str(md) is a bogus name like
+        # "<MagicMock name='mock.memory_dir' id=…>" and the persist mkdir
+        # below would litter that directory into the CWD (the repo root,
+        # under the test runner). An isinstance check against os.PathLike is
+        # NOT enough — a MagicMock auto-implements __fspath__, so it passes
+        # BOTH isinstance(_, os.PathLike) AND os.fspath(_). Restrict to the
+        # concrete path types production actually uses (str / pathlib);
+        # anything else means "no persistence dir" (2026-07-12).
+        from pathlib import Path as _Path, PurePath as _PurePath
+        if not isinstance(md, (str, _PurePath)):
+            return None
         try:
-            from pathlib import Path as _Path
             return _Path(str(md)) / "reflected_ids.json"
         except Exception:
             return None
@@ -11829,7 +11866,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         the correction and poison future retrieval.
         """
         perfection_data = await self.context.llm_client.chat_completion(
-            p_payload, use_worker=True, is_background=not foreground
+            p_payload, use_worker=True, is_background=not foreground, task_label="perfect-it"
         )
         p_msg = perfection_data["choices"][0]["message"].get("content", "")
         p_msg = re.sub(r'<tool_call>.*?</tool_call>', '', p_msg, flags=re.DOTALL | re.IGNORECASE).strip()

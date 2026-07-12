@@ -57,6 +57,18 @@ CONTAINER_WORKDIR = "/workspace"
 BLOCKED_PORTS: FrozenSet[int] = frozenset({8000, 8080, 8088, 9050})
 SUGGESTED_PORTS = "8100-8104"
 
+# Operator helpers that put a published sandbox port on the tailnet
+# (2026-07-12). Exposing a service to the network is a HOST action, run by
+# the operator — the agent lives in the sandbox and cannot (and should not)
+# flip `tailscale serve` itself. The service report points here; the scripts
+# self-discover the tailscale CLI + tailnet name. Overridable for a host
+# whose ops scripts live elsewhere.
+REMOTE_SERVE_SCRIPT = os.environ.get(
+    "GHOST_REMOTE_SERVE_SCRIPT", "/Users/vasilis/Data/AI/bin/serve-remote.sh")
+REMOTE_UNSERVE_SCRIPT = os.environ.get(
+    "GHOST_REMOTE_UNSERVE_SCRIPT",
+    "/Users/vasilis/Data/AI/bin/unserve-remote.sh")
+
 MAX_SERVICES = 5
 _NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
 _FORBIDDEN_CMD_RE = re.compile(
@@ -95,6 +107,36 @@ def publishable_service_ports(spec: Optional[str] = None) -> list:
     check and ``containers.run`` is handled by docker.py's retry.
     """
     return [p for p in default_service_ports(spec) if _port_free(p)]
+
+
+def is_published_port(port: int, spec: Optional[str] = None) -> bool:
+    """True when docker publishes ``port`` to the host loopback, i.e. it's in
+    the configured ``GHOST_SANDBOX_SERVICE_PORTS`` range (bridge mode). Only
+    such a port is reachable at ``127.0.0.1:<port>`` on the host — and thus a
+    candidate for remote exposure. A port outside the range never leaves the
+    container, so we don't offer to serve it. (Uses the CONFIGURED range, not
+    the runtime-free subset: whether it was free at container-create time is
+    what actually got published, and that's already reflected on the host.)"""
+    try:
+        return int(port) in set(default_service_ports(spec))
+    except Exception:
+        return False
+
+
+def remote_access_hint(port: int) -> str:
+    """Operator recipe for reaching a published sandbox service from another
+    device on the tailnet (2026-07-12). Assumes the app binds 0.0.0.0 (the
+    manager exports ``HOST``/``PORT`` for it) so docker's bridge-publish
+    actually forwards. The exposure step is a HOST action; see
+    ``REMOTE_SERVE_SCRIPT``."""
+    return (
+        f"Remote access: published to the host at http://127.0.0.1:{port}. "
+        f"To reach it from another device on your tailnet, run ON THE HOST:\n"
+        f"    {REMOTE_SERVE_SCRIPT} {port}\n"
+        f"→ serves https://<this-host>.<tailnet>.ts.net:{port}/ "
+        f"(tear down: {REMOTE_UNSERVE_SCRIPT} {port}). The app must bind "
+        f"0.0.0.0 — HOST=0.0.0.0 and PORT={port} are exported for it."
+    )
 
 
 def default_service_ports(spec: Optional[str] = None) -> list:
@@ -173,7 +215,19 @@ class ServiceSupervisor:
             pid = int(pid)
         except (TypeError, ValueError):
             return False
-        _, code = self._exec(f"sh -c 'kill -0 {pid} 2>/dev/null'", timeout=15)
+        # `kill -0` alone reports ZOMBIES as alive — and in this container
+        # every dead orphan IS a zombie unless PID 1 reaps (sleep-infinity
+        # never did; docker.py now runs with init=True, but keep this
+        # zombie-proof for containers created before that). A zombie launcher
+        # made a dead service look "already running", made stop() a no-op,
+        # and suppressed start()'s exited-immediately diagnostic (observed
+        # live 2026-07-12: three defunct [sh] launchers, 137s of thrash).
+        # State = first field after the LAST ')' in /proc/<pid>/stat (comm
+        # may contain spaces/parens, so field-splitting is unsafe).
+        cmd = (f"sh -c 'kill -0 {pid} 2>/dev/null && "
+               f"[ \"$(sed \"s/^.*) //\" /proc/{pid}/stat 2>/dev/null "
+               f"| cut -d\" \" -f1)\" != Z ]'")
+        _, code = self._exec(cmd, timeout=15)
         return code == 0
 
     def _port_listening(self, port) -> bool:
@@ -260,15 +314,106 @@ class ServiceSupervisor:
             # process group (so stop can kill the whole tree) and the shell
             # exiting re-parents it to the container's PID 1 — out of reach
             # of execute()'s timeout.
+            # Export the assigned port so the app can BIND it instead of
+            # hardcoding one (2026-07-12). Without this an app that hardcodes,
+            # say, 5055 while the manager probes 8100 looks "started but not
+            # listening", and the agent thrashes reconciling the mismatch. A
+            # well-behaved app does `port = int(os.environ.get("PORT", …))`.
+            # Both PORT (the de-facto convention: Flask/Heroku/gunicorn/many
+            # frameworks read it) and the explicit GHOST_SERVICE_PORT are set.
             self.host_dir.mkdir(parents=True, exist_ok=True)
-            (self.host_dir / f"{name}.cmd.sh").write_text(
-                "#!/bin/sh\n" + str(command).rstrip() + "\n")
-            try:
-                (self.host_dir / f"{name}.log").unlink()
-            except OSError:
-                pass
 
+            # Resolve + VALIDATE the workdir BEFORE anything launches
+            # (2026-07-12). The launch below runs `cd <wd> && setsid …` inside
+            # an async subshell, where a cd failure is INVISIBLE: the service
+            # log's redirection opens after the cd, so nothing is written
+            # anywhere — the model saw only "not listening" and thrashed
+            # through identical retries (observed live: workdir
+            # '/projects/<id>' — a container-absolute path missing the
+            # /workspace prefix — cost a 137s request 3 failed launches).
             wd = str(workdir or CONTAINER_WORKDIR)
+            if not wd.startswith("/"):
+                # Relative paths are relative to /workspace by contract.
+                wd = f"{CONTAINER_WORKDIR}/{wd}"
+            _, _wd_code = self._exec(f"test -d {shlex.quote(wd)}", timeout=10)
+            if _wd_code != 0:
+                _healed = None
+                if not wd.startswith(CONTAINER_WORKDIR):
+                    _cand = f"{CONTAINER_WORKDIR}{wd}"
+                    _, _h = self._exec(f"test -d {shlex.quote(_cand)}",
+                                       timeout=10)
+                    if _h == 0:
+                        _healed = _cand
+                if _healed:
+                    logger.info("manage_services: healed workdir %s -> %s",
+                                wd, _healed)
+                    wd = _healed
+                else:
+                    return (f"Error: workdir {wd!r} does not exist in the "
+                            f"sandbox. Paths are inside the container — use a "
+                            f"path relative to {CONTAINER_WORKDIR} (e.g. "
+                            f"'projects/<id>') or the full "
+                            f"{CONTAINER_WORKDIR}/... path. Nothing was "
+                            f"launched.")
+
+            # Strip a redundant leading `cd X && ` when workdir already puts
+            # us in X — the model habitually passes BOTH, and the inner
+            # relative cd then fails FROM the workdir (X/X doesn't exist),
+            # killing the service with a confusing log.
+            _cmd_str = str(command).rstrip()
+            _m = re.match(r"^\s*cd\s+([^\s;&|]+)\s*&&\s*(.+)$", _cmd_str,
+                          re.DOTALL)
+            if _m:
+                _tgt = _m.group(1).strip("'\"").rstrip("/")
+                _tgt_abs = (_tgt if _tgt.startswith("/")
+                            else f"{CONTAINER_WORKDIR}/{_tgt}")
+                if _tgt_abs == wd.rstrip("/") or \
+                        wd.rstrip("/").endswith("/" + _tgt.lstrip("/")):
+                    logger.info("manage_services: dropped redundant 'cd %s' "
+                                "(workdir=%s already covers it)", _tgt, wd)
+                    _cmd_str = _m.group(2).strip()
+            # HOST=0.0.0.0: bind the container's forwarding interface, not
+            # loopback (2026-07-12). In bridge mode docker publishes host
+            # 127.0.0.1:<port> -> container <port>, and a loopback-bound app
+            # never receives the forwarded packets — so it's reachable from
+            # the in-sandbox browser but NOT from the host or a remote device.
+            # 0.0.0.0 is safe: the container is network-isolated. Frameworks
+            # that read HOST (uvicorn/gunicorn --host, `flask run`, many Node
+            # servers) pick it up; the report + docs tell hand-rolled apps to
+            # honour it. This is the code half of "host something remotely-
+            # reachable"; `tailscale serve` on the host is the other half.
+            _env_prefix = ""
+            if port is not None:
+                _env_prefix = (f"export PORT={int(port)}\n"
+                               f"export GHOST_SERVICE_PORT={int(port)}\n"
+                               f"export HOST=0.0.0.0\n"
+                               f"export GHOST_SERVICE_HOST=0.0.0.0\n")
+            _pidfile_in = f"{CONTAINER_SERVICES_DIR}/{name}.pid"
+            # `exec` the command so the (setsid) shell BECOMES it — same pid,
+            # still the session/group leader — so the pid we record IS the real
+            # process (not a wrapper the shell forked and then exited from,
+            # which left status() showing DEAD and stop() killing nothing). Only
+            # for a single SIMPLE command; a compound one (`a && b`, pipes)
+            # can't be exec'd, so it runs normally and the port-reclaim fallback
+            # + group kill still cover it. Prefer `workdir=` over `cd x && …`.
+            _run_line = (("exec " + _cmd_str)
+                         if not re.search(r"[;&|\n]", _cmd_str) else _cmd_str)
+            (self.host_dir / f"{name}.cmd.sh").write_text(
+                "#!/bin/sh\n" + _env_prefix
+                + f"export GHOST_SERVICE_NAME={shlex.quote(name)}\n"
+                # Record THIS shell's pid. Under `setsid` it is the session/
+                # group leader, so `kill -- -<pid>` reaps the whole tree. With
+                # the exec above, $$ IS the service process — the registry
+                # tracks the REAL pid, not the transient `$!` launcher that
+                # stop() used to miss, orphaning the service (2026-07-12).
+                + f"echo $$ > {_pidfile_in}\n"
+                + _run_line + "\n")
+            for _stale in (f"{name}.log", f"{name}.pid"):
+                try:
+                    (self.host_dir / _stale).unlink()
+                except OSError:
+                    pass
+
             inner = (
                 f"cd {shlex.quote(wd)} && "
                 f"setsid nohup sh {CONTAINER_SERVICES_DIR}/{name}.cmd.sh "
@@ -278,11 +423,26 @@ class ServiceSupervisor:
             if code != 0:
                 return (f"Error: failed to launch '{name}' "
                         f"(exit {code}): {out.strip()[:400]}")
+            # Prefer the pid the script recorded (the real session leader,
+            # written to <name>.pid as its first action). Poll briefly for the
+            # bind-mounted file to appear.
             pid = None
-            for tok in reversed(out.split()):
-                if tok.isdigit():
-                    pid = int(tok)
-                    break
+            pid_path = self.host_dir / f"{name}.pid"
+            for _ in range(20):        # ~2s
+                try:
+                    _txt = pid_path.read_text().strip()
+                    if _txt.isdigit():
+                        pid = int(_txt)
+                        break
+                except OSError:
+                    pass
+                time.sleep(0.1)
+            if pid is None:
+                # Fallback: the transient launcher pid from `echo $!`.
+                for tok in reversed(out.split()):
+                    if tok.isdigit():
+                        pid = int(tok)
+                        break
             if pid is None:
                 return (f"Error: could not determine '{name}' pid "
                         f"from launcher output: {out.strip()[:200]!r}")
@@ -304,25 +464,103 @@ class ServiceSupervisor:
                     listening = False
 
             reg[name] = {
-                "name": name, "command": str(command), "pid": pid,
+                "name": name, "command": _cmd_str, "pid": pid,
                 "port": int(port) if port is not None else None,
                 "workdir": wd, "started_at": time.time(),
             }
             self._save(reg)
 
+        # Process alive but the requested port never came up. This is the
+        # "app crashed after startup / missing dependency / bound a DIFFERENT
+        # port" case — and the cause is almost always sitting in the service
+        # log (e.g. `ModuleNotFoundError: No module named 'chess'`). Surface it
+        # NOW (2026-07-12): previously this returned a vague "NOT listening
+        # yet" with no diagnostics, so the agent proceeded to browse the URL,
+        # got ERR_CONNECTION_REFUSED, and only THEN discovered the missing
+        # deps — a whole browse→fail→install→restart cycle for an error that
+        # was already captured. Same log-tail treatment the immediate-exit
+        # branch above already gives.
+        if port is not None and listening is False:
+            tail = self._log_tail(name)
+            return (
+                f"Service '{name}' started (pid {pid}) but nothing is "
+                f"listening on port {port} after ~6s — it likely FAILED to "
+                f"bind (missing dependency, a crash on import, or the app "
+                f"binds a different port). Check the log below BEFORE trying "
+                f"to reach it:\n--- {name} log tail ---\n{tail}\n"
+                f"Fix the cause (e.g. pip install the missing module, or point "
+                f"the app at port {port}), then action='restart' name='{name}'."
+            )
+
         lines = [f"Service '{name}' RUNNING (pid {pid})."]
         if port is not None:
             lines.append(
                 f"In-sandbox URL: http://127.0.0.1:{port} — the browser and "
-                f"execute tools reach it there"
-                + (" (listening ✓)." if listening
-                   else " (NOT listening yet — check action='logs' if it "
-                        "stays down)."))
+                f"execute tools reach it there (listening ✓).")
+            if is_published_port(port):
+                lines.append(remote_access_hint(port))
         lines.append(
             f"Logs: action='logs' name='{name}' · stop: action='stop'. "
             f"It survives across turns until stopped (or the sandbox "
             f"container is recreated).")
         return "\n".join(lines)
+
+    def _kill_pgroup(self, pid) -> None:
+        """TERM then KILL a whole process group (setsid made pid the leader),
+        with a plain-pid fallback."""
+        self._exec(f"sh -c 'kill -TERM -- -{int(pid)} 2>/dev/null || "
+                   f"kill -TERM {int(pid)} 2>/dev/null'", timeout=15)
+        time.sleep(1.0)
+        if self._pid_alive(pid):
+            self._exec(f"sh -c 'kill -KILL -- -{int(pid)} 2>/dev/null || "
+                       f"kill -KILL {int(pid)} 2>/dev/null'", timeout=15)
+
+    def _kill_port_holder(self, port) -> bool:
+        """Kill whatever is LISTENING on <port> in the container — the safety
+        net for an orphaned service whose tracked pid was wrong (the old `$!`
+        bug), so the real process was left bound to the port. Finds the pid via
+        `ss` (iproute2, baked into the sandbox image); best-effort."""
+        out, _ = self._exec(
+            "sh -c \"ss -H -ltnp 'sport = :%d' 2>/dev/null | "
+            "grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2\"" % int(port),
+            timeout=10)
+        holder = out.strip()
+        if holder.isdigit():
+            self._kill_pgroup(int(holder))
+            return True
+        return False
+
+    def _kill_service(self, entry) -> bool:
+        """Kill one service's process tree and reclaim its port. Returns True
+        if anything was actually alive/reclaimed. Also drops its pidfile."""
+        pid = entry.get("pid")
+        name = entry.get("name")
+        port = entry.get("port")
+        was_alive = bool(pid) and self._pid_alive(pid)
+        if was_alive:
+            self._kill_pgroup(pid)
+        reclaimed = False
+        if port is not None and self._port_listening(port):
+            reclaimed = self._kill_port_holder(port)
+        if name:
+            try:
+                (self.host_dir / f"{name}.pid").unlink()
+            except OSError:
+                pass
+        return was_alive or reclaimed
+
+    def _reap_dead(self, reg) -> list:
+        """Drop registry entries whose process is gone (e.g. after a container
+        recreate) so the list can't accumulate zombies. Caller holds the lock
+        and saves. Returns the reaped names."""
+        dead = [n for n, e in reg.items() if not self._pid_alive(e.get("pid"))]
+        for n in dead:
+            reg.pop(n, None)
+            try:
+                (self.host_dir / f"{n}.pid").unlink()
+            except OSError:
+                pass
+        return dead
 
     def stop(self, name: str) -> str:
         err = self._validate_name(name)
@@ -335,23 +573,30 @@ class ServiceSupervisor:
             if entry is None:
                 return (f"Error: no service named '{name}' "
                         f"(action='status' lists them).")
-            pid = entry.get("pid")
-            was_alive = self._pid_alive(pid)
-            if was_alive:
-                # TERM the whole process group (setsid made pid the group
-                # leader), escalate to KILL, with a plain-pid fallback.
-                self._exec(f"sh -c 'kill -TERM -- -{int(pid)} "
-                           f"2>/dev/null || kill -TERM {int(pid)} "
-                           f"2>/dev/null'", timeout=15)
-                time.sleep(1.0)
-                if self._pid_alive(pid):
-                    self._exec(f"sh -c 'kill -KILL -- -{int(pid)} "
-                               f"2>/dev/null || kill -KILL {int(pid)} "
-                               f"2>/dev/null'", timeout=15)
+            was_alive = self._kill_service(entry)
             self._save(reg)
         state = "stopped" if was_alive else "was already dead; removed"
         return (f"Service '{name}' {state}. Log kept at "
                 f"{CONTAINER_SERVICES_DIR}/{name}.log")
+
+    def stop_all(self) -> str:
+        """Stop EVERY registered service and reclaim their ports — the
+        one-command cleanup for accumulated / orphaned services."""
+        with self._lock:
+            reg = self._load()
+            if not reg:
+                return "No services registered — nothing to stop."
+            killed, cleared = [], []
+            for nm, entry in list(reg.items()):
+                (killed if self._kill_service(entry) else cleared).append(nm)
+            reg.clear()
+            self._save(reg)
+        parts = [f"Stopped {len(killed) + len(cleared)} service(s)."]
+        if killed:
+            parts.append(f"Killed (running/orphaned): {', '.join(killed)}.")
+        if cleared:
+            parts.append(f"Cleared (already dead): {', '.join(cleared)}.")
+        return " ".join(parts)
 
     def restart(self, name: str) -> str:
         err = self._validate_name(name)
@@ -379,14 +624,21 @@ class ServiceSupervisor:
                     "name='...' command='...' port=... "
                     f"(suggested ports: {SUGGESTED_PORTS}).")
         lines = []
+        _dead = 0
         for n, e in entries.items():
             alive = self._pid_alive(e.get("pid"))
+            if not alive:
+                _dead += 1
             state = "RUNNING" if alive else "DEAD (exited or container recreated)"
             part = f"- {n}: {state}, pid {e.get('pid')}"
             if e.get("port") is not None:
                 if alive:
+                    _lp = self._port_listening(e['port'])
                     part += (f", http://127.0.0.1:{e['port']} "
-                             f"{'listening ✓' if self._port_listening(e['port']) else 'NOT listening ✗'}")
+                             f"{'listening ✓' if _lp else 'NOT listening ✗'}")
+                    if _lp and is_published_port(e['port']):
+                        part += (f" · remote: {REMOTE_SERVE_SCRIPT} "
+                                 f"{e['port']}")
                 else:
                     part += f", port {e['port']}"
             up = time.time() - float(e.get("started_at") or 0)
@@ -394,6 +646,9 @@ class ServiceSupervisor:
                 part += f", up {int(up // 60)}m"
             part += f" · cmd: {str(e.get('command') or '')[:80]}"
             lines.append(part)
+        if _dead and name is None:
+            lines.append(f"({_dead} dead — action='stop-all' clears them and "
+                         f"reclaims any orphaned ports.)")
         return "Services:\n" + "\n".join(lines)
 
     def logs(self, name: str, lines: int = 60) -> str:
@@ -454,4 +709,6 @@ __all__ = [
     "CONTAINER_SERVICES_DIR", "SERVICES_DIRNAME",
     "ServiceSupervisor", "default_service_ports", "publishable_service_ports",
     "get_service_supervisor", "active_service_ports",
+    "is_published_port", "remote_access_hint",
+    "REMOTE_SERVE_SCRIPT", "REMOTE_UNSERVE_SCRIPT",
 ]
