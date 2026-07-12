@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js';
+import * as matrixGraphFace from './matrix_graph.js?v=3.1';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -293,17 +293,26 @@ function connectWebSocket() {
                 const icon = extractIcon(data.content);
                 const flashColor = getIconColor(icon);
 
+                // Log lines feed the face's activity ENVELOPE — a small
+                // energy contribution each, smoothed inside matrix_graph —
+                // instead of firing a full pulse per line, which strobed
+                // the scene several times a second on a busy agent.
                 const isMonologue = data.content.includes("PLANNER MONOLOGUE");
-                if (isMonologue) {
+                if (activeFace.noteActivity) {
+                    activeFace.noteActivity(isMonologue ? 0.08 : 0.16, flashColor);
+                } else if (isMonologue) {
                     activeFace.triggerSmallPulse();
                 } else {
-                    activeFace.triggerPulse(flashColor); // Always heartbeat on new log
+                    activeFace.triggerPulse(flashColor);
                 }
 
                 if (icon) {
                     updateActivityIcon(icon);
                     updateStateFromIcon(icon);
-                    if (['❌', '🛑', '⚠️', '🔥'].includes(icon)) activeFace.triggerSpike();
+                    // Genuine failures only: ⚠️ warnings are routine (node
+                    // fallbacks, heals) and kept tinting the face on
+                    // ordinary healthy turns.
+                    if (['❌', '🛑', '🔥'].includes(icon)) activeFace.triggerSpike();
                 }
                 flashActivityIcon();
                 if (data.is_error) activeFace.triggerSpike();
@@ -371,18 +380,19 @@ function extractIcon(logLine) {
     return match ? match[0] : null;
 }
 
-// Map each class to a distinct sphere-pulse color. Keeps the pulse
-// varied (purple/cyan/orange/green/red) instead of the previous mostly-
-// purple (default) fallback the old map dropped everything into.
+// Map each class to a distinct accent color for the face's slow mood
+// tint. Dark, muted family only (2026-07-12): deep purple / crimson /
+// dark blue / dark green — these BLEND into the sphere's accent, so a
+// neon here would drag the whole theme bright again.
 const _ICON_CLASS_COLOR = {
-    accent_ok:   '#00ff9d',  // ✅ success-green
-    accent_err:  '#ff2a2a',  // ❌ 🛑 ⚠️ red
-    accent:      '#1e90ff',  // ⚡ 🚀 🎬 🏁 blue
-    tool:        '#bd00ff',  // magenta
-    memory:      '#ffaa00',  // orange
-    plan:        '#8ab4ff',  // soft indigo
-    think:       '#00f3ff',  // cyan
-    idle:        '#ffffff',
+    accent_ok:   '#0f5c38',  // ✅ dark green
+    accent_err:  '#8f1030',  // ❌ 🛑 ⚠️ crimson red
+    accent:      '#1c3f8f',  // ⚡ 🚀 🎬 🏁 dark blue
+    tool:        '#4b1a7a',  // deep purple
+    memory:      '#2f4a14',  // dark moss green
+    plan:        '#232a6e',  // dark indigo
+    think:       '#3d1460',  // deep purple
+    idle:        '#20242a',  // near-black slate
 };
 
 function getIconColor(icon) {

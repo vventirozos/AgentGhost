@@ -33,14 +33,15 @@ async def test_tool_generate_image_success(mock_sandbox, mock_llm_client):
     # Run the tool
     result = await tool_generate_image(prompt, mock_llm_client, mock_sandbox)
 
-    # The tool now snaps requested size to the nearest SDXL bucket and
-    # forwards it on the payload. With no width/height passed, the
-    # default 1024x1024 (which IS a bucket) is used unchanged.
+    # The tool snaps requested size to the node's native bucket ladder
+    # (SD1.5 Jetson envelope). With no width/height passed, the square
+    # bucket 624x624 is used. Steps are OMITTED by default so the node's
+    # tuned default (30) applies — the old LCM-era steps=6 forced the
+    # server's 15-step floor and silently halved quality.
     mock_llm_client.generate_image.assert_awaited_once_with({
         "prompt": prompt,
-        "steps": 6,
-        "width": 1024,
-        "height": 1024,
+        "width": 624,
+        "height": 624,
     })
 
     # Verify result string format. The tool was redesigned to embed a
@@ -74,10 +75,11 @@ async def test_tool_generate_image_offline_client(mock_sandbox, mock_llm_client)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("input_steps, expected_steps", [
-    (2, 4),      # less than min
-    (10, 8),      # greater than max
-    (6, 6),      # within range
-    ("5", 5),    # string castable to int
+    (2, 15),     # below the SD1.5 quality floor -> raised
+    (10, 15),    # LCM-era habit values also land on the floor
+    (30, 30),    # within range
+    ("35", 35),  # string castable to int
+    (99, 50),    # above max -> clamped
 ])
 async def test_tool_generate_image_steps_clipping(mock_sandbox, mock_llm_client, input_steps, expected_steps):
     fake_img_data = b"fake"
@@ -90,18 +92,22 @@ async def test_tool_generate_image_steps_clipping(mock_sandbox, mock_llm_client,
 
     mock_llm_client.generate_image.assert_awaited_once_with({
         "prompt": "prompt",
+        "width": 624,
+        "height": 624,
         "steps": expected_steps,
-        "width": 1024,
-        "height": 1024,
     })
 
 @pytest.mark.asyncio
 async def test_tool_generate_image_invalid_steps_type(mock_sandbox, mock_llm_client):
-    # int("invalid") raises ValueError before the try block
-    with pytest.raises(ValueError, match="invalid literal for int"):
-        await tool_generate_image("prompt", mock_llm_client, mock_sandbox, steps="invalid")
-    
-    mock_llm_client.generate_image.assert_not_called()
+    # A hallucinated non-int steps ("invalid") must NOT crash the tool —
+    # it heals to "omitted" and the node's tuned default applies (matches
+    # the tool's parameter-healing philosophy everywhere else).
+    fake_b64 = base64.b64encode(b"fake").decode("utf-8")
+    mock_llm_client.generate_image.return_value = {"data": [{"b64_json": fake_b64}]}
+    result = await tool_generate_image("prompt", mock_llm_client, mock_sandbox, steps="invalid")
+    assert result.startswith("SUCCESS")
+    sent = mock_llm_client.generate_image.await_args.args[0]
+    assert "steps" not in sent
 
 @pytest.mark.asyncio
 async def test_tool_generate_image_api_exception(mock_sandbox, mock_llm_client):

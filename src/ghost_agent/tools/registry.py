@@ -562,35 +562,39 @@ def get_active_tool_definitions(context, query: str = None):
             "type": "function",
             "function": {
                 "name": "image_generation",
-                "description": "Generate an image using the external GPU node. Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append SDXL enhancements, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong.",
+                "description": "Generate a photorealistic image on the external GPU node (SD1.5 realism model). Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append photographic style/quality enhancements, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. LONG prompts are fully used (no truncation), and A1111 attention weights work — (sharp focus:1.2) emphasises, [background] de-emphasises. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "The final image generation prompt. 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append comma-separated style tags and SDXL quality boosters. 3) IMAGINATION: Generate a high-entropy prompt."
+                            "description": "The final image generation prompt. 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append comma-separated photographic style tags; attention weights like (cinematic lighting:1.2) are supported. 3) IMAGINATION: Generate a high-entropy prompt. Detail is rewarded — the full prompt is used however long it is."
                         },
                         "steps": {
                             "type": "integer",
-                            "minimum": 4,
-                            "maximum": 8,
-                            "description": "Number of inference steps (default 6. Keep it between 4 and 8 for Lightning models)."
+                            "minimum": 15,
+                            "maximum": 50,
+                            "description": "Inference steps. OMIT to get the node's tuned default (30). Only set it to trade quality for speed (15 = fast draft, 40+ = maximum detail)."
                         },
                         "width": {
                             "type": "integer",
                             "description": (
-                                "Requested width in pixels (optional, default 1024). "
-                                "Will be snapped to the nearest SDXL training "
-                                "bucket: 640, 768, 832, 896, 1024, 1152, 1216, "
-                                "1344, or 1536. Aspect ratio is honored."
+                                "Requested width in pixels (optional). Snapped to "
+                                "the node's supported sizes: 512x768 (portrait), "
+                                "544x720, 624x624 (square), 720x544, 768x512 "
+                                "(landscape) — choose by aspect ratio."
                             ),
                         },
                         "height": {
                             "type": "integer",
                             "description": (
-                                "Requested height in pixels (optional, default 1024). "
-                                "Snapped to the same SDXL bucket set as `width`."
+                                "Requested height in pixels (optional). Snapped "
+                                "together with `width` to the node's size set."
                             ),
+                        },
+                        "seed": {
+                            "type": "integer",
+                            "description": "Optional. Reuse the SAME seed with a tweaked prompt to refine an image the user liked; omit for a fresh random image."
                         },
                     },
                     "required": ["prompt"]

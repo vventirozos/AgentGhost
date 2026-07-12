@@ -805,8 +805,14 @@ class LLMClient:
                 if node.get("url"):
                     self.circuit_breaker.record_failure(node["url"])
                 if attempt < 2:
+                    # A 503 is the node WARMING UP (it binds its port ~1-2s
+                    # after a restart but loads the model for ~5-10s more) or
+                    # GPU-busy — a fixed 1-2s backoff expired before either
+                    # cleared. Wait long enough for the warmup to finish.
+                    _is_503 = getattr(getattr(e, "response", None),
+                                      "status_code", None) == 503
                     pretty_log("Image Node Retry", f"Attempt {attempt+1} failed: {type(e).__name__}: {e}", level="WARNING", icon=Icons.WARN)
-                    await asyncio.sleep(2 ** attempt)
+                    await asyncio.sleep(8.0 if _is_503 else 2 ** attempt)
                     # Try to get next node if possible
                     node = self.get_image_gen_node()
                 else:

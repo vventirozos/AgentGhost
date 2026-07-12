@@ -5,32 +5,32 @@ from pathlib import Path
 from typing import Tuple
 from ..utils.logging import Icons, pretty_log
 
-# SDXL is happiest at its training buckets — feeding it an arbitrary
-# size produces stretched or mode-collapsed output. The caller can
-# request any width/height; we snap to the nearest bucket by minimising
-# squared-aspect-ratio error first, then absolute-pixel-area error.
-# Source: the seven canonical SDXL training buckets used by every
-# major fine-tune (Pony, JuggernautXL, etc.).
-_SDXL_BUCKETS: list[Tuple[int, int]] = [
-    (640, 1536), (768, 1344), (832, 1216), (896, 1152),
-    (1024, 1024),
-    (1152, 896), (1216, 832), (1344, 768), (1536, 640),
+# Diffusion models are happiest at their training buckets — an arbitrary
+# size produces stretched or mode-collapsed output. The live node
+# (ghost, Jetson Orin) runs SD1.5 CyberRealistic with a VRAM-safe pixel
+# budget of 512x768 (393k px) and a 768 per-side cap; the old SDXL
+# buckets (1024², 640x1536, …) all exceeded it, so the node scaled them
+# down and the per-side clamp DISTORTED the extreme aspect ratios the
+# bucket snap had deliberately chosen. This ladder fits the node's
+# envelope natively (all /8, all ≤ budget, portrait→landscape coverage).
+_NODE_BUCKETS: list[Tuple[int, int]] = [
+    (512, 768), (544, 720), (624, 624), (720, 544), (768, 512),
 ]
 
 
-def _snap_to_sdxl_bucket(width: int, height: int) -> Tuple[Tuple[int, int], bool]:
+def _snap_to_bucket(width: int, height: int) -> Tuple[Tuple[int, int], bool]:
     """Return ((w, h), adjusted) where adjusted=True iff the requested
     size was not already a valid bucket. Picks the bucket minimising
     aspect-ratio distance first, then pixel-area distance.
     """
     requested = (int(width), int(height))
-    if requested in _SDXL_BUCKETS:
+    if requested in _NODE_BUCKETS:
         return requested, False
     rw, rh = max(1, requested[0]), max(1, requested[1])
     target_ar = rw / rh
     target_area = rw * rh
     best = min(
-        _SDXL_BUCKETS,
+        _NODE_BUCKETS,
         key=lambda b: (
             abs((b[0] / b[1]) - target_ar),
             abs((b[0] * b[1]) - target_area),
@@ -39,13 +39,14 @@ def _snap_to_sdxl_bucket(width: int, height: int) -> Tuple[Tuple[int, int], bool
     return best, True
 
 
-async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 6, width: int = 0, height: int = 0, **kwargs):
+async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=None, steps: int = 0, width: int = 0, height: int = 0, seed=None, negative_prompt: str = "", **kwargs):
     # --- PARAMETER HALLUCINATION HEALING ---
     prompt = prompt or kwargs.get("image") or kwargs.get("description") or kwargs.get("subject") or kwargs.get("text")
     if not prompt:
         # Extreme fallback: If they hallucinated `<parameter name="imagination_prompt">`, grab the longest string passed
         longest_str = ""
-        _skip = {"steps", "mode", "size", "dimensions", "width", "height"}
+        _skip = {"steps", "mode", "size", "dimensions", "width", "height",
+                 "seed", "negative_prompt"}
         for k, v in kwargs.items():
             if k not in _skip and isinstance(v, str) and len(v) > len(longest_str):
                 longest_str = v
@@ -56,9 +57,16 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
     if not prompt:
         return "SYSTEM ERROR: The 'prompt' parameter is MANDATORY for image generation. You must provide a description of the image."
 
-    # Enforce step limits
-    steps = int(steps)
-    steps = max(4, min(8, steps))
+    # Steps: 0/absent = defer to the NODE's tuned default (30 for the
+    # SD1.5 realism model). The old 4-8 clamp was for the long-gone
+    # DreamShaper LCM node — against the current model it forced every
+    # image down to the server's 15-step floor, half the tuned quality.
+    try:
+        steps = int(steps)
+    except (TypeError, ValueError):
+        steps = 0
+    if steps > 0:
+        steps = max(15, min(50, steps))
 
     # Accept hallucinated parameter shapes the model commonly emits:
     # `size="512x512"`, `dimensions=[w, h]`, or separate `width`/
@@ -71,7 +79,7 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
             return 0
 
     # Coerce the direct width/height first: a hallucinated "1024px" / "large"
-    # is truthy but not int-able, and _snap_to_sdxl_bucket's int() ran OUTSIDE
+    # is truthy but not int-able, and _snap_to_bucket's int() ran OUTSIDE
     # the try below → an uncaught ValueError escaped the tool.
     raw_w, raw_h = _as_int(width), _as_int(height)
     if not (raw_w and raw_h):
@@ -85,8 +93,8 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         elif isinstance(size_str, (list, tuple)) and len(size_str) == 2:
             raw_w, raw_h = _as_int(size_str[0]), _as_int(size_str[1])
     if not (raw_w and raw_h):
-        raw_w, raw_h = 1024, 1024
-    (final_w, final_h), snapped = _snap_to_sdxl_bucket(raw_w, raw_h)
+        raw_w, raw_h = 624, 624
+    (final_w, final_h), snapped = _snap_to_bucket(raw_w, raw_h)
 
     try:
         pretty_log("Image Gen",
@@ -97,8 +105,16 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         if not getattr(llm_client, 'image_gen_clients', None):
             return "ERROR: Image generation node is offline or not configured."
 
-        payload = {"prompt": prompt, "steps": steps,
-                   "width": final_w, "height": final_h}
+        payload = {"prompt": prompt, "width": final_w, "height": final_h}
+        if steps > 0:
+            payload["steps"] = steps        # omitted → node's tuned default
+        try:
+            if seed is not None:
+                payload["seed"] = int(seed)  # reproducible variations
+        except (TypeError, ValueError):
+            pass
+        if negative_prompt and isinstance(negative_prompt, str):
+            payload["negative_prompt"] = negative_prompt
         resp_data = await llm_client.generate_image(payload)
 
         b64_str = (resp_data.get("data") or [{}])[0].get("b64_json") or ""

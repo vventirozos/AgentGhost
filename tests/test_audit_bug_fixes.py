@@ -404,34 +404,38 @@ async def test_bug9_pdf_rejects_unsafe_filename(tmp_path, monkeypatch):
 # ======================================================================
 
 def test_bug10_snap_returns_exact_bucket_when_matching():
-    from ghost_agent.tools.image_gen import _snap_to_sdxl_bucket
-    (w, h), adjusted = _snap_to_sdxl_bucket(1024, 1024)
-    assert (w, h) == (1024, 1024)
+    from ghost_agent.tools.image_gen import _snap_to_bucket
+    (w, h), adjusted = _snap_to_bucket(624, 624)
+    assert (w, h) == (624, 624)
     assert adjusted is False
 
 
-def test_bug10_snap_small_square_to_1024():
-    """The audit prompt asked for 512x512; we should pick the closest
-    SDXL bucket — for a square aspect ratio that's 1024x1024."""
-    from ghost_agent.tools.image_gen import _snap_to_sdxl_bucket
-    (w, h), adjusted = _snap_to_sdxl_bucket(512, 512)
-    assert (w, h) == (1024, 1024)
+def test_bug10_snap_square_to_node_square():
+    """Squares snap to the node's square bucket (624x624 — the node is an
+    SD1.5 Jetson with a 512x768 pixel budget; the old SDXL 1024 buckets
+    exceeded it and got scale-distorted server-side)."""
+    from ghost_agent.tools.image_gen import _snap_to_bucket
+    (w, h), adjusted = _snap_to_bucket(512, 512)
+    assert (w, h) == (624, 624)
+    assert adjusted is True
+    (w, h), adjusted = _snap_to_bucket(1024, 1024)
+    assert (w, h) == (624, 624)
     assert adjusted is True
 
 
 def test_bug10_snap_landscape_to_landscape_bucket():
     """A landscape request must NOT pick a portrait bucket — aspect
     ratio is the primary discriminator."""
-    from ghost_agent.tools.image_gen import _snap_to_sdxl_bucket
+    from ghost_agent.tools.image_gen import _snap_to_bucket
     # 16:9-ish landscape.
-    (w, h), adjusted = _snap_to_sdxl_bucket(1600, 900)
+    (w, h), adjusted = _snap_to_bucket(1600, 900)
     assert w > h, f"expected landscape, got {w}x{h}"
     assert adjusted is True
 
 
 def test_bug10_snap_portrait_to_portrait_bucket():
-    from ghost_agent.tools.image_gen import _snap_to_sdxl_bucket
-    (w, h), adjusted = _snap_to_sdxl_bucket(900, 1600)
+    from ghost_agent.tools.image_gen import _snap_to_bucket
+    (w, h), adjusted = _snap_to_bucket(900, 1600)
     assert h > w, f"expected portrait, got {w}x{h}"
     assert adjusted is True
 
@@ -463,8 +467,11 @@ async def test_bug10_payload_contains_snapped_size(tmp_path):
         height=512,
     )
     assert "SUCCESS" in out
-    assert captured["width"] in (1024,)  # snapped square
-    assert captured["height"] in (1024,)
+    assert captured["width"] in (624,)   # snapped to the node's square bucket
+    assert captured["height"] in (624,)
+    # Steps omitted -> node's tuned default (30) applies server-side; the
+    # old LCM-era 4-8 clamp forced every image to the 15-step floor.
+    assert "steps" not in captured
 
 
 # ======================================================================

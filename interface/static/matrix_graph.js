@@ -10,16 +10,20 @@ export const SPEEDS = {
 };
 
 // --- COLOR CONFIGURATION ---
+// Dark, muted family only (2026-07-12): deep purple, crimson red, dark
+// blue, dark green. Additive blending + bloom lift these considerably,
+// so everything here is deliberately several stops darker than it will
+// read on screen.
 export const COLORS = {
     background: new THREE.Color('#000000'),
 
-    nodeBase: new THREE.Color('#1a0000'),    // Very Dark Red
-    nodeActive: new THREE.Color('#005eff'),  // Electric Blue
-    nodeError: new THREE.Color('#ff00ee'),   // Magenta
+    nodeBase: new THREE.Color('#0e0018'),    // near-black purple
+    nodeActive: new THREE.Color('#1e2f8c'),  // dark blue
+    nodeError: new THREE.Color('#7a0f26'),   // crimson red
 
-    lineBase: new THREE.Color('#300000'),    // Very Dark Red (lines)
-    lineActive: new THREE.Color('#450000'),  // Dark Red (lines)
-    lineError: new THREE.Color('#00fff2'),   // Cyan
+    lineBase: new THREE.Color('#0a1a12'),    // very dark green
+    lineActive: new THREE.Color('#2a0a3d'),  // deep purple
+    lineError: new THREE.Color('#8f1030'),   // crimson red
 };
 // ---------------------------
 
@@ -54,24 +58,43 @@ let targetErrorState = 0.0;
 let workingState = 0.0;
 let targetWorkingState = 0.0;
 
-// Pulse (shockwave) state. triggerPulse()/triggerSmallPulse() raise
-// pulseT to some peak and then decay toward 0 each frame. The line
-// shader uses it to amplify the traveling pulse; the node shader
-// boosts brightness.
+// Shader "energy" (uPulseT in the shaders): faint traveling charge on
+// the lines + a mild node glow. Since 2026-07-12 this is DERIVED from
+// the smoothed activity envelope every frame — it is no longer a
+// per-event shockwave.
 let pulseT = 0.0;
-let pulseDecay = 0.0;  // per-frame decay rate (tuned in setPulse)
 
-// Accent tint — a transient color nudge driven by the log icon. Decays
-// on its own so the color lingers slightly longer than the shockwave
-// for a softer "afterimage" feel.
-const accentColor = new THREE.Color(0x00f3ff);
+// Accent tint — the graph's slow "mood" color, blended toward the hue
+// of recent log activity and drained back to neutral over ~10s.
+// Neutral default = deep purple, matching the dark theme.
+const accentColor = new THREE.Color(0x3d1460);
 let accentStrength = 0.0;
-const ACCENT_DECAY = 0.015;  // ~1.2s to fall from 1.0 to 0.0 at 60fps
 
 // TTS-driven audio level (0..1). Wired by setAudioLevel() from app.js
 // when the TTS engine is active; multiplies node jitter subtly so the
 // sphere "breathes with the voice."
 let audioLevel = 0.0;
+
+// --- Activity envelope (2026-07-12) -------------------------------
+// The face is ALIVE, not reactive-per-event: log lines feed small
+// amounts of energy into `activityTarget`; the rendered `activity`
+// follows it with a soft attack (~1s) and a slow release (~8s). All
+// visuals read the smoothed envelope — a busy agent makes the graph
+// drift faster, glow slightly warmer, and rewire more often; a quiet
+// agent lets it settle. This replaced the per-log-line triggerPulse()
+// shockwave, which strobed the whole scene several times a second the
+// moment the live log stream came back to life.
+let activityTarget = 0.0;   // raw accumulated energy, decays on its own
+let activity = 0.0;         // smoothed envelope the visuals actually use
+let accentTarget = 0.0;     // smoothed accent-tint strength target
+const _accentBlend = new THREE.Color();
+
+// Structural evolution: a few nodes at a time slowly MIGRATE to new
+// home positions, so the graph's topology genuinely evolves (proximity
+// links dissolve and re-form along the way) instead of oscillating
+// around a fixed skeleton. Rate scales gently with activity.
+let migrateCooldown = 4.0;         // seconds until the next migration starts
+const MAX_CONCURRENT_MIGRATIONS = 5;
 
 // Parallax — camera drift toward cursor / device tilt. Never more than
 // ±PARALLAX_RANGE units so the chat never visually shifts.
@@ -138,10 +161,12 @@ void main() {
     // distant nodes so the cloud reads as a 3D volume, not a flat sheet.
     vDepthFade = clamp((-mvPosition.z - 2.5) / 7.0, 0.0, 1.0);
 
-    // Active color drifts electric-blue <-> cyan across the body so the
-    // network isn't one flat hue.
+    // Active color drifts dark-blue <-> deep-purple across the body so
+    // the network isn't one flat hue (companion kept dark to match the
+    // muted theme — the old vec3(0.0,0.95,1.0) cyan glowed way outside
+    // the palette under bloom).
     float hueShift = sin(instancePos.y * 1.5 + instancePos.z * 1.5) * 0.5 + 0.5;
-    vec3 activeCol = mix(uActiveColor, vec3(0.0, 0.95, 1.0), hueShift);
+    vec3 activeCol = mix(uActiveColor, vec3(0.24, 0.06, 0.38), hueShift);
 
     // Smoothly shift between shades based on position/time to give it life
     float colorMix = sin(instancePos.x * 2.0 + instancePos.y * 2.0 + uWorkingState) * 0.5 + 0.5;
@@ -427,17 +452,19 @@ function _installParallaxListeners() {
 
 // --- Public hooks --------------------------------------------------
 
-function _applyPulse(peak, durationMs, color) {
-    pulseT = Math.max(pulseT, peak);
-    // Decay so that pulseT reaches 0 after `durationMs`.
-    // At 60fps that's durationMs/16.67 frames.
-    pulseDecay = peak / Math.max(1, durationMs / 16.67);
+// Feed energy into the envelope. `weight` is small (a single log line
+// is ~0.1-0.2); saturation at 1.0 means "very busy". An optional color
+// BLENDS into the accent tint over time — a slow mood shift, never a
+// flash cut.
+export function noteActivity(weight, color) {
+    const w = Math.max(0, Math.min(1, weight || 0.15));
+    activityTarget = Math.min(1.0, activityTarget + w);
     if (color) {
         try {
-            accentColor.set(color);
+            _accentBlend.set(color);
+            accentColor.lerp(_accentBlend, 0.18);   // drift, don't jump
         } catch (e) { /* bad color string — keep previous */ }
-        // Accent sticks around a touch longer than the shockwave.
-        accentStrength = Math.max(accentStrength, peak);
+        accentTarget = Math.min(0.4, accentTarget + w * 0.35);
     }
 }
 
@@ -445,23 +472,28 @@ export function updateSphereColor(colorHex) {
     try { accentColor.set(colorHex); } catch (e) { /* ignore */ }
 }
 
-// Spike clear-timeout is tracked so rapid repeat spikes each extend
-// the error window to +2s from the latest call instead of letting the
-// first timeout yank it down while later spikes are still in flight.
+// Errors tint the graph toward magenta for a couple of seconds —
+// noticeable, but no longer a flashbang: the old spike drove the error
+// uniforms to 1.0 (full recolor + bloom x3) AND zeroed the connection
+// probability, disintegrating every link. Repeat calls extend the
+// window from the latest call.
 let _spikeClearTimeout;
-export function triggerSpike() {
-    targetErrorState = 1.0;
+export function noteError() {
+    targetErrorState = 0.5;
+    activityTarget = Math.min(1.0, activityTarget + 0.3);
     if (_spikeClearTimeout) clearTimeout(_spikeClearTimeout);
     _spikeClearTimeout = setTimeout(() => {
         targetErrorState = 0.0;
         _spikeClearTimeout = null;
-    }, 2000);
+    }, 2500);
 }
 
+// Back-compat aliases: older call sites keep working, but they now feed
+// the envelope instead of firing shockwaves.
+export function triggerSpike() { noteError(); }
 export function triggerNextColor() { /* retained no-op for compatibility */ }
-
-export function triggerPulse(color) { _applyPulse(1.0, 700, color); }
-export function triggerSmallPulse(color) { _applyPulse(0.45, 500, color); }
+export function triggerPulse(color) { noteActivity(0.3, color); }
+export function triggerSmallPulse(color) { noteActivity(0.12, color); }
 
 // Called by app.js on each audio-analyser tick during TTS playback.
 // Level is a normalized 0..1 RMS; we low-pass it here to hide the
@@ -498,12 +530,27 @@ function animate() {
     const transitionSpeed = isWaking ? 0.05 : 0.02;
 
     workingState += (targetWorkingState - workingState) * transitionSpeed;
-    errorState   += (targetErrorState   - errorState)   * 0.08;
+    errorState   += (targetErrorState   - errorState)   * 0.05;
 
-    // Pulse / accent decay. Independent rates so the color lingers past
-    // the shockwave for a softer afterimage.
-    pulseT = Math.max(0, pulseT - pulseDecay);
-    accentStrength = Math.max(0, accentStrength - ACCENT_DECAY);
+    // Activity envelope: the raw target decays on its own (half-life
+    // ~2.5s at 60fps) and the rendered value follows it with a soft
+    // attack and a slower release — so a burst of log lines swells the
+    // graph over ~a second and lets it settle over ~8, instead of
+    // strobing per event.
+    activityTarget *= 0.9955;
+    if (activityTarget < 0.005) activityTarget = 0;
+    const _rising = activityTarget > activity;
+    activity += (activityTarget - activity) * (_rising ? 0.035 : 0.008);
+
+    // Accent tint follows the same philosophy: drift up with colored
+    // activity, drain slowly back to neutral.
+    accentTarget *= 0.995;
+    accentStrength += (accentTarget - accentStrength) * 0.02;
+
+    // The shader "energy" (formerly the per-event shockwave) is now the
+    // smoothed envelope — faint traveling charge on the lines and a mild
+    // node glow when the agent is busy, perfectly still when quiet.
+    pulseT = Math.min(1.0, activity * 0.55);
 
     // Audio-level natural decay: even if setAudioLevel stops being
     // called (TTS queue drained), the residual level dies out fast.
@@ -535,8 +582,12 @@ function animate() {
     camera.position.z = parallaxCameraBaseZ;
     camera.lookAt(0, 0, 0);
 
-    // Structure changes form slowly when idle, faster when busy
-    let targetShapeSpeed = SPEEDS.idle + (workingState * (SPEEDS.busy - SPEEDS.idle));
+    // Structure changes form slowly when idle, faster when busy. "Busy"
+    // is the max of an in-flight chat turn (workingState) and ambient
+    // log activity (the envelope) — so autonomous background work also
+    // animates the graph, just smoothly.
+    const drive = Math.min(1.0, Math.max(workingState, activity * 0.85));
+    let targetShapeSpeed = SPEEDS.idle + (drive * (SPEEDS.busy - SPEEDS.idle));
     let speedDiff = targetShapeSpeed - currentShapeSpeed;
     if (Math.abs(speedDiff) > 0.001) {
         // Change by 2.0 over ~180 frames (3 seconds at 60fps) -> 0.011 per frame
@@ -550,6 +601,51 @@ function animate() {
     // so the sphere visibly resonates with speech. Capped at +30% so it
     // stays subtle — chat overlay must remain readable.
     const morphAmp = 1.5 * (1.0 + audioLevel * 0.3);
+
+    // Structural evolution: start a slow migration for one node every
+    // few seconds (sooner when the agent is active). The node's HOME
+    // position glides to a fresh point in the volume over ~6s, so its
+    // proximity links dissolve and re-form — the graph visibly rewires
+    // itself instead of orbiting a fixed skeleton.
+    migrateCooldown -= (1 / 60) * (1.0 + activity * 3.0);
+    if (migrateCooldown <= 0) {
+        migrateCooldown = 3.5 + Math.random() * 3.0;
+        let migrating = 0;
+        for (let i = 0; i < NODE_COUNT; i++) {
+            if (basePositions[i]._mig) migrating++;
+        }
+        if (migrating < MAX_CONCURRENT_MIGRATIONS) {
+            const bp = basePositions[Math.floor(Math.random() * NODE_COUNT)];
+            if (!bp._mig) {
+                const u = Math.random(), v = Math.random();
+                const th = 2 * Math.PI * u, ph = Math.acos(2 * v - 1);
+                const r = 2.0 * Math.cbrt(Math.random());
+                bp._mig = {
+                    sx: bp.x, sy: bp.y, sz: bp.z,
+                    tx: r * Math.sin(ph) * Math.cos(th),
+                    ty: r * Math.sin(ph) * Math.sin(th),
+                    tz: r * Math.cos(ph),
+                    p: 0,
+                };
+            }
+        }
+    }
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const m = basePositions[i]._mig;
+        if (!m) continue;
+        m.p += (1 / 60) / 6.0;   // ~6s per migration
+        if (m.p >= 1) {
+            basePositions[i].x = m.tx;
+            basePositions[i].y = m.ty;
+            basePositions[i].z = m.tz;
+            basePositions[i]._mig = null;
+        } else {
+            const e = m.p * m.p * (3 - 2 * m.p);   // smoothstep ease
+            basePositions[i].x = m.sx + (m.tx - m.sx) * e;
+            basePositions[i].y = m.sy + (m.ty - m.sy) * e;
+            basePositions[i].z = m.sz + (m.tz - m.sz) * e;
+        }
+    }
 
     for (let i = 0; i < NODE_COUNT; i++) {
         const bp = basePositions[i];
@@ -571,14 +667,17 @@ function animate() {
     const lineUvAttr = lineGeometry.attributes.aLightPass.array;
     let lineIdx = 0;
 
-    const connectionProbability = errorState > 0.5 ? 0.0 : 1.0;
+    // NB: errors no longer sever connections. The old
+    // `errorState > 0.5 → connectionProbability 0` made every link
+    // vanish at once (the graph "disintegrated") on any log line
+    // containing ERROR — spectacular, but the opposite of "alive".
     const connected = new Array(NODE_COUNT).fill(false);
 
     for (let i = 0; i < NODE_COUNT; i++) {
         for (let j = i + 1; j < NODE_COUNT; j++) {
             const distSq = currentPositions[i].distanceToSquared(currentPositions[j]);
             if (distSq < PROXIMITY_SQ) {
-                if (connectionProbability > 0) {
+                {
                     connected[i] = true;
                     connected[j] = true;
 
@@ -636,10 +735,11 @@ function animate() {
     lUniforms.uPulseT.value = pulseT;
     lUniforms.uAccentStrength.value = accentStrength;
 
-    // Bloom tracks work + errors, and kicks briefly on each pulse so the
-    // heartbeat reads as a glow swell. Mobile scale keeps the composite
-    // pass cheap on A-series GPUs.
-    bloomPass.strength = (1.15 + workingState * 0.45 + errorState * 2.2 + pulseT * 0.5) * BLOOM_SCALE;
+    // Bloom breathes with the envelope. The old formula added
+    // errorState * 2.2 (a 3x glow flashbang on any error line) and
+    // pulseT * 0.5 per event — together the main source of "flashing".
+    bloomPass.strength = (1.15 + workingState * 0.3 + activity * 0.35
+        + errorState * 0.5) * BLOOM_SCALE;
 
     composer.render();
 }

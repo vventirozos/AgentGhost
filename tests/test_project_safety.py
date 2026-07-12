@@ -250,26 +250,52 @@ def test_suggestion_blocked_below_thresholds():
     assert s.should_suggest is False
 
 
-def test_suggestion_triggered_on_turn_threshold():
+def test_turns_alone_no_longer_trigger():
+    # Depth WITHOUT durable output = just a long conversation, not a
+    # project (the "12 turns titled hello" false positive).
     s = should_suggest_promotion(
         user_turns=["a"] * MIN_TURNS_FOR_SUGGESTION,
         assistant_turns=["b"] * MIN_TURNS_FOR_SUGGESTION,
         sandbox_writes=0, plan_node_count=0,
         already_in_project=False,
     )
+    assert s.should_suggest is False
+
+
+def test_suggestion_needs_turns_AND_writes():
+    # Enough turns AND enough writes = a real promotable effort.
+    from ghost_agent.core.project_safety import MIN_WRITES_FOR_SUGGESTION
+    s = should_suggest_promotion(
+        user_turns=["Build a log parser"] * MIN_TURNS_FOR_SUGGESTION,
+        assistant_turns=["b"] * MIN_TURNS_FOR_SUGGESTION,
+        sandbox_writes=MIN_WRITES_FOR_SUGGESTION, plan_node_count=0,
+        already_in_project=False,
+    )
     assert s.should_suggest is True
-    assert "turns" in s.reason
+    assert "turns" in s.reason and "sandbox" in s.reason
 
 
-def test_suggestion_triggered_on_sandbox_writes():
+def test_enough_turns_but_too_few_writes_does_not_trigger():
+    from ghost_agent.core.project_safety import MIN_WRITES_FOR_SUGGESTION
+    s = should_suggest_promotion(
+        user_turns=["Build a thing"] * MIN_TURNS_FOR_SUGGESTION,
+        assistant_turns=["b"] * MIN_TURNS_FOR_SUGGESTION,
+        sandbox_writes=MIN_WRITES_FOR_SUGGESTION - 1, plan_node_count=0,
+        already_in_project=False,
+    )
+    assert s.should_suggest is False
+
+
+def test_writes_alone_without_turns_does_not_trigger():
+    # A couple of writes in a 1-turn chat isn't a project either — both
+    # signals are now required (unless the planner built a real plan).
     s = should_suggest_promotion(
         user_turns=["Research BGE embeddings"],
         assistant_turns=["a"],
         sandbox_writes=2, plan_node_count=0,
         already_in_project=False,
     )
-    assert s.should_suggest is True
-    assert "sandbox" in s.reason
+    assert s.should_suggest is False
 
 
 def test_suggestion_triggered_on_plan_depth():
@@ -283,9 +309,10 @@ def test_suggestion_triggered_on_plan_depth():
 
 def test_suggestion_title_derived_from_first_user_turn():
     s = should_suggest_promotion(
-        user_turns=["Build a log parser for Nginx", "also tell me the weather"],
+        user_turns=(["Build a log parser for Nginx"]
+                    + ["more"] * MIN_TURNS_FOR_SUGGESTION),
         assistant_turns=["ok"] * 10,
-        sandbox_writes=1, plan_node_count=0,
+        sandbox_writes=3, plan_node_count=0,
         already_in_project=False,
     )
     assert s.suggested_title.startswith("Build a log parser")
@@ -294,11 +321,39 @@ def test_suggestion_title_derived_from_first_user_turn():
 def test_suggestion_title_truncated():
     s = should_suggest_promotion(
         user_turns=["x" * 200], assistant_turns=["a"],
-        sandbox_writes=1, plan_node_count=0,
+        sandbox_writes=0, plan_node_count=MIN_PLAN_NODES_FOR_SUGGESTION,
         already_in_project=False,
     )
     assert len(s.suggested_title) <= 80
     assert s.suggested_title.endswith("…")
+
+
+def test_greeting_first_turn_is_skipped_for_title():
+    # The "hello" bug: a greeting first turn must not become the title.
+    s = should_suggest_promotion(
+        user_turns=(["hello!", "hey ghost"]
+                    + ["Build a CSV analyzer"]
+                    + ["tweak it"] * MIN_TURNS_FOR_SUGGESTION),
+        assistant_turns=["ok"] * 12,
+        sandbox_writes=3, plan_node_count=0,
+        already_in_project=False,
+    )
+    assert s.should_suggest is True
+    assert s.suggested_title.startswith("Build a CSV analyzer")
+    assert "hello" not in s.suggested_title.lower()
+
+
+def test_all_greetings_falls_back_to_first_nonempty():
+    # If every early turn is a greeting, don't return empty — use the
+    # first non-empty turn rather than "Untitled effort".
+    s = should_suggest_promotion(
+        user_turns=(["hi", "thanks"] + ["ok"] * MIN_TURNS_FOR_SUGGESTION),
+        assistant_turns=["b"] * 12,
+        sandbox_writes=3, plan_node_count=0,
+        already_in_project=False,
+    )
+    assert s.suggested_title  # non-empty
+    assert s.suggested_title != "Untitled effort"
 
 
 def test_suggestion_never_auto_promotes():

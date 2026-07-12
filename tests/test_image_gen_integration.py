@@ -126,7 +126,9 @@ def test_prompts_and_registry_image_gen_instructions():
     
     param_desc = img_gen_def["function"]["parameters"]["properties"]["prompt"]["description"]
     assert "EXACTLY as they described it" in param_desc
-    assert "SDXL quality boosters" in param_desc
+    # The node is SD1.5 with real weight support now — the description
+    # teaches attention-weight syntax instead of "SDXL quality boosters".
+    assert "attention weights" in param_desc
     assert "high-entropy prompt" in param_desc
     
     vision_def = next((t for t in tools if t.get("function", {}).get("name") == "vision_analysis"), None)

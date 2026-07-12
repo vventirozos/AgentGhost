@@ -20,6 +20,7 @@ decide whether to wire them in.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
@@ -182,11 +183,28 @@ class PromotionSuggestion:
 # Threshold knobs are module-level so tests + operators can override
 # without touching the callsite. The defaults are deliberate: 8 turns
 # is roughly where a freeform session stops looking like chat; ≥1
-# sandbox write means the user has started producing durable output;
-# ≥3 plan nodes means the planner thought the work deserved
-# decomposition.
+# sandbox writes mean the user is producing durable output; ≥3 plan
+# nodes means the planner thought the work deserved decomposition.
 MIN_TURNS_FOR_SUGGESTION = 8
+# Promotion now needs BOTH depth (turns) AND durable output (writes) —
+# 12 turns of pure chat titled "hello" was a false positive (reported in
+# the field). A large plan alone still qualifies (the planner already
+# decided the work is structured). Writes are counted CUMULATIVELY across
+# the session by the caller, not per-turn.
+MIN_WRITES_FOR_SUGGESTION = 3
 MIN_PLAN_NODES_FOR_SUGGESTION = 3
+
+# First turns that are pure greetings/pleasantries make useless titles
+# ("hello", "hi ghost", "hey there!"). A turn counts as a greeting when it
+# OPENS with one and carries no real content after it — we allow a short
+# trailing address/interjection (a name, "there", "!") but not a full
+# sentence, so "hey ghost" is skipped while "hi, can you build X" is kept.
+_GREETING_RE = re.compile(
+    r"^\s*(hi|hey|hello|yo|sup|howdy|good\s+(morning|afternoon|evening)|"
+    r"greetings|thanks?|thank\s+you|ok(ay)?|cool|nice|test|ping)\b"
+    r"[\s,!.?]*(there|ghost|again|all|folks|\w{1,12})?[\s,!.?]*$",
+    re.IGNORECASE,
+)
 
 
 def should_suggest_promotion(
@@ -228,22 +246,34 @@ def should_suggest_promotion(
         "plan_node_count": plan_node_count,
     }
 
-    strong_signal = (
-        len(user_turns) >= MIN_TURNS_FOR_SUGGESTION
-        or sandbox_writes >= 1
+    # A promotable session shows BOTH sustained engagement AND durable
+    # output: enough turns AND enough sandbox writes. A large plan alone
+    # still qualifies — the planner already judged the work structured.
+    substantive = (
+        (len(user_turns) >= MIN_TURNS_FOR_SUGGESTION
+         and sandbox_writes >= MIN_WRITES_FOR_SUGGESTION)
         or plan_node_count >= MIN_PLAN_NODES_FOR_SUGGESTION
     )
-    if not strong_signal:
+    if not substantive:
         return PromotionSuggestion(False, reason="below thresholds",
                                    signals=signals)
 
-    # Derive a compact title from the first user turn (the original
-    # goal) rather than the latest turn (which is usually a follow-up).
+    # Derive a compact title from the first SUBSTANTIVE user turn — skip
+    # greetings/pleasantries ("hello", "thanks") which make useless
+    # project titles. Fall back to the first non-empty turn if every
+    # early turn is a greeting.
     title = ""
+    first_nonempty = ""
     for t in user_turns:
-        if t and t.strip():
-            title = t.strip()
+        if not (t and t.strip()):
+            continue
+        s = t.strip()
+        if not first_nonempty:
+            first_nonempty = s
+        if not _GREETING_RE.match(s):
+            title = s
             break
+    title = title or first_nonempty
     if len(title) > 80:
         title = title[:77] + "…"
 

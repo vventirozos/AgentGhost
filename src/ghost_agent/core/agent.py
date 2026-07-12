@@ -7936,10 +7936,22 @@ class GhostAgent:
                         if isinstance(m, dict) and m.get("role") == "assistant"
                         and isinstance(m.get("content"), str)
                     ]
-                    _writes = sum(
+                    # Sandbox writes accumulate ACROSS the session (the AND
+                    # rule needs ≥3 total, and a chat rarely writes 3 files in
+                    # one turn). Persist a running counter in the scratchpad.
+                    _writes_this_turn = sum(
                         1 for t in (tools_run_this_turn or [])
                         if isinstance(t, dict) and t.get("name") == "file_system"
                     )
+                    _writes = _writes_this_turn
+                    try:
+                        if _sp is not None:
+                            _prev = int(_sp.get("_session_sandbox_writes") or 0)
+                            _writes = _prev + _writes_this_turn
+                            if _writes_this_turn:
+                                _sp.set("_session_sandbox_writes", str(_writes))
+                    except Exception:
+                        _writes = _writes_this_turn
                     # If the user is administering the project system
                     # itself this turn (list / delete / switch / ...),
                     # don't nudge them to create one — they obviously

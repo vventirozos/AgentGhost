@@ -190,6 +190,27 @@ expansion"; it was actually DECOMPOSE_QUERY — label now derives from the task.
 and the smart-memory journal appends on both finalize paths (also stops chess FENs polluting
 memory). **Needs prod restart.**
 
+**Image generation — node + agent both fixed (2026-07-12).** ghost's Jetson image node had two
+silent quality killers (77-token CLIP truncation ate the agent's long prompts; A1111 `(x:1.4)`
+syntax entered CLIP as literal garbage) + an anime VAE (ClearVAE) overriding CyberRealistic's baked
+realism VAE — fixed server-side (lpw chunked encoding + A1111 weight parser + baked VAE + DPM++ 2M
+Karras pinned + seed/clip_skip params; verified by generating and LOOKING at before/after images;
+see memory imggen-node-quality). Then the AGENT side turned out to still be tuned for the long-gone
+DreamShaper LCM node: `image_gen.py` clamped steps 4-8 (schema literally said "Lightning models") —
+server floor-raised to 15, HALF the tuned 30 — and snapped sizes to SDXL 1024²+ buckets that blow
+the Jetson's 393k-px budget. Fixed: steps omitted by default (node default wins), SD1.5 bucket
+ladder (512x768…768x512), seed/negative_prompt passthrough, schema/prompts now teach weight syntax
++ no-truncation, 503-aware image retry (8s for node warmup). **Agent side needs prod restart.**
+
+**Chat→project promotion nudge retuned (2026-07-12).** The "💡 promote to a tracked project" footer
+(agent.py finalize → `project_safety.should_suggest_promotion`) fired on 12 turns of pure chat and
+titled the project "hello" (the first user turn). Fixes: promotion now needs turns AND ≥3 sandbox
+writes (`MIN_WRITES_FOR_SUGGESTION`, was `or ≥1`); writes are counted CUMULATIVELY across the session
+(scratchpad `_session_sandbox_writes`) since a chat rarely writes 3 files in one turn; a big plan
+(≥3 nodes) still qualifies alone. Title derives from the first NON-greeting user turn (`_GREETING_RE`
+skips "hello"/"hey ghost"/"thanks", keeps "hi, can you build X"), falling back to first-non-empty.
+**Needs prod restart.**
+
 **Interface server audit (2026-07-12) — the web UI's live-log stream was DEAD in prod.** server.py's
 default agent-log path was `/Users/vasilis/AI/Logs/…` (missing `Data/`) and the prod deployment
 (`uvicorn server:app` via start-ghost-client.sh) never passes `--agent-log` (uvicorn owns argv) — so
