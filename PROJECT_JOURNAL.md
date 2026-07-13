@@ -735,6 +735,47 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-13 (later 6) — worker-node model bake-off: Ornith-9B REJECTED, Gemma 4 E4B stays (2× faster AND more accurate)
+- Operator was seeing ~20-30 t/s on nova (worker) and asked for a model recommendation. I researched
+  and recommended **Ornith-1.0-9B-heretic-MTP** (Qwen3.5-9B lineage, MTP head, strong sub-10B
+  benchmarks). Operator swapped it in; we then benched it properly and **the recommendation was
+  WRONG on both axes**. Reverted to Gemma 4 E4B.
+- **Speed**: Ornith 12–18 t/s decode vs Gemma **18–34** (wall-clock: decompose 9.5s vs **4.5s**;
+  web-summary 7.7s vs **3.5s**). Root cause: nova is a base M4 (16GB, ~120GB/s) and decode is
+  BANDWIDTH-bound. Gemma E4B's 33 t/s on a 5.1GB file would require 168GB/s — impossible — proving
+  the E-series streams far less than its file per token (per-layer-embeddings / MatFormer =
+  genuinely "effective 4B"). Ornith streams its full 5.9GB → ~14-20 t/s ceiling, and it was AT that
+  ceiling. My earlier claim that "E4B decodes at its raw size" was simply false.
+- **Quality (the real surprise)**: on the two bench tasks with a checkable answer, **Gemma WON**.
+  Verify: given a deliberately under-supported claim (exit 0 + stdout `42` ≠ "printed the 9th
+  largest"), Ornith wrongly **CONFIRMED** (fail-open — precisely what the verifier exists to
+  prevent) while Gemma correctly **REFUTED with the reason**. Difficulty-classify: Gemma right
+  (`advanced` — the prompt described the malformed-lines twist), Ornith wrong (`basic`). Tied on
+  decompose / web-summary / memory-extract / Greek. Benchmark reputation (MMLU-Pro, GPQA) measures
+  long-form reasoning, NOT this workload of short mechanical calls.
+- **Three dead-end hypotheses, all measured and killed** (documented so nobody re-runs them):
+  (a) *swap thrash* — RSS was 9.9GB/16GB with 9.5GB swap used, but `vm_stat` **pageouts did not
+  move during the bench**: stale swap from the model transition, not live paging; (b) *oversized
+  KV* — dropping `--ctx-size` 131072→65536 freed 1.5GB RSS and changed speed by **zero**;
+  (c) *under-drafting* — `--spec-draft-n-max` 3→6 made it **worse** (acceptance collapsed 0.9→0.28;
+  6 draft passes to keep ~2.5 tokens on a compute-limited box). Deeper speculation is not free.
+- **Live config restored = the ORIGINAL config, which was already optimal**: Gemma 4 E4B UD-Q4_K_XL
+  + mmproj + MTP draft, `--ctx-size 131072` (its KV layer-sharing makes that affordable — Ornith's
+  doesn't), `-np 4`, **`--spec-draft-n-max 2`**, RSS 7.4GB, no swap pressure.
+- **Draft-depth A/B settled (same model/ctx, only n-max varied)**: **n-max 2 WINS** — mean 21.4 t/s
+  vs 19.6 at n-max 3 (decompose 3.87s vs 4.59s, ~16% faster; server decode 23–36 vs 18–34 t/s), and
+  per-token acceptance is HIGHER at depth 2 (0.61–1.00 vs 0.53–0.76). Combined with Ornith's n-max 6
+  collapse, the rule for this box is settled: **shallower speculation wins on a bandwidth/compute-
+  limited M4** — each extra drafted token costs a full draft forward pass and acceptance decays with
+  depth. My "raise n-max" hypothesis was wrong on BOTH models.
+- **Net outcome of the whole exercise: nothing was broken and nothing needed changing.** The operator's
+  original 20–30 t/s is this hardware's honest ceiling for this model, and the config they already had
+  was the best of everything we measured.
+- **Bench gotcha worth keeping**: every candidate is a thinking model — a raw bench MUST send
+  `chat_template_kwargs:{enable_thinking:false}` or the whole budget goes to `reasoning_content`
+  and `content` comes back EMPTY (12 t/s and blank outputs). The agent's worker path already does
+  this (`llm._disable_thinking`, added 2026-07-11 for this exact reason).
+
 ### 2026-07-13 (later 5) — web UI: live log console (header button → bottom drawer)
 - Operator asked for a button showing the logs in near-realtime. The transport already existed —
   the interface's WebSocket has streamed the pretty log to the browser since 2026-07-11 (it drives
