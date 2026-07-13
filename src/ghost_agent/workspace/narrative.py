@@ -12,6 +12,7 @@ path is what tests / disabled-LLM deployments exercise.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Awaitable, Callable, Iterable, List, Optional
@@ -133,6 +134,12 @@ class WorkspaceNarrative:
         self.critique_fn = critique_fn
         self.max_recent_events = int(max_recent_events)
         self.enabled = bool(enabled)
+        # Fingerprint of the last successfully-persisted regeneration's
+        # INPUT (the deterministic template). Same idempotency discipline
+        # as the selfhood narrative: identical workspace state → skip the
+        # LLM round-trip and the redundant persist. In-memory on purpose
+        # (fresh boot regenerates once).
+        self._last_input_key = ""
 
     def latest(self) -> str:
         if not self.path.exists():
@@ -173,8 +180,20 @@ class WorkspaceNarrative:
         if not template:
             return ""
 
+        # Idempotency guard: the template is a deterministic render of
+        # ALL inputs (tracked files, events, changes), so an unchanged
+        # template means an unchanged workspace — skip the regeneration.
+        # Never skip the very first write (no narrative on disk yet).
+        input_key = hashlib.sha1(template.encode("utf-8")).hexdigest()
+        if input_key == self._last_input_key and self.latest():
+            logger.debug(
+                "workspace narrative input unchanged; skipping regeneration"
+            )
+            return ""
+
         if self.critique_fn is None:
             self._persist(template)
+            self._last_input_key = input_key
             return template
 
         prompt = (
@@ -187,9 +206,17 @@ class WorkspaceNarrative:
         )
         try:
             text = await self.critique_fn(prompt)
+            if not (text or "").strip():
+                # Make the degraded mode visible — a whole night of raw
+                # template output went unnoticed because this was silent.
+                logger.warning(
+                    "workspace narrative critique returned empty content; "
+                    "persisting raw template"
+                )
         except Exception as e:  # noqa: BLE001
             logger.warning("workspace narrative LLM critique failed: %s", e)
             text = ""
         text = (text or "").strip() or template
         self._persist(text)
+        self._last_input_key = input_key
         return text

@@ -69,6 +69,15 @@ A single `(state, action)` tuple where:
   > are now pinned to neutral inference constants. **PRM checkpoints
   > trained before this fix must be retrained.** See
   > [Audit &amp; hardening](../audit_fixes.html).
+
+  > **Retrain note (2026-07-13).** The same pinning now covers the whole
+  > plan-progress block: `steps_so_far`, `failures_so_far`,
+  > `tools_used_this_turn`, `tools_failed_this_turn` are fixed to the
+  > turn-start constants (0 / 0 / () / ()) because every live scoring
+  > site scores at turn start — mid-turn training variance was pure
+  > train↔serve skew (and `steps_so_far` mildly label-leaking: it equals
+  > the step index the MC label is monotone in). Checkpoints trained
+  > before this refresh automatically on the next idle retrain.
 * **action** = a candidate's `(description, tool_name, tool_args)`
   tuple. Mirrors `core.mcts.ActionCandidate` so MCTS can adapt one
   to the other without translation logic in the hot path.
@@ -155,18 +164,28 @@ all-FAILED corpus still bails) **plus** a label-variance floor
 (`min_label_std`), and it does *not* re-impose the fraction floor;
 binary mode keeps the original per-class fraction floor.
 
-**Train↔serve feature skew is surfaced.** Several turn-progress features
-(`plan_steps_so_far_log1p`, `plan_failures_so_far_log1p`,
-`plan_has_any_failure`, `tool_already_used_this_turn`,
-`tool_failed_this_turn` — `SERVE_TURN_START_INERT_FEATURES`) vary across
-training samples (drawn mid-turn) but are **always 0 at the live scoring
-site**, which fires at TURN START (no step run, no tool used yet). A fit
-that leans on them reports a train accuracy the deployed model can't
-reproduce. When any such feature carries non-trivial training variance,
-`run` sets `TrainerReport.feature_skew_warning` (and logs it) so the
-caveat rides alongside the accuracy number. A full fix — scoring at turn
-start, or dropping these columns — is a training-signal redesign left as
-a known item.
+**Train↔serve feature skew — RESOLVED 2026-07-13 (check kept as
+tripwire).** Several turn-progress features (`plan_steps_so_far_log1p`,
+`plan_failures_so_far_log1p`, `plan_has_any_failure`,
+`tool_already_used_this_turn`, `tool_failed_this_turn` —
+`SERVE_TURN_START_INERT_FEATURES`) are **always 0 at the live scoring
+sites**, which fire at TURN START (agent.py MCTS lookahead,
+`frontier_selection.representative_state`: no step run, no tool used
+yet). They used to vary across training samples (drawn mid-turn), so
+the fit leaned on signal the deployed model could never see — surfaced
+as the "serve-inert features vary in training" warning on every idle
+retrain. The training-signal redesign landed: `_build_state_for_step`
+now pins the **entire plan-progress block** to the turn-start constants
+(steps=0, failures=0, no tools used/failed, pending=1, depth=1), so
+training and serving see identical values and only the request text and
+candidate action carry gradient. The skew check in `run` remains as a
+regression **tripwire**: it fires only if mid-turn variance is
+reintroduced without moving the scoring sites in lockstep
+(`TrainerReport.feature_skew_warning`, mirrored into `summary()` with a
+⚠). If a future call site needs mid-turn scoring, un-pin the fields and
+make that site pass its real progress state — training and serving must
+move together. Tests: `tests/test_prm_binary_floor_and_skew.py` (both
+directions), `tests/test_prm_labels.py` (pin contract).
 
 When ANY floor isn't met, `run` returns a `TrainerReport` with
 `fit_attempted=False` and a human-readable `bail_reason`. **No

@@ -237,6 +237,17 @@ class TestHardModeTwist:
         assert "DISTINCT" not in basic_prompt
         assert "distinct_desc" in adv_validator
 
+    def test_algo_k_never_degenerates_to_max(self):
+        # k=1 renders "the 1-th LARGEST" — plain max(), a zero-signal
+        # challenge (observed live 2026-07-13). k is floored at 2.
+        import re as _re
+        for tier in (None, "basic", "intermediate", "advanced", "expert"):
+            for _ in range(30):
+                prompt, _, _ = TEMPLATES["algo"](tier=tier)
+                m = _re.search(r"the (\d+)-th LARGEST", prompt)
+                assert m, f"kth-largest task line missing: {prompt[:200]}"
+                assert int(m.group(1)) >= 2
+
     def test_sql_advanced_allows_NULL_amounts(self):
         basic_prompt, basic_setup, _ = TEMPLATES["sql"](tier="basic")
         adv_prompt, adv_setup, _ = TEMPLATES["sql"](tier="advanced")

@@ -556,7 +556,10 @@ def _algo_kth_largest(tier: Optional[str] = None) -> ChallengeTriple:
     """
     seed = _pick_seed()
     n = random.randint(_size(20, tier), _size(60, tier))
-    k = random.randint(1, min(10, n))
+    # k floored at 2: k=1 renders "the 1-th LARGEST" — i.e. plain max() —
+    # a zero-signal challenge (observed live 2026-07-13). n ≥ 20 at every
+    # tier, so the range is always valid.
+    k = random.randint(2, min(10, n))
     hard = _is_hard_mode(tier)
 
     if hard:

@@ -160,45 +160,32 @@ def test_iter_step_samples_skips_unknown_trajectories():
     assert len(samples) == 2
 
 
-def test_iter_step_samples_state_reflects_prefix_only():
-    """A step's state must reflect what was known *before* the step
-    fired — leaking later steps would let the model post-hoc infer
-    the answer instead of learning to predict it."""
+def test_iter_step_samples_state_pinned_to_turn_start():
+    """Every training state must present the TURN-START constants the
+    live scoring sites use (agent.py MCTS lookahead and
+    frontier_selection.representative_state: steps=0, failures=0, no
+    tools used/failed, pending=1, depth=1). Mid-turn variance here is
+    exactly the train↔serve skew the trainer's tripwire guards against
+    — see SERVE_TURN_START_INERT_FEATURES (fixed 2026-07-13)."""
     t = _traj(
         outcome=Outcome.PASSED.value,
         tool_calls=[
-            _call("file_system"),
+            _call("file_system", error="boom"),
             _call("execute"),
-            _call("vision"),
+            _call("vision", error="kaboom"),
         ],
     )
     samples = list(iter_step_samples([t]))
-    # Step 0: nothing used yet.
-    assert samples[0].state.steps_so_far == 0
-    assert samples[0].state.tools_used_this_turn == ()
-    # Step 1: only step 0 visible.
-    assert samples[1].state.steps_so_far == 1
-    assert samples[1].state.tools_used_this_turn == ("file_system",)
-    # Step 2: both prior steps visible.
-    assert samples[2].state.steps_so_far == 2
-    assert samples[2].state.tools_used_this_turn == ("file_system", "execute")
-
-
-def test_iter_step_samples_failures_so_far_counts_only_errored_prior_calls():
-    t = _traj(
-        outcome=Outcome.PASSED.value,
-        tool_calls=[
-            _call("a", error="boom"),
-            _call("b"),
-            _call("c", error="kaboom"),
-            _call("d"),
-        ],
-    )
-    samples = list(iter_step_samples([t]))
-    assert samples[0].state.failures_so_far == 0
-    assert samples[1].state.failures_so_far == 1
-    assert samples[2].state.failures_so_far == 1
-    assert samples[3].state.failures_so_far == 2
+    assert len(samples) == 3
+    for s in samples:
+        assert s.state.steps_so_far == 0
+        assert s.state.failures_so_far == 0
+        assert s.state.tools_used_this_turn == ()
+        assert s.state.tools_failed_this_turn == ()
+        assert s.state.pending_count == 1
+        assert s.state.plan_depth == 1
+    # step_index still records position for provenance / debugging.
+    assert [s.step_index for s in samples] == [0, 1, 2]
 
 
 def test_iter_step_samples_action_extraction():

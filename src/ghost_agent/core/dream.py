@@ -627,6 +627,86 @@ def detect_tool_patterns(skill_memory) -> list:
     return results
 
 
+# ── REM heuristic actionability gate ─────────────────────────────────
+# The REM prompt asks the (small, worker-hosted) model for imperative
+# behavioral rules, but in practice it also emits observations —
+# "The agent is capable of…", "The user has shown interest in…" — and
+# sometimes misattributes the OPERATOR's requests as agent tendencies.
+# Those land in SkillMemory as mistake="none" pseudo-lessons that match
+# no real query and pollute retrieval. Prompt instructions alone don't
+# hold against a small model, so a deterministic gate default-REJECTS
+# anything that doesn't read as an actionable rule.
+
+_HEURISTIC_MIN_LEN = 12
+_HEURISTIC_MAX_LEN = 600
+
+# Observation/profile openers — descriptive statements about an actor,
+# never instructions. Checked as a prefix of the normalised text.
+_HEURISTIC_SUBJECT_BLOCKLIST = (
+    "the agent", "this agent", "the user", "this user", "the system",
+    "this system", "the model", "the assistant", "the operator",
+    "agents ", "users ", "it is ", "there is ", "there are ",
+    "requests ", "the request",
+)
+
+# First word of an imperative rule ("Always wrap…", "Use absolute paths…").
+_HEURISTIC_IMPERATIVE_STARTERS = frozenset({
+    "always", "never", "prefer", "avoid", "use", "ensure", "verify",
+    "check", "validate", "wrap", "keep", "run", "add", "set", "treat",
+    "confirm", "do", "don't", "dont", "remember", "apply", "include",
+    "escape", "quote", "pin", "cap", "limit", "strip", "sanitize",
+    "sanitise", "batch", "cache", "log", "default", "force", "require",
+    "skip", "favor", "favour", "double-check", "re-read", "reread",
+    "test", "read", "write", "call", "pass", "return", "handle",
+    "guard", "normalize", "normalise", "convert", "parse", "split",
+    "sort", "restart", "close", "flush", "await", "retry", "escalate",
+    "ask", "state", "make", "stop", "start", "prefix", "compare",
+})
+
+# Conditional openers are only rules if an imperative/modal follows
+# ("When coaching chess, always name the threat" — yes;
+#  "When asked for news, the naftemporiki skill is used" — no).
+_HEURISTIC_CONDITIONAL_STARTERS = frozenset({
+    "when", "if", "while", "before", "after", "during", "on", "for",
+})
+
+_HEURISTIC_MODAL_RE = re.compile(
+    r"\b(?:should|must|always|never|use|avoid|prefer|ensure|verify|"
+    r"check|validate|wrap|keep|treat|confirm|do not|don'?t|re-?read|"
+    r"remember|require|limit|escalate|ask|state)\b",
+    re.IGNORECASE,
+)
+
+# No plain hyphen in the class: "double-check" / "re-read" must survive
+# as single starter tokens (em/en dashes still split).
+_HEURISTIC_FIRST_WORD_RE = re.compile(r"[\s,:;—–]+")
+
+
+def _is_actionable_heuristic(text) -> bool:
+    """True iff ``text`` reads as an imperative behavioral rule.
+
+    Default-reject: dream heuristics are a bonus learning channel (the
+    reflector and self-play lesson pipeline carry the real signal), so
+    a false reject costs little while a false accept pollutes the
+    playbook until utility pruning gets around to it.
+    """
+    if not isinstance(text, str):
+        return False
+    t = " ".join(text.split())
+    if not (_HEURISTIC_MIN_LEN <= len(t) <= _HEURISTIC_MAX_LEN):
+        return False
+    low = t.lower()
+    if any(low.startswith(prefix) for prefix in _HEURISTIC_SUBJECT_BLOCKLIST):
+        return False
+    first = _HEURISTIC_FIRST_WORD_RE.split(low, 1)[0]
+    if first in _HEURISTIC_IMPERATIVE_STARTERS:
+        return True
+    if first in _HEURISTIC_CONDITIONAL_STARTERS:
+        rest = low[len(first):]
+        return bool(_HEURISTIC_MODAL_RE.search(rest))
+    return False
+
+
 # Tools that should never anchor an auto-proposed macro: meta / control-flow
 # tools, or one-off side-effecting tools that aren't reusable as a bundled
 # step. A mined window made up entirely of these is dropped.
@@ -1143,7 +1223,13 @@ You are the Active Memory Consolidation (Dream) Subsystem.
 Below is a list of raw, fragmented memories from the Ghost Agent's recent tasks.
 Your job is twofold:
 1. MERGE overlapping facts into single, high-density facts.
-2. EXTRACT HEURISTICS: Identify repeating errors or user preferences and translate them into a persistent behavioral rule (e.g., "Always use absolute paths in Docker").
+2. EXTRACT HEURISTICS: Identify repeating mistakes-then-fixes or stable operational rules and phrase each as ONE imperative behavioral rule the agent can apply next time (e.g., "Always use absolute paths in Docker").
+
+HEURISTIC RULES (strict):
+- Imperative voice only: start with a verb ("Always…", "Use…", "Verify…") or a condition followed by a verb ("When X, always Y").
+- NO observations, summaries, or profiles. Sentences shaped like "The agent…", "The user…", "The system…" are NOT heuristics — if it does not tell the agent to DO something differently, omit it.
+- The raw memories quote messages the OPERATOR sent to the agent. Never attribute the operator's requests to the agent, and never turn one-off operator requests into rules.
+- Fewer, better heuristics beat many. If no genuine rule exists, return an empty list.
 
 ### RAW MEMORIES
 {mem_block}
@@ -1234,8 +1320,22 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
 
             # --- HEURISTICS ---
             heuristics = result_json.get("heuristics", [])
+            kept_heuristics = 0
+            dropped_heuristics = 0
             for h in heuristics:
                 if h:
+                    # Actionability gate: only imperative behavioral rules
+                    # reach SkillMemory. Observations / actor profiles (and
+                    # operator requests misattributed to the agent) are
+                    # dropped here — see _is_actionable_heuristic.
+                    if not _is_actionable_heuristic(h):
+                        dropped_heuristics += 1
+                        pretty_log(
+                            "Dream Skip",
+                            f"Dropped non-actionable heuristic: {str(h)[:70]}...",
+                            icon=Icons.SKIP,
+                        )
+                        continue
                     if hasattr(self.context, 'skill_memory') and self.context.skill_memory:
                         # Key each heuristic on its OWN content, not the
                         # constant "[System] Dream Heuristic". SkillMemory
@@ -1258,6 +1358,7 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                             trigger=_h_task,
                             source="dream",
                         )
+                        kept_heuristics += 1
 
             # --- CROSS-EPISODE PATTERN DETECTION ---
             # Scan the skill playbook for recurring tool-call sequences
@@ -1329,10 +1430,15 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             except Exception as pe:
                 logger.debug(f"Lesson prune skipped: {pe}")
 
-            h_count = len(heuristics)
+            # Report only heuristics that PASSED the actionability gate —
+            # counting raw LLM output would overstate what actually landed
+            # in the playbook.
+            h_count = kept_heuristics
             metrics_note = ""
+            if dropped_heuristics > 0:
+                metrics_note = f" ({dropped_heuristics} non-actionable heuristics dropped)"
             if skipped_low_compression > 0:
-                metrics_note = f" ({skipped_low_compression} low-compression consolidations skipped)"
+                metrics_note += f" ({skipped_low_compression} low-compression consolidations skipped)"
             if patterns_found > 0:
                 metrics_note += f" ({patterns_found} tool-call patterns detected)"
             if macros_proposed > 0:

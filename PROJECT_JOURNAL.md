@@ -57,12 +57,16 @@ wired). Repo is versioned on another server (local git intentionally absent).
 ## 2. Operational reference (live agent)
 
 **Process / flags.** `python -m src.ghost_agent.main --port 8000` under a **root launchd job**
-`/Library/LaunchAgents/com.local.ghost-agent.plist` (**KeepAlive=true**). Live flags (2026-07-07):
-`--verbose --deep-reason --smart-memory 0.9 --max-context 240000 --api-key "" --mandatory-tor
+`/Library/LaunchDaemons/com.local.ghost-agent.plist` (**KeepAlive=true**). Live flags (2026-07-13):
+`--verbose --deep-reason --smart-memory 0.9 --max-context 240000 --mandatory-tor
 --autoadvance-idle --enable-metacog --metacog-mem-high 98 --metacog-mem-floor-mb 300
---visual-nodes http://127.0.0.1:8088|Eva --image-gen-nodes http://100.122.46.101:8000|Jetson`.
+--visual-nodes http://127.0.0.1:8088|Eva --image-gen-nodes http://192.168.0.155:8000|Ghost
+--worker-nodes http://192.168.0.20:8088|Nova`.
 Env: `GHOST_HOME=/Users/vasilis/Data/AI/Data/`, `GHOST_CRITIC_ASYNC=1`, `GHOST_CRITIC_NO_THINK=0`,
-`GHOST_PIN_TOOL_SCHEMAS=1`. cwd `/Users/vasilis/Data/AI/Agent`. Verifier is ENABLED; postmortem is
+`GHOST_PIN_TOOL_SCHEMAS=1`, **`GHOST_API_KEY=$(cat ~/Data/AI/.ghost_api_key)`** (auth ENABLED
+2026-07-13 — the launcher reads the canonical mode-600 secret file and exports the env var; no
+`--api-key` argv so the secret stays out of `ps`. ALL API calls need `X-Ghost-Key`, /api/health
+included). cwd `/Users/vasilis/Data/AI/Agent`. Verifier is ENABLED; postmortem is
 deliberately OFF. The launcher exec line (out-of-repo `bin/start-ghost-agent.sh`) is the only
 flag truth — this list can drift; check `GET /api/health` `config` for the resolved reality.
 
@@ -75,19 +79,21 @@ lacks `uvicorn`; Tor on :9050 must be up for the `--mandatory-tor` boot gate):
 ```bash
 cd /Users/vasilis/Data/AI/Agent
 export GHOST_HOME=/Users/vasilis/Data/AI/Data/ GHOST_CRITIC_ASYNC=1 GHOST_PIN_TOOL_SCHEMAS=1
+export GHOST_API_KEY="$(cat /Users/vasilis/Data/AI/.ghost_api_key)"
 /Users/vasilis/Data/AI/.agent.venv/bin/python -m src.ghost_agent.main --port 8000 \
   --upstream-url http://127.0.0.1:8088 --visual-nodes 'http://127.0.0.1:8088|Eva' \
-  --image-gen-nodes 'http://100.122.46.101:8000|Jetson' --verbose --deep-reason \
-  --smart-memory 0.9 --max-context 240000 --api-key '' --mandatory-tor --autoadvance-idle \
+  --image-gen-nodes 'http://192.168.0.155:8000|Ghost' --verbose --deep-reason \
+  --smart-memory 0.9 --max-context 240000 --mandatory-tor --autoadvance-idle \
   --enable-metacog --metacog-mem-high 98 --metacog-mem-floor-mb 300 \
   >> /Users/vasilis/Data/AI/Logs/ghost-agent.log 2>&1 &
 ```
 A manually-started prod is **unsupervised**; kill it before re-enabling the launchd service to
 avoid a :8000 bind conflict.
 
-**Drive a request** (model name validated — must be `qwen-3.6-35b-a3`):
+**Drive a request** (model name validated — must be `qwen-3.6-35b-a3`; key required since 2026-07-13):
 ```bash
 curl -s -m 180 -X POST http://127.0.0.1:8000/api/chat -H 'Content-Type: application/json' \
+  -H "X-Ghost-Key: $(cat /Users/vasilis/Data/AI/.ghost_api_key)" \
   -d '{"model":"qwen-3.6-35b-a3","messages":[{"role":"user","content":"…"}],"stream":false}'
 ```
 Reply at `choices[0].message.content`. **Introspect health:** `GET /api/health` (X-Ghost-Key)
@@ -233,7 +239,9 @@ SYSTEM ONLINE, 16 live log frames received. Mobile hardening: mic hold-to-talk g
 `touch-action:none`/callout suppression (JS already had the full touch lifecycle). SECURITY FLAG:
 the launchd plist sets GHOST_API_KEY=**ghost-secret-123** — the exact guessable default the code
 banned; the UI is TLS on 0.0.0.0:8080, so anyone on the LAN who guesses it gets full agent access →
-operator should rotate it (bookmarks use `?key=`).
+operator should rotate it (bookmarks use `?key=`). **RESOLVED 2026-07-13** — key rotated to a
+random secret in `~/Data/AI/.ghost_api_key`, exported by start-ghost-client.sh (overrides the
+stale plist value), and agent auth ENABLED with the same key; see the 2026-07-13 (later 3) entry.
 
 **Sandbox image baked to v4 (2026-07-12):** added `iproute2` (the `ss` port inspector) to apt and
 `flask` + `python-chess` to pip in BOTH `sandbox/docker.py` (runtime provisioner) and
@@ -726,6 +734,133 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-13 (later 3) — API auth ENABLED everywhere: key minted, rotated, rolled to every client
+- Closes BOTH standing security flags at once: the agent's `--api-key ""` on a 0.0.0.0 bind (boot-log
+  SECURITY WARNING, flagged in the overnight review) AND the interface's publicly-known
+  `ghost-secret-123` (flagged 2026-07-12). One shared secret now guards both.
+- **Canonical secret file**: `~/Data/AI/.ghost_api_key` (openssl rand -hex 32, mode 600). ONE file
+  to rotate; every launcher reads it at start.
+- **Agent** (`bin/start-ghost-agent.sh`): exports `GHOST_API_KEY` from the file (env, NOT argv — the
+  secret stays out of `ps`); `--api-key ""` removed from the exec line. Missing file fails OPEN with
+  a loud log line (a refusing boot would respawn-loop under KeepAlive) — treat that line as a page.
+- **Interface** (`bin/start-ghost-client.sh`): exports the same key, deliberately OVERRIDING the
+  stale `ghost-secret-123` in `/Library/LaunchDaemons/com.local.ghost-client.plist` (plist edit
+  needs sudo; user-owned script is the override point). Front door verified: old key → 401, new →
+  200. Upstream baked key = agent key → proxy chain works unchanged.
+- **Slack bot**: `.env` key set (was explicitly empty for the authless agent), chmod 600; rebooted;
+  poller confirmed 200 against the authed `/api/notifications/pending`. `.env.example` + docs
+  updated (the "leave EMPTY for prod" guidance is now wrong and says so).
+- **`ghost` CLI** (`bin/ghost`): default key now env → secret file → "" (retired ghost-secret-123
+  fallback). **Scripts** (gaia/ablation/claude_trainer) already read `GHOST_API_KEY` env — export
+  from the file when driving prod.
+- **uConsole client** (`interface/externals/clockwork_ghost/client.py`): the four hardcoded
+  `"YOUR_KEY_HERE"` headers (worked only because auth was off) replaced with `_resolve_ghost_api_key()`
+  (env → `~/.ghost_api_key` on device → `.ghost_api_key` beside client.py). **DEVICE NOT DEPLOYED**
+  — clockworkpi was unreachable (off). On next power-up: sync client.py + copy the key
+  (`scp ~/Data/AI/.ghost_api_key clockworkpi:~/.ghost_api_key && ssh clockworkpi chmod 600 ~/.ghost_api_key`);
+  until then the uConsole client gets 403s.
+- **Verified live**: agent 403 without key / 403 with old public key / 200 with new key; fresh boot
+  has NO security warning; web UI end-to-end (Playwright: SYSTEM ONLINE, green dot = page → proxy →
+  agent stream all on the new key); Slack bot clean boot. `/api/health` now REQUIRES the key —
+  update any ad-hoc curl habit (§2 examples updated).
+- Left as-is, deliberate: 0.0.0.0 binds themselves (LAN/tailnet reachability is the point — auth is
+  now the gate); the stale plist env value (harmless: overridden, and the old key is dead); voice
+  services on disorder:8000 (different host/service, no agent auth involved).
+
+### 2026-07-13 (later 2) — web face re-themed: dark-but-MULTICOLOR jewel wheel (operator: "dull")
+- Operator liked the 2026-07-12 animation/envelope rework but found the muted near-black palette dull.
+  Requirement: "dark but multicolor". Redesign in `interface/static/matrix_graph.js`:
+- **5-stop jewel wheel instead of one active hue.** `COLORS.palette` = deep violet `#3e187a` /
+  electric blue `#1f39a1` / teal `#0a6675` / emerald `#0f7143` / magenta `#80198f` (all tuned dark —
+  additive blending + bloom lift them; warm hues deliberately absent so crimson ERROR stays unique;
+  dimmed ~18% from the first cut on operator feedback "a tiny bit too bright" — render check: lit
+  fraction 0.386→0.292, white-clip 42→28 px; `COLORS.palette` is THE brightness knob, everything
+  else scales off it).
+  Each node gets a stable wheel position via an `aSeed` InstancedBufferAttribute; a `uHueDrift`
+  uniform slides the whole wheel (~50s/cycle idle, ~15s busy, damped under reduced-motion). Each
+  LINE gradients between its endpoints' hues (per-vertex `aLineHue` written in the per-frame line
+  builder from `nodeSeeds`). Dim floor keeps a whisper of each hue so the idle graph is multicolor,
+  not grey. `uActiveColor` uniform + hardcoded shader companion hue removed. Animations, envelope,
+  accent-mood tint, error tint, bloom formula: all untouched.
+- `app.js` `_ICON_CLASS_COLOR` mood accents enriched to matching jewel tones; cache-bust bumped
+  (app.js + matrix_graph.js → v=3.3 after the dim pass; index.html serves no-cache so a plain
+  reload picks it up — NO server restart needed, statics are read from disk per request).
+- **Verified in a real headless render** (Playwright chromium + swiftshader against the LIVE :8080
+  server, key pulled from the running process env): no GLSL/shader errors; screenshot pixel analysis
+  → 5 distinct hue buckets present, lit fraction 0.386 (dark preserved), 42/64k white-clip px
+  (bloom cores only). Palette contract pinned by `tests/test_interface_face_palette.py` (5 distinct
+  stops, darkness cap ≤0xd0/channel, wheel+attributes wired, app/matrix cache-bust versions move
+  together). Interface test set 45 passed. Docs: `docs/interfaces/web_server.html` static-assets
+  section rewritten (old "electric-blue↔cyan" description was stale).
+
+### 2026-07-13 (later) — narrative churn fixed (no-think + triviality filter + idempotency) + k=1 template floor
+- Second batch from the same overnight-log review (0.0.0.0/no-auth deliberately deferred by operator).
+- **(1) The selfhood diary spent the whole night in TEMPLATE-FALLBACK voice — and nobody could tell.**
+  The log's `Lately, I worked on "reply with just: pong"…` narrative is the fallback concat, not LLM
+  prose. Root cause: `_selfhood_critique_fn` / `_workspace_critique_fn` in main.py left thinking ON,
+  so the reasoning upstream burned the whole max_tokens budget (1024/512) inside `<think>` and
+  returned EMPTY content — the exact failure `project_research._llm_complete` already documents
+  ("verified live: finish_reason=length, 900 reasoning tokens, content=''"). Both closures now use
+  the standard utility pattern (`/no_think` + `chat_template_kwargs: enable_thinking=False` + system
+  nudge + `_strip_think`), and an empty critique result logs a WARNING instead of degrading silently.
+  Wiring pinned by source-inspection tests (`tests/test_narrative_nothink_wiring.py`) since the
+  closures live inside `lifespan` and aren't importable.
+- **(2) Trivial turns dominated the diary.** `selfhood/narrative.py::regenerate` now pulls a 4× wider
+  recent pool and keeps only informative experiences (`_is_informative_experience`: tool use, real
+  passed/failed verdict, ≥40-char request, or boot marker); ping-shaped turns (no tools, no verdict,
+  tiny request) are filtered. All-trivial window falls back to the unfiltered slice (thin diary >
+  empty diary).
+- **(3) Identical hourly regenerations (~15 overnight, selfhood AND workspace).** Both summarisers
+  got the dream-style idempotency guard: fingerprint the full input (selfhood: rendered prompt;
+  workspace: deterministic template), skip the LLM call + persist when unchanged since the last
+  successful regeneration and a narrative exists on disk. In-memory key — a fresh boot regenerates
+  once, which is wanted post-deploy. `test_narrative_history_appends` updated (it asserted the old
+  regenerate-on-identical-input behaviour).
+- **(4) k=1 self-play template floor.** `_algo_kth_largest` drew `k = randint(1, …)`; k=1 renders
+  "the 1-th LARGEST" = plain `max()` — zero-signal challenge observed live. Floored at 2 (n ≥ 20 at
+  every tier so the range is always valid). Test sweeps 30 renders × 5 tiers.
+- Suite **7376 passed / 12 skipped / 0 failed**. Docs: `algorithms/selfhood.html`,
+  `algorithms/workspace.html`, `core/challenge_templates.html`. Prod restart = deploy (plain kill).
+- Expected log changes: hourly `narrative regenerated` lines mostly disappear when idle (only fire
+  on real change); when they do fire the diary should be LLM prose, not "Lately, I worked on…";
+  `WARNING … critique … empty content` now marks the degraded mode if it ever recurs.
+
+### 2026-07-13 — overnight-log review actioned: dream heuristic actionability gate + PRM serve-inert pinning
+- Overnight log (22:53→15:19, one boot, 0 crashes) was healthy — 12/12 self-play SUCCESS incl. one
+  full fail→judge-diff→fix→lesson→verified loop; native tool_call corruption guard repaired a merged
+  multi-tool reply live. Two recurring defects actioned:
+- **(1) Dream REM heuristics stored observations/misattributions as skills.** Trajectory-digest dreams
+  wrote actor profiles into SkillMemory as `mistake="none"` pseudo-lessons — including the OPERATOR's
+  boundary-test prompts misattributed as "the agent exhibits a tendency to engage in inappropriate
+  requests", the operator profiled as a role-play persona, and chess-v4 service trivia. Fix in
+  `core/dream.py`: REM prompt now demands imperative rules (verb-first or condition+verb), forbids
+  "The agent/user/system…" observation shapes, and states raw memories quote the operator; plus a
+  deterministic `_is_actionable_heuristic()` gate (default-REJECT: blocklisted subject openers,
+  imperative/conditional-starter allowlist, modal check after When/If, 12–600 char bounds) before
+  `learn_lesson`. Dropped ones logged as `Dream Skip` + counted in the completion message; "extracted
+  N heuristics" now reports only what reached the playbook. Rationale: dream is a bonus channel (the
+  reflector + self-play lesson pipeline carry the real signal) so false-reject is cheap.
+  Tests: `tests/test_dream_heuristic_gate.py` (23 cases). Docs: `docs/core/dream.html`.
+- **(2) PRM "serve-inert features vary in training" warning — root cause fixed, warning retired to
+  tripwire.** Every idle retrain warned that 5 plan-progress features (`plan_steps_so_far_log1p`,
+  `plan_failures_so_far_log1p`, `plan_has_any_failure`, `tool_already_used_this_turn`,
+  `tool_failed_this_turn`) vary in training but read 0 at the live scoring sites (BOTH score at turn
+  start: agent.py MCTS lookahead + `frontier_selection.representative_state`). Fix in
+  `prm/labels.py::_build_state_for_step`: the ENTIRE plan-progress block is now pinned to turn-start
+  constants (0/0/()/(), pending=1, depth=1) — the May-2026 `pending_count`/`plan_depth` pinning
+  extended to the remaining fields for the same two reasons (train↔serve skew; `steps_so_far` = step
+  index the MC label is monotone in → mild label leak). Only request text + candidate action carry
+  gradient now, which is exactly what the deployed PRM can see. The trainer's skew check STAYS as a
+  regression tripwire (fires only if mid-turn variance is reintroduced without moving the scoring
+  sites in lockstep). Old checkpoints refresh automatically on the next idle retrain — no manual step.
+  Tests: `test_prm_binary_floor_and_skew.py` (no-warning + tripwire directions), `test_prm_labels.py`
+  + `test_high_tier_audit_fixes.py` (pin contract). Docs: `docs/algorithms/prm.md` (skew section +
+  retrain note).
+- Suite **7369 passed / 12 skipped / 0 failed**. Prod restart required to take effect (plain `kill`
+  = deploy). Remaining from the same log review, NOT yet actioned: `--api-key ''` + bind 0.0.0.0
+  security warning (operator deferred); narrative churn + k=1 template → FIXED same day, see the
+  "(later)" entry above.
 
 ### 2026-07-12 (later 4) — the `Nova: ReadTimeout` spam is a TAILSCALE cold-path issue, not threads
 - Operator asked why worker ReadTimeouts keep appearing "even though nova runs 4 threads." Diagnosed

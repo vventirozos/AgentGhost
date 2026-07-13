@@ -187,38 +187,41 @@ def _build_state_for_step(
     succeed?". Building the state from the full trajectory (including
     later steps) would leak information about the future and bias the
     model toward post-hoc plausibility.
+
+    Every plan-progress field is pinned to the TURN-START constants the
+    live scoring sites present (``core/agent.py`` MCTS lookahead and
+    ``core/frontier_selection.representative_state``: steps=0,
+    failures=0, no tools used/failed, pending=1, depth=1) — the state a
+    deployed PRM actually scores against. Two independent reasons:
+
+      * ``pending_count`` / ``plan_depth`` derived from the trajectory
+        are FUTURE knowledge (the MC label V = γ^(N-i-1)·terminal is
+        monotone in the remaining-step count), so the fit learned the
+        label almost directly — high train accuracy, useless deployed
+        scores.
+      * ``steps_so_far`` / ``failures_so_far`` / ``tools_*_this_turn``
+        drawn mid-turn VARY in training but are always 0/empty at the
+        turn-start scoring sites (``SERVE_TURN_START_INERT_FEATURES``
+        in ``trainer.py``). A fit that leaned on them reported a train
+        accuracy the deployed model couldn't reproduce — surfaced every
+        idle retrain as the "serve-inert features vary in training"
+        warning until pinned here (2026-07-13). ``steps_so_far`` is
+        also mildly label-leaking: it equals ``i``, which V is monotone
+        in for PASSED trajectories.
+
+    If a future call site scores MID-turn, un-pin these and make that
+    site pass its real progress state — training and serving must move
+    together. NOTE: models trained before this change must be retrained
+    (the idle retrain phase refreshes the checkpoint automatically).
     """
-    calls = list(traj.tool_calls or ())
-    prior = calls[:step_index]
-    used = tuple(
-        (tc.name or "").strip() for tc in prior if (tc.name or "").strip()
-    )
-    failed = tuple(
-        (tc.name or "").strip()
-        for tc in prior
-        if (tc.name or "").strip() and (tc.error or "").strip()
-    )
     return PlanState(
         user_request=traj.user_request or "",
-        steps_so_far=int(step_index),
-        failures_so_far=len(failed),
-        # pending_count and plan_depth are deliberately NOT derived from
-        # the trajectory. `len(calls) - step_index - 1` (steps AFTER this
-        # one) and `traj.n_steps` (total executed steps) are FUTURE
-        # knowledge relative to the moment the agent chose step
-        # `step_index` — exactly what this prefix-state must exclude. The
-        # MC-discounted label V = γ^(N-i-1)·terminal is monotone in that
-        # remaining-step count, so feeding it as a feature let the PRM
-        # learn the label almost directly (high train accuracy, useless
-        # deployed scores — at inference the remaining count is unknown).
-        # We pin them to the same neutral constants the live inference
-        # path uses (frontier_selection._seed_state_action: 1/1), so the
-        # features carry neither label leakage nor train/serve skew. NOTE:
-        # models trained before this change must be retrained.
+        steps_so_far=0,
+        failures_so_far=0,
         pending_count=1,
         plan_depth=1,
-        tools_used_this_turn=used,
-        tools_failed_this_turn=failed,
+        tools_used_this_turn=(),
+        tools_failed_this_turn=(),
     )
 
 

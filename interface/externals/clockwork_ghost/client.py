@@ -27,6 +27,32 @@ TTS_SERVER_URL = "http://192.168.0.24:8000/tts"
 STT_SERVER_URL = "http://192.168.0.24:8000/stt"
 
 
+def _resolve_ghost_api_key() -> str:
+    """Agent API key (X-Ghost-Key). The agent enforces a real key since
+    2026-07-13 — the old hardcoded placeholder only worked because auth
+    used to be disabled. Resolution order: GHOST_API_KEY env, then
+    ~/.ghost_api_key on the device, then a .ghost_api_key next to this
+    file. Deploy: copy the key file from eva
+    (~/Data/AI/.ghost_api_key) to the uConsole as ~/.ghost_api_key
+    (chmod 600)."""
+    env = os.environ.get("GHOST_API_KEY")
+    if env:
+        return env
+    for path in (
+        os.path.expanduser("~/.ghost_api_key"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ghost_api_key"),
+    ):
+        try:
+            with open(path) as f:
+                return f.read().strip()
+        except OSError:
+            continue
+    return ""
+
+
+GHOST_API_KEY = _resolve_ghost_api_key()
+
+
 # ============================================================================
 # THEME — central palette + stylesheet builders
 # ============================================================================
@@ -563,7 +589,7 @@ class MainWindow(QWidget):
 
     async def _async_save_workspace(self, filename):
         url = "http://eva:8000/api/workspace/save"
-        headers = {"X-Ghost-Key": "YOUR_KEY_HERE"}
+        headers = {"X-Ghost-Key": GHOST_API_KEY}
         payload = {"chat_history": self.conversation_history}
         self.update_chat_signal.emit("append", f"<br>{NOTE_DIM}archiving workspace…</i></div>")
         try:
@@ -580,7 +606,7 @@ class MainWindow(QWidget):
 
     async def _async_load_workspace(self, filename):
         url = "http://eva:8000/api/workspace/load"
-        headers = {"X-Ghost-Key": "YOUR_KEY_HERE"}
+        headers = {"X-Ghost-Key": GHOST_API_KEY}
         self.update_chat_signal.emit("append", f"<br>{NOTE_DIM}restoring workspace…</i></div>")
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
@@ -899,7 +925,7 @@ class MainWindow(QWidget):
     async def send_chat_request(self):
         url = "http://eva:8000/api/chat"
         headers = {
-            "X-Ghost-Key": "YOUR_KEY_HERE"
+            "X-Ghost-Key": GHOST_API_KEY
         }
         # Get the text directly from the last user input
         text = self.conversation_history[-1]["content"] if self.conversation_history else ""
@@ -1067,7 +1093,7 @@ class MainWindow(QWidget):
 
     async def _download_and_show_image(self, image_path):
         url = f"http://eva:8000{image_path}"
-        headers = {"X-Ghost-Key": "YOUR_KEY_HERE"}
+        headers = {"X-Ghost-Key": GHOST_API_KEY}
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 r = await client.get(url, headers=headers)

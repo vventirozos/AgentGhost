@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=3.1';
+import * as matrixGraphFace from './matrix_graph.js?v=3.3';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -381,18 +381,18 @@ function extractIcon(logLine) {
 }
 
 // Map each class to a distinct accent color for the face's slow mood
-// tint. Dark, muted family only (2026-07-12): deep purple / crimson /
-// dark blue / dark green — these BLEND into the sphere's accent, so a
-// neon here would drag the whole theme bright again.
+// tint. Jewel-tone family (2026-07-13, matching matrix_graph's palette
+// wheel): saturated but dark-mid — these BLEND into the sphere's
+// accent, so a full neon here would drag the whole theme bright again.
 const _ICON_CLASS_COLOR = {
-    accent_ok:   '#0f5c38',  // ✅ dark green
-    accent_err:  '#8f1030',  // ❌ 🛑 ⚠️ crimson red
-    accent:      '#1c3f8f',  // ⚡ 🚀 🎬 🏁 dark blue
-    tool:        '#4b1a7a',  // deep purple
-    memory:      '#2f4a14',  // dark moss green
-    plan:        '#232a6e',  // dark indigo
-    think:       '#3d1460',  // deep purple
-    idle:        '#20242a',  // near-black slate
+    accent_ok:   '#128a52',  // ✅ emerald
+    accent_err:  '#a3123a',  // ❌ 🛑 ⚠️ crimson red
+    accent:      '#2f55d4',  // ⚡ 🚀 🎬 🏁 electric blue
+    tool:        '#6d28d9',  // vivid violet
+    memory:      '#2f7d4a',  // sea green
+    plan:        '#3644b8',  // indigo
+    think:       '#5b21b6',  // violet
+    idle:        '#232734',  // near-black slate
 };
 
 function getIconColor(icon) {

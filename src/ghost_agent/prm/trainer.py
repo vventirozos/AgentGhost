@@ -32,13 +32,16 @@ from typing import Iterable, List, Optional, Sequence, Tuple
 from ..distill.schema import Trajectory
 from .features import extract_step_features
 
-# Features that VARY across training samples (drawn mid-turn) but are ALWAYS 0
-# at the live scoring site — the PRM scores at TURN START, where no step has run
-# yet (steps_so_far=0, failures_so_far=0, no tool used/failed this turn). A fit
-# that leans on them reports a train accuracy the deployed model can't reproduce.
-# We surface this skew (see PRMTrainer.run); a full fix is a training-signal
-# redesign (score at turn start, or drop these columns). Names must exist in
-# PRM_FEATURE_NAMES (guarded by a unit test).
+# Features that are ALWAYS 0 at the live scoring site — the PRM scores at TURN
+# START, where no step has run yet (steps_so_far=0, failures_so_far=0, no tool
+# used/failed this turn). They USED to vary across training samples (drawn
+# mid-turn), so a fit leaned on them and reported a train accuracy the deployed
+# model couldn't reproduce. Fixed 2026-07-13: labels._build_state_for_step now
+# pins the whole plan-progress block to the same turn-start constants the
+# scoring sites present, so these columns are constant 0 in training too. The
+# skew check in PRMTrainer.run stays as a regression TRIPWIRE — it fires only
+# if someone reintroduces mid-turn variance without moving the scoring sites in
+# lockstep. Names must exist in PRM_FEATURE_NAMES (guarded by a unit test).
 SERVE_TURN_START_INERT_FEATURES: Tuple[str, ...] = (
     "plan_steps_so_far_log1p",
     "plan_failures_so_far_log1p",

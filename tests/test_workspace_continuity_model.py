@@ -118,6 +118,33 @@ async def test_consolidate_narrative_empty_when_no_state(tmp_path: Path):
     assert text == ""
 
 
+async def test_consolidate_narrative_skips_on_unchanged_input(tmp_path: Path):
+    # Idempotency guard (2026-07-13): an unchanged workspace template
+    # means an unchanged workspace — no LLM call, no re-persist.
+    # Observed live: identical hourly regenerations all night.
+    calls = [0]
+
+    async def fake_critique(prompt: str) -> str:
+        calls[0] += 1
+        return f"narrative v{calls[0]}"
+
+    wm = WorkspaceModel(tmp_path, narrative_critique_fn=fake_critique)
+    wm.record_task_outcome(job_id="j", task_name="cron", outcome="passed")
+
+    first = await wm.consolidate_narrative()
+    assert first == "narrative v1"
+
+    second = await wm.consolidate_narrative()
+    assert second == ""
+    assert calls[0] == 1
+    assert wm.narrative.latest() == "narrative v1"
+
+    # New workspace activity unblocks the guard.
+    wm.record_command_outcome(command="pytest -q", exit_code=0)
+    third = await wm.consolidate_narrative()
+    assert third == "narrative v2"
+
+
 def test_note_records_freeform_event(tmp_path: Path):
     wm = WorkspaceModel(tmp_path)
     ev = wm.note("user reorganised src/ directory")

@@ -77,8 +77,10 @@ async def test_narrative_falls_back_when_critique_raises(tmp_path: Path):
 
 
 async def test_narrative_history_appends(tmp_path: Path):
+    # A NEW experience lands between regenerations — each run therefore
+    # sees changed input and must persist. (Identical-input runs are
+    # skipped by the idempotency guard; see the dedicated tests below.)
     autobio = AutobiographicalMemory(tmp_path)
-    autobio.append(Experience(summary="A turn."))
 
     call_count = [0]
 
@@ -87,9 +89,9 @@ async def test_narrative_history_appends(tmp_path: Path):
         return f"Run {call_count[0]}."
 
     n = NarrativeSummariser(tmp_path, critique_fn=fake_critique)
-    await n.regenerate(autobio=autobio)
-    await n.regenerate(autobio=autobio)
-    await n.regenerate(autobio=autobio)
+    for i in range(3):
+        autobio.append(Experience(summary=f"A turn {i}."))
+        await n.regenerate(autobio=autobio)
 
     history_path = tmp_path / "narrative.history.jsonl"
     assert history_path.exists()
@@ -101,6 +103,79 @@ async def test_narrative_history_appends(tmp_path: Path):
 
     # The "latest" file holds only the most recent text.
     assert (tmp_path / "narrative.md").read_text(encoding="utf-8") == "Run 3."
+
+
+async def test_narrative_skips_regeneration_on_unchanged_input(tmp_path: Path):
+    autobio = AutobiographicalMemory(tmp_path)
+    autobio.append(Experience(summary="I fixed the parser.", outcome="passed"))
+
+    call_count = [0]
+
+    async def fake_critique(prompt: str) -> str:
+        call_count[0] += 1
+        return f"Run {call_count[0]}."
+
+    n = NarrativeSummariser(tmp_path, critique_fn=fake_critique)
+    first = await n.regenerate(autobio=autobio)
+    assert first == "Run 1."
+
+    # Nothing new happened → no LLM call, no persist, empty return.
+    second = await n.regenerate(autobio=autobio)
+    assert second == ""
+    assert call_count[0] == 1
+    history = (tmp_path / "narrative.history.jsonl").read_text(encoding="utf-8")
+    assert len([l for l in history.splitlines() if l]) == 1
+    assert n.latest() == "Run 1."
+
+    # A new experience unblocks the guard.
+    autobio.append(Experience(summary="I shipped the fix.", outcome="passed"))
+    third = await n.regenerate(autobio=autobio)
+    assert third == "Run 2."
+
+
+async def test_narrative_filters_trivial_experiences(tmp_path: Path):
+    # Live failure shape (2026-07-13): ping-shaped turns (no tools, no
+    # verdict, tiny request) dominated the recent window, so the diary
+    # opened with 'Lately, I worked on "reply with just: pong"'. With an
+    # informative experience available anywhere in the wider window, the
+    # trivial ones must not reach the prompt.
+    autobio = AutobiographicalMemory(tmp_path)
+    autobio.append(Experience(
+        summary='I worked on "debug the tor circuit racing". I reached for execute and it passed.',
+        outcome="passed", tools_used=["execute"],
+        user_first_words="debug the tor circuit racing",
+    ))
+    for _ in range(6):
+        autobio.append(Experience(
+            summary='I worked on "reply with just: pong". I reasoned through it without tools without a verdict either way.',
+            outcome="unknown", user_first_words="reply with just: pong",
+        ))
+
+    captured = []
+
+    async def fake_critique(prompt: str) -> str:
+        captured.append(prompt)
+        return "A proper diary entry."
+
+    n = NarrativeSummariser(tmp_path, critique_fn=fake_critique)
+    out = await n.regenerate(autobio=autobio)
+    assert out == "A proper diary entry."
+    assert "tor circuit racing" in captured[0]
+    assert "reply with just: pong" not in captured[0]
+
+
+async def test_narrative_all_trivial_window_still_writes(tmp_path: Path):
+    # When EVERY recent experience is trivial, fall back to the
+    # unfiltered slice — a thin diary beats an empty one.
+    autobio = AutobiographicalMemory(tmp_path)
+    for i in range(3):
+        autobio.append(Experience(
+            summary=f'I worked on "ping {i}". I reasoned through it without tools without a verdict either way.',
+            outcome="unknown", user_first_words=f"ping {i}",
+        ))
+    n = NarrativeSummariser(tmp_path, critique_fn=None)
+    out = await n.regenerate(autobio=autobio)
+    assert out.startswith("Lately")
 
 
 async def test_narrative_includes_state_in_prompt(tmp_path: Path):

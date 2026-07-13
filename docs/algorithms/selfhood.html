@@ -65,6 +65,16 @@
     </ul>
   </div>
 
+  <div class="note">
+    <strong>2026-07-13 narrative-churn fix.</strong> A night of idle logs showed the diary stuck on <code>Lately, I worked on "reply with just: pong"…</code>, regenerated ~15 times with identical content. Three root causes, three fixes:
+    <ul>
+      <li><strong>Thinking ate the diary.</strong> The <code>_selfhood_critique_fn</code> closure in <code>main.py</code> left reasoning ON, so the upstream burned the whole 1024-token budget inside <code>&lt;think&gt;</code> and returned empty content — the summariser <em>silently</em> fell back to the template concat every cycle. The closure now uses the standard utility-call pattern (<code>/no_think</code> soft-switch + <code>chat_template_kwargs: enable_thinking=False</code> hard-switch + system nudge + <code>_strip_think</code>), same as <code>project_research._llm_complete</code>. The empty-content fallback also logs a WARNING now instead of degrading silently. Wiring pinned by <code>tests/test_narrative_nothink_wiring.py</code>.</li>
+      <li><strong>Trivial turns dominated the window.</strong> <code>regenerate()</code> now pulls a 4× wider recent pool and keeps only <em>informative</em> experiences (<code>_is_informative_experience</code>: any tool use, a real passed/failed verdict, a ≥40-char request, or a boot marker). Ping-shaped turns (no tools, no verdict, tiny request) can no longer crowd out real work. When the whole window is trivial, the unfiltered slice is used — a thin diary beats an empty one.</li>
+      <li><strong>Identical regenerations burned LLM calls.</strong> An idempotency guard (same discipline as the dream fragment-set guard) fingerprints the rendered prompt; when the input is unchanged since the last successful persist and a narrative exists on disk, the cycle is skipped — no LLM round-trip, no redundant history append. In-memory key, so a fresh boot regenerates once. The workspace narrative (phase 2.9) got the same guard keyed on its deterministic template.</li>
+    </ul>
+    Tests: <code>tests/test_selfhood_narrative.py</code> (filter, guard, fallback), <code>tests/test_workspace_continuity_model.py</code> (workspace guard).
+  </div>
+
   <p>Implementation lives entirely in <code>src/ghost_agent/selfhood/</code>. The agent reads it through a single <code>context.self_model</code> facade — call sites never branch on availability.</p>
 
   <h2>Module shape</h2>

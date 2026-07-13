@@ -12,12 +12,16 @@ Two defects (PROJECT_JOURNAL §4B, prm):
    floors on label VARIANCE, binary mode keeps the class-balance floor.
 
 2. **Train↔serve feature skew is invisible.** Several turn-progress features
-   vary across training samples (drawn mid-turn) but are always 0 at the live
-   scoring site (turn start). The trainer now flags them so train accuracy is
-   not read as deployed discrimination.
+   used to vary across training samples (drawn mid-turn) but are always 0 at
+   the live scoring site (turn start). FIXED 2026-07-13: the label pipeline
+   (``labels._build_state_for_step``) now pins the plan-progress block to the
+   turn-start constants the scoring sites present, so the standard pipeline
+   can no longer produce the skew. The trainer's check remains as a regression
+   TRIPWIRE — these tests verify both directions: no warning from the standard
+   pipeline, and the warning still fires if mid-turn variance is reintroduced.
 """
 from ghost_agent.distill.schema import Outcome, ToolCall, Trajectory
-from ghost_agent.prm.features import PRM_FEATURE_NAMES
+from ghost_agent.prm.features import PRM_FEATURE_NAMES, PlanState
 from ghost_agent.prm.trainer import (
     PRMTrainer,
     SERVE_TURN_START_INERT_FEATURES,
@@ -96,9 +100,46 @@ def test_serve_inert_features_are_all_real_feature_names():
     assert set(SERVE_TURN_START_INERT_FEATURES).issubset(set(PRM_FEATURE_NAMES))
 
 
-def test_feature_skew_warning_surfaced_and_in_summary():
-    # A balanced corpus fits; the failing trajectories make steps_so_far /
-    # failures_so_far vary across steps → serve-inert features carry variance.
+def test_standard_pipeline_produces_no_skew_warning():
+    # Since 2026-07-13 the label pipeline pins every plan-progress field to
+    # the turn-start constants, so a normal corpus — even one with failing
+    # multi-step trajectories — must fit WITHOUT the skew caveat.
+    corpus = ([_passing(f"good {i}") for i in range(8)]
+              + [_failing(f"bad {i}") for i in range(8)])
+    trainer = PRMTrainer(min_samples=5, min_trajectories=2)
+    report = trainer.run(corpus)
+    assert report.fit_succeeded is True, report.bail_reason
+    assert report.feature_skew_warning == ""
+    assert "⚠" not in report.summary()
+
+
+def test_skew_tripwire_fires_if_midturn_variance_reintroduced(monkeypatch):
+    # The check in PRMTrainer.run is a regression tripwire: if someone
+    # reverts the label pipeline to mid-turn prefix states without moving
+    # the scoring sites in lockstep, the warning must come back.
+    def _midturn_state(traj, step_index):
+        calls = list(traj.tool_calls or ())
+        prior = calls[:step_index]
+        failed = tuple(
+            (tc.name or "").strip()
+            for tc in prior
+            if (tc.name or "").strip() and (tc.error or "").strip()
+        )
+        return PlanState(
+            user_request=traj.user_request or "",
+            steps_so_far=int(step_index),
+            failures_so_far=len(failed),
+            pending_count=1,
+            plan_depth=1,
+            tools_used_this_turn=tuple(
+                (tc.name or "").strip() for tc in prior
+            ),
+            tools_failed_this_turn=failed,
+        )
+
+    monkeypatch.setattr(
+        "ghost_agent.prm.labels._build_state_for_step", _midturn_state
+    )
     corpus = ([_passing(f"good {i}") for i in range(8)]
               + [_failing(f"bad {i}") for i in range(8)])
     trainer = PRMTrainer(min_samples=5, min_trajectories=2)

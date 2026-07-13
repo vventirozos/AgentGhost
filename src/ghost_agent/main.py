@@ -1208,23 +1208,37 @@ async def lifespan(app):
     try:
         async def _selfhood_critique_fn(prompt: str) -> str:
             """LLM critique closure for the narrative summariser.
-            Mirrors the Reflector's pattern: low temperature, generous
-            max_tokens so Qwen 3.6's reasoning_content doesn't crowd
-            out the diary text."""
+
+            Thinking is disabled the way every other utility call does it
+            (/no_think soft-switch + enable_thinking=False hard-switch +
+            system nudge — see core/project_research._llm_complete): with
+            thinking ON, the reasoning model burned the whole max_tokens
+            budget inside <think> and returned EMPTY content, so the diary
+            silently fell back to the template concat every single cycle
+            (observed live 2026-07-13: a full night of "Lately, I worked
+            on \"reply with just: pong\"…" fallback narratives)."""
             payload = {
                 "model": args.model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "system",
+                     "content": "Write the requested text directly. "
+                                "Do NOT emit a <think> block."},
+                    {"role": "user", "content": prompt + "\n\n/no_think"},
+                ],
                 "temperature": 0.6,  # warmer than reflection — diary, not analysis
                 "max_tokens": 1024,
                 "stream": False,
+                "chat_template_kwargs": {"enable_thinking": False},
             }
             res = await context.llm_client.chat_completion(payload)
-            return (
+            content = (
                 (res or {})
                 .get("choices", [{}])[0]
                 .get("message", {})
                 .get("content", "")
             )
+            from .core.project_research import _strip_think
+            return _strip_think(content or "")
 
         context.self_model = SelfModel(
             root=self_root,
@@ -1268,21 +1282,32 @@ async def lifespan(app):
         async def _workspace_critique_fn(prompt: str) -> str:
             """LLM critique closure for the workspace narrative. Same
             shape as the selfhood narrative critique — low temperature,
-            modest max_tokens for a 3-5 sentence paragraph."""
+            modest max_tokens for a 3-5 sentence paragraph. Thinking is
+            disabled for the same reason as the selfhood closure above:
+            with it on, <think> ate the 512-token budget and the empty
+            content silently degraded every cycle to the raw template."""
             payload = {
                 "model": args.model,
-                "messages": [{"role": "user", "content": prompt}],
+                "messages": [
+                    {"role": "system",
+                     "content": "Write the requested text directly. "
+                                "Do NOT emit a <think> block."},
+                    {"role": "user", "content": prompt + "\n\n/no_think"},
+                ],
                 "temperature": 0.4,
                 "max_tokens": 512,
                 "stream": False,
+                "chat_template_kwargs": {"enable_thinking": False},
             }
             res = await context.llm_client.chat_completion(payload)
-            return (
+            content = (
                 (res or {})
                 .get("choices", [{}])[0]
                 .get("message", {})
                 .get("content", "")
             )
+            from .core.project_research import _strip_think
+            return _strip_think(content or "")
 
         context.workspace_model = WorkspaceModel(
             root=workspace_root,

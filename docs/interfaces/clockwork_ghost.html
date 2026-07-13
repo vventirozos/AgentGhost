@@ -39,7 +39,7 @@
   <h3>UI layout</h3>
   <ul>
     <li><strong>Left</strong>: chat display + text input with up/down history.</li>
-    <li><strong>Right</strong>: stacked widget — MatrixFaceWidget · QWebEngineView dashboard · QWebEngineView 3D face.</li>
+    <li><strong>Right</strong>: stacked widget — NetworkFaceWidget (default) · FluidFaceWidget · NeuralFaceWidget (iris). Only the visible face animates.</li>
     <li><strong>Top</strong>: workspace, face toggle, fullscreen.</li>
     <li><strong>Bottom</strong>: camera snap, push-to-talk, TTS toggle + stats.</li>
   </ul>
@@ -69,14 +69,19 @@
   <h3>Concurrency</h3>
   <p><code>qasync.QEventLoop</code> wraps the QApplication so asyncio and Qt cooperate. Async tasks for <code>audio_fetch_task()</code>, <code>audio_worker_task()</code>, <code>send_chat_request()</code>. Signal/slot pattern for cross-thread UI updates.</p>
 
-  <h2>matrix_face.py — 3D Animated Visualization</h2>
+  <h2>face/ — avatar package (CPU-rendered, QPainter raster)</h2>
+  <p>Three interchangeable faces share one public API (<code>set_mood · pulse · feed_audio · startle · wake · set_state</code>) and one mood system (<code>moods.py</code>: idle/listen/think/speak/error/sleep, palettes lerped over 0.45&nbsp;s transitions). The default is <code>NetworkFaceWidget</code>; the <code>◈</code> toolbar chip cycles to <code>FluidFaceWidget</code> (smoke oracle) and <code>NeuralFaceWidget</code> (iris eye).</p>
   <ul>
-    <li>OpenGL ES 3.0 inside <code>QOpenGLWidget</code>.</li>
-    <li>75 nodes on a random sphere; idle vs. busy speeds: 0.75 vs. 2.75.</li>
-    <li>Three render passes: scene → bloom blur → tone-mapped composite.</li>
-    <li>State controlled by <code>set_state(active=bool, error=bool)</code> — error flips all nodes magenta.</li>
-    <li>Physics: each node = base sphere position + 3 phase-shifted sine waves; lines drawn between nodes within 2.5 distance.</li>
-    <li>Driven by a <code>QTimer</code> firing every 16 ms.</li>
+    <li><strong>NetworkFaceWidget (2026-07-12 "tamed" rework)</strong> — sparse MoE diagram: 42 nodes / 72 edges (was 111/276), 4 experts, one expert per pulse. A wavefront takes ~1.8&nbsp;s to cross; activations decay fast enough that a thought visibly <em>passes</em> instead of lighting the whole net. Expert hues are the dark-jewel family: deep violet, crimson, dark blue, dark green. No bloom pass, no offscreen buffer, no wavefront bands, no status readout.</li>
+    <li><strong>Mood palettes</strong> follow the same family as the web UI dark theme: idle/listen indigo-blue, think deep purple, speak dark green, error crimson.</li>
+  </ul>
+  <h3>Performance model (CM4, software raster — the lessons)</h3>
+  <ul>
+    <li>All three faces exist in a <code>QStackedWidget</code>, but animation timers are gated by <code>showEvent</code>/<code>hideEvent</code> — a hidden face costs zero CPU. (Previously all three simulated at 30&nbsp;fps forever: the client pinned a core at ~113%.)</li>
+    <li>Full-screen software ops are the budget: nebula composite, wireframe skeleton, and vignette+scanlines are all cached pixmaps, re-rendered only when their inputs actually change (nebula scroll ~3&nbsp;s, wireframe 200&nbsp;ms, vignette per-resize). Grain is the only per-frame overlay blit.</li>
+    <li>Per-node <code>QRadialGradient</code> halos were replaced by flat translucent discs; active edges get one Bézier stroke, not glow+core, and are skipped below the skeleton's own brightness.</li>
+    <li>Adaptive frame rate: 20&nbsp;fps active moods, 15&nbsp;fps idle, 10&nbsp;fps sleep.</li>
+    <li>Measured on-device: client steady-state ~20% of one core idle (was 113%), think ~60% during generation.</li>
   </ul>
 
   <h2>External dependencies</h2>

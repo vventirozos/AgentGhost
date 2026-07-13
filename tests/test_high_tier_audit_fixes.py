@@ -148,7 +148,15 @@ def test_build_state_for_step_does_not_leak_future():
     assert s_short.plan_depth == 1
 
 
-def test_build_state_for_step_prefix_fields_still_reflect_prefix():
+def test_build_state_for_step_all_progress_fields_pinned_to_turn_start():
+    # Superseded contract (2026-07-13): the prefix fields (steps_so_far,
+    # failures_so_far, tools_used/failed) USED to reflect the mid-turn
+    # prefix, but the live scoring sites only ever score at TURN START —
+    # so those fields varied in training while reading 0 deployed
+    # (SERVE_TURN_START_INERT_FEATURES skew, warned on every idle
+    # retrain). They are now pinned to the same turn-start constants as
+    # pending_count/plan_depth. Only the request text and the action
+    # remain informative — matching what the deployed PRM can see.
     from ghost_agent.prm.labels import _build_state_for_step
     from ghost_agent.distill.schema import Trajectory, ToolCall
 
@@ -162,8 +170,9 @@ def test_build_state_for_step_prefix_fields_still_reflect_prefix():
         n_steps=3,
     )
     s = _build_state_for_step(traj, 2)
-    assert s.steps_so_far == 2
-    assert s.failures_so_far == 1          # the prior failed 'a'
-    assert "a" in s.tools_used_this_turn
-    # Future-independent constants regardless of step index.
+    assert s.steps_so_far == 0
+    assert s.failures_so_far == 0
+    assert s.tools_used_this_turn == ()
+    assert s.tools_failed_this_turn == ()
     assert s.pending_count == 1 and s.plan_depth == 1
+    assert s.user_request == "do x"

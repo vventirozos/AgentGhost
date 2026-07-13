@@ -19,6 +19,7 @@ so the module works (just less richly) without an upstream LLM.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import re
@@ -77,6 +78,33 @@ def sanitise_meta_insights(text: str, *, max_chars: int = 600) -> str:
     return out
 
 
+# A user request shorter than this — with no tools and no verdict — is
+# treated as trivial chat ("pong", "what is this ?", "hello") and kept
+# out of the diary input. Observed live (2026-07-13): a night of idle
+# regenerations produced a narrative whose opening line was 'Lately, I
+# worked on "reply with just: pong"' because ping-shaped turns dominated
+# the most-recent-N window.
+_INFORMATIVE_MIN_REQUEST_CHARS = 40
+
+
+def _is_informative_experience(exp: Experience) -> bool:
+    """True when an experience carries diary-worthy signal.
+
+    Kept deliberately permissive: any tool use, any real verdict, a
+    substantial request, or a session-boot marker (those structure the
+    diary — "after a few hours off…") all qualify. Only the no-tools /
+    no-verdict / short-request combination is filtered.
+    """
+    if (getattr(exp, "outcome", "") or "") == "boot":
+        return True
+    if getattr(exp, "tools_used", None):
+        return True
+    if (getattr(exp, "outcome", "") or "") in ("passed", "failed"):
+        return True
+    req = (getattr(exp, "user_first_words", "") or "").strip()
+    return len(req) >= _INFORMATIVE_MIN_REQUEST_CHARS
+
+
 # Critique-style prompt: the model is asked to write a first-person
 # diary entry from its OWN past, not a third-person summary of someone
 # else's actions. The framing matters — a third-person summary
@@ -133,6 +161,13 @@ class NarrativeSummariser:
         self.max_recent_experiences = max(1, int(max_recent_experiences))
         self.enabled = bool(enabled)
         self._lock = threading.Lock()
+        # Fingerprint of the last successfully-persisted regeneration's
+        # INPUT (the rendered prompt). Lets the idle phase skip when
+        # nothing new happened — observed live: ~15 identical hourly
+        # regenerations overnight, each an LLM round-trip. In-memory on
+        # purpose: a fresh boot regenerates once, which is wanted after
+        # a deploy.
+        self._last_input_key = ""
 
     # -----------------------------------------------------------------
     # Read path
@@ -267,9 +302,16 @@ class NarrativeSummariser:
         if not self.enabled:
             return ""
 
-        recent = autobio.recent(limit=self.max_recent_experiences)
-        if not recent:
+        # Pull a wider window than the diary slice, then keep only
+        # informative experiences (tools used, real verdict, substantial
+        # request, or a boot marker) so trivial chat turns can't dominate
+        # the narrative. When the ENTIRE window is trivial, fall back to
+        # the unfiltered slice — a thin diary beats an empty one.
+        pool = autobio.recent(limit=self.max_recent_experiences * 4)
+        if not pool:
             return ""
+        informative = [e for e in pool if _is_informative_experience(e)]
+        recent = (informative or pool)[-self.max_recent_experiences:]
 
         # Blend recent + relevant: with hundreds of entries on disk,
         # the most-recent-N window is < 3% of the agent's actual past.
@@ -296,6 +338,19 @@ class NarrativeSummariser:
             patterns=self._format_patterns_block(autobio, meta_insights),
         )
 
+        # Idempotency guard (same discipline as the dream fragment-set
+        # guard): identical input → identical-or-noisier output, so skip
+        # the LLM round-trip and the redundant persist entirely. The
+        # rendered prompt fingerprints ALL inputs (experiences, state,
+        # meta-insights). Guard only when a narrative already exists on
+        # disk — never skip the very first write.
+        input_key = hashlib.sha1(rendered.encode("utf-8")).hexdigest()
+        if input_key == self._last_input_key and self.latest():
+            logger.debug(
+                "narrative input unchanged since last regeneration; skipping"
+            )
+            return ""
+
         text = ""
         used_llm = False
         if self.critique_fn is not None:
@@ -303,6 +358,14 @@ class NarrativeSummariser:
                 text = (await self.critique_fn(rendered)) or ""
                 text = text.strip()
                 used_llm = bool(text)
+                if not text:
+                    # Silent degradation is how the diary spent a whole
+                    # night in template voice without anyone noticing —
+                    # make the fallback visible to the operator stream.
+                    logger.warning(
+                        "narrative critique_fn returned empty content; "
+                        "using template fallback"
+                    )
             except Exception as e:
                 logger.warning("narrative critique_fn failed; using fallback: %s", e)
                 text = ""
@@ -321,6 +384,9 @@ class NarrativeSummariser:
                 text += f"\n\nWhat I've noticed about myself: {mi}"
 
         self._persist(text, used_llm=used_llm, source_count=len(recent))
+        # Only remembered after a successful persist — a transient LLM
+        # error must not poison the guard against a valid retry.
+        self._last_input_key = input_key
         return text
 
     def _persist(self, text: str, *, used_llm: bool, source_count: int) -> None:
