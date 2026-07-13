@@ -1310,3 +1310,106 @@ pre:hover .render-code-btn {
         background-position: 0 center !important;
     }
 }
+
+/* ═══════════════════════════════════════════════════════════════
+   Live log console (2026-07-13) — bottom drawer rendering the same
+   pretty-log stream that drives the face. Visual language mirrors
+   #render-window (dark glass, violet borders); lines are dim
+   monospace with a jewel-accent left border per icon class.
+   ═══════════════════════════════════════════════════════════════ */
+
+#log-console {
+    position: fixed;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    height: min(44dvh, 440px);
+    z-index: 90; /* above chat, below #render-window (100) */
+    background: rgba(9, 6, 16, 0.92);
+    border-top: 1px solid rgba(75, 26, 122, 0.55);
+    box-shadow: 0 -16px 44px rgba(0, 0, 0, 0.75),
+        0 0 20px rgba(75, 26, 122, 0.22);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    display: flex;
+    flex-direction: column;
+    pointer-events: auto;
+}
+
+#log-console.hidden {
+    display: none !important;
+}
+
+#log-console-header {
+    background: rgba(75, 26, 122, 0.18);
+    border-bottom: 1px solid rgba(75, 26, 122, 0.4);
+    padding: 8px 14px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    letter-spacing: 2px;
+    color: rgba(255, 255, 255, 0.65);
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+#log-console-controls {
+    display: flex;
+    gap: 8px;
+}
+
+#log-console-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 12px calc(10px + env(safe-area-inset-bottom));
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    line-height: 1.55;
+}
+
+.log-line {
+    color: rgba(158, 170, 192, 0.92);
+    border-left: 2px solid transparent;
+    padding-left: 8px;
+    margin-bottom: 2px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.log-line-error {
+    color: #e0637f;
+}
+
+#log-resume {
+    position: absolute;
+    bottom: calc(14px + env(safe-area-inset-bottom));
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(75, 26, 122, 0.55);
+    border: 1px solid rgba(123, 98, 196, 0.6);
+    color: #e6e9ef;
+    border-radius: 999px;
+    padding: 5px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+}
+
+#log-resume.hidden {
+    display: none !important;
+}
+
+#logs-btn.active {
+    background: rgba(75, 26, 122, 0.28);
+    color: #b894ff;
+    border-color: rgba(123, 98, 196, 0.7);
+    box-shadow: 0 0 15px rgba(75, 26, 122, 0.45);
+}

@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=3.3';
+import * as matrixGraphFace from './matrix_graph.js?v=3.4';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -293,6 +293,10 @@ function connectWebSocket() {
                 const icon = extractIcon(data.content);
                 const flashColor = getIconColor(icon);
 
+                // Feed the live log console's ring buffer (renders only
+                // while the drawer is open; collects regardless).
+                pushLogEntry(data.content, data.is_error);
+
                 // Log lines feed the face's activity ENVELOPE — a small
                 // energy contribution each, smoothed inside matrix_graph —
                 // instead of firing a full pulse per line, which strobed
@@ -353,6 +357,128 @@ if ('visualViewport' in window) {
     };
     window.visualViewport.addEventListener('resize', updateKeyboardOffset);
     window.visualViewport.addEventListener('scroll', updateKeyboardOffset);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Live log console (2026-07-13)
+//
+//  The pretty-log stream already arrives over the WebSocket (it drives
+//  the face's activity envelope + the planner monologue) — this just
+//  makes it READABLE: a bottom-drawer console toggled from the header.
+//  A ring buffer collects even while the drawer is closed, so opening
+//  shows recent history instead of starting blind. Lines carry the same
+//  icon→jewel-tone accent mapping as the face (left border), with plain
+//  dim text for readability on the dark theme.
+// ═══════════════════════════════════════════════════════════════
+
+const LOG_BUFFER_CAP = 500;
+const logBuffer = [];
+const logsBtn = document.getElementById('logs-btn');
+const logConsole = document.getElementById('log-console');
+const logConsoleBody = document.getElementById('log-console-body');
+const logClearBtn = document.getElementById('log-clear');
+const logCloseBtn = document.getElementById('log-close');
+const logResumeBtn = document.getElementById('log-resume');
+const logNewCount = document.getElementById('log-new-count');
+let logPinned = true;    // auto-scroll follows the tail until the user scrolls up
+let logUnseen = 0;
+
+// CSI colour/cursor sequences from the agent's pretty stream.
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+function cleanLogLine(raw) {
+    return String(raw || '').replace(ANSI_ESCAPE_RE, '').replace(/\s+$/, '');
+}
+
+function pushLogEntry(rawContent, isError) {
+    const text = cleanLogLine(rawContent);
+    if (!text.trim()) return;
+    const icon = extractIcon(text);
+    const entry = {
+        text,
+        accent: icon ? getIconColor(icon) : '',
+        isError: !!isError,
+    };
+    logBuffer.push(entry);
+    if (logBuffer.length > LOG_BUFFER_CAP) logBuffer.shift();
+    if (logConsole && !logConsole.classList.contains('hidden')) {
+        logConsoleBody.appendChild(buildLogLine(entry));
+        while (logConsoleBody.childElementCount > LOG_BUFFER_CAP) {
+            logConsoleBody.removeChild(logConsoleBody.firstChild);
+        }
+        if (logPinned) {
+            logConsoleBody.scrollTop = logConsoleBody.scrollHeight;
+        } else {
+            logUnseen++;
+            if (logNewCount) logNewCount.textContent = String(logUnseen);
+            if (logResumeBtn) logResumeBtn.classList.remove('hidden');
+        }
+    }
+}
+
+function buildLogLine(entry) {
+    const div = document.createElement('div');
+    div.className = 'log-line' + (entry.isError ? ' log-line-error' : '');
+    if (entry.accent) div.style.borderLeftColor = entry.accent;
+    div.textContent = entry.text;
+    return div;
+}
+
+function openLogConsole() {
+    if (!logConsole) return;
+    const frag = document.createDocumentFragment();
+    for (const entry of logBuffer) frag.appendChild(buildLogLine(entry));
+    logConsoleBody.innerHTML = '';
+    logConsoleBody.appendChild(frag);
+    logConsole.classList.remove('hidden');
+    if (logsBtn) logsBtn.classList.add('active');
+    logPinned = true;
+    logUnseen = 0;
+    if (logResumeBtn) logResumeBtn.classList.add('hidden');
+    logConsoleBody.scrollTop = logConsoleBody.scrollHeight;
+}
+
+function closeLogConsole() {
+    if (!logConsole) return;
+    logConsole.classList.add('hidden');
+    if (logsBtn) logsBtn.classList.remove('active');
+}
+
+if (logsBtn) {
+    logsBtn.addEventListener('click', () => {
+        if (logConsole.classList.contains('hidden')) openLogConsole();
+        else closeLogConsole();
+    });
+}
+if (logCloseBtn) logCloseBtn.addEventListener('click', closeLogConsole);
+if (logClearBtn) {
+    logClearBtn.addEventListener('click', () => {
+        logBuffer.length = 0;
+        logConsoleBody.innerHTML = '';
+        logUnseen = 0;
+        if (logResumeBtn) logResumeBtn.classList.add('hidden');
+    });
+}
+if (logConsoleBody) {
+    logConsoleBody.addEventListener('scroll', () => {
+        const nearBottom = logConsoleBody.scrollTop + logConsoleBody.clientHeight
+            >= logConsoleBody.scrollHeight - 40;
+        if (nearBottom) {
+            logPinned = true;
+            logUnseen = 0;
+            if (logResumeBtn) logResumeBtn.classList.add('hidden');
+        } else {
+            logPinned = false;
+        }
+    }, { passive: true });
+}
+if (logResumeBtn) {
+    logResumeBtn.addEventListener('click', () => {
+        logPinned = true;
+        logUnseen = 0;
+        logResumeBtn.classList.add('hidden');
+        logConsoleBody.scrollTop = logConsoleBody.scrollHeight;
+    });
 }
 
 function showPlannerMonologue(text) {

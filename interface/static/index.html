@@ -30,7 +30,7 @@
     <script src="/static/vendor/mermaid.min.js"></script>
     <script src="/static/vendor/papaparse.min.js"></script>
     <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=3.0">
+    <link rel="stylesheet" href="/static/style.css?v=3.1">
 </head>
 
 <body>
@@ -66,6 +66,21 @@
             </div>
         </div>
 
+        <!-- Live log console: renders the same pretty-log stream that already
+             feeds the face/monologue over the WebSocket. Toggled by #logs-btn;
+             fed from a ring buffer that collects even while closed. -->
+        <div id="log-console" class="hidden">
+            <div id="log-console-header">
+                <span id="log-console-title">LIVE LOG</span>
+                <div id="log-console-controls">
+                    <button id="log-clear" class="render-btn" title="Clear">⌫</button>
+                    <button id="log-close" class="render-btn" title="Close">✕</button>
+                </div>
+            </div>
+            <div id="log-console-body"></div>
+            <button id="log-resume" class="hidden">▼ paused — <span id="log-new-count">0</span> new</button>
+        </div>
+
         <header>
             <div id="status-wrapper">
                 <div id="status-indicator">
@@ -77,6 +92,12 @@
             <div id="header-controls">
                 
                 
+                <button id="logs-btn" class="icon-btn" title="Live Log">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <polyline points="4 17 10 11 4 5"></polyline>
+                        <line x1="12" y1="19" x2="20" y2="19"></line>
+                    </svg>
+                </button>
                 <input type="file" id="workspace-upload-input" style="display: none;" accept=".zip" />
                 <button id="workspace-btn" class="icon-btn" title="Load Workspace">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -150,7 +171,7 @@
         </footer>
     </div>
 
-    <script type="module" src="/static/app.js?v=3.3"></script>
+    <script type="module" src="/static/app.js?v=3.4"></script>
 </body>
 
 </html>

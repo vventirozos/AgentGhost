@@ -735,6 +735,21 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-13 (later 5) — web UI: live log console (header button → bottom drawer)
+- Operator asked for a button showing the logs in near-realtime. The transport already existed —
+  the interface's WebSocket has streamed the pretty log to the browser since 2026-07-11 (it drives
+  the face envelope + planner monologue); it just wasn't rendered anywhere readable. Front-end-only
+  change (`interface/static/`): `#logs-btn` (terminal icon, header) toggles `#log-console` (bottom
+  drawer, 44dvh, render-window visual language). 500-entry ring buffer fed in `ws.onmessage`
+  UNCONDITIONALLY (collects while closed → opening shows history); ANSI stripped client-side; lines
+  dim monospace with the face's icon→jewel-accent mapping as a left border, errors crimson;
+  tail-following auto-scroll with a "paused — N new" pill when scrolled up; DOM capped at buffer
+  size. Cache-bust: app.js+matrix_graph → v3.4, style.css → v3.1 (index no-cache, plain reload).
+- Verified live headlessly: clicked the button, appended a marker line to the real agent log
+  (tail -F broadcast it), marker rendered in the open drawer; history survived close/reopen; no
+  page errors. Interface tests 52 passed (new pins: `tests/test_interface_log_console.py`). Docs:
+  `interfaces/web_server.html`. No server restart needed (statics read from disk).
+
 ### 2026-07-13 (later 4) — Slack notifications were DEAD for 2 days: pipeline wedge (both halves) + finish-line guard
 - Operator report: "notify me in slack when done" produced nothing (reqs `11fe11d8`, `bebd549d`).
   Three distinct defects found; all fixed, tested, deployed, and proven live.
