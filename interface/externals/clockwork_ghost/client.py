@@ -930,7 +930,8 @@ class MainWindow(QWidget):
         # Get the text directly from the last user input
         text = self.conversation_history[-1]["content"] if self.conversation_history else ""
         payload = {
-            "model": "qwen",
+            # model omitted on purpose — the agent uses its configured model;
+            # pinning a name here 404s (ModelNotFound) whenever the model is upgraded
             "messages": self.conversation_history,
             "stream": True
         }

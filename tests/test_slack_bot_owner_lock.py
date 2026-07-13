@@ -364,3 +364,92 @@ class TestRunScript:
     def test_execs_script_relative_main(self):
         # exec (signal propagation) + script-dir anchoring (cwd-independent).
         assert 'exec "$PYTHON" "$SCRIPT_DIR/main.py"' in self.RUN
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Notification poller ack contract (2026-07-13 wedge, bot half)
+# ══════════════════════════════════════════════════════════════════════
+#
+# The poller used to ack ONLY when records were non-empty (or baseline).
+# But the server's scan window can be all non-notify lines — an empty
+# response still carries an ADVANCED watermark. Skipping that ack froze
+# consumer="slack" at its Jul-11 offset: every 30s poll re-scanned the
+# same window, returned [], never acked, and NOTHING was delivered for
+# two days (found via req bebd549d). The contract now: ack every
+# response that carries a watermark, after any delivery.
+
+
+class _FakeResp:
+    def __init__(self, payload):
+        self.status_code = 200
+        self._payload = payload
+
+    def json(self):
+        return self._payload
+
+
+class _FakeHttp:
+    """Minimal httpx.AsyncClient stand-in recording the call sequence."""
+
+    def __init__(self, pending_payload):
+        self._pending = pending_payload
+        self.calls = []
+
+    async def get(self, url, **kw):
+        self.calls.append(("get", url))
+        return _FakeResp(self._pending)
+
+    async def post(self, url, json=None, **kw):
+        self.calls.append(("post", url, json))
+        return _FakeResp({"ok": True})
+
+
+def test_poller_acks_empty_response(bot):
+    http = _FakeHttp({"records": [], "watermark": 4242})
+    poster = AsyncMock()
+    n = asyncio.run(bot.poll_and_deliver_once(http, "C123", poster=poster))
+    assert n == 0
+    poster.assert_not_awaited()
+    acks = [c for c in http.calls if c[0] == "post"]
+    assert len(acks) == 1
+    assert acks[0][2] == {"consumer": "slack", "watermark": 4242}
+
+
+def test_poller_delivers_then_acks(bot):
+    http = _FakeHttp({
+        "records": [
+            {"phase": "agent_message", "summary": "task done"},
+            {"phase": "project", "summary": "needs your input"},
+        ],
+        "watermark": 999,
+    })
+    order = []
+
+    async def poster(channel, text):
+        order.append("post")
+        assert channel == "C123"
+        assert "task done" in text and "needs your input" in text
+
+    _orig_post = http.post
+
+    async def tracking_post(url, **kw):
+        order.append("ack")
+        return await _orig_post(url, **kw)
+
+    http.post = tracking_post
+    n = asyncio.run(bot.poll_and_deliver_once(http, "C123", poster=poster))
+    assert n == 2
+    # Delivery strictly precedes the ack — a crash in between re-serves.
+    assert order == ["post", "ack"]
+
+
+def test_poller_raises_on_http_error(bot):
+    class _Err:
+        async def get(self, url, **kw):
+            r = _FakeResp({})
+            r.status_code = 500
+            return r
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(bot.poll_and_deliver_once(_Err(), "C123",
+                                              poster=AsyncMock()))

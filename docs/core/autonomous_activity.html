@@ -80,7 +80,18 @@
     "sent to Slack" blindly. Delegated sub-agents can NOT reach this tool
     (not in their allowlist — the main agent reports; a delegate paging the
     operator is spam surface). Tests:
-    <code>tests/test_notify_operator.py</code> (14).</li>
+    <code>tests/test_notify_operator.py</code> (14).
+    <br><strong>Finish-line guard (2026-07-13, req 11fe11d8):</strong> the model
+    can PLAN the notify call in its reasoning and then finalize without making
+    it — the user's one explicit delivery requirement silently dropped (the
+    verifier confirms such turns: the deliverable itself is fine). The turn
+    loop now detects an explicit notify-me ask in the user text
+    (<code>_user_asked_for_notification</code> — narrow by design; negations and
+    questions <em>about</em> Slack don't arm it) and, when a turn is about to
+    ship its final response with <code>notify_operator</code> never called,
+    injects ONE steer toward the call (never against a force-finalising
+    loop-breaker; one-shot per request). Tests:
+    <code>tests/test_notify_finish_guard.py</code>.</li>
   </ul>
 
   <h2>Consumers</h2>
@@ -114,7 +125,22 @@
     The Slack bot (<code>interface/externals/slack_bot</code>) runs a
     <code>notification_poller</code> when <code>GHOST_NOTIFY_SLACK_CHANNEL</code>
     is set — poll → <code>chat_postMessage</code> → ack, so a crash re-serves
-    rather than drops.</li>
+    rather than drops.
+    <br><strong>Wedge fixed 2026-07-13 (both halves).</strong> The pipeline was
+    silently dead 2026-07-11→13: (a) <em>server</em> — <code>read_since</code>'s
+    <code>limit</code> bounds <em>scanned lines</em>, so a poll window full of
+    info-severity records (dream/self-play spam) returned <code>[]</code> without
+    ever reaching the notify records beyond it; <code>pending</code> now scans
+    forward in 200-line chunks (≤50/poll) until it has <code>limit</code> notify
+    records or EOF, and <code>limit</code> is a soft bound — whole chunks are
+    kept, since truncating mid-chunk would advance the watermark past records
+    never returned; (b) <em>bot</em> — the poller only acked non-empty
+    responses, so the empty-but-advanced watermark was never persisted and every
+    poll re-scanned the same window forever. The bot now acks every response
+    that carries a watermark (still after delivery, so at-least-once holds) and
+    logs <code>delivered N notification(s)</code> so a silent pipeline is
+    diagnosable. Backlog proof at fix time: 4 stranded records (2 days) arrived
+    in one DM.</li>
   </ol>
 
   <h2>Internal-request gate</h2>

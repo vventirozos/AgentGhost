@@ -957,12 +957,34 @@ async def notifications_pending(request: Request, consumer: str = "default",
         limit = max(1, min(int(limit), 200))
     except (TypeError, ValueError):
         limit = 50
-    records, new_offset = log.read_since(offset, limit=limit,
-                                         severity=SEVERITY_NOTIFY)
+    # Scan PAST non-notify noise (bounded). ``read_since``'s own limit
+    # bounds SCANNED LINES per chunk, not returned records — a single
+    # call from a stale watermark into an info-heavy ledger (dream /
+    # self-play spam) can scan its whole window without meeting one
+    # notify record and return []. Combined with a client that only
+    # acks non-empty responses, that WEDGED the slack consumer at its
+    # Jul-11 watermark: every 30s poll re-scanned the same 20 info
+    # lines forever and nothing was ever delivered again (found
+    # 2026-07-13). Loop until we have ``limit`` notify records or EOF,
+    # capped at 50×200 = 10k lines per poll so one call can't scan an
+    # unbounded ledger. ``limit`` is a SOFT bound (whole chunks are
+    # kept): truncating mid-chunk would advance the watermark past
+    # records we never returned, silently dropping them.
+    records = []
+    cursor = offset
+    for _ in range(50):
+        chunk, new_cursor = log.read_since(cursor, limit=200,
+                                           severity=SEVERITY_NOTIFY)
+        records.extend(chunk)
+        if new_cursor <= cursor:  # EOF / no progress
+            break
+        cursor = new_cursor
+        if len(records) >= limit:
+            break
     return JSONResponse({
         "enabled": True,
         "records": [r.to_dict() for r in records],
-        "watermark": new_offset,
+        "watermark": cursor,
     })
 
 

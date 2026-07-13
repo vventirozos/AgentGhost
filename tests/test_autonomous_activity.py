@@ -459,6 +459,43 @@ class TestNotificationsAPI:
             r3 = c.get("/api/notifications/pending?consumer=slack").json()
             assert r3["records"] == []
 
+    def test_pending_scans_past_info_noise(self, tmp_path):
+        # THE 2026-07-13 wedge, server half: read_since's limit bounds
+        # SCANNED LINES, so a 20-line poll window full of info-severity
+        # records (dream/self-play spam) returned [] even though notify
+        # records sat just beyond it. The endpoint must scan forward
+        # (bounded) until it finds notify records or EOF.
+        app, ctx = _make_app(tmp_path)
+        with TestClient(app) as c:
+            base = c.get("/api/notifications/pending?consumer=slack").json()
+            c.post("/api/notifications/ack",
+                   json={"consumer": "slack", "watermark": base["watermark"]})
+            for i in range(250):
+                ctx.activity_log.record("dream", f"info noise {i}",
+                                        severity=SEVERITY_INFO)
+            ctx.activity_log.record("agent_message", "the real notification",
+                                    severity=SEVERITY_NOTIFY)
+            r = c.get("/api/notifications/pending?consumer=slack&limit=20").json()
+            assert [x["summary"] for x in r["records"]] == [
+                "the real notification"]
+            assert r["watermark"] == ctx.activity_log.current_offset()
+
+    def test_pending_empty_window_advances_watermark_to_eof(self, tmp_path):
+        # An all-info ledger tail must still return an EOF watermark so an
+        # always-acking client makes progress instead of re-scanning the
+        # same window forever.
+        app, ctx = _make_app(tmp_path)
+        with TestClient(app) as c:
+            base = c.get("/api/notifications/pending?consumer=slack").json()
+            c.post("/api/notifications/ack",
+                   json={"consumer": "slack", "watermark": base["watermark"]})
+            for i in range(30):
+                ctx.activity_log.record("self_play", f"info {i}",
+                                        severity=SEVERITY_INFO)
+            r = c.get("/api/notifications/pending?consumer=slack&limit=20").json()
+            assert r["records"] == []
+            assert r["watermark"] == ctx.activity_log.current_offset()
+
     def test_ack_invalid_body_400(self, tmp_path):
         app, _ = _make_app(tmp_path)
         with TestClient(app) as c:

@@ -735,6 +735,38 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-13 (later 4) — Slack notifications were DEAD for 2 days: pipeline wedge (both halves) + finish-line guard
+- Operator report: "notify me in slack when done" produced nothing (reqs `11fe11d8`, `bebd549d`).
+  Three distinct defects found; all fixed, tested, deployed, and proven live.
+- **(1) Delivery pipeline WEDGED since Jul 11 15:14.** Two interlocking halves:
+  *Server* (`routes.py::notifications_pending`): `read_since(limit)` bounds SCANNED LINES, not
+  returned records — from the stale watermark (3774) every 20-line window was all info-severity
+  (dream/self-play spam), so every poll returned `[]` while notify records sat beyond the window.
+  *Bot* (`slack_bot/main.py`): the poller only ACKed non-empty responses, so the empty-response
+  watermark never persisted → same window re-scanned every 30s forever (thousands of identical
+  200-OK polls in the bot log; `notify_consumers.json` mtime frozen at Jul 11). Victims: "Meta
+  project complete", a needs-your-input, and both of the agent's own test notifications. FIX:
+  pending now scans forward in 200-line chunks (≤50/poll) to `limit` notify records or EOF
+  (`limit` soft — whole chunks kept, else the watermark would skip past unreturned records); bot
+  acks EVERY response with a watermark (still after delivery — at-least-once preserved) and logs
+  `delivered N notification(s)`. Poller body factored into testable `poll_and_deliver_once()`.
+- **(2) req 11fe11d8: the agent PLANNED the notify call and never made it.** Research + plan + PDF
+  all done, reasoning said "now send the Slack notification", then the final response shipped with
+  zero `notify_operator` call — and the verifier CONFIRMED (the deliverable itself was fine). FIX:
+  finish-line guard in the turn loop — `_user_asked_for_notification()` (narrow: "notify/ping/alert
+  me", comm-verb+slack-destination in one clause, "send me a notification"; negations and questions
+  ABOUT slack don't arm; 4k truncation so pasted docs can't) + one-shot SYSTEM-ALERT steer when a
+  turn finalizes with the ask unfulfilled. Never fights force-finalisation.
+- **(3) req bebd549d burned 17 turns diagnosing INSIDE the sandbox** (printenv/ps/find for the
+  slack bot — invisible from a container by design; the loop-breaker fired twice). Not separately
+  fixed: the honest limitation is documented; with (1)+(2) fixed the situation shouldn't recur.
+  Classic [[sandbox-loopback-blind-spot]] shape, worth remembering.
+- **Live proof after deploy**: pending surfaced the 4 stranded records; bot delivered all 4 in ONE
+  DM (`delivered 4 notification(s) → U56CVBHHQ`); watermark 3774→40308 (first movement in 2 days);
+  queue drained. Suite **7412 passed / 12 skipped / 0 failed** (new: pending-scan tests, poller
+  ack-contract tests via fake httpx, `test_notify_finish_guard.py`). Docs:
+  `core/autonomous_activity.html` (wedge + guard sections).
+
 ### 2026-07-13 (later 3) — API auth ENABLED everywhere: key minted, rotated, rolled to every client
 - Closes BOTH standing security flags at once: the agent's `--api-key ""` on a 0.0.0.0 bind (boot-log
   SECURITY WARNING, flagged in the overnight review) AND the interface's publicly-known
@@ -756,10 +788,15 @@ skills_auto graduation wiring). Residuals in §4C.
   from the file when driving prod.
 - **uConsole client** (`interface/externals/clockwork_ghost/client.py`): the four hardcoded
   `"YOUR_KEY_HERE"` headers (worked only because auth was off) replaced with `_resolve_ghost_api_key()`
-  (env → `~/.ghost_api_key` on device → `.ghost_api_key` beside client.py). **DEVICE NOT DEPLOYED**
-  — clockworkpi was unreachable (off). On next power-up: sync client.py + copy the key
-  (`scp ~/Data/AI/.ghost_api_key clockworkpi:~/.ghost_api_key && ssh clockworkpi chmod 600 ~/.ghost_api_key`);
-  until then the uConsole client gets 403s.
+  (env → `~/.ghost_api_key` on device → `.ghost_api_key` beside client.py). **DEPLOYED same day**
+  once clockworkpi came up: device copy backed up (`~/backup/client.py.pre-apikey-20260713`), merged
+  client pushed to `~/bin/client.py`, key at `~/.ghost_api_key` (600), client restarted via
+  `setsid launch_ghost.sh` (DISPLAY=:0), device→agent verified 200-with-key / 403-without, no
+  Auth-Rejected lines on the agent. **Repo↔device drift caught during the diff**: the device copy
+  had dropped the pinned `"model": "qwen"` from the chat payload (pinning 404s ModelNotFound on
+  every model upgrade) — the repo copy was STALE and would have reintroduced the bug; fix
+  backported to the repo BEFORE deploying. Lesson: always diff a device-deployed external before
+  overwriting it.
 - **Verified live**: agent 403 without key / 403 with old public key / 200 with new key; fresh boot
   has NO security warning; web UI end-to-end (Playwright: SYSTEM ONLINE, green dot = page → proxy →
   agent stream all on the new key); Slack bot clean boot. `/api/health` now REQUIRES the key —

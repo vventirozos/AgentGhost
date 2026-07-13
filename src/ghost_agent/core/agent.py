@@ -1682,6 +1682,50 @@ class GhostContext:
 _CORRECTION_MAX = 3
 _CORRECTION_TTL = 900.0  # seconds
 
+# Promised-notification finish-line guard (2026-07-13, req 11fe11d8): the
+# user asked "notify me in slack when you're done", the model PLANNED the
+# notify_operator call in its reasoning, then emitted the final response
+# without ever calling the tool — the one explicit delivery requirement in
+# the request was silently dropped (and the verifier confirmed the turn:
+# the deliverable itself was fine). These patterns detect an explicit
+# notify-me ask in the USER text so the turn loop can steer once toward
+# notify_operator before letting the final response ship. Kept narrow on
+# purpose — a false fire injects a bogus SYSTEM ALERT into casual chat.
+_NOTIFY_INTENT_RE = re.compile(
+    # Direct ask: "notify me", "ping me", "alert me".
+    r"\b(?:notify|ping|alert)\s+me\b"
+    # Communication verb bound to a Slack destination within one clause:
+    # "let me know / tell me / report back / update me / message me /
+    # dm me … in|on|via|over slack". A bare "in slack" or "slack message"
+    # deliberately does NOT match — questions ABOUT Slack ("how do I
+    # format a slack message?") must not arm the guard.
+    r"|\b(?:let\s+me\s+know|tell\s+me|report\s+back|update\s+me|"
+    r"message\s+me|dm\s+me|write\s+me)\b[^.!?\n]{0,40}?"
+    r"\b(?:in|on|via|over|through)\s+slack\b"
+    # "send me a notification / dm / slack message".
+    r"|\bsend\s+me\s+a\s+(?:notification|dm|slack\s+(?:message|dm|notification))\b",
+    re.IGNORECASE,
+)
+_NOTIFY_NEGATION_RE = re.compile(
+    r"\b(?:don'?t|do\s+not|no\s+need\s+to|without|stop)\s+"
+    r"(?:notify(?:ing)?|ping(?:ing)?|alert(?:ing)?|messag(?:e|ing))",
+    re.IGNORECASE,
+)
+
+
+def _user_asked_for_notification(user_text) -> bool:
+    """True when the user's request explicitly asks for an out-of-band
+    notification ("notify me in slack when you're done") and doesn't
+    negate it ("don't notify me"). Long pasted documents are truncated
+    before matching so an incidental 'slack' deep inside one can't arm
+    the guard."""
+    t = str(user_text or "")[:4000]
+    if not t:
+        return False
+    if _NOTIFY_NEGATION_RE.search(t):
+        return False
+    return bool(_NOTIFY_INTENT_RE.search(t))
+
 
 @dataclass
 class TurnState:
@@ -8778,6 +8822,11 @@ class GhostAgent:
                 # process-global `context.cached_sandbox_state`).
                 request_sandbox_state = None
                 raw_tools_called = set()
+                # One-shot latch for the promised-notification guard: the
+                # steer fires at most once per request (a model that still
+                # won't call notify_operator after the alert ships its
+                # final response rather than looping).
+                notify_steer_fired = False
                 execution_failure_count = 0
                 transient_failure_count = 0   # Separate budget for retryable errors
                 # Repeated-IDENTICAL-failure tracking. The structural strike
@@ -10832,6 +10881,41 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         has_img_markdown = bool(re.search(r'!\[.*?\]\(.*?\)', clean_ui))
                         has_valid_image_tool = any(t in raw_tools_called for t in ["image_generation", "execute", "file_system"])
                         has_run_tools = len(tools_run_this_turn) > 0
+
+                        # Catch a PROMISED NOTIFICATION dropped at the finish
+                        # line (req 11fe11d8): user said "notify me in slack
+                        # when you're done", the model planned the call in
+                        # reasoning, then finalized without making it. Steer
+                        # ONCE toward notify_operator; never fight a
+                        # force-finalising loop-breaker.
+                        if (clean_ui and not notify_steer_fired
+                                and not force_final_response
+                                and not is_final_generation
+                                and not force_stop
+                                and "notify_operator" not in raw_tools_called
+                                and _user_asked_for_notification(last_user_content)):
+                            notify_steer_fired = True
+                            pretty_log(
+                                "Notify Guard",
+                                "Turn ending without the notification the user "
+                                "explicitly asked for — steering to "
+                                "notify_operator (once).",
+                                level="WARNING", icon=Icons.WARN,
+                            )
+                            messages.append(msg)
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "SYSTEM ALERT: The user explicitly asked to "
+                                    "be NOTIFIED when this task is done, but you "
+                                    "are ending the turn without having called "
+                                    "`notify_operator`. Call `notify_operator` "
+                                    "NOW with one short line summarising the "
+                                    "outcome, then give your final response."
+                                ),
+                            })
+                            continue
+
                         # Catch Stalled Image Mentions
                         if has_img_markdown and not has_valid_image_tool:
                             is_valid_final = "```" in clean_ui or bool(re.search(r'\b(SUCCESS|DONE|COMPLETE|ERROR)\b', clean_ui.upper()))

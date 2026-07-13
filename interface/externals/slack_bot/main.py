@@ -548,35 +548,50 @@ def format_notification(rec: dict) -> str:
     return f"{icon} *[{phase}]* {summary}"
 
 
+async def poll_and_deliver_once(client, channel: str, poster=None) -> int:
+    """One poll → deliver → ack cycle. Returns the number of records
+    delivered. Factored out of the loop so the ack contract is unit-
+    testable (``poster`` defaults to the live Slack client's
+    chat_postMessage; tests inject a fake).
+    """
+    poster = poster or app.client.chat_postMessage
+    r = await client.get(
+        f"{GHOST_API_BASE}/api/notifications/pending",
+        params={"consumer": _NOTIFY_CONSUMER, "limit": 20},
+        headers=AUTH_HEADERS,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"pending poll HTTP {r.status_code}")
+    data = r.json()
+    records = data.get("records") or []
+    watermark = data.get("watermark")
+    if records:
+        text = "\n".join(format_notification(rec) for rec in records)
+        await poster(channel=channel, text=text)
+        logger.info(f"delivered {len(records)} notification(s) → {channel}")
+    # Ack UNCONDITIONALLY (post-delivery). The old `records or baseline`
+    # guard skipped the ack on empty responses — but the server's scan
+    # window can be all non-notify lines, so an empty response still
+    # carries an ADVANCED watermark. Not acking it froze the consumer at
+    # the same offset and re-scanned the same window forever (wedged
+    # 2026-07-11→13; NOTHING was delivered for two days). Ordering is
+    # preserved: a crash between post and ack re-serves rather than drops.
+    if watermark is not None:
+        await client.post(
+            f"{GHOST_API_BASE}/api/notifications/ack",
+            json={"consumer": _NOTIFY_CONSUMER, "watermark": watermark},
+            headers=AUTH_HEADERS,
+        )
+    return len(records)
+
+
 async def notification_poller(channel: str):
-    headers = AUTH_HEADERS
     logger.info(
         f"Notification poller ON → {channel} every {NOTIFY_POLL_SECONDS:.0f}s")
     while True:
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(
-                    f"{GHOST_API_BASE}/api/notifications/pending",
-                    params={"consumer": _NOTIFY_CONSUMER, "limit": 20},
-                    headers=headers,
-                )
-                if r.status_code != 200:
-                    raise RuntimeError(f"pending poll HTTP {r.status_code}")
-                data = r.json()
-                records = data.get("records") or []
-                watermark = data.get("watermark")
-                if records:
-                    text = "\n".join(format_notification(rec)
-                                     for rec in records)
-                    await app.client.chat_postMessage(channel=channel,
-                                                      text=text)
-                if watermark is not None and (records or data.get("baseline")):
-                    await client.post(
-                        f"{GHOST_API_BASE}/api/notifications/ack",
-                        json={"consumer": _NOTIFY_CONSUMER,
-                              "watermark": watermark},
-                        headers=headers,
-                    )
+                await poll_and_deliver_once(client, channel)
         except Exception as e:  # noqa: BLE001
             logger.warning(f"notification poller: {e}")
         await asyncio.sleep(NOTIFY_POLL_SECONDS)
