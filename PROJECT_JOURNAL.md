@@ -735,6 +735,42 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-13 (later 7) — web face: immersion dive ("the grid swallows the camera" while working)
+- Operator idea, built after an explicit feasibility pass: while a USER request is in flight the
+  camera is swallowed INTO the node cloud (scene scale ×1.7 + camera dolly z 5.0→1.3), drifting
+  back out organically on completion. All in `interface/static/matrix_graph.js` (+1-line dev hook
+  in app.js); backup at `matrix_graph.js.bak-20260713-preimmersion` (operator-requested).
+- Design decisions that make it work: (1) driven ONLY by `workingState` — background/idle activity
+  deliberately does NOT engulf (it would fire all night; the swallow means "working for YOU");
+  (2) asymmetric ease much slower than workingState (~5s in / ~10s out) so short requests just
+  lean — no yo-yo; (3) NEAR-CAMERA FADE added to both shaders (`smoothstep(0.3,1.4,-mvPosition.z)`)
+  so nodes dissolve instead of exploding into screen-filling quads at the camera plane; (4) bloom
+  damped ×0.65 fully inside (reply text is read on top of near geometry); (5) look-target blends
+  from origin to forward-through-the-cloud (`lookAt(0,0,-3.5·dive)`) to dodge the lookAt-origin
+  singularity that turns parallax into wild rotation; (6) reduced-motion caps the dive at 0.15.
+- Verified live headlessly via new `window.__ghostFace.getDebugState()` hook: idle camZ=5.00/scale
+  0.90 → swallowed camZ=1.33/scale 1.54 → released camZ=4.94/scale 0.92, zero page errors, and the
+  swallowed screenshot reads as genuinely inside the lattice with UI text still legible. Cache-bust
+  → v3.5. Interface tests 60 passed (new pins: `tests/test_interface_face_immersion.py` — guard the
+  working-state-only trigger, reduced-motion cap, near-fade, bloom damping, lookAt blend, backup).
+- **Interior enrichment (v3.6, same day)** — operator: "fully zoomed it looks kind of empty".
+  Root cause: the scale swell DILUTES local node density exactly when the camera is closest. Three
+  dive-gated compensators (resting view untouched): (1) **interior motes** — 400 (150 mobile) tiny
+  jewel-tinted particles with shader-side drift (zero per-frame CPU, one draw call,
+  `visible=false` at rest), inward-biased distribution along the camera's path; (2) **thicker
+  web** — proximity threshold eases up ×1.5 with the dive (O(n²) distances computed anyway; only
+  accepts more pairs, MAX_LINES-capped); (3) **faster data pulses** inside (+60% line-pulse tempo)
+  + scale boost trimmed 0.7→0.55. Headless re-verify: interior now dense (thick web + junction
+  stars + mote haze), no page errors. Interface tests 61 passed.
+- **Brightness/density tuning (v3.7, operator: "too many lines and too bright")**: web-thickening
+  +50%→+15%; bloom damping inside 0.35→0.5; NEW per-line `diveDim` (×0.7 fully inside) — additive
+  stacking of overlapping lines in front of the camera was the real brightness driver. Headless
+  re-verify clean; pins updated.
+- **Glass chat + translucent log drawer (style.css v3.2, operator: "chat panels hide the face")**:
+  bubble fill alphas cut (agent 0.45→0.20, user 0.62→0.28, system 0.5→0.3) with blur strengthened
+  (15→18 / 12→16px) — the blur carries readability, the fill was only occluding the face; log
+  drawer 0.92→0.58. Verified headlessly with injected large-output bubbles over the busy face.
+
 ### 2026-07-13 (later 6) — worker-node model bake-off: Ornith-9B REJECTED, Gemma 4 E4B stays (2× faster AND more accurate)
 - Operator was seeing ~20-30 t/s on nova (worker) and asked for a model recommendation. I researched
   and recommended **Ornith-1.0-9B-heretic-MTP** (Qwen3.5-9B lineage, MTP head, strong sub-10B

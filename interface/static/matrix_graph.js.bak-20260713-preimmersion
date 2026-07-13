@@ -66,7 +66,6 @@ const PROXIMITY_SQ = 2.5;
 let scene, camera, renderer, composer, bloomPass;
 let instancedMesh, linesMesh;
 let lineGeometry, nodeMaterial, lineMaterial;
-let motesMesh, motesMaterial;
 let time = 0;
 let shapeTime = 0;
 let sceneSpin = 0;  // accumulated slow-orbit angle (radians)
@@ -94,30 +93,6 @@ let accentStrength = 0.0;
 // (~50s per full cycle at idle, ~15s when busy), so a node's color is
 // stable moment-to-moment but the graph's overall cast keeps evolving.
 let hueDrift = 0.0;
-
-// Immersion (2026-07-13): while a USER request is in flight the grid
-// "swallows" the camera — the scene scales up around the viewer and the
-// camera dollies from its resting z into the middle of the cloud; on
-// completion it drifts back out. Driven by the smoothed workingState
-// with a DELIBERATELY slower attack/release than workingState itself:
-// a 2-second request produces only a subtle lean inward, and the full
-// engulfment develops only on sustained work — that asymmetry is what
-// makes it read as "alive" instead of a yo-yo. Background agent
-// activity (the envelope) does NOT drive immersion on purpose: it
-// animates speed/glow all night; the swallow is reserved for "working
-// for YOU, right now". Reduced-motion users get a capped slight lean.
-let immersion = 0.0;
-const IMMERSION_CAP = PREFERS_REDUCED_MOTION ? 0.15 : 1.0;
-const CAMERA_REST_Z = 5.0;
-const CAMERA_DIVE_Z = 1.3;   // inside the cloud (node shell radius ~2)
-
-// Interior atmosphere: tiny drifting motes that only exist while
-// immersed. The dive dilutes local node density (the scene scales up
-// around the viewer), so the inside looked empty — the motes are the
-// "data nebula" filling that void. Drift is computed in the vertex
-// shader from a per-mote seed, so the layer costs one draw call and
-// zero per-frame CPU; it is skipped entirely (visible=false) at rest.
-const MOTE_COUNT = IS_MOBILE ? 150 : 400;
 
 // TTS-driven audio level (0..1). Wired by setAudioLevel() from app.js
 // when the TTS engine is active; multiplies node jitter subtly so the
@@ -171,10 +146,8 @@ export function destroy() {
     basePositions.length = 0;
     if (nodeMaterial) nodeMaterial.dispose();
     if (lineMaterial) lineMaterial.dispose();
-    if (motesMaterial) motesMaterial.dispose();
     if (instancedMesh && instancedMesh.geometry) instancedMesh.geometry.dispose();
     if (linesMesh && linesMesh.geometry) linesMesh.geometry.dispose();
-    if (motesMesh && motesMesh.geometry) motesMesh.geometry.dispose();
     if (renderer) renderer.dispose();
     window.removeEventListener('resize', handleResize);
 }
@@ -215,7 +188,6 @@ ${paletteGLSL}
 varying vec3 vColor;
 varying vec2 vUv;
 varying float vDepthFade;
-varying float vNearFade;
 
 void main() {
     vUv = uv;
@@ -238,12 +210,6 @@ void main() {
     // Depth fade: 0 near the camera .. 1 far. Lets the fragment dim
     // distant nodes so the cloud reads as a 3D volume, not a flat sheet.
     vDepthFade = clamp((-mvPosition.z - 2.5) / 7.0, 0.0, 1.0);
-
-    // Near fade: nodes dissolve as they approach the camera instead of
-    // exploding into screen-filling quads (or popping when they cross
-    // the camera plane). Essential for the immersion dive, harmless at
-    // rest (nothing sits within 1.4 units of the resting camera).
-    vNearFade = smoothstep(0.3, 1.4, -mvPosition.z);
 
     // Per-node jewel hue: aSeed anchors this node on the palette wheel,
     // uHueDrift slides the whole wheel slowly. Replaces the old
@@ -279,7 +245,6 @@ const nodeFragmentShader = `
 varying vec3 vColor;
 varying vec2 vUv;
 varying float vDepthFade;
-varying float vNearFade;
 void main() {
     float d = distance(vUv, vec2(0.5)) * 2.0; // scaled 0 to 1
     if (d > 1.0) discard;
@@ -289,7 +254,7 @@ void main() {
     // Intense bright core
     float core = pow(1.0 - d, 8.0) * 1.5;
 
-    float alpha = (intensity + core) * vNearFade;
+    float alpha = intensity + core;
     // Distance dimming: far nodes glow less and fade out, near nodes pop.
     float depthDim = mix(1.0, 0.35, vDepthFade);
     gl_FragColor = vec4(vColor * alpha * depthDim, alpha * mix(1.0, 0.7, vDepthFade));
@@ -302,16 +267,12 @@ attribute float aLineHue;
 varying float vLightPass;
 varying float vLineHue;
 varying float vLineDepth;
-varying float vLineNear;
 
 void main() {
     vLightPass = aLightPass;
     vLineHue = aLineHue;
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     vLineDepth = clamp((-mvPosition.z - 2.5) / 7.0, 0.0, 1.0);
-    // Near fade — see the node shader; lines whose endpoint passes the
-    // camera dissolve instead of slashing across the whole screen.
-    vLineNear = smoothstep(0.3, 1.4, -mvPosition.z);
     gl_Position = projectionMatrix * mvPosition;
 }
 `;
@@ -322,7 +283,6 @@ uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
 uniform float uHueDrift;
-uniform float uDive;
 uniform vec3 uBaseColor;
 uniform vec3 uErrorColor;
 uniform vec3 uAccentColor;
@@ -331,7 +291,6 @@ ${paletteGLSL}
 varying float vLightPass;
 varying float vLineHue;
 varying float vLineDepth;
-varying float vLineNear;
 
 void main() {
     float gradient = fract(vLightPass * 1.5 - uTime * 2.0);
@@ -360,56 +319,9 @@ void main() {
 
     float alpha = mix(0.4 + uWorkingState * 0.2, 1.0, pulse);
     alpha = max(alpha, burst * uPulseT);
-    alpha *= vLineNear;
-    // Inside the cloud MANY lines stack additively right in front of
-    // the camera — dim each one so the sum stays comfortable.
-    float diveDim = 1.0 - 0.30 * uDive;
     // Distance dimming so far links recede behind near ones.
     float depthDim = mix(1.0, 0.4, vLineDepth);
-    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim * vLineNear * diveDim, alpha * diveDim * mix(1.0, 0.55, vLineDepth));
-}
-`;
-
-const moteVertexShader = `
-attribute float aSeed;
-uniform float uTime;
-uniform float uDive;
-uniform float uHueDrift;
-uniform float uDpr;
-${paletteGLSL}
-varying vec3 vMoteCol;
-varying float vMoteFade;
-
-void main() {
-    // Slow, per-mote orbital drift — pure shader math, no CPU updates.
-    vec3 p = position + 0.18 * vec3(
-        sin(uTime * 0.40 + aSeed * 37.0),
-        cos(uTime * 0.33 + aSeed * 53.0),
-        sin(uTime * 0.27 + aSeed * 71.0)
-    );
-    vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
-    // Near fade (don't smear across the lens) + gentle far fade, all
-    // gated by the dive: motes are invisible at rest by construction.
-    float near = smoothstep(0.12, 0.8, -mvPosition.z);
-    float far = 1.0 - clamp((-mvPosition.z - 3.0) / 6.0, 0.0, 0.85);
-    vMoteFade = near * far * uDive;
-    vMoteCol = palette(aSeed + uHueDrift);
-    // Perspective size attenuation, clamped so close motes stay motes.
-    gl_PointSize = min(mix(1.5, 4.5, fract(aSeed * 7.31))
-        * (2.2 / max(-mvPosition.z, 0.2)) * uDpr, 9.0 * uDpr);
-    gl_Position = projectionMatrix * mvPosition;
-}
-`;
-
-const moteFragmentShader = `
-varying vec3 vMoteCol;
-varying float vMoteFade;
-void main() {
-    vec2 c = gl_PointCoord - vec2(0.5);
-    float d = length(c) * 2.0;
-    if (d > 1.0) discard;
-    float a = pow(1.0 - d, 2.5) * 0.55 * vMoteFade;
-    gl_FragColor = vec4(vMoteCol * a, a);
+    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim, alpha * mix(1.0, 0.55, vLineDepth));
 }
 `;
 
@@ -526,7 +438,6 @@ export function init() {
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
-            uDive: { value: 0.0 },
             uBaseColor: { value: COLORS.lineBase },
             uErrorColor: { value: COLORS.lineError },
             uAccentColor: { value: accentColor },
@@ -540,40 +451,6 @@ export function init() {
 
     linesMesh = new THREE.LineSegments(lineGeometry, lineMaterial);
     scene.add(linesMesh);
-
-    // Interior motes (see MOTE_COUNT comment). Distributed with an
-    // inward bias so the region the camera dives through is the
-    // densest. Added to the scene so they inherit its spin/scale.
-    const moteGeom = new THREE.BufferGeometry();
-    const motePos = new Float32Array(MOTE_COUNT * 3);
-    const moteSeeds = new Float32Array(MOTE_COUNT);
-    for (let i = 0; i < MOTE_COUNT; i++) {
-        const u = Math.random(), v = Math.random();
-        const th = 2 * Math.PI * u, ph = Math.acos(2 * v - 1);
-        const r = 2.4 * Math.pow(Math.random(), 0.55); // inward bias
-        motePos[i * 3] = r * Math.sin(ph) * Math.cos(th);
-        motePos[i * 3 + 1] = r * Math.sin(ph) * Math.sin(th);
-        motePos[i * 3 + 2] = r * Math.cos(ph);
-        moteSeeds[i] = Math.random();
-    }
-    moteGeom.setAttribute('position', new THREE.BufferAttribute(motePos, 3));
-    moteGeom.setAttribute('aSeed', new THREE.BufferAttribute(moteSeeds, 1));
-    motesMaterial = new THREE.ShaderMaterial({
-        vertexShader: moteVertexShader,
-        fragmentShader: moteFragmentShader,
-        uniforms: {
-            uTime: { value: 0 },
-            uDive: { value: 0 },
-            uDpr: { value: Math.min(window.devicePixelRatio, dprCap) },
-            ...paletteUniforms(),
-        },
-        transparent: true,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-    });
-    motesMesh = new THREE.Points(moteGeom, motesMaterial);
-    motesMesh.visible = false;   // skipped entirely at rest
-    scene.add(motesMesh);
 
     // Scale scene down by 10%
     scene.scale.set(0.9, 0.9, 0.9);
@@ -704,18 +581,6 @@ export function setAudioLevel(level) {
     audioLevel += (clamped - audioLevel) * 0.35;
 }
 
-// Introspection for headless verification / tuning — never used by the
-// render path itself.
-export function getDebugState() {
-    return {
-        immersion,
-        workingState,
-        cameraZ: camera ? camera.position.z : null,
-        sceneScale: scene ? scene.scale.x : null,
-        activity,
-    };
-}
-
 let workingTimeout;
 export function setWorkingState(isWorking) {
     if (isWorking) {
@@ -769,32 +634,14 @@ function animate() {
     // called (TTS queue drained), the residual level dies out fast.
     audioLevel *= 0.92;
 
-    // Immersion follows workingState with a slower, asymmetric ease:
-    // ~5s to fully swallow (only sustained work gets there), ~10s to
-    // drift back out after completion. Short requests barely lean in.
-    const immersionTarget = workingState * IMMERSION_CAP;
-    immersion += (immersionTarget - immersion)
-        * (immersionTarget > immersion ? 0.012 : 0.006);
-    // Smoothstepped path so both ends of the dive are gentle.
-    const dive = immersion * immersion * (3.0 - 2.0 * immersion);
-
-    // Accumulate time for lines at steady pace — except inside the
-    // cloud, where the data pulses rush a little faster: the interior
-    // should feel BUSIER than the outside view, not emptier.
-    time += 0.005 * (1.0 + dive * 0.6);
+    // Accumulate time for lines at steady pace regardless of state
+    time += 0.005;
 
     // Idle breathing: ±1% scene-scale sine at ~0.1Hz. Below the
     // motion-detection threshold on both desktop and mobile; keeps the
     // sphere from looking frozen when nothing else is animating.
-    // Immersion scales the whole scene UP around the viewer — combined
-    // with the camera dolly below, this is what reads as "the grid
-    // swallowing the camera" rather than the camera flying somewhere.
     const breathe = 1.0 + 0.012 * Math.sin(time * 0.6);
-    // Scale boost trimmed 0.7 → 0.55: the swell is what sells the
-    // swallow, but it also DILUTES local node density exactly when the
-    // camera is closest — the interior looked empty at 0.7 even with
-    // the denser web + motes compensating.
-    const baseScale = 0.9 * breathe * (1.0 + dive * 0.55);
+    const baseScale = 0.9 * breathe;
     scene.scale.set(baseScale, baseScale, baseScale);
 
     // Slow continuous orbit (faster while working) plus a gentle tilt
@@ -806,17 +653,12 @@ function animate() {
         scene.rotation.x = 0.12 * Math.sin(time * 0.25);
     }
 
-    // Parallax: ease camera toward target offset. Z is owned by the
-    // immersion dive (rest 5.0 → inside the cloud 1.3); x/y parallax
-    // rides on top at any depth.
+    // Parallax: ease camera toward target offset. Never changes z, so
+    // depth-of-field / chat clipping don't flicker.
     camera.position.x += (parallaxTargetX - camera.position.x) * 0.04;
     camera.position.y += (parallaxTargetY - camera.position.y) * 0.04;
-    camera.position.z = CAMERA_REST_Z - (CAMERA_REST_Z - CAMERA_DIVE_Z) * dive;
-    // Look-target blend: at rest the camera studies the origin; deep in
-    // the cloud it must look FORWARD through it instead — near the
-    // origin, lookAt(0,0,0) turns tiny parallax offsets into wild
-    // rotations (the lookAt singularity).
-    camera.lookAt(0, 0, -3.5 * dive);
+    camera.position.z = parallaxCameraBaseZ;
+    camera.lookAt(0, 0, 0);
 
     // Structure changes form slowly when idle, faster when busy. "Busy"
     // is the max of an in-flight chat turn (workingState) and ambient
@@ -910,16 +752,10 @@ function animate() {
     // containing ERROR — spectacular, but the opposite of "alive".
     const connected = new Array(NODE_COUNT).fill(false);
 
-    // The web THICKENS while immersed: easing the proximity threshold
-    // up with the dive forms more links exactly when the viewer is in
-    // the middle of them (the O(n²) distances are computed either way;
-    // this only accepts more pairs, bounded by MAX_LINES).
-    const proximitySq = PROXIMITY_SQ * (1.0 + dive * 0.15);
-
     for (let i = 0; i < NODE_COUNT; i++) {
         for (let j = i + 1; j < NODE_COUNT; j++) {
             const distSq = currentPositions[i].distanceToSquared(currentPositions[j]);
-            if (distSq < proximitySq) {
+            if (distSq < PROXIMITY_SQ) {
                 {
                     connected[i] = true;
                     connected[j] = true;
@@ -992,25 +828,12 @@ function animate() {
     lUniforms.uPulseT.value = pulseT;
     lUniforms.uAccentStrength.value = accentStrength;
     lUniforms.uHueDrift.value = hueDrift;
-    lUniforms.uDive.value = dive;
-
-    // Interior motes: only rendered while actually diving.
-    motesMesh.visible = dive > 0.01;
-    if (motesMesh.visible) {
-        motesMaterial.uniforms.uTime.value = time;
-        motesMaterial.uniforms.uDive.value = dive;
-        motesMaterial.uniforms.uHueDrift.value = hueDrift;
-    }
 
     // Bloom breathes with the envelope. The old formula added
     // errorState * 2.2 (a 3x glow flashbang on any error line) and
     // pulseT * 0.5 per event — together the main source of "flashing".
-    // Immersion DAMPS bloom (×0.65 fully inside): at close range the
-    // additive quads are already bright, and the streaming reply is
-    // being read right on top of them — inside should feel vast and
-    // dim, not blinding.
     bloomPass.strength = (1.15 + workingState * 0.3 + activity * 0.35
-        + errorState * 0.5) * BLOOM_SCALE * (1.0 - 0.5 * dive);
+        + errorState * 0.5) * BLOOM_SCALE;
 
     composer.render();
 }

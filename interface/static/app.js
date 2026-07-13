@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=3.4';
+import * as matrixGraphFace from './matrix_graph.js?v=3.7';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -1528,6 +1528,11 @@ if (!window.marked || !window.DOMPurify) {
 
 // Restore the previously chosen face (default = first) and start it.
 activeFace.init();
+// Dev/verification hook: lets headless checks (Playwright) drive the
+// face's working state and read its debug state. Harmless in prod —
+// the page is key-gated and the hook mutates nothing the WS handlers
+// don't already mutate.
+window.__ghostFace = activeFace;
 loadChatState();
 connectWebSocket();
 if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();

@@ -251,13 +251,13 @@ main#chat-container {
     align-self: flex-end;
     color: #dfe3ec;
     /* Dark-blue glass — YOUR side of the conversation */
-    background: rgba(9, 13, 28, 0.62);
+    background: rgba(9, 13, 28, 0.28);
     border: 1px solid rgba(58, 95, 174, 0.35);
     border-right: 2px solid #3a5fae;
     /* Tech accent */
     border-radius: 16px 4px 16px 16px;
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
     font-family: var(--font-mono);
     font-size: 0.85rem;
     /* Technical feel */
@@ -267,13 +267,13 @@ main#chat-container {
     align-self: flex-start;
     color: #eceaf4;
     /* Deep-purple glass — the agent's side */
-    background: rgba(22, 13, 38, 0.45);
+    background: rgba(22, 13, 38, 0.20);
     border: 1px solid rgba(75, 26, 122, 0.4);
     border-left: 2px solid #4b1a7a;
     /* Agent accent */
     border-radius: 4px 16px 16px 16px;
-    backdrop-filter: blur(15px);
-    -webkit-backdrop-filter: blur(15px);
+    backdrop-filter: blur(18px);
+    -webkit-backdrop-filter: blur(18px);
     box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1);
 }
 
@@ -284,7 +284,7 @@ main#chat-container {
     color: rgba(255, 255, 255, 0.4);
     text-transform: uppercase;
     letter-spacing: 1.5px;
-    background: rgba(0, 0, 0, 0.5);
+    background: rgba(0, 0, 0, 0.3);
     border: 1px solid var(--surface-border);
     border-radius: 30px;
     padding: 8px 16px;
@@ -1325,7 +1325,7 @@ pre:hover .render-code-btn {
     bottom: 0;
     height: min(44dvh, 440px);
     z-index: 90; /* above chat, below #render-window (100) */
-    background: rgba(9, 6, 16, 0.92);
+    background: rgba(9, 6, 16, 0.58);
     border-top: 1px solid rgba(75, 26, 122, 0.55);
     box-shadow: 0 -16px 44px rgba(0, 0, 0, 0.75),
         0 0 20px rgba(75, 26, 122, 0.22);
