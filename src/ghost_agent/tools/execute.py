@@ -327,6 +327,32 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                                 _body_is_last = (_i + 3 == len(_toks))
                                 break
 
+                # AST-RESCUE (2026-07-14). Mixed/unescaped quotes defeat the
+                # shlex path above (`_quote_safe` False, or unbalanced-quote
+                # ValueError), so a long repair one-liner with both quote
+                # types got BLOCKED — in a live code-fix turn that cost a
+                # strike plus a ~4-step write-probe detour, twice. But the
+                # corruption the block protects against is bash mangling the
+                # inline form; the auto-convert transport (base64 → file)
+                # never lets bash see the body at all. So when the RAW
+                # regex-captured body parses as valid Python it is almost
+                # certainly the code the model intended — a transport-mangled
+                # or mis-captured body essentially never parses — and we can
+                # ship it as a file instead of blocking. Python only (bash
+                # has no cheap host-side parse), never a skill wrap, and no
+                # trailing pipe (regex `post` must be empty).
+                if (_bash_body is None
+                        and not _candidate_name
+                        and _inline_py_match.group("interp") != "bash"
+                        and not (_inline_py_match.group("post") or "").strip()):
+                    try:
+                        ast.parse(_body)
+                    except (SyntaxError, ValueError):
+                        pass
+                    else:
+                        _bash_body = _body
+                        _body_is_last = True
+
                 if _bash_body is not None and _body_is_last:
                     # --- AUTO-CONVERT → in-sandbox file run -------------------
                     _interp = _inline_py_match.group("interp")

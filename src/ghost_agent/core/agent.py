@@ -1727,6 +1727,57 @@ def _user_asked_for_notification(user_text) -> bool:
     return bool(_NOTIFY_INTENT_RE.search(t))
 
 
+# Trailing-promise detection (2026-07-14). A final reply whose LAST sentence
+# promises imminent action ("…Let me fix it.") means the model narrated an
+# action instead of doing it — the turn ends and nothing runs afterwards
+# (observed live: a mid-repair turn shipped exactly that, the user believed
+# the fix was applied). "let me know…" is conversational and excluded.
+_ACTION_PROMISE_RE = re.compile(
+    r"\b(?:let\s+me\s+(?!know\b)|i['’]ll\s+|i\s+will\s+"
+    r"|i\s+am\s+going\s+to\s+|now\s+i['’]m\s+going\s+to\s+|gonna\s+)",
+    re.IGNORECASE,
+)
+
+
+def _ends_with_action_promise(text) -> str:
+    """Return the final sentence of ``text`` when it promises imminent
+    action, else "". Only the LAST sentence counts — promises earlier in a
+    reply are usually followed by the action's actual result."""
+    t = str(text or "").strip()
+    if not t:
+        return ""
+    last_sentence = re.split(r"(?<=[.!?])\s+|\n+", t)[-1].strip()
+    if not last_sentence or len(last_sentence) > 120:
+        return ""
+    if _ACTION_PROMISE_RE.search(last_sentence):
+        return last_sentence
+    return ""
+
+
+#: Tools whose dropped-at-the-finish-line call means user-visible work was
+#: silently skipped (vs. terminal-tool re-calls, which are dropped by
+#: design). Used for the honesty note when force_final_response eats a call.
+_MUTATING_TOOLS_FOR_DROP_NOTE = frozenset({
+    "file_system", "execute", "manage_services", "manage_projects", "database",
+})
+
+
+def _dropped_mutation_note(dropped_names) -> str:
+    """Return the not-applied honesty note when ``dropped_names`` contains a
+    mutating tool, else "". Appended to the final reply so a fix the turn
+    closure swallowed is never presented as done."""
+    muts = sorted({str(n) for n in (dropped_names or [])
+                   if str(n) in _MUTATING_TOOLS_FOR_DROP_NOTE})
+    if not muts:
+        return ""
+    return (
+        "\n\n⚠ Note: this turn was finalized before my pending "
+        f"{', '.join(muts)} action(s) could run — any change described "
+        "above as about to happen has NOT been applied yet. Ask me to "
+        "continue to apply it."
+    )
+
+
 @dataclass
 class TurnState:
     """Turn-loop state crossing the `_dispatch_and_process_tool_batch`
@@ -8943,6 +8994,11 @@ class GhostAgent:
                 # won't call notify_operator after the alert ships its
                 # final response rather than looping).
                 notify_steer_fired = False
+                # One-shot latch for the trailing-promise guard: a final
+                # reply whose LAST sentence promises imminent action ("Let
+                # me fix it.") gets steered once to either act or state the
+                # action was not done; never loops.
+                pending_promise_steer_fired = False
                 execution_failure_count = 0
                 transient_failure_count = 0   # Separate budget for retryable errors
                 # Repeated-IDENTICAL-failure tracking. The structural strike
@@ -10945,6 +11001,18 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             "Dropping %d tool_call(s) — force_final_response is set (names=%s)",
                             len(tool_calls), dropped,
                         )
+                        # HONESTY NOTE ON DROPPED MUTATIONS (2026-07-14). When
+                        # the dropped call would have CHANGED something
+                        # (file_system replace at the finish line — observed
+                        # live 2026-07-12, twice), silently eating it leaves
+                        # the reply implying the action happened. Append an
+                        # explicit not-applied note so the user (and the next
+                        # turn's context) knows the work is still pending.
+                        # Terminal-tool re-calls (self_play etc.) stay silent —
+                        # dropping those is the point of this guard.
+                        _drop_note = _dropped_mutation_note(dropped)
+                        if _drop_note:
+                            ui_content = (ui_content or "").rstrip() + _drop_note
                         tool_calls = []
                         msg["tool_calls"] = []
 
@@ -11123,6 +11191,48 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     messages.append({"role": "user", "content": f"SYSTEM ALERT: You provided conversational text mentioning the tool `{mentioned_tools[0]}`, but you DID NOT output the actual XML `<tool_call>` block! Do not narrate your actions. Output the XML `<tool_call>` immediately."})
                                     execution_failure_count += 1
                                     continue
+
+                        # TRAILING-PROMISE GUARD (2026-07-14). The filler
+                        # guard above only fires when a TOOL NAME is
+                        # mentioned; a mid-repair turn that finalized with
+                        # "…That's what's causing the error. Let me fix it."
+                        # sailed through (observed live: the reply shipped, the
+                        # fix never ran, and the user believed it had). Fire
+                        # when the reply's LAST sentence promises imminent
+                        # action after a working turn: steer ONCE to either DO
+                        # the action now or state plainly that it was NOT
+                        # done. `has_run_tools` keeps pure conversation exempt;
+                        # "let me know…" is explicitly excluded.
+                        if (clean_ui and not pending_promise_steer_fired
+                                and not force_final_response
+                                and not is_final_generation
+                                and not force_stop
+                                and has_run_tools):
+                            _last_sentence = _ends_with_action_promise(clean_ui)
+                            if _last_sentence:
+                                pending_promise_steer_fired = True
+                                pretty_log(
+                                    "Pending-Promise Guard",
+                                    f"Final reply ends promising an action "
+                                    f"({_last_sentence[:80]!r}) — steering to "
+                                    f"act-or-admit (once).",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
+                                messages.append(msg)
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        "SYSTEM ALERT: Your reply ENDS by "
+                                        f"promising an action ({_last_sentence[:120]!r}). "
+                                        "The turn ends when you reply — nothing "
+                                        "runs afterwards. Either output the "
+                                        "tool_call(s) and DO it NOW, or rewrite "
+                                        "your final sentence to state plainly "
+                                        "that this was NOT done and what "
+                                        "remains for the user to ask for."
+                                    ),
+                                })
+                                continue
 
                         # Conversational fallback removed for smarter models.
                         if not clean_ui and not force_final_response and not is_final_generation:

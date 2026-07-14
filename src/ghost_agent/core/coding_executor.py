@@ -91,6 +91,33 @@ def _looks_like_write_error(out: str) -> bool:
     )
 
 
+def _syntax_fail_reason(path: str, out: str) -> Optional[str]:
+    """Extract the post-write syntax diagnostic from a file_system result,
+    shaped as an apply-failure reason — or None when the file parses.
+
+    file_system's write/replace paths append ``⚠ SYNTAX CHECK FAILED: …``
+    (ast/node-backed, HTML <script> blocks included) to an otherwise-
+    successful result when the file left on disk does NOT parse. The
+    interactive loop reads that warning in-context and fixes it next turn;
+    this executor used to discard it — observed live 2026-07-14: five
+    consecutive autoadvance tasks each rewrote index.html carrying the same
+    duplicate-identifier SyntaxError, every write was flagged, every task
+    still closed DONE, and the broken build was only caught when the final
+    turn browsed the page. Returning the diagnostic here feeds the
+    retry-with-feedback loop (the model gets the exact line and can fix it
+    with `edits`); on exhaust the task fails honestly instead of piling more
+    features onto a file that doesn't parse.
+    """
+    text = str(out or "")
+    idx = text.find("SYNTAX CHECK FAILED")
+    if idx < 0:
+        return None
+    diag = " ".join(text[idx:].split())[:400]
+    return (f"{path} is on disk but does NOT parse — {diag} "
+            f"Fix the syntax error with `edits` (do not rewrite the whole "
+            f"file); the task cannot complete while the file is broken.")
+
+
 # Distinctive structural identifiers (HTML ids, function/def/class/const names,
 # CSS id/class selectors) used to detect that a rewrite dropped prior work.
 _ANCHOR_RE = re.compile(
@@ -452,8 +479,17 @@ async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list) -> Optio
         if not _op_ok(out):
             return f"edit on {path} did not apply (anchor not found): {_short(out)}"
         applied += 1
+        last_out = out
     if applied == 0:
         return f"no usable edits for {path}"
+    # The LAST edit's result reflects the file's final on-disk state — the
+    # replace path appends the same syntax diagnostic writes get. (Replaces
+    # that would INTRODUCE breakage are already REJECTED by file_system's
+    # rollback guard and caught by _op_ok above; this catches edits that
+    # leave an already-broken file still broken.)
+    sfail = _syntax_fail_reason(path, last_out)
+    if sfail:
+        return sfail
     return None
 
 
@@ -490,6 +526,9 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
             return (None, f"append failed for {path}: {e}")
         if _looks_like_write_error(out):
             return (None, f"append rejected for {path}: {_short(out)}")
+        sfail = _syntax_fail_reason(path, out)
+        if sfail:
+            return (None, sfail)
         return (path, None)
 
     edits = fspec.get("edits")
@@ -531,6 +570,9 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
         return (None, f"write failed for {path}: {e}")
     if _looks_like_write_error(out):
         return (None, f"write rejected for {path}: {_short(out)}")
+    sfail = _syntax_fail_reason(path, out)
+    if sfail:
+        return (None, sfail)
     return (path, None)
 
 

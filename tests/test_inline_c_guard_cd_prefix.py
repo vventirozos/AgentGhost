@@ -35,11 +35,24 @@ _BIG_BODY = (
 
 
 @pytest.mark.asyncio
-async def test_cd_prefixed_python_c_is_blocked(tmp_path):
+async def test_cd_prefixed_python_c_is_rescued_exact(tmp_path):
+    # AST-RESCUE (2026-07-14): this used to BLOCK (unescaped inner `"`
+    # defeats the shlex path), costing a strike + a write-probe detour. The
+    # RAW regex-captured body is valid Python, so it now ships via base64 —
+    # bash never sees it — and runs as a file with the body byte-exact.
+    mgr = MagicMock()
+    mgr.execute = MagicMock(return_value=("ok", 0))
     cmd = f'cd projects/abc123/PetAI && python3 -c "{_BIG_BODY}"'
     result = await tool_execute(command=cmd, sandbox_dir=tmp_path,
-                                sandbox_manager=MagicMock())
-    assert "SYSTEM BLOCK" in result
+                                sandbox_manager=mgr)
+    assert "SYSTEM BLOCK" not in result
+    ran = mgr.execute.call_args[0][0]
+    assert "base64 -d" in ran and "_ghost_inline_" in ran
+    import base64 as _b64
+    import re as _re
+    import shlex as _shlex
+    m = _re.search(r'printf %s (.+?) \| base64 -d', ran)
+    assert _b64.b64decode(_shlex.split(m.group(1))[0]).decode() == _BIG_BODY
 
 
 @pytest.mark.asyncio
@@ -80,25 +93,36 @@ async def test_cd_prefixed_escaped_nested_quotes_auto_converts(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_unescaped_nested_quotes_still_blocked(tmp_path):
-    # BARE inner delimiter quote = the genuine bash-split corruption shape:
-    # `"x = "literal""` — bash closes the string early. Must still BLOCK.
+async def test_unescaped_nested_quotes_rescued_when_valid_python(tmp_path):
+    # BARE inner delimiter quote = the shape bash WOULD split early — but
+    # since 2026-07-14 the guard doesn't hand it to bash at all: the raw
+    # captured body parses as Python, so it auto-converts to a base64 file
+    # run with the intended quotes intact (previously a hard BLOCK).
+    mgr = MagicMock()
+    mgr.execute = MagicMock(return_value=("ok", 0))
     cmd = (
         'cd app && python3 -c "import os; '
         'label = "the current dir"; print(label, os.getcwd())"'
     )
     result = await tool_execute(command=cmd, sandbox_dir=tmp_path,
-                                sandbox_manager=MagicMock())
-    assert "SYSTEM BLOCK" in result
+                                sandbox_manager=mgr)
+    assert "SYSTEM BLOCK" not in result
+    ran = mgr.execute.call_args[0][0]
+    assert "base64 -d" in ran and "_ghost_inline_" in ran
 
 
 @pytest.mark.asyncio
-async def test_plain_python_c_still_blocked(tmp_path):
-    # No regression on the original start-anchored case.
+async def test_plain_python_c_rescued(tmp_path):
+    # Start-anchored form of the same rescue: valid-Python body with an
+    # unescaped inner quote auto-converts instead of blocking (2026-07-14).
+    mgr = MagicMock()
+    mgr.execute = MagicMock(return_value=("ok", 0))
     cmd = f'python3 -c "{_BIG_BODY}"'
     result = await tool_execute(command=cmd, sandbox_dir=tmp_path,
-                                sandbox_manager=MagicMock())
-    assert "SYSTEM BLOCK" in result
+                                sandbox_manager=mgr)
+    assert "SYSTEM BLOCK" not in result
+    ran = mgr.execute.call_args[0][0]
+    assert "base64 -d" in ran and "_ghost_inline_" in ran
 
 
 @pytest.mark.asyncio

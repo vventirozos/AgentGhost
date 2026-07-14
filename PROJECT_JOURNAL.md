@@ -766,6 +766,46 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-14l — autoadvance now consumes the write-time syntax-check signal
+First build after the 14j deploy proved the new visibility AND exposed the unwired loop: a 6-task
+WebOS autoadvance rewrote index.html 5×, EVERY write result carried `⚠ SYNTAX CHECK FAILED …
+Identifier 'WebOS' has already been declared` (the check firing for the first time in prod thanks to
+`_find_node`), yet every task closed DONE — `_looks_like_write_error` only reads the result head, and
+nothing else consumed the warning. The broken build was only caught when the final turn browsed the
+page (the agent then self-healed it — already better than the pre-14j user-paste-back loop).
+Fix (coding_executor.py): `_syntax_fail_reason(path, out)` extracts the diagnostic; all three apply
+paths (append / full-content write / edits — last edit's result = final on-disk state) return it as
+an apply FAILURE. File stays on disk (file_system semantics unchanged); the retry-with-feedback loop
+gets the exact line and a steer toward `edits`; exhausted attempts → CodingResult(ok=False) →
+`_finalize_coding` marks the task FAILED and stops the batch, instead of stacking features on a file
+that doesn't parse. Fails open when no warning present (unknown ext / node absent).
+Tests: test_autoadvance_syntax_gate.py (8: extraction, all 3 apply paths, retry-exhaust → honest FAIL,
+taint→fix→retry success). Full suite green. Docs: core/coding_executor.html (new section).
+NOT deployed — operator restarts manually.
+
+### 2026-07-14k — 14j follow-ups: finish-line honesty guards + inline `-c` AST rescue
+Closed the two "observed, deliberately unchanged" items from 14j.
+- **Trailing-promise guard (agent.py).** The 14j corrupting turn didn't hit the 40-turn cap — it
+  finalized normally on narration ("…That's what's causing the error. Let me fix it.") and the
+  conversational-filler guard only fires on tool-NAME mentions. New `_ends_with_action_promise()`:
+  last sentence ≤120 chars starting an imminent action (`let me` minus `let me know`, `I'll`,
+  `I will`, `I am going to`, `gonna`) after a tool-running turn → ONE act-or-admit steer per request
+  (latched like the notify guard; pure conversation exempt via has_run_tools).
+- **Dropped-mutation honesty note (agent.py).** force_final_response drops queued tool_calls by
+  design (post-terminal-tool hallucinations), but a dropped MUTATING call (file_system/execute/
+  manage_services/manage_projects/database — observed 2026-07-12 ×2 eating file_system at the finish
+  line) left the reply implying the work ran. `_dropped_mutation_note()` appends "⚠ … has NOT been
+  applied yet" to the final reply; terminal-tool drops stay silent.
+- **Inline `-c` AST rescue (execute.py).** The auto-convert's quote-safe gate is a proxy for "shlex
+  can reconstruct bash's view" — irrelevant to the base64 transport, which never lets bash see the
+  body. A long valid-Python body mixing quote types (the 14j 769-char cleanup script, blocked twice)
+  now rescues: shlex path unavailable → `ast.parse(raw regex-captured body)` → parses → ship
+  byte-exact via base64. Python only, no skill wraps, no trailing pipe; invalid bodies still BLOCK.
+  3 stale tests in test_inline_c_guard_cd_prefix.py updated to the new (strictly better) expectation.
+Tests: test_pending_action_and_inline_rescue.py (14). Full suite green. Docs: core/agent.html
+(finish-line honesty guards), tools/execute.html (AST-rescue section + stale "still blocks" line).
+NOT deployed — operator restarts manually (14j + 14k ship together).
+
 ### 2026-07-14j — "correct code" failure chain: marker-leak replace parser + 3 compounding guards
 Operator report: "when I ask it to correct code it consistently fails — LLM or us?" Verdict: **us.**
 Trajectory trawl (394 records, 07-12→14) + live-stream forensics on the WebOS episode showed the model's
@@ -790,9 +830,9 @@ declarations; the user's next two messages were the browser errors. Four compoun
 `[SYSTEM ERROR]: Process failed (Exit 1) with no output.` sentinel — the agent couldn't verify its own fix
 (3 identical `====` searches burned turns; execute.py had this normalization since the chess session,
 search didn't). Ported: exit 1 + empty/sentinel output → "Report: No matches found…"; exit 2 passes through.
-Secondary observations from the trawl (not changed here): the corrupting turn hit the n_steps=31 cap at
-literally "Let me fix it" (wrap-up message should state the fix was NOT applied); inline `python -c` guard
-cost ~4 steps/turn in repair loops (working as designed). Tests: test_replace_marker_leak_guard.py (16).
+Secondary observations from the trawl — BOTH CLOSED same day in 14k (trailing-promise guard +
+dropped-mutation note + inline `-c` AST rescue): the corrupting turn ended at n_steps=31 at literally
+"Let me fix it"; inline `python -c` guard cost ~4 steps/turn in repair loops. Tests: test_replace_marker_leak_guard.py (16).
 Full suite green. Docs: tools/file_system.html (new 2026-07-14 section + ops-table rows).
 
 ### 2026-07-14i — search fetch + 4 unreviewed tools (database/report_pdf/image_gen/system)
