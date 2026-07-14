@@ -66,8 +66,13 @@ MAX_BOUND_VALUE_CHARS = 16000
 
 _BIND_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 
+# Parallel-mode fan-out window. Most steps ultimately hit the single-slot
+# local llama server (searches, LLM-backed tools), so an unbounded gather
+# of 20 steps would stampede it; 4 keeps the pipeline busy without that.
+_PARALLEL_STEP_CONCURRENCY = 4
 
-def _validate_dataflow(steps, mode: str):
+
+def _validate_dataflow(steps, mode: str, branches=None):
     """Reject a macro whose `save_as`/`$var` wiring can't work at runtime.
     Returns an error string, or None when the data-flow is sound.
 
@@ -79,40 +84,55 @@ def _validate_dataflow(steps, mode: str):
         simultaneously, so no sibling can observe another's result.
     A name that is never produced by any step is fine: it's a runtime
     param the caller supplies (that's the pre-existing contract).
+
+    ``branches`` (2026-07-14): each branch sequence gets the same checks.
+    A branch step may freely reference MAIN-step bindings (at runtime the
+    branch runs after the branching step, so main bindings bound up to that
+    point are in scope) — only within-branch ordering is enforced.
     """
-    produced_at = {}
-    for i, st in enumerate(steps):
-        if st.save_as:
-            if st.save_as in produced_at:
-                return (f"Error: step {i + 1} re-binds 'save_as' name "
-                        f"{st.save_as!r} already bound by step "
-                        f"{produced_at[st.save_as] + 1} — use a distinct name.")
-            produced_at[st.save_as] = i
-    if not produced_at:
-        return None
-    if mode == "parallel":
-        return ("Error: 'save_as' data-flow requires mode='sequential' — "
-                "parallel steps start simultaneously, so a step cannot "
-                "consume a sibling's result.")
-    for i, st in enumerate(steps):
-        if not isinstance(st.param_template, dict):
-            continue
-        for key, v in st.param_template.items():
-            if not isinstance(v, str) or "$" not in v:
+    def _check_seq(seq, label):
+        produced_at = {}
+        for i, st in enumerate(seq):
+            if st.save_as:
+                if st.save_as in produced_at:
+                    return (f"Error: {label} {i + 1} re-binds 'save_as' name "
+                            f"{st.save_as!r} already bound by {label} "
+                            f"{produced_at[st.save_as] + 1} — use a distinct name.")
+                produced_at[st.save_as] = i
+        if not produced_at:
+            return None
+        if mode == "parallel":
+            return ("Error: 'save_as' data-flow requires mode='sequential' — "
+                    "parallel steps start simultaneously, so a step cannot "
+                    "consume a sibling's result.")
+        for i, st in enumerate(seq):
+            if not isinstance(st.param_template, dict):
                 continue
-            for mo in _VAR_RE.finditer(v):
-                nm = mo.group(1) or mo.group(2)
-                src = produced_at.get(nm)
-                if src is None:
-                    continue  # runtime param — supplied by the caller
-                if src == i:
-                    return (f"Error: step {i + 1} param {key!r} references "
-                            f"${nm}, which the SAME step produces — a step "
-                            f"cannot consume its own output.")
-                if src > i:
-                    return (f"Error: step {i + 1} param {key!r} references "
-                            f"${nm}, but step {src + 1} produces it — "
-                            f"bindings only flow forward. Reorder the steps.")
+            for key, v in st.param_template.items():
+                if not isinstance(v, str) or "$" not in v:
+                    continue
+                for mo in _VAR_RE.finditer(v):
+                    nm = mo.group(1) or mo.group(2)
+                    src = produced_at.get(nm)
+                    if src is None:
+                        continue  # runtime param or a main-step binding
+                    if src == i:
+                        return (f"Error: {label} {i + 1} param {key!r} references "
+                                f"${nm}, which the SAME step produces — a step "
+                                f"cannot consume its own output.")
+                    if src > i:
+                        return (f"Error: {label} {i + 1} param {key!r} references "
+                                f"${nm}, but {label} {src + 1} produces it — "
+                                f"bindings only flow forward. Reorder the steps.")
+        return None
+
+    err = _check_seq(steps, "step")
+    if err:
+        return err
+    for bname, bsteps in (branches or {}).items():
+        err = _check_seq(bsteps, f"branch {bname!r} step")
+        if err:
+            return err
     return None
 
 
@@ -157,8 +177,15 @@ def _step_result_ok(result_str: str) -> bool:
     m = re.search(r"EXIT CODE:\s*(\d+)", s)
     if m:
         return m.group(1) == "0"
+    # "SYSTEM INSTRUCTION:" and "REJECTED:" are file_system's hard-failure
+    # prefixes (missing params, replace block not found, syntax-regression
+    # rollback) — they used to count as SUCCESSES here, inflating macro
+    # success_rate. Prefix-only checks: a SUCCESS message that merely
+    # *contains* "SYSTEM INSTRUCTION" mid-text (e.g. a partial aider-block
+    # report) still counts as ok.
     return not s.startswith(
-        ("[error]", "Error", "ERROR", "SYSTEM ERROR", "Traceback")
+        ("[error]", "Error", "ERROR", "SYSTEM ERROR", "Traceback",
+         "SYSTEM INSTRUCTION", "REJECTED")
     )
 
 
@@ -335,19 +362,9 @@ class ComposedSkillRegistry:
         logger.info("Registered composed skill: %s (%d steps)", skill.name, len(skill.steps))
         return True
 
-    def find_matching(self, query: str, limit: int = 3) -> List[ComposedSkill]:
-        """Find composed skills matching a query by keyword overlap."""
-        if not query or not self.skills:
-            return []
-        query_words = set(query.lower().split())
-        scored = []
-        for skill in self.skills.values():
-            trigger_words = set(skill.trigger_description.lower().split())
-            overlap = len(query_words & trigger_words)
-            if overlap > 0:
-                scored.append((skill, overlap))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return [s for s, _ in scored[:limit]]
+    # NOTE: a keyword-overlap `find_matching(query)` used to live here — it
+    # had zero callers in the runtime (macro discovery happens via the tool
+    # definitions the LLM sees), so it was removed 2026-07-14 as dead code.
 
     def record_usage(self, skill_name: str, success: bool):
         """Record that a composed skill was used."""
@@ -406,20 +423,30 @@ class ComposedSkillRegistry:
             # Referenced names minus names BOUND by an earlier step's
             # `save_as`: an internally-produced value is not a runtime
             # param, so advertising it would ask the LLM to supply
-            # something the pipeline computes for itself.
+            # something the pipeline computes for itself. Branch steps are
+            # mined too (they run after the main steps, so main bindings
+            # count as produced for them) — a runtime param used ONLY inside
+            # a branch was previously never advertised.
             param_keys: set = set()
-            produced: set = set()
-            for step in skill.steps:
-                if isinstance(step.param_template, dict):
-                    for v in step.param_template.values():
-                        if isinstance(v, str) and "$" in v:
-                            for mo in _VAR_RE.finditer(v):
-                                nm = mo.group(1) or mo.group(2)
-                                if nm not in produced:
-                                    param_keys.add(nm)
-                if step.save_as:
-                    produced.add(step.save_as)
-            param_keys -= produced
+
+            def _mine(seq, produced_seed):
+                produced = set(produced_seed)
+                for step in seq:
+                    if isinstance(step.param_template, dict):
+                        for v in step.param_template.values():
+                            if isinstance(v, str) and "$" in v:
+                                for mo in _VAR_RE.finditer(v):
+                                    nm = mo.group(1) or mo.group(2)
+                                    if nm not in produced:
+                                        param_keys.add(nm)
+                    if step.save_as:
+                        produced.add(step.save_as)
+                return produced
+
+            main_produced = _mine(skill.steps, set())
+            for _bsteps in skill.branches.values():
+                _mine(_bsteps, main_produced)
+            param_keys -= main_produced
             properties = {
                 k: {"type": "string", "description": f"Runtime value for ${k}."}
                 for k in sorted(param_keys)
@@ -560,7 +587,19 @@ class ComposedSkillRegistry:
                 # deliberately reference it — and a downstream step gets ""
                 # rather than a stale binding from a previous execution.
                 if step.save_as:
-                    scope[step.save_as] = result_str[:MAX_BOUND_VALUE_CHARS]
+                    bound_val = result_str
+                    if len(bound_val) > MAX_BOUND_VALUE_CHARS:
+                        # NEVER truncate silently (same policy as the display
+                        # cap): a downstream step consuming a cut-off body
+                        # must be able to SEE it was cut, not act on partial
+                        # data believing it is complete.
+                        bound_val = (
+                            bound_val[:MAX_BOUND_VALUE_CHARS]
+                            + f"\n…[binding truncated: this step's output "
+                              f"exceeded the {MAX_BOUND_VALUE_CHARS}-char "
+                              f"save_as cap]"
+                        )
+                    scope[step.save_as] = bound_val
                     if step.save_as not in bound:
                         bound.append(step.save_as)
                 results.append({
@@ -626,28 +665,17 @@ class ComposedSkillRegistry:
         validation path (`_validate_dataflow`) rejects a parallel macro that
         references a step-produced name, so this can't be authored by
         accident.
+
+        Fan-out is BOUNDED by a semaphore: most steps land on the single-slot
+        local llama box (searches, LLM-backed tools), and an unbounded
+        20-step macro would stampede it. Steps beyond the window queue and
+        start as slots free up — all of them still run.
         """
+        sem = asyncio.Semaphore(_PARALLEL_STEP_CONCURRENCY)
+
         async def _run_step(step: "SkillStep") -> Dict[str, Any]:
-            resolved_args = self._resolve_args(step, params)
-            try:
-                result = await executor(step.tool_name, resolved_args)
-                result_str = str(result)
-                # Classify from the RESULT — tools return error strings.
-                return {
-                    "step": step.description,
-                    "tool": step.tool_name,
-                    "result": _cap_step_result(result_str),
-                    "success": _step_result_ok(result_str),
-                    "optional": step.optional,
-                }
-            except Exception as exc:
-                return {
-                    "step": step.description,
-                    "tool": step.tool_name,
-                    "error": str(exc),
-                    "success": False,
-                    "optional": step.optional,
-                }
+            async with sem:
+                return await self._run_parallel_step(step, executor, params)
 
         results = list(await asyncio.gather(*[_run_step(s) for s in skill.steps]))
         # A step is "tolerated" if it succeeded or was declared optional.
@@ -661,6 +689,31 @@ class ComposedSkillRegistry:
             "total_steps": len(skill.steps),
             "mode": "parallel",
         }
+
+    async def _run_parallel_step(self, step: "SkillStep",
+                                 executor: Callable,
+                                 params: Dict[str, Any]) -> Dict[str, Any]:
+        """Run ONE parallel-mode step and classify its result (tools return
+        error strings, not raises)."""
+        resolved_args = self._resolve_args(step, params)
+        try:
+            result = await executor(step.tool_name, resolved_args)
+            result_str = str(result)
+            return {
+                "step": step.description,
+                "tool": step.tool_name,
+                "result": _cap_step_result(result_str),
+                "success": _step_result_ok(result_str),
+                "optional": step.optional,
+            }
+        except Exception as exc:
+            return {
+                "step": step.description,
+                "tool": step.tool_name,
+                "error": str(exc),
+                "success": False,
+                "optional": step.optional,
+            }
 
 
 def _registry_from_context(context) -> Optional[ComposedSkillRegistry]:
@@ -855,18 +908,24 @@ def register_composed_skill_runners(tools: Dict[str, Callable], context) -> int:
 async def tool_manage_composed_skills(context=None, action: str = None,
                                       name: str = None, description: str = None,
                                       steps=None, mode: str = "parallel",
-                                      known_tools=None, **_extra):
-    """Define / list / delete composed skills — named macros that bundle
-    several tool calls into ONE invocation.
+                                      known_tools=None, branches=None, **_extra):
+    """Define / list / approve / delete composed skills — named macros that
+    bundle several tool calls into ONE invocation.
 
     Actions
     -------
     define : register a new macro. ``steps`` is a list of
-        ``{tool, description, params, optional}`` objects. ``mode`` is
-        ``"parallel"`` (default — fan out independent steps) or
-        ``"sequential"`` (ordered). The macro becomes a top-level tool the
-        agent invokes by ``name``.
+        ``{tool, description, params, optional, save_as, branch_condition,
+        branch_target}`` objects. ``mode`` is ``"parallel"`` (default — fan
+        out independent steps) or ``"sequential"`` (ordered; required for
+        save_as data-flow and branching). ``branches`` (optional, sequential
+        only) maps a branch name to its own step list; a step whose result
+        contains its ``branch_condition`` substring jumps to the
+        ``branch_target`` sequence. The macro becomes a top-level tool the
+        agent invokes by ``name``. An existing name is NOT overwritten —
+        delete it first.
     list   : show all registered macros.
+    approve: activate a proposed (auto-discovered) macro.
     delete : remove one by ``name``.
     """
     if not action:
@@ -945,42 +1004,110 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         if known_tools and name in known_tools:
             return (f"Error: '{name}' is already a built-in/acquired tool; a "
                     "composed skill can't shadow it. Choose a different name.")
+        # No silent overwrite: `register()` replaces the object, which also
+        # resets usage/success stats — a name typo could clobber a tuned
+        # macro. Replacement must be explicit: delete, then define.
+        if name in reg.skills:
+            existing = reg.skills[name]
+            return (f"Error: composed skill '{name}' already exists "
+                    f"(status={existing.status}, {len(existing.steps)} steps, "
+                    f"used {existing.usage_count}x). To replace it, delete it "
+                    f"first: manage_composed_skills(action='delete', "
+                    f"name='{name}').")
         if not isinstance(steps, list) or not steps:
             return "Error: 'steps' must be a non-empty list of step objects."
         mode = str(mode or "parallel").strip().lower()
         if mode not in ("parallel", "sequential"):
             return "Error: 'mode' must be 'parallel' or 'sequential'."
 
-        skill_steps: List[SkillStep] = []
         unknown_tools: List[str] = []
-        for i, raw in enumerate(steps):
-            if not isinstance(raw, dict):
-                return f"Error: step {i + 1} must be an object, got {type(raw).__name__}."
-            tool = (raw.get("tool") or raw.get("tool_name") or "").strip()
-            if not tool:
-                return f"Error: step {i + 1} is missing 'tool'."
-            if tool == name:
-                return (f"Error: step {i + 1} references the macro itself "
-                        f"('{name}') — composed skills cannot recurse.")
-            if known_tools and tool not in known_tools:
-                unknown_tools.append(tool)
-            params = raw.get("params") or raw.get("param_template") or {}
-            if not isinstance(params, dict):
-                return f"Error: step {i + 1} 'params' must be an object."
-            save_as = (raw.get("save_as") or raw.get("saveAs") or "").strip()
-            if save_as and not _BIND_NAME_RE.fullmatch(save_as):
-                return (f"Error: step {i + 1} 'save_as' must be a plain "
-                        f"identifier (letters/digits/underscore), got "
-                        f"{save_as!r}.")
-            skill_steps.append(SkillStep(
-                tool_name=tool,
-                description=(raw.get("description") or f"Step {i + 1}"),
-                param_template=params,
-                optional=bool(raw.get("optional", False)),
-                save_as=save_as,
-            ))
 
-        df_err = _validate_dataflow(skill_steps, mode)
+        def _parse_steps(raw_list, label):
+            """Parse a list of raw step objects → (steps, error)."""
+            parsed: List[SkillStep] = []
+            for i, raw in enumerate(raw_list):
+                if not isinstance(raw, dict):
+                    return None, f"Error: {label} {i + 1} must be an object, got {type(raw).__name__}."
+                tool = (raw.get("tool") or raw.get("tool_name") or "").strip()
+                if not tool:
+                    return None, f"Error: {label} {i + 1} is missing 'tool'."
+                if tool == name:
+                    return None, (f"Error: {label} {i + 1} references the macro itself "
+                                  f"('{name}') — composed skills cannot recurse.")
+                if known_tools and tool not in known_tools:
+                    unknown_tools.append(tool)
+                params = raw.get("params") or raw.get("param_template") or {}
+                if not isinstance(params, dict):
+                    return None, f"Error: {label} {i + 1} 'params' must be an object."
+                save_as = (raw.get("save_as") or raw.get("saveAs") or "").strip()
+                if save_as and not _BIND_NAME_RE.fullmatch(save_as):
+                    return None, (f"Error: {label} {i + 1} 'save_as' must be a plain "
+                                  f"identifier (letters/digits/underscore), got "
+                                  f"{save_as!r}.")
+                b_cond = str(raw.get("branch_condition") or "").strip()
+                b_target = str(raw.get("branch_target") or "").strip()
+                if bool(b_cond) != bool(b_target):
+                    _have = "branch_condition" if b_cond else "branch_target"
+                    return None, (f"Error: {label} {i + 1} sets {_have} without its "
+                                  f"counterpart — a branching step needs BOTH "
+                                  f"branch_condition (substring to match in the "
+                                  f"result) AND branch_target (a key in 'branches').")
+                parsed.append(SkillStep(
+                    tool_name=tool,
+                    description=(raw.get("description") or f"Step {i + 1}"),
+                    param_template=params,
+                    optional=bool(raw.get("optional", False)),
+                    save_as=save_as,
+                    branch_condition=b_cond,
+                    branch_target=b_target,
+                ))
+            return parsed, None
+
+        skill_steps, err = _parse_steps(steps, "step")
+        if err:
+            return err
+
+        # Branch sequences (2026-07-14): previously the executor honoured
+        # branches but NOTHING could author them — the fields existed only
+        # for hand-edited JSON. `branches` maps a name to its own step list;
+        # a step whose result contains its branch_condition jumps there.
+        skill_branches: Dict[str, List[SkillStep]] = {}
+        if branches:
+            if not isinstance(branches, dict):
+                return ("Error: 'branches' must be an object mapping a branch "
+                        "name to a list of step objects.")
+            if mode != "sequential":
+                return ("Error: branching requires mode='sequential' — parallel "
+                        "steps have no ordered result to branch on.")
+            for bname, braw in branches.items():
+                bname_s = str(bname).strip()
+                if not bname_s or not _BIND_NAME_RE.fullmatch(bname_s):
+                    return (f"Error: branch name {bname!r} must be a plain "
+                            f"identifier (letters/digits/underscore).")
+                if not isinstance(braw, list) or not braw:
+                    return (f"Error: branch '{bname_s}' must be a non-empty "
+                            f"list of step objects.")
+                bsteps, err = _parse_steps(braw, f"branch '{bname_s}' step")
+                if err:
+                    return err
+                skill_branches[bname_s] = bsteps
+
+        # Every branch_target must resolve to a defined branch — otherwise
+        # the jump silently falls through at runtime and the "alternative
+        # path" never runs.
+        _all_steps = list(skill_steps) + [
+            s for bs in skill_branches.values() for s in bs
+        ]
+        for st in _all_steps:
+            if st.branch_target and st.branch_target not in skill_branches:
+                return (f"Error: branch_target '{st.branch_target}' has no "
+                        f"matching entry in 'branches' — pass "
+                        f"branches={{'{st.branch_target}': [ …steps ]}}.")
+        if mode == "parallel" and any(st.branch_condition for st in skill_steps):
+            return ("Error: branching requires mode='sequential' — parallel "
+                    "steps have no ordered result to branch on.")
+
+        df_err = _validate_dataflow(skill_steps, mode, skill_branches)
         if df_err:
             return df_err
 
@@ -988,17 +1115,22 @@ async def tool_manage_composed_skills(context=None, action: str = None,
             name=name,
             trigger_description=description,
             steps=skill_steps,
+            branches=skill_branches,
             execution_mode=mode,
         )
         reg.register(skill)
         pretty_log(
             "Macro Defined",
-            f"Composed skill '{name}' ({len(skill_steps)} steps, {mode}).",
+            f"Composed skill '{name}' ({len(skill_steps)} steps, {mode}"
+            + (f", {len(skill_branches)} branch(es)" if skill_branches else "")
+            + ").",
             icon=Icons.MEM_SAVE,
         )
         msg = (
             f"Success: composed skill '{name}' defined with {len(skill_steps)} "
-            f"steps ({mode} mode). It is now a TOP-LEVEL TOOL — invoke it by "
+            f"steps ({mode} mode"
+            + (f", branches: {', '.join(sorted(skill_branches))}" if skill_branches else "")
+            + f"). It is now a TOP-LEVEL TOOL — invoke it by "
             f"name like any built-in; its steps run and the combined results "
             f"come back for you to synthesise."
         )

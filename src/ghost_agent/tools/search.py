@@ -673,53 +673,75 @@ async def tool_deep_research(query: Optional[str] = None, anonymous: bool = Fals
     return f"--- DEEP RESEARCH RESULT ---\n{full_report}\n\nSYSTEM INSTRUCTION: Analyze the text above."
 
 async def tool_fact_check(query: Optional[str] = None, statement: Optional[str] = None, llm_client=None, tool_definitions=None, deep_research_callable: Optional[Callable] = None, model_name: str = "qwen-3.6-35b-a3", max_context: int = 8192, **kwargs: Any):
-    query_text = query or statement or kwargs.get("query") or kwargs.get("statement", "")
-    from ..core.agent import extract_json_from_text
+    """Verify a claim: run deep_research on it, then have the model judge the
+    claim strictly against that evidence.
+
+    2026-07-14 rewrite. The old flow spent a whole LLM round asking the model
+    to emit a FORCED deep_research tool call (``tool_choice`` pinned it) just
+    to rephrase the claim into a query — and when the model answered in plain
+    content instead (the documented native-tools transport corruption family),
+    the function fell off the end and returned ``None`` to the dispatcher. It
+    also broke whenever ``tool_definitions`` didn't contain deep_research
+    (subagent allowlists): forcing a function that isn't in ``tools`` is
+    undefined server behaviour. The research call is now made DIRECTLY with
+    the claim as the query: one less LLM round, no forced-tool fragility, no
+    ``None`` path. ``tool_definitions`` is accepted for back-compat but no
+    longer used.
+    """
+    query_text = str(query or statement or kwargs.get("query")
+                     or kwargs.get("statement") or "").strip()
+    if not query_text:
+        return ("Error: fact_check needs the claim to verify — call it as "
+                "fact_check(query='<the exact claim>').")
     pretty_log("Fact Check", query_text[:50] + "..", icon=Icons.TOOL_DEEP)  # type: ignore
-    
-    allowed_names = ["deep_research"]
-    restricted_tools = [t for t in (tool_definitions or []) if t["function"]["name"] in allowed_names]
-    
+
+    if deep_research_callable is None or llm_client is None:
+        return ("Error: fact_check is unavailable in this context (research/"
+                "LLM clients not wired). Use deep_research or web_search directly.")
+
+    try:
+        dr_result = str(await deep_research_callable(query_text))
+    except Exception as exc:
+        return (f"Error: fact_check research phase failed: {exc}. "
+                f"Try web_search or deep_research directly.")
+
+    # Bound the evidence spliced into the verify prompt the same way raw file
+    # reads are bounded (chars ≈ tokens · 3.5) — deep_research can return up
+    # to 8 sources × 10 KB, and `max_context` was previously accepted here but
+    # never used, so nothing stopped the verify call from overflowing.
+    evidence_cap = max(20_000, int(max_context * 3.5 * 0.30))
+    if len(dr_result) > evidence_cap:
+        dr_result = (dr_result[:evidence_cap]
+                     + "\n…[evidence truncated to fit the verification context]")
+
     messages = [
-        {"role": "system", "content": "### ROLE: DEEP FORENSIC VERIFIER\nVerify this claim with deep_research."},
-        {"role": "user", "content": query_text}
+        {"role": "system", "content": (
+            "### ROLE: DEEP FORENSIC VERIFIER\n"
+            "Judge the user's claim STRICTLY against the research evidence "
+            "provided in the message. Open with a one-word verdict — TRUE, "
+            "FALSE, PARTIALLY TRUE, or UNVERIFIABLE — then cite the key "
+            "evidence for it and note any disagreement between sources.")},
+        {"role": "user", "content": (
+            f"CLAIM TO VERIFY:\n{query_text}\n\n[RESEARCH RESULTS]:\n{dr_result}\n\n"
+            f"Verify the claim precisely using these results.")},
     ]
-    
-    payload = {
-        "model": model_name,
-        "messages": messages,
-        "temperature": 0.1,
-        "tools": restricted_tools,
-        "tool_choice": {"type": "function", "function": {"name": "deep_research"}}
-    }
-    
-    plan_response = await llm_client.chat_completion(payload)
-    ai_msg = plan_response["choices"][0]["message"]
-    
-    if ai_msg.get("tool_calls"):
-        t_call = ai_msg["tool_calls"][0]["function"]
-        t_args_raw = t_call.get("arguments", {})
-        
-        t_args_dict = {}
-        if isinstance(t_args_raw, str):
-            try: t_args_dict = json.loads(t_args_raw)
-            except: pass
-        elif isinstance(t_args_raw, dict):
-            t_args_dict = t_args_raw
-            
-        q = t_args_dict.get("query", query_text)
-        dr_result = await deep_research_callable(q)
-        
-        # Bypass inserting formal API `tool_calls` back into context.
-        # This prevents Llama-Server's Chat Template vs API Schema paradox from crashing
-        # when it requires JSON strings but Jinja requires Python Dictionaries.
-        messages.append({
-            "role": "user", 
-            "content": f"The `deep_research` tool successfully executed for '{q}'.\n\n[RESEARCH RESULTS]:\n{dr_result}\n\nVerify the original claim precisely using these results."
-        })
-        
-        verify_payload = {"model": model_name, "messages": messages, "temperature": 0.1}
-        final_res = await llm_client.chat_completion(verify_payload)
-        return f"FACT CHECK COMPLETE:\n{final_res['choices'][0]['message'].get('content', '')}"
-    
+    try:
+        final_res = await llm_client.chat_completion(
+            {"model": model_name, "messages": messages, "temperature": 0.1})
+        # `or ""`: some OpenAI-compatible servers send content: null — .get's
+        # default doesn't cover an EXISTING null key (same coercion bug class
+        # fixed in vision.py), which rendered "FACT CHECK COMPLETE:\nNone".
+        verdict = (final_res["choices"][0]["message"].get("content") or "").strip()
+    except Exception as exc:
+        # The research itself succeeded — hand the evidence back instead of
+        # dropping the whole result on a verify-call hiccup.
+        return (f"FACT CHECK PARTIAL: the verification call failed ({exc}); "
+                f"judge the claim from the raw research results below.\n"
+                f"[RESEARCH RESULTS]:\n{dr_result}")
+    if not verdict:
+        return (f"FACT CHECK PARTIAL: the verifier returned no text; judge the "
+                f"claim from the raw research results below.\n"
+                f"[RESEARCH RESULTS]:\n{dr_result}")
+    return f"FACT CHECK COMPLETE:\n{verdict}"
+
     return "SYSTEM ERROR: You failed to use the required `deep_research` tool. You must retry your action AND USE THE TOOL to fact check this claim."

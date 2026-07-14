@@ -137,14 +137,14 @@ class GhostFileSystem(BaseTool):
         {
             'name': 'operation',
             'type': 'string',
-            'enum': ["read", "read_chunked", "inspect", "search", "list_files", "write", "replace", "download", "copy", "rename", "move", "delete"],
+            'enum': ["read", "read_chunked", "inspect", "search", "find", "list_files", "write", "replace", "download", "copy", "rename", "move", "delete"],
             'description': "The exact operation to perform.",
             'required': True
         },
         {
             'name': 'path',
             'type': 'string',
-            'description': "The target file or directory path relative to the active project root.",
+            'description': "The target file or directory path relative to the active project root. For operation='list_files', pass a subdirectory to list just that subtree (omit for the workspace root). Container-absolute '/workspace/...' paths are also accepted.",
             'required': True
         },
         {
@@ -215,6 +215,13 @@ class GhostFileSystem(BaseTool):
         # so the alternate Qwen-Agent runtime doesn't silently write to root.
         sandbox_dir = project_scoped_sandbox(_ctx)[0]
         tor_proxy = getattr(_ctx, 'tor_proxy', None)
+        # search/find shell out via the sandbox manager; without it they died
+        # with "'NoneType' object has no attribute 'execute'" on this runtime
+        # (the registry path always passed it). max_context / read_budget
+        # keep the read caps consistent with the registry path too.
+        sandbox_manager = getattr(_ctx, 'sandbox_manager', None)
+        max_context = getattr(getattr(_ctx, 'args', None), 'max_context', 8192) or 8192
+        read_budget = getattr(_ctx, '_read_budget', None)
 
         # Generic pass-through: anything in `params` or `kwargs` we didn't
         # explicitly name above still goes to the native handler. Without
@@ -223,12 +230,14 @@ class GhostFileSystem(BaseTool):
         # disappeared between the qwen tool wrapper and the underlying
         # implementation.
         _named = {"operation", "path", "page", "chunk_size", "content",
-                  "replace_with", "destination", "pattern", "url"}
+                  "replace_with", "destination", "pattern", "url",
+                  "sandbox_manager", "max_context", "read_budget"}
         extra = {k: v for k, v in params.items() if k not in _named}
         # `kwargs` here are agent-runtime kwargs from BaseTool.call(); merge
         # them in too so nothing is lost.
         for k, v in kwargs.items():
-            extra.setdefault(k, v)
+            if k not in _named:
+                extra.setdefault(k, v)
 
         return _run_coro_blocking(tool_file_system(
             operation=operation,
@@ -242,6 +251,9 @@ class GhostFileSystem(BaseTool):
             url=url,
             sandbox_dir=sandbox_dir,
             tor_proxy=tor_proxy,
+            sandbox_manager=sandbox_manager,
+            max_context=max_context,
+            read_budget=read_budget,
             **extra
         ))
 

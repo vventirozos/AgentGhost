@@ -766,6 +766,121 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-14f — first-request latency: main-node prefix warmup (~70s → ~20-25s expected)
+Operator report: first request of a session prefills 32-33k tokens ≈ 1 minute (KV cache fine after).
+Diagnosis: prefill measured at ~450 tok/s (llama-server.log); the rendered head = system slot
+(SYSTEM_PROMPT+profile, 14.3KB) + native tool schemas (63KB, 39 tools — the whale, rendered by the
+chat template right after the system text) ≈ 20-24k tokens, and it is BYTE-STABLE across
+conversations (continuity blocks were already moved to the tail injection for cache stability;
+`working_memory_context` is a vestige, always ""). Divergence only starts at the query-routed
+acquired-skill tail + hydrated memory in user msg 1.
+Fix: `GhostAgent.warm_up_main_prefix()` — one background max_tokens=1 request at lifespan start
+carrying the byte-exact head, built through the SAME code paths as a live request
+(_RequestState.get_profile_str → SYSTEM_PROMPT splice + perfect_it mutation; get_active_tool_defs
+for tools). is_background=True targets the main slot but yields to any live foreground request;
+best-effort (failures debug-logged); opt-out GHOST_MAIN_PREFIX_WARMUP=0. Sibling of
+warm_up_workers (2026-07-12, off-main nodes). Expected: first user request pays only its unique
+tail (~8-10k tokens ≈ 20-25s instead of ~70s). NOTE: warmup covers agent boot; a llama-server
+restart mid-session wipes the cache until the next agent deploy (acceptable — they usually
+co-restart). Operator is separately testing --ubatch-size 2048 for raw prefill throughput.
+Tests: tests/test_main_prefix_warmup.py (8). Docs: docs/core/llm.html (new section).
+
+### 2026-07-14e — browser tool audit: the text-preview feature never reached the model (formatter dropped it)
+Same review-then-fix pass as 14c/14d, over `tools/browser.py` (1895 lines incl. the in-sandbox runner).
+- **HEADLINE: navigate/click formatters silently DROPPED the runner's ~8KB text preview.** The
+  2026-07-07 nav-preview feature (one op instead of navigate→extract_text, each a full Chromium
+  relaunch + Tor re-fetch) was computed and shipped by the runner — and discarded by the host-side
+  result formatter. The runner side was tested; the formatter wasn't. `click` also dropped the
+  captured JS diagnostics (a click that crashed page JS looked identical to one that worked). Both
+  now render a PAGE TEXT block (+ js_errors for click).
+- **Render-check false positive**: `analyze_screenshot_render` flagged ANY frame ≥80% one colour as
+  BLANK — i.e. every white-background TEXT page. Poisoned evidence invites the verifier to refute
+  true "it renders" claims. Uniform now requires few distinct colour buckets too
+  ((≥80% AND ≤24 buckets) or ≤6 buckets) — sky/loading frames still flagged, docs pages pass.
+- **Interact screenshots bypassed the render check entirely** (only the atomic screenshot op was
+  checked) → container→host path map at sanitise time; every interact capture now gets RENDER_CHECK.
+- **Dead/broken knobs**: `nav_text_chars` was never plumbed host→runner (the preview size was
+  unconfigurable); `post_click_ms` likewise; `settle_ms="2s"` raised a raw ValueError OUT of the tool
+  (now `_safe_int`). Schema now advertises settle_ms/click_center/nav_text_chars (previously
+  learnable only from error-hint text).
+- **KNOWN RESIDUAL (documented, not fixed)**: Playwright's `ctx.route()` cannot intercept
+  WebSockets, so the in-runner SSRF interceptor doesn't vet ws:// — exploitable only while a
+  supervised service is running (the `<loopback>` proxy bypass opens all loopback ports and the
+  port gate doesn't apply to WS). Chromium has no disable-WS flag; documented in
+  docs/tools/browser.html with the exposure analysis.
+Tests: tests/test_browser_formatter_and_render_fixes.py (9 new); all 204 existing browser tests
+green unchanged. Also updated 4 stale fact_check tests + 1 binding-cap test (pinned the pre-14d
+behavior — the 14d full-suite run caught them). Docs: docs/tools/browser.html.
+
+### 2026-07-14d — fact_check / vision / composed_skills audit: 1 security hole, 2 correctness bugs, 2 silent truncations, 2 dead-feature closures
+Follow-up to 14c: reviewed the three never-reviewed subsystems, then fixed everything found.
+- **vision SSRF-via-redirect (SECURITY, `tools/vision.py`).** URL fetches used `follow_redirects=True`
+  while validating only the ORIGINAL url — a public page 302-ing to 127.0.0.1/169.254.169.254/LAN
+  bypassed the guard. Same hole was closed in tool_download_file 2026-07-07; vision never got it.
+  Now: auto-redirect OFF, every hop re-validated via the shared `_download_redirect_target`, 5-hop cap.
+- **fact_check returned None (`tools/search.py`).** The old flow forced a deep_research tool call via
+  tool_choice just to rephrase the claim; a content-only answer (native-tools corruption family) fell
+  off the end of the function → None to the dispatcher. REWRITTEN: deep_research is called directly
+  with the claim, then ONE verify call (verdict-first prompt). Kills the None path, the forced-tool
+  fragility (empty restricted_tools under subagent allowlists), a whole LLM round, and the
+  get_active_tool_definitions rebuild per call. Also: evidence now capped against max_context
+  (param was accepted-but-unused), verify failure degrades to PARTIAL + raw evidence, content:null
+  coerced (was rendering literal "None"), empty-query guard, error strings instead of raw tracebacks.
+  fact_check had ZERO tests → tests/test_fact_check.py (8).
+- **vision extract_text_pdf on an image** forced the fitz branch and REPLACED the extracted image data
+  with a doomed PDF parse → gated on is_pdf (action is just a prompt choice for non-PDFs). PDF 10-page
+  cap now ANNOUNCED (was silent). Local files typed by magic-byte sniff (`_sniff_image_mime`) with
+  extension fallback; non-images refused (a .txt was previously guessed image/jpeg and shipped to the
+  vision model). prompt aliases healed (question/query/text/instruction); garbage Content-Length no
+  longer crashes the fetch. tests/test_vision_hardening.py (11).
+- **composed_skills branching was built-but-unwired** — executor honoured branches; nothing could
+  author them (define never parsed the fields). Now: define accepts per-step branch_condition/
+  branch_target + top-level `branches` dict; validation (sequential-only, targets must exist, dataflow
+  checks over branch sequences); branch-only $params mined into the advertised schema; registry schema
+  documents it. Plus: define REFUSES an existing name (register() replaced the object and reset usage
+  stats — a typo could clobber a tuned macro); save_as bindings >16KB now carry an explicit
+  truncation marker (display cap was marked, the BINDING was cut silently); parallel fan-out bounded
+  by a 4-slot semaphore (single-slot llama box); `_step_result_ok` counts SYSTEM INSTRUCTION:/REJECTED:
+  prefixes (file_system hard failures) as failures — they inflated success_rate; dead `find_matching`
+  removed (zero runtime callers). tests/test_composed_skills_fixes.py (9); 4 obsolete tests removed.
+Docs: docs/tools/search.html, vision.html, composed_skills.html; registry schema for
+manage_composed_skills. Full suite green.
+
+### 2026-07-14c — file_system audit: project-scoped root blindness fixed (the "sandbox is EMPTY" lie)
+Operator report: `list_files` "not working for some subdirectories" — the agent gave up on file_system
+and explored via `execute` instead. The live log (sessions 1D/77) showed the real shape: with a project
+active, an `execute`-side `git clone` to an ABSOLUTE `/workspace/analysis/...` path landed at the
+sandbox ROOT while every file_system op stayed scoped to `projects/<id>/` — list said EMPTY, reads said
+"does not exist", and the explicit `/workspace/...` form was *healed into* the scoped dir (phantom
+path). vision/browser/agent-core each already hand-rolled a root fallback; file_system itself was the
+one subsystem without it. All fixed in `tools/file_system.py` (+ qwen_bridge/registry):
+- **`list` ignored `path` entirely** (dispatcher dropped it) + silent 200-entry truncation with
+  nondeterministic (unsorted) walk order → subdir listings now work, output is sorted/deterministic,
+  truncation REPORTS the hidden count and the recovery (`list` a subdir), and an empty scoped listing
+  names root-level files with their `/workspace/...` paths. Aliases `ls/dir/tree/list_dir/list_directory` healed.
+- **Existence-aware root anchoring in `_get_safe_path`**: `/workspace/X` under scoping resolves scoped
+  when the scoped copy exists (historical heal, still the default for new files — write/execute
+  symmetry and the browser heals unchanged), to the ROOT when the file/tree genuinely lives there.
+  Host-absolute paths under the outer root map the same way. Found+fixed a latent bug in the
+  host-absolute branch: `relative_to()` raised on the first non-matching base and aborted the mapping.
+  Destructive guard (`allow_root=False`) now also refuses the OUTER root (`delete '/workspace'`).
+- **Read-only root fallback** (`_scoped_root_fallback`): read/inspect/read_chunked/search/find/list
+  serve a root copy with a NOTE naming its `/workspace/...` path; `replace` deliberately does NOT
+  silently cross scope — it returns the exact path to re-issue with. `_missing_file_message` appends
+  the root-files hint instead of a dead-end "EMPTY".
+- **search/find default scope**: rg/find run at the container root, so the old literal `.` swept the
+  WHOLE sandbox (other projects included) when scoped → default is now the active workspace's container
+  path (`/workspace/projects/<id>`).
+- **qwen_bridge never passed `sandbox_manager`** → search/find on that runtime always died with
+  "'NoneType' has no attribute 'execute'"; also now forwards `max_context`/`read_budget`; enum gained `find`.
+- **Smaller:** dispatcher dropped `inspect`'s `lines` arg (now forwarded + coerced); httpx download
+  rotated the Tor identity TWICE per 401/403/503 attempt (now once); `_syntax_feedback` read files
+  with the process locale (LANG unset under launchd → UnicodeDecodeError → check silently skipped) —
+  now explicit UTF-8 like the write path.
+Tests: `tests/test_file_system_scoped_root_and_list.py` (27 new); 3 stale assertions updated
+(search/find "." defaults). Full suite green. Docs: `docs/tools/file_system.html` (new 2026-07-14
+section), `docs/tools/qwen_bridge.html`.
+
 ### 2026-07-14b — Bug-hunt pass over the never-reviewed cohorts (post-July-hunt shipping since 2026-07-05)
 The July static/functional hunts (§5B/§5C) + the 2026-07-07 six-agent review covered everything that
 existed THEN; ~10 days of shipping since (host services, notifications, delegation, sessions/cancel,

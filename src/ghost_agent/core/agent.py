@@ -3824,6 +3824,101 @@ class GhostAgent:
             self._active_tool_defs_cache.clear()
             self._xml_schema_cache.clear()
 
+    async def warm_up_main_prefix(self) -> None:
+        """Prefill the MAIN node's prompt cache with the byte-stable request
+        head at boot, so the first user request doesn't pay it (2026-07-14).
+
+        The first request of a session prefills ~30k+ tokens at the measured
+        ~450 tok/s (≈70s wall): the rendered head is
+        ``[system slot][native tool schemas]`` — SYSTEM_PROMPT + profile is
+        ~14 KB and the tools JSON ~63 KB, and BOTH are byte-stable across
+        conversations (all volatile continuity was already moved to the tail
+        injection for exactly this reason; the chat template renders `tools`
+        immediately after the system text). Upstream prefix caching
+        (``cache_prompt`` + ``--cache-ram``) reuses everything up to the
+        first differing byte, so one background ``max_tokens=1`` request at
+        startup with the SAME head moves that prefill off the user's
+        critical path — the first real request then only pays its unique
+        tail (hydrated memory, dynamic state, the query itself).
+
+        Byte-exactness is load-bearing: the head here is built by the SAME
+        code paths a live request uses (``_RequestState.get_profile_str`` +
+        ``SYSTEM_PROMPT`` splice + ``get_active_tool_defs``), so it cannot
+        drift from real request bytes. The acquired-skill tail of the tool
+        list is query-routed and may differ per conversation — that only
+        shortens the match, never breaks it (schemas render in list order,
+        static tools first).
+
+        Main-slot etiquette: ``is_background=True`` with no off-main flags
+        targets the main node but waits for any live foreground request to
+        clear first, so a user who beat the warmup to the first request is
+        never queued behind it. Best-effort: any failure is logged at debug
+        and never escapes. Sibling of ``LLMClient.warm_up_workers`` (which
+        covers the off-main nodes); wired in main.py at lifespan start,
+        opt-out via GHOST_MAIN_PREFIX_WARMUP=0.
+        """
+        try:
+            llm = getattr(self.context, "llm_client", None)
+            if llm is None:
+                return
+            request_state = self._RequestState(self)
+            profile_str = await request_state.get_profile_str()
+            base_prompt = SYSTEM_PROMPT.replace("{{PROFILE}}", profile_str)
+            # Mirror the one config-driven system-slot splice a live request
+            # applies (handle_chat's perfect_it block) — byte-exactness.
+            if getattr(self.context.args, 'perfect_it', False) is True:
+                base_prompt = base_prompt.replace(
+                    "### TOOL ORCHESTRATION",
+                    '5. THE "PERFECT IT" PROTOCOL: Upon successfully completing a complex technical task, analyze the result (the most recent <tool_response> output in this conversation) and proactively suggest one concrete way to optimize it.\n\n### TOOL ORCHESTRATION'
+                )
+
+            payload = {
+                "model": getattr(self.context.args, "model", "default"),
+                "messages": [
+                    {"role": "system", "content": base_prompt},
+                    {"role": "user", "content": "ok"},
+                ],
+                "stream": False,
+                "temperature": 0.0,
+                "max_tokens": 1,
+            }
+            if getattr(self.context.args, "native_tools", False) is True:
+                # Same builder + same neutral-query routing a live request's
+                # first turn resolves to; the payload mirrors the live shape
+                # (tool_choice/parallel flags don't affect the rendered
+                # prefix, but identical payloads leave nothing to reason
+                # about).
+                all_tools = request_state.get_active_tool_defs("")
+                if getattr(self, "disabled_tools", None):
+                    all_tools = [t for t in all_tools
+                                 if t["function"]["name"] not in self.disabled_tools]
+                if all_tools:
+                    payload["tools"] = all_tools
+                    payload["tool_choice"] = "auto"
+                    payload["parallel_tool_calls"] = True
+
+            _est_tokens = (len(base_prompt)
+                           + len(json.dumps(payload.get("tools", [])))) // 4
+            pretty_log(
+                "Main Prefix Warmup",
+                f"prefilling ~{_est_tokens} tokens of byte-stable request head "
+                f"(system slot + tool schemas) into the main node's cache",
+                icon=Icons.BOOT_AWAKE,
+            )
+            # Generous timeout: this IS the ~70s prefill we're absorbing.
+            await llm.chat_completion(
+                payload, is_background=True, timeout=240.0,
+                task_label="main-prefix-warmup",
+            )
+            pretty_log(
+                "Main Prefix Warmup",
+                "done — first user request now pays only its unique tail",
+                icon=Icons.OK,
+            )
+        except Exception as e:  # noqa: BLE001 — warmup is best-effort
+            logger.debug("main-prefix warmup skipped: %s: %s",
+                         type(e).__name__, e)
+
     # Allowlist of phrases that the trivial fast path is safe to intercept.
     # Anything not on this list (even a 1-word "test") falls through to the
     # full turn loop. The list is intentionally tight on **action verbs**

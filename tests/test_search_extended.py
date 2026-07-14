@@ -61,97 +61,50 @@ async def test_deep_research_flow(mock_ddgs):
 
 @pytest.mark.asyncio
 async def test_fact_check_router(mock_llm):
-    # Test that fact check calls the LLM with restricted tools
-    
-    # RESPONSE 1: Request Deep Research
-    resp1_data = {
-        "choices": [{
-            "message": {
-                "tool_calls": [{
-                    "id": "call_1",
-                    "function": {
-                        "name": "deep_research",
-                        "arguments": '{"query": "Is earth flat?", "anonymous": true, "tor_proxy": "x"}'
-                    }
-                }]
-            }
-        }]
+    # 2026-07-14 rewrite: fact_check calls deep_research DIRECTLY with the
+    # claim (no planning round), then makes ONE verify call.
+    resp_verify = {
+        "choices": [{"message": {"content": "Research says Round."}}]
     }
-
-    # RESPONSE 2: Final Verification
-    resp2_data = {
-        "choices": [{"message": {"content": "Research says Round.", "tool_calls": []}}]
-    }
-    
-    # Mock LLM chat_completion to return resp1_data then resp2_data
-    mock_llm.chat_completion = AsyncMock(side_effect=[resp1_data, resp2_data])
-    
-    # Mock deep_research callable
+    mock_llm.chat_completion = AsyncMock(return_value=resp_verify)
     mock_dr = AsyncMock(return_value="Research says Round.")
-    
+
     res = await tool_fact_check(
-        statement="Earth is flat", 
-        llm_client=mock_llm, 
-        tool_definitions=[], 
+        statement="Earth is flat",
+        llm_client=mock_llm,
+        tool_definitions=[],
         deep_research_callable=mock_dr
     )
-    
+
+    assert res.startswith("FACT CHECK COMPLETE")
     assert "Research says Round" in res
-    mock_dr.assert_called_once()
+    mock_dr.assert_called_once_with("Earth is flat")
+    assert mock_llm.chat_completion.await_count == 1
 
 @pytest.mark.asyncio
 async def test_fact_check_string_arguments(mock_llm):
-    # Test that fact check properly overrides string arguments to dict
-    
-    # RESPONSE 1: Request Deep Research, but with a dict argument instead of a string to check robustness
-    # The agent might return dicts sometimes
-    # But we want to test string parsing
-    
-    resp1_data = {
-        "choices": [{
-            "message": {
-                "tool_calls": [{
-                    "id": "call_1",
-                    "function": {
-                        "name": "deep_research",
-                        "arguments": '{"query": "Is earth flat?", "anonymous": true, "tor_proxy": "x"}'
-                    }
-                }]
-            }
-        }]
+    # The verify prompt carries BOTH the original claim and the research
+    # evidence as plain user content — no native tool_calls anywhere (the
+    # Llama-Server dict-vs-string paradox is structurally gone).
+    resp_verify = {
+        "choices": [{"message": {"content": "Research says Round."}}]
     }
-
-    # RESPONSE 2: Final Verification
-    resp2_data = {
-        "choices": [{"message": {"content": "Research says Round.", "tool_calls": []}}]
-    }
-    
-    # Mock LLM chat_completion to return resp1_data then resp2_data
-    mock_llm.chat_completion = AsyncMock(side_effect=[resp1_data, resp2_data])
-    
-    # Mock deep_research callable
+    mock_llm.chat_completion = AsyncMock(return_value=resp_verify)
     mock_dr = AsyncMock(return_value="Research says Round.")
-    
+
     res = await tool_fact_check(
-        statement="Earth is flat", 
-        llm_client=mock_llm, 
-        tool_definitions=[], 
+        statement="Earth is flat",
+        llm_client=mock_llm,
+        tool_definitions=[],
         deep_research_callable=mock_dr
     )
-    
-    # Assert chat_completion was called twice, the second time with the modified tool_calls
-    # Specifically, check that the "arguments" field in the appended ai_msg is a dict
-    
+
     calls = mock_llm.chat_completion.call_args_list
-    assert len(calls) == 2
-    
-    verify_call_kwargs = calls[1].kwargs
-    
-    # The appended msg should now be the LAST message, which is a system message bypassing legacy tool dicts
-    appended_ai_msg = calls[1].args[0]['messages'][-1]
-    
-    # We check that the context was passed correctly mapped to a user bypass message
-    assert appended_ai_msg["role"] == "user"
-    assert "Research says Round." in appended_ai_msg["content"]
-    assert "Is earth flat?" in appended_ai_msg["content"]
-    assert "tool_calls" not in appended_ai_msg
+    assert len(calls) == 1
+
+    verify_msg = calls[0].args[0]['messages'][-1]
+    assert verify_msg["role"] == "user"
+    assert "Research says Round." in verify_msg["content"]
+    assert "Earth is flat" in verify_msg["content"]
+    for msg in calls[0].args[0]['messages']:
+        assert "tool_calls" not in msg

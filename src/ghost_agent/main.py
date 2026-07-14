@@ -1358,6 +1358,26 @@ async def lifespan(app):
     # the chat handler without needing access to the FastAPI app object.
     context.agent = agent
 
+    # Pre-warm the MAIN node's prompt cache with the byte-stable request head
+    # (system slot + native tool schemas ≈ 20k+ tokens ≈ ~50s of prefill at
+    # the measured ~450 tok/s) so the FIRST user request only pays its unique
+    # tail. Sibling of warm_up_workers above, which covers the off-main
+    # nodes; this covers the big one. Background + best-effort: boot proceeds
+    # immediately, and the call yields to any user request that arrives
+    # first (is_background targets main but waits for foreground to clear).
+    # Guard on a REAL client via its attribute VALUE, not the class name —
+    # tests patch `main.LLMClient` with a MagicMock (so isinstance against
+    # the module-level name raises), while a real client always carries a
+    # non-empty string upstream_url. Mocked contexts are a clean no-op.
+    # Opt out via GHOST_MAIN_PREFIX_WARMUP=0.
+    _warm_main = os.environ.get("GHOST_MAIN_PREFIX_WARMUP", "1").strip().lower() not in ("0", "false", "no")
+    _llm_main = getattr(context, "llm_client", None)
+    if (_warm_main and _llm_main is not None
+            and isinstance(getattr(_llm_main, "upstream_url", None), str)
+            and _llm_main.upstream_url):
+        from .utils.logging import spawn_bg as _spawn_bg_main
+        _spawn_bg_main(agent.warm_up_main_prefix(), name="main-prefix-warmup")
+
     # Calibration spine (roadmap phase 2.5). Pairs each turn's composite
     # confidence with the realized outcome, measures Brier/ECE, and (idle
     # phase 2.7c) re-fits τ + weights + λ. Constructed unconditionally —

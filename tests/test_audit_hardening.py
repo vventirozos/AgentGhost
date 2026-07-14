@@ -67,16 +67,17 @@ async def test_llm_client_node_optional_none_getters():
 
 @pytest.mark.asyncio
 async def test_search_fact_check_optional_arguments_kwargs():
-    # Assert the search tool gracefully processes kwargs via Dict[str, Any] and Optional boundaries
+    # Assert the search tool gracefully processes kwargs via Dict[str, Any] and
+    # Optional boundaries. (2026-07-14: fact_check no longer runs a planning
+    # tool-call round — deep_research is invoked directly, then ONE verify call.)
     with patch("ghost_agent.tools.search.tool_deep_research", new_callable=AsyncMock) as mock_dr:
         mock_dr.return_value = "Simulated valid facts."
-        
+
         mock_llm = AsyncMock()
-        mock_llm.chat_completion.side_effect = [
-            {"choices": [{"message": {"tool_calls": [{"id": "1", "function": {"name": "deep_research", "arguments": "{}"}}]}}]},
-            {"choices": [{"message": {"content": "Simulated valid facts inside the final response."}}]}
-        ]
+        mock_llm.chat_completion = AsyncMock(return_value={
+            "choices": [{"message": {"content": "Simulated valid facts inside the final response."}}]
+        })
         result = await tool_fact_check(query=None, statement="The sky is green", extraneous_dict={"key": "val"}, tool_definitions=[{"function": {"name": "deep_research"}}], llm_client=mock_llm, deep_research_callable=mock_dr)
-        
+
         assert "Simulated valid facts inside the final response." in result
-        mock_dr.assert_called_once()
+        mock_dr.assert_called_once_with("The sky is green")

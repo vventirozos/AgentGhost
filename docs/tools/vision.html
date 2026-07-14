@@ -52,15 +52,19 @@
   </table>
 
   <h2>PDF handling</h2>
-  <p>PyMuPDF rasterises the first 10 pages at 2× zoom to JPEG; otherwise the host's vision LLM would balloon context. A single image file is base64-encoded directly.</p>
+  <p>PyMuPDF rasterises the first 10 pages at 2× zoom to JPEG; otherwise the host's vision LLM would balloon context. A single image file is base64-encoded directly. <strong>2026-07-14:</strong> the 10-page cap is no longer silent — when the PDF has more pages, the result carries an explicit <q>only the first 10 were analyzed</q> note pointing at <code>read_chunked</code>/knowledge-base ingestion for the rest. The fitz branch is also gated on the file <em>actually</em> being a PDF: previously <code>action='extract_text_pdf'</code> forced it for ANY target, so calling it on an image replaced the already-extracted image data with a doomed PDF parse — for a non-PDF target that action is now just a prompt choice (OCR over the image).</p>
+
+  <h2>Local-file typing (2026-07-14)</h2>
+  <p>Local files are typed from CONTENT first — magic-byte sniffing (<code>_sniff_image_mime</code>: PNG/JPEG/GIF/BMP/TIFF/WEBP) — with the original target name's extension as fallback. A file that matches neither is refused with a pointer to <code>file_system(operation='read')</code>. Previously an unknown type was silently guessed <code>image/jpeg</code>, so a .txt/.bin was shipped to the vision model to hallucinate over. Sniffing also fixes extensionless screenshots. The <code>prompt</code> parameter heals the aliases the model reaches for (<code>question</code>/<code>query</code>/<code>text</code>/<code>instruction</code>).</p>
 
   <h2>Execution</h2>
   <p>Calls <code>llm_client.chat_completion({"messages": [...]}, use_vision=True)</code>. Returns <code>"VISION ANALYSIS RESULT:\n{response}"</code>.</p>
 
   <h2>Safety</h2>
   <ul>
-    <li>50 MB host file cap.</li>
-    <li>Path-traversal guard via <a href="file_system.html"><code>_get_safe_path</code></a>.</li>
+    <li>50 MB cap on both local files and URL downloads (streamed with a byte cap, so a lying Content-Length can't OOM the host).</li>
+    <li>Path-traversal guard via <a href="file_system.html"><code>_get_safe_path</code></a>, with the read-only sandbox-root fallback for project-scoped sessions.</li>
+    <li><strong>SSRF-on-redirect closed (2026-07-14).</strong> URL fetches used <code>follow_redirects=True</code> while validating only the ORIGINAL url — a public page 302-redirecting to <code>127.0.0.1</code>/<code>169.254.169.254</code>/a LAN host bypassed the guard (the exact hole closed in <a href="file_system.html">tool_download_file</a> on 2026-07-07; vision never got that fix). Auto-redirect is now OFF; every hop's <code>Location</code> is re-validated via the shared <code>_download_redirect_target</code>, bounded at 5 hops. Covered by <code>tests/test_vision_hardening.py</code>.</li>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>

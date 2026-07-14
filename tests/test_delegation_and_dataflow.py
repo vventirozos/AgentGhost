@@ -179,7 +179,13 @@ class TestSequentialDataFlow:
             return "z" * (MAX_BOUND_VALUE_CHARS * 2) if tool == "big" else "ok"
 
         asyncio.run(m.execute("p6", executor, {}))
-        assert len(seen[1]["v"]) == MAX_BOUND_VALUE_CHARS
+        # 2026-07-14: the cap is EXPLICIT — the sliced value carries a
+        # visible truncation marker so a downstream step can't act on
+        # partial data believing it is complete.
+        bound = seen[1]["v"]
+        assert bound.startswith("z" * 100)
+        assert len(bound) <= MAX_BOUND_VALUE_CHARS + 200
+        assert "binding truncated" in bound
 
     def test_failed_optional_step_still_binds(self, tmp_path):
         skill = ComposedSkill(

@@ -108,34 +108,9 @@ class TestComposedSkillRegistry:
         reg2 = ComposedSkillRegistry(storage_dir=storage_dir)
         assert "persistent_skill" in reg2.skills
 
-    def test_find_matching(self, registry):
-        registry.register(ComposedSkill(
-            name="csv_analysis",
-            trigger_description="analyze CSV data file statistics",
-        ))
-        registry.register(ComposedSkill(
-            name="web_scrape",
-            trigger_description="scrape website extract data",
-        ))
-
-        matches = registry.find_matching("analyze the CSV data")
-        assert len(matches) >= 1
-        assert matches[0].name == "csv_analysis"
-
-    def test_find_matching_no_results(self, registry):
-        registry.register(ComposedSkill(
-            name="csv_analysis",
-            trigger_description="analyze CSV data file",
-        ))
-        matches = registry.find_matching("quantum physics simulation")
-        assert len(matches) == 0
-
-    def test_find_matching_empty_registry(self, registry):
-        assert registry.find_matching("anything") == []
-
-    def test_find_matching_empty_query(self, registry):
-        registry.register(ComposedSkill(name="test", trigger_description="test"))
-        assert registry.find_matching("") == []
+    # find_matching was removed 2026-07-14 — it had zero runtime callers
+    # (macro discovery happens via the tool definitions the LLM sees), so
+    # its keyword-overlap matcher and these tests went with it.
 
     def test_record_usage_success(self, registry):
         registry.register(ComposedSkill(name="test", trigger_description="test"))

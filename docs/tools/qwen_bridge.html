@@ -41,6 +41,7 @@
     </tbody>
   </table>
   <p>Named parameters are extracted from the Qwen call; unknown extras are passed via <code>**extra</code>.</p>
+  <p><strong>Context plumbing parity with the registry path (2026-07-14).</strong> <code>GhostFileSystem.call()</code> now forwards <code>sandbox_manager</code>, <code>max_context</code>, and <code>read_budget</code> from the bridge context, matching what the main registry passes. Previously <code>operation='search'</code>/<code>'find'</code> on this runtime always died with <q>'NoneType' object has no attribute 'execute'</q> (no sandbox manager), and reads used the minimum byte budget regardless of the configured context window. The <code>operation</code> enum also gained the <code>find</code> value the dispatcher already supported.</p>
 
   <h2>Back-compat</h2>
   <p><code>GLOBAL_CONTEXT</code> is exposed as a property that returns <code>_CTX.get()</code>, so older callsites continue to work without per-task isolation.</p>

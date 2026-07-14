@@ -1192,6 +1192,8 @@ def _build_op_payload(
     stop_on_error: Optional[bool] = None,
     click_center: Optional[bool] = None,
     settle_ms: Optional[int] = None,
+    post_click_ms: Optional[int] = None,
+    nav_text_chars: Optional[int] = None,
     allowed_local_ports=None,
 ) -> dict:
     """Assemble the op dict the runner expects.
@@ -1244,7 +1246,15 @@ def _build_op_payload(
     if click_center is not None:
         payload["click_center"] = bool(click_center)
     if settle_ms is not None:
-        payload["settle_ms"] = int(settle_ms)
+        # _safe_int, not int(): these are LLM-supplied (settle_ms="2s" was
+        # possible) and a ValueError here raised OUT of the tool as a raw
+        # traceback instead of an op error.
+        payload["settle_ms"] = _safe_int(settle_ms, 0)
+    if post_click_ms is not None:
+        payload["post_click_ms"] = _safe_int(post_click_ms, 800)
+    if nav_text_chars is not None:
+        # Clamp like max_chars so a huge value can't flood the context.
+        payload["nav_text_chars"] = max(0, min(_safe_int(nav_text_chars, 8 * 1024), _MAX_TEXT_CHARS))
     if allowed_local_ports:
         payload["allowed_local_ports"] = sorted(
             int(p) for p in allowed_local_ports)
@@ -1309,7 +1319,14 @@ def analyze_screenshot_render(host_path, sample_max: int = 200):
     dominant = buckets.most_common(1)[0][1]
     dominant_pct = dominant / total
     distinct = len(buckets)
-    if dominant_pct >= 0.80 or distinct <= 6:
+    # "uniform" needs BOTH a dominant colour AND few distinct buckets. A
+    # dominant-colour-only rule (the original `>= 0.80 or`) false-flagged
+    # every white-background TEXT page as "BLANK/sky-only" — ordinary docs
+    # pages are >80% white but their anti-aliased glyphs span dozens of
+    # colour buckets, while a real blank/sky/loading frame has almost none.
+    # Poisoned evidence cuts both ways: a false BLANK invites the verifier
+    # to refute a true "the page renders" claim.
+    if (dominant_pct >= 0.80 and distinct <= 24) or distinct <= 6:
         verdict = "uniform"
         note = (
             f"{dominant_pct:.0%} of the frame is a single colour "
@@ -1616,6 +1633,11 @@ async def tool_browser(
     # never safety-checked against the sandbox root, which either
     # silently escapes or fails in a confusing way.
     sanitised_actions = None
+    # container out_path → host path for every interact screenshot, so the
+    # objective render check runs on those too (previously ONLY the atomic
+    # screenshot op was checked — routing a capture through interact silently
+    # bypassed the whole anti-"it renders" apparatus).
+    _interact_shot_hosts: dict = {}
     if operation == "interact":
         if not isinstance(actions, list) or not actions:
             return _err(
@@ -1644,6 +1666,7 @@ async def tool_browser(
                     host_sub.parent.mkdir, parents=True, exist_ok=True
                 )
                 new_step["out_path"] = _to_container_path(sandbox_dir, host_sub)
+                _interact_shot_hosts[new_step["out_path"]] = host_sub
             # Heal a goto/navigate sub-action's file:// URL the same way the
             # top-level url is healed (so scoped files resolve mid-sequence).
             if new_step.get("action") in ("goto", "navigate") and new_step.get("url"):
@@ -1668,6 +1691,8 @@ async def tool_browser(
         stop_on_error=stop_on_error,
         click_center=kwargs.get("click_center"),
         settle_ms=kwargs.get("settle_ms"),
+        post_click_ms=kwargs.get("post_click_ms"),
+        nav_text_chars=kwargs.get("nav_text_chars"),
         allowed_local_ports=_svc_ports,
     )
 
@@ -1767,11 +1792,26 @@ async def tool_browser(
     if _nav_suggestion:
         header += f"\nNOTE: {_nav_suggestion}"
     js_diag = _format_js_diagnostics(parsed)
+
+    def _text_block(p: dict) -> str:
+        """Render the runner's capped innerText preview. The runner has
+        computed and shipped this since the nav-preview feature landed, but
+        the formatter silently DROPPED it — so every navigate/click forced
+        the follow-up extract_text (a full Chromium relaunch + re-fetch over
+        Tor) that the preview exists to eliminate."""
+        text = p.get("text")
+        if not text:
+            return ""
+        trunc = " (truncated)" if p.get("truncated") else ""
+        return (f"\nLENGTH: {p.get('length')}{trunc}"
+                f"\n--- PAGE TEXT (capped preview) ---\n{text}")
+
     if operation == "navigate":
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
             f"HTTP_STATUS: {parsed.get('status')}\n"
             f"TITLE: {parsed.get('title')}{js_diag}{_pre_interaction_line(parsed)}"
+            f"{_text_block(parsed)}"
         )
     if operation == "extract_text":
         body = parsed.get("text", "")
@@ -1783,9 +1823,13 @@ async def tool_browser(
             f"--- TEXT ---\n{body}"
         )
     if operation == "click":
+        # js_diag + the post-click text preview were computed by the runner
+        # but dropped here (same formatter gap as navigate) — a click that
+        # crashed page JS looked identical to one that worked.
         return (
             f"{header}\nURL: {parsed.get('url')}\n"
-            f"TITLE: {parsed.get('title')}"
+            f"TITLE: {parsed.get('title')}{js_diag}"
+            f"{_text_block(parsed)}"
         )
     if operation == "screenshot":
         # Echo the host-relative path so the user can reference it via
@@ -1873,6 +1917,20 @@ async def tool_browser(
                         f"  [{idx}] {status} screenshot → {host_rel} "
                         f"(download: /api/download/{host_rel})"
                     )
+                    # Same objective render check as the atomic screenshot
+                    # op — an interact-captured frame is evidence too.
+                    try:
+                        _hp = _interact_shot_hosts.get(r.get("path", ""))
+                        probe = analyze_screenshot_render(_hp) if _hp else None
+                        if probe:
+                            lines.append(
+                                f"      RENDER_CHECK: {probe['verdict'].upper()} "
+                                f"(dominant_colour={probe['dominant_pct']:.0%}, "
+                                f"distinct_colours={probe['distinct_colors']}) — "
+                                f"{probe['note']}"
+                            )
+                    except Exception:
+                        pass
                 elif act == "fill":
                     lines.append(
                         f"  [{idx}] {status} fill {r.get('selector')!r} "

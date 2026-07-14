@@ -125,16 +125,29 @@ async def test_file_search_passes_container_path_not_host_path(sandbox):
 
 
 @pytest.mark.asyncio
-async def test_file_search_with_no_filename_uses_dot(sandbox):
-    """Backwards compatibility: omitting the filename still searches
-    the current directory (which IS /workspace inside the container).
+async def test_file_search_with_no_filename_targets_active_workspace(sandbox):
+    """Omitting the filename searches the ACTIVE workspace's container path
+    — "/workspace" for an unscoped sandbox (same tree the old "." default
+    reached), the project subdir when scoped (see the scoped test below).
     """
     sm = _make_sandbox_manager(stdout="hit.py:1:match", exit_code=0)
     await tool_file_search("anything", sandbox, None, sm)
     cmd = sm.execute.call_args[0][0]
-    # No path arg → "." (workspace root, container POV)
-    assert cmd.endswith(" .") or cmd.endswith(" '.'")
+    assert cmd.rstrip().endswith("/workspace") or "/workspace'" in cmd
     assert str(sandbox) not in cmd
+
+
+@pytest.mark.asyncio
+async def test_file_search_scoped_default_targets_project_dir(tmp_path):
+    """Project-scoped: the no-filename default must be the PROJECT dir, not
+    the sandbox root — rg ran at /workspace, so the old "." swept every
+    other project's files too."""
+    scoped = tmp_path / "projects" / "abc123def456"
+    scoped.mkdir(parents=True)
+    sm = _make_sandbox_manager(stdout="", exit_code=0)
+    await tool_file_search("anything", scoped, None, sm)
+    cmd = sm.execute.call_args[0][0]
+    assert "/workspace/projects/abc123def456" in cmd
 
 
 @pytest.mark.asyncio
@@ -195,14 +208,25 @@ async def test_find_files_translates_path_when_sandbox_dir_provided(sandbox):
 
 
 @pytest.mark.asyncio
-async def test_find_files_dot_path_unchanged(sandbox):
-    """The default '.' path is the container WORKDIR — no
-    translation needed."""
+async def test_find_files_dot_path_targets_active_workspace(sandbox):
+    """The default '.' path now translates to the ACTIVE workspace's
+    container path — "/workspace" unscoped (the same tree "." reached, since
+    find ran at the container WORKDIR), the project subdir when scoped."""
     sm = _make_sandbox_manager(stdout="./x.py\n", exit_code=0)
     await tool_find_files("*.py", sm, ".", sandbox_dir=sandbox)
     cmd = sm.execute.call_args[0][0]
-    # The literal "." must appear (find's first positional)
-    assert " . " in cmd or cmd.startswith("find . ") or " '.'" in cmd
+    assert "/workspace" in cmd
+    assert str(sandbox) not in cmd
+
+
+@pytest.mark.asyncio
+async def test_find_files_scoped_dot_targets_project_dir(tmp_path):
+    scoped = tmp_path / "projects" / "abc123def456"
+    scoped.mkdir(parents=True)
+    sm = _make_sandbox_manager(stdout="", exit_code=0)
+    await tool_find_files("*.py", sm, ".", sandbox_dir=scoped)
+    cmd = sm.execute.call_args[0][0]
+    assert "/workspace/projects/abc123def456" in cmd
 
 
 @pytest.mark.asyncio

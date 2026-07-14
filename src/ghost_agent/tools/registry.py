@@ -108,7 +108,7 @@ TOOL_DEFINITIONS = [
                     },
                     "path": {
                         "type": "string",
-                        "description": "The target file or directory path relative to the active project root."
+                        "description": "The target file or directory path relative to the active project root. For operation='list_files', pass a subdirectory to list just that subtree (omit for the workspace root). Container-absolute '/workspace/...' paths (as printed by `execute` shell output) are also accepted and resolve to the same files the shell sees."
                     },
                     "start_line": {
                         "type": "integer",
@@ -179,7 +179,10 @@ TOOL_DEFINITIONS = [
                     "wait_until": {"type": "string", "enum": ["load", "domcontentloaded", "networkidle"], "description": "Navigation readiness threshold. Default 'load'. Use 'domcontentloaded' for slow pages that never idle, 'networkidle' for SPAs."},
                     "full_page": {"type": "boolean", "description": "Screenshot: capture entire scrollable page (default true) vs. just the viewport."},
                     "max_chars": {"type": "integer", "description": "extract_text: cap returned text at this many chars (default 65536)."},
-                    "timeout_ms": {"type": "integer", "description": "Per-operation (or per-action, for interact) timeout in ms. Default 30000. The overall interact budget is (timeout_ms × len(actions)), so large sequences get proportionally more wall time."}
+                    "timeout_ms": {"type": "integer", "description": "Per-operation (or per-action, for interact) timeout in ms. Default 30000. The overall interact budget is (timeout_ms × len(actions)), so large sequences get proportionally more wall time."},
+                    "settle_ms": {"type": "integer", "description": "screenshot: wait this many ms after page load before capturing — lets a WebGL/canvas scene paint its first frames instead of shooting a blank."},
+                    "click_center": {"type": "boolean", "description": "screenshot: click the viewport centre before capturing (then wait post_click_ms, default 800). Use for pointer-lock/canvas games that only start rendering after a click — captures what a USER would actually see."},
+                    "nav_text_chars": {"type": "integer", "description": "navigate/click: size of the inline page-text preview in chars (default 8192, 0 disables, capped at 65536)."}
                 },
                 "required": ["operation"]
             }
@@ -491,9 +494,37 @@ TOOL_DEFINITIONS.append({
                                     "whole macro. Default false."
                                 ),
                             },
+                            "branch_condition": {
+                                "type": "string",
+                                "description": (
+                                    "Sequential mode only: if this step's result "
+                                    "CONTAINS this substring, jump to the "
+                                    "'branch_target' sequence instead of the "
+                                    "remaining steps. Pair with branch_target and "
+                                    "a matching key in the top-level 'branches'."
+                                ),
+                            },
+                            "branch_target": {
+                                "type": "string",
+                                "description": (
+                                    "Name of the branch (a key in 'branches') to "
+                                    "jump to when branch_condition matches."
+                                ),
+                            },
                         },
                         "required": ["tool"],
                     },
+                },
+                "branches": {
+                    "type": "object",
+                    "description": (
+                        "For define (sequential mode only): alternative step "
+                        "sequences, keyed by branch name. A step whose result "
+                        "contains its 'branch_condition' jumps to its "
+                        "'branch_target' sequence (replacing the remaining main "
+                        "steps). Each value is a step list with the same shape "
+                        "as 'steps'."
+                    ),
                 },
             },
             "required": ["action"],
@@ -819,7 +850,7 @@ def get_available_tools(context):
         "flag_uncertainty": lambda **kwargs: tool_flag_uncertainty(uncertainty_tracker=getattr(context, "uncertainty_tracker", None), **kwargs),
         "web_search": lambda **kwargs: tool_search(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, **kwargs),
         "deep_research": lambda **kwargs: tool_deep_research(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None), **kwargs),
-        "fact_check": lambda **kwargs: tool_fact_check(llm_client=context.llm_client, model_name=getattr(context.args, 'model', "qwen-3.6-35b-a3"), tool_definitions=get_active_tool_definitions(context), deep_research_callable=lambda q: tool_deep_research(query=q, anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None)), **kwargs),
+        "fact_check": lambda **kwargs: tool_fact_check(llm_client=context.llm_client, model_name=getattr(context.args, 'model', "qwen-3.6-35b-a3"), max_context=context.args.max_context, deep_research_callable=lambda q: tool_deep_research(query=q, anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None)), **kwargs),
         "darkweb_search": lambda **kwargs: tool_darkweb_search(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, **kwargs),
         "darkweb_research": lambda **kwargs: tool_darkweb_research(anonymous=context.args.anonymous, tor_proxy=context.tor_proxy, llm_client=context.llm_client, model_name=getattr(context.args, 'model', 'default'), max_context=context.args.max_context, workspace_model=getattr(context, "workspace_model", None), **kwargs),
         "update_profile": lambda **kwargs: tool_update_profile(profile_memory=context.profile_memory, memory_system=context.memory_system, graph_memory=getattr(context, "graph_memory", None), memory_bus=getattr(context, "memory_bus", None), **kwargs),

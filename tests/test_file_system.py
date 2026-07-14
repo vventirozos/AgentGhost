@@ -146,7 +146,10 @@ async def test_tool_file_search_ripgrep(sandbox):
     cmd = args[0]
     assert "rg " in cmd
     assert "'def execute'" in cmd
-    assert "." in cmd
+    # Default (no filename) now targets the container path of the ACTIVE
+    # workspace ("/workspace" for an unscoped sandbox) instead of ".", so a
+    # project-scoped search no longer sweeps the whole sandbox root.
+    assert cmd.rstrip().endswith("/workspace") or "/workspace'" in cmd
     
     # 2. Test specific path injection immunity
     sandbox_manager.execute.reset_mock()

@@ -180,6 +180,34 @@
   single 35B slot every 45&nbsp;s for as long as a node stayed down). Covered
   by <code>tests/test_worker_warmup.py</code>.</p>
 
+  <h2>Main-node prefix warmup (2026-07-14)</h2>
+  <p>The worker warmup above covers the <em>off-main</em> nodes; the main
+  node's cost is different — the FIRST request of a session prefills the
+  ~30k-token rendered head (system slot ≈ 14&nbsp;KB + native tool schemas
+  ≈ 63&nbsp;KB, rendered by the chat template immediately after the system
+  text) at the measured ~450&nbsp;tok/s ≈ <strong>70&nbsp;s on the user's
+  critical path</strong>. Both blocks are byte-stable across conversations
+  (all volatile continuity was moved to the tail injection precisely for
+  cache stability), so <code>GhostAgent.warm_up_main_prefix()</code>
+  (spawn_bg'd from main.py at lifespan start; opt-out
+  <code>GHOST_MAIN_PREFIX_WARMUP=0</code>) sends one background
+  <code>max_tokens=1</code> request carrying that exact head. The server's
+  prefix cache (<code>cache_prompt</code> + <code>--cache-ram</code>) then
+  serves it, and the first real request pays only its unique tail (hydrated
+  memory + dynamic state + query ≈ 20-25&nbsp;s).</p>
+  <p><strong>Byte-exactness is the contract:</strong> the warmup builds its
+  system slot and tools through the SAME code paths a live request uses
+  (<code>_RequestState.get_profile_str()</code> → <code>SYSTEM_PROMPT</code>
+  splice + the <code>perfect_it</code> mutation when configured;
+  <code>get_active_tool_defs</code> for the tools) so it cannot drift. The
+  acquired-skill tail of the tool list is query-routed and may differ per
+  conversation — that only shortens the cache match (schemas render in list
+  order, static tools first), never breaks it. Main-slot etiquette:
+  <code>is_background=True</code> with no off-main flags targets main but
+  waits for any live foreground request, so a user who beats the warmup is
+  never queued behind it; failures are debug-logged and never escape.
+  Covered by <code>tests/test_main_prefix_warmup.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

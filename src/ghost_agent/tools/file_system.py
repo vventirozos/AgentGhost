@@ -202,6 +202,18 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
     mismatch ("python3: can't open file '/workspace/skills/in_gr_news.py'").
     Write-then-read symmetry is still preserved: both tools now
     interpret ``/workspace/...`` as sandbox-root-relative.
+
+    PROJECT-SCOPED sandboxes (``sandbox_dir`` = ``<root>/projects/<id>``)
+    add one more wrinkle: the container bind-mounts the OUTER ``<root>`` at
+    ``/workspace`` even while file ops are scoped to the project dir, so a
+    ``/workspace/X`` reference may name a real root-level file (e.g. a repo
+    ``execute`` cloned with an absolute path) that the scoped heal made
+    unreachable — every file_system op reported the project sandbox EMPTY
+    while the shell listed the files fine (2026-07-14 log). Step 1c below
+    resolves the ambiguity by existence: prefer the scoped candidate when
+    it exists (the historical heal, and the default for brand-new files),
+    fall back to the outer root when the file genuinely lives there.
+    Host-absolute paths under the outer root anchor the same way in step 0.
     """
     raw = str(filename).strip()
 
@@ -218,6 +230,18 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
         except Exception:
             pass
 
+    # Project-scoping context. When a project is active, ``sandbox_dir`` is
+    # ``<root>/projects/<id>`` but the container STILL bind-mounts ``<root>``
+    # at ``/workspace`` (see ``_to_container_path``) — so an explicitly
+    # root-anchored reference (``/workspace/...`` or a host-absolute path
+    # under ``<root>``) can legitimately name a file OUTSIDE the scoped dir,
+    # e.g. one ``execute`` created with an absolute ``/workspace/...`` path
+    # (a git clone). ``anchor`` is the directory the cleaned name is joined
+    # to AND the containment root for the final safety check.
+    _outer_root = (sandbox_dir.parent.parent
+                   if sandbox_dir.parent.name == "projects" else None)
+    anchor = sandbox_dir
+
     # 0. Host-absolute sandbox path → sandbox-relative. The LLM sometimes
     # echoes the full HOST path of the sandbox (it sees it in a prior
     # sandbox-tree listing / file-read error and passes it back), e.g.
@@ -227,21 +251,36 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
     # relative form (2026 report-regeneration trace burned ~5 turns on
     # this). If the given absolute path is already inside the sandbox
     # root, strip the prefix and honour the remainder as sandbox-relative.
-    # Does NOT touch "/workspace/..." (handled below) — that host path is
-    # not under the sandbox dir, so the relative_to check skips it.
+    # When project-scoped, a host-absolute path under the OUTER root (but
+    # outside the scoped dir) anchors to the outer root — it names a real
+    # root-level file, not a scoped one. Does NOT touch "/workspace/..."
+    # (handled below) — that host path is not under either dir, so the
+    # relative_to checks skip it.
     if raw.startswith("/"):
         try:
-            _sb = sandbox_dir.resolve()
             _abs = Path(raw).resolve()
-            try:
-                inside = (_abs == _sb) or _abs.is_relative_to(_sb)
-                rel = "" if _abs == _sb else str(_abs.relative_to(_sb))
-            except AttributeError:  # Python < 3.9
-                s_abs, s_sb = str(_abs), str(_sb).rstrip("/")
-                inside = s_abs == s_sb or s_abs.startswith(s_sb + "/")
-                rel = "" if s_abs == s_sb else s_abs[len(s_sb) + 1:]
-            if inside:
-                raw = rel
+            _bases = [sandbox_dir] + ([_outer_root] if _outer_root is not None else [])
+            for _base in _bases:
+                _sb = _base.resolve()
+                try:
+                    # relative_to() RAISES when not inside — compute it only
+                    # after the containment test, or a non-matching FIRST
+                    # base would abort the whole loop through the outer
+                    # except before the outer root ever got tried.
+                    if _abs == _sb:
+                        inside, rel = True, ""
+                    elif _abs.is_relative_to(_sb):
+                        inside, rel = True, str(_abs.relative_to(_sb))
+                    else:
+                        inside, rel = False, ""
+                except AttributeError:  # Python < 3.9
+                    s_abs, s_sb = str(_abs), str(_sb).rstrip("/")
+                    inside = s_abs == s_sb or s_abs.startswith(s_sb + "/")
+                    rel = "" if s_abs == s_sb else s_abs[len(s_sb) + 1:]
+                if inside:
+                    raw = rel
+                    anchor = _base
+                    break
         except Exception:
             pass
 
@@ -253,10 +292,16 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
     # ``workspace_xyz/`` are untouched. Applied AFTER the leading
     # slash strip so ``/workspace/foo``, ``workspace/foo``, and
     # ``//workspace/foo`` all collapse identically.
+    _had_workspace_prefix = False
     if clean_name == "workspace":
         clean_name = ""
+        _had_workspace_prefix = True
     elif clean_name.startswith("workspace/"):
         clean_name = clean_name[len("workspace/"):]
+        _had_workspace_prefix = True
+    # Pre-heal remainder — the literal container-relative path, needed by
+    # step 1c to compute the ROOT candidate before 1b rewrites clean_name.
+    _ws_remainder = clean_name
 
     # 1b. Redundant project-prefix heal (project-scoped sandbox only).
     # When a project is active the sandbox root IS <sandbox>/projects/<id>
@@ -273,7 +318,7 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
     # Case-insensitive on the id (project ids are canonicalised to lowercase
     # hex). Untouched for the normal unscoped root, whose parent dir is not
     # literally named ``projects``.
-    if sandbox_dir.parent.name == "projects":
+    if sandbox_dir.parent.name == "projects" and anchor is sandbox_dir:
         _pid = sandbox_dir.name
         _root_name = sandbox_dir.parent.parent.name
         # Longest (root-qualified) form first so it wins over the bare one.
@@ -304,11 +349,43 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
         if _m:
             clean_name = clean_name[_m.end():]
 
-    # 2. Resolve to absolute path inside the sandbox root
-    target_path = (sandbox_dir / clean_name).resolve()
+    # 1c. Existence-aware ROOT re-anchor for ``/workspace/...`` paths under
+    # project scoping. Such a path is ambiguous: it may be the model's usual
+    # shorthand for "my working file X" (healed into the scoped dir — the
+    # common write case, kept as the default), or a REAL container-absolute
+    # path quoted from ``execute`` output (ls / find / git clone) whose file
+    # lives at the sandbox ROOT, outside the project dir. The 2026-07-14 log
+    # shows the cost of always healing: a repo cloned to /workspace/analysis
+    # was invisible to every file_system op ("sandbox is EMPTY") while the
+    # shell saw it fine. Disambiguate by what actually exists on disk:
+    #   1. scoped candidate exists                    → scoped (heal wins)
+    #   2. ROOT candidate exists                      → root (the clone case)
+    #   3. neither exists, but the ROOT candidate's parent dir does and the
+    #      scoped one's doesn't                       → root (a NEW file
+    #      inside an execute-created tree)
+    #   4. otherwise                                  → scoped (heal default)
+    if (_had_workspace_prefix and _outer_root is not None
+            and anchor is sandbox_dir and _ws_remainder):
+        try:
+            _scoped_cand = (sandbox_dir / clean_name).resolve()
+            _root_cand = (_outer_root / _ws_remainder).resolve()
+            if _root_cand != _scoped_cand and not _scoped_cand.exists():
+                if _root_cand.exists() or (
+                        _root_cand.parent.is_dir()
+                        and not _scoped_cand.parent.is_dir()):
+                    anchor = _outer_root
+                    clean_name = _ws_remainder
+        except OSError:
+            pass
 
-    # 3. Ensure it's still inside sandbox (Robust Pathlib Check)
-    _sb_resolved = sandbox_dir.resolve()
+    # 2. Resolve to absolute path inside the anchor root
+    target_path = (anchor / clean_name).resolve()
+
+    # 3. Ensure it's still inside the anchor root (Robust Pathlib Check).
+    # ``anchor`` is the scoped sandbox dir normally, or the OUTER sandbox
+    # root for explicitly root-anchored paths — both are inside the true
+    # sandbox boundary, so traversal is blocked either way.
+    _sb_resolved = anchor.resolve()
     try:
         if not target_path.is_relative_to(_sb_resolved):
             raise ValueError(f"Security Error: Path '{filename}' attempts to access outside sandbox.")
@@ -321,13 +398,19 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
         if _t_str != _sb_str and not _t_str.startswith(_sb_str + os.sep):
             raise ValueError(f"Security Error: Path '{filename}' attempts to access outside sandbox.")
 
-    # 4. Destructive ops must not target the root itself.
-    if not allow_root and target_path == _sb_resolved:
-        raise ValueError(
-            f"Security Error: refusing to run a destructive operation on the "
-            f"sandbox/project root ('{filename}'). Target a specific file or "
-            f"subdirectory instead."
-        )
+    # 4. Destructive ops must not target a root itself — neither the scoped
+    # project root NOR (when scoped) the outer sandbox root, which root-
+    # anchored paths can now name directly.
+    if not allow_root:
+        _roots = {sandbox_dir.resolve()}
+        if _outer_root is not None:
+            _roots.add(_outer_root.resolve())
+        if target_path in _roots:
+            raise ValueError(
+                f"Security Error: refusing to run a destructive operation on the "
+                f"sandbox/project root ('{filename}'). Target a specific file or "
+                f"subdirectory instead."
+            )
 
     return target_path
 
@@ -476,6 +559,62 @@ def _to_container_path(sandbox_dir: Path, host_path: Path) -> str:
         return _CONTAINER_WORKDIR
     return f"{_CONTAINER_WORKDIR}/{rel_str}"
 
+def _scoped_root_fallback(sandbox_dir: Path, filename):
+    """Resolve ``filename`` against the OUTER sandbox root when a project-
+    scoped lookup missed. Returns the resolved root path when it exists
+    there, else ``None`` (always ``None`` for an unscoped sandbox).
+
+    READ-ONLY callers use this to serve files ``execute`` created via
+    absolute ``/workspace/...`` paths — those land at the root, not the
+    project dir, and were previously invisible to every file_system op
+    (the 2026-07-14 "sandbox is EMPTY" log). Destructive ops must NOT use
+    it: cross-scope edits stay explicit via a ``/workspace/...`` path."""
+    sd = Path(sandbox_dir)
+    if sd.parent.name != "projects":
+        return None
+    root = sd.parent.parent
+    try:
+        cand = _get_safe_path(root, filename)
+        if cand.exists() and cand != root.resolve():
+            return cand
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def _outer_root_files_hint(sandbox_dir: Path, limit: int = 8) -> str:
+    """When a project-scoped workspace lookup comes up empty, name a few
+    entries that DO exist at the sandbox ROOT (outside ``projects/``) so the
+    model learns the ``/workspace/...`` route instead of concluding its files
+    vanished. Empty string when unscoped or nothing relevant exists."""
+    sd = Path(sandbox_dir)
+    if sd.parent.name != "projects":
+        return ""
+    root = sd.parent.parent
+    names = []
+    try:
+        for entry in sorted(os.listdir(root)):
+            if entry.startswith(".") or entry in (
+                    "projects", "__pycache__", "node_modules", "venv", "env"):
+                continue
+            names.append(entry + ("/" if (root / entry).is_dir() else ""))
+            if len(names) >= limit:
+                break
+    except OSError:
+        return ""
+    if not names:
+        return ""
+    return (
+        " NOTE: the sandbox ROOT (outside this project's dir) DOES contain: "
+        + ", ".join(names)
+        + ". Files created by `execute` with absolute /workspace/... paths "
+        "land there, not in this project's workspace. Reach them with "
+        "container-absolute paths, e.g. file_system(operation='list_files', "
+        f"path='/workspace/{names[0].rstrip('/')}') or operation='read', "
+        "path='/workspace/<file>'."
+    )
+
+
 def _missing_file_message(filename, sandbox_dir) -> str:
     """Loop-breaking 'not found' message for a missing read target.
 
@@ -507,7 +646,8 @@ def _missing_file_message(filename, sandbox_dir) -> str:
     if existing:
         listing = "Files that DO exist here: " + ", ".join(existing[:20]) + "."
     else:
-        listing = "This project's sandbox is currently EMPTY (no files yet)."
+        listing = ("This project's sandbox is currently EMPTY (no files yet)."
+                   + _outer_root_files_hint(sandbox_dir))
     return (
         f"Error: '{filename}' does not exist in the current project's sandbox. "
         f"{listing} The live sandbox is AUTHORITATIVE — if a workspace narrative, "
@@ -592,8 +732,22 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
 
     try:
         path = _get_safe_path(sandbox_dir, filename)
+        _fb_note = ""
         if not path.exists():
-            return _missing_file_message(filename, sandbox_dir)
+            # Project-scoped miss, but the file exists at the sandbox ROOT
+            # (created by `execute` via an absolute /workspace/... path):
+            # serve it read-only with a note, instead of the dead-end
+            # "sandbox is EMPTY" error the 2026-07-14 session looped on.
+            fb = _scoped_root_fallback(sandbox_dir, filename)
+            if fb is None:
+                return _missing_file_message(filename, sandbox_dir)
+            path = fb
+            _fb_note = (
+                f"NOTE: '{filename}' is not in the current project's "
+                f"workspace; serving the file at the sandbox ROOT "
+                f"(container path '{_to_container_path(sandbox_dir, fb)}'). "
+                f"Use that /workspace/... path to reference it in other "
+                f"file/shell operations.\n")
 
         # LINE-RANGE READ (#11): a bounded slice, EXEMPT from the whole-file
         # size cap — this is the cheap recovery path after a failed replace or
@@ -602,8 +756,11 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
         # slice is returned with line-number prefixes so it chains directly
         # from `rg --line-number` output and the replace-failure snippet.
         if start_line is not None or end_line is not None:
-            return await asyncio.to_thread(
+            _rng = await asyncio.to_thread(
                 _read_line_range, path, filename, start_line, end_line)
+            if _fb_note and not _rng.startswith("Error"):
+                _rng = _fb_note + _rng
+            return _rng
 
         file_size = path.stat().st_size
         max_bytes = read_byte_budget(max_context)
@@ -656,7 +813,7 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
         # read in this same turn sees a smaller remaining allowance.
         if read_budget is not None:
             read_budget.charge(len(content))
-        return f"--- {filename} CONTENTS ---\n{content}"
+        return f"{_fb_note}--- {filename} CONTENTS ---\n{content}"
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
@@ -783,7 +940,19 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             
     try:
         path = _get_safe_path(sandbox_dir, filename)
-        if not path.exists(): return f"Error: '{filename}' not found."
+        if not path.exists():
+            # NO silent cross-scope edit: when the file exists at the sandbox
+            # ROOT instead (execute-created via an absolute path), require
+            # the model to name it explicitly — an edit landing outside the
+            # project dir must be intentional.
+            fb = _scoped_root_fallback(sandbox_dir, filename)
+            if fb is not None:
+                _cp = _to_container_path(sandbox_dir, fb)
+                return (f"Error: '{filename}' is not in the current project's "
+                        f"workspace, but it DOES exist at the sandbox ROOT as "
+                        f"'{_cp}'. Re-issue the replace with path='{_cp}' to "
+                        f"edit that file.")
+            return f"Error: '{filename}' not found."
 
         try:
             file_size = path.stat().st_size
@@ -1444,15 +1613,22 @@ async def _syntax_feedback(path: Path, filename: str) -> str:
     ext = str(filename).split(".")[-1].lower()
     err = ""
     try:
+        # Explicit UTF-8 on every read here: without it read_text() uses the
+        # process locale (LANG unset under launchd on this box), and a non-
+        # ASCII char in the file raised UnicodeDecodeError — swallowed by the
+        # blanket except below, silently SKIPPING the whole syntax check.
+        # Mirrors the same fix already applied to tool_write_file's write.
         if ext == "py":
             import ast
             try:
-                ast.parse(await asyncio.to_thread(path.read_text))
+                ast.parse(await asyncio.to_thread(
+                    path.read_text, encoding="utf-8", errors="replace"))
             except SyntaxError as se:
                 err = f"{se.msg} (line {se.lineno}, col {se.offset})"
         elif ext == "json":
             try:
-                json.loads(await asyncio.to_thread(path.read_text))
+                json.loads(await asyncio.to_thread(
+                    path.read_text, encoding="utf-8", errors="replace"))
             except json.JSONDecodeError as je:
                 err = f"{je.msg} (line {je.lineno}, col {je.colno})"
         elif ext in ("js", "mjs", "cjs"):
@@ -1483,7 +1659,8 @@ async def _syntax_feedback(path: Path, filename: str) -> str:
             # check each so a typo there (e.g. `content='…'` written `content=`)
             # is named with its HTML line instead of surfacing as a silent
             # blank page the model can only find by re-reading the whole file.
-            html = await asyncio.to_thread(path.read_text)
+            html = await asyncio.to_thread(
+                path.read_text, encoding="utf-8", errors="replace")
             for start_line, src in _inline_js_blocks(html):
                 diag = await _node_check_source(src)
                 if diag:
@@ -1699,26 +1876,74 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
-async def tool_list_files(sandbox_dir: Path, memory_system=None):
-    pretty_log("Sandbox Tree", "Listing workspace files & mapping repo", icon=Icons.TOOL_FILE_I)
+# Hard cap on entries in one listing. Beyond it the tail is COUNTED and the
+# message says how to see it (list a subdirectory) — the old silent [:200]
+# slice made big workspaces look like their subdirectories were empty, which
+# sent the model to `execute`+ls instead of file_system (2026-07-14 log).
+_LIST_MAX_ENTRIES = 200
+
+
+async def tool_list_files(sandbox_dir: Path, memory_system=None, path: str = None):
+    """List the workspace tree (with Python AST signatures). ``path`` scopes
+    the listing to one subdirectory — previously the dispatcher dropped it,
+    so 'list analysis/src' silently re-listed the whole (truncated) root."""
+    _want_sub = path is not None and str(path).strip() not in ("", ".", "./")
+    pretty_log("Sandbox Tree",
+               "Listing workspace files & mapping repo"
+               + (f" [{path}]" if _want_sub else ""),
+               icon=Icons.TOOL_FILE_I)
     try:
+        base = Path(sandbox_dir)
+        display_prefix = ""
+        if _want_sub:
+            try:
+                base = _get_safe_path(sandbox_dir, path)
+            except ValueError as ve:
+                return str(ve)
+            if not base.exists():
+                fb = _scoped_root_fallback(sandbox_dir, path)
+                if fb is None:
+                    return _missing_file_message(path, sandbox_dir)
+                base = fb
+            if base.is_file():
+                return (f"Note: '{path}' is a FILE, not a directory. Use "
+                        f"file_system(operation='read', path='{path}') to read it.")
+            # Prefix every entry with a path the model can feed straight back
+            # into file tools: sandbox-relative when the dir is inside the
+            # active workspace, container-absolute (/workspace/...) when it
+            # lives at the outer root of a project-scoped sandbox.
+            try:
+                rel = base.resolve().relative_to(Path(sandbox_dir).resolve())
+                display_prefix = "" if str(rel) in ("", ".") else rel.as_posix() + "/"
+            except ValueError:
+                display_prefix = _to_container_path(sandbox_dir, base).rstrip("/") + "/"
+
         def _build_map():
             import ast
             import os
             tree_lines = []
-            
-            for root, dirs, files in os.walk(sandbox_dir):
-                # Ignore hidden and virtual env directories
-                dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', 'venv', 'env']]
-                
-                rel_root = Path(root).relative_to(sandbox_dir)
-                root_prefix = "" if rel_root == Path(".") else f"{rel_root}/"
-                
+            total = 0
+
+            for root, dirs, files in os.walk(base):
+                # Ignore hidden and virtual env directories; sort so the
+                # listing is deterministic across calls (os.walk's raw dir
+                # order is filesystem-dependent, which made truncated
+                # listings show a DIFFERENT subset each time).
+                dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d not in ['__pycache__', 'node_modules', 'venv', 'env'])
+
+                rel_root = Path(root).relative_to(base)
+                root_prefix = display_prefix if rel_root == Path(".") else f"{display_prefix}{rel_root.as_posix()}/"
+
                 for f in sorted(files):
                     if f.startswith('.'): continue
-                    path = Path(root) / f
+                    total += 1
+                    if len(tree_lines) >= _LIST_MAX_ENTRIES:
+                        # Past the cap: keep COUNTING (for the truncation
+                        # report) but skip the expensive AST work.
+                        continue
+                    path_ = Path(root) / f
                     line = f"  {root_prefix}{f}"
-                    
+
                     # --- REPO MAP: Extract AST Signatures for Python files ---
                     if f.endswith('.py'):
                         try:
@@ -1726,8 +1951,8 @@ async def tool_list_files(sandbox_dir: Path, memory_system=None):
                             # symlink or a file deleted between os.walk and
                             # here raises OSError, which would otherwise
                             # abort the ENTIRE listing.
-                            if path.stat().st_size < 100000:
-                                code = path.read_text(errors='ignore')
+                            if path_.stat().st_size < 100000:
+                                code = path_.read_text(errors='ignore')
                                 parsed = ast.parse(code)
                                 sigs = []
                                 for node in parsed.body:
@@ -1740,13 +1965,27 @@ async def tool_list_files(sandbox_dir: Path, memory_system=None):
                         except Exception:
                             pass
                     tree_lines.append(line)
-                    
-            return "\n".join(tree_lines[:200]) if tree_lines else "[Empty]"
-            
-        sandbox_tree = await asyncio.to_thread(_build_map)
-        if len(sandbox_tree.splitlines()) >= 200:
-            sandbox_tree += "\n  ... [Truncated for length]"
-            
+
+            return tree_lines, total
+
+        tree_lines, total = await asyncio.to_thread(_build_map)
+        if tree_lines:
+            sandbox_tree = "\n".join(tree_lines)
+            if total > len(tree_lines):
+                sandbox_tree += (
+                    f"\n  ... [{total - len(tree_lines)} more files NOT shown "
+                    f"({total} total). This listing is capped at "
+                    f"{_LIST_MAX_ENTRIES} entries — list ONE subdirectory to "
+                    f"see the rest: file_system(operation='list_files', "
+                    f"path='<subdir>')]")
+        else:
+            sandbox_tree = "[Empty]"
+            if not _want_sub:
+                # The scoped workspace itself is empty — say so, but point at
+                # root-level files (e.g. an execute-side git clone) instead of
+                # letting the model conclude its files vanished.
+                sandbox_tree += _outer_root_files_hint(sandbox_dir)
+
         return f"CURRENT SANDBOX DIRECTORY STRUCTURE:\n{sandbox_tree}\n\n(Use these filenames for all file tools)"
     except Exception as e: return f"Error scanning sandbox: {e}"
 
@@ -1879,8 +2118,9 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                                 continue  # closes this stream, re-requests the validated hop
                             if resp.status_code != 200:
                                 if resp.status_code in [401, 403, 503] and mode == "TOR":
-                                    await asyncio.to_thread(request_new_tor_identity)
-                                    await asyncio.sleep(5)
+                                    # Rotation happens ONCE below the hop
+                                    # loop — rotating here too doubled the
+                                    # identity churn + 10s of sleep per retry.
                                     break  # break the hop loop → outer attempt retry
                                 return f"Error {resp.status_code} - Failed to download from {url}"
 
@@ -1953,10 +2193,23 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
         # outside ``sandbox_dir``.
         if filename:
             search_path = _get_safe_path(sandbox_dir, filename)
+            if not search_path.exists():
+                # Read-only root fallback (see _scoped_root_fallback): the
+                # target may live at the sandbox ROOT, outside the project.
+                fb = _scoped_root_fallback(sandbox_dir, filename)
+                if fb is not None:
+                    search_path = fb
             container_path = _to_container_path(sandbox_dir, search_path)
             escaped_path = shlex.quote(container_path)
         else:
-            escaped_path = "."
+            # Scope the default search to the ACTIVE workspace. The rg
+            # command runs at the container root (/workspace), so a bare "."
+            # searched the WHOLE sandbox root even when a project was active
+            # — matches from other projects came back with paths the scoped
+            # read op couldn't resolve. "/workspace" when unscoped (same
+            # tree as "." was), "/workspace/projects/<id>" when scoped.
+            escaped_path = shlex.quote(
+                _to_container_path(sandbox_dir, Path(sandbox_dir)))
 
         pattern = str(pattern).strip("'\"") # Strip accidental quotes
         escaped_pattern = shlex.quote(pattern)
@@ -2008,14 +2261,26 @@ async def tool_find_files(pattern: str, sandbox_manager, path: str = ".", sandbo
         # left alone. ``sandbox_dir`` is required for translation; when
         # missing we fall through to the legacy behavior.
         search_path = path
-        if sandbox_dir is not None and path and path != ".":
-            try:
-                resolved = _get_safe_path(sandbox_dir, path)
-                search_path = _to_container_path(sandbox_dir, resolved)
-            except ValueError:
-                # Outside-sandbox traversal — surface clearly rather than
-                # silently searching the wrong tree.
-                return f"Error: path '{path}' resolves outside the sandbox."
+        if sandbox_dir is not None:
+            if not path or str(path).strip() in ("", "."):
+                # Scope the default to the ACTIVE workspace: find runs at the
+                # container root (/workspace), so a literal "." swept the
+                # whole sandbox root even when a project was active.
+                search_path = _to_container_path(sandbox_dir, Path(sandbox_dir))
+            else:
+                try:
+                    resolved = _get_safe_path(sandbox_dir, path)
+                    if not resolved.exists():
+                        # Read-only root fallback — the dir may live at the
+                        # sandbox ROOT (execute-created), outside the project.
+                        fb = _scoped_root_fallback(sandbox_dir, path)
+                        if fb is not None:
+                            resolved = fb
+                    search_path = _to_container_path(sandbox_dir, resolved)
+                except ValueError:
+                    # Outside-sandbox traversal — surface clearly rather than
+                    # silently searching the wrong tree.
+                    return f"Error: path '{path}' resolves outside the sandbox."
         # The sandbox runs commands WITHOUT a shell (docker exec splits the
         # string into argv), so a bare `| head` would be passed as literal
         # args to `find`. Wrap the whole pipeline in `sh -c` so the pipe is
@@ -2030,9 +2295,22 @@ async def tool_inspect_file(filename: str, sandbox_dir: Path, lines: int = 10):
     if not filename: return "Error: 'path' (filename) is required for inspection."
     pretty_log("File Peek", filename, icon=Icons.TOOL_FILE_I)
     try:
+        # Coerce: the dispatcher forwards the model-supplied value verbatim
+        # (may be None, "20", or garbage) — a bad value must not crash the op.
+        try:
+            lines = max(1, int(lines))
+        except (TypeError, ValueError):
+            lines = 10
         path = _get_safe_path(sandbox_dir, filename)
+        _fb_note = ""
         if not path.exists():
-            return _missing_file_message(filename, sandbox_dir)
+            fb = _scoped_root_fallback(sandbox_dir, filename)
+            if fb is None:
+                return _missing_file_message(filename, sandbox_dir)
+            path = fb
+            _fb_note = (f"NOTE: serving the sandbox-ROOT copy "
+                        f"'{_to_container_path(sandbox_dir, fb)}' (not in this "
+                        f"project's workspace).\n")
         def _read_peek():
             content = []
             with open(path, 'r', encoding='utf-8', errors='replace') as f:
@@ -2041,8 +2319,8 @@ async def tool_inspect_file(filename: str, sandbox_dir: Path, lines: int = 10):
                     if not line: break
                     content.append(line.strip())
             return "\n".join(content)
-        
-        return await asyncio.to_thread(_read_peek)
+
+        return _fb_note + await asyncio.to_thread(_read_peek)
     except ValueError as ve: return str(ve)
     except Exception as e: return f"Error: {e}"
 
@@ -2126,7 +2404,11 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
 
     try:
         path = _get_safe_path(sandbox_dir, filename)
-        if not path.exists(): return f"Error: '{filename}' not found."
+        if not path.exists():
+            fb = _scoped_root_fallback(sandbox_dir, filename)
+            if fb is None:
+                return _missing_file_message(filename, sandbox_dir)
+            path = fb
 
         # Ensure page and chunk_size are integers
         try:
@@ -2281,7 +2563,13 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
 
     sandbox_manager = kwargs.get("sandbox_manager")
 
-    if operation in ["list", "list_files"]: return await tool_list_files(sandbox_dir)
+    # Accept the aliases the model reaches for; `path` (optional) scopes the
+    # listing to one subdirectory — it used to be silently dropped, so every
+    # "list <subdir>" call re-listed the (truncated) root and big workspaces
+    # looked like their subdirectories were empty.
+    if operation in ("list", "list_files", "ls", "dir", "tree", "list_dir",
+                     "list_directory"):
+        return await tool_list_files(sandbox_dir, path=target_path)
     if operation == "search": 
         search_target = pattern or final_content
         if not search_target:
@@ -2327,7 +2615,11 @@ async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path
         page = kwargs.get("page", 1)
         chunk_size = kwargs.get("chunk_size", 32000)
         return await tool_read_document_chunked(target_path, sandbox_dir, page=page, chunk_size=chunk_size, max_context=max_context)
-    elif operation == "inspect": return await tool_inspect_file(target_path, sandbox_dir)
+    elif operation == "inspect":
+        # `lines` used to be dropped here, so the model could never widen the
+        # peek; tool_inspect_file coerces bad values back to the default.
+        return await tool_inspect_file(target_path, sandbox_dir,
+                                       lines=kwargs.get("lines", 10))
     elif operation == "write": return await tool_write_file(target_path, final_content, sandbox_dir)
     elif operation == "replace":
         # Accept the param-name variants the model routinely reaches for
