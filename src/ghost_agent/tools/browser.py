@@ -696,6 +696,33 @@ async def op_click(op):
 
     async def run(page):
         await page.goto(url, wait_until=wait_until)
+        # FAIL-FAST SELECTOR PROBE (2026-07-14). Every atomic op runs in a
+        # fresh context and re-navigates, so DOM created by a PREVIOUS click
+        # (an opened window/menu/dialog) does not exist on this freshly
+        # loaded page — page.click would then burn the FULL timeout waiting
+        # for a selector that can never appear (observed live: two 30s click
+        # timeouts on '.wp-option', which only exists after clicking the
+        # Wallpapers icon, ate the turn's verification budget and tripped
+        # the no-progress loop breaker — twice in one evening). Probe
+        # existence with a short bounded wait; when absent, fail fast and
+        # NAME the escape (op='interact' keeps one context alive across
+        # steps). state='attached' not 'visible' so a present-but-animating
+        # element still proceeds to page.click's own actionability wait.
+        probe_ms = min(8000, int(op["timeout_ms"]))
+        try:
+            await page.wait_for_selector(selector, state="attached",
+                                         timeout=probe_ms)
+        except Exception:
+            raise RuntimeError(
+                f"selector {selector!r} not found within {probe_ms}ms on the "
+                f"freshly-loaded page. Each atomic browser op reloads the "
+                f"page in a fresh context, so elements created by a PREVIOUS "
+                f"click (an opened window, menu or dialog) no longer exist. "
+                f"Run the whole flow in ONE context with op='interact', e.g. "
+                f"actions=[{{\"action\":\"click\",\"selector\":\"<the "
+                f"opener>\"}}, {{\"action\":\"click\",\"selector\":"
+                f"\"{selector}\"}}]."
+            )
         await page.click(selector)
         # Wait for any navigation triggered by the click to settle.
         try:
@@ -1537,6 +1564,9 @@ async def tool_browser(
                     a CSS selector. Truncates at `max_chars` (64 KB default).
       click: click a selector, wait for load, return {url, title, text} —
              the post-click page text (~8 KB preview), same as navigate.
+             NOTE: reloads the page first (fresh context) — an element that
+             only exists after a previous click (opened window/menu) will
+             NOT be there; use `interact` for any multi-step flow.
       screenshot: save a PNG to `out_path` inside /workspace.
       close: delete the persistent profile so the next session is fresh.
       interact: run a list of sub-actions in ONE Chromium context
@@ -1755,12 +1785,18 @@ async def tool_browser(
             f"Runner failed (exit {exit_code}): {parsed}",
             hint=(
                 "If this is a navigation timeout, try wait_until='domcontentloaded' "
-                "or raise timeout_ms. If the error mentions 'headless_shell not "
-                "found' or 'Executable doesn't exist', the sandbox was provisioned "
-                "before the Chromium pre-install was added — delete "
-                "`/root/.supercharged` inside the container and retry. If the "
-                "error says the op needs a URL, call `operation=\"navigate\"` "
-                "once first, or pass `url=...` on this call."
+                "or raise timeout_ms. If a CLICK timed out or its selector was "
+                "not found: each atomic op reloads the page in a fresh context, "
+                "so elements created by a previous click (opened windows, menus, "
+                "dialogs) are GONE — run the whole flow in one context with "
+                "operation='interact' and an actions list "
+                "([{\"action\":\"click\",...}, ...]). If the error mentions "
+                "'headless_shell not found' or 'Executable doesn't exist', the "
+                "sandbox was provisioned before the Chromium pre-install was "
+                "added — delete `/root/.supercharged` inside the container and "
+                "retry. If the error says the op needs a URL, call "
+                "`operation=\"navigate\"` once first, or pass `url=...` on "
+                "this call."
             ),
         )
 

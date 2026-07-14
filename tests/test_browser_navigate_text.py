@@ -52,6 +52,11 @@ class _FakePage:
     async def click(self, selector):
         return None
 
+    async def wait_for_selector(self, selector, state="visible", timeout=None):
+        # Selector always "exists" — the click fail-fast probe (2026-07-14)
+        # must pass through in these post-click-text tests.
+        return None
+
     async def wait_for_load_state(self, *a, **k):
         return None
 

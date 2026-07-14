@@ -766,6 +766,25 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-14m — browser click fail-fast: impossible selectors no longer eat the repair turn
+Operator spotted it in the live log: two WebOS repair turns (3D 18:53, 7C 19:03) died at the same
+wall — `click .wp-option` → `TimeoutError: Page.click: Timeout 30000ms exceeded` ×2 → no-progress
+loop breaker force-ends the turn before the wallpaper fix could be verified. Root cause is
+structural, not flakiness: every atomic browser op launches a fresh context and re-navigates (only
+cookies persist), so `.wp-option` — which exists only after clicking the Wallpapers icon — can NEVER
+appear; page.click waited out the full 30s on an impossible selector and the opaque error taught the
+model nothing (it retried variants of the same doomed call; its reasoning never reached for
+`interact`, the op that exists exactly for multi-step flows).
+Fix (tools/browser.py, embedded runner): `op_click` probes the selector post-goto with
+`wait_for_selector(state='attached', timeout=min(8s, timeout_ms))` — absent → fail in ≤8s with an
+error explaining the state reset and naming the escape verbatim (op='interact' + actions list).
+'attached' not 'visible' so animating-but-present elements still get page.click's own actionability
+diagnostics. Outer failure hint + click op description carry the same steer. Runner is rewritten to
+the sandbox per call, so this needs only the agent restart. One stale FakePage in
+test_browser_navigate_text.py grew a no-op wait_for_selector.
+Tests: test_browser_click_failfast.py (4; runner-exec harness). All 237 browser tests + full suite
+green. Docs: tools/browser.html (new section). NOT deployed — operator restarts manually.
+
 ### 2026-07-14l — autoadvance now consumes the write-time syntax-check signal
 First build after the 14j deploy proved the new visibility AND exposed the unwired loop: a 6-task
 WebOS autoadvance rewrote index.html 5×, EVERY write result carried `⚠ SYNTAX CHECK FAILED …
