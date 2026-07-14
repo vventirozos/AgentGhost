@@ -57,6 +57,15 @@
     <li>Connection pool with autocommit; broken connections are closed and discarded; the next call opens a fresh one.</li>
   </ul>
 
+  <h2>2026-07-14 audit fixes</h2>
+  <ul>
+    <li><strong>Host-restriction bypass via libpq URI query params (MED, closed).</strong> When a default DSN is configured, an LLM-supplied connection string may only target the SAME database. The check was built from <code>urlparse</code> netloc alone — but libpq honours connection parameters in the URI QUERY STRING, and <code>?hostaddr=10.0.0.99</code> is the <em>actual TCP target</em> (the netloc host becomes mere TLS SNI), while <code>?host=</code>/<code>?port=</code>/<code>?dbname=</code> likewise override it. So <code>…/prod?hostaddr=10.0.0.99</code> passed the netloc check and connected to <code>10.0.0.99</code> (verified with <code>psycopg2.extensions.parse_dsn</code>). The comparison key is now built by parsing the URI directly with <code>urllib</code> (<code>urlparse</code> + <code>parse_qs</code>), resolving the query-string overrides — <code>hostaddr</code> preferred over <code>host</code> (libpq's endpoint precedence), last-duplicate-wins — so all four override shapes are caught. Parsed with <code>urllib</code> rather than <code>psycopg2.parse_dsn</code> on purpose: the guard stays deterministic even where a partial/mocked psycopg2 makes <code>parse_dsn</code> unavailable (a <code>parse_dsn</code> returning a non-dict would have silently reopened the bypass). A non-numeric port in the supplied URI now returns a formatted error instead of an uncaught <code>ValueError</code>.</li>
+    <li><strong><code>confirm="false"</code> no longer authorizes DROP/TRUNCATE (MED, closed).</strong> Tool args arrive as strings, and <code>bool("false")</code>/<code>bool("0")</code>/<code>bool("no")</code> are all <code>True</code> — so an explicit <code>confirm="false"</code> was passed to the validator as confirmed. Coercion is now affirmative-token only (<code>true</code>/<code>1</code>/<code>yes</code>/<code>y</code>).</li>
+    <li><strong><code>schema</code> output is now row-capped</strong> (1000 columns) with an explicit truncation note — a wide DB previously flooded the model context with every column of every public table, unbounded (the inverse of the <code>query</code>/<code>activity</code> caps).</li>
+    <li><strong>Session <code>statement_timeout</code> no longer leaks across pooled calls</strong> — it is SET at the top of every action, so a prior <code>query</code> with a short timeout can't cause spurious cancellations on a later <code>schema</code>/<code>activity</code> reusing the cached autocommit connection.</li>
+    <li>The SQL validator still fails OPEN on its own crash (a validator bug must not brick a mostly-read tool) but now logs at WARNING, not debug — the operator sees when the destructive-statement guard is disabled. Covered by <code>tests/test_tools_batch_audit_fixes.py</code>.</li>
+  </ul>
+
   <h2>DSN</h2>
   <p>Default DSN comes from <code>--default-db</code> / <code>GHOST_DEFAULT_DB</code>. The tool can be invoked with an alternative DSN per-call.</p>
 

@@ -164,7 +164,12 @@ def _filter_junk(raw_results) -> List[Dict]:
     """Drop results with missing/relative URLs or junk-domain hosts."""
     valid = []
     for r in raw_results or []:
-        url = r.get('href', r.get('url', '')).lower()
+        # `or` chain, not `.get('href', default)`: a result dict with an
+        # explicit href=None (some backends emit that for a malformed hit)
+        # made `.get('href', ...).lower()` raise AttributeError — which, at
+        # the try-guarded call site, sank the WHOLE engine's result batch for
+        # that wave, not just the one bad row.
+        url = (r.get('href') or r.get('url') or '').lower()
         if not url or url.startswith("/") or any(j in url for j in _JUNK_DOMAINS):
             continue
         valid.append(r)

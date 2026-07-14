@@ -766,6 +766,115 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-14j — "correct code" failure chain: marker-leak replace parser + 3 compounding guards
+Operator report: "when I ask it to correct code it consistently fails — LLM or us?" Verdict: **us.**
+Trajectory trawl (394 records, 07-12→14) + live-stream forensics on the WebOS episode showed the model's
+diagnoses were correct and canonical single-envelope replaces applied 5/5; the harness did the damage.
+**Root bug — multi-edit envelope marker leak (file_system.py aider path).** Only the FIRST `====` in a
+`<<<< SEARCH` envelope is the separator; a second edit packed into the same envelope lands in
+`replace_str` VERBATIM — extra `====` lines + both texts written to the file, result "SUCCESS".
+That's exactly how index.html shipped with `====` at lines 78/80/85 + 3 duplicate `let zIndex`
+declarations; the user's next two messages were the browser errors. Four compounding gaps, all fixed:
+- **Parse-time rejection:** a block whose replacement contains a bare marker line (`====` exactly-4,
+  `<<<< SEARCH`, `>>>>`) is rejected with a one-envelope-per-edit steer (multi-envelope calls unchanged).
+- **`_marker_leak` write backstop** in `_write_replace_guarded` (covers exact/flexible/fuzzy/anchor +
+  native-args merges): refuses any result that would ADD marker lines vs. prev content. Count-aware so
+  cleanup edits on an already-corrupted file still land. RST `=====` underlines don't trip it.
+- **js/html syntax-regression rollback:** `_syntax_regression` only covered .py/.json — an HTML-corrupting
+  replace was un-rejectable. New async `_syntax_regression_js_html` runs `node --check` on .js and inline
+  `<script>` blocks with the same parse→no-parse semantics (fail-open sans node; broken files stay editable).
+- **`_find_node()` — the reason the EXISTING post-write html/js check never fired in prod:** launchd PATH
+  has no /opt/homebrew/bin, so `shutil.which("node")` was None and checks silently skipped. Now falls back
+  to the standard install paths. (Generalize: any which()-based optional checker is dead under launchd.)
+**Also: `file_system search` exit-1 misreport.** rg's "no matches" exit 1 came back as the docker layer's
+`[SYSTEM ERROR]: Process failed (Exit 1) with no output.` sentinel — the agent couldn't verify its own fix
+(3 identical `====` searches burned turns; execute.py had this normalization since the chess session,
+search didn't). Ported: exit 1 + empty/sentinel output → "Report: No matches found…"; exit 2 passes through.
+Secondary observations from the trawl (not changed here): the corrupting turn hit the n_steps=31 cap at
+literally "Let me fix it" (wrap-up message should state the fix was NOT applied); inline `python -c` guard
+cost ~4 steps/turn in repair loops (working as designed). Tests: test_replace_marker_leak_guard.py (16).
+Full suite green. Docs: tools/file_system.html (new 2026-07-14 section + ops-table rows).
+
+### 2026-07-14i — search fetch + 4 unreviewed tools (database/report_pdf/image_gen/system)
+Two-part audit. Headline finds were anonymity leaks and a DB SSRF bypass.
+**Fetch/anonymity (search.py, darkweb_search.py, utils/helpers.py):**
+- **DNS leak on Tor page fetch (HIGH for an anonymity tool).** `helper_fetch_url_content` (behind
+  deep_research + knowledge_base URL ingest) and darkweb's `_fetch_onion_text` validated URLs with the
+  SSRF guard's default resolve=True → host-side getaddrinfo of every fetched hostname, leaking the DNS
+  query for the site being visited anonymously. For .onion it leaks WHICH hidden service. Both always
+  fetch over Tor (resolution happens at the exit), so the host lookup only leaked. Fixed:
+  resolve=not bool(proxy) / resolve=False — mirrors browser/download's resolve=not anonymous.
+- `_filter_junk` crashed on a result with explicit href=None → at the try-guarded call site it sank
+  the whole engine's result batch. Now `(r.get('href') or r.get('url') or '')`.
+- Redirect-not-revalidated in these fetches is Tor-mitigated (exit-node routed, not host-reachable) —
+  documented, not a hole in Tor mode. The report_pdf/vision/download redirect fixes were the non-Tor cases.
+**database.py (survey + verified):**
+- **Host-restriction SSRF bypass via libpq URI query params (MED).** Guard compared urlparse netloc
+  only, but `?hostaddr=10.0.0.99` is libpq's actual TCP target (host→SNI); `?host=/?port=/?dbname=`
+  also override. Verified with parse_dsn: `…/prod?hostaddr=10.0.0.99` connected to 10.0.0.99 while
+  reading as prod. Now compares canonical parse_dsn keys (hostaddr>host precedence). Non-numeric port
+  → formatted error (was uncaught ValueError).
+- **confirm="false" authorized DROP/TRUNCATE (MED)** — bool("false") is True. Now affirmative-token only.
+- schema output row-capped (was unbounded flood); session statement_timeout no longer leaks across
+  pooled calls; validator fail-open now logs WARNING not debug.
+**report_pdf.py:** files-that-exist hint now fires on the all-source-files-missing error path (was
+success-path only — the exact scenario it was built for); hidden-dir filter uses relative parts.
+**image_gen.py:** SUCCESS message states actual (snapped) dimensions (was operator-log only → model
+lied about size / re-called); mkdir before write (was discarding a GPU-paid image on missing dir).
+**system.py:** null-valued profile keys no longer crash location lookup (`(data.get("root") or {})`);
+unknown location → clear message not "failed: None"; localhost/::1 count as Tor mode; bare except
+narrowed; cpu_percent moved off loop thread. Reviewed residual (documented, NOT changed): verify=False
+on the HTTPS checks — flipping on the live Tor path risks regressing weather/health vs quirky exits;
+narrow threat model; weather already untrusted content.
+Tests: test_fetch_dns_leak.py (6) + test_tools_batch_audit_fixes.py (15); 3 stale tests updated
+(schema SQL + fetchmany, one ssrf lambda signature). Full suite green. Docs: 6 tool pages.
+
+### 2026-07-14h — tasks.py + scheduler audit: user cron tasks silently died on EVERY deploy
+The predicted "invisible for weeks" bug was real, just not in a formatter: the AsyncIOScheduler
+jobstore is IN-MEMORY and deploys are plain kills, so every deploy wiped all user-scheduled tasks —
+while the "task X is running" note in vector memory kept asserting they were alive. Nobody watches
+scheduled output, so nothing surfaced the loss. Fixed:
+- **Persistent task store**: create → $GHOST_HOME/system/scheduled_tasks.json (atomic write, persisted
+  only after live registration succeeds); stop/stop_all unpersist; `restore_persisted_tasks()` at
+  lifespan start re-registers via the same `_add_job` trigger-builder the create path uses (malformed
+  records skipped+dropped, never aborting the rest). No memory_dir ⇒ clean no-op (old semantics).
+- **UTC ambiguity**: list output now says "(times in UTC)" and the manage_tasks schema tells the model
+  to convert local-time requests ("9am" = '0 6 * * *' in Athens summer). Deliberately NOT switched to
+  host tz — existing expressions were authored under UTC semantics.
+- Schema also documents persistence + same-name-replaces semantics.
+Verified CLEAN (checked, no change needed): should_defer_scheduled_task reads the real request-scoped
+`foreground_requests` counter (routes.py increments it around whole user requests — my initial
+"wrong attribute" suspicion was wrong, retracted); the 2026-07-11 conclusion-recording path
+(record_scheduled_result → activity ledger → digest/push) does deliver task output (300-char digest
+by design); the interval-validation and action-normalisation fixes hold; scheduler-error listener
+isolation intact. `idle_dream_monitor` list-filter is a harmless vestige (nothing adds that job).
+Tests: tests/test_tasks_persistence.py (9); 50 existing tasks/scheduler tests green. Docs:
+docs/tools/tasks.html (persistence + timezone sections).
+
+### 2026-07-14g — execute.py audit: cross-scope run-path gap (14c integration), gate parity, retry spill
+Final audit of the review sweep (file_system → fact_check/vision/composed_skills → browser → execute).
+execute.py was the healthiest so far — its 2026-07-02 chess-trace fixes hold — but the sweep's own
+14c change opened one gap, plus three latent issues:
+- **Root-anchored run path (14c integration).** file_system's root-anchoring means _get_safe_path can
+  now resolve `/workspace/x.py` to the OUTER root under a scoped session; execute's rel_path
+  derivation (relative_to(scoped) → lstrip fallback) then minted the phantom `workspace/x.py` →
+  ENOENT. Such files now run via container-absolute `/workspace/<rel>` — cwd-independent, same file
+  the read/write touched.
+- **Both not-found retries dropped `spill_large_output`** (remap + root-cwd) → a noisy retry dumped
+  full output into context; and the root-cwd retry succeeded SILENTLY, so the model never learned the
+  file lived at the root and re-issued scoped paths. Retries keep spill; root retry announces itself.
+- **Script-branch workspace gate was missing** despite the comment claiming parity with the bash
+  branch — every fast successful script run was recorded (duration 0.0) into the activity ledger.
+  Now timed + gated (failures always, successes ≥5s).
+- **Egress-guard bypass on run-existing-file, closed non-blockingly:** a probe script written earlier
+  via file_system ran unchecked (guard only vets command/inline content), but hard-blocking would seal
+  legit apps that reference the agent's URL by design. The run proceeds with a SANDBOX LOOPBACK BLIND
+  SPOT ground-truth note appended when source matches URL+net-client — breaks the mock-server
+  misdiagnosis chain with zero false-positive blocking. Also: dead in-function `import json` removed;
+  docs/tools/execute.html had two sections AFTER its footer (fixed).
+Tests: tests/test_execute_audit_fixes.py (9); all 72 existing execute tests green unchanged.
+This closes the systems-review sweep — remaining known threads live in §4B + the 14e ws:// residual.
+
 ### 2026-07-14f — first-request latency: main-node prefix warmup (~70s → ~20-25s expected)
 Operator report: first request of a session prefills 32-33k tokens ≈ 1 minute (KV cache fine after).
 Diagnosis: prefill measured at ~450 tok/s (llama-server.log); the rendered head = system slot

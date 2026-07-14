@@ -134,6 +134,11 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
 
         filename = f"gen_{uuid.uuid4().hex[:8]}.png"
         file_path = sandbox_dir / filename
+        # mkdir first: a fresh project scope may not have created the dir yet,
+        # and without this a FileNotFoundError would discard an image the GPU
+        # node already spent ~30s producing.
+        await asyncio.to_thread(
+            lambda: Path(sandbox_dir).mkdir(parents=True, exist_ok=True))
         await asyncio.to_thread(file_path.write_bytes, image_bytes)
 
         # When a project is active sandbox_dir is scoped to <root>/projects/<id>;
@@ -141,8 +146,20 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
         from .file_system import project_download_prefix
         download_rel = f"{project_download_prefix(sandbox_dir)}{filename}"
 
+        # Tell the model the ACTUAL output dimensions (and that a requested
+        # size was snapped to the node's bucket ladder) — otherwise it reports
+        # the size the user asked for, or re-calls the tool trying to "fix" a
+        # size that was deliberately adjusted for the diffusion model.
+        _size_note = (
+            f"Rendered at {final_w}x{final_h}"
+            + (f" (snapped from the requested {raw_w}x{raw_h} to the image "
+               f"node's nearest supported bucket — tell the user the actual "
+               f"size if they asked for a specific one)" if snapped else "")
+            + ".\n\n"
+        )
         return (
             "SUCCESS: Image generated and saved to sandbox. "
+            f"{_size_note}"
             "DO NOT CALL THIS TOOL AGAIN with the same prompt.\n\n"
             "Respond DIRECTLY to the user. First, display the image using EXACTLY "
             "this markdown line (keep the short alt text — do NOT paste the full "

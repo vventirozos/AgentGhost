@@ -202,7 +202,7 @@ class TestTokenCacheThreadSafety:
 class TestBinaryUrlPathCheck:
     @pytest.mark.asyncio
     async def test_pdf_with_query_string_short_circuits(self):
-        with patch("ghost_agent.utils.helpers.url_ssrf_reason", lambda u: None), \
+        with patch("ghost_agent.utils.helpers.url_ssrf_reason", lambda u, **k: None), \
              patch("ghost_agent.utils.helpers.httpx.AsyncClient") as mock_client_cls, \
              patch.dict("sys.modules", {"curl_cffi": None, "curl_cffi.requests": None}):
             mock_client = AsyncMock()

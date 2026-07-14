@@ -105,6 +105,26 @@ _HOST_PROCESS_NOTE = (
     "------------------------"
 )
 
+# Non-blocking sibling of _AGENT_PORT_PROBE_MSG for the run-existing-file
+# path. The egress guard vets `command` and inline `content`, but a script
+# WRITTEN earlier (via file_system, whose writes are deliberately not gated)
+# and executed by name was never checked — and hard-blocking it here would
+# seal off legitimate apps whose source references the agent's URL by
+# design. So the run proceeds, but when the source matches the probe
+# signature (loopback URL + a network client) the result carries the ground
+# truth, cutting off the "connection refused → the agent is down → write a
+# mock server" misdiagnosis chain at the moment it would start.
+_AGENT_PORT_FILE_NOTE = (
+    "\n\n--- 💡 SANDBOX LOOPBACK BLIND SPOT ---\n"
+    "This script references 127.0.0.1:8000 / :8088 and uses a network "
+    "client. Inside the sandbox that loopback is the CONTAINER'S OWN — a "
+    "connection failure to those ports here proves NOTHING about the "
+    "agent/LLM on the host (both are fine). Do NOT conclude the server is "
+    "down, and NEVER write a mock/stand-in for it. Verify endpoints with "
+    "the `browser` tool or ask the user to run the check on THEIR machine.\n"
+    "------------------------"
+)
+
 
 def _looks_like_file_not_found(out) -> bool:
     """Heuristic: did a command fail because the target file wasn't where it
@@ -471,9 +491,13 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     f"remapped to {container_workdir}. Original: {command[:80]}",
                     level="WARNING", icon=Icons.SHIELD,
                 )
+                # spill_large_output on the retry too — dropping it meant a
+                # noisy retried command dumped its full output into context,
+                # the exact flood the primary call's spill mode prevents.
                 _re_out, _re_code = await asyncio.to_thread(
                     sandbox_manager.execute,
-                    f"bash -c {shlex.quote(_remapped)}", timeout=600, **_workdir_kw)
+                    f"bash -c {shlex.quote(_remapped)}", timeout=600,
+                    spill_large_output=True, **_workdir_kw)
                 if _re_code == 0 or not _looks_like_file_not_found(_re_out):
                     output, exit_code = _re_out, _re_code
                     if exit_code == 0:
@@ -482,7 +506,20 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                             f"{container_workdir} (the active project's workspace). "
                             f"Reference project files by BARE relative path instead.]")
             else:
-                output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd_str, timeout=600)
+                # Root-cwd retry (relative paths, file at the sandbox root).
+                _re_out, _re_code = await asyncio.to_thread(
+                    sandbox_manager.execute, cmd_str, timeout=600,
+                    spill_large_output=True)
+                output, exit_code = _re_out, _re_code
+                if exit_code == 0:
+                    # Say WHERE it ran — silently succeeding from the root
+                    # taught the model nothing, so its next command used the
+                    # scoped-relative path again and failed again.
+                    output = (output or "") + (
+                        "\n[SYSTEM NOTE: the target was not in the active "
+                        "project's workspace; this ran from the sandbox ROOT "
+                        "(/workspace). Reference it as /workspace/<path>, or "
+                        "move it into the project.]")
         _dt = _time.time() - _t0
 
         # Match-style commands (grep family, pgrep) exit 1 to mean "no
@@ -582,6 +619,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         return _format_error(str(ve))
 
     is_new_code = True
+    _probe_note = ""
     if not content:
         if not host_path.exists():
             return _format_error(f"SYSTEM ERROR: File '{filename}' does not exist. You must provide 'content' to create it.")
@@ -594,6 +632,21 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         except OSError as _read_err:
             return _format_error(f"SYSTEM ERROR: could not read '{filename}': {_read_err}")
         is_new_code = False
+        # Existing-file source was never seen by the egress guard above
+        # (it only vets `command`/inline `content`). Don't block — a legit
+        # app may reference the agent's URL by design — but make the
+        # result carry the loopback ground truth so a failed connect can't
+        # start the mock-server misdiagnosis chain.
+        if (_AGENT_PORT_PROBE_RE.search(content)
+                and _NET_CLIENT_RE.search(content)):
+            _probe_note = _AGENT_PORT_FILE_NOTE
+            pretty_log(
+                "Sandbox Loopback Note",
+                f"'{filename}' references the agent's ports and a net "
+                f"client — running it, with the loopback ground truth "
+                f"appended to the result",
+                level="WARNING", icon=Icons.SHIELD,
+            )
 
     # 1. Holistic Sanitization
     content, syntax_error = await asyncio.to_thread(sanitize_code, content, str(filename))
@@ -655,7 +708,26 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         try:
             rel_path = host_path.relative_to(Path(sandbox_dir).resolve()).as_posix()
         except (TypeError, ValueError, OSError):
-            rel_path = str(filename).lstrip("/")
+            # Root-anchored resolution (file_system 2026-07-14): under a
+            # project-scoped sandbox, _get_safe_path may legitimately resolve
+            # the filename to the OUTER root (e.g. "/workspace/x.py" whose
+            # file exists only at the root — an execute-created tree). The
+            # scoped relative_to then raises, and the legacy lstrip fallback
+            # minted a phantom "workspace/x.py" relative path → ENOENT from
+            # the scoped cwd. Run such a file via its container-ABSOLUTE
+            # path instead, which is cwd-independent and names the same file
+            # the read/write above touched.
+            rel_path = None
+            try:
+                _sd = Path(sandbox_dir).resolve()
+                if _sd.parent.name == "projects":
+                    _root_rel = host_path.relative_to(
+                        _sd.parent.parent.resolve()).as_posix()
+                    rel_path = f"/workspace/{_root_rel}"
+            except (TypeError, ValueError, OSError):
+                pass
+            if rel_path is None:
+                rel_path = str(filename).lstrip("/")
     else:
         # _get_safe_path was stubbed (unit tests) — legacy derivation.
         rel_path = str(filename).lstrip("/")
@@ -893,7 +965,6 @@ if has_error:
              # SECURITY FIX: Use shlex.quote to safely escape all arguments
              if isinstance(args, str):
                  try:
-                     import json
                      args = json.loads(args)
                  except (json.JSONDecodeError, ValueError):
                      # Not valid JSON — treat the whole string as a single argument.
@@ -910,8 +981,11 @@ if has_error:
         # ~70 KB of tokens that persist in history, and nothing is lost. The old
         # 512 KB trim here was dead code (docker capped at 256 KB before it saw
         # the output) and a fourth divergent budget; it is removed.
+        import time as _time
+        _t0 = _time.time()
         output, exit_code = await asyncio.to_thread(
             sandbox_manager.execute, cmd, spill_large_output=True, **_workdir_kw)
+        _dt = _time.time() - _t0
 
         diagnostic_info = ""
         if exit_code != 0:
@@ -955,22 +1029,27 @@ if has_error:
         # Workspace command-outcome capture for the script-execution
         # branch. Significance gate is the same as the bash branch:
         # failures always, successes only when they took noticeable
-        # wall time. Non-fatal — never block a real return.
+        # wall time. (The gate was previously MISSING here despite this
+        # comment claiming parity — every fast successful script run was
+        # recorded with duration 0.0, spamming the activity ledger.)
+        # Non-fatal — never block a real return.
         if workspace_model is not None and getattr(workspace_model, "enabled", False):
             try:
-                workspace_model.record_command_outcome(
-                    command=f"{runner} {filename}" if runner else str(filename),
-                    exit_code=int(exit_code),
-                    duration_seconds=0.0,
-                    note=("failed" if exit_code != 0 else "ran"),
-                )
+                if int(exit_code) != 0 or _dt >= 5.0:
+                    workspace_model.record_command_outcome(
+                        command=f"{runner} {filename}" if runner else str(filename),
+                        exit_code=int(exit_code),
+                        duration_seconds=float(_dt),
+                        note=("failed" if exit_code != 0 else "long-running"),
+                    )
             except Exception:  # noqa: BLE001
                 pass
 
         if exit_code != 0:
-             return _format_error(output, hint=diagnostic_info)
+             return _format_error(output, hint=diagnostic_info) + _probe_note
 
-        return f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\nSTDOUT/STDERR:\n{output}"
+        return (f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\n"
+                f"STDOUT/STDERR:\n{output}{_probe_note}")
     except Exception as e:
         return _format_error(f"Error: {e}")
     finally:

@@ -35,6 +35,12 @@
 
   <p>Backend topology and SDXL model config: <a href="../interfaces/image_gen_server.html">image-gen server</a>.</p>
 
+  <h2>2026-07-14 audit fixes</h2>
+  <ul>
+    <li><strong>The SUCCESS message now states the actual output size.</strong> The requested dimensions are snapped to the image node's bucket ladder (SD1.5 VRAM envelope), but that adjustment was only logged for the operator — the model told the user it generated the requested size, or re-called the tool trying to "fix" a size that was deliberately snapped. The message now says <q>Rendered at WxH (snapped from …)</q>.</li>
+    <li><strong>The sandbox dir is created before the write.</strong> A fresh project scope may not have created the dir yet; without the <code>mkdir</code> a <code>FileNotFoundError</code> discarded an image the GPU node had already spent ~30s producing. Covered by <code>tests/test_tools_batch_audit_fixes.py</code>.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

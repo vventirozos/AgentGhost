@@ -73,6 +73,12 @@ exact markdown so the file is offered for download:
   <h2>Auto-sectioning a dumped report</h2>
   <p>The model frequently dumps a whole multi-part report into ONE markdown string (<code>sections="# Report\n## Task 1 …\n## Task 2 …"</code>) instead of a structured list — rendering as a single flat section that reads "thin" even when long. <code>_normalise_sections</code> now <strong>auto-splits a single markdown string on its top-level (<code>#</code> / <code>##</code>) headers</strong> into one section per header (deeper <code>###</code>+ stay in the parent body); a string with fewer than two top-level headers stays a single section. This is on top of the existing JSON-string-list decode and the <code>body=</code>/<code>content=</code> alias healing. Covered by <code>tests/test_report_pdf_sections.py</code>.</p>
 
+  <h2>2026-07-14 audit fixes</h2>
+  <ul>
+    <li><strong>Files-that-exist hint now fires on the all-missing path.</strong> <code>_available_files_hint</code> exists so a model that invented <code>source_files</code> names can fix them in ONE retry. But it was only appended on the SUCCESS path (which needs at least one section to have rendered). When ALL <code>source_files</code> were missing and no explicit sections were passed, the error named the misses but showed nothing that exists — back to guessing. The hint is now appended to that error too.</li>
+    <li>The hint's hidden-directory filter checks the SANDBOX-RELATIVE path parts, not the absolute <code>p.parts</code> — so a sandbox root that itself lives under a dot-directory (e.g. <code>~/.ghost/sandbox/</code>) no longer makes the hint silently return empty. Covered by <code>tests/test_tools_batch_audit_fixes.py</code>.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

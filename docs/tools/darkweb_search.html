@@ -128,6 +128,9 @@
     Parsing (anchors, redirect unwrapping, plain-text sweep, de-dup), independent-index corroboration ranking (the two Ahmia endpoints are <em>not</em> double-counted), engine self-link filtering, the per-engine deadline, the untrusted-body size cap (<code>_cap_body</code>: binary refusal, declared-oversize refusal, truncation), the actionable zero-results error, anonymous-mode scrubbing, the <code>GHOST_ONION_ENGINES</code> override + malformed fallback + stray-placeholder rejection, <code>socks5h</code> normalisation, result caching, the research deep-read path honouring the passed proxy, research caching, and <code>max_context</code>-bounded extraction are covered by <code>tests/test_darkweb_search.py</code>.
   </p>
 
+  <h2>Onion DNS-leak fix (2026-07-14)</h2>
+  <p><code>_fetch_onion_text</code> (the research-phase page fetch) validated the onion URL with the SSRF guard's default <code>resolve=True</code> — a host-side <code>getaddrinfo</code> on the <code>.onion</code> hostname. For a hidden service this is the sharpest form of the leak: it tells the host resolver <em>which hidden service is being visited</em> (and fails anyway, since <code>.onion</code> addressing lives at the Tor SOCKS layer, not the host resolver). Now passes <code>resolve=False</code> — this path is always over Tor. The literal-internal-IP string check still runs. Covered by <code>tests/test_fetch_dns_leak.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

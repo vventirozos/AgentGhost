@@ -130,9 +130,14 @@ def _available_files_hint(sandbox_dir: Path) -> str:
                 break
             if not p.is_file() or p.suffix.lower() not in (".md", ".txt", ".rst"):
                 continue
-            if any(part.startswith(".") for part in p.parts):
+            # Check the SANDBOX-RELATIVE parts for a dot-prefix, not p.parts:
+            # p.parts includes every ancestor of the sandbox, so if the
+            # sandbox root itself lives under a dot-dir (e.g. ~/.ghost/…),
+            # every file would match and the hint silently returned "".
+            rel = p.relative_to(root)
+            if any(part.startswith(".") for part in rel.parts):
                 continue
-            rels.append(str(p.relative_to(root)))
+            rels.append(str(rel))
         if not rels:
             return ""
         more = ("\n  …(list truncated)" if len(rels) >= _HINT_MAX_FILES else "")
@@ -431,12 +436,19 @@ async def tool_generate_pdf(
     if not secs:
         _miss = (f" (source_files given but none readable: {file_missing})"
                  if file_missing else "")
+        # Append the files-that-DO-exist hint on THIS path too — it is the
+        # exact scenario the hint was built for (the model invented all the
+        # source_file names, so nothing rendered and it would otherwise
+        # guess again). Previously the hint only fired on the SUCCESS path,
+        # which required at least one section to have rendered.
+        _exist_hint = (_available_files_hint(Path(sandbox_dir))
+                       if (file_missing and sandbox_dir is not None) else "")
         return (
             "SYSTEM ERROR: 'sections' is REQUIRED for report_pdf. Pass a "
             "list of {heading, body} dicts (body is markdown), a single "
             "markdown string, OR — to compile a detailed report from files "
             "you already wrote — source_files=['a.md','b.md', …] and the "
-            "tool will read and section them for you." + _miss
+            "tool will read and section them for you." + _miss + _exist_hint
         )
 
     total_chars = sum(len(s.get("body", "")) for s in secs)

@@ -421,7 +421,13 @@ async def _fetch_onion_text(url: str, tor_proxy: str) -> str:
     NEWNYM / `tor` service restart mid-run would sabotage the sibling onion
     fetches running concurrently. Keeps the shared SSRF guard and the raw
     fetch's body-size cap."""
-    reason = url_ssrf_reason(url)
+    # resolve=False: this ALWAYS fetches over Tor, so a host-side getaddrinfo
+    # would (a) leak the target — and for a .onion, leak WHICH hidden service
+    # is being visited, the exact anonymity break dark-web research must
+    # avoid — and (b) fail anyway (.onion doesn't resolve via the host
+    # resolver; onion addressing lives at the Tor SOCKS layer). The literal-
+    # internal-IP string check still runs.
+    reason = url_ssrf_reason(url, resolve=False)
     if reason:
         return f"Error: {reason}"
     try:

@@ -81,26 +81,51 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
 
     # Host restriction (SSRF / internal-DB-probe guard): when a default URI
     # is configured, the LLM may NOT redirect the connection to a DIFFERENT
-    # host. Only honor an LLM-supplied connection_string whose host matches
+    # host. Only honor an LLM-supplied connection_string whose target matches
     # the configured default. (With no default configured the operator has
     # explicitly opted into arbitrary URIs.)
+    #
+    # The comparison key resolves libpq's URI-QUERY-STRING overrides, not just
+    # the netloc: `?hostaddr=` is the ACTUAL TCP target (the netloc host becomes
+    # mere TLS SNI), while `?host=`/`?port=`/`?dbname=` also override the netloc.
+    # A key built from netloc alone saw only the innocent host and passed — so
+    # `…/prod?hostaddr=10.0.0.99` connected to 10.0.0.99 while reading as
+    # db.internal (verified 2026-07-14). Parsed with urllib (urlparse + parse_qs)
+    # DIRECTLY — deliberately NOT psycopg2's parse_dsn, so the guard stays
+    # deterministic even where a test double or a partial psycopg2 install makes
+    # parse_dsn unavailable (a mocked parse_dsn returning a non-dict would have
+    # silently reopened the bypass).
     if default_uri and _supplied_conn and _supplied_conn != default_uri:
+        from urllib.parse import urlparse, parse_qs
+
+        def _dsn_target(uri):
+            p = urlparse(uri)
+            q = parse_qs(p.query)
+
+            def _last(key):
+                vals = q.get(key)
+                return vals[-1] if vals else ""  # libpq: last duplicate wins
+            # hostaddr (literal IP endpoint) wins over host, query-host over
+            # netloc-host — matches libpq's endpoint precedence. `p.port`
+            # raises ValueError on a non-numeric port; that propagates to the
+            # outer handler as a formatted parse error rather than crashing
+            # the tool.
+            host = (_last("hostaddr") or _last("host") or (p.hostname or "")).lower()
+            port = str(_last("port") or (p.port or 5432))
+            dbname = _last("dbname") or (p.path or "").lstrip("/")
+            return (host, port, dbname)
         try:
-            from urllib.parse import urlparse
-            _sup, _def = urlparse(_supplied_conn), urlparse(default_uri)
+            _sup_key, _def_key = _dsn_target(_supplied_conn), _dsn_target(default_uri)
         except Exception:
             return "Error: could not parse the supplied connection_string."
-        # Compare host + port + dbname, not just host: a same-host override
-        # with a different port/database would otherwise connect to a
-        # DIFFERENT Postgres instance/database, escaping the intended scope.
-        _sup_key = ((_sup.hostname or "").lower(), _sup.port or 5432, (_sup.path or "").lstrip("/"))
-        _def_key = ((_def.hostname or "").lower(), _def.port or 5432, (_def.path or "").lstrip("/"))
         if _sup_key != _def_key:
             return (
                 f"Error: refused connection to {_sup_key[0]}:{_sup_key[1]}/{_sup_key[2]!r}; "
                 f"only the configured database "
                 f"{_def_key[0]}:{_def_key[1]}/{_def_key[2]!r} is allowed. Omit "
-                f"connection_string to use the default."
+                f"connection_string to use the default. (Note: host/hostaddr/"
+                f"port/dbname in the URI query string are resolved and checked "
+                f"too — they cannot be used to redirect the connection.)"
             )
 
     if query:
@@ -113,13 +138,25 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
     # metacog telemetry is emitted only when the bundle is wired. We validate
     # only `query`/`explain_analyze`; `schema`/`activity` use hand-crafted SQL
     # that never sees user content. `confirm=true` allows DROP/TRUNCATE.
+    # `confirm` gates DROP/TRUNCATE. Coerce like a truthy STRING, not bool():
+    # tool args arrive as strings (see the timeout_ms note below), and
+    # bool("false") / bool("0") / bool("no") are all True — so an explicit
+    # confirm="false" would AUTHORIZE a destructive statement. Only the
+    # affirmative tokens count.
+    _confirmed = (confirm is True
+                  or str(confirm).strip().lower() in ("true", "1", "yes", "y"))
     _metacog = kwargs.get("_metacog_bundle")
     if query and action in ("query", "explain_analyze"):
         try:
             from .validators import validate_sql
-            ok, reason = validate_sql(query, confirm=bool(confirm))
+            ok, reason = validate_sql(query, confirm=_confirmed)
         except Exception as _vexc:
-            logger.debug("SQL validator crashed: %s", _vexc)
+            # Fails OPEN (a validator bug must not brick a mostly-read tool)
+            # but at WARNING, not debug: this disables the destructive-
+            # statement guard, so the operator (who monitors the live stream)
+            # must SEE that it happened rather than have it buried.
+            logger.warning("SQL validator crashed — destructive-statement "
+                           "guard DISABLED for this call: %s", _vexc)
             ok, reason = True, ""
         if not ok:
             if _metacog is not None and getattr(_metacog, "enabled", False):
@@ -156,18 +193,39 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
     effective_timeout = max(100, min(effective_timeout, 600000))
 
     def _run_action(cur):
+        # Statement timeout is SESSION-scoped on the cached autocommit
+        # connection, so a prior call's `SET statement_timeout=100` would
+        # leak into THIS call and cause spurious cancellations on a healthy
+        # DB. Set it at the top of every action (not just query) so each
+        # action runs under its own bound. Parameterized (int-clamped above).
+        cur.execute("SET statement_timeout = %s", (effective_timeout,))
         if action == "schema":
             # Parameterized — table_name comes from an LLM and could
             # otherwise carry an injection payload ("'; DROP TABLE--").
-            sql = "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'"
+            # Bounded + byte-capped like `query`: a wide DB (hundreds of
+            # tables) would otherwise flood the model context with every
+            # column of every public table, unbounded.
+            _SCHEMA_ROW_CAP = 1000
+            sql = ("SELECT table_name, column_name, data_type "
+                   "FROM information_schema.columns WHERE table_schema = 'public' "
+                   "ORDER BY table_name, ordinal_position")
             if table_name:
-                sql += " AND table_name = %s"
+                sql = ("SELECT table_name, column_name, data_type "
+                       "FROM information_schema.columns "
+                       "WHERE table_schema = 'public' AND table_name = %s "
+                       "ORDER BY ordinal_position")
                 cur.execute(sql, (table_name,))
             else:
                 cur.execute(sql)
-            rows = cur.fetchall()
+            rows = cur.fetchmany(_SCHEMA_ROW_CAP + 1)
             if not rows: return "No schema found."
-            return tabulate(rows, headers="keys", tablefmt="pipe")
+            _schema_truncated = len(rows) > _SCHEMA_ROW_CAP
+            out = tabulate(rows[:_SCHEMA_ROW_CAP], headers="keys", tablefmt="pipe")
+            if _schema_truncated:
+                out += (f"\n\n[... schema truncated at {_SCHEMA_ROW_CAP} columns; "
+                        "pass a specific table_name, or query information_schema "
+                        "directly with your own filter, for the rest.]")
+            return out
 
         elif action == "activity":
             # Bounded row count + ordering so the model sees the
@@ -194,8 +252,8 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
             if action == "explain_analyze" and not sql.upper().strip().startswith("EXPLAIN"):
                 sql = f"EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) {sql}"
 
-            # Parameterized + already int-clamped (defense in depth).
-            cur.execute("SET statement_timeout = %s", (effective_timeout,))
+            # statement_timeout already SET at the top of _run_action (for
+            # every action), so no per-query SET is needed here.
             cur.execute(sql)
             if cur.description:
                 # We fetch one extra row beyond our display cap so we

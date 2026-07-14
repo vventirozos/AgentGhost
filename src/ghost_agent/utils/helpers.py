@@ -149,18 +149,28 @@ async def helper_fetch_url_content(
     concurrently-running sibling fetch (deep_research runs several at once),
     sabotaging them; callers that fan out should pass False.
     """
+    # 1. Setup Tor Proxy (computed BEFORE the SSRF guard so the guard knows
+    # whether to do a host-side DNS lookup — see below).
+    proxy_url = proxy_override or os.getenv("TOR_PROXY", "socks5://127.0.0.1:9050")
+    if proxy_url and proxy_url.startswith("socks5://"):
+        proxy_url = proxy_url.replace("socks5://", "socks5h://")
+
     # --- URL VALIDATION (shared SSRF guard) ---
     # Reject non-http(s) schemes and any host that is/resolves to an
     # internal address, so an LLM tool call can't fetch `file:///etc/passwd`,
     # hit cloud-metadata (169.254.169.254), or reach internal services.
-    _ssrf = url_ssrf_reason(url)
+    #
+    # resolve=False when fetching over Tor: the default resolve=True does a
+    # HOST-SIDE getaddrinfo of the target hostname, which LEAKS the DNS query
+    # for the very site we're about to visit anonymously — defeating the
+    # DNS-over-SOCKS anonymity this fetch exists to provide (and, for a
+    # .onion, leaking which hidden service is being visited). Tor routes/
+    # resolves at the exit node anyway, so a host lookup buys no protection
+    # here; literal-IP internal targets are still blocked without resolving.
+    # Mirrors the browser/download tools' `resolve=not anonymous` handling.
+    _ssrf = url_ssrf_reason(url, resolve=not bool(proxy_url))
     if _ssrf:
         return f"Error: {_ssrf}"
-
-    # 1. Setup Tor Proxy
-    proxy_url = proxy_override or os.getenv("TOR_PROXY", "socks5://127.0.0.1:9050")
-    if proxy_url and proxy_url.startswith("socks5://"):
-        proxy_url = proxy_url.replace("socks5://", "socks5h://")
 
     try:
         import curl_cffi.requests

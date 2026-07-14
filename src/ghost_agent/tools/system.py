@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import logging
 import urllib.parse
 import httpx
 try:
@@ -9,26 +10,36 @@ except ImportError:
 from ..utils.logging import Icons, pretty_log
 from ..utils.helpers import request_new_tor_identity
 
+logger = logging.getLogger("GhostAgent")
+
 async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = None):
     if not location and profile_memory:
+        # Narrow to Exception (was a bare `except:` catching BaseException —
+        # it swallowed CancelledError/KeyboardInterrupt and hid every
+        # profile-load failure).
         try:
             data = profile_memory.load()
             found_loc = _find_location_in_profile(data)
             if found_loc:
                 location = found_loc
                 pretty_log("Weather", f"Using profile location: {location}", icon=Icons.MEM_MATCH)
-        except: pass
+        except Exception as _ploc_err:
+            logger.debug("profile location lookup failed: %s", _ploc_err)
 
     pretty_log("System Weather", f"Location: {location}", icon=Icons.TOOL_SEARCH)
     if not location:
         return "SYSTEM ERROR: No location provided. You MUST specify a city (e.g., 'London') or update your profile."
 
     proxy_url = tor_proxy
-    mode = "TOR" if proxy_url and "127.0.0.1" in proxy_url else "WEB"
+    # Accept a loopback Tor proxy named "localhost" too, not just the
+    # 127.0.0.1 literal — otherwise socks5://localhost:9050 silently ran in
+    # "WEB" mode (no identity rotation, wrong failure diagnosis).
+    mode = "TOR" if proxy_url and any(h in proxy_url for h in ("127.0.0.1", "localhost", "::1")) else "WEB"
     if proxy_url and proxy_url.startswith("socks5://"):
         proxy_url = proxy_url.replace("socks5://", "socks5h://")
-    
+
     last_error = None
+    geo_not_found = False  # geocoder answered 200 but knew no such place
     for attempt in range(3):
         try:
             if curl_requests:
@@ -65,6 +76,11 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                                 f"Wind: {curr.get('wind_speed_10m')} km/h\n"
                                 f"Humidity: {curr.get('relative_humidity_2m')}%"
                             )
+                    elif geo_resp.status_code == 200:
+                        # 200 with no results = the geocoder knows no such
+                        # place. Record it so the final message can say so
+                        # instead of the opaque "failed: None".
+                        geo_not_found = True
                     break
             else:
                 async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, verify=False) as client:
@@ -99,6 +115,11 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                                 f"Wind: {curr.get('wind_speed_10m')} km/h\n"
                                 f"Humidity: {curr.get('relative_humidity_2m')}%"
                             )
+                    elif geo_resp.status_code == 200:
+                        # 200 with no results = the geocoder knows no such
+                        # place. Record it so the final message can say so
+                        # instead of the opaque "failed: None".
+                        geo_not_found = True
                     break 
         except Exception as e:
             last_error = e
@@ -142,6 +163,16 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
                 
     pretty_log("Weather Error", str(last_error), level="ERROR", icon=Icons.FAIL)
 
+    # Location genuinely not found (geocoder answered 200-empty and both
+    # sources fell through) — surface the CAUSE, not "failed: None". A
+    # retry of the identical call would just fail identically.
+    if geo_not_found and last_error is None:
+        return (
+            f"SYSTEM ERROR: could not find a location named {location!r}. "
+            "Check the spelling, or give a more specific place (e.g. add the "
+            "country: 'Springfield, US'). Do NOT retry the same name."
+        )
+
     # Distinguish "Tor itself is down" from "weather API rejected us / is down".
     # The last_error string lets the model decide whether to retry at all.
     if mode == "TOR":
@@ -157,7 +188,10 @@ async def tool_get_weather(tor_proxy: str, profile_memory=None, location: str = 
             f"(Open-Meteo, wttr.in) rejected the request. Underlying: {last_error}. Tor itself is "
             "likely fine; the remote services may be rate-limiting or down."
         )
-    return f"SYSTEM ERROR: Weather lookup failed: {last_error}"
+    return (f"SYSTEM ERROR: Weather lookup failed: {last_error}" if last_error is not None
+            else f"SYSTEM ERROR: Weather lookup for {location!r} failed — no data "
+            "returned by Open-Meteo or wttr.in. The location may be unrecognised; "
+            "try a more specific place name.")
 
 def _find_location_in_profile(data: dict) -> str:
     """
@@ -165,12 +199,19 @@ def _find_location_in_profile(data: dict) -> str:
     Prioritizes specific keys (location, city, address) across all categories.
     """
     if not data: return None
-    
-    # Priority 1: Explicit Root/Personal keys
+
+    # Priority 1: Explicit Root/Personal keys. `(data.get("root") or {})`,
+    # NOT `data.get("root", {})` — a profile with an explicit "root": null
+    # (key present, value null) makes the default-arg form return None, and
+    # None.get(...) then AttributeError'd (crashing tool_check_location and,
+    # via the bare-except in tool_get_weather, silently killing profile
+    # location lookup).
+    _root = data.get("root") or {}
+    _personal = data.get("personal") or {}
     loc = (
-        data.get("root", {}).get("location") or 
-        data.get("root", {}).get("city") or 
-        data.get("personal", {}).get("location")
+        _root.get("location") or
+        _root.get("city") or
+        _personal.get("location")
     )
     if loc: return loc
 
@@ -227,7 +268,10 @@ async def tool_check_health(context=None):
         pass # Not available on Windows
 
     if psutil:
-        health_status.append(f"CPU Usage: {psutil.cpu_percent(interval=0.1)}%")
+        # cpu_percent(interval=0.1) is a BLOCKING 100ms sleep — off the loop
+        # thread so a health check doesn't stall every other coroutine.
+        _cpu_pct = await asyncio.to_thread(psutil.cpu_percent, 0.1)
+        health_status.append(f"CPU Usage: {_cpu_pct}%")
         
         # 3. Memory
         mem = psutil.virtual_memory()

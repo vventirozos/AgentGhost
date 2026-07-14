@@ -638,8 +638,25 @@ async def lifespan(app):
         # `tool_schedule_task` can pass it to `scheduler.add_job`.
         _tools_tasks.run_proactive_task_fn = _run_proactive_task
 
+        # Persistent task store (2026-07-14): the AsyncIOScheduler jobstore
+        # is in-memory and the operator deploys by killing the agent, so
+        # every deploy silently WIPED all user cron tasks — while the
+        # "task X is running" vector-memory note kept asserting they were
+        # alive. Bind the store (under $GHOST_HOME/system/, next to
+        # calibration/ and prm/) and re-register everything it holds.
+        try:
+            if getattr(context, "memory_dir", None):
+                _tools_tasks.task_store_path = (
+                    Path(str(context.memory_dir)).parent / "scheduled_tasks.json")
+        except Exception as _tse:  # noqa: BLE001 — persistence is best-effort
+            logger.debug("scheduled-task store binding failed: %s", _tse)
+
         _sched.start()
         context.scheduler = _sched
+        try:
+            _tools_tasks.restore_persisted_tasks(_sched)
+        except Exception as _tre:  # noqa: BLE001
+            logger.warning("scheduled-task restore failed: %s", _tre)
         pretty_log(
             "Scheduler",
             "APScheduler (AsyncIOScheduler) initialized — user tasks enabled",

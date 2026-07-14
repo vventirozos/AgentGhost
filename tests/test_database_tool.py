@@ -48,12 +48,13 @@ async def test_postgres_admin_schema_with_table_name():
 
     with patch("psycopg2.connect", return_value=mock_conn):
         with patch("tabulate.tabulate", return_value="| ok |"):
-            mock_cursor.fetchall.return_value = [{"table_name": "users", "column_name": "id", "data_type": "int"}]
+            # schema now uses fetchmany (row-capped, 2026-07-14) + ORDER BY.
+            mock_cursor.fetchmany.return_value = [{"table_name": "users", "column_name": "id", "data_type": "int"}]
             await tool_postgres_admin("schema", "postgres://uri", table_name="users")
 
             # Must be parameterized — second positional arg is the params tuple.
             mock_cursor.execute.assert_called_with(
-                "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = %s",
+                "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' AND table_name = %s ORDER BY ordinal_position",
                 ("users",),
             )
 
@@ -69,7 +70,7 @@ async def test_postgres_admin_schema_injection_blocked():
     payload = "users'; DROP TABLE users; --"
     with patch("psycopg2.connect", return_value=mock_conn):
         with patch("tabulate.tabulate", return_value=""):
-            mock_cursor.fetchall.return_value = []
+            mock_cursor.fetchmany.return_value = []
             await tool_postgres_admin("schema", "postgres://uri", table_name=payload)
 
             sql_arg, params_arg = mock_cursor.execute.call_args.args
@@ -128,10 +129,10 @@ async def test_postgres_admin_schema_no_table_name():
 
     with patch("psycopg2.connect", return_value=mock_conn):
         with patch("tabulate.tabulate", return_value="Schema Table"):
-            mock_cursor.fetchall.return_value = [{"table_name": "users"}]
+            mock_cursor.fetchmany.return_value = [{"table_name": "users"}]
             await tool_postgres_admin("schema", "postgres://uri")
             mock_cursor.execute.assert_called_with(
-                "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public'"
+                "SELECT table_name, column_name, data_type FROM information_schema.columns WHERE table_schema = 'public' ORDER BY table_name, ordinal_position"
             )
 
 

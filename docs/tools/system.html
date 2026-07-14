@@ -51,6 +51,14 @@
 
   <p>All HTTP calls honour the configured Tor SOCKS proxy when <code>TOR_PROXY</code> is set.</p>
 
+  <h2>2026-07-14 audit fixes</h2>
+  <ul>
+    <li><strong>Null-valued profile keys no longer crash location lookup.</strong> <code>_find_location_in_profile</code> used <code>data.get("root", {}).get(...)</code> — a profile with an explicit <code>"root": null</code> (key present, value null) made the default-arg form return <code>None</code> and the chained <code>.get</code> raised <code>AttributeError</code> (crashing <code>check_location</code>, and silently killing profile-based weather lookup via the bare except). Now <code>(data.get("root") or {})</code>.</li>
+    <li><strong>Unknown location gives a clear message, not <q>failed: None</q>.</strong> When the geocoder answers 200 with no results and both sources fall through, the tool now says <q>could not find a location named 'X'</q> (and tells the model not to retry the same name) instead of the opaque <code>last_error=None</code> string.</li>
+    <li><strong>Tor mode detection</strong> accepts <code>localhost</code>/<code>::1</code>, not just the <code>127.0.0.1</code> literal (a <code>socks5://localhost:9050</code> proxy was silently running in WEB mode — no identity rotation). The bare <code>except:</code> in the profile-location path was narrowed to <code>Exception</code>, and <code>psutil.cpu_percent(interval=0.1)</code> (a blocking 100ms sleep) moved off the event-loop thread. Covered by <code>tests/test_tools_batch_audit_fixes.py</code>.</li>
+  </ul>
+  <p class="note"><strong>Reviewed residual — <code>verify=False</code> on the HTTPS checks.</strong> The weather / <code>1.1.1.1</code> / <code>check.torproject.org</code> fetches disable TLS verification (a Tor-exit-compatibility choice). This means the Tor-anonymity confirmation is forgeable by a malicious exit and forged weather bodies enter model context. Left as-is deliberately: flipping <code>verify</code> on the LIVE Tor path risks regressing the weather/health tools against exits with cert-handling quirks (the usual reason it was set), the threat model (an adversary controlling the operator's own Tor exit) is narrow, weather text is already treated as untrusted external content (same trust boundary as web_search), and the wrong-anonymity-label consequence is low-stakes. Revisit if the endpoints prove stable with verification on.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

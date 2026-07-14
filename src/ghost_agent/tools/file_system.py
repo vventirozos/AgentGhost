@@ -1066,6 +1066,29 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                         "CURRENT text in SEARCH and your NEW text after "
                         "====.")
                     continue
+                # MULTI-EDIT ENVELOPE GUARD (2026-07-14). Only the FIRST
+                # `====` in an envelope is the separator; when the model
+                # packs a second edit into the same envelope, that edit's
+                # `====` lines and text all land in `replace_str` and would
+                # be written to the file LITERALLY (observed live: index.html
+                # shipped with `====` at lines 78/80/85 plus duplicated code,
+                # and the tool said SUCCESS — the user's next message was the
+                # browser's `Unexpected token '==='`). This syntax cannot
+                # express that shape, so reject the block and teach
+                # one-envelope-per-edit instead of failing open.
+                if any(_MARKER_LINE_RE.match(ln.rstrip("\r"))
+                       for ln in replace_str.splitlines()):
+                    errors.append(
+                        "Block REJECTED: its replacement section contains a "
+                        "bare '====' (or '<<<< SEARCH'/'>>>>') marker line — "
+                        "you packed MORE THAN ONE edit into a single "
+                        "SEARCH/REPLACE envelope, and everything after the "
+                        "first '====' would have been written into the file "
+                        "literally. Emit ONE complete envelope per edit "
+                        "(each with its own '<<<< SEARCH', '====' and "
+                        "'>>>>'); multiple envelopes in one call are "
+                        "supported.")
+                    continue
                 # Full matching ladder (exact → whitespace-flexible →
                 # fuzzy → anchor), same rescue chain the two-argument form
                 # gets — the SEARCH-block form is the one we now steer the
@@ -1498,6 +1521,29 @@ def _fixture_summary(content: str, ext: str) -> str:
 
 _SYNTAX_CHECK_TIMEOUT_S = 10.0
 
+
+def _find_node() -> "str | None":
+    """Resolve the node binary even under launchd's minimal PATH.
+
+    The agent runs as a LaunchDaemon whose PATH is /usr/bin:/bin:/usr/sbin:
+    /sbin — no /opt/homebrew/bin — so a bare ``shutil.which("node")``
+    returned None in production and every JS/HTML syntax check silently
+    skipped. That's how a replace that pasted literal ``====`` marker lines
+    into index.html still returned SUCCESS with no syntax warning
+    (2026-07-14). Fall back to the common install locations before giving
+    up; a missing node still fails open (checks are best-effort).
+    """
+    import shutil
+    node = shutil.which("node")
+    if node:
+        return node
+    for cand in ("/opt/homebrew/bin/node", "/usr/local/bin/node",
+                 "/opt/local/bin/node"):
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 # <script>…</script> blocks; group(1)=attributes, group(2)=body.
 _HTML_SCRIPT_RE = re.compile(r"<script\b([^>]*)>(.*?)</script>", re.IGNORECASE | re.DOTALL)
 # Inline script types we can syntax-check as classic JS. A `type=module`
@@ -1534,9 +1580,8 @@ def _inline_js_blocks(html: str):
 async def _node_check_source(source: str) -> str:
     """`node --check` a JS source string. Returns node's raw diagnostic
     (stderr) when it does NOT parse, else "" (also "" when node is absent)."""
-    import shutil
     import tempfile
-    node = shutil.which("node")
+    node = _find_node()
     if not node:
         return ""
     tmp = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8")
@@ -1632,8 +1677,7 @@ async def _syntax_feedback(path: Path, filename: str) -> str:
             except json.JSONDecodeError as je:
                 err = f"{je.msg} (line {je.lineno}, col {je.colno})"
         elif ext in ("js", "mjs", "cjs"):
-            import shutil
-            node = shutil.which("node")
+            node = _find_node()
             if not node:
                 return ""
             proc = await asyncio.create_subprocess_exec(
@@ -1751,8 +1795,10 @@ def _syntax_regression(prev_content: str, new_content: str, filename: str) -> st
     that's what compounded a single broken edit into a multi-turn rewrite
     spiral (each subsequent SEARCH block failed to match the now-corrupted
     file). If the file was ALREADY broken, the edit is allowed (it may be a
-    partial fix). Only .py / .json are checked in-process; other types pass
-    through (best-effort, unchanged behaviour).
+    partial fix). Only .py / .json are checked in-process here; .js/.html
+    get the same regression semantics via the async, node-backed
+    `_syntax_regression_js_html` companion (both run in
+    `_write_replace_guarded`); other types pass through (best-effort).
     """
     ext = str(filename).split(".")[-1].lower()
     if ext == "py":
@@ -1788,17 +1834,113 @@ def _syntax_regression(prev_content: str, new_content: str, filename: str) -> st
     return ""
 
 
+# A line that IS a SEARCH/REPLACE marker: exactly `====` (the separator the
+# block parser recognizes — 5+ equals, e.g. an RST underline, is NOT a
+# separator and must not trip this), a `<<<< SEARCH` opener, or a `>>>>`
+# closer. Used to catch marker text leaking INTO file content.
+_MARKER_LINE_RE = re.compile(r"^(?:====|<<<<[ \t]*SEARCH.*|>>>>)[ \t]*$")
+
+
+def _marker_leak(prev_content: str, new_content: str) -> str:
+    """Return a short description of SEARCH/REPLACE marker lines that
+    ``new_content`` would ADD relative to ``prev_content``, else "".
+
+    A replace result must never contain MORE marker lines than the file
+    already had: markers appearing in the output mean block syntax leaked
+    into file content (observed live 2026-07-14 — a multi-edit envelope
+    pasted its extra ``====`` separators plus the second edit's text into
+    index.html and reported SUCCESS; the user's next message was the
+    browser's `Unexpected token '==='`). Count-aware on purpose: a file
+    that already carries leaked markers stays editable (the cleanup edit
+    REMOVES markers, never adds them).
+    """
+    def _counts(text: str) -> dict:
+        c: dict = {}
+        for ln in text.splitlines():
+            if _MARKER_LINE_RE.match(ln):
+                key = ln.strip()
+                c[key] = c.get(key, 0) + 1
+        return c
+    prev_counts = _counts(prev_content)
+    added = [k for k, n in _counts(new_content).items()
+             if n > prev_counts.get(k, 0)]
+    return ", ".join(repr(k) for k in sorted(added))
+
+
+async def _syntax_regression_js_html(prev_content: str, new_content: str,
+                                     filename: str) -> str:
+    """node-backed companion to `_syntax_regression` for .js/.mjs/.cjs files
+    and inline <script> blocks in .html/.htm.
+
+    Same contract: return a one-line error only when ``new_content``
+    INTRODUCES a parse failure that ``prev_content`` did not have, else ""
+    (fail open when node is unavailable). Kept separate from the sync
+    `_syntax_regression` because `node --check` needs a subprocess; the
+    write path awaits both. Before this existed, the syntax-rollback guard
+    covered .py/.json only, so a replace could corrupt an HTML deliverable
+    and still report SUCCESS (2026-07-14 marker-leak incident).
+    """
+    ext = str(filename).split(".")[-1].lower()
+    try:
+        if ext in ("js", "mjs", "cjs"):
+            diag = await _node_check_source(new_content)
+            if not diag:
+                return ""
+            if await _node_check_source(prev_content):
+                return ""  # already broken — not a regression
+            first = next((ln for ln in diag.splitlines() if ln.strip()), "syntax error")
+            return first[:200]
+        if ext in ("html", "htm"):
+            new_err = ""
+            for start_line, src in _inline_js_blocks(new_content):
+                diag = await _node_check_source(src)
+                if diag:
+                    new_err = _remap_node_diag(diag, start_line)
+                    break
+            if not new_err:
+                return ""
+            for _start, src in _inline_js_blocks(prev_content):
+                if await _node_check_source(src):
+                    return ""  # already broken — not a regression
+            return new_err
+    except Exception:
+        return ""  # best-effort: a broken checker must never block an edit
+    return ""
+
+
 async def _write_replace_guarded(path: Path, prev_content: str, new_content: str,
                                  filename: str, success_msg: str) -> str:
     """Apply a replace result with a syntax-regression rollback guard.
 
     If ``new_content`` would introduce a NEW syntax error (see
-    `_syntax_regression`), the file is left UNCHANGED and a REJECTED message
+    `_syntax_regression` for .py/.json, `_syntax_regression_js_html` for
+    .js/.html) or would ADD SEARCH/REPLACE marker lines to the file (see
+    `_marker_leak`), the file is left UNCHANGED and a REJECTED message
     is returned steering the model to a tight surgical edit instead of a
     full-file rewrite. Otherwise the content is written and normal
     post-write syntax feedback is appended.
     """
+    leak = _marker_leak(prev_content, new_content)
+    if leak:
+        pretty_log("Replace Rejected",
+                   f"{filename}: edit would write SEARCH/REPLACE marker "
+                   f"line(s) into the file ({leak}) — file left unchanged",
+                   icon=Icons.WARN, level="WARNING")
+        return (
+            f"REJECTED: that replace would have written SEARCH/REPLACE "
+            f"marker line(s) ({leak}) into '{filename}' as literal file "
+            f"content — '{filename}' is unchanged on disk. This usually "
+            f"means you packed more than one edit into a single "
+            f"<<<< SEARCH block. Emit ONE complete envelope per edit "
+            f"(each with its own '<<<< SEARCH', '====' and '>>>>' lines); "
+            f"multiple envelopes in one call are fine. If the file "
+            f"legitimately needs a line of exactly '====', use "
+            f"operation='write' or an execute script instead."
+        )
     regression = _syntax_regression(prev_content, new_content, filename)
+    if not regression:
+        regression = await _syntax_regression_js_html(
+            prev_content, new_content, filename)
     if regression:
         pretty_log("Replace Rejected",
                    f"{filename}: edit would break syntax — file left unchanged",
@@ -2218,7 +2360,25 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
 
         cmd = f"rg --line-number --no-heading --color=never --max-columns=300 {escaped_pattern} {escaped_path}"
         output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, timeout=20)
-        
+
+        # rg exits 1 to mean "no matches" — a successful query with an empty
+        # result, not a failure. The docker layer substitutes "[SYSTEM
+        # ERROR]: Process failed (Exit 1) with no output." for empty output
+        # before we see it, so the friendly no-matches fallback below never
+        # fired and the model read its own successful verification as a tool
+        # failure (observed live 2026-07-14: three identical searches burned
+        # verification turns because "artifacts gone" was indistinguishable
+        # from "search broken"). Mirrors execute.py's grep-exit-1
+        # normalization. rg signals real errors with exit 2 + stderr, which
+        # still passes through untouched.
+        _out_stripped = (output or "").strip() if isinstance(output, str) else ""
+        if exit_code == 1 and (
+                not _out_stripped
+                or _out_stripped == "[SYSTEM ERROR]: Process failed (Exit 1) with no output."):
+            return (f"Report: No matches found for '{pattern}'. (rg exited 1, "
+                    f"which for a search means the pattern was NOT FOUND — "
+                    f"the search itself did not fail.)")
+
         # Cap search output but keep BOTH head and tail. Without the tail
         # we'd silently hide the last matches in the file, which is the
         # opposite of helpful when the user is debugging a regression

@@ -37,6 +37,13 @@
 
   <p>The job body is the prompt that will be re-injected into the agent on the trigger schedule. APScheduler is bound to the FastAPI lifespan and shut down with <code>wait=False</code> so server restart doesn't block on long-running jobs.</p>
 
+  <h2>Persistence across restarts (2026-07-14)</h2>
+  <p><strong>The bug this closes:</strong> the <code>AsyncIOScheduler</code> jobstore is in-memory, and the operator deploys by killing the agent — so every deploy silently WIPED all user cron tasks, while the <q>task X is running</q> note written to vector memory kept asserting they were alive. Scheduled tasks run with nobody watching the output, so nothing ever surfaced the loss.</p>
+  <p>Every <code>create</code> now also writes the task (name, prompt, expression) to <code>$GHOST_HOME/system/scheduled_tasks.json</code> (atomic tmp+replace; persisted only AFTER the live registration succeeds, so the store never holds an unschedulable task). <code>stop</code>/<code>stop_all</code> unpersist. At lifespan start, <code>restore_persisted_tasks()</code> re-registers everything in the store through the same <code>_add_job</code> trigger-builder the create path uses — a malformed record is skipped with a warning and dropped, never aborting the rest. No <code>memory_dir</code> (degraded/test contexts) ⇒ persistence is a clean no-op with the old semantics. Covered by <code>tests/test_tasks_persistence.py</code>.</p>
+
+  <h2>Timezone</h2>
+  <p>The scheduler runs on <strong>UTC</strong> (<code>AsyncIOScheduler(timezone="UTC")</code>): cron expressions are interpreted in UTC and <code>list</code> output is labelled accordingly — a <q>Next Run: 06:00</q> read as local time would make a correctly-firing task look 2-3 hours late (or early) from Athens. The <code>manage_tasks</code> schema now tells the model to convert local-time requests to UTC when building the expression. (Deliberately NOT switched to the host timezone: existing expressions were authored under UTC semantics, and silently shifting their firing times on upgrade would be its own invisible bug.)</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>
