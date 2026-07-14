@@ -1004,8 +1004,19 @@ async def notifications_ack(request: Request):
                        "type": "InvalidRequestShape"}},
             status_code=400,
         )
-    from ..core.autonomous_activity import save_consumer_offset
+    from ..core.autonomous_activity import (
+        save_consumer_offset, get_activity_log)
     from pathlib import Path as _Path
+    # Clamp to [0, EOF]. A watermark past EOF (client bug, or a stale large
+    # value replayed after a ledger truncation) permanently wedges the
+    # consumer: every /pending then reads nothing and re-returns the huge
+    # watermark, so no future record is ever served. Clamp so the consumer
+    # can only ever be caught up to real EOF, never beyond it.
+    _log = get_activity_log(agent.context)
+    if _log is not None:
+        watermark = max(0, min(watermark, _log.current_offset()))
+    else:
+        watermark = max(0, watermark)
     consumers_path = (_Path(str(agent.context.memory_dir)).parent
                       / "notify_consumers.json")
     save_consumer_offset(consumers_path, consumer, watermark)

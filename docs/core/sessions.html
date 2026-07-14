@@ -92,6 +92,9 @@
     </tbody>
   </table>
 
+  <h2>1b. Hydration tier (2026-07-14)</h2>
+  <p>Stored sessions are now a retrieval source, not just replay state: <code>SessionStore.search_messages(query, limit=5)</code> keyword-searches the most-recently-updated <code>_SEARCH_MAX_SESSIONS</code> (50) sessions and feeds <code>MemoryBus._fetch_session</code> as the fifth hydration tier (see <a href="bus.html">bus</a>). Bounded by design: per-file mtime cache (unchanged sessions are never re-parsed), a 2s summaries memo (one glob scan per hydration, not per sub-query), 240-char snippets, and a ≥2-distinct-term floor for multi-term queries so one shared common word can't surface an unrelated conversation. Fail-safe — returns <code>[]</code> on any error. Tests: <code>tests/test_session_hydration_tier.py</code>.</p>
+
   <h2>2. Real turn cancellation</h2>
   <p><strong>The gap.</strong> Turns are globally serialized
   (<code>agent_semaphore = Semaphore(1)</code>, #22), so ONE wedged turn blocks
@@ -128,6 +131,9 @@
     partial work and no boundary to reach, and killing it is strictly better
     than letting it start.</li>
   </ul>
+
+  <h3>req_id collision handling (2026-07-14 bug hunt)</h3>
+  <p><code>req_id</code> can be a CLIENT-supplied <code>X-Request-ID</code> (the route reads the header), so two overlapping requests can carry the same id. The old registry overwrote the live entry unconditionally and popped by key, so <code>/api/turns</code> hid the first turn, <code>cancel("X")</code> flagged the SECOND turn (cancelling B killed running A), and A's <code>finally</code> evicted B's entry. Fixed: <code>register()</code> never clobbers a live entry — it uniquifies the new key (<code>X#2</code>, …) and <code>handle_chat</code> adopts the effective id; <code>unregister()</code> is IDENTITY-CHECKED (pops only if the stored object is this turn). <strong>Known residual (§4C):</strong> the STREAMING final-generation tail returns its generator inside the semaphore block, so the tail runs after the lock releases and after unregister — uncancellable and invisible to <code>/api/turns</code> (the single upstream slot is still protected by foreground-marking). Tests: <code>tests/test_turn_registry_collision.py</code>.</p>
 
   <h2>Tests</h2>
   <p><code>tests/test_sessions_and_cancel.py</code> (48) — the merge contract

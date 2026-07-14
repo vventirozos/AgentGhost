@@ -35,9 +35,9 @@ SCHEMA_VERSION = "ghost.rrf.weights.v1"
 # Mirror of bus.MemoryBus._INTENT_WEIGHTS — the safe fallback AND the
 # anchor a fit starts from (cells with too little data keep these).
 DEFAULT_INTENT_WEIGHTS: Dict[str, Dict[str, float]] = {
-    "factual":    {"graph": 2.0, "vector": 1.0, "skill": 0.5, "episodic": 0.3},
-    "procedural": {"graph": 0.5, "vector": 1.0, "skill": 2.0, "episodic": 1.5},
-    "contextual": {"graph": 1.0, "vector": 1.5, "skill": 1.0, "episodic": 1.0},
+    "factual":    {"graph": 2.0, "vector": 1.0, "skill": 0.5, "episodic": 0.3, "session": 0.8},
+    "procedural": {"graph": 0.5, "vector": 1.0, "skill": 2.0, "episodic": 1.5, "session": 0.5},
+    "contextual": {"graph": 1.0, "vector": 1.5, "skill": 1.0, "episodic": 1.0, "session": 1.2},
 }
 
 WEIGHT_MIN = 0.1

@@ -356,7 +356,9 @@ class GhostKnowledgeBase(BaseTool):
         profile_memory = getattr(_ctx, 'profile_memory', None)
 
         # Generic pass-through (see GhostFileSystem.call rationale).
-        _named = {"action", "content"}
+        # episodic_memory/session_store are system-injected below — exclude
+        # them so a model-supplied value can't collide as a duplicate kwarg.
+        _named = {"action", "content", "episodic_memory", "session_store"}
         extra = {k: v for k, v in params.items() if k not in _named}
         for k, v in kwargs.items():
             extra.setdefault(k, v)
@@ -368,5 +370,7 @@ class GhostKnowledgeBase(BaseTool):
             memory_system=memory_system,
             profile_memory=profile_memory,
             graph_memory=getattr(_ctx, "graph_memory", None),
+            episodic_memory=getattr(_ctx, "episodic_memory", None),
+            session_store=getattr(_ctx, "session_store", None),
             **extra
         ))

@@ -329,9 +329,36 @@ def test_ingest_document_chunk_ids_use_full_chunk_hash(tmp_path):
     # they would have collided.
     assert len(set(ids)) == 2
 
-    # Verify the new hash uses the full chunk text:
-    expected_id_0 = hashlib.md5("animals.txt|0|the quick brown fox jumps over the lazy dog".encode("utf-8")).hexdigest()
+    # The id hashes the filename + the FULL ENRICHED chunk text. The per-batch
+    # index was dropped (2026-07-13, streaming ingest): `enumerate()` restarts
+    # at 0 on every batch, so an index-based id COLLIDED across the batches of
+    # a streamed document. Hashing the text keeps ids globally unique and
+    # stable on re-ingest, and makes identical chunks dedup by construction.
+    enriched_0 = "[Source: animals.txt]\nthe quick brown fox jumps over the lazy dog"
+    expected_id_0 = hashlib.md5(
+        f"animals.txt|{enriched_0}".encode("utf-8")).hexdigest()
     assert ids[0] == expected_id_0
+
+
+def test_ingest_document_batch_mode_ids_are_stable_across_batches(tmp_path):
+    """Streaming ingest calls ingest_document once per BATCH. Ids must not
+    collide across batches (the old per-batch `enumerate` index did), and
+    batch chunks must NOT be re-enriched — pdf_ingest already stamps each
+    chunk with its `[file] breadcrumb` header."""
+    vm = _make_vm_skeleton(tmp_path)
+    batch1 = ["[manual.pdf] Ch 1 › A\nalpha text", "[manual.pdf] Ch 1 › B\nbeta text"]
+    batch2 = ["[manual.pdf] Ch 2 › C\ngamma text"]
+
+    vm.ingest_document("manual.pdf", batch1, _batch=True)
+    ids1 = vm.collection.upsert.call_args.kwargs["ids"]
+    docs1 = vm.collection.upsert.call_args.kwargs["documents"]
+    vm.ingest_document("manual.pdf", batch2, _batch=True)
+    ids2 = vm.collection.upsert.call_args.kwargs["ids"]
+
+    assert not set(ids1) & set(ids2), "batch ids collided across batches"
+    # No double-enrichment: the chunk keeps its own breadcrumb header.
+    assert docs1[0] == batch1[0]
+    assert not docs1[0].startswith("[Source:")
 
 
 # =====================================================================

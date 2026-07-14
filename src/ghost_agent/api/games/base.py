@@ -49,7 +49,11 @@ def extract_move_text(reply: str) -> Optional[str]:
     matches = _MOVE_LINE_RE.findall(reply or "")
     if matches:
         return matches[-1]
-    bare = (reply or "").strip().splitlines()[-1].strip() if reply else ""
+    # A whitespace-only reply is truthy but ``"".strip().splitlines()`` is []
+    # → the old ``[-1]`` raised IndexError and the route 500'd instead of
+    # taking the retry/no-move path. Guard the empty-after-strip case.
+    lines = (reply or "").strip().splitlines()
+    bare = lines[-1].strip() if lines else ""
     if bare and len(bare) <= 12 and " " not in bare:
         return bare
     return None

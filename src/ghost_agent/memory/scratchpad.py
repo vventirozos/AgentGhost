@@ -4,6 +4,7 @@ import os
 import sqlite3
 import threading
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Optional
 from collections import OrderedDict
@@ -38,16 +39,25 @@ class Scratchpad:
             self._load_from_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.persist_path) as conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS scratchpad (
-                    key TEXT PRIMARY KEY,
-                    value TEXT,
-                    created_at REAL,
-                    accessed_at REAL
-                )
-            ''')
-            conn.commit()
+        # A corrupt/unreadable DB must not take down boot (the launchd
+        # supervisor would respawn-loop) — degrade to in-memory instead.
+        try:
+            with closing(sqlite3.connect(self.persist_path)) as conn:
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS scratchpad (
+                        key TEXT PRIMARY KEY,
+                        value TEXT,
+                        created_at REAL,
+                        accessed_at REAL
+                    )
+                ''')
+                conn.commit()
+        except Exception as e:
+            logger.warning(
+                f"Scratchpad DB unusable ({self.persist_path}): {e} — "
+                f"falling back to in-memory (state will not survive restarts)"
+            )
+            self.persist_path = None
 
     def _load_from_db(self):
         """Load non-expired entries from SQLite into memory."""
@@ -55,7 +65,7 @@ class Scratchpad:
             return
         cutoff = time.time() - self.ttl
         try:
-            with sqlite3.connect(self.persist_path) as conn:
+            with closing(sqlite3.connect(self.persist_path)) as conn:
                 # Purge expired entries
                 conn.execute("DELETE FROM scratchpad WHERE accessed_at < ?", (cutoff,))
                 conn.commit()
@@ -86,7 +96,7 @@ class Scratchpad:
         try:
             now = time.time()
             value_json = json.dumps(value, default=str)
-            with sqlite3.connect(self.persist_path) as conn:
+            with closing(sqlite3.connect(self.persist_path)) as conn:
                 conn.execute(
                     "INSERT OR REPLACE INTO scratchpad (key, value, created_at, accessed_at) VALUES (?, ?, ?, ?)",
                     (key, value_json, now, now)
@@ -99,7 +109,7 @@ class Scratchpad:
         if not self.persist_path:
             return
         try:
-            with sqlite3.connect(self.persist_path) as conn:
+            with closing(sqlite3.connect(self.persist_path)) as conn:
                 conn.execute(
                     "UPDATE scratchpad SET accessed_at = ? WHERE key = ?",
                     (time.time(), key)
@@ -112,7 +122,7 @@ class Scratchpad:
         if not self.persist_path:
             return
         try:
-            with sqlite3.connect(self.persist_path) as conn:
+            with closing(sqlite3.connect(self.persist_path)) as conn:
                 conn.execute("DELETE FROM scratchpad WHERE key = ?", (key,))
                 conn.commit()
         except Exception:
@@ -122,7 +132,7 @@ class Scratchpad:
         if not self.persist_path:
             return
         try:
-            with sqlite3.connect(self.persist_path) as conn:
+            with closing(sqlite3.connect(self.persist_path)) as conn:
                 conn.execute("DELETE FROM scratchpad")
                 conn.commit()
         except Exception:

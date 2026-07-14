@@ -20,8 +20,9 @@ already paid for:
   sub-agent's turns must not be mined for auto-macros or reflected on as if
   they were user work;
 * memory stores are wrapped READ-ONLY (a sub-agent researches; it does not
-  rewrite the operator's memory), and ``memory_bus = None`` so the bus is
-  rebuilt over the wrapped stores rather than the production ones;
+  rewrite the operator's memory), and ``memory_bus = None`` — the sub-agent
+  has no hydration bus at all, so a stray publish can't reach the production
+  stores through it;
 * the LLM client is forced to background mode so a delegated job can never
   starve a live user turn of the single upstream slot.
 
@@ -177,13 +178,25 @@ async def run_subagent(context, *, job_id: str, task: str,
                                  allowed_tools=allowed_tools)
     agent = GhostAgent(iso)
 
-    # Restrict the tool surface. GhostAgent builds `available_tools` from the
-    # registry in __init__; filtering the dict is enough — the schema the
-    # model sees is derived from it, and dispatch looks up by name here.
+    # Restrict the tool surface. THREE gates are needed — filtering the
+    # dispatch dict alone does NOT contain the sub-agent:
+    #   1. `disabled_tools` = every advertised tool MINUS the allowlist. This
+    #      is the one lever that filters the SCHEMA the model sees (agent.py
+    #      ~9302) AND blocks dispatch by name (agent.py ~5835). Without it the
+    #      sub-agent's model is literally shown `delegate`/`jobs`/`manage_*`
+    #      and invited to call them.
+    #   2. narrow `available_tools` (the dispatch dict) to the allowlist.
+    #   3. the guard at agent.py's dispatch-miss rebuild re-narrows to
+    #      `_subagent_allowed_tools` (set on `iso` in build_subagent_context)
+    #      so a miss can't heal the dict back to the full registry.
+    # Any one of these alone is bypassable; together they contain the agent.
+    allow = set(allowed_tools)
     try:
+        from ..tools.registry import TOOL_DEFINITIONS
+        advertised = {t["function"]["name"] for t in TOOL_DEFINITIONS}
+        agent.disabled_tools = (advertised | set(agent.available_tools)) - allow
         agent.available_tools = {
-            k: v for k, v in agent.available_tools.items()
-            if k in set(allowed_tools)
+            k: v for k, v in agent.available_tools.items() if k in allow
         }
     except Exception as e:  # noqa: BLE001
         logger.debug("subagent tool restriction failed: %s", e)

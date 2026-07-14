@@ -20,7 +20,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
+import time
 from collections import OrderedDict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..utils.helpers import get_utc_timestamp
@@ -51,12 +54,24 @@ class MemoryBus:
                  skill_memory: Any = None,
                  profile_memory: Any = None,
                  episodic_memory: Any = None,
-                 intent_weights: Any = None):
+                 session_store: Any = None,
+                 intent_weights: Any = None,
+                 usefulness_ledger_path: Any = None):
         self.vector = vector_memory
         self.graph = graph_memory
         self.skill = skill_memory
         self.profile = profile_memory
         self.episodic = episodic_memory
+        # Raw-conversation tier (2026-07-14): stored sessions were durable
+        # but unreachable by retrieval — replay-only. Fifth hydration source.
+        self.sessions = session_store
+        # Post-turn usefulness feedback (2026-07-14): hydrate_context stashes
+        # this turn's surviving items here; judge_hydration_usefulness
+        # consumes it after the reply is known and appends (intent, source,
+        # used) observations to the ledger that dream's RRF refit reads.
+        self.last_hydration: Optional[Dict[str, Any]] = None
+        self.usefulness_ledger_path = (
+            Path(usefulness_ledger_path) if usefulness_ledger_path else None)
         # Learned RRF intent→source weights (core.rrf_weights). None →
         # the hand-tuned class defaults are used (zero behaviour change);
         # main.py injects a fitted matrix here only when a weights.json
@@ -107,9 +122,9 @@ class MemoryBus:
     # three sources equally, we classify the query and boost the source
     # most likely to have the answer.
     _INTENT_WEIGHTS = {
-        "factual":    {"graph": 2.0, "vector": 1.0, "skill": 0.5, "episodic": 0.3},
-        "procedural": {"graph": 0.5, "vector": 1.0, "skill": 2.0, "episodic": 1.5},
-        "contextual": {"graph": 1.0, "vector": 1.5, "skill": 1.0, "episodic": 1.0},
+        "factual":    {"graph": 2.0, "vector": 1.0, "skill": 0.5, "episodic": 0.3, "session": 0.8},
+        "procedural": {"graph": 0.5, "vector": 1.0, "skill": 2.0, "episodic": 1.5, "session": 0.5},
+        "contextual": {"graph": 1.0, "vector": 1.5, "skill": 1.0, "episodic": 1.0, "session": 1.2},
     }
 
     # Keyword-based intent classifier (no LLM call needed)
@@ -188,22 +203,24 @@ class MemoryBus:
         tier_results_per_query = await asyncio.gather(*fetch_coros)
 
         # Flatten all tier results into a single ranked list set
-        combined_vector, combined_graph, combined_skill, combined_episodic = [], [], [], []
-        for vector_items, graph_items, skill_items, episodic_items in tier_results_per_query:
+        combined_vector, combined_graph, combined_skill, combined_episodic, combined_session = [], [], [], [], []
+        for vector_items, graph_items, skill_items, episodic_items, session_items in tier_results_per_query:
             combined_vector.extend(vector_items)
             combined_graph.extend(graph_items)
             combined_skill.extend(skill_items)
             combined_episodic.extend(episodic_items)
+            combined_session.extend(session_items)
 
         # Deduplicate by text content
         combined_vector = self._dedup_items(combined_vector)
         combined_graph = self._dedup_items(combined_graph)
         combined_skill = self._dedup_items(combined_skill)
         combined_episodic = self._dedup_items(combined_episodic)
+        combined_session = self._dedup_items(combined_session)
 
         intent = self._classify_query_intent(query)
         fused = self._reciprocal_rank_fusion(
-            [combined_vector, combined_graph, combined_skill, combined_episodic],
+            [combined_vector, combined_graph, combined_skill, combined_episodic, combined_session],
             k=rrf_k, intent=intent,
             weight_overrides=self._intent_weights,
         )
@@ -219,7 +236,127 @@ class MemoryBus:
             await asyncio.to_thread(self._credit_surfaced, survivors)
         except Exception as e:
             logger.debug(f"MemoryBus surfaced-credit failed (non-critical): {e}")
+        # Stash this turn's injected items for the post-turn usefulness
+        # judge. Timestamped so a turn that dies before finalization can't
+        # leak stale survivors into the next turn's judgment.
+        self.last_hydration = (
+            {"intent": intent, "survivors": survivors, "ts": time.time()}
+            if survivors else None
+        )
         return out
+
+    async def judge_hydration_usefulness(self, reply: str, llm_client: Any,
+                                         model_name: str = "default",
+                                         max_age_s: float = 600.0) -> int:
+        """Post-turn usefulness judge — closes the retrieval feedback loop.
+
+        ``_credit_surfaced`` credits items for ENTERING the prompt, which is
+        circular: popular memories get more popular whether or not they help.
+        This runs OFF the critical path (spawned after the reply is final)
+        and asks the worker which injected snippets the reply actually drew
+        on, then:
+
+        - vector items  → ``bump_helpful`` (double spaced-repetition credit);
+        - skill items   → ``record_helpful_retrieval`` (feeds hit_rate/utility
+          and the prune ranking);
+        - every survivor → an ``(intent, source, used)`` observation appended
+          to the ledger consumed by the dream cycle's RRF-weight refit — so
+          the learned fusion matrix tracks real usefulness, not surfacing.
+
+        Consumes ``self.last_hydration``. Returns the number of items judged
+        used; never raises.
+        """
+        state, self.last_hydration = self.last_hydration, None
+        if (not state or not state.get("survivors") or not reply
+                or llm_client is None):
+            return 0
+        if time.time() - float(state.get("ts", 0)) > max_age_s:
+            return 0  # stale stash from a turn that never finalized
+        survivors = state["survivors"][:12]
+        intent = state.get("intent", "contextual")
+
+        numbered = "\n".join(
+            f"{i + 1}. {str(s.get('text', ''))[:150]}"
+            for i, s in enumerate(survivors)
+        )
+        prompt = (
+            "Below are memory snippets that were injected into an assistant's "
+            "context, followed by the assistant's final reply. Decide which "
+            "snippets the reply ACTUALLY DREW ON (facts restated, lessons "
+            "applied, past events referenced). Merely being on-topic is NOT "
+            "enough; when unsure, exclude it.\n\n"
+            f"SNIPPETS:\n{numbered}\n\n"
+            f"REPLY:\n{str(reply)[:2000]}\n\n"
+            'Return ONLY JSON: {"used": [<snippet numbers>]}'
+        )
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "You are a precise evaluator. Output JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 128,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            data = await llm_client.chat_completion(
+                payload, use_worker=True, is_background=True, timeout=60.0,
+                task_label="hydration-judge",
+            )
+            content = data["choices"][0]["message"]["content"] or ""
+        except Exception as e:
+            logger.debug(f"hydration usefulness judge failed (skipped): {e}")
+            return 0
+
+        used_idx: set = set()
+        try:
+            parsed = json.loads(re.search(r"\{[\s\S]*\}", content).group())
+            for num in parsed.get("used", []) or []:
+                idx = int(num) - 1
+                if 0 <= idx < len(survivors):
+                    used_idx.add(idx)
+        except Exception:
+            return 0  # unparseable verdict → no credit, no observations
+
+        used_vec = [s.get("mem_id") for i, s in enumerate(survivors)
+                    if i in used_idx and s.get("source") == "vector" and s.get("mem_id")]
+        bump_h = getattr(self.vector, "bump_helpful", None) if self.vector else None
+        if used_vec and callable(bump_h):
+            try:
+                await asyncio.to_thread(bump_h, used_vec)
+            except Exception as e:
+                logger.debug(f"vector bump_helpful failed: {e}")
+        rec_h = getattr(self.skill, "record_helpful_retrieval", None) if self.skill else None
+        if callable(rec_h):
+            for i, s in enumerate(survivors):
+                if i in used_idx and s.get("source") == "skill" and s.get("trigger"):
+                    try:
+                        await asyncio.to_thread(rec_h, s["trigger"])
+                    except Exception as e:
+                        logger.debug(f"skill record_helpful_retrieval failed: {e}")
+
+        if self.usefulness_ledger_path is not None:
+            lines = "".join(
+                json.dumps({
+                    "intent": intent,
+                    "source": s.get("source", "vector"),
+                    "success": (i in used_idx),
+                    "ts": get_utc_timestamp(),
+                }) + "\n"
+                for i, s in enumerate(survivors)
+            )
+
+            def _append():
+                self.usefulness_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self.usefulness_ledger_path, "a", encoding="utf-8") as f:
+                    f.write(lines)
+
+            try:
+                await asyncio.to_thread(_append)
+            except Exception as e:
+                logger.debug(f"usefulness ledger append failed: {e}")
+        return len(used_idx)
 
     def _credit_surfaced(self, survivors: List[Dict[str, Any]]) -> None:
         """One deduped retrieval-credit pass for the items injected this turn."""
@@ -249,6 +386,7 @@ class MemoryBus:
             self._fetch_graph(query),
             self._fetch_skill(query),
             self._fetch_episodic(query),
+            self._fetch_session(query),
         )
 
     @staticmethod
@@ -479,6 +617,35 @@ class MemoryBus:
             return []
         return [{"source": "episodic", "text": formatted.strip()}]
 
+    async def _fetch_session(self, query: str) -> List[Dict[str, Any]]:
+        """Raw-conversation tier: keyword hits from stored sessions.
+
+        The lowest-abstraction tier (NapMem-style raw layer): durable
+        server-side conversations were previously replay-only. One RRF item
+        per matching message, prefixed with the session title so the model
+        can tell WHICH past conversation it came from."""
+        if not self.sessions:
+            return []
+        search = getattr(self.sessions, "search_messages", None)
+        if not callable(search):
+            return []
+        try:
+            hits = await asyncio.to_thread(search, query, 5)
+        except Exception as e:
+            logger.warning(f"MemoryBus session fetch failed: {type(e).__name__}: {e}")
+            return []
+        items = []
+        for h in hits or []:
+            if not isinstance(h, dict) or not h.get("text"):
+                continue
+            title = str(h.get("title") or "untitled")[:60]
+            items.append({
+                "source": "session",
+                "text": f"[{title}] {h.get('role', 'user')}: {h['text']}",
+                "session_id": h.get("session_id"),
+            })
+        return items
+
     # ----------------------------------------------------------------- RRF
 
     @classmethod
@@ -500,10 +667,9 @@ class MemoryBus:
         weights = wmap.get(intent, wmap.get("contextual", cls._INTENT_WEIGHTS["contextual"]))
         # Map source names to their weights. Sources: vector, graph, skill
         # Positional fallback for a source-less ranked list. hydrate_context
-        # passes FOUR lists (vector, graph, skill, episodic) — the 3-entry
-        # order left index 3 (episodic) falling back to "vector", weighting it
-        # wrong if an episodic item ever lacked its "source" key.
-        _source_order = ["vector", "graph", "skill", "episodic"]
+        # passes FIVE lists (vector, graph, skill, episodic, session) — keep
+        # this order in sync or a source-less item gets the wrong weight.
+        _source_order = ["vector", "graph", "skill", "episodic", "session"]
 
         scores: Dict[Tuple[str, str], float] = {}
         index: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -560,6 +726,7 @@ class MemoryBus:
             # framing that used to live inside the tier blob rides the
             # section header instead.
             "episodic": "### PAST EPISODES (prior sessions — reference only, NOT the current conversation):",
+            "session": "### PAST CONVERSATIONS (stored sessions — reference only, NOT the current conversation):",
         }
 
         # Normalise fused scores to [0,1] against the top-ranked item so the

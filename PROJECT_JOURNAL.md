@@ -415,6 +415,31 @@ graph inverted index (the forgetting pass + node-cache landed).
 Severity in parens. Many are latent (no prod caller), multi-process (single-tenant today), or
 model-behavior edges.
 
+- **[2026-07-14 post-July-hunt cohort review] open residuals** (the CONFIRMED-and-fixed items are
+  in §6's 2026-07-14b entry). Still open:
+  - **[concurrency] streaming final-generation tail escapes the semaphore + turn registry** (HIGH,
+    architectural) — `handle_chat` returns `stream_wrapper()` INSIDE `async with agent_semaphore`,
+    so the tail's upstream stream runs after the lock releases AND after `unregister`: two streaming
+    tails can overlap the serialized region, and the tail is uncancellable + invisible to
+    `/api/turns`/`/api/turn/cancel`. Practical blast radius is bounded — `_mark_foreground` covers
+    the whole streamed lifecycle so the single upstream slot isn't stolen; the real defect is
+    cancellability/visibility. Fix needs the route (or `stream_wrapper`) to hold the permit + defer
+    unregister until the generator drains, plus an `is_cancelled` boundary inside the wrapper.
+    Deferred to a focused turns/cancel session (hot path, high regression risk).
+  - **[host] `is_published_port` uses the CONFIGURED range, not the actually-published set** (MED) —
+    in the ≥2-instance case a second agent publishes nothing yet the function returns true, pointing
+    the operator at the FIRST instance's forwarder. Fix: persist the published set on the docker
+    manager and consult it (cross-module plumbing; rare, non-security). Docs: sandbox/services.html.
+  - **[activity] `read_since` re-baselines to EOF on a shrunk ledger** (LOW, latent) — a truncation/
+    rotation smaller than a saved watermark silently skips post-truncation records. No rotation code
+    in-tree today. Fix: detect `size < offset` and re-read from 0.
+  - **[games] tic-tac-toe `load` accepts turn/parity-impossible boards + double-winner boards** (LOW,
+    SUSPECTED) — client owns state and it self-heals on the next `load`; reject a supplied `turn`
+    that disagrees with mark parity.
+  - **[self-play] `_invoke_template`'s broad `except TypeError` around the whole `fn(tier=)` call**
+    (LOW, SUSPECTED) — a genuine TypeError from a template body silently falls back to `fn()` (wrong
+    tier). Fix: detect kwarg support via `inspect.signature`, not a catch around execution.
+
 - **`current_project_id` cross-conversation race (projects + api)** — **RESOLVED 2026-07-07.** #22
   (turn serialization) closes the chat-turn-vs-chat-turn window; the residual was the stateless
   `/api/upload` + `/api/download` endpoints, which carry no conversation context and read the racy
@@ -454,8 +479,11 @@ model-behavior edges.
   delete), and carries `valid_from`/`valid_until` through a new `_merge_triplet_row` helper — a
   superseded fact stays expired instead of re-entering as current, weights sum without double-counting,
   and a temporal merge is current-wins (either side current ⇒ current; both expired ⇒ later expiry +
-  earliest `valid_from`). Still unwired (only a no-op stub in `dream.py` calls it) — hardened before
-  wiring. Tests: test_graph_compression_temporal.py (7). Docs: memory/graph.html.
+  earliest `valid_from`). **WIRED LIVE 2026-07-14** — the dream cycle now calls it after
+  `prune_stale_edges` via `Dreamer._compress_graph_nodes` (deterministic candidates from the new
+  `propose_merge_candidates`; fuzzy pairs need a worker same-entity confirmation; capped 8/cycle;
+  self-play ReadOnly wrapper still no-ops). Tests: test_graph_compression_temporal.py (7) +
+  test_dream_graph_compression_wiring.py (13). Docs: memory/graph.html, core/dream.html.
 - **vector smart_update template over-match + correct_fragment id-collision** — **RESOLVED
   2026-07-07.** smart_update still computes `dist<0.50` but now ALSO requires the neighbor's
   extracted subject key to agree before deleting (`_subject_key`: "User's favorite color is blue" →
@@ -571,10 +599,13 @@ model-behavior edges.
   `recall` tool / `manage_projects` (which also nudges the recall-routing item below). A consistency
   test pins the schema enum ⊆ `_VALID_ACTIONS` (they are two sources of truth). Tests:
   test_workspace_search.py (14). Docs: tools/workspace.html.
-- **[behavior] "project X" recall-routing variance** (low, model-dependent) — "when does project
-  Kestrel ship?" made the model check the *projects* tool and give up, while "search your memory for
-  Kestrel" recalled it (0.76). Storage correct; nudge via tool description or a recall-fallback on
-  empty project lookups.
+- **[behavior] "project X" recall-routing variance** — **RESOLVED 2026-07-14.** Both suggested
+  fixes landed: (a) a `manage_projects` `get` miss now runs `_not_found_with_recall` (vector
+  `search_advanced`, MEDIUM-or-better band <1.15) and returns hits as a NON-error payload
+  (`{"project": null, "memory_recall": [facts]}`) so the model answers without a strike or a second
+  unprompted hop; (b) the `recall` tool description carries the mirror-image nudge ("ALSO the right
+  tool when a question names a project manage_projects doesn't track"). Tests:
+  test_iterative_recall_expand.py (12). Docs: tools/projects.html.
 - **[search] Yandex fails over Tor** (low, known) — per-exit-node reachability; circuit rotation per
   attempt already implemented; search succeeds via other backends. MEASURE across exit nodes before
   changing the backend set (see `tor-search-reachability` memory). Possible cheap win: shorter
@@ -734,6 +765,155 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-14b — Bug-hunt pass over the never-reviewed cohorts (post-July-hunt shipping since 2026-07-05)
+The July static/functional hunts (§5B/§5C) + the 2026-07-07 six-agent review covered everything that
+existed THEN; ~10 days of shipping since (host services, notifications, delegation, sessions/cancel,
+games, RAG, challenge_templates) had never had a review pass. Ran 4 parallel read-only review agents
+(one per cohort), verified every finding against the code myself, fixed the CONFIRMED bugs with tests
++ HTML docs, logged residuals to §4B. **Two HIGH containment breaks were the headline** — a delegated
+sub-agent could escape isolation ENTIRELY:
+- **Sub-agent tool containment (HIGH, `core/subagent.py` + `core/agent.py`).** The old restriction
+  filtered only the dispatch DICT and left `_subagent_allowed_tools` UNUSED, so (a) the SCHEMA the
+  model saw was the full registry — it was literally shown `delegate`/`jobs`/`manage_*` and invited to
+  call them (recursive fan-out, daemon scheduling, profile writes), and (b) any dispatch miss HEALED
+  `available_tools` back to the full registry, undoing the filter. Fixed with three gates: `disabled_tools`
+  = advertised − allowlist (filters schema AND blocks dispatch by name), narrowed dispatch dict, and
+  `_rebuild_available_tools` re-narrows to the allowlist on every miss. Tests: test_subagent_containment.py (7).
+- **Read-only memory façades didn't block the real mutators (HIGH, `memory/readonly.py`).** The no-op
+  method names were GUESSED (`add_memory`, `delete_memory`, `add_triplet`, `insert_fact`) and don't
+  exist on the stores; the REAL mutators (`add`, `ingest_document`, `add_triplets`, `delete_by_target`,
+  `remove_by_trigger`, …) and the raw `.real`/`.collection`/`.nx_graph` handles passed straight through.
+  Rewritten as a default-allow-reads / explicit-deny-writes proxy pinned to real method names, `search`
+  forced `record_retrievals=False`, raw handles blocked. A mutator-list guard test introspects each real
+  store and fails if it grows an unblocked writer. Tests: test_readonly_memory.py (14).
+- **Other CONFIRMED, fixed:** swarm jobs landed `str(True)` as their result while content sat in the
+  scratchpad → `Job.result_resolver` (jobs.py) reads `output_key` so `collect` returns content; turn
+  registry used the client-supplied `X-Request-ID` as key with unconditional overwrite + key-based
+  unregister → cross-turn mis-cancel (cancelling B killed running A) → `register` uniquifies on
+  collision, `unregister` identity-checked; `/notifications/ack` stored an unbounded watermark →
+  permanent consumer wedge → clamped to `[0,EOF]`; notify egress LAN-suffix list diverged from the
+  egress guard → `.home`/`.arpa` pushes silently dropped under mandatory-tor → share the guard's
+  constants; notify_tool rate-limit consumed a slot before the write → split check/commit; `send_soon`
+  task GC-drop → retained; Tor CONTROL port 9051 added to sandbox BLOCKED_PORTS (SSRF defence-in-depth);
+  `extract_move_text` IndexError → HTTP 500 on a whitespace-only reply → guarded; self-play
+  concurrency-cancel template budget 2.0s couldn't reject a non-cancelling solution (parallel losers
+  ~1.5s) → 1.0s; SQL group-by validator sorted by raw float → `-round(t,2)`.
+- **Verified HOLDS (agents tried and failed to break):** notify.py Tor fail-closed (public target with
+  no proxy raises PermissionError before any socket; no cleartext fallback); browser SSRF guard
+  (integer-IP / 0.0.0.0 / redirect / DNS-rebind all blocked); the turn cancellation state machine on
+  this interpreter (semaphore release on hard-kill, CancelledError propagation, queued-turn kill, no
+  registry leak). httpx 0.28 `proxy=` kwarg is correct; no codebase misuse of the removed `proxies=`.
+- **Residuals** (analysis in §4B): streaming-tail-outside-semaphore (HIGH, architectural — deferred to a
+  focused turns/cancel session), `is_published_port` multi-instance (MED), `read_since` shrunk-ledger
+  (LOW latent), tic-tac-toe parity load (LOW), `_invoke_template` TypeError catch (LOW).
+- New tests: test_subagent_containment.py, test_readonly_memory.py, test_turn_registry_collision.py,
+  test_bughunt_20260714.py (+1 source-inspection assertion updated for the identity-checked unregister).
+  Docs: core/delegation.html, memory/readonly.html (new), core/sessions.html, sandbox/services.html,
+  core/autonomous_activity.html, api/game_routes.html, core/challenge_templates.html. Suite **7565
+  passed / 12 skipped / 1 xfailed** (`env -u FORCE_COLOR`). **Needs prod restart** for the containment
+  fixes, turn-registry, ack clamp, and the notify egress/rate-limit fixes.
+
+### 2026-07-14 — Memory-system upgrade: three unwired loops closed, NapMem-inspired structure, usefulness feedback loop, recall eval harness
+Triggered by a comparison against arXiv 2607.05794 (NapMem — "memory as an action space": linked
+multi-granularity pyramid + active navigation). Verdict: this agent had ~80% of the storage parts
+(and decay/episodic/graph tiers the paper lacks) but sat on the paper's "passive retrieval"
+ablation side, and three built subsystems had no caller. Eight items shipped, ordered by the
+"close loops before new modules" principle:
+- **Scratchpad persists in prod** — `main()` now builds `Scratchpad(persist_path=memory_dir/
+  "scratchpad.db")` (plain-`kill` deploys wiped working state incl. the `__current_project__`
+  resume sentinel; the main.py:417 NOTE anticipated exactly this flip). `--no-memory` stays
+  in-memory. Plus the §4B nit: every sqlite connect wrapped in `contextlib.closing` (the `with
+  sqlite3.connect()` form only scopes the TRANSACTION), and a corrupt DB at boot degrades to
+  in-memory instead of respawn-looping launchd. Tests: test_scratchpad_persistence.py (+2).
+- **Episodic consolidation wired** (`Dreamer._consolidate_episodes`) — `get_unconsolidated`/
+  `mark_consolidated` finally have their caller: runs after journal drain and BEFORE the REM
+  entropy gate (a thin auto pool can't starve it), one worker call generalizes ≤40 episodes
+  (trigger → action chain with FAILED markers → outcome) into imperative strategies through the
+  actionability gate, `source="episode"`. Failure contract mirrors the smart-memory requeue fix:
+  mark only after a successful parse. This is also the trajectory-shaped seed source §4A(c) said
+  dream needs. Tests: test_dream_episode_consolidation.py (8).
+- **Graph compression wired** (see §4B item, now closed) — safe/fuzzy candidate tiers, worker
+  confirmation, 8-merge/cycle cap.
+- **Provenance on abstractions** (NapMem's falsifiability idea) — syntheses store
+  `provenance=[{id, excerpt}]` captured BEFORE the merged sources are deleted; lessons carry
+  `source_refs` (e.g. `ep:12`, unioned on dedup, mirrored to the vector twin); `tool_recall`
+  renders EVIDENCE lines. Tests: test_memory_provenance.py (8).
+- **Sessions became the raw-conversation tier** — `SessionStore.search_messages` (50 most-recent
+  sessions, mtime-cached parses, 2s summaries memo shared across the RAG-fusion fan-out,
+  ≥2-distinct-term floor) feeds a FIFTH MemoryBus fetcher under a PAST CONVERSATIONS header;
+  intent weights extended (session: factual .8 / procedural .5 / contextual 1.2, mirrored in
+  rrf_weights defaults). Sessions were durable since 2026-07-11 but replay-only — the lowest
+  abstraction layer was invisible to retrieval. Tests: test_session_hydration_tier.py (11).
+- **Iterative recall** — `knowledge_base(action='expand', ref='ep:12'|'session:<id>')` resolves
+  EVIDENCE REFS to raw records (the query_document read→refine loop generalized to memory);
+  recall's zero-hit reply nudges ONE reworded retry; §4C recall-routing variance RESOLVED (see
+  item). Tests: test_iterative_recall_expand.py (12).
+- **Usefulness feedback loop closed** — `_credit_surfaced` was circular (credit for ENTERING the
+  prompt). Now `hydrate_context` stashes survivors; both finalization paths spawn
+  `judge_hydration_usefulness` (worker, off critical path): used vector items get `bump_helpful`
+  (helpful_count weighs 2× retrieval_count in the spaced-repetition half-life), used skills get
+  `record_helpful_retrieval`, every survivor appends `(intent, source, used)` to
+  `rrf/observations.jsonl`; dream's new `_refit_rrf_weights` fits ≥30 observations, persists
+  `rrf/weights.json`, hot-swaps the live matrix, trims the ledger. The learned RRF matrix is now
+  an ONLINE loop keyed to real usefulness. Tests: test_hydration_usefulness_loop.py (14).
+- **Recall regression eval** (`test_recall_regression_eval.py`) — golden corpus across all five
+  tiers through the REAL pipeline (BGE + Chroma + fusion): measured paraphrase recall 100%
+  (floors at 75%), all per-tier cases pass. One deliberate `xfail` pins a MEASURED gap: with
+  `bus._RELEVANCE_FLOOR = 0.0` an off-topic query hydrates most of a small store — tune the floor
+  from the usefulness ledger, not by guessing; the xfail flips visible when it lands.
+- NOT adopted from the paper (deliberately): RL-trained navigation policy (their biggest ablation
+  win, but their own 9B-without-RL scored BELOW passive baselines — structure alone only pays at
+  ~400B prompted scale; no training infra here) and multi-hop navigation on the hot path (each hop
+  is a full local-inference round-trip + busts the KV-cache-stable injection).
+- Suite **7523 passed / 12 skipped / 1 xfailed (deliberate)** in 3m05s. NOTE for test runs: a
+  shell with `FORCE_COLOR` set fails `test_thinking_loop_guards` (env-sensitive, documented in
+  run-and-test-setup memory) — run `env -u FORCE_COLOR`. **Needs prod restart** to pick up:
+  persistent scratchpad, session tier, judge hook, dream steps.
+
+### 2026-07-13 (later 8) — RAG overhaul: the full PostgreSQL manual (3,075 pages) is now queryable, 6/6 on eval
+- Operator goal: "load the full PostgreSQL manual (~15MB PDF) and ask questions". Analysis found the
+  store held **160 fragments and ZERO documents** — the doc path had never been exercised — and that
+  the manual would fail at the first step. Three phases, all shipped.
+- **Phase 1 — streaming, structure-aware ingest** (`memory/pdf_ingest.py`, new). The old path
+  **hard-refused >1000 pages** (manual = 3,075), then **silently truncated at 5M chars** (manual ≈
+  10M), and materialised the whole text + whole chunk list + an enriched COPY in RAM. Now: pages
+  stream one at a time, accumulate per TOC SECTION, chunk, and flush in 256-chunk batches (peak RAM
+  = one batch). Caps → 6,000 pages / 40M chars; chunk 600 → **1,200** (600 shredded parameter
+  descriptions). **TOC breadcrumbs** are the big win: PDF text has no markdown headers, so
+  `semantic_split_text`'s header-prepending NEVER fired and a `wal_level` chunk had no idea it lived
+  under "19.5. Write Ahead Log". `build_page_breadcrumbs` walks PyMuPDF's outline with a level stack
+  (pops correctly on siblings/new chapters) → every chunk's EMBEDDED text carries
+  `Part III › Chapter 19 › 19.5. Write Ahead Log › 19.5.1. Settings`.
+- **Phase 2 — the missing loop.** There was NO document-scoped retrieval: the only path to the model
+  was ambient hydration (MemoryBus, 4 tiers, RRF, shared 6-12k char budget, ~12 fragments from the
+  WHOLE store) — useless against a 3k-page manual. New `VectorMemory.search_document()` (Chroma
+  `where={"source": f}`, 60-candidate pool, BM25 rerank, NO priority tiers / time decay / distance
+  gate — all meaningless or harmful inside one document) + `knowledge_base(action="query",
+  filename=, question=)` returning ranked passages as TOOL OUTPUT the model iterates on. System
+  prompt + `recall`'s description now steer document questions here.
+- **Phase 3 — embedder swap.** all-MiniLM-L6-v2 → **BAAI/bge-small-en-v1.5** (also 384-d, so the
+  Chroma schema is unchanged). MiniLM is SYMMETRIC-similarity trained with a 256-token window and
+  weak on technical/SQL text; doc QA is ASYMMETRIC — its exact failure mode, which the code conceded
+  by relaxing the document threshold to 1.25 "for Asymmetric QA". BGE takes a query instruction,
+  applied to QUERIES only via `embed_query` (Chroma's `query_texts=` reuses the DOC embedder and
+  can't express the asymmetry → the doc-QA path embeds the question itself and passes
+  `query_embeddings=`). **Silent-wrongness guard**: both models are 384-d + L2-normalised, so a swap
+  raises NOTHING — the vectors just stop meaning anything. Store now carries an `embedder.json`
+  fingerprint; boot REFUSES on mismatch and points at `scripts/reembed_memory.py` (snapshot → JSONL,
+  recreate collection, re-add; 161 fragments in 0.7s). **The guard fired for real** during the
+  migration — launchd's respawn hit the un-migrated store and was correctly refused.
+- **Measured live**: manual ingested in **2m29s → 3,075 pages, 1,897 sections, 7,131 chunks**.
+  6-question eval (wal_level values, VACUUM vs VACUUM FULL, range-partition syntax, pg_stat_activity,
+  MVCC isolation levels, shared_buffers) → **6/6 correct section retrieved**, agent citing breadcrumbs
+  (`Chapter 27 › 27.2.3. pg_stat_activity`). Unprompted routing verified: a plain "what does
+  archive_command do?" made the agent pick the scoped tool on its own and answer with correct
+  `%p`/`%f` semantics. Suite **7449 passed / 12 skipped / 0 failed** (new: `tests/test_rag_document_qa.py`
+  ×20; updated: the PDF-extraction test now pins the streaming contract, the chunk-id test the
+  batch-safe id, the prompt test the new routing). Docs: `memory/vector.html`.
+- Ops note: ingest/migration require the agent STOPPED or driven through it (Chroma is single-writer);
+  `scripts/reembed_memory.py` refuses to run against a live agent. BGE model is now HF-cached (needed
+  before boot — `--mandatory-tor` is fail-closed).
 
 ### 2026-07-13 (later 7) — web face: immersion dive ("the grid swallows the camera" while working)
 - Operator idea, built after an explicit feasibility pass: while a USER request is in flight the

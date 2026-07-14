@@ -98,6 +98,12 @@
 
   <p><code>ChallengeTriple = Tuple[str, str, str]</code></p>
 
+  <h2>Bug hunt (2026-07-14)</h2>
+  <ul>
+    <li><strong>Concurrency cancel-losers budget.</strong> The winner-takes-all template set <code>wall_clock_max_s = 2.0</code> with losers sleeping 1500ms — but the losers sleep in PARALLEL, so a naive "wait for all, never cancel" solution finishes in ~1.5s and PASSED, rewarding non-cancelling code and silently corrupting the cooperative-cancel training signal. Budget lowered to <strong>1.0s</strong> (between the 200ms winner and the 1500ms parallel-loser floor) so wait-for-all is actually rejected.</li>
+    <li><strong>SQL group-by float-noise sort.</strong> The <code>_sql_group_by_aggregation</code> validator sorted expected rows by the RAW float sum while the solver uses SQL <code>SUM()</code> — two products whose printed <code>{t:.2f}</code> totals tie could order oppositely on last-ULP noise, wrongly FAILing a correct <code>ORDER BY SUM(amount) DESC, product ASC</code>. Now sorts on <code>-round(t, 2)</code>, matching the <code>data_analysis</code> template's existing fix.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

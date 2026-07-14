@@ -114,7 +114,7 @@ class TestHydrateContextRAGFusion:
 
 
 class TestFetchAllTiers:
-    async def test_fetch_all_tiers_returns_four_lists(self, bus):
+    async def test_fetch_all_tiers_returns_five_lists(self, bus):
         bus.vector.search = MagicMock(return_value="fact1")
         bus.graph.get_neighborhood = MagicMock(return_value=["edge1"])
         bus.skill.get_playbook_context = MagicMock(return_value="lesson1")
@@ -122,7 +122,7 @@ class TestFetchAllTiers:
         bus.episodic.format_for_context = MagicMock(return_value="")
 
         result = await bus._fetch_all_tiers("test query")
-        assert len(result) == 4  # vector, graph, skill, episodic
+        assert len(result) == 5  # vector, graph, skill, episodic, session
 
 
 class TestExistingBusFunctionality:

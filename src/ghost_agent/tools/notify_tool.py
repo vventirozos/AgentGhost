@@ -37,14 +37,20 @@ _sent_timestamps: list = []
 
 
 def _rate_limited() -> bool:
+    """CHECK only — does NOT consume a slot. The slot is committed via
+    ``_note_sent`` after the record is actually written, so a failed write
+    doesn't burn budget (the old version appended here, so a record-write
+    failure still counted against the 12/hour cap)."""
     now = time.time()
     cutoff = now - 3600.0
     while _sent_timestamps and _sent_timestamps[0] < cutoff:
         _sent_timestamps.pop(0)
-    if len(_sent_timestamps) >= _MAX_PER_HOUR:
-        return True
-    _sent_timestamps.append(now)
-    return False
+    return len(_sent_timestamps) >= _MAX_PER_HOUR
+
+
+def _note_sent() -> None:
+    """Commit one slot against the hourly budget — only after a successful send."""
+    _sent_timestamps.append(time.time())
 
 
 def _delivery_channels(context) -> list:
@@ -103,6 +109,7 @@ async def tool_notify_operator(message: str = None, context=None, **kwargs):
     if not ok:
         return "Error: failed to write the notification record."
 
+    _note_sent()  # commit the rate-limit slot only after a successful write
     channels = _delivery_channels(context)
     return (f"Notification queued for the operator via: "
             f"{', '.join(channels)}.\nMessage: {message}")

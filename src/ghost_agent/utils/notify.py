@@ -37,7 +37,14 @@ from urllib.parse import urlsplit
 logger = logging.getLogger("GhostAgent")
 
 _TIMEOUT_S = 8.0
-_LAN_SUFFIXES = (".local", ".lan", ".home", ".internal", ".arpa")
+# Share the LAN classification with the egress guard so the two can't
+# diverge: a host this module calls "direct" but the guard BLOCKS under
+# --mandatory-tor was silently dropped after two failed attempts (and vice
+# versa for `.localhost`). The guard is the authority — reuse its lists.
+from .egress_guard import (  # noqa: E402
+    _LOCAL_HOST_SUFFIXES as _LAN_SUFFIXES,
+    _LOCAL_HOST_NAMES as _LAN_NAMES,
+)
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")  # Tailscale lives here
 
 
@@ -56,7 +63,7 @@ def url_needs_tor(url: str) -> bool:
                         or ip in _CGNAT)
         except ValueError:
             pass  # not an IP literal — classify by hostname shape
-        if host == "localhost" or host.endswith(_LAN_SUFFIXES):
+        if host in _LAN_NAMES or host.endswith(_LAN_SUFFIXES):
             return False
         if "." not in host:
             return False  # bare intranet hostname
@@ -84,6 +91,10 @@ class OutboundNotifier:
         self._transport = transport
         self.sent_count = 0
         self.failed_count = 0
+        # Strong refs to in-flight fire-and-forget send tasks. asyncio holds
+        # only a WEAK ref to a bare create_task result, so a push could be
+        # GC-dropped mid-flight; retain until done.
+        self._pending: set = set()
 
     @property
     def configured(self) -> bool:
@@ -182,7 +193,9 @@ class OutboundNotifier:
             except RuntimeError:
                 loop = None
             if loop is not None:
-                loop.create_task(self.send(**kwargs))
+                t = loop.create_task(self.send(**kwargs))
+                self._pending.add(t)
+                t.add_done_callback(self._pending.discard)
             else:
                 # No loop (sync caller, e.g. a thread) — one daemon thread
                 # per push is fine at notification volume.

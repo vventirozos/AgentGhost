@@ -17,24 +17,92 @@ from ..utils.helpers import get_utc_timestamp
 logger = logging.getLogger("GhostAgent")
 
 
-# The embedder is all-MiniLM-L6-v2 (hardcoded below): 384-d, L2-NORMALISED
-# (its sentence-transformers config ends in a Normalize module). When the
-# model config can't be resolved — HF unreachable and not forced offline —
-# sentence-transformers logs "Creating a new one with mean pooling" and
-# silently builds an UNTRAINED Transformer+Pooling model with NO Normalize.
-# That model still returns 384-d vectors, so nothing errors, but the
-# embeddings are wrong and poison every retrieval. The distinguishing
-# signal: the trained model emits norm≈1.0; the degraded fallback does NOT
-# (observed ~7.7). Probe once at boot and refuse to serve garbage.
+# ── Embedder ─────────────────────────────────────────────────────────
+#
+# Default: BAAI/bge-small-en-v1.5 (2026-07-13, was all-MiniLM-L6-v2).
+#
+# Same 384-d, so the Chroma schema is unchanged — but the vectors live in a
+# DIFFERENT space, so a store embedded with the old model is garbage under
+# the new one. That mismatch is silent (right dim, right norm, wrong
+# meaning), so we fingerprint the embedder in a sidecar next to the store
+# and REFUSE to boot on a mismatch (see `_embedder_sidecar_mismatch`),
+# pointing the operator at `scripts/reembed_memory.py`.
+#
+# Why BGE: MiniLM is trained for SYMMETRIC similarity (sentence ≈ sentence)
+# with a 256-token window, and it is weak on technical / code / SQL text.
+# Document QA is ASYMMETRIC — a short question against a long passage —
+# which is exactly its failure mode; the retrieval code even conceded this
+# by relaxing the document distance threshold to 1.25 "for Asymmetric QA".
+# bge-small-en-v1.5 is trained for that task (and takes an optional query
+# instruction, applied in `embed_query`), while staying small enough to
+# embed thousands of chunks on CPU in about a minute.
+#
+# Override with GHOST_EMBED_MODEL (any 384-d sentence-transformers model).
+EMBED_MODEL_NAME = os.environ.get(
+    "GHOST_EMBED_MODEL", "BAAI/bge-small-en-v1.5").strip()
+
+# BGE v1.5 retrieval instruction. Applied to QUERIES only (never to stored
+# passages) in the document-QA path. The model card calls it optional for
+# v1.5 ("performance degrades only slightly without it"), so any non-BGE
+# override simply gets no prefix.
+_BGE_QUERY_INSTRUCTION = (
+    "Represent this sentence for searching relevant passages: "
+)
+
+# The embedder must be 384-d and L2-NORMALISED (its sentence-transformers
+# config ends in a Normalize module). When the model config can't be
+# resolved — HF unreachable and not forced offline — sentence-transformers
+# logs "Creating a new one with mean pooling" and silently builds an
+# UNTRAINED Transformer+Pooling model with NO Normalize. That model still
+# returns 384-d vectors, so nothing errors, but the embeddings are wrong and
+# poison every retrieval. The distinguishing signal: the trained model emits
+# norm≈1.0; the degraded fallback does NOT (observed ~7.7). Probe once at
+# boot and refuse to serve garbage.
 EXPECTED_EMBED_DIM = 384
 _EMBED_NORM_TOLERANCE = 0.1  # |norm - 1.0| must be within this
+EMBEDDER_SIDECAR = "embedder.json"
+
+
+def _embedder_sidecar_mismatch(sidecar_path, current_model: str,
+                               fragment_count: int) -> Optional[str]:
+    """Return a reason string when the store was embedded with a DIFFERENT
+    model than the one now configured (→ every vector is meaningless), else
+    None. Pure enough to unit-test: takes a Path and the current counts.
+
+    Cases:
+      * sidecar present, model matches      → None (normal boot)
+      * sidecar present, model differs      → mismatch (refuse)
+      * no sidecar, store EMPTY             → None (fresh store; caller stamps)
+      * no sidecar, store NON-empty         → mismatch (legacy MiniLM store)
+    """
+    try:
+        p = Path(sidecar_path)
+        if p.exists():
+            data = json.loads(p.read_text() or "{}")
+            stored = str((data or {}).get("model") or "").strip()
+            if stored and stored != current_model:
+                return (
+                    f"the vector store was embedded with '{stored}' but the "
+                    f"agent is configured for '{current_model}'"
+                )
+            return None
+    except Exception as e:  # noqa: BLE001 — unreadable sidecar = treat as absent
+        logger.debug("embedder sidecar unreadable (%s)", e)
+    if fragment_count > 0:
+        return (
+            f"the vector store holds {fragment_count} fragments but carries no "
+            f"embedder fingerprint — it predates the fingerprint (i.e. it was "
+            f"embedded with all-MiniLM-L6-v2) while the agent is configured "
+            f"for '{current_model}'"
+        )
+    return None
 
 
 def _embedding_degradation_reason(probe_vector) -> Optional[str]:
-    """Return None if ``probe_vector`` looks like the trained
-    all-MiniLM-L6-v2 output (right dim, L2-normalised, finite), else a
-    human-readable reason the embedder is in the degraded mean-pooling
-    fallback state. Pure — unit-testable without loading a real model."""
+    """Return None if ``probe_vector`` looks like a trained, L2-normalised
+    384-d embedding, else a human-readable reason the embedder is in the
+    degraded mean-pooling fallback state. Pure — unit-testable without
+    loading a real model."""
     if probe_vector is None:
         return "embedder returned no vector for the probe text"
     try:
@@ -44,7 +112,7 @@ def _embedding_degradation_reason(probe_vector) -> Optional[str]:
     if len(vec) != EXPECTED_EMBED_DIM:
         return (
             f"unexpected embedding dimension {len(vec)} "
-            f"(trained all-MiniLM-L6-v2 is {EXPECTED_EMBED_DIM}-d)"
+            f"(expected {EXPECTED_EMBED_DIM}-d for {EMBED_MODEL_NAME})"
         )
     if not all(x == x and x not in (float("inf"), float("-inf")) for x in vec):
         return "embedding contains non-finite values"
@@ -53,7 +121,7 @@ def _embedding_degradation_reason(probe_vector) -> Optional[str]:
         return (
             f"embedding is not L2-normalised (norm={norm:.2f}); "
             "sentence-transformers fell back to an untrained mean-pooling "
-            "model — the real all-MiniLM-L6-v2 config was not loaded"
+            f"model — the real {EMBED_MODEL_NAME} config was not loaded"
         )
     return None
 
@@ -210,7 +278,7 @@ class VectorMemory:
             try:
                 from chromadb.utils import embedding_functions
                 self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(
-                    model_name="all-MiniLM-L6-v2"
+                    model_name=EMBED_MODEL_NAME
                 )
                 break  # Success, exit the retry loop
             except Exception as e:
@@ -244,17 +312,18 @@ class VectorMemory:
         if _degraded:
             logger.error(
                 "FATAL: embedding model loaded in a DEGRADED state — %s. The "
-                "all-MiniLM-L6-v2 cache is likely missing and the model-"
+                "%s cache is likely missing and the model-"
                 "resolution call was blocked (fail-closed Tor) or failed DNS. "
                 "Fix: pre-cache the model by booting ONCE with "
                 "--no-mandatory-tor, or route Hugging Face through the SOCKS "
                 "proxy (HF_HUB_OFFLINE=0). Refusing to serve wrong embeddings.",
-                _degraded,
+                _degraded, EMBED_MODEL_NAME,
             )
             sys.exit(1)
         pretty_log(
             "Memory System",
-            "Embedder self-check OK (trained MiniLM, 384-d L2-normalised)",
+            f"Embedder self-check OK ({EMBED_MODEL_NAME}, "
+            f"{EXPECTED_EMBED_DIM}-d L2-normalised)",
             icon=Icons.VECTOR_EMBED,
         )
 
@@ -276,7 +345,35 @@ class VectorMemory:
             )
             
             pretty_log("Memory System", f"Initialized [{collection_name}] ({self.collection.count()} items)", icon=Icons.MEM_INDEX)
-            
+
+            # Embedder-fingerprint guard. Swapping the embedding model keeps
+            # the dimension (384) and the norm (1.0) — so NOTHING errors —
+            # while every stored vector silently becomes meaningless under the
+            # new model. Fail LOUD instead (project stance: a stalled agent
+            # beats a silently-wrong one) and point at the migration script.
+            self._embedder_sidecar = self.chroma_dir / EMBEDDER_SIDECAR
+            # Only enforce against a REAL Chroma collection. A MagicMock's
+            # count() coerces to int 1, which would make every mocked-store
+            # test look like a populated legacy store and hard-exit.
+            _is_real = type(self.collection).__module__.startswith("chromadb")
+            try:
+                _count = int(self.collection.count()) if _is_real else 0
+            except Exception:
+                _count = 0
+            _mismatch = _embedder_sidecar_mismatch(
+                self._embedder_sidecar, EMBED_MODEL_NAME, _count) if _is_real else None
+            if _mismatch:
+                logger.error(
+                    "FATAL: embedder/store mismatch — %s. Every stored vector "
+                    "is in the OLD model's space and retrieval would return "
+                    "plausible-looking garbage. Fix: re-embed the store with\n"
+                    "    PYTHONPATH=src python scripts/reembed_memory.py\n"
+                    "(or set GHOST_EMBED_MODEL back to the old model).",
+                    _mismatch,
+                )
+                sys.exit(1)
+            self._stamp_embedder_sidecar()
+
         except Exception as e:
             if "already exists" in str(e) or "Embedding function conflict" in str(e):
                 # An embedding-provider mismatch on an existing collection is
@@ -302,6 +399,36 @@ class VectorMemory:
             else:
                 logger.error(f"CRITICAL DB ERROR: {e}")
                 self.collection = None
+
+    def _stamp_embedder_sidecar(self) -> None:
+        """Record which model embedded this store (see the guard in __init__).
+        Best-effort: a failure here must not stop the agent booting."""
+        try:
+            path = getattr(self, "_embedder_sidecar", None)
+            if path is None:
+                return
+            Path(path).write_text(json.dumps({
+                "model": EMBED_MODEL_NAME,
+                "dim": EXPECTED_EMBED_DIM,
+                "stamped_at": get_utc_timestamp(),
+            }))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("embedder sidecar stamp failed: %s", e)
+
+    def embed_query(self, text: str):
+        """Embed a QUERY (not a passage).
+
+        BGE v1.5 is an asymmetric retriever: queries want a short
+        instruction prefix, passages must be embedded raw. Chroma's
+        ``query_texts=`` path runs the SAME embedding function it uses for
+        documents, so it cannot express that asymmetry — callers that want
+        the prefix must embed here and pass ``query_embeddings=``.
+        Non-BGE models get no prefix (harmless).
+        """
+        q = str(text or "")
+        if EMBED_MODEL_NAME.lower().startswith(("baai/bge", "bge")):
+            q = _BGE_QUERY_INSTRUCTION + q
+        return self.embedding_fn([q])
 
     def _get_lock(self):
         """Return the instance lock, lazily creating one if `__init__` was
@@ -535,30 +662,48 @@ class VectorMemory:
         except Exception as e:
             logger.error(f"Smart Update Error: {e}")
 
-    def ingest_document(self, filename: str, chunks: List[str]):
+    def ingest_document(self, filename: str, chunks: List[str], _batch: bool = False):
+        """Embed and store document chunks under ``type="document"``.
+
+        Two modes:
+
+          * **Whole-document** (default): the legacy single-shot path. The
+            caller hands the ENTIRE chunk list; each chunk is enriched with
+            a ``[Source: filename]`` prefix, and an already-ingested
+            filename is skipped (TOCTOU-safe dedup under the lock).
+
+          * **Batch append** (``_batch=True``): one slice of a streaming
+            ingest (see ``memory.pdf_ingest``). The chunks ALREADY carry
+            their own ``[filename] breadcrumb`` header, so they are NOT
+            re-enriched; the whole-file dedup guard is skipped (the 2nd+
+            batch of the same file must not be refused); and the library
+            index is updated idempotently on every batch (cheap, and it
+            means a mid-ingest crash still leaves the file discoverable /
+            deletable). IDs hash the FULL chunk text (not a per-batch
+            index), so they stay globally unique across batches and stable
+            on re-ingest.
+        """
         try:
-            # Authoritative dedup under the lock — closes the TOCTOU window
-            # between `tool_gain_knowledge`'s outer dedup check and the
-            # actual ingest. Two concurrent calls on the same filename now
-            # see only one of them do the embedding work; the other gets
-            # the no-op success message.
-            with self._get_lock():
-                if filename in self.get_library():
-                    return True, f"Skipped: '{filename}' is already ingested."
+            if not _batch:
+                # Authoritative dedup under the lock — closes the TOCTOU
+                # window between the tool's outer check and the ingest.
+                with self._get_lock():
+                    if filename in self.get_library():
+                        return True, f"Skipped: '{filename}' is already ingested."
+                enriched_chunks = [f"[Source: {filename}]\n{chunk}" for chunk in chunks]
+            else:
+                # Streaming chunks already carry their breadcrumb header.
+                enriched_chunks = list(chunks)
 
-            # ENRICH CHUNKS WITH SOURCE CONTEXT
-            enriched_chunks = [f"[Source: {filename}]\n{chunk}" for chunk in chunks]
-
-            # Chunk ID = MD5 of (filename, index, FULL chunk text). The
-            # previous version hashed only the first 20 chars, which (a)
-            # collided when two chunks shared a prefix and (b) produced
-            # different IDs for the same chunk if chunk_size changed —
-            # leading to silent duplicates on re-ingest.
+            # ID = MD5(filename | FULL chunk text). No per-batch index (that
+            # collided across batches); identical chunks dedup by design.
             ids = [
-                hashlib.md5(f"{filename}|{i}|{chunk}".encode("utf-8")).hexdigest()
-                for i, chunk in enumerate(chunks)
+                hashlib.md5(f"{filename}|{chunk}".encode("utf-8")).hexdigest()
+                for chunk in enriched_chunks
             ]
-            metadatas = [{"timestamp": get_utc_timestamp(), "type": "document", "source": filename} for _ in range(len(chunks))]
+            ts = get_utc_timestamp()
+            metadatas = [{"timestamp": ts, "type": "document", "source": filename}
+                         for _ in range(len(enriched_chunks))]
 
             batch_size = 25
             with self._get_lock():
@@ -568,10 +713,11 @@ class VectorMemory:
                         metadatas=metadatas[i:i + batch_size],
                         ids=ids[i:i + batch_size]
                     )
-                    if i % 10 == 0:
+                    if not _batch and i % 10 == 0:
                         pretty_log("Memory Ingest", f"{filename} ({i+1}/{len(chunks)})", icon=Icons.MEM_INGEST)
                 # Library index update lives INSIDE the lock so two
                 # concurrent ingests can't race on the index file.
+                # _update_library_index is idempotent on "add".
                 self._update_library_index(filename, "add")
             return True, f"Successfully ingested {len(chunks)} chunks from {filename}."
         except Exception as e:
@@ -588,6 +734,33 @@ class VectorMemory:
         uniq = [i for i in dict.fromkeys(ids or []) if i]
         if uniq:
             self._bump_retrieval_stats(uniq)
+
+    def bump_helpful(self, ids: list):
+        """Usefulness credit from the post-turn hydration judge (MemoryBus).
+
+        `bump_retrievals` credits SURFACING (the item entered the prompt);
+        this credits USE (the reply actually drew on it) — the signal that
+        breaks the popularity feedback loop where surfaced items only get
+        more surfaced. helpful_count stretches the spaced-repetition
+        half-life twice as hard as a plain retrieval (see the ranking
+        code's effective_half_life)."""
+        uniq = [i for i in dict.fromkeys(ids or []) if i]
+        if not uniq:
+            return
+        try:
+            with self._get_lock():
+                existing = self.collection.get(ids=uniq, include=["metadatas"])
+                if not existing or not existing['ids']:
+                    return
+                new_metadatas = []
+                for meta in existing['metadatas']:
+                    updated = dict(meta)
+                    updated["helpful_count"] = int(updated.get("helpful_count", 0)) + 1
+                    updated["last_accessed"] = get_utc_timestamp()
+                    new_metadatas.append(updated)
+                self.collection.update(ids=existing['ids'], metadatas=new_metadatas)
+        except Exception as e:
+            logger.debug(f"Helpful stats bump failed (non-critical): {e}")
 
     def search_items(self, query: str, inject_identity: bool = True) -> list:
         """Per-item variant of `search()` for the MemoryBus.
@@ -787,7 +960,13 @@ class VectorMemory:
                         # 5 retrievals → ~54-day half-life
                         # 20 retrievals → ~90-day half-life
                         retrieval_count = int(c['meta'].get('retrieval_count', 0))
-                        effective_half_life = 30.0 * (1.0 + _math.log1p(retrieval_count))
+                        # Judged-useful items (helpful_count, from the post-
+                        # turn hydration judge) weigh double: being USED in a
+                        # reply is a stronger retention signal than merely
+                        # being surfaced into a prompt.
+                        helpful_count = int(c['meta'].get('helpful_count', 0))
+                        effective_half_life = 30.0 * (
+                            1.0 + _math.log1p(retrieval_count + 2 * helpful_count))
                         time_penalty = 0.30 * (1.0 - _math.exp(-age_days / effective_half_life))
                     except Exception:
                         time_penalty = 0.05
@@ -825,6 +1004,79 @@ class VectorMemory:
             except Exception as e:
                 logger.error(f"Search failed: {e}")
                 return []
+
+    def search_document(self, filename: str, question: str, *, k: int = 8,
+                        pool: int = 60) -> list:
+        """Document-SCOPED retrieval — the "ask this manual" path (2026-07-13).
+
+        Distinct from ``search`` / the MemoryBus hydration path in three
+        ways that matter for real document QA:
+
+          * **Scoped.** ``where={"source": filename}`` — only this document's
+            chunks are candidates. The ambient path searches the whole
+            memory soup, so a PostgreSQL question competed with chess
+            memories and skill lessons for a shared 6-12k char budget.
+          * **Deep pool, no priority tiers.** ``pool`` (default 60) candidates
+            from a corpus that may hold thousands of chunks, ranked purely on
+            relevance — the p_score/time-decay machinery is meaningless
+            inside one document (every chunk has the same type and timestamp)
+            and would only add noise.
+          * **No distance gate.** The ambient path drops anything past a
+            per-type threshold; here the user has explicitly asked THIS
+            document, so we always return the best k we have and let the
+            model judge. An empty answer is worse than a weak one it can
+            reject.
+
+        BM25 reranks the pool (exact identifiers — ``wal_level``,
+        ``pg_stat_activity`` — are exactly what embeddings blur), then the
+        top-k are returned newest-first-agnostic, in rank order.
+
+        Returns a list of ``{"text", "id", "score"}``; empty on any failure.
+        """
+        if not (filename or "").strip() or not (question or "").strip():
+            return []
+        try:
+            # Asymmetric embedding: the question gets BGE's query instruction,
+            # the stored passages did not (see embed_query). Falls back to the
+            # plain query_texts path if anything about that fails.
+            q_emb = None
+            try:
+                q_emb = self.embed_query(question)
+            except Exception as ee:  # noqa: BLE001
+                logger.debug("embed_query failed, falling back: %s", ee)
+            with self._get_lock():
+                if q_emb is not None:
+                    res = self.collection.query(
+                        query_embeddings=q_emb,
+                        n_results=max(1, int(pool)),
+                        where={"source": filename},
+                    )
+                else:
+                    res = self.collection.query(
+                        query_texts=[question],
+                        n_results=max(1, int(pool)),
+                        where={"source": filename},
+                    )
+        except Exception as e:
+            logger.warning("search_document(%s) failed: %s", filename, e)
+            return []
+
+        docs = (res.get("documents") or [[]])[0]
+        dists = (res.get("distances") or [[]])[0]
+        ids = (res.get("ids") or [[]])[0]
+        if not docs:
+            return []
+
+        candidates = [
+            {"doc": d, "id": i, "dist": float(dist), "combined_score": float(dist)}
+            for d, i, dist in zip(docs, ids, dists)
+        ]
+        ranked = _cross_encoder_rerank(question, candidates, top_k=max(1, int(k)))
+        return [
+            {"text": c["doc"], "id": c["id"],
+             "score": round(c.get("rerank_score", c["dist"]), 4)}
+            for c in ranked
+        ]
 
     def forget_episode(self, episode_id) -> None:
         """Remove an episode's vector entry by its ``episode_id`` metadata.

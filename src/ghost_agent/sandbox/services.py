@@ -53,8 +53,11 @@ CONTAINER_WORKDIR = "/workspace"
 # 8000/8088: the agent's API / upstream LLM — inside the sandbox these are
 # NOT reachable and standing in for them is the forbidden mock-server
 # pathology (see tools/execute.py's guard). 8080: NetMon on this host
-# (host-network Linux would collide). 9050: Tor (same rationale).
-BLOCKED_PORTS: FrozenSet[int] = frozenset({8000, 8080, 8088, 9050})
+# (host-network Linux would collide). 9050/9051: Tor SOCKS + CONTROL port.
+# 9051 matters for defence-in-depth: a registered service on 9051 lands in
+# active_service_ports, which the browser SSRF allowlist consults — and the
+# browser guard explicitly names 127.0.0.1:9051 (Tor control) as must-block.
+BLOCKED_PORTS: FrozenSet[int] = frozenset({8000, 8080, 8088, 9050, 9051})
 SUGGESTED_PORTS = "8100-8104"
 
 # Operator helpers that put a published sandbox port on the tailnet

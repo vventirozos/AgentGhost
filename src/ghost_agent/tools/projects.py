@@ -12,6 +12,7 @@ Actions:
     artifact_add / event_log / promote_from_context
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -125,6 +126,42 @@ def _ok(payload: Any) -> str:
         return json.dumps(payload, default=str)
     except Exception:
         return str(payload)
+
+
+async def _not_found_with_recall(context, term) -> str:
+    """A `get` miss that tries memory before giving up (§4C routing fix).
+
+    Returns a non-striking `_ok` payload when recall finds related facts —
+    the model should answer FROM them, not retry project lookups; falls
+    back to a plain `_err` with a `recall` redirect when memory is empty
+    or unavailable."""
+    base = f"No tracked project matches {str(term)!r}."
+    vm = getattr(context, "memory_system", None)
+    search = getattr(vm, "search_advanced", None) if vm is not None else None
+    hits = []
+    if callable(search):
+        try:
+            raw = await asyncio.to_thread(search, str(term), 3)
+            for h in raw or []:
+                if not isinstance(h, dict) or not h.get("text"):
+                    continue
+                try:
+                    score = float(h.get("score", 9.0))
+                except (TypeError, ValueError):
+                    continue
+                if score < 1.15:  # tool_recall's MEDIUM-or-better band
+                    hits.append(str(h["text"])[:200])
+        except Exception:
+            hits = []
+    if hits:
+        return _ok({
+            "project": None,
+            "note": base + (" However, MEMORY RECALL found related facts — "
+                            "answer from these instead of giving up:"),
+            "memory_recall": hits[:3],
+        })
+    return _err(base + " If this is a question about a topic rather than a "
+                       "tracked project, use the `recall` tool.")
 
 
 def _no_active_project(store) -> str:
@@ -1366,7 +1403,13 @@ async def tool_manage_projects(
             if rerr:
                 return _err(rerr)                # ambiguous title
             if not rid:
-                return _err(f"project not found: {project_id}")
+                # Recall-fallback on empty lookups (journal §4C routing
+                # variance): "when does project Kestrel ship?" routed here,
+                # got a bare not-found, and the model gave up — while the
+                # answer sat in vector memory at 0.76 relevance. Attach any
+                # memory hits so the model can answer without a second,
+                # unprompted tool hop.
+                return await _not_found_with_recall(context, project_id)
             return _ok(store.get_project(rid))
 
         if act == "switch":

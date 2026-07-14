@@ -216,6 +216,9 @@ def _normalize_lesson(lesson: dict) -> dict:
     # written before the user could push back). Empty string for
     # legacy lessons / lessons with no clear single source.
     out.setdefault("source_trajectory_id", "")
+    # Evidence handles ("ep:12", …) the lesson was generalized from —
+    # see build_lesson. Empty for legacy lessons.
+    out["source_refs"] = [str(r) for r in (out.get("source_refs") or [])][:20]
     return out
 
 
@@ -231,6 +234,7 @@ def build_lesson(
     verified: bool = False,
     source: str = "",
     source_trajectory_id: str = "",
+    source_refs=None,
 ) -> dict:
     """Construct a canonical structured lesson. Callers that only have
     legacy `task/mistake/solution` can pass those as trigger/
@@ -247,6 +251,12 @@ def build_lesson(
     reflection sink) thread the current turn's trajectory id
     through here so the user-correction path can retract poisoned
     lessons — see ``SkillMemory.retract_lessons_from_trajectory``.
+
+    ``source_refs`` is a list of evidence handles the lesson was
+    generalized FROM (e.g. ``["ep:12", "ep:15"]`` for episode ids) —
+    the drill-down provenance that makes an abstraction falsifiable.
+    Capped at 20; kept as a separate field for the same retrieval
+    reasons as ``source``.
     """
     lesson = {
         "timestamp": _now_iso(),
@@ -270,6 +280,7 @@ def build_lesson(
         "last_retrieved_at": "",
         "source": source or "",
         "source_trajectory_id": source_trajectory_id or "",
+        "source_refs": [str(r) for r in (source_refs or [])][:20],
     }
     return lesson
 
@@ -667,6 +678,7 @@ class SkillMemory:
         verified: bool = False,
         source: str = "",
         source_trajectory_id: str = "",
+        source_refs=None,
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
@@ -719,6 +731,12 @@ class SkillMemory:
                                     float(existing.get("confidence") or 0.5),
                                     min(1.0, float(confidence or 0.5) + 0.2),
                                 )
+                            if source_refs:
+                                merged_refs = list(dict.fromkeys(
+                                    [str(r) for r in (existing.get("source_refs") or [])]
+                                    + [str(r) for r in source_refs]
+                                ))[:20]
+                                existing["source_refs"] = merged_refs
                             existing["timestamp"] = _now_iso()
                             playbook[idx] = existing
                             self._save_playbook_unlocked(playbook)
@@ -756,6 +774,12 @@ class SkillMemory:
                                     float(existing.get("confidence") or 0.5),
                                     min(1.0, float(confidence or 0.5) + 0.2),
                                 )
+                            if source_refs:
+                                merged_refs = list(dict.fromkeys(
+                                    [str(r) for r in (existing.get("source_refs") or [])]
+                                    + [str(r) for r in source_refs]
+                                ))[:20]
+                                existing["source_refs"] = merged_refs
                             existing["timestamp"] = _now_iso()
                             playbook[idx] = existing
                             self._save_playbook_unlocked(playbook)
@@ -784,6 +808,7 @@ class SkillMemory:
                 verified=verified,
                 source=source,
                 source_trajectory_id=source_trajectory_id,
+                source_refs=source_refs,
             )
 
             with self._get_lock():
@@ -813,6 +838,9 @@ class SkillMemory:
                     # both stores at once via collection.delete with
                     # a `where` filter on this metadata key.
                     "source_trajectory_id": new_lesson.get("source_trajectory_id", "") or "",
+                    # Evidence handles (e.g. "ep:12,ep:15") so recall hits
+                    # can surface where the lesson was generalized from.
+                    "source_refs": ",".join(new_lesson.get("source_refs") or [])[:400],
                 }
                 memory_system.add(text, meta)
 

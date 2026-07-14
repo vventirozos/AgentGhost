@@ -47,6 +47,11 @@ class Job:
     error: str = ""
     meta: Dict[str, Any] = field(default_factory=dict)
     task: Optional[asyncio.Task] = None   # not serialised
+    # Optional callable(raw_task_result) -> str|None. When set, its return
+    # (if not None) becomes the recorded result instead of str(task.result()).
+    # Used by swarm jobs whose worker returns a bool while the real content
+    # lives in the scratchpad — without this `collect` returned "True".
+    result_resolver: Any = None           # not serialised
 
     @property
     def duration_s(self) -> float:
@@ -105,8 +110,20 @@ class JobRegistry:
                             error=f"{type(exc).__name__}: {exc}")
                 return
             res = task.result()
-            self.finish(job_id, status=STATUS_DONE,
-                        result="" if res is None else str(res))
+            # A job may carry a resolver that maps the raw task result to the
+            # real payload (e.g. a swarm worker returns a bool; the content is
+            # in the scratchpad under output_key). Resolver returning None →
+            # fall back to the raw result.
+            resolved = None
+            job = self.get(job_id)
+            resolver = getattr(job, "result_resolver", None) if job else None
+            if resolver is not None:
+                try:
+                    resolved = resolver(res)
+                except Exception as re:  # noqa: BLE001
+                    logger.debug("job result_resolver failed for %s: %s", job_id, re)
+            final = resolved if resolved is not None else ("" if res is None else str(res))
+            self.finish(job_id, status=STATUS_DONE, result=final)
         except Exception as e:  # noqa: BLE001
             logger.debug("job done-callback failed for %s: %s", job_id, e)
 

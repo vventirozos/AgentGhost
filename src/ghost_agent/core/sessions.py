@@ -39,6 +39,15 @@ MAX_TITLE_CHARS = 80
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ROLES = ("system", "user", "assistant", "tool", "function")
 
+# Search stopwords for the hydration tier (mirrors core.bus._STOPWORDS —
+# high-frequency chat words that would make every conversation "match").
+_SEARCH_STOPWORDS = {
+    "this", "that", "what", "with", "from", "your", "have", "they", "will",
+    "would", "could", "should", "just", "about", "like", "when", "then",
+    "there", "their", "them", "some", "make", "please", "know", "want",
+    "need", "tell", "give", "show",
+}
+
 
 def _now() -> float:
     return time.time()
@@ -135,9 +144,20 @@ def merge_history(stored: List[dict], incoming: List[dict]) -> List[dict]:
 class SessionStore:
     """One JSON file per session. Thread-safe; never raises."""
 
+    # Hydration-tier search bounds: only the most-recently-updated sessions
+    # are indexed (conversation recall is recency-heavy), snippets are
+    # clipped, and one summaries scan is memoized briefly so the 4 RAG-fusion
+    # sub-queries of a single hydration share it instead of re-globbing.
+    _SEARCH_MAX_SESSIONS = 50
+    _SNIPPET_CHARS = 240
+    _LIST_MEMO_TTL = 2.0
+
     def __init__(self, root):
         self.root = Path(root)
         self._lock = threading.Lock()
+        # session_id -> (mtime, messages) for search; bounded below.
+        self._search_cache: Dict[str, tuple] = {}
+        self._list_memo: tuple = (0.0, [])
 
     # -- paths --------------------------------------------------------------
 
@@ -222,6 +242,79 @@ class SessionStore:
         except (TypeError, ValueError):
             limit = 50
         return out[:limit]
+
+    # -- search (hydration tier) ---------------------------------------------
+
+    def _cached_messages(self, session_id: str) -> List[dict]:
+        """A session's messages via an mtime-keyed cache, so repeated
+        hydration scans only re-parse files that actually changed."""
+        path = self._path(session_id)
+        if path is None or not path.exists():
+            return []
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return []
+        cached = self._search_cache.get(session_id)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
+        sess = self.get(session_id)
+        msgs = sess.messages if sess else []
+        with self._lock:
+            self._search_cache[session_id] = (mtime, msgs)
+            while len(self._search_cache) > self._SEARCH_MAX_SESSIONS + 10:
+                self._search_cache.pop(next(iter(self._search_cache)))
+        return msgs
+
+    def search_messages(self, query: str, limit: int = 5) -> List[dict]:
+        """Keyword search over stored conversations — the raw-conversation
+        memory tier (2026-07-14). Sessions were previously replay-only:
+        durable, but unreachable by any retrieval path.
+
+        Token-overlap scoring (sessions are not vector-indexed; embedding
+        400 messages × 200 sessions is not worth it for this tier), scoped
+        to the ``_SEARCH_MAX_SESSIONS`` most-recently-updated sessions.
+        Multi-term queries must match ≥2 distinct terms — a single shared
+        word is noise, not conversation recall. Returns
+        ``[{session_id, title, role, text, score}]`` best-first.
+        Fail-safe: returns [] rather than raising."""
+        try:
+            terms = {w.lower().strip('.,?!;"\'()[]{}')
+                     for w in str(query or "").split()}
+            terms = {w for w in terms if len(w) > 3 and w not in _SEARCH_STOPWORDS}
+            if not terms:
+                return []
+            floor = 2 if len(terms) >= 2 else 1
+
+            now = time.time()
+            expires, summaries = self._list_memo
+            if now >= expires:
+                summaries = self.list(limit=self._SEARCH_MAX_SESSIONS)
+                self._list_memo = (now + self._LIST_MEMO_TTL, summaries)
+
+            hits: List[dict] = []
+            for meta in summaries:
+                for m in self._cached_messages(meta["id"]):
+                    if m.get("role") not in ("user", "assistant"):
+                        continue
+                    content = m.get("content")
+                    if not isinstance(content, str) or len(content) < 8:
+                        continue
+                    lowered = content.lower()
+                    score = sum(1 for t in terms if t in lowered)
+                    if score >= floor:
+                        hits.append({
+                            "session_id": meta["id"],
+                            "title": meta["title"] or "untitled",
+                            "role": m["role"],
+                            "text": content[:self._SNIPPET_CHARS],
+                            "score": score,
+                        })
+            hits.sort(key=lambda h: h["score"], reverse=True)
+            return hits[:max(1, int(limit))]
+        except Exception as e:  # noqa: BLE001 — hydration must never break
+            logger.debug("session search failed: %s", e)
+            return []
 
     # -- turn append --------------------------------------------------------
 

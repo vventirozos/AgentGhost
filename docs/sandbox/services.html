@@ -121,13 +121,26 @@
   <ul>
     <li>Max <strong>5</strong> concurrent services; names
     <code>[A-Za-z][A-Za-z0-9_-]{0,31}</code>.</li>
-    <li><strong>Ports 8000 / 8088 / 8080 / 9050 are refused</strong>
+    <li><strong>Ports 8000 / 8088 / 8080 / 9050 / 9051 are refused</strong>
     (agent API / upstream LLM — the sandbox-loopback blind spot and its
-    mock-server pathology — plus NetMon and Tor on a host-network Linux
-    box), as is any command referencing
+    mock-server pathology — plus NetMon and Tor SOCKS/CONTROL on a
+    host-network Linux box), as is any command referencing
     <code>127.0.0.1:8000/:8088</code>. Suggested ports:
-    <strong>8100-8104</strong>.</li>
+    <strong>8100-8104</strong>. <strong>9051 added 2026-07-14</strong> —
+    a registered service on 9051 would otherwise enter
+    <code>active_service_ports</code>, which the browser SSRF allowlist
+    consults, and the browser guard explicitly names
+    <code>127.0.0.1:9051</code> (Tor control) as must-block.</li>
   </ul>
+  <p class="warn"><strong>Known residual (§4B, 2026-07-14 bug hunt).</strong>
+  <code>is_published_port</code> consults the CONFIGURED port range, not the
+  ports docker <em>actually</em> published. In the ≥2-instance case (a
+  throwaway/ablation agent alongside prod) a second instance publishes nothing
+  yet <code>is_published_port</code> still returns true, so the operator is
+  pointed at <code>127.0.0.1:&lt;port&gt;</code> — which is the FIRST instance's
+  forwarder. Fix direction: persist the actually-published set on the docker
+  manager and consult that. Not yet fixed (needs cross-module plumbing; rare,
+  non-security).</p>
 
   <h2>Reachability</h2>
   <ul>

@@ -1159,6 +1159,25 @@ class Dreamer:
         except Exception as je:
             logger.warning(f"Dream journal drain failed (non-fatal): {je}")
 
+        # --- EPISODIC CONSOLIDATION -------------------------------------
+        # Episodes (trigger → action chain → outcome) are the trajectory-
+        # shaped substrate the fact-shaped auto-fragments aren't (B3
+        # finding). This pass runs BEFORE the REM entropy gate so a thin
+        # auto-memory pool can't starve it, and it closes the loop the
+        # episodes module docstring promised: get_unconsolidated /
+        # mark_consolidated finally have a caller.
+        episode_lessons = 0
+        try:
+            episode_lessons = await self._consolidate_episodes(model_name)
+            if episode_lessons:
+                pretty_log(
+                    "Dream Episodes",
+                    f"Generalized episode batch into {episode_lessons} strategy lessons",
+                    icon=Icons.BRAIN_SUM,
+                )
+        except Exception as ee:
+            logger.debug(f"Episode consolidation skipped: {ee}")
+
         try:
             results = await asyncio.to_thread(
                 self.memory.collection.get,
@@ -1192,6 +1211,8 @@ class Dreamer:
             else:
                 msg = ("Not enough entropy to dream. (Need ≥3 auto-memories "
                        "or ≥3 trajectories to form heuristics)")
+                if episode_lessons:
+                    msg += f" Episodic pass still learned {episode_lessons} strategy lessons."
                 pretty_log("Dream Mode", msg, icon=Icons.DREAM)
                 return msg
 
@@ -1209,6 +1230,8 @@ class Dreamer:
         # the cache when it's a real frozenset.
         if isinstance(last_fragment_key, frozenset) and last_fragment_key == current_fragment_key:
             msg = f"Skipping REM — fragment set unchanged ({len(ids)} memories, no new input since last cycle)."
+            if episode_lessons:
+                msg += f" Episodic pass still learned {episode_lessons} strategy lessons."
             pretty_log("Dream Mode", msg, icon=Icons.SKIP)
             return msg
 
@@ -1311,7 +1334,20 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 # Tag syntheses as "synthesis" rather than "auto" so
                 # subsequent dream cycles don't recursively re-consolidate
                 # their own prior outputs into ever-more-abstract summaries.
-                await asyncio.to_thread(self.memory.add, synthesis, {"type": "synthesis"})
+                # Provenance: the merged source fragments are DELETED right
+                # below, so id + excerpt stored here is the only surviving
+                # evidence a synthesis can be checked against.
+                _prov = []
+                for mid in merged_ids or []:
+                    _cid = str(mid).split(":")[-1].strip()
+                    for doc_id, doc_text in zip(ids, documents):
+                        if doc_id == _cid:
+                            _prov.append({"id": _cid, "excerpt": str(doc_text)[:100]})
+                            break
+                _syn_meta = {"type": "synthesis"}
+                if _prov:
+                    _syn_meta["provenance"] = json.dumps(_prov, ensure_ascii=False)[:1800]
+                await asyncio.to_thread(self.memory.add, synthesis, _syn_meta)
                 applied_consolidations += 1
                 if merged_ids:
                     ids_to_delete = [mid.split(":")[-1].strip() for mid in merged_ids]
@@ -1445,6 +1481,8 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 metrics_note += f" ({macros_proposed} macros proposed)"
             if pruned_count > 0:
                 metrics_note += f" ({pruned_count} low-utility lessons pruned)"
+            if episode_lessons > 0:
+                metrics_note += f" ({episode_lessons} episode strategies learned)"
 
             # Graph forgetting: drop weight-1 stale edges so the only uncapped
             # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced
@@ -1457,6 +1495,29 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                         metrics_note += f" ({_gpruned} stale graph edges forgotten)"
             except Exception as _gpx:
                 logger.debug("graph prune skipped: %s", _gpx)
+
+            # Graph compression: fold near-duplicate entity nodes into one.
+            # execute_graph_compression was hardened for exactly this caller
+            # (temporal merge semantics, 2026-07-07) but stayed unwired until
+            # now. Deterministic candidates; fuzzy pairs additionally need a
+            # worker same-entity confirmation. Best-effort; never fails a
+            # dream, and the self-play ReadOnly wrapper no-ops the merge.
+            try:
+                _gmerged = await self._compress_graph_nodes(model_name)
+                if _gmerged > 0:
+                    metrics_note += f" ({_gmerged} duplicate graph nodes merged)"
+            except Exception as _gcx:
+                logger.debug("graph compression skipped: %s", _gcx)
+
+            # RRF-weight refit from the usefulness ledger: the post-turn
+            # hydration judge appends (intent, source, used) observations;
+            # once enough accumulate, refit the fusion matrix, persist it,
+            # and hot-swap it onto the live bus. Best-effort.
+            try:
+                if await asyncio.to_thread(self._refit_rrf_weights):
+                    metrics_note += " (RRF weights refit from usefulness ledger)"
+            except Exception as _rwx:
+                logger.debug("rrf refit skipped: %s", _rwx)
             # Record the fragment set we just processed so the next REM
             # cycle can short-circuit if no new auto-memories have arrived.
             # Only stored on success — a transient LLM error must not
@@ -1471,6 +1532,256 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             msg = f"Dream error: {e}"
             pretty_log("Dream Mode", msg, level="ERROR", icon=Icons.FAIL)
             return msg
+
+    def _refit_rrf_weights(self, min_observations: int = 30,
+                           max_ledger_lines: int = 5000,
+                           keep_lines: int = 2000) -> bool:
+        """Refit the learned RRF intent→source matrix from real usefulness.
+
+        Reads the observations ledger written by the post-turn hydration
+        judge (``MemoryBus.judge_hydration_usefulness``), fits via
+        ``rrf_weights.fit_intent_weights`` (anchored on the bus's current
+        effective weights; thin cells keep their base), persists to the
+        ``rrf/weights.json`` main.py loads at boot, and hot-swaps the
+        matrix onto the live bus. Trims the ledger when it exceeds
+        ``max_ledger_lines``. Sync (runs in a thread). Returns True when
+        a refit was applied."""
+        bus = getattr(self.context, "memory_bus", None)
+        ledger = getattr(bus, "usefulness_ledger_path", None) if bus else None
+        if not ledger:
+            return False
+        from pathlib import Path as _Path
+        ledger = _Path(ledger)
+        if not ledger.exists():
+            return False
+        try:
+            lines = ledger.read_text(encoding="utf-8").splitlines()
+        except Exception:
+            return False
+        obs = []
+        for line in lines[-max_ledger_lines:]:
+            try:
+                d = json.loads(line)
+                obs.append((str(d["intent"]), str(d["source"]), bool(d["success"])))
+            except Exception:
+                continue
+        if len(obs) < min_observations:
+            return False
+        from .rrf_weights import fit_intent_weights, save_intent_weights
+        from .bus import MemoryBus as _MB
+        base = getattr(bus, "_intent_weights", None) or _MB._INTENT_WEIGHTS
+        fitted = fit_intent_weights(obs, base=base)
+        try:
+            save_intent_weights(ledger.parent / "weights.json", fitted)
+        except Exception as e:
+            logger.debug("rrf weights save failed: %s", e)
+        bus._intent_weights = fitted  # hot swap for the running process
+        # Trim the ledger so it can't grow unboundedly.
+        if len(lines) > max_ledger_lines:
+            try:
+                tmp = ledger.with_suffix(".tmp")
+                tmp.write_text("\n".join(lines[-keep_lines:]) + "\n", encoding="utf-8")
+                import os as _os
+                _os.replace(tmp, ledger)
+            except Exception as e:
+                logger.debug("rrf ledger trim failed: %s", e)
+        return True
+
+    async def _consolidate_episodes(self, model_name: str,
+                                    min_episodes: int = 3,
+                                    max_episodes: int = 40) -> int:
+        """Fold unconsolidated episodes into generalized strategy lessons.
+
+        Episodes are recorded automatically every turn (action→outcome→lesson
+        chains) but until now aged out at the 500-cap without ever being
+        generalized — get_unconsolidated / mark_consolidated had no caller.
+        One worker call generalizes the batch into imperative strategies;
+        each must pass the actionability gate before reaching SkillMemory
+        (source="episode"). The batch is marked consolidated ONLY after a
+        successful worker parse — a transient upstream failure leaves it
+        queued for the next cycle (same contract as the smart-memory
+        requeue fix, journal §4C). Cheap short-circuit below
+        ``min_episodes``, so most cycles cost zero LLM calls.
+        Returns the number of lessons learned."""
+        epi = getattr(self.context, "episodic_memory", None)
+        if epi is None or not hasattr(epi, "get_unconsolidated"):
+            return 0
+        episodes = await asyncio.to_thread(epi.get_unconsolidated, max_episodes)
+        if not isinstance(episodes, list) or len(episodes) < min_episodes:
+            return 0
+
+        lines = []
+        ep_ids = []
+        for ep in episodes:
+            try:
+                ep_id = int(ep["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ep_ids.append(ep_id)
+            full = None
+            try:
+                full = await asyncio.to_thread(epi.get_episode, ep_id)
+            except Exception:
+                pass
+            if not isinstance(full, dict):
+                full = ep
+            chain = " → ".join(
+                f"{a.get('tool_name', '?')}{'' if a.get('success', 1) else '(FAILED)'}"
+                for a in (full.get("actions") or [])[:8]
+            ) or "no tool calls"
+            line = (
+                f"- EP{ep_id} [{ep.get('cluster_id') or 'general'}] "
+                f"TRIGGER: {str(ep.get('trigger', ''))[:120]} | "
+                f"ACTIONS: {chain} | "
+                f"OUTCOME: {'SUCCESS' if ep.get('outcome_success') else 'FAILURE'}"
+                f" — {str(ep.get('outcome', ''))[:100]}"
+            )
+            if ep.get("lesson"):
+                line += f" | LESSON: {str(ep['lesson'])[:100]}"
+            lines.append(line)
+        if not ep_ids:
+            return 0
+
+        prompt = f"""### IDENTITY
+You are the Episodic Consolidation (Dream) Subsystem.
+
+### TASK
+Below are recorded episodes from the agent's recent work: what triggered each,
+the tool-call chain, and how it ended. Extract GENERALIZED STRATEGIES —
+recurring failure→fix patterns or stable winning procedures that would
+transfer to FUTURE similar tasks.
+
+STRATEGY RULES (strict):
+- Imperative voice only: start with a verb ("Always…", "Use…", "Verify…") or a
+  condition followed by a verb ("When X fails, do Y").
+- NO observations, summaries, or profiles. Sentences shaped like "The agent…",
+  "The user…", "The system…" are NOT strategies — if it does not tell the
+  agent to DO something differently next time, omit it.
+- Generalize ACROSS episodes; do not restate a single episode.
+- Fewer, better strategies beat many. If no genuine pattern exists, return an
+  empty list.
+
+### EPISODES
+{chr(10).join(lines)}
+
+### OUTPUT FORMAT
+Return ONLY valid JSON:
+{{"strategies": ["When a sandbox write fails, re-check the publish path before retrying."]}}
+"""
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system", "content": "You are a Memory Optimizer. Output JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.0,
+            "max_tokens": 1024,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            data = await self.context.llm_client.chat_completion(
+                payload, use_worker=True, is_background=True, timeout=180.0,
+                task_label="dream",
+            )
+            result = extract_json_from_text(data["choices"][0]["message"]["content"]) or {}
+        except Exception as ce:
+            # Transient worker failure: leave the batch unmarked so it
+            # retries next cycle instead of being lost invisibly.
+            logger.debug(f"Episode consolidation worker call failed (batch kept queued): {ce}")
+            return 0
+
+        learned = 0
+        for s in result.get("strategies", []) or []:
+            if not s or not _is_actionable_heuristic(s):
+                continue
+            if hasattr(self.context, "skill_memory") and self.context.skill_memory:
+                _task = " ".join(str(s).split())[:80] or "Episode Strategy"
+                await asyncio.to_thread(
+                    self.context.skill_memory.learn_lesson,
+                    _task, "none", s,
+                    memory_system=self.memory,
+                    trigger=_task,
+                    source="episode",
+                    # Drill-down provenance: the episode rows this batch
+                    # generalized from ("ep:<id>" resolves via get_episode).
+                    source_refs=[f"ep:{i}" for i in ep_ids[:20]],
+                )
+                learned += 1
+
+        # A successful parse means the batch was considered — mark it even
+        # when zero strategies survived the gate, otherwise the same rows
+        # re-process every cycle forever.
+        try:
+            await asyncio.to_thread(epi.mark_consolidated, ep_ids)
+        except Exception as me:
+            logger.debug(f"mark_consolidated failed: {me}")
+        return learned
+
+    async def _compress_graph_nodes(self, model_name: str, max_merges: int = 8) -> int:
+        """Dream-time entity dedup: merge near-duplicate graph nodes.
+
+        Candidates come from GraphMemory.propose_merge_candidates (read-only,
+        deterministic). "safe" pairs (punctuation/whitespace variants) are
+        applied directly; "fuzzy" pairs (plurals/typos by string similarity)
+        are applied only when the worker model confirms both names refer to
+        the same entity — similarity alone conflates distinct concepts
+        ("new"/"news"). Capped at ``max_merges`` per cycle so one bad batch
+        can't rewrite the whole graph. Returns the number of merges applied."""
+        graph = getattr(self.context, "graph_memory", None)
+        if graph is None or not hasattr(graph, "propose_merge_candidates"):
+            return 0
+        candidates = await asyncio.to_thread(graph.propose_merge_candidates)
+        if not candidates:
+            return 0
+        merges = [
+            {"old_node": c["old_node"], "new_node": c["new_node"]}
+            for c in candidates if c.get("kind") == "safe"
+        ]
+        fuzzy = [c for c in candidates if c.get("kind") == "fuzzy"]
+        llm = getattr(self.context, "llm_client", None)
+        if fuzzy and llm is not None:
+            pair_lines = "\n".join(
+                f"{i + 1}. \"{c['old_node']}\" vs \"{c['new_node']}\""
+                for i, c in enumerate(fuzzy)
+            )
+            prompt = (
+                "You maintain a knowledge graph of entities. For each candidate "
+                "pair below, decide whether BOTH names refer to the same "
+                "real-world entity (spelling / plural / punctuation variants of "
+                "one thing). Distinct concepts must NOT be merged; when unsure, "
+                "exclude the pair.\n\n"
+                f"{pair_lines}\n\n"
+                'Return ONLY JSON: {"same_entity": [<pair numbers>]}'
+            )
+            payload = {
+                "model": model_name,
+                "messages": [
+                    {"role": "system", "content": "You are a precise data curator. Output JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 256,
+                "response_format": {"type": "json_object"},
+            }
+            try:
+                data = await llm.chat_completion(
+                    payload, use_worker=True, is_background=True, timeout=60.0,
+                    task_label="dream",
+                )
+                result = extract_json_from_text(data["choices"][0]["message"]["content"]) or {}
+                for num in result.get("same_entity", []) or []:
+                    idx = int(num) - 1
+                    if 0 <= idx < len(fuzzy):
+                        merges.append({
+                            "old_node": fuzzy[idx]["old_node"],
+                            "new_node": fuzzy[idx]["new_node"],
+                        })
+            except Exception as ce:
+                logger.debug(f"Graph merge confirmation failed (fuzzy pairs skipped): {ce}")
+        if not merges:
+            return 0
+        applied = await asyncio.to_thread(graph.execute_graph_compression, merges[:max_merges])
+        return int(applied or 0)
 
     def _fallback_trajectory_collector(self):
         """Best-effort READ-ONLY collector at the canonical on-disk trajectory

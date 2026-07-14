@@ -63,9 +63,12 @@
   "helpful_retrievals":  int,
   "last_retrieved_at":   "ISO",
   "source":              str,
+  "source_trajectory_id": str,
+  "source_refs":         list[str] (max 20),
   "frequency":           int,
   "graduated":           bool
 }</code></pre>
+  <p><strong>source_refs (2026-07-14):</strong> evidence handles the lesson was generalized FROM — e.g. <code>["ep:12", "ep:15"]</code> for the episode rows behind a dream episode-strategy. Unioned (deduped, capped 20) when a duplicate lesson is merged/reinforced; mirrored onto the vector twin as a comma-joined <code>source_refs</code> metadata string so <code>tool_recall</code> hits can print an <code>EVIDENCE REFS:</code> line. Distinct from <code>source</code> (free-form origin tag) and <code>source_trajectory_id</code> (retraction key). Tests: <code>tests/test_memory_provenance.py</code>.</p>
 
   <h2>Retention &amp; eviction</h2>
   <p><code>PLAYBOOK_MAX = 50</code>. Trim policy:</p>

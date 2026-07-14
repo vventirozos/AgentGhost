@@ -75,7 +75,7 @@
       <tr><td><code>get_episode(id)</code></td><td>Full episode + actions.</td></tr>
       <tr><td><code>get_recent_episodes(limit)</code></td><td>Most recent episodes (no actions).</td></tr>
       <tr><td><code>get_episodes_by_cluster(cluster_id, limit)</code></td><td>Cluster-grouped.</td></tr>
-      <tr><td><code>mark_consolidated(ids)</code> / <code>get_unconsolidated(limit)</code></td><td>Dream-cycle markers.</td></tr>
+      <tr><td><code>mark_consolidated(ids)</code> / <code>get_unconsolidated(limit)</code></td><td>Dream-cycle markers. <strong>Wired live 2026-07-14:</strong> called by <code>Dreamer._consolidate_episodes</code> — see the <a href="../core/dream.html">dream doc</a>. Previously no caller existed, so episodes aged out at the 500-cap without ever being generalized.</td></tr>
       <tr><td><code>format_episode(ep) -&gt; str</code></td><td>Render ONE episode as a compact line. Extracted 2026-07-07 so the MemoryBus can emit one RRF item per episode; <code>format_for_context</code> is built from it, so the blob and per-item renderings can't drift.</td></tr>
       <tr><td><code>format_for_context(episodes, max_chars)</code></td><td>LLM-injection blob (kept for legacy callers).</td></tr>
       <tr><td><code>count()</code></td><td>Total episodes.</td></tr>

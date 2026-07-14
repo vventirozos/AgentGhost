@@ -84,11 +84,31 @@
     auto-macros or reflected on as if they were user work.</li>
     <li>Memory stores wrapped <strong>read-only</strong>
     (<a href="../memory/readonly.html">memory.readonly</a>) and
-    <code>memory_bus = None</code> so the bus rebuilds over the wrapped stores —
-    a delegate researches; it does not rewrite the operator's memory.</li>
+    <code>memory_bus = None</code> — a delegate has no hydration bus at all, so
+    a stray publish can't reach the production stores; a delegate researches, it
+    does not rewrite the operator's memory.</li>
     <li>The LLM client is forced to <strong>background mode</strong>, so a
     delegated job can never starve a live user turn of the single upstream slot.</li>
   </ul>
+  <p class="warn"><strong>Containment hardening (2026-07-14 bug hunt).</strong>
+  Two escapes made the isolation above nominal-only and are now closed:
+  <strong>(1) tool surface</strong> — the old code filtered only the dispatch
+  DICT and left <code>_subagent_allowed_tools</code> unused, so the SCHEMA the
+  model saw was the full registry (it was shown <code>delegate</code>/
+  <code>jobs</code>/<code>manage_*</code> and invited to call them), and a
+  dispatch miss <em>healed</em> the dict back to the full registry. Fixed:
+  <code>run_subagent</code> sets <code>disabled_tools</code> = advertised −
+  allowlist (filters the schema AND blocks dispatch by name), and
+  <code>GhostAgent._rebuild_available_tools</code> re-narrows to the allowlist on
+  every miss. <strong>(2) read-only memory</strong> — the old
+  <code>readonly.py</code> no-op'd GUESSED method names that don't exist on the
+  stores, while the real mutators (<code>add</code>, <code>ingest_document</code>,
+  <code>add_triplets</code>, <code>delete_by_target</code>,
+  <code>remove_by_trigger</code> …) and the raw <code>.real</code>/
+  <code>.collection</code> handles passed straight through. Rewritten as a
+  default-allow-reads / explicit-deny-writes proxy pinned to the real method
+  names, with a test that fails if a store grows an unblocked writer. Tests:
+  <code>test_subagent_containment.py</code>, <code>test_readonly_memory.py</code>.</p>
   <p><strong>Rails.</strong> <code>FORBIDDEN_TOOLS</code> is absolute — a
   sub-agent can never delegate (no recursive fan-out), schedule
   (<code>manage_tasks</code>), run daemons (<code>manage_services</code>), mutate
@@ -112,6 +132,14 @@
   Tasks are spawned via <code>spawn_bg</code> — the codebase's one
   fire-and-forget primitive (strong ref + contextvar propagation + exception
   logging), never a bare <code>create_task</code>.</p>
+  <p class="warn"><strong>Swarm result surfacing (2026-07-14 bug hunt).</strong>
+  A swarm worker returns a <em>bool</em> while its real output lands in the
+  scratchpad, so <code>jobs(action='collect')</code> on a swarm job returned
+  <code>"True"</code>. <code>Job</code> gained an optional
+  <code>result_resolver</code> that maps the raw task result to the real payload;
+  <code>delegate_to_swarm</code> wires it to read the scratchpad
+  <code>output_key</code>, so collect now returns the content (or the failure
+  ALERT). Test: <code>test_bughunt_20260714.py</code>.</p>
 
   <h2>Why this matters beyond convenience</h2>
   <p>It is the fix for the deepest finding of the ablation program: "recalled

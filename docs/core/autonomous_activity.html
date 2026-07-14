@@ -91,7 +91,18 @@
     ship its final response with <code>notify_operator</code> never called,
     injects ONE steer toward the call (never against a force-finalising
     loop-breaker; one-shot per request). Tests:
-    <code>tests/test_notify_finish_guard.py</code>.</li>
+    <code>tests/test_notify_finish_guard.py</code>.
+    <br><strong>Bug hunt (2026-07-14):</strong> (a) the 12/hour rate limit
+    consumed a slot in <code>_rate_limited()</code> BEFORE the record was
+    written, so a failed write still burned budget — split into a check
+    (<code>_rate_limited</code>) and a commit (<code>_note_sent</code>, called
+    only after a successful write); (b) push egress classification
+    (<code>utils/notify.py</code> <code>url_needs_tor</code>) diverged from the
+    egress guard's LAN-suffix list — a <code>.home</code>/<code>.arpa</code>
+    target was called "direct" here but BLOCKED at the socket under
+    <code>--mandatory-tor</code>, silently dropping the push. Now both share the
+    guard's constants; (c) the fire-and-forget <code>send_soon</code> task is
+    retained (asyncio holds only a weak ref → possible GC-drop mid-push).</li>
   </ul>
 
   <h2>Consumers</h2>
@@ -140,7 +151,14 @@
     that carries a watermark (still after delivery, so at-least-once holds) and
     logs <code>delivered N notification(s)</code> so a silent pipeline is
     diagnosable. Backlog proof at fix time: 4 stranded records (2 days) arrived
-    in one DM.</li>
+    in one DM.
+    <br><strong>Ack clamp (2026-07-14 bug hunt).</strong> The wedge above had a
+    twin on the CLIENT side: <code>/ack</code> stored the posted watermark
+    verbatim, so a value past EOF (client bug, or a stale large value replayed
+    after a ledger truncation) permanently wedged the consumer — every
+    <code>/pending</code> then returned nothing and re-echoed the huge watermark,
+    so no future record was ever served. Ack now clamps to
+    <code>[0, current_offset()]</code>.</li>
   </ol>
 
   <h2>Internal-request gate</h2>

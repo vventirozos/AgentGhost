@@ -211,6 +211,12 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
                     "swarm", t_instruction or t_output_key,
                     output_key=t_output_key, swarm_id=task_id,
                 )
+                # The worker returns a bool; the real output (or the failure
+                # ALERT) is in the scratchpad under output_key. Resolve the
+                # job result from there so `jobs(action='collect')` returns
+                # the content instead of "True"/"False".
+                _job.result_resolver = (
+                    lambda _res, _sp=scratchpad, _k=t_output_key: _sp.get(_k))
                 _jreg.attach(_job.id, task)
         except Exception as _jx:  # noqa: BLE001
             logger.debug("swarm job registration skipped: %s", _jx)

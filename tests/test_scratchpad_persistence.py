@@ -8,6 +8,7 @@ Verifies that:
 """
 
 import pytest
+import sqlite3
 import time
 from pathlib import Path
 from ghost_agent.memory.scratchpad import Scratchpad
@@ -101,6 +102,52 @@ class TestPersistentScratchpad:
         persistent_scratchpad.set("a", 1)
         persistent_scratchpad.set("b", 2)
         assert persistent_scratchpad.count() == 2
+
+
+class TestConnectionHygiene:
+    def test_connections_closed_after_operations(self, tmp_path, monkeypatch):
+        """Every sqlite connection must be closed after its operation.
+
+        `with sqlite3.connect(...)` only wraps the *transaction* — it never
+        closes the connection — so each persistence helper wraps the connect
+        in contextlib.closing (§4B "scratchpad connections not closed").
+        """
+        import ghost_agent.memory.scratchpad as sp_mod
+        opened = []
+        real_connect = sp_mod.sqlite3.connect
+
+        def tracking_connect(*a, **kw):
+            conn = real_connect(*a, **kw)
+            opened.append(conn)
+            return conn
+
+        monkeypatch.setattr(sp_mod.sqlite3, "connect", tracking_connect)
+        sp = Scratchpad(max_entries=5, persist_path=tmp_path / "scratchpad.db")
+        sp.set("k", "v")
+        sp.get("k")
+        sp.delete("k")
+        sp.clear()
+
+        assert opened, "expected sqlite connections to be opened"
+        for conn in opened:
+            with pytest.raises(sqlite3.ProgrammingError):
+                conn.execute("SELECT 1")
+
+
+class TestCorruptDbFallback:
+    def test_corrupt_db_falls_back_to_memory(self, tmp_path):
+        """A corrupt scratchpad.db must not crash construction.
+
+        The scratchpad is built during prod boot; an unguarded raise here
+        would put the launchd KeepAlive supervisor into a respawn loop.
+        """
+        db_path = tmp_path / "scratchpad.db"
+        db_path.write_bytes(b"this is not a sqlite database " * 20)
+
+        sp = Scratchpad(max_entries=5, persist_path=db_path)  # must not raise
+        assert sp.persist_path is None  # degraded to in-memory
+        sp.set("k", "v")
+        assert sp.get("k") == "v"
 
 
 class TestMemoryOnlyScratchpad:

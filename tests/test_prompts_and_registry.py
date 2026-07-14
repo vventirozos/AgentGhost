@@ -150,12 +150,23 @@ def test_tool_schemas_and_properties():
     assert ms_props["skill_name"]["type"] == "string"
 
 def test_system_prompt_rag_routing():
-    """Verify that SYSTEM_PROMPT explicitly routes document questions to recall tool"""
+    """Document questions must route to the DOC-SCOPED query action, not to
+    `recall` (2026-07-13). `recall` searches ALL memory and returns ~12
+    fragments from the whole store under a shared budget — useless against a
+    3,000-page manual. `knowledge_base(action="query", filename=...)` searches
+    ONE document, returns more passages, and carries section breadcrumbs."""
     assert "KNOWLEDGE & RAG" in SYSTEM_PROMPT
-    
+    assert 'knowledge_base(action="query"' in SYSTEM_PROMPT
+    assert "breadcrumb" in SYSTEM_PROMPT.lower()
+
+    kb_tool = next(t for t in TOOL_DEFINITIONS
+                   if t["function"]["name"] == "knowledge_base")
+    assert "query" in kb_tool["function"]["parameters"]["properties"]["action"]["enum"]
+
+    # `recall` must actively STEER document questions to the scoped tool
+    # rather than claiming them.
     recall_tool = next(t for t in TOOL_DEFINITIONS if t["function"]["name"] == "recall")
-    assert "INGESTED DOCUMENTS" in recall_tool["function"]["description"]
-    assert "ALWAYS use this FIRST" in recall_tool["function"]["description"]
+    assert "knowledge_base(action='query'" in recall_tool["function"]["description"]
 
 def test_system_prompt_parallel_execution():
     """Verify that QWEN_TOOL_PROMPT explicitly permits and documents parallel tool execution usage."""

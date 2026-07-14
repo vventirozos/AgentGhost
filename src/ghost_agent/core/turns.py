@@ -87,8 +87,9 @@ class TurnRegistry:
 
     def register(self, req_id: str, *, preview: str = "",
                  session_id: str = "") -> ActiveTurn:
+        base = str(req_id)
         turn = ActiveTurn(
-            req_id=str(req_id),
+            req_id=base,
             preview=" ".join(str(preview or "").split())[:120],
             session_id=str(session_id or ""),
         )
@@ -97,11 +98,32 @@ class TurnRegistry:
         except RuntimeError:
             turn.task = None
         with self._lock:
-            self._turns[turn.req_id] = turn
+            key = base
+            if key in self._turns:
+                # Collision. req_id can be a CLIENT-supplied X-Request-ID
+                # (routes.py reads the header), so two overlapping requests
+                # can carry the same id. Overwriting the live entry made
+                # /api/turns hide the first turn and made cancel/unregister
+                # hit the WRONG one (cancelling B killed running A). Never
+                # clobber a live entry — uniquify the new turn's key instead.
+                n = 2
+                while f"{base}#{n}" in self._turns:
+                    n += 1
+                key = f"{base}#{n}"
+                turn.req_id = key
+            self._turns[key] = turn
         return turn
 
-    def unregister(self, req_id: str) -> None:
+    def unregister(self, req_id: str, turn: Optional["ActiveTurn"] = None) -> None:
+        """Remove a turn. When ``turn`` is given the pop is IDENTITY-CHECKED —
+        a turn's ``finally`` must not evict a different turn that happens to
+        share the key (see register's collision handling)."""
         with self._lock:
+            cur = self._turns.get(str(req_id))
+            if cur is None:
+                return
+            if turn is not None and cur is not turn:
+                return
             self._turns.pop(str(req_id), None)
 
     def mark_running(self, req_id: str) -> None:

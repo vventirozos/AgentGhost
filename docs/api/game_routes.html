@@ -85,6 +85,9 @@
   <h3>tictactoe (<code>games/tictactoe.py</code>)</h3>
   <p>A small, dependency-free second game that proves the endpoint is genuinely game-agnostic. State is nine cells in reading order (<code>X</code>/<code>O</code>/<code>.</code>) plus the side to move, e.g. <code>"......... X"</code>. Cells are numbered 1-9 in reading order (top-left = 1); a move is that number (<code>a1</code>..<code>c3</code> coordinates also accepted). Wins are the eight lines; a full board with no line is a draw. Impossible positions (counts off by more than one, since X moves first) are rejected with 422.</p>
 
+  <h2>Bug hunt (2026-07-14)</h2>
+  <p><code>extract_move_text</code> crashed with an <code>IndexError</code> (→ HTTP 500) on a whitespace-only LLM reply: the guard was <code>if reply</code> (a non-empty all-whitespace string is truthy) but <code>"".strip().splitlines()</code> is <code>[]</code>, so <code>[-1]</code> raised — and the call sits outside the route's try/except. Fixed to guard the empty-after-strip case, so a blank reply takes the retry / 502-no-legal-move path instead of 500. Test: <code>tests/test_bughunt_20260714.py</code>. (Also logged as §4C residuals: tic-tac-toe <code>load</code> accepts turn/parity-impossible boards, and <code>_invoke_template</code>'s broad <code>TypeError</code> catch can mask a template-body error — both SUSPECTED-LOW, client-owned/pure.)</p>
+
   <h2>Tests</h2>
   <p>Chess rules: <code>tests/test_game_move_api.py</code>. Game dispatch, tic-tac-toe, and the adapter registry: <code>tests/test_game_adapters.py</code>.</p>
 

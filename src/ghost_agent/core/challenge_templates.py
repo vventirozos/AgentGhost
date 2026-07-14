@@ -717,7 +717,12 @@ for product, amount in conn.execute("SELECT product, amount FROM sales WHERE amo
     totals[product] += amount
 conn.close()
 
-expected = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))
+# Sort tiebreak on the DISPLAYED 2-decimal value (round), not the raw float:
+# the solver uses SQL SUM() while this expects Python's sequential float
+# accumulation — two products whose printed `{t:.2f}` totals tie could order
+# oppositely on last-ULP noise, wrongly FAILing a correct
+# `ORDER BY SUM(amount) DESC, product ASC` (matches the data_analysis template's fix).
+expected = sorted(totals.items(), key=lambda kv: (-round(kv[1], 2), kv[0]))
 expected_lines = [f"{p}: {t:.2f}" for p, t in expected]
 
 result = subprocess.run(
@@ -1546,7 +1551,13 @@ def _concurrency_cancel_losers() -> ChallengeTriple:
     # cancel signal the only way to finish in < WALL_CLOCK_MAX.
     winner_sleep_ms = 200
     loser_sleep_ms = 1500
-    wall_clock_max_s = 2.0
+    # Budget MUST sit BETWEEN winner and (parallel) loser sleep. The losers
+    # sleep concurrently, so a naive "wait for all, never cancel" solution
+    # finishes in ~1.5s (max, not sum) — under a 2.0s budget it PASSED, so the
+    # gate rewarded non-cancelling code and the "cooperative cancel" training
+    # signal was silently corrupted. At 1.0s: wait-for-all (~1.5s) is rejected
+    # while a correct cancelling solution (~200ms + startup) has clear margin.
+    wall_clock_max_s = 1.0
 
     challenge_prompt = f"""You are building a concurrent "winner takes all" system.
 

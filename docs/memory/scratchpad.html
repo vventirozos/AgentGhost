@@ -33,6 +33,9 @@
   <ul>
     <li>OrderedDict in process memory (LRU).</li>
     <li>Optional SQLite at <code>persist_path/scratchpad.db</code> with table <code>scratchpad(key PK, value JSON, created_at REAL, accessed_at REAL)</code>.</li>
+    <li><strong>Prod is persistent since 2026-07-14</strong>: <code>main()</code> builds the context scratchpad with <code>persist_path=$GHOST_HOME/system/memory/scratchpad.db</code>, so working state (incl. the <code>__current_project__</code> resume sentinel) survives the plain-<code>kill</code> deploy path. <code>--no-memory</code> keeps it purely in-memory; self-play isolation contexts (<code>core/dream.py</code>) still build ephemeral <code>Scratchpad()</code>s.</li>
+    <li>A corrupt/unreadable DB at construction degrades to in-memory with a warning instead of raising (an unguarded raise at boot would respawn-loop the launchd supervisor).</li>
+    <li>Every SQLite connection is wrapped in <code>contextlib.closing</code> — <code>with sqlite3.connect(...)</code> alone only scopes the transaction, never closes the handle.</li>
   </ul>
 
   <h2>API</h2>

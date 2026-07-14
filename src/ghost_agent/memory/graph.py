@@ -320,6 +320,69 @@ class GraphMemory:
                 )
                 return [dict(row) for row in cursor.fetchall()]
 
+    def propose_merge_candidates(self, max_candidates: int = 12,
+                                 neighbor_window: int = 5,
+                                 fuzzy_cutoff: float = 0.90) -> List[Dict[str, str]]:
+        """Deterministic near-duplicate node pairs for dream-time compression.
+
+        Two tiers, distinguished by ``kind``:
+
+        - ``"safe"`` — names identical after stripping punctuation/whitespace
+          ("new-york" vs "new york"): mergeable without confirmation.
+        - ``"fuzzy"`` — high-similarity lexicographic neighbors (plural forms,
+          trailing typos): the caller must get an LLM same-entity confirmation
+          before merging — string similarity alone conflates distinct entities
+          ("new"/"news").
+
+        Fuzzy comparison is bounded to each node's ``neighbor_window`` sorted
+        neighbors (near-duplicates share prefixes) so the pass stays
+        ~O(n log n) on the only uncapped memory tier. Canonical direction: the
+        higher-degree node survives as ``new_node`` (ties: the longer name).
+        Read-only — the merge policy lives in core/dream.py."""
+        import re
+
+        def _norm(name: str) -> str:
+            return re.sub(r"[\s\-_./'\"]+", "", name)
+
+        with self._lock:
+            nodes = [n for n in self._nodes_snapshot()
+                     if isinstance(n, str) and len(n) > 2 and not n.isdigit()]
+            deg = {n: self.nx_graph.degree(n) for n in nodes}
+
+        out: List[Dict[str, str]] = []
+        seen: set = set()
+
+        def _add(a: str, b: str, kind: str):
+            key = tuple(sorted((a, b)))
+            if key in seen:
+                return
+            seen.add(key)
+            # Higher-degree node survives; tie broken toward the longer name.
+            if (deg.get(a, 0), len(a)) >= (deg.get(b, 0), len(b)):
+                old, new = b, a
+            else:
+                old, new = a, b
+            out.append({"old_node": old, "new_node": new, "kind": kind})
+
+        by_norm: Dict[str, List[str]] = {}
+        for n in nodes:
+            by_norm.setdefault(_norm(n), []).append(n)
+        for variants in by_norm.values():
+            for other in variants[1:]:
+                _add(variants[0], other, "safe")
+
+        ordered = sorted(nodes)
+        for i, a in enumerate(ordered):
+            if len(out) >= max_candidates:
+                break
+            for b in ordered[i + 1:i + 1 + neighbor_window]:
+                if _norm(a) == _norm(b):
+                    continue  # tier-1 pair (or already merged direction)
+                if difflib.SequenceMatcher(None, a, b).ratio() >= fuzzy_cutoff:
+                    _add(a, b, "fuzzy")
+
+        return out[:max_candidates]
+
     def execute_graph_compression(self, merges: List[Dict[str, str]]) -> int:
         ops = 0
         with self._lock:

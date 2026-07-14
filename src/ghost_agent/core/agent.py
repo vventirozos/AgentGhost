@@ -1813,6 +1813,20 @@ class FinalizeState:
 
 
 class GhostAgent:
+    def _rebuild_available_tools(self):
+        """Rebuild the dispatch dict from the registry after a lookup miss
+        (models hallucinate tool-name variants). CONTAINMENT: a restricted
+        sub-agent sets ``context._subagent_allowed_tools``; the rebuild MUST
+        re-narrow to that allowlist, otherwise a dispatch miss heals the dict
+        back to the full registry and a delegate reaches
+        delegate/jobs/manage_* despite the allowlist (2026-07-14 bug hunt)."""
+        rebuilt = get_available_tools(self.context)
+        _allow = getattr(self.context, "_subagent_allowed_tools", None)
+        if _allow is not None:
+            rebuilt = {k: v for k, v in rebuilt.items() if k in _allow}
+        self.available_tools = rebuilt
+        return self.available_tools
+
     def __init__(self, context: GhostContext):
         self.context = context
         self.disabled_tools = set()
@@ -6107,7 +6121,7 @@ class GhostAgent:
                         target_path = str(t_args.get("path", "")).lower()
 
                 if fname not in self.available_tools:
-                    self.available_tools = get_available_tools(self.context)
+                    self._rebuild_available_tools()
 
                 # --- TOOL NAME CANONICALIZATION ---
                 # Qwen 3.5 (and other models) hallucinates tool name
@@ -7586,6 +7600,9 @@ class GhostAgent:
 
                     await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': list(tools_run_this_turn), 'ai': final_ai_content, 'model': model})
                     await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)
+        # Post-turn hydration usefulness judge (fire-and-forget, worker-
+        # hosted): scores which injected memories the reply actually used.
+        self._judge_hydration_safe(final_ai_content)
 
         # Retrieval feedback: a clean, non-failing turn credits
         # any lesson surfaced in the last ~5min. Hoisted out of
@@ -8143,6 +8160,10 @@ class GhostAgent:
             if isinstance(body.get("messages"), list) else "",
             session_id=str(body.get("session_id") or ""),
         )
+        # register() may uniquify the key on a client-req-id collision — adopt
+        # the effective id so mark_running / is_cancelled / unregister all
+        # address THIS turn's entry, not the colliding one.
+        req_id = _active_turn.req_id
 
         try:
             async with self.agent_semaphore:
@@ -10236,6 +10257,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                         await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
                                     await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
 
+                            # Post-turn hydration usefulness judge (fire-and-
+                            # forget, worker-hosted) — every finalized turn,
+                            # matching the non-streaming site.
+                            self._judge_hydration_safe(full_content)
+
                             # Retrieval feedback loop: credit lessons that
                             # were surfaced during this turn whenever the
                             # turn finished without an execution failure.
@@ -11346,7 +11372,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             return _content, int(datetime.datetime.now().timestamp()), req_id
 
         finally:
-            _turn_reg.unregister(req_id)
+            # Identity-checked: only evict OUR entry (req_id may collide with
+            # a concurrent turn's client-supplied id — see TurnRegistry).
+            _turn_reg.unregister(req_id, _active_turn)
             if 'messages' in locals(): del messages
             if 'tools_run_this_turn' in locals(): del tools_run_this_turn
             if 'sandbox_state' in locals(): del sandbox_state
@@ -11893,6 +11921,32 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as exc:
             logger.warning("journal append('%s') failed: %s: %s",
                            kind, type(exc).__name__, exc)
+
+    def _judge_hydration_safe(self, ai_text) -> None:
+        """Fire-and-forget post-turn hydration usefulness judge.
+
+        Consumes MemoryBus.last_hydration (set when this turn was hydrated)
+        and spawns judge_hydration_usefulness on the worker, off the
+        critical path — see core/bus.py for what it credits. No-op when
+        the turn wasn't hydrated. Never raises."""
+        bus = getattr(self.context, "memory_bus", None)
+        if bus is None or not getattr(bus, "last_hydration", None):
+            return
+        judge = getattr(bus, "judge_hydration_usefulness", None)
+        if not callable(judge):
+            return
+        try:
+            from ..utils.logging import spawn_bg
+            spawn_bg(
+                judge(
+                    str(ai_text or ""),
+                    getattr(self.context, "llm_client", None),
+                    getattr(getattr(self.context, "args", None), "model", "default") or "default",
+                ),
+                name="hydration-judge",
+            )
+        except Exception as e:
+            logger.debug(f"hydration judge spawn skipped: {e}")
 
     async def _record_episode_safe(self, user_text, tools, ai_text) -> None:
         """Best-effort episodic-memory write for a completed significant turn.

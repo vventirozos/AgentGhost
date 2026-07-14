@@ -414,11 +414,11 @@ async def lifespan(app):
         pretty_log("Project Store Failed", str(e), level="WARNING", icon=Icons.WARN)
         context.project_store = None
 
-    # NOTE: cross-restart resume of `current_project_id` requires the
-    # scratchpad to be constructed with `persist_path=...` (it currently
-    # isn't — see line where `Scratchpad()` is built). When that flips
-    # to persistent, the sentinel `__current_project__` written by
-    # `tools.projects._set_current` will rehydrate automatically.
+    # NOTE: the scratchpad is persistent in prod (see `main()` — built
+    # with `persist_path=memory_dir / "scratchpad.db"` unless
+    # --no-memory), so the sentinel `__current_project__` written by
+    # `tools.projects._set_current` rehydrates automatically across
+    # restarts.
 
     # --no-memory is a user-facing promise that NOTHING will be written to
     # any persistent memory store for this session. The previous version
@@ -676,7 +676,19 @@ async def lifespan(app):
         skill_memory=getattr(context, 'skill_memory', None),
         profile_memory=getattr(context, 'profile_memory', None),
         episodic_memory=getattr(context, 'episodic_memory', None),
+        # Raw-conversation tier: stored sessions become retrievable
+        # (previously replay-only). Sessions are an API-layer feature and
+        # exist even under --no-memory; this only READS what the chat
+        # route already persists.
+        session_store=getattr(context, 'session_store', None),
         intent_weights=_learned_rrf,
+        # Post-turn usefulness observations land here; the dream cycle's
+        # RRF refit consumes them and writes ../rrf/weights.json (the file
+        # loaded above on the next boot — plus a hot swap in-process).
+        usefulness_ledger_path=(
+            Path(str(context.memory_dir)).parent / "rrf" / "observations.jsonl"
+            if getattr(context, "memory_dir", None) is not None else None
+        ),
     )
     pretty_log("Memory Bus", "Cognitive event bus initialized", icon=Icons.EVENT_BUS)
 
@@ -1715,7 +1727,6 @@ def main():
         print("🎯 Frontier Self-Play: disabled (--no-frontier-selfplay)")
 
     context = GhostContext(args, sandbox_dir, memory_dir, tor_proxy)
-    context.scratchpad = Scratchpad()
     if args.no_memory:
         # --no-memory promises NOTHING is written to any persistent memory
         # store (the lifespan gate covers profile/graph/vector). These three
@@ -1724,12 +1735,19 @@ def main():
         # and the reflection sink keeps appending lessons. They have no
         # disable flag and are dereferenced un-guarded across the codebase,
         # so back them with a session-scoped throwaway dir instead of None.
+        # The scratchpad likewise stays purely in-memory here.
         import tempfile
         _ephemeral_dir = Path(tempfile.mkdtemp(prefix="ghost_no_memory_"))
+        context.scratchpad = Scratchpad()
         context.journal = MemoryJournal(_ephemeral_dir)
         context.skill_memory = SkillMemory(_ephemeral_dir)
         context.frontier_tracker = FrontierTracker(_ephemeral_dir)
     else:
+        # Persistent scratchpad: deploys are a plain `kill` under the
+        # launchd KeepAlive supervisor, so without persistence every
+        # deploy silently wiped working state (incl. the
+        # `__current_project__` resume sentinel).
+        context.scratchpad = Scratchpad(persist_path=memory_dir / "scratchpad.db")
         context.journal = MemoryJournal(context.memory_dir)
         context.skill_memory = SkillMemory(memory_dir)
         context.frontier_tracker = FrontierTracker(memory_dir)

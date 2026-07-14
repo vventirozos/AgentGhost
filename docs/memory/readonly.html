@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>memory.readonly — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Memory</h3>
+    <a href="vector.html">vector</a>
+    <a href="graph.html">graph</a>
+    <a href="profile.html">profile</a>
+    <a href="skills.html">skills</a>
+    <a href="journal.html">journal</a>
+    <a href="scratchpad.html">scratchpad</a>
+    <a href="episodes.html">episodes</a>
+    <a class="current" href="readonly.html">readonly</a>
+    <a href="frontier.html">frontier</a>
+    <a href="projects.html">projects</a>
+    <a href="adaptive_threshold.html">adaptive_threshold</a>
+    <a href="contradiction_log.html">contradiction_log</a>
+  </nav>
+</aside>
+<main>
+  <h1>memory / readonly.py — read-only store façades</h1>
+  <p class="subtitle">Isolate an agent that may READ the operator's memory but must never WRITE it — today the delegated <a href="../core/delegation.html">sub-agent</a>.</p>
+
+  <h2>Model (hardened 2026-07-14 bug hunt)</h2>
+  <p><strong>Default-allow-reads / explicit-deny-writes.</strong> A base <code>_ReadOnlyProxy</code> proxies every attribute through to the real store EXCEPT: names in the subclass <code>_MUTATORS</code> set (return a no-op) and names in <code>_BLOCKED_ATTRS</code> (return <code>None</code>). <code>is_read_only = True</code> is exposed so callers that branch on it (dream's Perfect-It skip) see the wrap. The real store is held as <code>_real</code>, so <code>proxy.real</code> hits <code>__getattr__</code> and is blocked.</p>
+
+  <h2>Why the rewrite</h2>
+  <p>The previous version no-op'd <strong>guessed</strong> method names (<code>add_memory</code>, <code>delete_memory</code>, <code>add_triplet</code>, <code>insert_fact</code>) that <em>do not exist</em> on the real stores, while the REAL mutators fell straight through <code>__getattr__</code> and executed against the operator's live memory:</p>
+  <ul>
+    <li><strong>Vector</strong>: <code>add</code>, <code>ingest_document</code>, <code>process_batch</code>, <code>smart_update</code>, <code>bump_retrievals</code>, <code>bump_helpful</code>, <code>forget_episode</code>, <code>delete_document_by_name</code>, <code>correct_fragment</code>, <code>delete_fragment</code>, <code>delete_by_query</code> — all unblocked.</li>
+    <li><strong>Graph</strong>: <code>add_triplets</code> (plural), <code>delete_by_target</code>, <code>wipe_all</code>, <code>prune_stale_edges</code>, <code>bump</code> — all unblocked.</li>
+    <li><strong>Skill</strong>: <code>remove_by_trigger</code>, <code>record_retrieval</code>, <code>record_helpful_retrieval</code>, <code>record_retrievals_bulk</code>, <code>mark_verified</code>, <code>retract_lessons_from_trajectory</code> — all unblocked.</li>
+    <li>And the raw writable handles <code>.real</code> / chromadb <code>.collection</code> / <code>.client</code> / graph <code>.nx_graph</code> were reachable, so a caller could write <em>around</em> the façade entirely.</li>
+  </ul>
+  <p>Combined with the sub-agent tool-surface escape (see delegation), a delegate could permanently rewrite the operator's vector DB and knowledge graph — the exact outcome the read-only wrap exists to prevent.</p>
+
+  <h2>Guard against drift</h2>
+  <p>The <code>_MUTATORS</code> sets are pinned to the real method names and covered by <code>tests/test_readonly_memory.py</code>, which introspects each real store and <strong>fails if a store grows a new writer</strong> that isn't blocked. <code>search</code> is special-cased on the vector proxy to force <code>record_retrievals=False</code> — a read that reinforces retrieval stats is still a write to operator memory.</p>
+
+  <p class="note">NOTE: <code>core.dream</code>'s self-play path defines its own equivalent classes inline (they predate this module and carry self-play-specific behaviour). Keep the semantics in sync if you change them there.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

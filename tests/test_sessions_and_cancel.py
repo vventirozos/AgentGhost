@@ -324,7 +324,9 @@ class TestCancellationReleasesLock:
         assert "_turn_reg.is_cancelled(req_id)" in src
         assert "raise TurnCancelled(req_id" in src
         assert "except TurnCancelled as _tc:" in src
-        assert "_turn_reg.unregister(req_id)" in src
+        # unregister is now IDENTITY-CHECKED (req_id can collide with a
+        # concurrent client-supplied X-Request-ID) — see TurnRegistry.
+        assert "_turn_reg.unregister(req_id, _active_turn)" in src
 
 
 # ══════════════════════════════════════════════════════════════════════

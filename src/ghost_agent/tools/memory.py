@@ -286,10 +286,10 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                 
         # Hard caps for ingest. Without these a 1 GB PDF or text file in
         # the sandbox would OOM the host while the model thinks it's just
-        # ingesting a document.
+        # ingesting a document. (PDF page/char ceilings now live in
+        # memory.pdf_ingest — raised so a real reference manual fits.)
         MAX_INGEST_FILE_BYTES = 100 * 1024 * 1024   # 100 MB on disk
-        MAX_INGEST_TEXT_CHARS = 5_000_000           # 5 MB of extracted text
-        MAX_PDF_PAGES = 1000
+        MAX_INGEST_TEXT_CHARS = 5_000_000           # 5 MB of extracted text (non-PDF)
 
         try:
             stat_res = file_path.stat()
@@ -305,63 +305,92 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
         except OSError as se:
             return f"Disk Error: failed to stat '{filename}': {se}"
 
+        # ── PDF: STREAMING, STRUCTURE-AWARE PATH (2026-07-13) ──────────
+        # A reference manual (PostgreSQL: ~3k pages, ~10M chars) cannot go
+        # through the whole-document path — it used to be refused outright
+        # at 1000 pages, then silently halved at 5M chars, and it would
+        # hold the full text + full chunk list + an enriched COPY in RAM.
+        # pdf_ingest streams page→section→chunk→store in bounded memory and
+        # stamps each chunk with its TOC breadcrumb ("19.5. Write Ahead
+        # Log"), which raw PDF text otherwise loses entirely.
+        if filename.lower().endswith(".pdf"):
+            from ..memory.pdf_ingest import ingest_pdf_streaming
+
+            def _progress(st):
+                pretty_log(
+                    "KB Ingest",
+                    f"{filename}: {st.pages} pages · {st.chunks} chunks · "
+                    f"{st.sections} sections",
+                    icon=Icons.MEM_INGEST,
+                )
+
+            try:
+                stats = await asyncio.to_thread(
+                    ingest_pdf_streaming, file_path, filename, memory_system,
+                    progress=_progress,
+                )
+            except Exception as e:
+                return f"Ingest Error: {e}"
+
+            if not stats.chunks:
+                return "Error: Extracted text is empty."
+
+            # Doc-level summary for "what's in X / summarise X" queries.
+            try:
+                summary = (
+                    f"[Document Summary: {filename}] Reference document: "
+                    f"{stats.pages} pages, {stats.sections} sections, "
+                    f"{stats.chunks} indexed chunks, {stats.chars} characters. "
+                    f"Query it with knowledge_base(action='query', "
+                    f"filename='{filename}', question='...')."
+                )
+                await asyncio.to_thread(
+                    memory_system.add, summary,
+                    {"type": "document_summary", "source": filename,
+                     "timestamp": get_utc_timestamp()},
+                )
+            except Exception:
+                pass
+
+            note = ""
+            if stats.truncated:
+                note += " (TRUNCATED at the text cap)"
+            if stats.skipped_pages:
+                note += f" ({stats.skipped_pages} unreadable pages skipped)"
+            return (
+                f"SUCCESS: Ingested '{filename}' — {stats.pages} pages, "
+                f"{stats.sections} sections, {stats.chunks} chunks{note}. "
+                f"Ask questions with knowledge_base(action='query', "
+                f"filename='{filename}', question='...')."
+            )
+
         try:
             def _extract_text():
+                # NOTE: PDFs never reach here — they take the streaming
+                # pdf_ingest path above. This is the plain-text branch.
                 extracted_parts: list[str] = []
                 running_len = 0
                 binary_exts = ['.png', '.jpg', '.jpeg', '.gif', '.zip', '.tar', '.gz', '.sqlite', '.db', '.mp4', '.exe']
                 if any(filename.lower().endswith(ext) for ext in binary_exts):
                     raise ValueError("Cannot ingest binary or media files into text memory.")
-                if filename.lower().endswith(".pdf"):
-                    import fitz
-                    doc = fitz.open(file_path)
-                    try:
-                        page_count = len(doc)
-                        if page_count > MAX_PDF_PAGES:
-                            raise ValueError(
-                                f"PDF has {page_count} pages; ingest refuses PDFs with more than "
-                                f"{MAX_PDF_PAGES} pages. Use a script via `execute` to split it first."
-                            )
-                        for page_num, page in enumerate(doc):
-                            try:
-                                text = page.get_text()
-                            except Exception as pe:
-                                # Skip individual pages that fail rather than aborting the whole doc.
-                                logger = __import__("logging").getLogger("GhostAgent")
-                                logger.warning(f"PDF page {page_num} extraction failed: {pe}")
-                                continue
-                            if text:
-                                extracted_parts.append(text)
-                                running_len += len(text) + 1
-                                if running_len > MAX_INGEST_TEXT_CHARS:
-                                    extracted_parts.append("\n[... INGEST TRUNCATED at 5 MB of extracted text ...]")
-                                    break
-                    finally:
-                        # ALWAYS close the doc handle, even on exception
-                        # (was previously leaked on per-page failures).
-                        try:
-                            doc.close()
-                        except Exception:
-                            pass
-                else:
-                    # Stream the file in chunks rather than `f.read()` so we
-                    # can enforce the text-size cap without materialising the
-                    # whole file in memory first.
-                    # utf-8-sig strips a BOM (a leading U+FEFF would otherwise
-                    # pollute the first chunk/embedding); errors="replace" keeps
-                    # a non-UTF-8 file's mangling visible rather than silently
-                    # dropped by errors="ignore".
-                    with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
-                        while running_len < MAX_INGEST_TEXT_CHARS:
-                            chunk = f.read(min(65536, MAX_INGEST_TEXT_CHARS - running_len))
-                            if not chunk:
-                                break
-                            extracted_parts.append(chunk)
-                            running_len += len(chunk)
-                        # If there's more, peek to see if the file kept going.
-                        if f.read(1):
-                            extracted_parts.append("\n[... INGEST TRUNCATED at 5 MB of extracted text ...]")
-                return "\n".join(extracted_parts) if filename.lower().endswith(".pdf") else "".join(extracted_parts)
+                # Stream the file in chunks rather than `f.read()` so we
+                # can enforce the text-size cap without materialising the
+                # whole file in memory first.
+                # utf-8-sig strips a BOM (a leading U+FEFF would otherwise
+                # pollute the first chunk/embedding); errors="replace" keeps
+                # a non-UTF-8 file's mangling visible rather than silently
+                # dropped by errors="ignore".
+                with open(file_path, "r", encoding="utf-8-sig", errors="replace") as f:
+                    while running_len < MAX_INGEST_TEXT_CHARS:
+                        chunk = f.read(min(65536, MAX_INGEST_TEXT_CHARS - running_len))
+                        if not chunk:
+                            break
+                        extracted_parts.append(chunk)
+                        running_len += len(chunk)
+                    # If there's more, peek to see if the file kept going.
+                    if f.read(1):
+                        extracted_parts.append("\n[... INGEST TRUNCATED at 5 MB of extracted text ...]")
+                return "".join(extracted_parts)
             full_text = await asyncio.to_thread(_extract_text)
         except Exception as e: return f"Disk Error: {str(e)}"
 
@@ -412,6 +441,64 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
 
     return f"SUCCESS: Ingested '{filename}'."
 
+async def tool_query_document(filename: str = None, question: str = None,
+                              memory_system=None, k: int = 8):
+    """Ask a question against ONE ingested document (2026-07-13).
+
+    The missing half of the RAG loop. Ingest existed; retrieval did not —
+    the only way a chunk reached the model was ambient hydration, where it
+    competed with episodes/skills for a shared budget and was capped at 12
+    fragments from the whole store. This returns the k best passages from
+    the NAMED document as TOOL OUTPUT, so the model reads them directly and
+    can iterate (search → read → refine → search again).
+    """
+    if not filename or not question:
+        return ("SYSTEM ERROR: both 'filename' and 'question' are MANDATORY "
+                "for action='query'. Example: knowledge_base(action='query', "
+                "filename='postgresql.pdf', question='how does wal_level work?')")
+    if not memory_system:
+        return "Error: Memory system is disabled."
+
+    library = await asyncio.to_thread(memory_system.get_library)
+    library = library or []
+    if filename not in library:
+        # Forgiving match: the model often passes a stem or a near-miss.
+        stem = str(filename).lower().rsplit(".", 1)[0]
+        match = next(
+            (f for f in library
+             if f.lower() == str(filename).lower()
+             or f.lower().rsplit(".", 1)[0] == stem),
+            None,
+        )
+        if not match:
+            return (f"Error: '{filename}' is not in the knowledge base. "
+                    f"Available documents: {library or '(none)'}. "
+                    f"Ingest it first with action='ingest_document'.")
+        filename = match
+
+    pretty_log("KB Query", f"{filename} ← {question[:60]}", icon=Icons.MEM_READ)
+    try:
+        hits = await asyncio.to_thread(
+            memory_system.search_document, filename, question, k=k)
+    except Exception as e:
+        return f"Error: document query failed: {e}"
+
+    if not hits:
+        return (f"No passages found in '{filename}' for that question. "
+                f"Try rephrasing with the document's own terminology.")
+
+    parts = [
+        f"PASSAGES FROM '{filename}' (ranked, {len(hits)} of the best matches):",
+        "Answer the user's question FROM THESE PASSAGES. Cite the section "
+        "breadcrumb shown in each passage's header. If they do not contain "
+        "the answer, say so and query again with different wording.",
+        "",
+    ]
+    for i, h in enumerate(hits, 1):
+        parts.append(f"--- [{i}] (relevance {h['score']}) ---\n{h['text']}")
+    return "\n".join(parts)
+
+
 async def tool_recall(query: str = None, memory_system=None, graph_memory=None, **kwargs):
     if not query:
         return "SYSTEM ERROR: The 'query' parameter is MANDATORY. You must specify it."
@@ -438,7 +525,27 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
 
         # 1.35 is a realistic upper bound for short queries against long chunks using L2 distance
         if score < 1.35:
-            valid_chunks.append(f"SOURCE: {source}\nCONTENT: {text}")
+            chunk = f"SOURCE: {source}\nCONTENT: {text}"
+            # Drill-down provenance: syntheses carry {"provenance": [{id,
+            # excerpt}, ...]} (their merged sources are deleted, the excerpt
+            # IS the surviving evidence); episode-derived skills carry
+            # source_refs ("ep:12,ep:15") resolvable via episodic memory.
+            meta = res.get('metadata', {}) or {}
+            prov_raw = meta.get('provenance')
+            if prov_raw:
+                try:
+                    import json as _json
+                    _prov = _json.loads(prov_raw)
+                    _ex = "; ".join(
+                        f"\"{str(p.get('excerpt', ''))[:60]}\"" for p in _prov[:3]
+                    )
+                    chunk += f"\nEVIDENCE (synthesized from {len(_prov)} fragments): {_ex}"
+                except Exception:
+                    pass
+            refs = meta.get('source_refs')
+            if refs:
+                chunk += f"\nEVIDENCE REFS: {refs}"
+            valid_chunks.append(chunk)
             
     if graph_memory:
         import re as _re
@@ -451,9 +558,82 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
             except: pass
             
     if valid_chunks:
-        return f"SYSTEM: Found {len(valid_chunks)} highly relevant memories.\n\n" + "\n\n".join(valid_chunks)
+        out = f"SYSTEM: Found {len(valid_chunks)} highly relevant memories.\n\n" + "\n\n".join(valid_chunks)
+        # Iterative drill-down affordance: when a hit carries evidence
+        # handles, tell the model how to expand them (the query_document
+        # "read → refine → read again" loop, generalized to memory).
+        if "EVIDENCE REFS:" in out or "EVIDENCE (synthesized" in out:
+            out += (
+                "\n\nTIP: to inspect the raw evidence behind a memory above, call "
+                "knowledge_base(action='expand', ref='ep:<id>') for an episode ref, "
+                "or refine this recall with more specific wording."
+            )
+        return out
     else:
-        return "SYSTEM OBSERVATION: Zero high-confidence memories found for this query."
+        return (
+            "SYSTEM OBSERVATION: Zero high-confidence memories found for this query. "
+            "Before concluding the memory doesn't exist, try ONE more recall with "
+            "different wording (a synonym, or just the key entity's name)."
+        )
+
+async def tool_expand_evidence(ref=None, episodic_memory=None,
+                               session_store=None, **kwargs):
+    """Drill down from an EVIDENCE REF (surfaced by `recall`) to the raw
+    record behind an abstraction — episode-strategy lessons carry
+    ``ep:<id>`` refs, session hits carry ``session:<id>``. This is the
+    memory-store counterpart of tool_query_document's iterative loop."""
+    if not ref:
+        return ("SYSTEM ERROR: The 'ref' parameter is MANDATORY — pass an "
+                "evidence handle like 'ep:12' (episode) or 'session:<id>'.")
+    ref = str(ref).strip()
+    pretty_log("Evidence Expand", ref, icon=Icons.MEM_READ)
+
+    if ref.startswith("ep:"):
+        if not episodic_memory:
+            return "Error: Episodic memory is disabled."
+        try:
+            ep_id = int(ref.split(":", 1)[1])
+        except (ValueError, IndexError):
+            return f"Error: malformed episode ref '{ref}' — expected 'ep:<number>'."
+        ep = await asyncio.to_thread(episodic_memory.get_episode, ep_id)
+        if not ep:
+            return (f"Error: episode {ep_id} no longer exists (episodes are "
+                    f"capped at 500 and old ones are evicted).")
+        lines = [
+            f"EPISODE {ep_id} [{ep.get('cluster_id') or 'general'}]",
+            f"TRIGGER: {ep.get('trigger', '')}",
+        ]
+        if ep.get("context"):
+            lines.append(f"CONTEXT: {str(ep['context'])[:500]}")
+        lines.append(
+            f"OUTCOME ({'SUCCESS' if ep.get('outcome_success') else 'FAILURE'}): "
+            f"{ep.get('outcome', '')}"
+        )
+        if ep.get("lesson"):
+            lines.append(f"LESSON: {ep['lesson']}")
+        for i, a in enumerate(ep.get("actions") or [], 1):
+            ok = "ok" if a.get("success", 1) else "FAILED"
+            lines.append(
+                f"  {i}. {a.get('tool_name', '?')}({str(a.get('tool_args', ''))[:120]}) "
+                f"→ [{ok}] {str(a.get('result', ''))[:150]}"
+            )
+        return "\n".join(lines)
+
+    if ref.startswith("session:"):
+        if not session_store:
+            return "Error: Session store is unavailable."
+        sid = ref.split(":", 1)[1].strip()
+        sess = await asyncio.to_thread(session_store.get, sid)
+        if not sess:
+            return f"Error: session '{sid}' not found (it may have been evicted)."
+        tail = (sess.messages or [])[-10:]
+        lines = [f"SESSION {sid} — {sess.title or 'untitled'} (last {len(tail)} messages):"]
+        lines += [f"{m.get('role', '?')}: {str(m.get('content', ''))[:200]}" for m in tail]
+        return "\n".join(lines)
+
+    return (f"Error: unknown ref scheme '{ref}' — supported: 'ep:<id>' "
+            f"(episode from EVIDENCE REFS) and 'session:<id>'.")
+
 
 async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memory_system=None, profile_memory=None, graph_memory=None):
     if not target:
@@ -971,6 +1151,21 @@ async def tool_knowledge_base(action: str = None, sandbox_dir: Path = None, memo
 
     elif action == "forget":
         return await tool_unified_forget(target, sandbox_dir, memory_system, kwargs.get("profile_memory"), kwargs.get("graph_memory"))
+
+    elif action == "query":
+        return await tool_query_document(
+            filename=kwargs.get("filename") or kwargs.get("source") or target,
+            question=(kwargs.get("question") or kwargs.get("query")
+                      or kwargs.get("q")),
+            memory_system=memory_system,
+        )
+
+    elif action == "expand":
+        return await tool_expand_evidence(
+            ref=kwargs.get("ref") or kwargs.get("id") or target,
+            episodic_memory=kwargs.get("episodic_memory"),
+            session_store=kwargs.get("session_store"),
+        )
 
     elif action == "list_docs":
         if not memory_system: return "Error: Memory system is disabled."
