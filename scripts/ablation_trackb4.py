@@ -44,14 +44,31 @@ import hashlib
 import json
 import os
 import random
+import re
 import sys
 import tempfile
 import time
+import uuid
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 HERE = Path(__file__).resolve().parent
+
+# Driver turns are tagged with this request-id prefix so `_wait_arm_quiet`
+# counts ONLY the driver's completions, not interleaved self-play turns
+# (which share the "request finished" marker). "dv" is collision-proof: a
+# uuid hex id can't start with 'v', and internal turns use sub-/sched-/job-
+# prefixes — so the 2-char frame tag "DV" is exclusively the driver's.
+_DRIVER_RID_PREFIX = "dv"
+_DRIVER_TAG = _DRIVER_RID_PREFIX.upper()
+_ANSI_RE = re.compile(r"\033\[[0-9;]*m")
+
+
+def _new_driver_rid() -> str:
+    return _DRIVER_RID_PREFIX + uuid.uuid4().hex[:10]
+
+
 sys.path.insert(0, str(HERE))
 import ablation_eval as AE                      # noqa: E402
 from ablation_trackb2 import _post              # noqa: E402
@@ -246,8 +263,29 @@ def _mcnemar_cells(records, arm_a="treatment", arm_b="control"):
 
 # ── phases ───────────────────────────────────────────────────────────────────
 
+def _count_finished(log_path, driver_tag: Optional[str]) -> int:
+    """Count completed turns in the arm log.
+
+    With ``driver_tag`` (e.g. "DV"), count ONLY END frames whose 2-char tag
+    is the driver's — self-play turns drive the SAME handle_chat and emit the
+    same "request finished" marker, so counting all of them inflated the count
+    and let the timeout-bleed guard proceed into a still-busy arm in exactly
+    the treatment (self-play-active) arms (found 2026-07-15). Without a tag,
+    fall back to counting every marker (legacy behaviour)."""
+    try:
+        text = _ANSI_RE.sub("", log_path.read_text(errors="replace"))
+    except Exception:
+        return -1
+    if not driver_tag:
+        return text.lower().count("request finished")
+    # END frame: "└─ DV  request finished  3.2s ────" (ANSI already stripped).
+    pat = re.compile(r"└─\s+" + re.escape(driver_tag) + r"\s+request finished",
+                     re.IGNORECASE)
+    return len(pat.findall(text))
+
+
 async def _wait_arm_quiet(arm, requests_sent: int, grace: float = 900.0,
-                          hold: float = 1800.0):
+                          hold: float = 1800.0, driver_tag: Optional[str] = None):
     """A client-side probe timeout does NOT stop the agent's in-flight turn:
     the agent keeps working it (and may write the artifact minutes later),
     while the NEXT request queues behind the turn-serialization semaphore and
@@ -260,13 +298,8 @@ async def _wait_arm_quiet(arm, requests_sent: int, grace: float = 900.0,
     deadline = _t.time() + grace
     n = -1
     while _t.time() < deadline:
-        try:
-            # case-insensitive: the pretty-stream renders the END marker as
-            # lowercase "request finished" while the source spells it title-
-            # case; counting only one form made this wait ALWAYS burn the
-            # full grace (re-pilot #2, 2026-07-09 — +240s dead time per task)
-            n = arm["log"].read_text(errors="replace").lower().count("request finished")
-        except Exception:
+        n = _count_finished(arm["log"], driver_tag)
+        if n < 0:
             return
         if n >= requests_sent:
             return
@@ -280,9 +313,8 @@ async def _wait_arm_quiet(arm, requests_sent: int, grace: float = 900.0,
             f"(finished {n}/{requests_sent}) — holding up to the ceiling")
     ceiling = _t.time() + hold
     while _t.time() < ceiling:
-        try:
-            n = arm["log"].read_text(errors="replace").lower().count("request finished")
-        except Exception:
+        n = _count_finished(arm["log"], driver_tag)
+        if n < 0:
             return
         if n >= requests_sent:
             AE._log(f"  arm quiet again (finished {n}/{requests_sent})")
@@ -299,7 +331,7 @@ async def _drive_task(arm, task: B4Task, seed: int, model: str,
     before = _playbook_retrievals(home)
     out, dur = await _post(arm["url"],
                            [{"role": "user", "content": task.prompt()}],
-                           model, timeout)
+                           model, timeout, request_id=_new_driver_rid())
     artifact = _read_artifact(sandbox, task)
     ok, why = task.verify(artifact or "", fixtures)
     return {"task_id": task.task_id, "cluster": task.cluster,
@@ -326,7 +358,7 @@ async def _run_arm(name, flags, args, battery, seeding, rep):
         for t in seeding:
             rec = await _drive_task(arm, t, seed, args.model, args.timeout, home)
             sent += 1
-            await _wait_arm_quiet(arm, sent)
+            await _wait_arm_quiet(arm, sent, driver_tag=_DRIVER_TAG)
             rec.update({"arm": name, "repeat": rep, "phase": "seed"})
             records.append(rec)
         instrument_s = {
@@ -341,7 +373,7 @@ async def _run_arm(name, flags, args, battery, seeding, rep):
         for t in battery:
             rec = await _drive_task(arm, t, seed, args.model, args.timeout, home)
             sent += 1
-            await _wait_arm_quiet(arm, sent)
+            await _wait_arm_quiet(arm, sent, driver_tag=_DRIVER_TAG)
             rec.update({"arm": name, "repeat": rep, "phase": "probe"})
             records.append(rec)
         probes = [r for r in records if r["phase"] == "probe"]
@@ -407,7 +439,16 @@ def _b4_report(records, artifacts, meta) -> str:
     for rep_art in artifacts:
         for arm in ("treatment", "treatment_uniform"):
             if arm in rep_art:
-                lbs = rep_art[arm].get("lessons_by_source", {})
+                a = rep_art[arm]
+                # A boot-failed arm ({"error": ...}) rendered as an empty
+                # yield with no marker, so the pre-registered keep/flip rule
+                # below could flip on an infrastructure failure (found
+                # 2026-07-15). Flag it loudly instead.
+                if a.get("error"):
+                    L.append(f"- repeat {rep_art['repeat']} {arm}: "
+                             f"!! BOOT FAILED ({a.get('error')}) — exclude from the rule")
+                    continue
+                lbs = a.get("lessons_by_source", {})
                 L.append(f"- repeat {rep_art['repeat']} {arm}: "
                          f"lessons_by_source={lbs}")
     L.append("- pre-registered rule (§4D item 6): KEEP frontier iff self-play "
@@ -453,7 +494,7 @@ async def _pilot(args, battery, seeding) -> int:
                 rec = await _drive_task(arm, t, DEFAULT_SEED + rep,
                                         args.model, args.timeout, arm["home"])
                 sent += 1
-                await _wait_arm_quiet(arm, sent)
+                await _wait_arm_quiet(arm, sent, driver_tag=_DRIVER_TAG)
                 per_task[t.task_id].append(rec)
     finally:
         _teardown(arm)
@@ -526,6 +567,16 @@ def main() -> int:
 
     all_records: List[dict] = []
     all_artifacts: List[dict] = []
+    out = Path(args.report_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    def _checkpoint():
+        """Persist records+artifacts after each repeat. A B4 run is many
+        hours; the old end-of-run-only write lost the ENTIRE dataset on any
+        crash / Ctrl-C (trackb2 checkpointed per-arm precisely for this;
+        the newer harnesses had dropped it — found 2026-07-15)."""
+        (out / "trackb4_artifacts.json").write_text(json.dumps(all_artifacts, indent=2))
+        (out / "trackb4_records.json").write_text(json.dumps(all_records, indent=2))
 
     async def _driver():
         for rep in range(args.repeats):
@@ -546,17 +597,18 @@ def main() -> int:
             all_records.extend(c_recs)
             arts["control"] = c_art
             all_artifacts.append(arts)
+            _checkpoint()   # a crash after this repeat still leaves a report-able dataset
 
-    asyncio.run(_driver())
-
-    report = _b4_report(all_records, all_artifacts,
-                        {"harness": "trackb4", "time_scale": args.time_scale,
-                         "idle_epochs": args.idle_epochs,
-                         "battery_size": len(battery)})
-    out = Path(args.report_dir)
-    (out / "trackb4_report.md").write_text(report)
-    (out / "trackb4_artifacts.json").write_text(json.dumps(all_artifacts, indent=2))
-    (out / "trackb4_records.json").write_text(json.dumps(all_records, indent=2))
+    try:
+        asyncio.run(_driver())
+    finally:
+        # Build a report from whatever landed — a partial run is still worth reading.
+        _checkpoint()
+        report = _b4_report(all_records, all_artifacts,
+                            {"harness": "trackb4", "time_scale": args.time_scale,
+                             "idle_epochs": args.idle_epochs,
+                             "battery_size": len(battery)})
+        (out / "trackb4_report.md").write_text(report)
     AE._log(f"B4 report written to {out}")
     print(report)
     return 0

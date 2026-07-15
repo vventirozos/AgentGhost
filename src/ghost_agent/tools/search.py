@@ -155,7 +155,9 @@ def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int,
             return base_proxy
         bare = urlunparse((p.scheme, f"{p.hostname}:{p.port or 9050}", "", "", "", ""))
         qh = hashlib.md5((query or "").encode("utf-8", "ignore")).hexdigest()[:8]
-        return socks_url_with_identity(bare, f"{qh}{salt}a{attempt}") or base_proxy
+        tbucket = int(time.monotonic() // 60)
+        return socks_url_with_identity(
+            bare, f"{qh}{salt}a{attempt}n{_PROC_NONCE}t{tbucket}") or base_proxy
     except Exception:
         return base_proxy
 
@@ -209,6 +211,23 @@ def _failure_category(msg: str) -> str:
 # the caller wait forever.
 _RACE_WAVE_GRACE = 4
 
+# Dedicated pool for race threads. Cancelling a loser only cancels the
+# asyncio wrapper — the thread runs its ddgs call to completion (up to the
+# full 18s timeout) — so a few concurrent waves of 6 engines saturated the
+# loop's shared to_thread pool (min(32, cpu+4)) and stalled every OTHER
+# to_thread user in the process (found 2026-07-15). Sized for 4 concurrent
+# waves; excess waves queue here instead of starving unrelated work.
+from concurrent.futures import ThreadPoolExecutor as _TPE
+_RACE_POOL = _TPE(max_workers=len(_RACE_ENGINES) * 4,
+                  thread_name_prefix="search-race")
+
+# Fresh per process AND per ~minute: an identical SOCKS-auth tag maps to
+# the SAME Tor circuit while it lives (~10 min dirtiness), so a retried
+# failed query rode the exact same dead exits (found 2026-07-15).
+# Uniqueness is all Tor needs; per-query isolation is kept via the query
+# hash in the tag.
+_PROC_NONCE = os.urandom(2).hex()
+
 # deep_research page-fetch resilience (2026-07-08). Fetch reachability over
 # Tor is exit-node-dependent just like search: a URL that times out / 503s
 # on one exit often serves fine on the next. Each URL gets its own circuit
@@ -260,6 +279,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
         kwargs: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
         if proxy:
             kwargs["proxy"] = proxy
+        t_start = time.monotonic()
         try:
             with DDGS(**kwargs) as ddgs:
                 return list(ddgs.text(query, max_results=max_results, region="wt-wt",
@@ -269,12 +289,29 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
             # (PEP 479 — it corrupts the event loop's future chaining), and
             # a generator-backed engine can surface one. Convert it.
             raise RuntimeError(f"engine {engine} produced no result stream") from e
+        except Exception as e:
+            # ddgs's internal future-wait starts its clock marginally BEFORE
+            # the primp request, so a hung circuit expires the wait first and
+            # surfaces as 'No results found.' — misbucketed as "empty" and
+            # corrupting the timeout-vs-empty distinction the Tor runbook
+            # diagnoses with (found 2026-07-15). Re-shape by elapsed time.
+            elapsed = time.monotonic() - t_start
+            if ("no results found" in str(e).lower()
+                    and elapsed >= _DDGS_TOR_TIMEOUT - 0.5):
+                raise RuntimeError(
+                    f"engine {engine} timed out after {elapsed:.0f}s") from e
+            raise
 
     t0 = time.monotonic()
+    loop = asyncio.get_running_loop()
     tasks: Dict[Any, str] = {}
     for engine in _RACE_ENGINES:
         proxy = _proxy_for_attempt(tor_proxy, query, wave, salt=engine[:4])
-        task = asyncio.ensure_future(asyncio.to_thread(_run_engine, engine, proxy))
+        # Dedicated _RACE_POOL, NOT to_thread: uncancellable loser threads
+        # must queue against other WAVES, not against the process-wide
+        # default executor every other to_thread caller shares.
+        task = asyncio.ensure_future(
+            loop.run_in_executor(_RACE_POOL, _run_engine, engine, proxy))
         tasks[task] = engine
 
     # Several searches can race concurrently in one agent turn; the query
@@ -309,8 +346,19 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
                     return valid
                 failures.append((engine, "empty"))
     finally:
-        for task in pending:
-            task.cancel()
+        for task in tasks:
+            if task.done():
+                if not task.cancelled():
+                    # A loser that co-completed in the winner's batch never
+                    # had .result() called; sweep its exception so GC doesn't
+                    # log 'Task exception was never retrieved' at ERROR onto
+                    # the operator stream (found 2026-07-15).
+                    try:
+                        task.exception()
+                    except Exception:  # noqa: BLE001
+                        pass
+            else:
+                task.cancel()
     if failures or timed_out:
         # Operator stream gets ONE terse line — categories, not reprs:
         #   wave 0 ‹postgresql 20 features…›: no winner — 5 empty; mojeek conn-error
@@ -378,9 +426,13 @@ def _reformulate_query(query: str) -> List[str]:
         question = f"how to {query}"
         reformulations.append(question)
     elif len(words) > 3:
-        # Already a question — try simplifying
+        # Already a question — try simplifying. For a 4-5 word question the
+        # first-5-words "simplification" IS the original query; re-running it
+        # labeled "[Reformulated]" burned a full wave on a lie (found
+        # 2026-07-15) — fall through to the tutorial/guide fallback instead.
         simplified = " ".join(words[:5])
-        reformulations.append(simplified)
+        if simplified != query.strip():
+            reformulations.append(simplified)
 
     # Ensure we have exactly 2 reformulations
     if len(reformulations) == 0:

@@ -355,7 +355,7 @@ async def lifespan(app):
             icon=Icons.SHIELD,
         )
 
-    context.llm_client = LLMClient(args.upstream_url, context.tor_proxy, args.swarm_nodes_parsed, args.worker_nodes_parsed, getattr(args, 'visual_nodes_parsed', None), getattr(args, 'coding_nodes_parsed', None), getattr(args, 'image_gen_nodes_parsed', None), getattr(args, 'critic_nodes_parsed', None))
+    context.llm_client = LLMClient(args.upstream_url, context.tor_proxy, args.swarm_nodes_parsed, args.worker_nodes_parsed, getattr(args, 'visual_nodes_parsed', None), getattr(args, 'coding_nodes_parsed', None), getattr(args, 'image_gen_nodes_parsed', None), getattr(args, 'critic_nodes_parsed', None), node_api_key=args.api_key)
 
     # Pre-warm off-main nodes in the BACKGROUND so the first user-critical-path
     # worker call (query expansion) doesn't eat a cold-start timeout (nova is a

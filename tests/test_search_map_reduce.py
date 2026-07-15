@@ -2,14 +2,17 @@ import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from ghost_agent.tools.search import tool_deep_research
 
-# We need to mock importlib.util.find_spec("ddgs") and asyncio.to_thread
+# Stub the search wave itself (the URL source): the wave runs each engine on
+# a dedicated executor now, not asyncio.to_thread, so patch at that seam — it
+# is also more robust than reaching into the wave's threading internals.
 @pytest.fixture
 def mock_ddgs():
     with patch("importlib.util.find_spec") as mock_find:
         mock_find.return_value = True
-        with patch("asyncio.to_thread", new_callable=AsyncMock) as mock_thread:
-            mock_thread.return_value = [{"href": "http://example.com/1"}]
-            yield mock_thread
+        with patch("ghost_agent.tools.search._race_search_wave",
+                   new_callable=AsyncMock) as mock_wave:
+            mock_wave.return_value = [{"href": "http://example.com/1"}]
+            yield mock_wave
 
 @pytest.fixture
 def mock_fetch():

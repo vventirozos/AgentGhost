@@ -77,8 +77,9 @@ class TestDisableThinking:
     def test_route_timeout_bounds_the_critical_path(self):
         # route() is awaited BEFORE memory-bus hydration and its fallback is a
         # free string concat — a sick worker must degrade fast, not stall the
-        # user for 15s.
-        assert _ROUTE_TIMEOUT_S <= 8.0
+        # user for 15s. (12s: absorbs a double-queued call on a small-`-np`
+        # worker — see test_worker_warmup.py::TestRouteTimeoutSizing.)
+        assert _ROUTE_TIMEOUT_S <= 12.0
         src = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
                / "core" / "llm.py").read_text()
         assert "timeout=_ROUTE_TIMEOUT_S" in src

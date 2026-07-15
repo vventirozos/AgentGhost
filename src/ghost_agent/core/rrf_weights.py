@@ -25,12 +25,21 @@ import json
 import logging
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
 SCHEMA_VERSION = "ghost.rrf.weights.v1"
+
+# Serialises the two writers of the observations ledger: the post-turn
+# hydration judge APPENDS (bus.judge_hydration_usefulness, via to_thread)
+# while the dream cycle's refit READS + TRIM-REWRITES (dream._refit_rrf_
+# weights). Without it, lines appended between the refit's read and its
+# os.replace were silently discarded (found 2026-07-15). Same process,
+# different threads → a plain threading.Lock suffices.
+LEDGER_LOCK = threading.Lock()
 
 # Mirror of bus.MemoryBus._INTENT_WEIGHTS — the safe fallback AND the
 # anchor a fit starts from (cells with too little data keep these).
@@ -70,35 +79,47 @@ def load_intent_weights(path) -> Optional[Dict[str, Dict[str, float]]]:
     raw = d.get("weights")
     if not isinstance(raw, dict):
         return None
-    out: Dict[str, Dict[str, float]] = {}
+    # Deep-merge over the hand-tuned defaults: a truncated / hand-edited /
+    # externally-produced file that is schema-valid but missing a source or
+    # intent must NOT silently replace a tuned weight with the bus's 1.0
+    # lookup fallback (found 2026-07-15).
+    out: Dict[str, Dict[str, float]] = {i: dict(sw)
+                                        for i, sw in DEFAULT_INTENT_WEIGHTS.items()}
+    loaded_any = False
     for intent, sw in raw.items():
         if not isinstance(sw, dict):
             continue
-        cell = {}
         for src, val in sw.items():
             try:
-                cell[str(src)] = _clamp(float(val))
+                out.setdefault(str(intent), {})[str(src)] = _clamp(float(val))
+                loaded_any = True
             except (TypeError, ValueError):
                 continue
-        if cell:
-            out[str(intent)] = cell
-    return out or None
+    return out if loaded_any else None
 
 
 def fit_intent_weights(
     observations: Iterable[Tuple[str, str, bool]],
     *,
     base: Optional[Dict[str, Dict[str, float]]] = None,
-    min_obs_per_cell: int = 3,
+    min_obs_per_cell: int = 20,
 ) -> Dict[str, Dict[str, float]]:
     """Fit an intent→source weight matrix from ``(intent, source,
     success)`` observations.
 
     Per (intent, source) cell with ≥ ``min_obs_per_cell`` samples, the
-    weight is set from the success rate mapped onto ``[WEIGHT_MIN,
-    WEIGHT_MAX]`` (rate 0 → MIN, 0.5 → ~1.0, 1 → MAX). Cells below the
-    floor keep the ``base`` weight, so a thin sample never overrides a
-    sensible default. Always returns a full matrix (base merged)."""
+    weight follows the success rate on a piecewise-linear curve ANCHORED
+    ON THE BASE WEIGHT: rate 0 → ``WEIGHT_MIN``, rate 0.5 → the cell's
+    base weight, rate 1 → ``WEIGHT_MAX``. (The old mapping was linear on
+    the absolute band, so a coin-flip 0.5 gave every source ~1.55 —
+    contradicting its own "0.5 → ~1.0" contract and handing a 5x boost
+    to a 0.3-base tier; found 2026-07-15.)
+
+    ``min_obs_per_cell`` defaults to 20 because observations arrive up to
+    12-per-turn sharing ONE judge verdict — they are correlated, not
+    independent, and the old floor of 3 let a single turn swing a cell
+    20x. Cells below the floor keep the ``base`` weight. Always returns a
+    full matrix (base merged)."""
     base = base or DEFAULT_INTENT_WEIGHTS
     agg: Dict[Tuple[str, str], list] = {}
     for intent, source, success in observations:
@@ -111,8 +132,12 @@ def fit_intent_weights(
         if n < max(1, int(min_obs_per_cell)):
             continue
         rate = wins / n if n else 0.5
-        w = _clamp(WEIGHT_MIN + rate * (WEIGHT_MAX - WEIGHT_MIN))
-        out.setdefault(intent, {})[source] = round(w, 3)
+        anchor = _clamp(out.get(intent, {}).get(source, 1.0))
+        if rate <= 0.5:
+            w = WEIGHT_MIN + (rate / 0.5) * (anchor - WEIGHT_MIN)
+        else:
+            w = anchor + ((rate - 0.5) / 0.5) * (WEIGHT_MAX - anchor)
+        out.setdefault(intent, {})[source] = round(_clamp(w), 3)
     return out
 
 
@@ -129,6 +154,7 @@ def save_intent_weights(path, weights: Dict[str, Dict[str, float]]) -> None:
 
 __all__ = [
     "DEFAULT_INTENT_WEIGHTS",
+    "LEDGER_LOCK",
     "load_intent_weights",
     "fit_intent_weights",
     "save_intent_weights",

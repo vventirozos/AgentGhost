@@ -180,12 +180,35 @@ def main() -> int:
         args.ghost_model = args.ghost_model if args.ghost_model != "default" else "qwen-3.6-35b-a3"
         print(f"[gaia] booting isolated agent on :{args.boot_port} "
               f"(GHOST_HOME={ghost_home}, memory={'on' if args.memory else 'off'})")
+        # Port-free preflight: if a stale agent already listens on the boot
+        # port (e.g. a prior run SIGKILL'd before teardown), the new agent
+        # dies on EADDRINUSE while _wait_ready gets a 200 from the STALE
+        # process — the whole run then scores a foreign agent under a false
+        # config (found 2026-07-15).
+        import socket as _socket
+        _s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        try:
+            _s.bind(("127.0.0.1", args.boot_port))
+        except OSError:
+            print(f"ERROR: --boot-port {args.boot_port} is already in use — "
+                  f"free it (a stale agent?) or pick another port", file=sys.stderr)
+            return 1
+        finally:
+            _s.close()
         proc, lf = _boot(boot_flags, ghost_home, out_dir / "agent.log")
         if not _wait_ready(args.ghost_url, args.boot_timeout):
             print("ERROR: booted agent never became ready — see agent.log",
                   file=sys.stderr)
             from ablation_eval import _teardown, _container_name
             _teardown(proc, lf, _container_name(ghost_home / "sandbox"))
+            return 1
+        # Liveness: _wait_ready(200) alone can't prove OUR process answered —
+        # confirm it's still running (a crash on EADDRINUSE would have exited).
+        if proc.poll() is not None:
+            print(f"ERROR: booted agent exited (rc={proc.returncode}) — the "
+                  f"ready ping was answered by another process; see agent.log",
+                  file=sys.stderr)
             return 1
 
     try:
@@ -212,6 +235,27 @@ def _run(args, rows, headers, out_dir):
     skipped = 0
     t_start = time.time()
 
+    def _record_error(task_id, level, question, ground_truth, reason_trace):
+        """Persist an errored task. A real GAIA submission scores an empty
+        answer as WRONG, so when ground truth exists the task must count in
+        the denominator (and get a details row) — the old error paths dropped
+        it entirely, inflating `accuracy` (found 2026-07-15)."""
+        nonlocal total, errors
+        errors += 1
+        sub_f.write(json.dumps({
+            "task_id": task_id, "model_answer": "",
+            "reasoning_trace": reason_trace,
+        }) + "\n"); sub_f.flush()
+        if ground_truth is not None:
+            total += 1
+            lvl = by_level.setdefault(level, {"correct": 0, "total": 0})
+            lvl["total"] += 1
+            det_f.write(json.dumps({
+                "task_id": task_id, "level": level, "question": question,
+                "ground_truth": ground_truth, "model_answer": "",
+                "correct": False, "error": reason_trace, "elapsed_s": 0.0,
+            }) + "\n"); det_f.flush()
+
     with httpx.Client() as client, \
          open(submission_path, "w") as sub_f, \
          open(details_path, "w") as det_f:
@@ -231,20 +275,14 @@ def _run(args, rows, headers, out_dir):
                     continue
                 if file_path and Path(file_path).exists():
                     if not upload_file(client, args.ghost_url, headers, Path(file_path)):
-                        errors += 1
-                        sub_f.write(json.dumps({
-                            "task_id": task_id, "model_answer": "",
-                            "reasoning_trace": "ERROR: upload failed",
-                        }) + "\n"); sub_f.flush()
+                        _record_error(task_id, level, question, ground_truth,
+                                      "ERROR: upload failed")
                         continue
                     attached_filename = file_name
                 else:
                     print(f"  ! file_path missing on disk: {file_path}", file=sys.stderr)
-                    errors += 1
-                    sub_f.write(json.dumps({
-                        "task_id": task_id, "model_answer": "",
-                        "reasoning_trace": "ERROR: dataset file missing on disk",
-                    }) + "\n"); sub_f.flush()
+                    _record_error(task_id, level, question, ground_truth,
+                                  "ERROR: dataset file missing on disk")
                     continue
 
             t0 = time.time()
@@ -256,11 +294,8 @@ def _run(args, rows, headers, out_dir):
             except Exception as e:
                 print(f"[{i}/{len(rows)}] L{level} {task_id[:8]} ERR {type(e).__name__}: {e}",
                       file=sys.stderr)
-                errors += 1
-                sub_f.write(json.dumps({
-                    "task_id": task_id, "model_answer": "",
-                    "reasoning_trace": f"ERROR: {type(e).__name__}: {e}",
-                }) + "\n"); sub_f.flush()
+                _record_error(task_id, level, question, ground_truth,
+                              f"ERROR: {type(e).__name__}: {e}")
                 continue
             elapsed = time.time() - t0
 

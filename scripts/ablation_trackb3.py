@@ -101,25 +101,42 @@ def _b3_report(records, artifacts, meta) -> str:
     # seeding (treatment_uniform). The keep/delete-PRM decision hinges on
     # whether frontier selection out-yields a uniform baseline.
     def _lessons(arm_key):
-        tot = defaultdict(int); grad = 0; macro = 0
+        # A boot-failed arm returns {"error": ...} and contributes 0 with no
+        # marker — that silently sank a repeat's yield to zero and could flip
+        # the #27b keep/delete verdict on an INFRASTRUCTURE failure (found
+        # 2026-07-15). Skip errored repeats and report how many were skipped.
+        tot = defaultdict(int); grad = 0; macro = 0; ran = 0; failed = 0
         for rep in artifacts:
             a = rep.get(arm_key, {})
+            if a.get("error"):
+                failed += 1
+                continue
+            ran += 1
             for src, n in (a.get("lessons_by_source", {}) or {}).items():
                 tot[src] += n
             grad += a.get("graduated_skills", 0)
             macro += a.get("proposed_macros", 0)
-        return dict(tot), grad, macro
+        return dict(tot), grad, macro, ran, failed
     has_uniform = any("treatment_uniform" in rep for rep in artifacts)
     if has_uniform:
         L.append("\n## #27b — frontier vs uniform self-play (verified-lesson yield)")
         for arm_key, label in (("treatment", "frontier (default)"),
                                ("treatment_uniform", "uniform (--no-frontier-selfplay)")):
-            tot, grad, macro = _lessons(arm_key)
+            tot, grad, macro, ran, failed = _lessons(arm_key)
+            fail_note = f" [!! {failed} repeat(s) BOOT FAILED, excluded]" if failed else ""
             L.append(f"- {label}: lessons_by_source={tot} "
-                     f"total_lessons={sum(tot.values())} graduated_skills={grad} proposed_macros={macro}")
-        tf, _, _ = _lessons("treatment"); tu, _, _ = _lessons("treatment_uniform")
-        L.append(f"- verdict input: frontier total={sum(tf.values())} vs uniform total={sum(tu.values())} "
-                 f"(pre-registered criterion: keep frontier only if it out-yields uniform across repeats)")
+                     f"total_lessons={sum(tot.values())} graduated_skills={grad} "
+                     f"proposed_macros={macro} (over {ran} arm(s)){fail_note}")
+        tf, _, _, tf_ran, tf_fail = _lessons("treatment")
+        tu, _, _, tu_ran, tu_fail = _lessons("treatment_uniform")
+        verdict = (f"- verdict input: frontier total={sum(tf.values())} (over {tf_ran}) "
+                   f"vs uniform total={sum(tu.values())} (over {tu_ran}) "
+                   f"(pre-registered criterion: keep frontier only if it out-yields uniform across repeats)")
+        if tf_fail or tu_fail:
+            verdict += (f"\n- !! WARNING: {tf_fail} frontier + {tu_fail} uniform repeat(s) "
+                        f"boot-failed and were excluded — the comparison spans unequal/partial "
+                        f"arms; do NOT apply the keep/flip rule without re-running the failed arms")
+        L.append(verdict)
 
     # Learning artifacts produced DURING idle (the primary B3 signal).
     L.append("\n## Idle-loop learning artifacts (per repeat, per arm)")
@@ -129,6 +146,9 @@ def _b3_report(records, artifacts, meta) -> str:
             if arm not in rep:
                 continue
             a = rep.get(arm, {})
+            if a.get("error"):
+                L.append(f"- {arm}: !! BOOT FAILED ({a.get('error')}) — no learning yield measured")
+                continue
             lbs = a.get("lessons_by_source", {})
             L.append(f"- {arm}: lessons_by_source={lbs} "
                      f"graduated_skills={a.get('graduated_skills', 0)} "
@@ -188,18 +208,25 @@ def _learning_artifacts(home: Path) -> Dict[str, Any]:
                 out["lessons_by_source"][src] = out["lessons_by_source"].get(src, 0) + 1
     except Exception:
         pass
-    grad = home / "system" / "memory" / "graduated_skills.json"
+    # GraduatedSkillStore writes auto_skills.json (a dict keyed by signature),
+    # NOT graduated_skills.json — the old name matched nothing, hardwiring
+    # graduated_skills to 0 in every verdict (found 2026-07-15;
+    # skills_auto/store.py STORE_FILENAME).
+    grad = home / "system" / "memory" / "auto_skills.json"
     try:
         if grad.exists():
-            out["graduated_skills"] = len(json.loads(grad.read_text()) or [])
+            out["graduated_skills"] = len(json.loads(grad.read_text()) or {})
     except Exception:
         pass
-    macros = home / "system" / "memory" / "composed_skills.json"
+    # ComposedSkillRegistry writes composed_skills/composed_skills.json (a
+    # dict keyed by name), NOT a top-level composed_skills.json list
+    # (composed_skills.py: storage_dir = base/'composed_skills').
+    macros = home / "system" / "memory" / "composed_skills" / "composed_skills.json"
     try:
         if macros.exists():
-            data = json.loads(macros.read_text()) or []
+            data = json.loads(macros.read_text()) or {}
             out["proposed_macros"] = sum(
-                1 for m in data if (m.get("status") == "proposed"))
+                1 for m in data.values() if (m.get("status") == "proposed"))
     except Exception:
         pass
     return out
@@ -262,6 +289,15 @@ def main() -> int:
     items = load_trackb_pairs()
     all_records: List[Dict[str, Any]] = []
     all_artifacts: List[Dict[str, Any]] = []
+    out = Path(args.report_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    def _checkpoint():
+        """Persist after each repeat: a multi-hour run's end-of-run-only
+        write lost the whole dataset on any crash / Ctrl-C (found 2026-07-15;
+        trackb2 checkpointed per-arm for exactly this reason)."""
+        (out / "trackb3_artifacts.json").write_text(json.dumps(all_artifacts, indent=2))
+        (out / "trackb3_records.json").write_text(json.dumps(all_records, indent=2))
 
     async def _driver():
         for rep in range(args.repeats):
@@ -282,16 +318,16 @@ def main() -> int:
             all_records.extend(t_recs); all_records.extend(c_recs)
             arts["control"] = c_art
             all_artifacts.append(arts)
+            _checkpoint()
 
-    asyncio.run(_driver())
-
-    report = _b3_report(all_records, all_artifacts, {"harness": "trackb3",
-                                                     "time_scale": args.time_scale,
-                                                     "idle_epochs": args.idle_epochs})
-    out = Path(args.report_dir)
-    (out / "trackb3_report.md").write_text(report)
-    (out / "trackb3_artifacts.json").write_text(json.dumps(all_artifacts, indent=2))
-    (out / "trackb3_records.json").write_text(json.dumps(all_records, indent=2))
+    try:
+        asyncio.run(_driver())
+    finally:
+        _checkpoint()
+        report = _b3_report(all_records, all_artifacts, {"harness": "trackb3",
+                                                         "time_scale": args.time_scale,
+                                                         "idle_epochs": args.idle_epochs})
+        (out / "trackb3_report.md").write_text(report)
     AE._log(f"B3 report written to {out}")
     print(report)
     return 0

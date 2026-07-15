@@ -7748,7 +7748,7 @@ class GhostAgent:
                     await self._record_episode_safe(last_user_content, list(tools_run_this_turn), final_ai_content)
         # Post-turn hydration usefulness judge (fire-and-forget, worker-
         # hosted): scores which injected memories the reply actually used.
-        self._judge_hydration_safe(final_ai_content)
+        self._judge_hydration_safe(final_ai_content, turn_id=str(req_id or ""))
 
         # Retrieval feedback: a clean, non-failing turn credits
         # any lesson surfaced in the last ~5min. Hoisted out of
@@ -8903,6 +8903,13 @@ class GhostAgent:
                                             else getattr(self.context,
                                                          "llm_client", None)),
                                 context_budget=4000,
+                                # Stamp the stash so only THIS turn's judge
+                                # consumes it, and keep the active session's
+                                # own stored history out of the PAST
+                                # CONVERSATIONS tier.
+                                turn_id=str(req_id or ""),
+                                exclude_session_id=str(
+                                    body.get("session_id") or ""),
                             )
                             if fetched_context:
                                 fetched_context = fetched_context.replace("\r", "")
@@ -10411,7 +10418,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # Post-turn hydration usefulness judge (fire-and-
                             # forget, worker-hosted) — every finalized turn,
                             # matching the non-streaming site.
-                            self._judge_hydration_safe(full_content)
+                            self._judge_hydration_safe(
+                                full_content, turn_id=str(req_id or ""))
 
                             # Retrieval feedback loop: credit lessons that
                             # were surfaced during this turn whenever the
@@ -12127,16 +12135,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             logger.warning("journal append('%s') failed: %s: %s",
                            kind, type(exc).__name__, exc)
 
-    def _judge_hydration_safe(self, ai_text) -> None:
+    def _judge_hydration_safe(self, ai_text, turn_id: str = "") -> None:
         """Fire-and-forget post-turn hydration usefulness judge.
 
         Consumes MemoryBus.last_hydration (set when this turn was hydrated)
         and spawns judge_hydration_usefulness on the worker, off the
         critical path — see core/bus.py for what it credits. No-op when
-        the turn wasn't hydrated. Never raises."""
+        the turn wasn't hydrated, and — via the ``turn_id`` stamp — when the
+        stash belongs to a DIFFERENT turn (overlapping-turn race, or this
+        turn skipped hydration while another's stash was live); consuming a
+        foreign stash misattributed usefulness observations (found
+        2026-07-15). Never raises."""
         bus = getattr(self.context, "memory_bus", None)
-        if bus is None or not getattr(bus, "last_hydration", None):
+        stash = getattr(bus, "last_hydration", None) if bus is not None else None
+        if not stash:
             return
+        if (turn_id and stash.get("turn_id")
+                and stash["turn_id"] != str(turn_id)):
+            return  # another turn's stash — its own judge will consume it
         judge = getattr(bus, "judge_hydration_usefulness", None)
         if not callable(judge):
             return
@@ -12147,6 +12163,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     str(ai_text or ""),
                     getattr(self.context, "llm_client", None),
                     getattr(getattr(self.context, "args", None), "model", "default") or "default",
+                    turn_id=str(turn_id or ""),
                 ),
                 name="hydration-judge",
             )

@@ -766,6 +766,80 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-15 — never-reviewed cohorts sweep + image-node auth (route timeout 8s→12s)
+Started from a live `verify → Worker Node (Nova): ReadTimeout` at exactly 8.0s. Root cause: a
+`route()` call that queues behind TWO worker calls (VERIFY firing alongside the request-start
+classifier burst) lands just over the 8s `_ROUTE_TIMEOUT_S`. Raised to **12s** (`core/llm.py`;
+still fails fast on a genuinely sick node — breaker trips at 3 strikes). The real lever is still
+more worker slots (operator: bump nova's `-np`); this is margin. Tests + docs updated.
+
+Then answered "what haven't we reviewed?" by cross-referencing §5B/§5C/§4 against the module
+inventory. Five never-reviewed cohorts: the **2026-07-14 memory upgrade** (biggest un-audited
+surface — bus/sessions/rrf_weights/dream write+read paths), the **2026-07-08 `_race_search_wave`**
+(only the fetch half was audited on 14i), the **2026-07-13 web-UI JS** rewrite, the clockwork repo
+copy, and the post-hunt GAIA/ablation scripts. Ran a 6-cohort Workflow (one read-only finder per
+cohort → one adversarial refuter per finding; 39 agents). **32/33 confirmed, 1 refuted**; fixed all
+32 with regression tests. The headline defects and fixes are tabulated in `docs/audit_fixes.html`
+(new §"Never-reviewed cohorts sweep"). Load-bearing ones:
+- **Memory read path (`core/bus.py`, `core/sessions.py`):** the PAST CONVERSATIONS tier surfaced
+  the CURRENT session's own history under a "NOT the current conversation" header (now excludes the
+  active `session_id`, threaded from the route); the `last_hydration` stash had no turn identity so
+  an overlapping/hydration-skipping turn misattributed the usefulness observations that train RRF
+  (now `turn_id`-stamped compare-and-consume); **session eviction was dead code** (`_evict` listed
+  via the clamped `list()`, slice always empty → unbounded growth; now globs by mtime) and the
+  message cap silently stopped truncating with ≥cap systems + accumulated thin-client system dupes.
+- **RRF learning loop (`core/rrf_weights.py`, `core/dream.py`):** the fit could collapse a
+  hand-tuned hot-path weight 2.0→0.1 from 3 correlated same-turn observations, mapped rate 0.5 to
+  1.55 (not base), and anchored on the previously-learned matrix making a floored cell sticky. Now:
+  anchored piecewise map (0.5→base), `min_obs_per_cell` 3→20, refit anchors on DEFAULTS; partial
+  `weights.json` deep-merges over defaults; the observations-ledger append/trim race is closed with
+  a shared `LEDGER_LOCK`.
+- **Dream writes (`core/dream.py`):** episode batches were marked consolidated on an UNPARSEABLE
+  worker reply (`extract_json_from_text`→`{}` ambiguity) → permanent loss (now requeues unless
+  `strategies` present); a synthesis byte-identical to a source fragment shared its md5 id so
+  `add()` no-op'd then the source-delete erased the only copy (now skips the delete on id collision);
+  provenance JSON was string-sliced → unparseable for ≥12 fragments (now caps the list).
+- **Search racing (`tools/search.py`):** race losers only asyncio-cancel while the `ddgs` thread
+  runs to the 18s timeout on the SHARED `to_thread` pool → starved every other `to_thread` user
+  (now a dedicated bounded executor); co-completed loser exceptions retrieved (no ERROR "never
+  retrieved" spam); circuit tags fold in a per-process nonce + time bucket (a retried query no
+  longer rides the same dead exits); full-timeout hangs re-bucketed empty→timeout; a 4-5-word
+  question no longer "reformulates" to itself.
+- **Web face (`interface/static/app.js`):** WebSocket reconnect could orphan a live socket (double
+  log processing + multiplying chains) — `connectWebSocket` now coalesces in-flight connects and
+  tears down the old socket; the stale ICON_CLASS map (WARN/tool glyphs → "think" floor after the
+  wide-base glyph migration) regenerated and pinned by a Python↔JS drift test (`?v=` → 3.8).
+- **Scripts:** B4's `_wait_arm_quiet` counted self-play "request finished" markers → the
+  timeout-bleed guard proceeded into a still-busy treatment arm (HIGH within the harness); driver
+  turns now carry a collision-proof `dv` request-id tag ('v'∉hex, distinct from sub-/sched-/job-)
+  and only their own END frames count — needed a symmetric optional `request_id` on trackb2's
+  `_post`. GAIA `accuracy` excluded errored tasks from the denominator + `--boot` had no port/
+  liveness preflight (would score a stale foreign agent); trackb3 `_learning_artifacts` read
+  filenames the agent never writes (`graduated_skills.json`→`auto_skills.json`,
+  `composed_skills.json`→`composed_skills/composed_skills.json`); B3/B4 wrote records only at
+  end-of-run (crash lost hours — now checkpointed per repeat) and rendered boot-failed arms as
+  silent zero-yield (now flagged, keep/flip verdict warns); `bash_top_user` injected a
+  non-dominant winner (correct answers scored FAILED — burst 12→30, verified 0 losses/ties/2000 seeds).
+- **NOT fixed (deliberate):** the clockwork_ghost repo copy's 6 findings — the live device runs a
+  newer `face/` package the repo lacks (the repo copy is superseded/non-functional); fixing it
+  belongs on the offline device, not the stale repo copy.
+
+**Image-gen node auth** (closes the §4B "no auth on 0.0.0.0 GPU servers" residual, image half; TTS/STT
+skipped — currently offline). The Jetson node bound `0.0.0.0` with no auth while a generation
+monopolises the GPU ~30-60s. Added fleet `X-Ghost-Key` auth (`GHOST_API_KEY` env → `~/Data/AI/.ghost_api_key`
+→ refuse-to-start; checked BEFORE readiness gates; `/health`+`/ready` stay open); agent stamps the key
+only on the `image_gen` httpx pool (`core/llm.py` `node_api_key` from `--api-key`). Deployed the repo
+copy (which was STALE — it still had the old Mac SDXL server; the device had the hardened Jetson SD1.5
+version, now reconciled + auth added). First restart hit the known NvMap/CUDACachingAllocator OOM from
+teardown overlap → hardened the loader into a retry-with-backoff (5×20s) that clears the stale
+`_load_error` on success, instead of parking until a manual bounce. Verified live: `/health` open,
+`/generate` 401 without key / 200 with, authenticated end-to-end generation returned a 205KB PNG.
+
+New test files: `test_unreviewed_cohorts_20260715.py`, `test_ablation_scripts_20260715.py`,
+`test_imggen_node_auth.py`, `test_web_icon_map_drift.py`. Suite **7757 passed** / 12 skipped / 1 xfailed
+(`env -u FORCE_COLOR`). **Needs prod restart** for the memory-read/write, RRF, search, and image-pool-key
+changes (done: local agent redeployed via plain-kill; Jetson node restarted by operator).
+
 ### 2026-07-14m — browser click fail-fast: impossible selectors no longer eat the repair turn
 Operator spotted it in the live log: two WebOS repair turns (3D 18:53, 7C 19:03) died at the same
 wall — `click .wp-option` → `TimeoutError: Page.click: Timeout 30000ms exceeded` ×2 → no-progress

@@ -162,7 +162,9 @@ class MemoryBus:
                               max_chars: int = 6000,
                               rrf_k: int = 60,
                               context_budget: int = 0,
-                              llm_client: Any = None) -> str:
+                              llm_client: Any = None,
+                              turn_id: str = "",
+                              exclude_session_id: str = "") -> str:
         """Concurrently query Vector / Graph / Skill / Episodic memories and
         fuse the results with Reciprocal Rank Fusion. Returns a Markdown block
         (or an empty string when nothing is available).
@@ -196,31 +198,28 @@ class MemoryBus:
         sub_queries = await self._decompose_query(query, llm_client)
 
         # Fan-out retrieval for each sub-query in parallel
-        all_ranked_lists = []
         fetch_coros = []
         for sq in sub_queries:
-            fetch_coros.append(self._fetch_all_tiers(sq))
+            fetch_coros.append(
+                self._fetch_all_tiers(sq, exclude_session_id=exclude_session_id))
         tier_results_per_query = await asyncio.gather(*fetch_coros)
 
-        # Flatten all tier results into a single ranked list set
-        combined_vector, combined_graph, combined_skill, combined_episodic, combined_session = [], [], [], [], []
-        for vector_items, graph_items, skill_items, episodic_items, session_items in tier_results_per_query:
-            combined_vector.extend(vector_items)
-            combined_graph.extend(graph_items)
-            combined_skill.extend(skill_items)
-            combined_episodic.extend(episodic_items)
-            combined_session.extend(session_items)
-
-        # Deduplicate by text content
-        combined_vector = self._dedup_items(combined_vector)
-        combined_graph = self._dedup_items(combined_graph)
-        combined_skill = self._dedup_items(combined_skill)
-        combined_episodic = self._dedup_items(combined_episodic)
-        combined_session = self._dedup_items(combined_session)
+        # One ranked list PER (sub-query, tier). RRF's keyed accumulation
+        # both dedups (same (source, text) key sums, not duplicates) and
+        # rewards cross-sub-query consensus — an item found by all sub-
+        # queries outranks one found by only the first. The previous
+        # concatenate-then-dedup kept only the FIRST occurrence, nullifying
+        # the consensus boost that is the point of RAG-Fusion, and ranked a
+        # later sub-query's best hit below the first sub-query's worst
+        # (found 2026-07-15).
+        ranked_lists = [tier_list
+                        for tier_lists in tier_results_per_query
+                        for tier_list in tier_lists
+                        if tier_list]
 
         intent = self._classify_query_intent(query)
         fused = self._reciprocal_rank_fusion(
-            [combined_vector, combined_graph, combined_skill, combined_episodic, combined_session],
+            ranked_lists,
             k=rrf_k, intent=intent,
             weight_overrides=self._intent_weights,
         )
@@ -238,16 +237,21 @@ class MemoryBus:
             logger.debug(f"MemoryBus surfaced-credit failed (non-critical): {e}")
         # Stash this turn's injected items for the post-turn usefulness
         # judge. Timestamped so a turn that dies before finalization can't
-        # leak stale survivors into the next turn's judgment.
+        # leak stale survivors into the next turn's judgment, and stamped
+        # with the turn id so an overlapping turn's judge (or a turn that
+        # skipped hydration) can't consume another turn's stash and
+        # misattribute usefulness observations (found 2026-07-15).
         self.last_hydration = (
-            {"intent": intent, "survivors": survivors, "ts": time.time()}
+            {"intent": intent, "survivors": survivors, "ts": time.time(),
+             "turn_id": str(turn_id or "")}
             if survivors else None
         )
         return out
 
     async def judge_hydration_usefulness(self, reply: str, llm_client: Any,
                                          model_name: str = "default",
-                                         max_age_s: float = 600.0) -> int:
+                                         max_age_s: float = 600.0,
+                                         turn_id: str = "") -> int:
         """Post-turn usefulness judge — closes the retrieval feedback loop.
 
         ``_credit_surfaced`` credits items for ENTERING the prompt, which is
@@ -263,10 +267,17 @@ class MemoryBus:
           to the ledger consumed by the dream cycle's RRF-weight refit — so
           the learned fusion matrix tracks real usefulness, not surfacing.
 
-        Consumes ``self.last_hydration``. Returns the number of items judged
-        used; never raises.
+        Consumes ``self.last_hydration`` — but only when it belongs to this
+        turn: with both ``turn_id`` and the stash's stamp non-empty and
+        different, the stash is another (overlapping) turn's and is left for
+        its owner's judge. Returns the number of items judged used; never
+        raises.
         """
-        state, self.last_hydration = self.last_hydration, None
+        state = self.last_hydration
+        if (state is not None and turn_id and state.get("turn_id")
+                and state["turn_id"] != str(turn_id)):
+            return 0  # another turn's stash — not ours to consume
+        self.last_hydration = None
         if (not state or not state.get("survivors") or not reply
                 or llm_client is None):
             return 0
@@ -348,9 +359,15 @@ class MemoryBus:
             )
 
             def _append():
-                self.usefulness_ledger_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(self.usefulness_ledger_path, "a", encoding="utf-8") as f:
-                    f.write(lines)
+                # LEDGER_LOCK: the dream refit trim-rewrites this file; an
+                # unsynchronised append raced the rewrite and was lost.
+                from .rrf_weights import LEDGER_LOCK
+                with LEDGER_LOCK:
+                    self.usefulness_ledger_path.parent.mkdir(parents=True,
+                                                             exist_ok=True)
+                    with open(self.usefulness_ledger_path, "a",
+                              encoding="utf-8") as f:
+                        f.write(lines)
 
             try:
                 await asyncio.to_thread(_append)
@@ -379,14 +396,14 @@ class MemoryBus:
             except Exception as e:
                 logger.debug(f"skill record_retrievals_bulk failed: {e}")
 
-    async def _fetch_all_tiers(self, query: str):
+    async def _fetch_all_tiers(self, query: str, exclude_session_id: str = ""):
         """Fetch from all memory tiers for a single query."""
         return await asyncio.gather(
             self._fetch_vector(query),
             self._fetch_graph(query),
             self._fetch_skill(query),
             self._fetch_episodic(query),
-            self._fetch_session(query),
+            self._fetch_session(query, exclude_session_id=exclude_session_id),
         )
 
     @staticmethod
@@ -617,20 +634,29 @@ class MemoryBus:
             return []
         return [{"source": "episodic", "text": formatted.strip()}]
 
-    async def _fetch_session(self, query: str) -> List[Dict[str, Any]]:
+    async def _fetch_session(self, query: str,
+                             exclude_session_id: str = "") -> List[Dict[str, Any]]:
         """Raw-conversation tier: keyword hits from stored sessions.
 
         The lowest-abstraction tier (NapMem-style raw layer): durable
         server-side conversations were previously replay-only. One RRF item
         per matching message, prefixed with the session title so the model
-        can tell WHICH past conversation it came from."""
+        can tell WHICH past conversation it came from.
+
+        ``exclude_session_id`` filters out the ACTIVE session: its file
+        already holds turns 1..N-1 of the current conversation and is always
+        the most-recently-updated, so without the filter a follow-up turn
+        surfaced its own history under a header asserting it is NOT the
+        current conversation (found 2026-07-15)."""
         if not self.sessions:
             return []
         search = getattr(self.sessions, "search_messages", None)
         if not callable(search):
             return []
         try:
-            hits = await asyncio.to_thread(search, query, 5)
+            # Over-fetch slightly so filtering the active session out
+            # doesn't shrink the tier below its 5-item budget.
+            hits = await asyncio.to_thread(search, query, 8)
         except Exception as e:
             logger.warning(f"MemoryBus session fetch failed: {type(e).__name__}: {e}")
             return []
@@ -638,12 +664,17 @@ class MemoryBus:
         for h in hits or []:
             if not isinstance(h, dict) or not h.get("text"):
                 continue
+            if (exclude_session_id
+                    and str(h.get("session_id") or "") == str(exclude_session_id)):
+                continue
             title = str(h.get("title") or "untitled")[:60]
             items.append({
                 "source": "session",
                 "text": f"[{title}] {h.get('role', 'user')}: {h['text']}",
                 "session_id": h.get("session_id"),
             })
+            if len(items) >= 5:
+                break
         return items
 
     # ----------------------------------------------------------------- RRF

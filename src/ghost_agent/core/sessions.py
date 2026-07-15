@@ -138,6 +138,15 @@ def merge_history(stored: List[dict], incoming: List[dict]) -> List[dict]:
         if all(_key(a) == _key(b)
                for a, b in zip(stored, incoming[:len(stored)])):
             return list(incoming)   # fat client — already carries the history
+    # A thin client re-sends its system prompt every turn; appending it each
+    # time grew an unbounded run of duplicate system messages (and eventually
+    # bypassed append_turn's history cap). Keep only system messages we don't
+    # already hold verbatim.
+    stored_systems = {str(m.get("content") or "") for m in stored
+                      if m.get("role") == "system"}
+    incoming = [m for m in incoming
+                if not (m.get("role") == "system"
+                        and str(m.get("content") or "") in stored_systems)]
     return list(stored) + list(incoming)
 
 
@@ -341,11 +350,15 @@ class SessionStore:
         sess.messages.extend(new_msgs)
         # Bound the stored history: keep leading system messages + the most
         # recent tail (mirrors the agent's own 500-message hard cap).
+        # ``keep`` must be clamped: with >= MAX systems, ``rest[-0:]`` is the
+        # WHOLE tail and a negative keep re-grows it — the cap silently
+        # stopped truncating (found 2026-07-15).
         if len(sess.messages) > MAX_MESSAGES_PER_SESSION:
             systems = [m for m in sess.messages if m.get("role") == "system"]
             rest = [m for m in sess.messages if m.get("role") != "system"]
-            sess.messages = systems + rest[-(MAX_MESSAGES_PER_SESSION
-                                             - len(systems)):]
+            keep = max(0, MAX_MESSAGES_PER_SESSION - len(systems))
+            sess.messages = (systems[:MAX_MESSAGES_PER_SESSION]
+                             + (rest[-keep:] if keep else []))
         if not sess.title:
             sess.title = derive_title(sess.messages)
         sess.updated_at = _now()
@@ -354,11 +367,18 @@ class SessionStore:
         return ok
 
     def _evict(self) -> None:
-        """Drop the least-recently-updated sessions past ``MAX_SESSIONS``."""
+        """Drop the least-recently-updated sessions past ``MAX_SESSIONS``.
+
+        Enumerates the files directly: ``list()`` clamps its limit at
+        ``MAX_SESSIONS``, so going through it can never SEE the overflow —
+        the slice past the cap was always empty and eviction was dead code
+        (found 2026-07-15). File mtime tracks ``updated_at``: every update
+        rewrites the file."""
         try:
-            sessions = self.list(limit=MAX_SESSIONS + 50)
-            for s in sessions[MAX_SESSIONS:]:
-                self.delete(s["id"])
+            paths = sorted(self.root.glob("*.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+            for p in paths[MAX_SESSIONS:]:
+                self.delete(p.stem)
         except Exception as e:  # noqa: BLE001
             logger.debug("session eviction skipped: %s", e)
 

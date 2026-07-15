@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=3.7';
+import * as matrixGraphFace from './matrix_graph.js?v=3.8';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -88,10 +88,16 @@ const safeStorage = {
 //   plan    — planning, routing, context assembly
 //   think   — raw LLM thinking / replies (the floor; easily overwritten)
 //   idle    — system-idle states
+// Keys mirror utils/logging.py's Icons class. The Python glyphs were
+// migrated to wide-base (non-VS16) forms — WARN ⚠️→🔶, SHIELD 🛡️→🔒,
+// CUT ✂️→🔻, etc. This map was regenerated to match (2026-07-15); the old
+// two-codepoint VS16 keys ('⚠️','🛡️',…) were unreachable anyway because
+// extractIcon's \p{Extended_Pictographic} match strips the trailing U+FE0F.
 const ICON_CLASS = {
     // --- lifecycle / status (accent) ---
     '⚡': 'accent',   // SYSTEM_BOOT
     '🚀': 'accent',   // SYSTEM_READY
+    '🌅': 'accent',   // BOOT_AWAKE
     '💤': 'idle',     // SYSTEM_SHUT
     '😴': 'idle',
     '🎬': 'accent',   // REQ_START
@@ -99,23 +105,32 @@ const ICON_CLASS = {
     '⏳': 'accent',   // REQ_WAIT
     '✅': 'accent',   // OK
     '❌': 'accent',   // FAIL
-    '⚠️': 'accent',   // WARN
+    '🔶': 'accent',   // WARN
     '🛑': 'accent',   // STOP
     '🔄': 'accent',   // RETRY
     '💡': 'accent',   // IDEA
     '🐛': 'accent',   // BUG
-    '🛡️': 'accent',   // SHIELD
+    '🔒': 'accent',   // SHIELD
+    '📣': 'accent',   // NOTIFY_OUT
+    '🪞': 'accent',   // SELF_STATE
+    '🎓': 'accent',   // SKILL_GRADUATE
 
     // --- tools (external action) ---
     '🌐': 'tool',     // TOOL_SEARCH
+    '🌎': 'tool',     // TOOL_BROWSER
+    '🧅': 'tool',     // TOOL_DARKWEB
     '🔬': 'tool',     // TOOL_DEEP
     '🐍': 'tool',     // TOOL_CODE
     '🐚': 'tool',     // TOOL_SHELL
-    '⬇️': 'tool',     // TOOL_DOWN
-    '🎨': 'tool',     // Image Gen
-    '📥': 'tool',     // Docker pull
-    '📦': 'tool',     // Package install
-    '⚙️': 'tool',     // Sandbox init
+    '📥': 'tool',     // TOOL_DOWN / Docker pull
+    '🎨': 'tool',     // IMAGE_GEN
+    '📄': 'tool',     // REPORT_PDF
+    '🎮': 'tool',     // GAME_MOVE
+    '🎲': 'tool',     // UNCERTAINTY_DIE
+    '🧪': 'tool',     // VERIFIER_LAB
+    '📦': 'tool',     // SANDBOX_BOX
+    '🔧': 'tool',     // NODE_WORKER
+    '🛸': 'tool',     // NODE_EDGE
 
     // --- memory / filesystem ---
     '💾': 'memory',   // TOOL_FILE_W
@@ -126,27 +141,43 @@ const ICON_CLASS = {
     '🔎': 'memory',   // MEM_READ
     '📍': 'memory',   // MEM_MATCH
     '📚': 'memory',   // MEM_INGEST
-    '✂️': 'memory',   // MEM_SPLIT / CUT
-    '🧬': 'memory',   // MEM_EMBED
+    '📑': 'memory',   // MEM_SPLIT
+    '🔻': 'memory',   // CUT
+    '🧬': 'memory',   // MEM_EMBED / VECTOR_EMBED
     '🧹': 'memory',   // MEM_WIPE
-    '🗒️': 'memory',   // MEM_SCRATCH
+    '📔': 'memory',   // MEM_SCRATCH
+    '💪': 'memory',   // MEM_REINFORCE
+    '📇': 'memory',   // MEM_INDEX
+    '📓': 'memory',   // MEM_LIBRARY
+    '🪢': 'memory',   // GRAPH_WEB
+    '🧾': 'memory',   // BELIEF_SCALES
+    '📶': 'memory',   // THRESHOLD_TUNE
+    '🎥': 'memory',   // EPISODE_REEL
+    '📡': 'memory',   // ACTIVITY / EVENT_BUS
     '👤': 'memory',   // USER_ID
+    '🐘': 'memory',   // POSTGRES
 
     // --- planning / routing ---
     '📋': 'plan',     // BRAIN_PLAN
     '🧩': 'plan',     // BRAIN_CTX
     '🧭': 'plan',     // BRAIN_ROUTE
     '🎯': 'plan',     // BRAIN_AIM
+    '🌳': 'plan',     // MCTS_TREE
+    '🔗': 'plan',     // CONSTRAINT
 
     // --- raw thinking (the floor) ---
     '🧠': 'think',    // BRAIN_SUM — the one that was drowning everything
     '💭': 'think',    // BRAIN_THINK
-    '🗣️': 'think',    // LLM_ASK
+    '💬': 'think',    // LLM_ASK
     '🤖': 'think',    // LLM_REPLY
+
+    // --- idle / skipped ---
+    '⏩': 'idle',     // SKIP
+    '🌙': 'plan',     // DREAM
+    '🫀': 'idle',     // HEARTBEAT — biological watchdog, routine
 
     // --- misc ---
     '🫥': 'accent',   // MODE_GHOST
-    '🐘': 'memory',   // POSTGRES
     '🔥': 'accent',
 };
 
@@ -280,7 +311,21 @@ function setConnectionState(state, label) {
     if (statusText && label) statusText.textContent = label;
 }
 
+let _wsReconnectTimer = null;
 function connectWebSocket() {
+    // Coalesce overlapping triggers (the 3s onclose timer races the
+    // visibilitychange/pageshow handlers). Without this, a second call
+    // overwrote `ws` while the first socket stayed open and un-torn-down —
+    // an orphan that kept firing onmessage (every log line processed twice)
+    // and spawned its own onclose reconnect chain, multiplying sockets.
+    if (ws && (ws.readyState === WebSocket.CONNECTING
+               || ws.readyState === WebSocket.OPEN)) {
+        return;
+    }
+    if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
+    // Detach the old socket's handlers before replacing it so a late
+    // onclose from the previous socket can't schedule a duplicate reconnect.
+    if (ws) { ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null; }
     setConnectionState('pending', 'CONNECTING…');
     ws = new WebSocket(wsUrl);
     ws.onopen = () => {
@@ -331,7 +376,8 @@ function connectWebSocket() {
     };
     ws.onclose = () => {
         setConnectionState('error', 'DISCONNECTED');
-        setTimeout(connectWebSocket, 3000);
+        if (_wsReconnectTimer) clearTimeout(_wsReconnectTimer);
+        _wsReconnectTimer = setTimeout(connectWebSocket, 3000);
     };
 }
 
@@ -512,7 +558,7 @@ function extractIcon(logLine) {
 // accent, so a full neon here would drag the whole theme bright again.
 const _ICON_CLASS_COLOR = {
     accent_ok:   '#128a52',  // ✅ emerald
-    accent_err:  '#a3123a',  // ❌ 🛑 ⚠️ crimson red
+    accent_err:  '#a3123a',  // ❌ 🛑 🔥 crimson red (WARN 🔶 is routine, stays accent)
     accent:      '#2f55d4',  // ⚡ 🚀 🎬 🏁 electric blue
     tool:        '#6d28d9',  // vivid violet
     memory:      '#2f7d4a',  // sea green
@@ -525,7 +571,7 @@ function getIconColor(icon) {
     // Error/success get special sub-colors — they're visually the
     // most meaningful accent events the user can see flash by.
     if (icon === '✅') return _ICON_CLASS_COLOR.accent_ok;
-    if (icon === '❌' || icon === '🛑' || icon === '⚠️' || icon === '🔥') {
+    if (icon === '❌' || icon === '🛑' || icon === '🔥') {
         return _ICON_CLASS_COLOR.accent_err;
     }
     return _ICON_CLASS_COLOR[_iconClass(icon)] || _ICON_CLASS_COLOR.think;

@@ -27,9 +27,24 @@
   <table>
     <thead><tr><th>Method · Path</th><th>Behaviour</th></tr></thead>
     <tbody>
-      <tr><td>POST /generate · POST / · POST /v1/images/generations</td><td>Body: <code>{"prompt", "negative_prompt", "steps"}</code>. Steps clamped 3-8. Guidance 1.5. 832×1216 output. Returns <code>{"time": float, "data": [{"b64_json": ...}]}</code>.</td></tr>
+      <tr><td>POST /generate · POST /v1/images/generations</td><td>Body: <code>{"prompt", "negative_prompt", "steps", "width", "height", "size", "seed", "clip_skip"}</code>. Requires <code>X-Ghost-Key</code>. Size clamped to a VRAM-safe pixel budget. Returns <code>{"data": [{"b64_json": ...}]}</code>.</td></tr>
+      <tr><td>GET /health · GET /ready</td><td>Unauthenticated. <code>/health</code> reports <code>{ok, ready, load_error}</code>; <code>/ready</code> is 200 when the model is loaded, 503 while warming, 500 on load failure.</td></tr>
     </tbody>
   </table>
+
+  <div class="note">
+    <strong>Auth (2026-07-15).</strong> The deployed node (the Jetson, SD1.5 / CyberRealistic —
+    this page still describes the earlier Mac SDXL variant elsewhere) binds <code>0.0.0.0</code> on the
+    LAN and a generation monopolises the GPU for ~30–60s, so <code>/generate</code> now requires the
+    fleet <code>X-Ghost-Key</code> (the same key the agent's own API uses; resolved from
+    <code>GHOST_API_KEY</code> env, else <code>~/Data/AI/.ghost_api_key</code>, else the server refuses to
+    start — an explicit <code>GHOST_API_KEY=''</code> knowingly disables it on a trusted network). Auth is
+    checked <em>before</em> the readiness gates, so an unauthenticated caller can never probe warmup/GPU
+    state. Monitoring endpoints (<code>/health</code>, <code>/ready</code>) stay open. The agent stamps the
+    key only on its <code>image_gen</code> httpx pool (llama.cpp pools don't check keys). A post-restart
+    CUDA-teardown OOM now retries with backoff instead of parking until a manual bounce. Covered by
+    <code>tests/test_imggen_node_auth.py</code>.
+  </div>
 
   <h2>Model &amp; scheduler</h2>
   <ul>

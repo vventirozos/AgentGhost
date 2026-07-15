@@ -49,12 +49,17 @@ def _socks5h(tor_proxy: str) -> str:
 # returned [2.7, 2.8, 5.3, 5.3]s), so a route() call that queues behind one other
 # worker call (query expansion + classifiers/gates fire together at request
 # start/finalize) lands at ~5.3s — just over a 5s ceiling, producing the residual
-# `Nova: ReadTimeout` lines even on the LAN. 8s absorbs ONE queued call while
-# still failing fast on a genuinely sick node (the circuit breaker trips after 3
-# strikes). The real fix is more worker slots (operator: bump nova's -np); this
-# is the margin that keeps the value flowing until then. Losing the expansion
-# only costs a slightly cruder retrieval query, never correctness.
-_ROUTE_TIMEOUT_S = 8.0
+# `Nova: ReadTimeout` lines even on the LAN. 8s absorbed ONE queued call, but a
+# call that queues behind TWO (verify fired mid-request alongside the
+# start/finalize burst) still died at exactly 8.0s — observed live 2026-07-14:
+#     +37.7s  worker compute      verify → Worker Node (Nova)
+#     +45.7s  worker node failed  Nova: ReadTimeout — trying next
+# 12s clears that double-queued case (~2×5.3s) while still failing fast on a
+# genuinely sick node (the circuit breaker trips after 3 strikes). The real fix
+# is more worker slots (operator: bump nova's -np); this is the margin that
+# keeps the value flowing until then. Losing the expansion only costs a
+# slightly cruder retrieval query, never correctness.
+_ROUTE_TIMEOUT_S = 12.0
 
 
 class OffMainNodeUnavailable(Exception):
@@ -249,7 +254,7 @@ class RoutingTask:
 
 
 class LLMClient:
-    def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, swarm_nodes: Optional[list] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None, critic_nodes: Optional[list] = None):
+    def __init__(self, upstream_url: str, tor_proxy: Optional[str] = None, swarm_nodes: Optional[list] = None, worker_nodes: Optional[list] = None, visual_nodes: Optional[list] = None, coding_nodes: Optional[list] = None, image_gen_nodes: Optional[list] = None, critic_nodes: Optional[list] = None, node_api_key: Optional[str] = None):
         self.upstream_url = upstream_url
         limits = httpx.Limits(max_keepalive_connections=3, max_connections=15, keepalive_expiry=30.0)
 
@@ -381,7 +386,10 @@ class LLMClient:
                     proxy=get_proxy(node["url"]),
                     trust_env=False,
                     follow_redirects=True,
-                    http2=False
+                    http2=False,
+                    # The image node checks the fleet key (it binds 0.0.0.0 on
+                    # the LAN); llama.cpp pools don't, so only this pool sends it.
+                    headers={"X-Ghost-Key": node_api_key} if node_api_key else None,
                 )
                 self.image_gen_clients.append({
                     "client": client,

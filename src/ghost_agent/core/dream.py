@@ -1,6 +1,7 @@
 # src/ghost_agent/core/dream.py
 
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -1346,11 +1347,31 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                             break
                 _syn_meta = {"type": "synthesis"}
                 if _prov:
-                    _syn_meta["provenance"] = json.dumps(_prov, ensure_ascii=False)[:1800]
+                    # Cap the LIST, not the serialized string: slicing the
+                    # JSON at 1800 chars made it unparseable for ~12+
+                    # fragments — exactly the biggest consolidations, whose
+                    # sources are deleted below (found 2026-07-15).
+                    _pj = json.dumps(_prov, ensure_ascii=False)
+                    while _prov and len(_pj) > 1800:
+                        _prov = _prov[:-1]
+                        _pj = json.dumps(_prov, ensure_ascii=False)
+                    if _prov:
+                        _syn_meta["provenance"] = _pj
+                # VectorMemory.add no-ops on len<5 and keys by md5(text): a
+                # synthesis byte-identical to one of its sources shares that
+                # source's id, so add() dedup-no-ops and deleting the id
+                # would erase the only surviving copy (found 2026-07-15).
+                if len(str(synthesis).strip()) < 5:
+                    pretty_log("Dream Skip",
+                               "Skipped consolidation: synthesis too short to store",
+                               icon=Icons.SKIP)
+                    continue
+                _syn_id = hashlib.md5(str(synthesis).encode("utf-8")).hexdigest()
                 await asyncio.to_thread(self.memory.add, synthesis, _syn_meta)
                 applied_consolidations += 1
                 if merged_ids:
                     ids_to_delete = [mid.split(":")[-1].strip() for mid in merged_ids]
+                    ids_to_delete = [i for i in ids_to_delete if i and i != _syn_id]
                     if ids_to_delete:
                         await asyncio.to_thread(self.memory.collection.delete, ids=ids_to_delete)
 
@@ -1540,12 +1561,16 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
 
         Reads the observations ledger written by the post-turn hydration
         judge (``MemoryBus.judge_hydration_usefulness``), fits via
-        ``rrf_weights.fit_intent_weights`` (anchored on the bus's current
-        effective weights; thin cells keep their base), persists to the
-        ``rrf/weights.json`` main.py loads at boot, and hot-swaps the
+        ``rrf_weights.fit_intent_weights`` anchored on the HAND-TUNED
+        defaults — anchoring on the bus's current learned matrix made a
+        driven-down cell sticky: once a weight hit the floor its source
+        rarely surfaced, generated no fresh observations, and every later
+        thin refit re-inherited the floor (found 2026-07-15). Persists to
+        the ``rrf/weights.json`` main.py loads at boot, and hot-swaps the
         matrix onto the live bus. Trims the ledger when it exceeds
-        ``max_ledger_lines``. Sync (runs in a thread). Returns True when
-        a refit was applied."""
+        ``max_ledger_lines``; read and trim hold ``LEDGER_LOCK`` so a
+        concurrent judge append can't be dropped by the rewrite. Sync
+        (runs in a thread). Returns True when a refit was applied."""
         bus = getattr(self.context, "memory_bus", None)
         ledger = getattr(bus, "usefulness_ledger_path", None) if bus else None
         if not ledger:
@@ -1554,37 +1579,37 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
         ledger = _Path(ledger)
         if not ledger.exists():
             return False
-        try:
-            lines = ledger.read_text(encoding="utf-8").splitlines()
-        except Exception:
-            return False
-        obs = []
-        for line in lines[-max_ledger_lines:]:
+        from .rrf_weights import (fit_intent_weights, save_intent_weights,
+                                  DEFAULT_INTENT_WEIGHTS, LEDGER_LOCK)
+        with LEDGER_LOCK:
             try:
-                d = json.loads(line)
-                obs.append((str(d["intent"]), str(d["source"]), bool(d["success"])))
+                lines = ledger.read_text(encoding="utf-8").splitlines()
             except Exception:
-                continue
-        if len(obs) < min_observations:
-            return False
-        from .rrf_weights import fit_intent_weights, save_intent_weights
-        from .bus import MemoryBus as _MB
-        base = getattr(bus, "_intent_weights", None) or _MB._INTENT_WEIGHTS
-        fitted = fit_intent_weights(obs, base=base)
-        try:
-            save_intent_weights(ledger.parent / "weights.json", fitted)
-        except Exception as e:
-            logger.debug("rrf weights save failed: %s", e)
-        bus._intent_weights = fitted  # hot swap for the running process
-        # Trim the ledger so it can't grow unboundedly.
-        if len(lines) > max_ledger_lines:
+                return False
+            obs = []
+            for line in lines[-max_ledger_lines:]:
+                try:
+                    d = json.loads(line)
+                    obs.append((str(d["intent"]), str(d["source"]), bool(d["success"])))
+                except Exception:
+                    continue
+            if len(obs) < min_observations:
+                return False
+            fitted = fit_intent_weights(obs, base=DEFAULT_INTENT_WEIGHTS)
             try:
-                tmp = ledger.with_suffix(".tmp")
-                tmp.write_text("\n".join(lines[-keep_lines:]) + "\n", encoding="utf-8")
-                import os as _os
-                _os.replace(tmp, ledger)
+                save_intent_weights(ledger.parent / "weights.json", fitted)
             except Exception as e:
-                logger.debug("rrf ledger trim failed: %s", e)
+                logger.debug("rrf weights save failed: %s", e)
+            bus._intent_weights = fitted  # hot swap for the running process
+            # Trim the ledger so it can't grow unboundedly.
+            if len(lines) > max_ledger_lines:
+                try:
+                    tmp = ledger.with_suffix(".tmp")
+                    tmp.write_text("\n".join(lines[-keep_lines:]) + "\n", encoding="utf-8")
+                    import os as _os
+                    _os.replace(tmp, ledger)
+                except Exception as e:
+                    logger.debug("rrf ledger trim failed: %s", e)
         return True
 
     async def _consolidate_episodes(self, model_name: str,
@@ -1683,11 +1708,22 @@ Return ONLY valid JSON:
                 payload, use_worker=True, is_background=True, timeout=180.0,
                 task_label="dream",
             )
-            result = extract_json_from_text(data["choices"][0]["message"]["content"]) or {}
+            result = extract_json_from_text(data["choices"][0]["message"]["content"])
         except Exception as ce:
             # Transient worker failure: leave the batch unmarked so it
             # retries next cycle instead of being lost invisibly.
             logger.debug(f"Episode consolidation worker call failed (batch kept queued): {ce}")
+            return 0
+
+        # extract_json_from_text returns {} on EVERY failure mode, which is
+        # indistinguishable from a considered-and-empty verdict — marking on
+        # that permanently consumed the batch on a garbage reply, violating
+        # the mark-only-after-successful-parse contract (found 2026-07-15).
+        # Only a parsed object that actually carries "strategies" counts as
+        # considered; anything else requeues like a transport failure.
+        if not isinstance(result, dict) or "strategies" not in result:
+            logger.debug(
+                "Episode consolidation reply unparseable (batch kept queued)")
             return 0
 
         learned = 0

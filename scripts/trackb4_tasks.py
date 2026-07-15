@@ -452,11 +452,17 @@ def _ex_bash_users(fx):
 
 
 def _fx_bash_top_user(rng):  # hard shape — most active user (unique by construction)
+    # The winner MUST dominate every base user. _app_log spreads 220 lines
+    # over users 1-25 (~8.8 each, single-user max ~13-16 and occasionally
+    # ~20), so the old 12-line burst LOST in ~98% of seeds and tied the true
+    # top in ~24% — the task then scored a correct answer FAILED (found
+    # 2026-07-15). 30 burst lines clears any plausible base spike with margin;
+    # the winner is outside the 1-25 base range so it gets exactly the burst.
     log = _app_log(rng)
     winner = f"user{rng.randint(50, 80)}"  # outside the 1-25 base range
     extra = "\n".join(
         f"2026-07-09T0{rng.randint(0, 9)}:30:00 INFO user={winner} msg=burst{i}"
-        for i in range(12))
+        for i in range(30))
     return {"app.log": log + extra + "\n"}
 
 

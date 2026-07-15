@@ -80,9 +80,11 @@ class TestRouteTimeoutSizing:
     def test_timeout_absorbs_a_queued_worker_call_but_stays_bounded(self):
         # Warm query-expansion is ~2.3s uncontended, but on a small-`-np`
         # worker a route() call that queues behind one other lands at ~5.3s
-        # (measured -np 2). The ceiling must clear that queued case (>5.3s) yet
-        # still fail fast on a genuinely sick node — 8s does both.
-        assert 5.3 < _ROUTE_TIMEOUT_S <= 12.0
+        # (measured -np 2), and behind TWO at just over 8s (verify died at
+        # exactly 8.0s live, 2026-07-14). The ceiling must clear that
+        # double-queued case (>8s) yet still fail fast on a genuinely sick
+        # node — 12s does both.
+        assert 8.0 < _ROUTE_TIMEOUT_S <= 12.0
 
     def test_startup_wires_the_warmup_non_blocking(self):
         from pathlib import Path

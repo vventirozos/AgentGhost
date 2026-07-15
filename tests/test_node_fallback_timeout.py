@@ -130,7 +130,7 @@ class TestRouteNeverHitsMain:
         assert out == "LEGACY"
 
     def test_route_timeout_is_short(self):
-        assert _ROUTE_TIMEOUT_S <= 8.0
+        assert _ROUTE_TIMEOUT_S <= 12.0
 
 
 # ══════════════════════════════════════════════════════════════════════

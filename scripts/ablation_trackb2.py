@@ -40,13 +40,19 @@ CONTROL_FLAGS = ["--no-memory"]
 _CKPT = Path("/tmp/ablation_trackb2_ckpt.json")
 
 
-async def _post(url: str, messages: List[Dict[str, str]], model: str, timeout: float):
+async def _post(url: str, messages: List[Dict[str, str]], model: str, timeout: float,
+                request_id: str = None):
     import httpx
     payload = {"model": model, "stream": False, "messages": messages}
+    # X-Request-ID becomes the agent's req_id (agent.py: `request_id or uuid`),
+    # letting a driver attribute log frames to its OWN turns and not to
+    # interleaved self-play turns.
+    headers = {"X-Request-ID": request_id} if request_id else None
     t0 = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.post(f"{url.rstrip('/')}/v1/chat/completions", json=payload)
+            r = await client.post(f"{url.rstrip('/')}/v1/chat/completions",
+                                  json=payload, headers=headers)
             r.raise_for_status()
             data = r.json()
     except Exception as e:
