@@ -133,7 +133,26 @@
   </ul>
 
   <h3>req_id collision handling (2026-07-14 bug hunt)</h3>
-  <p><code>req_id</code> can be a CLIENT-supplied <code>X-Request-ID</code> (the route reads the header), so two overlapping requests can carry the same id. The old registry overwrote the live entry unconditionally and popped by key, so <code>/api/turns</code> hid the first turn, <code>cancel("X")</code> flagged the SECOND turn (cancelling B killed running A), and A's <code>finally</code> evicted B's entry. Fixed: <code>register()</code> never clobbers a live entry — it uniquifies the new key (<code>X#2</code>, …) and <code>handle_chat</code> adopts the effective id; <code>unregister()</code> is IDENTITY-CHECKED (pops only if the stored object is this turn). <strong>Known residual (§4C):</strong> the STREAMING final-generation tail returns its generator inside the semaphore block, so the tail runs after the lock releases and after unregister — uncancellable and invisible to <code>/api/turns</code> (the single upstream slot is still protected by foreground-marking). Tests: <code>tests/test_turn_registry_collision.py</code>.</p>
+  <p><code>req_id</code> can be a CLIENT-supplied <code>X-Request-ID</code> (the route reads the header), so two overlapping requests can carry the same id. The old registry overwrote the live entry unconditionally and popped by key, so <code>/api/turns</code> hid the first turn, <code>cancel("X")</code> flagged the SECOND turn (cancelling B killed running A), and A's <code>finally</code> evicted B's entry. Fixed: <code>register()</code> never clobbers a live entry — it uniquifies the new key (<code>X#2</code>, …) and <code>handle_chat</code> adopts the effective id; <code>unregister()</code> is IDENTITY-CHECKED (pops only if the stored object is this turn). Tests: <code>tests/test_turn_registry_collision.py</code>.</p>
+
+  <h3>Streaming tail stays cancellable (2026-07-15)</h3>
+  <p>The STREAMING final-generation path returns a generator from inside the
+  semaphore block, so the actual upstream stream runs while the client drains
+  it — after <code>handle_chat</code>'s <code>finally</code> has already run. That
+  <code>finally</code> unregistered the turn the instant the generator was
+  returned (before a single token streamed), so the tail was invisible to
+  <code>/api/turns</code> and uncancellable. Fixed: the streaming path wraps its
+  generator so the <code>unregister</code> is DEFERRED into the wrapper's own
+  <code>finally</code> (runs when the drain completes), and the stream loop now
+  checks <code>is_cancelled</code> each chunk — a cooperative cancel stops
+  emitting mid-stream and finalization still runs on the partial text.</p>
+  <p>The <code>agent_semaphore</code> is deliberately <em>not</em> held across the
+  drain (diverging from the original fix sketch): <code>stream_chat_completion</code>
+  already counts <code>foreground_tasks</code> for the whole stream, so the single
+  upstream slot isn't stolen, whereas holding the permit until the generator
+  drains would couple turn serialization to <strong>client read speed</strong> — a
+  stalled reader would block every later turn, a worse failure mode than the one
+  being fixed. Tests: <code>tests/test_streaming_tail_cancellable.py</code>.</p>
 
   <h2>Tests</h2>
   <p><code>tests/test_sessions_and_cancel.py</code> (48) — the merge contract

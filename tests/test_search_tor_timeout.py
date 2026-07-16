@@ -17,15 +17,33 @@ import pytest
 
 from ghost_agent.tools.search import (
     _DDGS_TOR_TIMEOUT,
+    _DDGS_FAST_ENGINE_TIMEOUT,
+    _engine_timeout,
     tool_search_ddgs,
     tool_deep_research,
 )
 
+# Valid per-engine timeouts (2026-07-15): mojeek keeps the full budget; the
+# fast engines get a shorter ceiling. Both must stay well above the old unsafe
+# 8s that killed mojeek mid-request.
+_VALID_TIMEOUTS = {_DDGS_TOR_TIMEOUT, _DDGS_FAST_ENGINE_TIMEOUT}
+
 
 def test_timeout_clears_mojeek_tor_latency():
-    # mojeek over Tor was measured at ~10-18s; 8s killed it. The constant
-    # must comfortably clear that — never regress below the safe floor.
+    # mojeek over Tor was measured at ~10-18s; 8s killed it. mojeek must
+    # comfortably clear that — never regress below the safe floor. The fast
+    # engines' shorter ceiling must still clear their ~1-6s fail window.
+    assert _engine_timeout("mojeek") >= 15
     assert _DDGS_TOR_TIMEOUT >= 15
+    assert _DDGS_FAST_ENGINE_TIMEOUT >= 10
+
+
+def test_mojeek_keeps_full_budget_fast_engines_shorter():
+    assert _engine_timeout("mojeek") == _DDGS_TOR_TIMEOUT
+    for eng in ("yahoo", "yandex", "brave", "google", "duckduckgo"):
+        assert _engine_timeout(eng) == _DDGS_FAST_ENGINE_TIMEOUT
+    # An unknown engine falls back to the fast (conservative) ceiling.
+    assert _engine_timeout("somenewengine") == _DDGS_FAST_ENGINE_TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -39,9 +57,12 @@ async def test_web_search_passes_safe_timeout_to_ddgs(mock_find_spec, mock_ddgs)
 
     await tool_search_ddgs("integrated information theory transformers", None)
 
-    # DDGS(...) constructor must receive the measured-safe timeout.
+    # EVERY DDGS(...) construction must receive a valid per-engine timeout —
+    # none left on the old unsafe 8s ceiling.
     assert mock_ddgs.call_args is not None
-    assert mock_ddgs.call_args.kwargs.get("timeout") == _DDGS_TOR_TIMEOUT
+    timeouts = {c.kwargs.get("timeout") for c in mock_ddgs.call_args_list}
+    assert timeouts and timeouts <= _VALID_TIMEOUTS
+    assert min(timeouts) >= _DDGS_FAST_ENGINE_TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -64,7 +85,9 @@ async def test_deep_research_passes_safe_timeout_to_ddgs(
     await tool_deep_research("ai consciousness theories", tor_proxy="socks5://127.0.0.1:9050")
 
     assert mock_ddgs.call_args is not None
-    assert mock_ddgs.call_args.kwargs.get("timeout") == _DDGS_TOR_TIMEOUT
+    timeouts = {c.kwargs.get("timeout") for c in mock_ddgs.call_args_list}
+    assert timeouts and timeouts <= _VALID_TIMEOUTS
+    assert min(timeouts) >= _DDGS_FAST_ENGINE_TIMEOUT
 
 
 @pytest.mark.asyncio
@@ -79,7 +102,8 @@ async def test_reformulation_also_uses_safe_timeout(mock_find_spec, mock_ddgs):
 
     await tool_search_ddgs("a query that yields nothing anywhere", None)
 
-    # EVERY DDGS() construction (primary attempts + reformulations) used the
-    # safe timeout — no call site left on the old 8s ceiling.
+    # EVERY DDGS() construction (primary attempts + reformulations) used a
+    # valid per-engine timeout — no call site left on the old 8s ceiling.
     timeouts = {c.kwargs.get("timeout") for c in mock_ddgs.call_args_list}
-    assert timeouts == {_DDGS_TOR_TIMEOUT}
+    assert timeouts and timeouts <= _VALID_TIMEOUTS
+    assert min(timeouts) >= _DDGS_FAST_ENGINE_TIMEOUT

@@ -77,7 +77,7 @@ class ReadOnlyVectorMemory(_ReadOnlyProxy):
         "add", "smart_update", "ingest_document", "process_batch",
         "bump_retrievals", "bump_helpful", "forget_episode",
         "delete_document_by_name", "correct_fragment", "delete_fragment",
-        "delete_by_query",
+        "delete_by_query", "delete_skill_twins",
         # legacy guessed names kept harmless in case an external caller used them
         "add_memory", "delete_memory", "forget",
     })

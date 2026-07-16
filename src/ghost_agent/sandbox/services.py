@@ -112,18 +112,28 @@ def publishable_service_ports(spec: Optional[str] = None) -> list:
     return [p for p in default_service_ports(spec) if _port_free(p)]
 
 
-def is_published_port(port: int, spec: Optional[str] = None) -> bool:
-    """True when docker publishes ``port`` to the host loopback, i.e. it's in
-    the configured ``GHOST_SANDBOX_SERVICE_PORTS`` range (bridge mode). Only
-    such a port is reachable at ``127.0.0.1:<port>`` on the host — and thus a
-    candidate for remote exposure. A port outside the range never leaves the
-    container, so we don't offer to serve it. (Uses the CONFIGURED range, not
-    the runtime-free subset: whether it was free at container-create time is
-    what actually got published, and that's already reflected on the host.)"""
+def is_published_port(port: int, spec: Optional[str] = None,
+                      published_ports: Optional[set] = None) -> bool:
+    """True when docker publishes ``port`` to the host loopback — reachable at
+    ``127.0.0.1:<port>`` on the host and thus a candidate for remote exposure.
+
+    ``published_ports`` is the set docker ACTUALLY published for the live
+    container (from the docker manager). When supplied it is authoritative;
+    pass it whenever a manager is in reach. It matters in the ≥2-instance case
+    (2026-07-15): a second agent — a throwaway for an ablation, the test suite
+    — filters the already-taken ports out of its publish list, so it publishes
+    NOTHING, yet the configured-range fallback below would still report the
+    port as published and point the operator at the FIRST instance's forwarder.
+    With no manager in reach, we fall back to the CONFIGURED range (the old
+    behaviour): the single-instance common case, where free-at-create ⇒
+    published."""
     try:
-        return int(port) in set(default_service_ports(spec))
+        p = int(port)
     except Exception:
         return False
+    if published_ports is not None:
+        return p in published_ports
+    return p in set(default_service_ports(spec))
 
 
 def remote_access_hint(port: int) -> str:
@@ -208,6 +218,16 @@ class ServiceSupervisor:
         os.replace(tmp, self._registry_path)
 
     # -- container helpers ---------------------------------------------------
+
+    def _published_ports(self) -> Optional[set]:
+        """The set docker ACTUALLY published for the live container, or None
+        when unknown (no container created yet) — passed to is_published_port
+        so a second instance that published nothing doesn't claim the first
+        instance's ports (2026-07-15)."""
+        try:
+            return self.sandbox.published_service_ports()
+        except Exception:
+            return None
 
     def _exec(self, cmd: str, timeout: int = 30):
         out, code = self.sandbox.execute(cmd, timeout=timeout)
@@ -500,7 +520,7 @@ class ServiceSupervisor:
             lines.append(
                 f"In-sandbox URL: http://127.0.0.1:{port} — the browser and "
                 f"execute tools reach it there (listening ✓).")
-            if is_published_port(port):
+            if is_published_port(port, published_ports=self._published_ports()):
                 lines.append(remote_access_hint(port))
         lines.append(
             f"Logs: action='logs' name='{name}' · stop: action='stop'. "
@@ -639,7 +659,8 @@ class ServiceSupervisor:
                     _lp = self._port_listening(e['port'])
                     part += (f", http://127.0.0.1:{e['port']} "
                              f"{'listening ✓' if _lp else 'NOT listening ✗'}")
-                    if _lp and is_published_port(e['port']):
+                    if _lp and is_published_port(
+                            e['port'], published_ports=self._published_ports()):
                         part += (f" · remote: {REMOTE_SERVE_SCRIPT} "
                                  f"{e['port']}")
                 else:

@@ -1,0 +1,213 @@
+[
+  {
+    "repeat": 0,
+    "treatment": {
+      "lessons_by_source": {
+        "perfection_protocol": 2,
+        "self_play": 1
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 40,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 0.75
+    },
+    "treatment_uniform": {
+      "lessons_by_source": {
+        "perfection_protocol": 2,
+        "self_play": 1
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 40,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 0.96875
+    },
+    "control": {
+      "lessons_by_source": {
+        "perfection_protocol": 3
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 39,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 1.0
+    }
+  },
+  {
+    "repeat": 1,
+    "treatment": {
+      "lessons_by_source": {
+        "self_play": 1
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 40,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 0.84375
+    },
+    "treatment_uniform": {
+      "lessons_by_source": {
+        "self_play": 1
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 40,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 0.15625
+    },
+    "control": {
+      "lessons_by_source": {
+        "perfection_protocol": 1
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 39,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 1.0
+    }
+  },
+  {
+    "repeat": 2,
+    "treatment": {
+      "lessons_by_source": {
+        "perfection_protocol": 3,
+        "self_play": 1
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 6,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 39,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 1.0
+    },
+    "treatment_uniform": {
+      "lessons_by_source": {
+        "perfection_protocol": 1,
+        "self_play": 1
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 40,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 1.0
+    },
+    "control": {
+      "lessons_by_source": {
+        "perfection_protocol": 3
+      },
+      "graduated_skills": 0,
+      "proposed_macros": 0,
+      "seed_instrumentation": {
+        "failed_trajectories_after_seed": 0,
+        "frontier_clusters_after_seed": {},
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 7,
+        "smart_memory_requeues": 0
+      },
+      "log_counts_final": {
+        "auto_memory_stores": 0,
+        "dream_entropy_skips": 0,
+        "bus_hydrations": 39,
+        "smart_memory_requeues": 0
+      },
+      "mediation_rate": 1.0
+    }
+  }
+]

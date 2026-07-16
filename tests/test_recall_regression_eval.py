@@ -97,6 +97,30 @@ def env(tmp_path_factory):
     return SimpleNamespace(vm=vm, bus=bus)
 
 
+class TestVectorMatchGate:
+    """The proactive-injection vector gate (2026-07-15): a query with no
+    strong match injects nothing, but the recall TOOL path (no gate) stays
+    best-effort."""
+
+    def test_off_topic_gated_to_empty(self, env):
+        # No golden/distractor item is a strong match for this — the gate
+        # returns [].
+        assert env.vm.search_items("what is the weather like on mars today",
+                                   inject_identity=False,
+                                   min_relevance_dist=0.42) == []
+
+    def test_on_topic_survives_the_gate(self, env):
+        items = env.vm.search_items("which chess opening does the user prefer",
+                                    inject_identity=False, min_relevance_dist=0.42)
+        assert any("Alekhine" in (it.get("text") or "") for it in items)
+
+    def test_tool_path_is_best_effort_without_gate(self, env):
+        # Same off-topic query with NO gate (the recall tool path) still
+        # returns its best-effort matches — an explicit ask is answered.
+        assert env.vm.search_items("what is the weather like on mars today",
+                                   inject_identity=False) != []
+
+
 class TestVectorTier:
     def test_every_golden_fact_is_reachable(self, env):
         """Each seeded fact must be retrievable by at least one paraphrase
@@ -151,18 +175,18 @@ class TestHydrationEndToEnd:
             "the llama server crashed with a metal assert during restart")
         assert "llama" in out.lower()
 
-    @pytest.mark.xfail(
-        reason="KNOWN GAP (measured 2026-07-14): bus._RELEVANCE_FLOOR is 0.0 "
-               "and the vector tier's distance gate admits weak matches in a "
-               "small store, so an off-topic query hydrates most of the corpus. "
-               "Tuning the floor should be driven by the usefulness ledger "
-               "(rrf/observations.jsonl), not guessed — when the gates are "
-               "tightened this test flips to xpass and the marker comes off.",
-        strict=False,
-    )
     async def test_off_topic_query_does_not_surface_golden_facts(self, env):
         """The relevance gates must keep unrelated memories out of the
-        prompt — injection of everything would also 'pass' hit-rate tests."""
-        out = await env.bus.hydrate_context("what is the weather like on mars today")
-        assert "Alekhine" not in out
-        assert "EACCES" not in out
+        prompt — injection of everything would also 'pass' hit-rate tests.
+
+        FIXED 2026-07-15 (was xfail): the fix is NOT the RRF _RELEVANCE_FLOOR
+        (measured incapable — RRF scores discard embedding distance), but the
+        vector best-match gate `_VECTOR_MATCH_FLOOR`: an off-topic query whose
+        closest vector item is beyond ~0.42 injects no vector context. Several
+        off-topic queries checked so the gate isn't overfit to one phrasing."""
+        for q in ("what is the weather like on mars today",
+                  "how do quantum computers factor integers",
+                  "recipe for chocolate chip cookies"):
+            out = await env.bus.hydrate_context(q)
+            assert "Alekhine" not in out, f"off-topic {q!r} surfaced a golden fact"
+            assert "EACCES" not in out, f"off-topic {q!r} surfaced a golden fact"

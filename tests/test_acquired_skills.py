@@ -171,6 +171,29 @@ async def test_tool_manage_skills_list(temp_dirs):
     assert "skill_a" in result
     assert "cool skill" in result
 
+
+@pytest.mark.asyncio
+async def test_manage_skills_list_is_complete_and_compact(temp_dirs, tmp_path):
+    """The list must be the COMPLETE custom inventory (acquired + composed) and
+    steer the model away from re-tabulating every built-in tool (2026-07-15)."""
+    from ghost_agent.tools.acquired_skills import tool_manage_skills
+    sandbox_dir = temp_dirs["sandbox"]
+    mem = tmp_path / "memory"
+    (mem / "composed_skills").mkdir(parents=True)
+    (mem / "composed_skills" / "composed_skills.json").write_text(json.dumps({
+        "deploy_and_verify": {"trigger_description": "deploy then check health",
+                              "status": "active"}}))
+    AcquiredSkillManager(mem, MagicMock()).save_skill("acq1", "an acquired one", {}, "")
+
+    result = await tool_manage_skills(sandbox_dir=sandbox_dir, memory_dir=mem,
+                                      memory_system=None, action="list")
+    # Both custom categories present in one call.
+    assert "acq1" in result and "an acquired one" in result
+    assert "deploy_and_verify" in result and "deploy then check health" in result
+    # The footer steers away from the verbose built-in-tool dump.
+    assert "BUILT-IN" in result
+    assert "full schema" in result
+
 @pytest.mark.asyncio
 async def test_tool_manage_skills_delete(temp_dirs):
     from ghost_agent.tools.acquired_skills import tool_manage_skills

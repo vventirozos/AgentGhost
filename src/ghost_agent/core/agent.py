@@ -8311,6 +8311,16 @@ class GhostAgent:
         # address THIS turn's entry, not the colliding one.
         req_id = _active_turn.req_id
 
+        # A STREAMED turn hands the caller a generator and returns; the actual
+        # upstream final-generation streams while the caller drains it, AFTER
+        # this method's finally has already run. If the finally unregistered
+        # the turn there, the streaming tail was invisible to /api/turns and
+        # uncancellable (2026-07-15). When the streaming path takes ownership
+        # it sets this flag so the finally DEFERS the unregister to the stream
+        # wrapper's own finally (which runs when the drain completes). The
+        # semaphore is NOT similarly deferred on purpose — see the wrapper.
+        _stream_owns_unregister = False
+
         try:
             async with self.agent_semaphore:
                 _turn_reg.mark_running(req_id)
@@ -10031,6 +10041,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                             async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
                                 if loop_detected: break
+                                # Cooperative cancel boundary (2026-07-15): the
+                                # turn stays registered for the whole drain now,
+                                # so /api/turn/cancel can flag it mid-stream —
+                                # stop emitting on the next chunk. Finalization
+                                # after the loop still runs on the partial text.
+                                if _turn_reg.is_cancelled(req_id):
+                                    break
                                 self.context.last_activity_time = datetime.datetime.now() # Heartbeat
 
                                 # Decode FIRST so we can decide whether to
@@ -10444,7 +10461,30 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 except Exception:
                                     pass
 
-                        return stream_wrapper(), created_time, req_id
+                        # Keep THIS turn registered — visible in /api/turns and
+                        # cancellable — for the WHOLE streamed drain, then
+                        # unregister when the client finishes reading. The outer
+                        # finally used to unregister the instant handle_chat
+                        # returned this generator (before a single token
+                        # streamed), so the tail was invisible + uncancellable
+                        # and could overlap the next turn (2026-07-15). The
+                        # agent_semaphore is deliberately NOT held across the
+                        # drain: stream_chat_completion already counts
+                        # foreground_tasks for the whole stream (the single LLM
+                        # slot isn't stolen), and holding the permit would couple
+                        # turn serialization to CLIENT read speed — a stalled
+                        # reader would then block every later turn.
+                        _stream_owns_unregister = True
+
+                        async def _stream_then_unregister(_gen):
+                            try:
+                                async for _chunk in _gen:
+                                    yield _chunk
+                            finally:
+                                _turn_reg.unregister(req_id, _active_turn)
+
+                        return (_stream_then_unregister(stream_wrapper()),
+                                created_time, req_id)
 
                     # Ensure msg is always defined in this scope
                     msg = {"role": "assistant", "content": "", "tool_calls": []}
@@ -11587,7 +11627,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         finally:
             # Identity-checked: only evict OUR entry (req_id may collide with
             # a concurrent turn's client-supplied id — see TurnRegistry).
-            _turn_reg.unregister(req_id, _active_turn)
+            # A streamed turn defers this to its stream wrapper's finally so the
+            # tail stays cancellable/visible for the whole drain (2026-07-15);
+            # every non-streamed exit path still unregisters here.
+            if not _stream_owns_unregister:
+                _turn_reg.unregister(req_id, _active_turn)
             if 'messages' in locals(): del messages
             if 'tools_run_this_turn' in locals(): del tools_run_this_turn
             if 'sandbox_state' in locals(): del sandbox_state

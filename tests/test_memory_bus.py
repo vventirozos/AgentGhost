@@ -125,7 +125,9 @@ def test_extract_query_terms_caps_and_does_not_append_user():
 async def test_hydrate_context_fans_out_in_parallel(bus, mocks):
     """All three subsystems must be queried for a single hydrate call."""
     out = await bus.hydrate_context("tell me about my dog")
-    mocks["vector"].search_items.assert_called_once_with("tell me about my dog")
+    # search_items now carries the proactive-injection relevance gate (2026-07-15).
+    mocks["vector"].search_items.assert_called_once_with(
+        "tell me about my dog", min_relevance_dist=MemoryBus._VECTOR_MATCH_FLOOR)
     mocks["graph"].get_neighborhood.assert_called_once()
     mocks["skill"].get_playbook_items.assert_called_once()
     # Combined Markdown contains markers from each section.

@@ -23,6 +23,30 @@ logger = logging.getLogger("GhostAgent")
 _SAFE_SKILL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
+def _list_composed_skills(memory_dir) -> list:
+    """(name, description) for each composed skill (a named macro), read from
+    the ComposedSkillRegistry's JSON so a single ``manage_skills(action=list)``
+    returns the COMPLETE custom-skill inventory (acquired + composed), not just
+    acquired (2026-07-15). Best-effort: returns [] on any problem."""
+    if not memory_dir:
+        return []
+    try:
+        path = Path(memory_dir) / "composed_skills" / "composed_skills.json"
+        if not path.exists():
+            return []
+        data = json.loads(path.read_text()) or {}
+        out = []
+        for name, sd in data.items():
+            if not isinstance(sd, dict):
+                continue
+            out.append((str(name),
+                        str(sd.get("trigger_description")
+                            or sd.get("description") or "")))
+        return out
+    except Exception:
+        return []
+
+
 class SkillNameError(ValueError):
     """Raised when a skill name fails the identifier-shape check."""
 
@@ -643,14 +667,33 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
         logger.debug("retire_degraded_skills skipped: %s", _re)
     if action == "list":
         skills = mgr.get_all_skills()
-        if not skills:
-            return "No custom skills have been acquired yet."
-        
-        result = "Custom Skills:\n"
-        for name, info in skills.items():
-            result += f"- {name}: {info.get('description', '')}\n"
-        return result
-        
+        composed = _list_composed_skills(memory_dir)
+
+        parts = []
+        if skills:
+            parts.append("Acquired skills (custom Python tools):")
+            for name, info in skills.items():
+                parts.append(f"- {name}: {info.get('description', '')}")
+        if composed:
+            parts.append("Composed skills (named macros):")
+            for name, desc in composed:
+                parts.append(f"- {name}: {desc}")
+        if not parts:
+            body = "No custom skills have been acquired or composed yet."
+        else:
+            body = "\n".join(parts)
+        # Compact footer so the model answers "list all your skills" from THIS
+        # authoritative call instead of re-tabulating every built-in tool from
+        # its schema — which blew the token budget before it reached the custom
+        # skills (2026-07-15). The built-in tools are always available; they
+        # don't need enumerating with full schemas to answer this question.
+        footer = ("\n\nYour BUILT-IN tools (execute, browser, file_system, "
+                  "search, knowledge_base, manage_projects, …) are standing "
+                  "capabilities, always available — summarise them by category "
+                  "if asked; do NOT reproduce each tool's full schema.")
+        return body + footer
+
+
     elif action == "delete":
         if not skill_name:
             return "Error: skill_name is required for 'delete' action."

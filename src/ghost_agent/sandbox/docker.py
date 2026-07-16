@@ -66,6 +66,10 @@ class DockerSandbox:
         self.tor_proxy = tor_proxy
         self.container = None
         self.image = "python:3.11-slim-bookworm"
+        # The service ports docker ACTUALLY published for the live container
+        # (loopback bridge-publish), set at (re)create. None until then →
+        # is_published_port falls back to the configured range (2026-07-15).
+        self._published_service_ports = None
         # Serializes ensure_running across threads. execute() is run via
         # asyncio.to_thread, so concurrent tool calls hit ensure_running
         # on different threads; without this they race container
@@ -85,6 +89,13 @@ class DockerSandbox:
         self._READY_TTL_S = 8.0
 
         pretty_log("Sandbox Init", f"Mounting {self.host_workspace} -> {CONTAINER_WORKDIR}", icon=Icons.SANDBOX_BOX)
+
+    def published_service_ports(self):
+        """The ports docker ACTUALLY published to the host loopback for the
+        live container, or None when unknown (no container created yet — the
+        caller then falls back to the configured range). getattr-guarded for
+        managers whose __init__ was bypassed in tests."""
+        return getattr(self, "_published_service_ports", None)
 
     def _ready_is_fresh(self) -> bool:
         # getattr defaults keep this safe when __init__ was bypassed (tests
@@ -286,6 +297,7 @@ class DockerSandbox:
                 # empty string disables). Host mode needs none (the service
                 # binds host ports directly). Only takes effect when the
                 # container is (re)created.
+                _published = set()
                 if run_kwargs.get("network_mode") == "bridge":
                     try:
                         from .services import publishable_service_ports
@@ -300,8 +312,13 @@ class DockerSandbox:
                                 f"{p}/tcp": ("127.0.0.1", p)
                                 for p in _svc_ports
                             }
+                        _published = set(_svc_ports)
                     except Exception as _spx:
                         logger.debug(f"service-port publish skipped: {_spx}")
+                # Record what was ACTUALLY published (may be empty for a 2nd
+                # instance) so is_published_port consults reality, not the
+                # configured range (2026-07-15). Host mode publishes none here.
+                self._published_service_ports = _published
 
                 # Check for cached environment image for instant boot.
                 # NB: never mutate self.image — it must stay the pullable

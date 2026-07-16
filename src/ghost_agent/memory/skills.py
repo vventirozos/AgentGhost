@@ -693,6 +693,24 @@ class SkillMemory:
             effective_anti = anti_pattern or mistake or ""
             effective_correct = correct_pattern or solution or ""
 
+            # Lesson-quality gate (2026-07-16): a MISTAKE-LESS entry (rule or
+            # observation) must read as an actionable heuristic. This is the
+            # single write chokepoint, so it covers every producer (dream,
+            # self-play, reflection, episode consolidation) — the autonomous
+            # loops were writing observations ("On a regex_parse task…", "The
+            # user prefers ripgrep") as pseudo-lessons that were 28% of playbook
+            # retrievals. Lessons that record a real mistake are genuine
+            # corrections and always pass; `verified` gets no bypass because it
+            # would only exempt a verified OBSERVATION (a verified fix has a
+            # mistake and passes; a verified actionable rule passes anyway).
+            from .lesson_quality import is_actionable_lesson
+            if not is_actionable_lesson(
+                    effective_anti, effective_correct, effective_trigger):
+                logger.debug(
+                    "learn_lesson: dropped non-actionable %s lesson: %r",
+                    source or "?", (effective_correct or effective_trigger)[:80])
+                return
+
             # Dedup uses legacy fields for compatibility with older
             # playbooks & vector entries written before the redesign.
             duplicate = self._find_duplicate_lesson(

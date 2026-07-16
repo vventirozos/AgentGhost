@@ -629,83 +629,11 @@ def detect_tool_patterns(skill_memory) -> list:
 
 
 # ── REM heuristic actionability gate ─────────────────────────────────
-# The REM prompt asks the (small, worker-hosted) model for imperative
-# behavioral rules, but in practice it also emits observations —
-# "The agent is capable of…", "The user has shown interest in…" — and
-# sometimes misattributes the OPERATOR's requests as agent tendencies.
-# Those land in SkillMemory as mistake="none" pseudo-lessons that match
-# no real query and pollute retrieval. Prompt instructions alone don't
-# hold against a small model, so a deterministic gate default-REJECTS
-# anything that doesn't read as an actionable rule.
-
-_HEURISTIC_MIN_LEN = 12
-_HEURISTIC_MAX_LEN = 600
-
-# Observation/profile openers — descriptive statements about an actor,
-# never instructions. Checked as a prefix of the normalised text.
-_HEURISTIC_SUBJECT_BLOCKLIST = (
-    "the agent", "this agent", "the user", "this user", "the system",
-    "this system", "the model", "the assistant", "the operator",
-    "agents ", "users ", "it is ", "there is ", "there are ",
-    "requests ", "the request",
-)
-
-# First word of an imperative rule ("Always wrap…", "Use absolute paths…").
-_HEURISTIC_IMPERATIVE_STARTERS = frozenset({
-    "always", "never", "prefer", "avoid", "use", "ensure", "verify",
-    "check", "validate", "wrap", "keep", "run", "add", "set", "treat",
-    "confirm", "do", "don't", "dont", "remember", "apply", "include",
-    "escape", "quote", "pin", "cap", "limit", "strip", "sanitize",
-    "sanitise", "batch", "cache", "log", "default", "force", "require",
-    "skip", "favor", "favour", "double-check", "re-read", "reread",
-    "test", "read", "write", "call", "pass", "return", "handle",
-    "guard", "normalize", "normalise", "convert", "parse", "split",
-    "sort", "restart", "close", "flush", "await", "retry", "escalate",
-    "ask", "state", "make", "stop", "start", "prefix", "compare",
-})
-
-# Conditional openers are only rules if an imperative/modal follows
-# ("When coaching chess, always name the threat" — yes;
-#  "When asked for news, the naftemporiki skill is used" — no).
-_HEURISTIC_CONDITIONAL_STARTERS = frozenset({
-    "when", "if", "while", "before", "after", "during", "on", "for",
-})
-
-_HEURISTIC_MODAL_RE = re.compile(
-    r"\b(?:should|must|always|never|use|avoid|prefer|ensure|verify|"
-    r"check|validate|wrap|keep|treat|confirm|do not|don'?t|re-?read|"
-    r"remember|require|limit|escalate|ask|state)\b",
-    re.IGNORECASE,
-)
-
-# No plain hyphen in the class: "double-check" / "re-read" must survive
-# as single starter tokens (em/en dashes still split).
-_HEURISTIC_FIRST_WORD_RE = re.compile(r"[\s,:;—–]+")
-
-
-def _is_actionable_heuristic(text) -> bool:
-    """True iff ``text`` reads as an imperative behavioral rule.
-
-    Default-reject: dream heuristics are a bonus learning channel (the
-    reflector and self-play lesson pipeline carry the real signal), so
-    a false reject costs little while a false accept pollutes the
-    playbook until utility pruning gets around to it.
-    """
-    if not isinstance(text, str):
-        return False
-    t = " ".join(text.split())
-    if not (_HEURISTIC_MIN_LEN <= len(t) <= _HEURISTIC_MAX_LEN):
-        return False
-    low = t.lower()
-    if any(low.startswith(prefix) for prefix in _HEURISTIC_SUBJECT_BLOCKLIST):
-        return False
-    first = _HEURISTIC_FIRST_WORD_RE.split(low, 1)[0]
-    if first in _HEURISTIC_IMPERATIVE_STARTERS:
-        return True
-    if first in _HEURISTIC_CONDITIONAL_STARTERS:
-        rest = low[len(first):]
-        return bool(_HEURISTIC_MODAL_RE.search(rest))
-    return False
+# Moved to memory/lesson_quality.py (2026-07-16) so the write chokepoint
+# (memory.skills.learn_lesson) can share the same gate without an import
+# cycle — the heuristics loop below and _consolidate_episodes still call
+# _is_actionable_heuristic exactly as before.
+from ..memory.lesson_quality import _is_actionable_heuristic  # noqa: E402,F401
 
 
 # Tools that should never anchor an auto-proposed macro: meta / control-flow

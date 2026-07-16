@@ -238,6 +238,32 @@ class TestIsPublishedPort:
         monkeypatch.setenv("GHOST_SANDBOX_SERVICE_PORTS", "")
         assert is_published_port(8100) is False
 
+    def test_actual_published_set_is_authoritative(self):
+        # The 2026-07-15 fix: a 2nd instance publishes NOTHING (all fixed ports
+        # taken), so the actual set is empty even though the port is in the
+        # configured range. The runtime set must win over the range fallback.
+        assert is_published_port(8100, published_ports=set()) is False
+        assert is_published_port(8100, published_ports={8100}) is True
+        # A port NOT in the actual set (published by another instance) is False
+        # even though it's a configured-range port.
+        assert is_published_port(8104, published_ports={8100}) is False
+
+    def test_none_published_set_falls_back_to_configured_range(self):
+        # Before any container is created the manager reports None → the old
+        # configured-range behaviour (single-instance common case) is preserved.
+        assert is_published_port(8100, published_ports=None) is True
+
+    def test_supervisor_consults_the_managers_published_set(self):
+        # A supervisor whose manager published NOTHING must not offer a remote
+        # hint for a configured-range port (the operator-misdirection bug).
+        from unittest.mock import MagicMock
+        from ghost_agent.sandbox.services import ServiceSupervisor
+        mgr = MagicMock()
+        mgr.published_service_ports.return_value = set()  # 2nd instance
+        sup = ServiceSupervisor(mgr)
+        assert sup._published_ports() == set()
+        assert is_published_port(8100, published_ports=sup._published_ports()) is False
+
 
 class TestRemoteAccessHint:
     def test_hint_names_the_serve_script_and_url_and_bind(self):

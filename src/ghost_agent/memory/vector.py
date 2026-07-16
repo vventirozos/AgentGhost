@@ -16,6 +16,21 @@ from ..utils.helpers import get_utc_timestamp
 
 logger = logging.getLogger("GhostAgent")
 
+# Give tqdm a THREADING lock before the embedder loads (2026-07-15). transformers
+# renders a "Loading weights" tqdm bar during `from_pretrained`, and tqdm's
+# default `get_lock()` creates a multiprocessing RLock — a NAMED posix semaphore
+# the resource_tracker never reclaims, so every SIGTERM (a plain-kill deploy)
+# printed `resource_tracker: 1 leaked semaphore` (traced to tqdm/std.py get_lock).
+# We never drive tqdm bars ACROSS PROCESSES, so a thread lock is sufficient and
+# the bars still render — this just stops the process-lock semaphore from being
+# created. Must run before any tqdm bar; this module is imported before the
+# embedder is instantiated.
+try:  # pragma: no cover - defensive; tqdm is a transformers dependency
+    import tqdm as _tqdm
+    _tqdm.tqdm.set_lock(threading.RLock())
+except Exception:  # noqa: BLE001
+    pass
+
 
 # ── Embedder ─────────────────────────────────────────────────────────
 #
@@ -762,7 +777,8 @@ class VectorMemory:
         except Exception as e:
             logger.debug(f"Helpful stats bump failed (non-critical): {e}")
 
-    def search_items(self, query: str, inject_identity: bool = True) -> list:
+    def search_items(self, query: str, inject_identity: bool = True,
+                     min_relevance_dist: Optional[float] = None) -> list:
         """Per-item variant of `search()` for the MemoryBus.
 
         Returns ``[{"id": <chroma id>, "text": <formatted line>, "score":
@@ -772,8 +788,22 @@ class VectorMemory:
         the model never saw (inflating the spaced-repetition half-life and
         the prune-survival ranking). The bus credits the survivors via
         `bump_retrievals` after fusion.
-        """
+
+        ``min_relevance_dist`` is the PROACTIVE-INJECTION relevance gate
+        (2026-07-15): when the CLOSEST candidate's raw embedding distance
+        exceeds it, the query has no strong semantic match here, so return
+        NOTHING rather than the weakly-related tail. Measured: on this
+        embedder (BGE-small) a genuine match lands < 0.40 while an off-topic
+        query's best match is ≥ 0.44, so the per-type thresholds admit the
+        same 0.44–0.58 noise for BOTH — the only real signal is the best
+        match's ABSOLUTE distance, which RRF's rank-derived scores discard.
+        Only the bus hydration path passes this; the recall TOOL leaves it
+        None (an explicit "what do you know about X" stays best-effort)."""
         selection = self._search_selection(query, inject_identity)
+        if min_relevance_dist is not None and selection:
+            best = min((it.get("dist", 99.0) for it in selection), default=99.0)
+            if best > min_relevance_dist:
+                return []
         return [
             {
                 "id": item.get("mem_id"),
@@ -1169,6 +1199,38 @@ class VectorMemory:
         except Exception as e:
             logger.warning("correct_fragment failed: %s", e, exc_info=True)
             return False, f"Error: {e}"
+
+    def delete_skill_twins(self, triggers):
+        """Delete the vector TWINS of the named skill lessons (documents with
+        ``type="skill"`` and a matching ``trigger``), in-process.
+
+        Built for cleaning up ORPHANED twins after a JSON-playbook prune: the
+        JSON is canonical, but a lesson removed from it leaves its embedded
+        twin behind (see skills.py ``_delete_lesson_twin`` — the same
+        precise metadata key). Runs inside the owning process for the usual
+        reason (a second PersistentClient against the live Chroma dir risks
+        HNSW corruption); exposed via POST /api/memory/delete_skill_twin.
+        Returns ``(removed_count, {"before", "after"})``; never raises.
+        """
+        removed = 0
+        try:
+            with self._get_lock():
+                before = self.collection.count()
+                for t in (triggers or []):
+                    trig = str(t or "")[:200]
+                    if not trig:
+                        continue
+                    where = {"$and": [{"type": "skill"}, {"trigger": trig}]}
+                    got = self.collection.get(where=where)
+                    n = len((got or {}).get("ids") or [])
+                    if n:
+                        self.collection.delete(where=where)
+                        removed += n
+                after = self.collection.count()
+            return removed, {"before": before, "after": after}
+        except Exception as e:  # noqa: BLE001 — advisory scrub, never fatal
+            logger.warning("delete_skill_twins failed: %s", e)
+            return removed, {"error": str(e)}
 
     def delete_fragment(self, match: str):
         """Surgically DELETE one stored fragment, in-process.

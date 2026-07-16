@@ -286,7 +286,7 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "manage_skills",
-            "description": "List or delete the agent's SKILLS — i.e. its custom acquired tools (Python tools created via `create_skill`). Use this EVERY TIME the user asks 'show me your skills', 'list your skills', 'what skills do you have', 'what custom tools do you have', 'forget skill X', or any variant about the agent's TOOLS / capabilities. Do NOT call this for 'lessons learned' / 'what have you learned' / 'show me the lesson playbook' — that means lessons (mistake-and-fix entries) and routes to `list_lessons`.",
+            "description": "List or delete the agent's SKILLS. `action='list'` returns the COMPLETE, COMPACT custom-skill inventory in ONE call — acquired tools (created via `create_skill`) AND composed macros — and is the AUTHORITATIVE answer to 'show me your skills', 'list your skills', 'what skills do you have', 'what custom tools do you have'. Call it EVERY TIME that's asked and answer FROM ITS OUTPUT: do NOT additionally reproduce every built-in tool with its full schema — that blows the token budget and truncates before the custom skills. The built-in tools are standing capabilities; summarise them by category if asked. Also handles 'forget skill X'. Do NOT call this for 'lessons learned' / 'what have you learned' / 'show me the lesson playbook' — that means lessons (mistake-and-fix entries) and routes to `list_lessons`.",
             "parameters": {
                 "type": "object",
                 "properties": {

@@ -1074,6 +1074,32 @@ async def memory_delete(request: Request):
     return {"ok": True, **detail}
 
 
+@router.post("/api/memory/delete_skill_twin", dependencies=[Security(verify_api_key)])
+async def memory_delete_skill_twin(request: Request):
+    """Delete the vector TWINS of named skill lessons (type=skill + trigger).
+
+    Cleanup companion for a JSON-playbook prune: the JSON is canonical, but a
+    lesson removed from it leaves its embedded twin behind. Runs in-process
+    (a second PersistentClient against the live Chroma dir risks HNSW
+    corruption). Body: {"triggers": [<trigger str>, ...]} (or {"trigger": …}).
+    """
+    agent = get_agent(request)
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError) as e:
+        return JSONResponse({"error": f"Invalid JSON: {e}"}, 400)
+    triggers = body.get("triggers")
+    if not triggers and body.get("trigger"):
+        triggers = [body["trigger"]]
+    if not isinstance(triggers, list) or not triggers:
+        return JSONResponse({"error": "body needs 'triggers' (list) or 'trigger'"}, 400)
+    memory = getattr(getattr(agent, "context", None), "memory_system", None)
+    if memory is None or not hasattr(memory, "delete_skill_twins"):
+        return JSONResponse({"error": "memory system unavailable"}, 503)
+    removed, detail = memory.delete_skill_twins(triggers)
+    return {"ok": True, "requested": len(triggers), "removed": removed, **detail}
+
+
 @router.post("/api/upload", dependencies=[Security(verify_api_key)])
 async def upload_file(request: Request, file: UploadFile = File(...)):
     agent = get_agent(request)

@@ -382,6 +382,15 @@ outcome-battery design (the harder task battery #4/#27b are blocked on — desig
   "Delete PRM" is still **not** triggered (self-play loop is productive either way), but "keep frontier
   BECAUSE it beats uniform" is **unproven**. Verdict needs more repeats + a HARDER task battery (see #4).
   **→ Battery designed 2026-07-09 with a pre-registered frontier verdict: §4D.**
+- **#4 — UPDATE 2026-07-16 (B4 re-run, §6): dependency chain narrowed to ONE blocker — battery
+  difficulty.** The 2026-07-09 chain was (a) battery too easy, (b) mediation ≈ 0, (c) dream starved.
+  This re-run (with the day's memory fixes) RESOLVED (b): mediation went ~1% → ~71-100% (retrieval
+  routing is fixed — the concrete win). With mediation healthy the outcome is a REAL null (treatment
+  = control = 98%, McNemar p=1.0) but CEILING-CONFOUNDED — you can't detect improvement at a 98%
+  baseline. So the idle-loop outcome question is now gated on ONLY (a): an expert-tier battery with
+  baseline < 80%. (c) dream-starvation persists (auto_memories(seed)=0; lessons come from self_play +
+  perfection_protocol, not dream). The single next step is the harder battery, NOT more repeats and
+  NOT more retrieval work. Prior updates below for history.
 - **#4 — UPDATE 2026-07-09 (B4 full run executed, §6): outcome question STILL open but now with a
   diagnosed dependency chain — (a) battery difficulty unsolved for this model below expert tier
   (re-ceilinged at 97% under run conditions; pilot difficulty was partly cross-pass memory
@@ -417,19 +426,17 @@ model-behavior edges.
 
 - **[2026-07-14 post-July-hunt cohort review] open residuals** (the CONFIRMED-and-fixed items are
   in §6's 2026-07-14b entry). Still open:
-  - **[concurrency] streaming final-generation tail escapes the semaphore + turn registry** (HIGH,
-    architectural) — `handle_chat` returns `stream_wrapper()` INSIDE `async with agent_semaphore`,
-    so the tail's upstream stream runs after the lock releases AND after `unregister`: two streaming
-    tails can overlap the serialized region, and the tail is uncancellable + invisible to
-    `/api/turns`/`/api/turn/cancel`. Practical blast radius is bounded — `_mark_foreground` covers
-    the whole streamed lifecycle so the single upstream slot isn't stolen; the real defect is
-    cancellability/visibility. Fix needs the route (or `stream_wrapper`) to hold the permit + defer
-    unregister until the generator drains, plus an `is_cancelled` boundary inside the wrapper.
-    Deferred to a focused turns/cancel session (hot path, high regression risk).
-  - **[host] `is_published_port` uses the CONFIGURED range, not the actually-published set** (MED) —
-    in the ≥2-instance case a second agent publishes nothing yet the function returns true, pointing
-    the operator at the FIRST instance's forwarder. Fix: persist the published set on the docker
-    manager and consult it (cross-module plumbing; rare, non-security). Docs: sandbox/services.html.
+  - **[concurrency] streaming final-generation tail escapes the semaphore + turn registry** —
+    **RESOLVED 2026-07-15 (later).** The streaming path now defers `unregister` into a generator
+    wrapper's finally (turn stays visible/cancellable for the whole drain) and the stream loop checks
+    `is_cancelled` each chunk. Deliberately did NOT hold the permit across the drain (the sketch's
+    suggestion): foreground-marking already protects the LLM slot, and holding it would couple turn
+    serialization to client read speed. Tests: test_streaming_tail_cancellable.py. Docs: core/sessions.html.
+  - **[host] `is_published_port` uses the CONFIGURED range, not the actually-published set** —
+    **RESOLVED 2026-07-15 (later).** `DockerSandbox.published_service_ports()` records the set actually
+    published at container (re)create (empty for a 2nd instance); `is_published_port(port,
+    published_ports=…)` treats it as authoritative, None → configured-range fallback. Tests:
+    test_sandbox_services.py. Docs: sandbox/services.html.
   - **[activity] `read_since` re-baselines to EOF on a shrunk ledger** (LOW, latent) — a truncation/
     rotation smaller than a saved watermark silently skips post-truncation records. No rotation code
     in-tree today. Fix: detect `size < offset` and re-read from 0.
@@ -608,11 +615,13 @@ model-behavior edges.
   test_iterative_recall_expand.py (12). Docs: tools/projects.html.
 - **[search] Yandex fails over Tor** (low, known) — per-exit-node reachability; circuit rotation per
   attempt already implemented; search succeeds via other backends. MEASURE across exit nodes before
-  changing the backend set (see `tor-search-reachability` memory). Possible cheap win: shorter
-  per-backend Tor timeout for known-flaky backends (needs measurement).
-- **[response] long skill-list truncated** (low) — "list all skills" tabulated 24 built-in tools and
-  ran out of budget before acquired/composed; verifier LATE-REFUTED. Check whether truncated-answer
-  auto-continuation fires here, or nudge to summarize not tabulate.
+  changing the backend set (see `tor-search-reachability` memory). **Per-backend timeout cheap-win
+  DONE 2026-07-15 (later):** `_engine_timeout` — mojeek keeps 18s, fast engines get 12s (grounded in
+  the recorded 2026-07-08 latencies), freeing uncancellable race threads ~6s sooner on a blocked wave.
+- **[response] long skill-list truncated** — **RESOLVED 2026-07-15 (later).** `manage_skills(action=
+  'list')` now returns the COMPLETE compact inventory (acquired + composed) in one call with a footer
+  steering the model to summarise built-ins by category, not reproduce every schema. Tests:
+  test_acquired_skills.py. Docs: tools/acquired_skills.html.
 - **[infra] smart-memory upstream 503 not retried** — **RESOLVED 2026-07-09.** Checked first: the
   HTTP layer DOES retry (worker-node failover, then one 2s retry on any 5xx in `_do_chat_completion`)
   — but a main-node TIMEOUT was never retried (falls to the generic handler), and on final failure
@@ -626,8 +635,11 @@ model-behavior edges.
   a re-run would fail identically. Post-mortem items share the drain loop and could adopt the same
   classification later (not done — scoped to the reported item). Tests: test_smart_memory_requeue.py
   (8). Docs: memory/journal.html.
-- **[infra] torch leaked-semaphore at shutdown** (low, cosmetic) — `resource_tracker: 1 leaked
-  semaphore` on every restart (the local embedder). Check the embedder subprocess/pool teardown.
+- **[infra] torch leaked-semaphore at shutdown** — **RESOLVED 2026-07-15 (later).** Traced to TQDM
+  (transformers' "Loading weights" bar → tqdm `get_lock()` creates a multiprocessing RLock / named
+  posix semaphore, never reclaimed at SIGTERM; 441 occurrences in prod stderr). Fix:
+  `tqdm.tqdm.set_lock(threading.RLock())` at `memory/vector.py` import (we never drive bars across
+  processes). Verified 0 leaked (was 1). Tests: test_embedder_semaphore_leak.py. Docs: memory/vector.html.
 - **[coding] huge-reasoning no-file-spec** (reviewed, no fix) — model emits only prose reasoning, no
   spec; salvage logic already present. Genuine model-behavior edge.
 
@@ -765,6 +777,127 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-16 (later) — lesson-quality gate: the playbook was 28% non-actionable noise
+Grounded the "next improvement" in the agent's OWN data (post-mortem queue is off in prod, so used the
+live skills_playbook.json). Finding: the playbook's top-retrieved "lessons" were dream/self-play
+OBSERVATIONS, not mistake-and-fixes — `mistake="none"` pseudo-lessons like "When playing live chess
+against Vasilis, provide continuous coaching commentary" (84 retrievals, the single most-retrieved
+item), "On a regex_parse task that has a familiar shape…", "The user prefers ripgrep". Measured: 23/50
+lessons mistake-less, drawing **28% of ALL playbook retrievals** — noise injected on every relevant
+turn, diluting the retrieval-routing win from earlier today.
+- **Gate at the write chokepoint.** The dream heuristics loop had an actionability gate since
+  2026-07-13, but it lived INSIDE dream so self-play/other producers bypassed it. Moved
+  `_is_actionable_heuristic` + constants to a leaf module `memory/lesson_quality.py` (shared with
+  core.dream, no import cycle) and added `is_actionable_lesson(mistake, solution, task)` at
+  `SkillMemory.learn_lesson` — the single chokepoint covering EVERY producer. Logic: a real-mistake
+  lesson is a genuine correction (always pass); a mistake-less entry must have an actionable solution.
+  `verified` gets NO bypass (it would only exempt a verified observation). Caught + fixed my own bug
+  pre-ship: dream stores `task=solution[:80]`, so a `solution==task` degeneracy check would have
+  wrongly dropped short valid rules — removed it (the actionability check alone catches the 11 real
+  drops).
+- **Retroactive prune** (fcntl-safe against live prod via `remove_by_trigger(memory_system=None)`,
+  which load-modify-saves under the same lock prod uses): 50 → 39 lessons, all 11 non-actionable
+  removed, 0 remaining. Backup: `skills_playbook.json.pre-quality-prune-20260716`.
+- **Orphaned vector twins cleaned in-process.** A second PersistentClient on the live Chroma dir risks
+  HNSW corruption (vector.py documents this), so the twin delete had to run INSIDE prod: added
+  `VectorMemory.delete_skill_twins(triggers)` (locked, precise `type=skill`+`trigger` key, returns
+  before/after count) + `POST /api/memory/delete_skill_twin` (companion to /correct, /delete) + the
+  readonly façade's mutator list (the guard test caught the new writer — working as intended). Deployed,
+  POSTed the 11 triggers → removed 11 (7315→7304 docs), verified idempotent (re-POST removed 0), prod
+  healthy (no HNSW corruption). Tests: test_delete_skill_twins.py (3).
+- This is the CONTENT-quality complement to the morning's retrieval-ROUTING fix: routing now surfaces
+  lessons (mediation ~1%→~85%), and this stops ~a quarter of what surfaces from being noise. Deployed
+  (plain-kill → pid 50686; prod reloaded the pruned 39-lesson playbook). Tests:
+  test_lesson_quality_gate.py (19). Suite 7800 passed. Docs: memory/skills.html, core/dream.html.
+
+### 2026-07-16 — B4 re-run: retrieval routing FIXED (mediation ~1%→~85%); outcome still ceiling-confounded
+Ran the B4 grounded outcome battery overnight with the day's memory-retrieval fixes in place, to re-ask
+"do the idle-learning loops improve outcomes." Operational notes: the harness must be launched FULLY
+DETACHED (`os.setsid` double-fork — macOS has no `setsid` binary) because `run_in_background` tasks are
+reaped by the session at ~2h (killed the pilot at 91/105). Host is memory-marginal (36GB, llama-server
+18.4GB resident); the concurrency probe tasks (conc_*) spawn worker pools that tipped it into swap
+thrash + a stuck turn (operator spotted "server idle"). Root causes: a pilot-orphan sandbox container
+never cleaned up (the reap gotcha) + the conc_* memory spikes. Fix: cleaned containers, excluded the 3
+conc_* tasks (`b4_battery_noconc.json`, 32 tasks), re-ran 3×3 detached → completed clean in 9h30m
+(swap dropped 2.7GB→1.08GB after cleanup). Report: `ablation_out/b4-20260715-trim/`.
+- **HEADLINE WIN — retrieval routing is FIXED (the prior B4's fatal flaw).** Prior B4: mediation ≈ 0
+  (lessons surfaced in 1/96 probes), which made every outcome number uninterpretable. This run:
+  mediation control 100%, treatment 86%, uniform 71% (probes where a playbook lesson's retrieval
+  counter bumped). The morning's memory fixes (RRF anchoring, session self-hit exclusion, vector
+  match gate, + the 2026-07-09 domain-rescue) demonstrably closed the loop. This is the concrete,
+  validated payoff of the session.
+- **Outcome NULL, but ceiling-confounded.** control 94/96, treatment 94/96, uniform 95/96 (98-99%);
+  treatment-vs-control McNemar p=1.0, task-stratified mean delta +0.000 p=1.0. The 5 failures are
+  scattered near-misses (off-by-a-few compute/parse errors) with no arm pattern — noise. Per the
+  pre-registered reading (outcomes-null + mediation healthy → "idle output doesn't transfer at this
+  scale") the null is now REAL (not an instrument artifact) — BUT you can't detect improvement when
+  the baseline passes 98%. Same battery-difficulty wall as B3/prior-B4. The idle-loop outcome question
+  is now cleanly gated on BATTERY DIFFICULTY, not retrieval → the real next step is an expert-tier
+  battery (baseline <80%), the #4 item.
+- **#27b frontier — still a WASH → uniform stays default.** Frontier ties uniform on self-play yield
+  (1=1 in all 3 repeats) AND weak-cluster pass (47/48=47/48). No evidence frontier out-yields uniform;
+  consistent with the 2026-07-09 flip. No change: frontier opt-in, PRM stays. (Caveat: excluding conc_*
+  dropped the concurrency weak-cluster from the #27b delta; everything tied on the other 3 clusters.)
+- **Dream STILL starved.** auto_memories(seed)=0 everywhere → the entropy gate had no material; the
+  lessons came from self_play + perfection_protocol, not dream. Dream-specific value remains inert
+  (needs a trajectory-shaped seed source — known open item).
+- New tool: `scripts/ablation_monitor.py` (progress/ETA monitor for a running trackb4 run; counts
+  DRIVER-tagged turns so self-play isn't miscounted). Tests: test_ablation_monitor.py (11).
+
+### 2026-07-15 (later) — §4 residual burn-down: relevance gate, streaming-tail cancel, + 4 smaller
+Operator picked six open items to close before the next B4 run (B4 deferred until after the code
+changes). All shipped with tests + HTML docs; suite **7770 passed** / 12 skipped / 0 failed. The
+measurement discipline changed two diagnoses mid-flight:
+- **Off-topic hydration gate (`core/bus.py`, `memory/vector.py`) — the pitched "tune `_RELEVANCE_FLOOR`
+  from the ledger" was the WRONG lever, proven by measurement.** RRF scores are a function of (rank,
+  tier weight, intent) and DISCARD embedding distance, so normalising against the top item makes the
+  best match 1.0 whether the query is on- or off-topic (off-topic scores are actually flatter) — a
+  relative floor cannot separate them, and the ledger doesn't carry distance so it can't drive it
+  either. Measured the real signal: on BGE-small the best on-topic match is < 0.40, the best off-topic
+  match ≥ 0.44 (clean gap). Fix: a `_VECTOR_MATCH_FLOOR = 0.42` best-match gate — if the closest vector
+  candidate exceeds it the vector tier injects nothing. On the HYDRATION path only (`search_items(min_
+  relevance_dist=…)`); the recall TOOL stays best-effort. On-topic hydration is untouched (true match
+  always < gate) so recall can't regress. Flipped the xfail in `test_recall_regression_eval` → real
+  pass (verified across 3 off-topic phrasings). `_RELEVANCE_FLOOR` kept at 0.0 as a relative-pruning knob.
+- **Streaming tail now stays cancellable (`core/agent.py`) — diverged from the finding's fix sketch,
+  with justification.** `handle_chat` returned the stream generator from inside `async with
+  agent_semaphore`, so the tail streamed after the outer finally unregistered the turn — invisible to
+  `/api/turns`, uncancellable. Fix: the streaming path wraps its generator so `unregister` is DEFERRED
+  into the wrapper's finally (runs at drain end), and the stream loop checks `is_cancelled` each chunk
+  (cooperative mid-stream stop; finalization still runs on the partial). Did NOT hold the semaphore
+  across the drain as the §4B sketch suggested: `stream_chat_completion` already counts
+  `foreground_tasks` for the whole stream (the LLM slot isn't stolen), and holding the permit would
+  couple turn serialization to CLIENT read speed — a stalled reader would block every later turn, a
+  worse failure mode. Live-verified: 4-chunk stream, clean [DONE], 0 active turns after drain.
+- **Per-engine Tor search timeout (`tools/search.py`)** — grounded in the recorded 2026-07-08
+  measurement (mojeek is the slow-but-reliable winner ~10-18s; others win/fail fast ~1-6s). mojeek
+  keeps 18s; fast engines get 12s via `_engine_timeout`, freeing their uncancellable `_RACE_POOL`
+  thread ~6s sooner on a blocked wave without costing wins. Marginal (the dedicated pool already
+  bounds starvation), but clean and measured.
+- **`is_published_port` (`sandbox/services.py` + `docker.py`)** — was consulting the CONFIGURED range,
+  so a 2nd instance that published NOTHING (all fixed ports taken) still claimed the port and pointed
+  the operator at the FIRST instance's forwarder. `DockerSandbox` now records the set it ACTUALLY
+  published at container (re)create (`published_service_ports()`, empty for a 2nd instance) and
+  `is_published_port(port, published_ports=…)` treats it as authoritative; None → configured-range
+  fallback (single-instance, unchanged).
+- **Skill-list truncation (`tools/acquired_skills.py` + `registry.py`)** — asked to "list all skills"
+  the model re-tabulated every built-in tool with its full schema and ran out of budget before the
+  custom ones (verifier late-refuted). `manage_skills(action='list')` now returns the COMPLETE compact
+  inventory in one call — acquired + composed macros — with a footer steering the model to summarise
+  built-ins by category, not reproduce schemas; description updated to match.
+- **Embedder leaked-semaphore (`memory/vector.py`)** — traced the `resource_tracker: 1 leaked semaphore`
+  (441 occurrences in prod stderr) to TQDM: transformers' "Loading weights" bar calls tqdm `get_lock()`
+  which creates a multiprocessing RLock (a named posix semaphore) never reclaimed at SIGTERM. Fix:
+  `tqdm.tqdm.set_lock(threading.RLock())` at vector.py import — we never drive bars across processes,
+  so a thread lock suffices and bars still render. Verified 0 leaked (was 1) under SIGTERM via the real
+  module path.
+
+New test files: `test_streaming_tail_cancellable.py`, `test_embedder_semaphore_leak.py`. Deployed
+(plain-kill → launchd, pid 96856, health ok); also **backed up the live `rrf/weights.json`** (it held
+the OLD buggy-fit contextual row from before today's `fit_intent_weights` fix — `graph 0.224`) →
+`weights.json.buggy-fit-bak-20260715` so the agent boots on hand-tuned defaults and the corrected refit
+relearns from the kept 297 observations.
 
 ### 2026-07-15 — never-reviewed cohorts sweep + image-node auth (route timeout 8s→12s)
 Started from a live `verify → Worker Node (Nova): ReadTimeout` at exactly 8.0s. Root cause: a

@@ -62,6 +62,22 @@ _TOR_BACKENDS = ",".join(_RACE_ENGINES)
 # all-circuits-blocked search pays the full timeout. Do not drop below ~15.
 _DDGS_TOR_TIMEOUT = 18
 
+# Per-engine timeout override (2026-07-15). The 2026-07-08 measurement (above)
+# attributes the 12-18s latency to MOJEEK — the reliable slow winner; the other
+# engines either win FAST or fail fast (~1-6s). A race loser's thread is
+# uncancellable (it runs to its ddgs timeout on the dedicated _RACE_POOL), so
+# giving the fast engines a shorter ceiling frees their thread ~6s sooner on a
+# blocked wave without costing wins (a non-mojeek win arrives well under 12s).
+# mojeek keeps the full budget so it can still win late, and the wave deadline
+# stays sized off mojeek (_DDGS_TOR_TIMEOUT + grace). Measure per-exit before
+# tightening the fast engines further; do NOT shorten mojeek below ~15.
+_DDGS_ENGINE_TIMEOUT = {"mojeek": 18}
+_DDGS_FAST_ENGINE_TIMEOUT = 12
+
+
+def _engine_timeout(engine: str) -> int:
+    return _DDGS_ENGINE_TIMEOUT.get(engine, _DDGS_FAST_ENGINE_TIMEOUT)
+
 # Small in-process TTL cache so the model's habit of firing many
 # near-identical queries in one turn doesn't re-pay the full Tor round
 # trip each time. Keyed on the normalized (sanitized, lower-cased) query.
@@ -276,7 +292,8 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
     from ddgs import DDGS
 
     def _run_engine(engine: str, proxy: Optional[str]) -> List[Dict]:
-        kwargs: Dict[str, Any] = {"timeout": _DDGS_TOR_TIMEOUT}
+        _eng_timeout = _engine_timeout(engine)
+        kwargs: Dict[str, Any] = {"timeout": _eng_timeout}
         if proxy:
             kwargs["proxy"] = proxy
         t_start = time.monotonic()
@@ -297,7 +314,7 @@ async def _race_search_wave(query: str, tor_proxy: Optional[str], wave: int,
             # diagnoses with (found 2026-07-15). Re-shape by elapsed time.
             elapsed = time.monotonic() - t_start
             if ("no results found" in str(e).lower()
-                    and elapsed >= _DDGS_TOR_TIMEOUT - 0.5):
+                    and elapsed >= _eng_timeout - 0.5):
                 raise RuntimeError(
                     f"engine {engine} timed out after {elapsed:.0f}s") from e
             raise

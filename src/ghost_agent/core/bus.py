@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from collections import OrderedDict
@@ -508,7 +509,16 @@ class MemoryBus:
         search_items = getattr(self.vector, "search_items", None)
         if callable(search_items):
             try:
-                items = await asyncio.to_thread(search_items, query)
+                # Proactive-injection gate: a query with no strong vector match
+                # injects nothing (see _VECTOR_MATCH_FLOOR). to_thread forwards
+                # the kwarg; a stub search_items without the param raises
+                # TypeError → retry positionally.
+                try:
+                    items = await asyncio.to_thread(
+                        search_items, query,
+                        min_relevance_dist=self._VECTOR_MATCH_FLOOR)
+                except TypeError:
+                    items = await asyncio.to_thread(search_items, query)
                 return [
                     {"source": "vector", "text": it.get("text", ""), "mem_id": it.get("id")}
                     for it in (items or [])
@@ -719,15 +729,27 @@ class MemoryBus:
 
     # ----------------------------------------------------------- formatting
 
-    # Cross-tier relevance floor. Applied to the fused RRF score AFTER it is
-    # normalised to [0,1] against the top-ranked item, so the floor is
-    # meaningful regardless of rrf_k / weight magnitudes. Items below the
-    # floor are dropped before injection so zero/low-signal context is never
-    # spliced into a prompt unconditionally. Default 0.0 keeps every scored
-    # item (a positive RRF score is, by construction, a real signal); the
-    # constant exists so it can be tuned UP to prune aggressively without
-    # touching the formatter.
+    # Cross-tier relevance floor on the NORMALISED fused RRF score. Kept 0.0:
+    # measured 2026-07-15 that this CANNOT reject an off-topic query — RRF
+    # scores are a function of (rank, tier weight, intent) and discard the
+    # underlying embedding distance, so normalising against the top item makes
+    # the best (least-bad) match 1.0 whether the query is on- or off-topic
+    # (an off-topic query's normalised scores are actually FLATTER). The real
+    # off-topic gate is `_VECTOR_MATCH_FLOOR` below. This constant survives as
+    # a relative-pruning knob (tune UP to trim the low-relative tail).
     _RELEVANCE_FLOOR = 0.0
+
+    # PROACTIVE-INJECTION vector relevance gate (2026-07-15). If the closest
+    # vector candidate for the query is beyond this raw embedding distance,
+    # the query has no strong semantic match and the vector tier injects
+    # NOTHING — this is what stops an off-topic query from hydrating a small
+    # store (the xfail'd regression in test_recall_regression_eval). Measured
+    # separation on BGE-small: worst on-topic best-match ≈ 0.40, best
+    # off-topic best-match ≈ 0.44 → 0.42 sits cleanly between with margin, and
+    # on-topic hydration is untouched (its true match is always well under the
+    # gate), so recall cannot regress. Applied ONLY on the bus hydration path;
+    # the recall tool stays best-effort. Override via GHOST_VECTOR_MATCH_FLOOR.
+    _VECTOR_MATCH_FLOOR = float(os.getenv("GHOST_VECTOR_MATCH_FLOOR", "0.42"))
 
     # Per-source cap on emitted items. The primary ordering / inclusion is by
     # fused score under one global char budget (below), but this cap stops a

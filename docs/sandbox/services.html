@@ -132,15 +132,19 @@
     consults, and the browser guard explicitly names
     <code>127.0.0.1:9051</code> (Tor control) as must-block.</li>
   </ul>
-  <p class="warn"><strong>Known residual (§4B, 2026-07-14 bug hunt).</strong>
-  <code>is_published_port</code> consults the CONFIGURED port range, not the
+  <p><strong>Published-set correctness (fixed 2026-07-15, was a §4B residual).</strong>
+  <code>is_published_port</code> used to consult the CONFIGURED port range, not the
   ports docker <em>actually</em> published. In the ≥2-instance case (a
   throwaway/ablation agent alongside prod) a second instance publishes nothing
-  yet <code>is_published_port</code> still returns true, so the operator is
-  pointed at <code>127.0.0.1:&lt;port&gt;</code> — which is the FIRST instance's
-  forwarder. Fix direction: persist the actually-published set on the docker
-  manager and consult that. Not yet fixed (needs cross-module plumbing; rare,
-  non-security).</p>
+  (all fixed host ports are taken, so <code>publishable_service_ports</code>
+  filters them all out), yet the function returned true and pointed the operator
+  at <code>127.0.0.1:&lt;port&gt;</code> — the FIRST instance's forwarder. Fixed:
+  <code>DockerSandbox</code> records the set it ACTUALLY published at container
+  (re)create (<code>published_service_ports()</code>, empty for a 2nd instance),
+  and <code>is_published_port(port, published_ports=…)</code> treats that runtime
+  set as authoritative. When no manager is in reach (<code>None</code>) it falls
+  back to the configured range — the single-instance common case, unchanged.
+  Tests: <code>tests/test_sandbox_services.py</code>.</p>
 
   <h2>Reachability</h2>
   <ul>

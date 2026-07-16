@@ -27,7 +27,7 @@
     <thead><tr><th>Tool</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>create_skill</code></td><td>Validate test_payload, write the skill to <code>acquired_skills/&lt;name&gt;.py</code>, run TDD via <a href="execute.html"><code>tool_execute</code></a>, persist to <code>skills_registry.json</code>, and embed the description in vector memory.</td></tr>
-      <tr><td><code>manage_skills</code></td><td>List active skills or delete by name. This tool is the canonical answer to "show me your skills" / "list your skills" / "what skills do you have" — a SKILL means a tool the agent has acquired, NOT a lesson it has learned. Lesson-shaped queries route to <a href="memory_tools.html"><code>list_lessons</code></a> instead.</td></tr>
+      <tr><td><code>manage_skills</code></td><td>List active skills or delete by name. This tool is the canonical answer to "show me your skills" / "list your skills" / "what skills do you have" — a SKILL means a tool the agent has acquired, NOT a lesson it has learned. Lesson-shaped queries route to <a href="memory_tools.html"><code>list_lessons</code></a> instead. <strong>action='list' (2026-07-15)</strong> returns the COMPLETE custom inventory in one compact call — acquired tools <em>and</em> composed macros (read from <code>composed_skills/composed_skills.json</code>) — followed by a footer reminding the model that the built-in tools are standing capabilities to summarise by category. This fixes a truncation: asked to "list all skills" the model used to re-tabulate every built-in tool with its full schema and ran out of token budget before reaching the custom skills (the verifier late-refuted the truncated answer).</td></tr>
     </tbody>
   </table>
 
