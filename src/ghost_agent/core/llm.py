@@ -441,13 +441,21 @@ class LLMClient:
                     payload: Dict[str, Any],
                     max_tokens: int = 128,
                     temperature: float = 0.0,
-                    fallback: Any = None) -> Any:
+                    fallback: Any = None,
+                    timeout: Optional[float] = None) -> Any:
         """Route a small cognitive sub-task to the worker pool.
 
         `task` is a short string label (e.g. ``"VALIDATE_TOOL_ARGS"``) used
         for logging; the actual prompt is in `payload`. `fallback` is
         returned if no worker pool exists or the call fails — callers
         should always pass a sensible default so they degrade silently.
+
+        `timeout` overrides the default `_ROUTE_TIMEOUT_S` ceiling. The
+        default is sized for sub-second routing chores (expand/classify);
+        a judged call routed through here (VERIFY: 7–11s uncontended on
+        the live worker) MUST pass its own budget or any node contention
+        kills it at the routing ceiling (observed 2026-07-16: every
+        finalize-burst verify died at exactly 12.0s).
         """
         # Worker pool absent → cheap fallback. We do NOT want a router
         # call to ever fall back to the foreground model: that would
@@ -483,7 +491,8 @@ class LLMClient:
                 # request and still timed out (`Nova: ReadTimeout`); with
                 # thinking disabled the same call takes 0.5s, so 6s is a
                 # generous ceiling that bounds the damage if a node is sick.
-                timeout=_ROUTE_TIMEOUT_S,
+                # Callers with genuinely slow tasks (VERIFY) override it.
+                timeout=(timeout if timeout is not None else _ROUTE_TIMEOUT_S),
                 # NEVER re-run a routing sub-task on the main model.
                 off_main_only=True,
                 # The log label is the ACTUAL routed task ("decompose query",

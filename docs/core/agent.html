@@ -52,6 +52,7 @@
       <tr><td><code>classify_thinking_budget</code></td><td><code>(query, has_coding_intent, is_meta_task, in_active_project) -&gt; "tight" | "extended" | "selfplay"</code></td><td>Selects which think-block budget prompt to inject (line 155).</td></tr>
       <tr><td><code>get_sampling_params</code></td><td><code>(is_tool_turn, query, is_coding) -&gt; dict</code></td><td>Returns temperature / top_p / top_k / presence_penalty appropriate for the situation (line 210).</td></tr>
       <tr><td><code>_find_substantive_tool_for_verifier</code></td><td><code>(tools_run) -&gt; Optional[dict]</code></td><td>Skips bookkeeping tools (<code>scratchpad</code>, <code>manage_projects</code>, …) when picking evidence to hand the verifier.</td></tr>
+      <tr><td><code>_collect_verifier_evidence</code></td><td><code>(tools_run, max_items=3, budget=4000) -&gt; str</code></td><td>Multi-tool evidence digest for claim-shaped verdicts (2026-07-16): last 3 substantive outputs, chronological, <code>[tool_name]</code>-labelled, newest-weighted budgets, total ≤ budget. Same skip rules as the selector above — see <a href="verifier.html">verifier</a> "Widened evidence window".</td></tr>
     </tbody>
   </table>
 

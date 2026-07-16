@@ -229,6 +229,77 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
     return None
 
 
+# Newest-heavy evidence budget splits for _collect_verifier_evidence,
+# indexed by (item count - 1). A single-tool turn keeps the FULL budget —
+# behaviourally identical to the old single-output evidence path.
+_EVIDENCE_BUDGET_WEIGHTS = ([1.0], [0.65, 0.35], [0.5, 0.3, 0.2])
+
+
+def _collect_verifier_evidence(tools_run: Optional[list],
+                               max_items: int = 3,
+                               budget: int = 4000) -> str:
+    """Build the EVIDENCE string for the verifier's ``verify_claim`` gate
+    from the last ``max_items`` substantive tool outputs — not just the
+    single most recent one.
+
+    Why: the final answer of a multi-source research turn synthesises
+    MANY tool outputs, but the gate used to judge it against only the
+    LAST substantive output (4000 chars). Whichever tool happened to run
+    last decided the verdict: on the 2026-07-16 souvlaki turn (req
+    738c/73) the last fetch was a 403 while the answer came from two
+    EARLIER successful loads — the verifier truthfully reported "evidence
+    does not support the claim" about the sliver it was shown and REFUTED
+    a correct answer.
+
+    Selection mirrors ``_find_substantive_tool_for_verifier`` exactly
+    (synthetic and bookkeeping entries skipped), so "no evidence here"
+    keeps meaning the same thing to both. Output is chronological (the
+    judge reads the turn the way it happened), each item prefixed with
+    ``[tool_name]`` so the prompt can attribute failures to a single
+    tool, and budgets are newest-heavy (the final answer usually leans
+    most on the latest evidence). Total length is capped at ``budget``
+    INCLUDING labels/separators, so ``verify_claim``'s own ``[:4000]``
+    guard never truncates the newest item away. Returns ``""`` when no
+    substantive tool exists — callers fall back / skip exactly as the
+    single-tool path does.
+    """
+    picked: list = []
+    for tool in reversed(tools_run or []):
+        if not tool:
+            continue
+        if tool.get("_synthetic"):
+            continue
+        name = str(tool.get("name", "")).lower().strip()
+        collapsed = name.replace("-", "_").replace(" ", "_")
+        if collapsed in _BOOKKEEPING_TOOL_NAMES:
+            continue
+        picked.append(tool)
+        if len(picked) >= max_items:
+            break
+    if not picked:
+        return ""
+    picked.reverse()  # chronological: oldest → newest
+    weights = _EVIDENCE_BUDGET_WEIGHTS[len(picked) - 1]
+    parts = []
+    # weights are newest-first; picked is oldest-first — walk them
+    # together from opposite ends so the NEWEST output gets the biggest
+    # slice.
+    for tool, weight in zip(picked, reversed(weights)):
+        label = f"[{str(tool.get('name', 'tool'))[:80]}] "
+        # Each item's cap covers its label and the joining separator, so
+        # the assembled string can never exceed `budget`.
+        body_cap = max(1, int(budget * weight) - len(label) - 2)
+        parts.append(label + str(tool.get("content", ""))[:body_cap])
+    return "\n\n".join(parts)
+
+
+# Upper bound on how long the hydration-usefulness judge defers to an
+# in-flight verifier verdict at finalize (see _judge_hydration_safe).
+# Sized above the verify worker budget (45s) + its direct-fallback retry,
+# and well under the judge's own 600s stash-staleness guard.
+_HYDRATION_JUDGE_STAGGER_S = 90.0
+
+
 # Mutation-verb markers in a file_system SUCCESS message. A file READ
 # returns the file's CONTENT (no SUCCESS:/verb), so it is correctly NOT
 # flagged — only write/replace confirmations are.
@@ -4548,6 +4619,14 @@ class GhostAgent:
         v_result = None
         tool_output = str(last_tool.get("content", ""))[:4000]
         tool_name = str(last_tool.get("name", ""))[:80]
+        # Claim-shaped verdicts judge the answer against the last FEW
+        # substantive tool outputs, not just the final one — a synthesis
+        # answer's support is spread across the turn, and judging it
+        # against whichever tool ran last REFUTED correct answers on a
+        # trailing 403 (req 738c/73). Code-shaped verdicts keep the
+        # single-output view: they audit one specific run.
+        claim_evidence = _collect_verifier_evidence(
+            tools_run_this_turn) or tool_output
         if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
             code_text = _reconstruct_executed_code(messages, last_tool)
             if code_text:
@@ -4560,13 +4639,13 @@ class GhostAgent:
             else:
                 v_result = await verifier.verify_claim(
                     claim=final_ai_content[:2000],
-                    evidence=tool_output,
+                    evidence=claim_evidence,
                     context=request_view[:1000],
                 )
         else:
             v_result = await verifier.verify_claim(
                 claim=final_ai_content[:2000],
-                evidence=tool_output,
+                evidence=claim_evidence,
                 context=request_view[:1000],
             )
         # Visual ground-truth override (unchanged from the inline gate).
@@ -5048,6 +5127,10 @@ class GhostAgent:
         conversation it belongs to, so it only surfaces back there.
         """
         def _on_done(t):
+            # Release the finalize-burst stagger (see
+            # _judge_hydration_safe) as soon as the verdict lands.
+            if getattr(self, "_deferred_verdict_task", None) is t:
+                self._deferred_verdict_task = None
             try:
                 v_result, _lt = t.result()
             except asyncio.CancelledError:
@@ -5069,6 +5152,11 @@ class GhostAgent:
             self._record_late_verdict(v_result, trajectory_id, conv_fp,
                                       last_tool=_lt)
 
+        # Published so _judge_hydration_safe can serialise the finalize
+        # burst behind the in-flight verdict (both used to hit the single
+        # worker node in the same second — the loser blew the route
+        # timeout on every substantive finalize, 2026-07-16 log).
+        self._deferred_verdict_task = task
         task.add_done_callback(_on_done)
 
     def _backfill_trajectory_outcome(self, trajectory_id, outcome, reason=""):
@@ -12324,7 +12412,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         stash belongs to a DIFFERENT turn (overlapping-turn race, or this
         turn skipped hydration while another's stash was live); consuming a
         foreign stash misattributed usefulness observations (found
-        2026-07-15). Never raises."""
+        2026-07-15). Defers (bounded) to an in-flight deferred verifier
+        verdict so the two never contend for the worker node at the same
+        instant — see the stagger comment below. Never raises."""
         bus = getattr(self.context, "memory_bus", None)
         stash = getattr(bus, "last_hydration", None) if bus is not None else None
         if not stash:
@@ -12337,15 +12427,36 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             return
         try:
             from ..utils.logging import spawn_bg
-            spawn_bg(
-                judge(
-                    str(ai_text or ""),
-                    getattr(self.context, "llm_client", None),
-                    getattr(getattr(self.context, "args", None), "model", "default") or "default",
-                    turn_id=str(turn_id or ""),
-                ),
-                name="hydration-judge",
+
+            judge_coro = judge(
+                str(ai_text or ""),
+                getattr(self.context, "llm_client", None),
+                getattr(getattr(self.context, "args", None), "model", "default") or "default",
+                turn_id=str(turn_id or ""),
             )
+            # Finalize-burst stagger (2026-07-16): this judge and the
+            # deferred verifier verdict used to hit the single worker
+            # node in the same second, and the loser blew the route
+            # timeout (`Nova: ReadTimeout` on effectively every
+            # substantive finalize). The verdict is the safety signal,
+            # so the judge yields: wait — bounded — for the in-flight
+            # verdict, then run. Costs nothing when no verdict is in
+            # flight or it already landed; worst case the judge starts
+            # _HYDRATION_JUDGE_STAGGER_S late, still far inside its own
+            # 600s stash-staleness guard. asyncio.wait never cancels
+            # the verdict task and shields this task from its errors.
+            verdict_task = getattr(self, "_deferred_verdict_task", None)
+            if verdict_task is not None and not verdict_task.done():
+                async def _stagger_then_judge(t=verdict_task, jc=judge_coro):
+                    try:
+                        await asyncio.wait(
+                            {t}, timeout=_HYDRATION_JUDGE_STAGGER_S)
+                    except Exception:
+                        pass
+                    return await jc
+
+                judge_coro = _stagger_then_judge()
+            spawn_bg(judge_coro, name="hydration-judge")
         except Exception as e:
             logger.debug(f"hydration judge spawn skipped: {e}")
 

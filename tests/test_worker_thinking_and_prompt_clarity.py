@@ -79,10 +79,15 @@ class TestDisableThinking:
         # free string concat — a sick worker must degrade fast, not stall the
         # user for 15s. (12s: absorbs a double-queued call on a small-`-np`
         # worker — see test_worker_warmup.py::TestRouteTimeoutSizing.)
+        # Since 2026-07-16 callers with genuinely slow judged tasks (VERIFY)
+        # may pass their own budget, but the DEFAULT must stay the routing
+        # ceiling — see tests/test_verify_worker_timeout.py for the
+        # behavioural pin of both halves.
         assert _ROUTE_TIMEOUT_S <= 12.0
         src = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
                / "core" / "llm.py").read_text()
-        assert "timeout=_ROUTE_TIMEOUT_S" in src
+        assert ("timeout=(timeout if timeout is not None "
+                "else _ROUTE_TIMEOUT_S)") in src
         assert "timeout=15.0" not in src
 
 

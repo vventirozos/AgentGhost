@@ -47,6 +47,24 @@ try:
 except ValueError:
     _CRITIC_MAX_TOKENS = 512
 
+# Worker-route budget for a VERIFY verdict. A verify is a judged call over
+# the whole turn's claim + evidence — NOT a sub-second routing chore — so it
+# must not ride `route()`'s default `_ROUTE_TIMEOUT_S` (12s, sized for query
+# expansion). Measured on the live worker (Gemma 4 E4B, 2026-07-16 log): an
+# UNCONTENDED verdict takes 7–11s, one whisker under 12s; any contention on
+# the node (the finalize burst fires verify + hydration-judge together)
+# pushed it past the ceiling → `Nova: ReadTimeout` → the gate shipped a
+# hallucinated answer unchecked (req 738c/35, the "Everest pizza" turn).
+# 45s absorbs a contended verdict; the loop-exit repair budget (25s) and the
+# late-verdict handler already tolerate a verdict that lands late, and a
+# genuinely sick node still fails bounded. Override with
+# GHOST_VERIFY_WORKER_TIMEOUT (seconds).
+try:
+    _VERIFY_WORKER_TIMEOUT_S = float(
+        os.getenv("GHOST_VERIFY_WORKER_TIMEOUT", "45") or 45)
+except ValueError:
+    _VERIFY_WORKER_TIMEOUT_S = 45.0
+
 # Hard cap per image fed to the visual verifier. The vision node rasterises
 # and base64-encodes every image into the prompt; an oversized screenshot
 # (or a hostile artifact) would blow the context / OOM the host. Mirrors the
@@ -86,7 +104,7 @@ _VERIFY_CLAIM_PROMPT = """You are a rigorous auditor. The agent ran a tool and g
 CLAIM (the agent's reply to the user):
 {claim}
 
-EVIDENCE (the tool output the claim was built from):
+EVIDENCE (the tool output(s) the claim was built from — may contain the outputs of SEVERAL tools from the same turn, in chronological order, each prefixed with [tool_name]):
 {evidence}
 
 USER REQUEST (what the user actually asked for):
@@ -97,6 +115,8 @@ Check, in order:
 1. **Request alignment (highest priority).** Does the CLAIM actually answer the USER REQUEST? If the user asked to do X (e.g. "stop self-play", "delete file foo", "list my notes") and the CLAIM is about something else (a weather report, an unrelated factoid, a different tool's output), this is REFUTED — even if the CLAIM is internally consistent with the EVIDENCE. A CLAIM that is true-but-off-topic is the wrong-question failure mode and must NOT be CONFIRMED.
    - If the USER REQUEST is empty or whitespace, skip this check and proceed to step 2.
 2. **Evidence support.** Given that the CLAIM is on-topic, is it actually supported by the EVIDENCE? Flag silent errors (empty output, truncated results, wrong columns, "succeeded" claims when the tool actually failed).
+   - Judge the CLAIM against ALL the tool outputs TOGETHER. One tool failing (403/timeout/empty) does NOT refute the parts of the CLAIM that are supported by OTHER tool outputs — refute on lack of support only when NO output supports the disputed part.
+   - Specific facts in the CLAIM (names, dates, awards, rankings, prices) that appear in NO tool output are fabrications — REFUTED, no matter how plausible they sound.
 3. **Constraint satisfaction.** If the user's wording included explicit constraints on the form of the answer ("just the code", "in one sentence", "as JSON", "list only the names"), does the CLAIM satisfy them?
 
 A verdict of CONFIRMED requires ALL THREE to hold. If alignment fails, return REFUTED regardless of how well the claim matches the evidence.
@@ -282,6 +302,9 @@ class Verifier:
                 result = await route_fn(
                     "VERIFY", payload, max_tokens=2048,
                     temperature=temperature, fallback=None,
+                    # Verify-sized budget — see _VERIFY_WORKER_TIMEOUT_S.
+                    # route()'s 12s default killed contended verdicts.
+                    timeout=_VERIFY_WORKER_TIMEOUT_S,
                 )
             except Exception as exc:
                 logger.debug("Verifier worker route failed: %s", exc)

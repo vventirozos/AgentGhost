@@ -778,6 +778,36 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-16 (later 3) — verifier triage: verify-sized timeout + widened evidence window + finalize stagger
+Operator report: "verifier either refutes valid answers or timeouts on work node." Log forensics
+(requests 73/35/E0/BD, the Athens food-research turns) found two distinct mechanisms that compounded:
+- **Timeouts.** With `--critic-nodes` absent from the live flags, every verify rode `route()`'s 12s
+  `_ROUTE_TIMEOUT_S` (sized for sub-second routing chores) to the single worker node. A verdict takes
+  7–11s UNCONTENDED (measured in-log); at finalize, verify + hydration-judge fired the same second and
+  the loser blew the ceiling — `Nova: ReadTimeout` on 4/17 verify calls that day. Worst case (req 35):
+  the gate verify died → the "Everest pizza / world champion June 2026" hallucination shipped
+  unchecked; only the LATE async verdict caught it (correctly) a turn later. FIX 1: `route()` accepts a
+  per-call `timeout`; verifier passes `_VERIFY_WORKER_TIMEOUT_S` (45s, `GHOST_VERIFY_WORKER_TIMEOUT`).
+  FIX 3: `_attach_late_verdict_handler` publishes `_deferred_verdict_task`; `_judge_hydration_safe`
+  defers (bounded 90s, `_HYDRATION_JUDGE_STAGGER_S`) to the in-flight verdict — back-to-back, not
+  colliding.
+- **False refutes.** The gate judged the WHOLE answer against only the LAST substantive tool output
+  (4000 chars). Req 73: answer built from two loaded sources, last fetch was a 403 → REFUTED "no data
+  was retrieved" → wasted repair round. FIX 2 (careful): `_collect_verifier_evidence` — last 3
+  substantive outputs, chronological, `[tool_name]`-labelled, newest-weighted 50/30/20 budgets, total
+  ≤4000 incl. labels (single-tool turn = old behavior); claim-shaped paths only (code-shape still
+  audits the one run); prompt now says one failed tool doesn't refute parts supported by others AND
+  specifics in NO output are fabrications (keeps the req-35 catch). `last_tool` semantics untouched.
+- NOTE: req 35's LATE REFUTED was CORRECT — the verifier's judgment is fine when it fires; it was
+  evidence-starved and time-starved. Residual (not built): loop-exit repair `_vtask` that overruns its
+  25s budget is abandoned and the post-loop gate spawns a fresh verify — duplicate Nova compute;
+  adopting the in-flight task is unsafe when repair mutated the answer, needs care. Also consider
+  re-enabling `--critic-nodes` (120s budget, off-host) as the verifier's proper home.
+- Tests: test_verify_worker_timeout.py (6), test_verifier_evidence_window.py (13),
+  test_finalize_stagger.py (7); route-timeout source pin in test_worker_thinking_and_prompt_clarity.py
+  updated. Suite **7854 passed**. Docs: core/verifier.html, core/llm.html, core/agent.html,
+  core/bus.html. NOT yet deployed (operator relaunch decision pending).
+
 ### 2026-07-16 (later 2) — two features: grounded file-artifact verification + reactive watch scheduler
 Two operator-approved features, both grounded in measured need.
 - **Grounded file-artifact verification (`core/agent.py`, `core/verifier.py`).** The agent's #1
