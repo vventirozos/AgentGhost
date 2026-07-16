@@ -778,6 +778,34 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-16 (later 2) — two features: grounded file-artifact verification + reactive watch scheduler
+Two operator-approved features, both grounded in measured need.
+- **Grounded file-artifact verification (`core/agent.py`, `core/verifier.py`).** The agent's #1
+  most-retrieved real lesson (ret=55) is "prematurely declared task completion … without showing the
+  actual content" — it claims a file deliverable that's missing/empty; B4 independently showed the LLM
+  verifier CONFIRMs at 100% while the agent errs. This is the general form of the existing web-exec
+  "execute, don't trust" override: `_claimed_deliverable_files` extracts filenames the answer presents
+  as PRODUCED (anchored on completion verbs saved/wrote/created/… — ignores files merely READ and
+  present-tense "the script writes to X"), `_verify_file_artifacts` re-reads each under the
+  project-scoped sandbox HOST path (direct FS, no docker exec), and a missing/empty claimed deliverable
+  → REFUTED(0.9) overriding a plausible text CONFIRM and feeding the same bounded auto-repair loop.
+  Low false-positive by construction (an input file the agent read still exists → passes; only a
+  claimed-but-absent deliverable refutes). Runs last in `_compute_verifier_verdict`. Tests:
+  test_grounded_file_verify.py (17).
+- **Reactive condition-watching scheduler (`tools/tasks.py`, `main.py`, `registry.py`).** The scheduler
+  could only fire on a clock (cron/interval). New `manage_tasks(action='watch')`: polls a shell
+  CONDITION every interval_secs in the sandbox and fires its reaction prompt only on the transition to
+  true (edge-triggered — exit 0 = condition true, shell `if` semantics), with the check output injected.
+  Reaches LAN/tailnet directly (sandbox egress guard) for real ops checks: `grep -q ' ERROR ' log`,
+  `! curl -sf https://host/health`, `[ $(metric) -gt 90 ]`. Edge state (`last_fired`) persists so a
+  restart doesn't re-fire an already-true condition; `_run_watch_condition` bound in main.py alongside
+  the proactive runner, restore path handles watch records. LIVE-VERIFIED: registered a watch via a
+  chat turn → it polled → `condition became TRUE — reacting` → reaction dispatched with context → (the
+  agent even recognized the test and stopped the watch itself). Tests: test_watch_condition.py (8).
+- Both deployed (plain-kill → pid 53638, health ok). Suite **7828 passed**. Docs: core/verifier.html,
+  tools/tasks.html. NOT built (deferred): the numeric self-check half of grounded verification (re-derive
+  a computed answer) — harder to ground generically; the artifact check covers the top lesson.
+
 ### 2026-07-16 (later) — lesson-quality gate: the playbook was 28% non-actionable noise
 Grounded the "next improvement" in the agent's OWN data (post-mortem queue is off in prod, so used the
 live skills_playbook.json). Finding: the playbook's top-retrieved "lessons" were dream/self-play

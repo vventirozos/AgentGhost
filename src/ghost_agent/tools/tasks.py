@@ -22,6 +22,13 @@ logger = logging.getLogger("GhostAgent")
 # This will need to be bound to run_proactive_task from agent.py
 run_proactive_task_fn = None
 
+# Reactive-WATCH runner (2026-07-16), bound from main.py like the proactive
+# runner. A watch task polls a shell CONDITION on an interval and fires its
+# reaction prompt only when the condition first becomes true (edge-triggered),
+# so the scheduler can react to external state (a log pattern, an endpoint
+# going down, a threshold crossed) instead of only firing on a clock.
+run_watch_condition_fn = None
+
 # JSON file holding every user-scheduled task, bound by main.py at lifespan
 # start (like run_proactive_task_fn above). The AsyncIOScheduler jobstore is
 # IN-MEMORY, and the operator deploys by killing the agent — so before this
@@ -67,15 +74,38 @@ def _save_task_store(tasks: dict) -> None:
 
 
 def _persist_task(job_id: str, task_name: str, prompt: str,
-                  cron_expression: str) -> None:
+                  cron_expression: str, kind: str = "task",
+                  check_command: str = None) -> None:
     tasks = _load_task_store()
-    tasks[job_id] = {
+    rec = {
         "task_name": task_name,
         "prompt": prompt,
         "cron_expression": cron_expression,
         "created_at": time.time(),
     }
+    if kind == "watch":
+        # A watch carries its condition command + the edge-trigger state so
+        # a restart doesn't re-fire a condition that was already true.
+        rec["kind"] = "watch"
+        rec["check_command"] = check_command
+        rec["last_fired"] = False
+    tasks[job_id] = rec
     _save_task_store(tasks)
+
+
+def get_watch_record(job_id: str) -> dict:
+    """The persisted record for a watch job (check_command, prompt,
+    last_fired), or {} if absent. Read by the watch runner each tick."""
+    return _load_task_store().get(job_id) or {}
+
+
+def set_watch_state(job_id: str, last_fired: bool) -> None:
+    """Persist a watch's edge-trigger state so it fires only on the
+    transition to true and survives a restart."""
+    tasks = _load_task_store()
+    if job_id in tasks:
+        tasks[job_id]["last_fired"] = bool(last_fired)
+        _save_task_store(tasks)
 
 
 def _unpersist_task(job_id: str) -> None:
@@ -91,10 +121,31 @@ def _unpersist_all() -> None:
 
 
 def _add_job(scheduler, job_id: str, task_name: str, prompt: str,
-             cron_expression: str):
+             cron_expression: str, kind: str = "task",
+             check_command: str = None):
     """Register one job on the scheduler. Returns an error STRING on a
     rejected/malformed schedule, None on success. Shared by the create tool
     and the boot-time restore so both interpret expressions identically."""
+    if kind == "watch":
+        # A watch polls its condition on an interval; the watch runner reads
+        # check_command + edge state from the store by job_id each tick.
+        if run_watch_condition_fn is None:
+            return "Error: the watch runner is not initialized in this context."
+        if not str(cron_expression).startswith("interval:"):
+            return ("Error: a watch must use 'interval:SECONDS' (it POLLS the "
+                    "condition) — cron schedules are for time-based tasks.")
+        try:
+            secs = int(cron_expression.split(":", 1)[1].strip())
+        except (IndexError, ValueError):
+            return (f"Error: malformed watch interval '{cron_expression}'. "
+                    "Use 'interval:SECONDS', e.g. 'interval:60'.")
+        if secs < 10:
+            return "Error: watch interval must be >= 10 seconds (don't hammer the check)."
+        scheduler.add_job(
+            run_watch_condition_fn, 'interval', seconds=secs,
+            args=[job_id], id=job_id, name=task_name, replace_existing=True,
+        )
+        return None
     if cron_expression.startswith("interval:"):
         parts = cron_expression.split(":")
         raw = parts[1].strip() if len(parts) > 1 else ""
@@ -154,6 +205,8 @@ def restore_persisted_tasks(scheduler) -> int:
                 str(rec.get("task_name") or job_id),
                 str(rec.get("prompt") or ""),
                 str(rec.get("cron_expression") or ""),
+                kind=str(rec.get("kind") or "task"),
+                check_command=rec.get("check_command"),
             )
             if err:
                 raise ValueError(err)
@@ -226,6 +279,53 @@ async def tool_schedule_task(task_name: str, prompt: str, cron_expression: str, 
         pretty_log("Schedule Error", str(e), level="ERROR")
         return f"ERROR: {e}"
 
+async def tool_watch_condition(task_name: str, check_command: str,
+                               reaction_prompt: str, interval_secs,
+                               scheduler, memory_system):
+    """Register a reactive WATCH: poll ``check_command`` every
+    ``interval_secs``; when it first SUCCEEDS (exit 0 — shell ``if``
+    semantics), fire ``reaction_prompt`` as a background agent turn with the
+    check's output attached. Edge-triggered (fires on the transition to true,
+    not every tick it stays true)."""
+    pretty_log("Watch Register",
+               f"Name: {task_name} | every {interval_secs}s | check: {str(check_command)[:60]}",
+               icon=Icons.BRAIN_PLAN)
+    if not scheduler:
+        return "Error: Background task scheduling is disabled or not available in this context."
+    if run_watch_condition_fn is None:
+        return "Error: the watch runner is not initialized."
+    if not (task_name and check_command and reaction_prompt):
+        return "Error: watch requires task_name, check_command, and prompt (the reaction)."
+    try:
+        secs = int(interval_secs)
+    except (TypeError, ValueError):
+        return "Error: interval_secs must be an integer number of seconds (e.g. 60)."
+    try:
+        job_id = f"watch_{hashlib.md5(task_name.encode()).hexdigest()[:10]}"
+        cron = f"interval:{secs}"
+        err = _add_job(scheduler, job_id, task_name, reaction_prompt, cron,
+                       kind="watch", check_command=check_command)
+        if err:
+            return err
+        _persist_task(job_id, task_name, reaction_prompt, cron,
+                      kind="watch", check_command=check_command)
+        if memory_system:
+            try:
+                await asyncio.to_thread(
+                    memory_system.add,
+                    f"Watch '{task_name}' (ID {job_id}) polls `{check_command}` every {secs}s "
+                    f"and reacts when it succeeds.",
+                    {"type": "manual", "task_id": job_id})
+            except Exception as mem_err:
+                pretty_log("Watch Memory", f"note write failed (watch still active): {mem_err}",
+                           level="WARNING", icon=Icons.WARN)
+        return (f"SUCCESS: Watch '{task_name}' active (ID: {job_id}) — polling every {secs}s. "
+                f"It fires the reaction the moment `{str(check_command)[:60]}` first exits 0.")
+    except Exception as e:
+        pretty_log("Watch Error", str(e), level="ERROR")
+        return f"ERROR: {e}"
+
+
 async def tool_stop_all_tasks(scheduler):
     pretty_log("Task Clear", "Deleting all scheduled jobs", icon=Icons.STOP)
     if not scheduler:
@@ -275,7 +375,7 @@ async def tool_list_tasks(scheduler):
         lines.append(f"- ID: {job.id} | Name: {job.name} | Next Run: {job.next_run_time}")
     return "\n".join(lines)
 
-async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, **kwargs):
+async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, check_command: str = None, interval_secs=None, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
     # Normalise like the sibling tools (self_state, introspect, uncertainty):
@@ -289,6 +389,12 @@ async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=No
         if not (task_name and cron_expression and prompt):
                 return "Error: 'create' requires task_name, cron_expression, and prompt."
         return await tool_schedule_task(task_name, prompt, cron_expression, scheduler, memory_system)
+    elif action == "watch":
+        if not (task_name and check_command and prompt and interval_secs):
+            return ("Error: 'watch' requires task_name, check_command (a shell condition that "
+                    "exits 0 when the thing to react to is TRUE), prompt (the reaction), and "
+                    "interval_secs.")
+        return await tool_watch_condition(task_name, check_command, prompt, interval_secs, scheduler, memory_system)
     elif action == "list":
         return await tool_list_tasks(scheduler)
     elif action == "stop":

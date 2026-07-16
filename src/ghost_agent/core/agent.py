@@ -289,6 +289,50 @@ def _web_artifacts_written(tools_run: Optional[list]) -> list:
     return out
 
 
+# ── Deliverable-file ground-truth check ──────────────────────────────
+# The #1 most-retrieved real lesson (ret=55) is the agent "prematurely
+# declared task completion ... without showing the actual content" — it
+# claims a file deliverable that is missing or empty in the sandbox. A
+# text/vision verifier can't catch this (the claim reads fine); re-reading
+# the file is hard ground truth. This is the general, non-web form of the
+# web-exec override's "execute, don't trust" philosophy.
+_DELIVERABLE_EXT = (
+    r"md|markdown|txt|text|csv|tsv|json|jsonl|ya?ml|py|js|ts|sh|bash|sql|"
+    r"html?|xml|ini|toml|cfg|conf|log|pdf|xlsx?|docx?|pptx?|png|jpe?g|svg|"
+    r"tex|rs|go|java|c|cpp|rb|php|ipynb"
+)
+# A COMPLETION verb (past/perfect — the agent DID produce it, not a present-
+# tense description of what a script does) followed within a short window by
+# a filename. Anchoring on completion verbs keeps input files the agent only
+# READ out of the candidate set and avoids "the script writes to X" (present
+# tense) false positives.
+_CLAIMED_FILE_RE = re.compile(
+    r"\b(?:saved|wrote|written|created|generated|produced|exported|stored|"
+    r"placed|dumped)\b"
+    r"[^\n`'\"]{0,60}?"
+    r"[`'\"]?([A-Za-z0-9][A-Za-z0-9._/\-]*\.(?:" + _DELIVERABLE_EXT + r"))\b",
+    re.IGNORECASE,
+)
+_SYS_PATH_PREFIXES = ("/usr", "/etc", "/bin", "/sbin", "/lib", "/opt",
+                      "/var", "/System", "/Library", "/private", "/dev",
+                      "/proc", "/Users", "/home", "/root", "/tmp")
+
+
+def _claimed_deliverable_files(text) -> list:
+    """Filenames the answer presents as a CREATED/SAVED deliverable."""
+    if not text:
+        return []
+    out: list = []
+    for m in _CLAIMED_FILE_RE.findall(str(text)):
+        name = m.strip().strip("`'\"")
+        if (not name or "://" in name
+                or name.startswith(_SYS_PATH_PREFIXES)):
+            continue
+        if name not in out:
+            out.append(name)
+    return out[:8]
+
+
 # ── Visual verification evidence ─────────────────────────────────────
 # A text-only verifier cannot tell whether a reported VISUAL symptom
 # ("the blocks look transparent", "the layout is broken") was actually
@@ -4647,7 +4691,98 @@ class GhostAgent:
                 f"{self._WEB_EXEC_SKIP_CONF_CAP:.0%} (artifact never executed)",
                 icon=Icons.BRAIN_THINK, level="WARNING",
             )
+        # File-artifact ground-truth override (2026-07-16) — the general form
+        # of the web-exec check for NON-web deliverables. If the answer claims
+        # a file was produced but it is missing/empty in the sandbox, that's
+        # the #1 premature-completion lesson made grounded (a real file read,
+        # not the text verifier's plausibility). A REFUTED here is authoritative
+        # and feeds the same auto-repair loop, so the agent gets a bounded
+        # attempt to actually produce the deliverable.
+        try:
+            _claimed = _claimed_deliverable_files(final_ai_content)
+            if _claimed:
+                from ..tools.file_system import project_scoped_sandbox
+                _host_dir = project_scoped_sandbox(self.context)[0]
+                _fa = self._verify_file_artifacts(_claimed, _host_dir)
+                if _fa is not None:
+                    v_result = _fa
+                    pretty_log(
+                        "Verifier",
+                        f"FILE-ARTIFACT REFUTED: {(_fa.reasoning or '')[:130]}",
+                        icon=Icons.BRAIN_THINK, level="WARNING",
+                    )
+                else:
+                    pretty_log(
+                        "Verifier",
+                        f"FILE-ARTIFACT clean: {len(_claimed)} claimed "
+                        f"deliverable(s) present + non-empty",
+                        icon=Icons.BRAIN_THINK,
+                    )
+        except Exception as _fa_exc:
+            pretty_log(
+                "Verifier",
+                f"FILE-ARTIFACT check error: {type(_fa_exc).__name__}: {_fa_exc}",
+                icon=Icons.WARN, level="WARNING",
+            )
         return v_result, last_tool
+
+    @staticmethod
+    def _verify_file_artifacts(claimed, host_dir):
+        """Grounded check: re-read the claimed deliverable files under the
+        sandbox host dir. Refute if any is MISSING or EMPTY — hard ground
+        truth the text verifier can't see. Returns a REFUTED VerifyResult or
+        None (all present + non-empty, or nothing checkable)."""
+        from pathlib import Path as _P
+        from .verifier import VerifyResult, VerifyVerdict
+        if not claimed or not host_dir:
+            return None
+        root = _P(host_dir)
+        if not root.exists():
+            return None
+        missing, empty = [], []
+        for name in claimed:
+            rel = name
+            for pfx in ("/workspace/", "workspace/", "./"):
+                if rel.startswith(pfx):
+                    rel = rel[len(pfx):]
+            rel = rel.lstrip("/")
+            found = None
+            try:
+                cand = root / rel
+                if cand.is_file():
+                    found = cand
+                else:
+                    base = _P(rel).name
+                    for p in root.rglob(base):  # path mismatch → basename search
+                        if p.is_file():
+                            found = p
+                            break
+            except Exception:
+                continue
+            if found is None:
+                missing.append(name)
+            else:
+                try:
+                    if found.stat().st_size == 0:
+                        empty.append(name)
+                except OSError:
+                    pass
+        if not missing and not empty:
+            return None
+        parts = []
+        if missing:
+            parts.append("missing: " + ", ".join(missing))
+        if empty:
+            parts.append("empty: " + ", ".join(empty))
+        return VerifyResult(
+            verdict=VerifyVerdict.REFUTED,
+            confidence=0.9,
+            reasoning=("File-artifact check: the answer claims deliverable "
+                       "file(s) that are not actually present/non-empty in the "
+                       "sandbox (" + "; ".join(parts) + "). The content was "
+                       "declared done but not produced."),
+            issues=[f"claimed-but-{'missing' if missing else 'empty'} deliverable"],
+        )
 
     @staticmethod
     def _compose_injection(req_messages, stable_injection, dynamic_state, pin):

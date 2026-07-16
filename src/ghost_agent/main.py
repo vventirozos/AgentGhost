@@ -634,9 +634,60 @@ async def lifespan(app):
                 except Exception:  # noqa: BLE001
                     pass
 
-        # Bind the runner function into the tasks module so
-        # `tool_schedule_task` can pass it to `scheduler.add_job`.
+        async def _run_watch_condition(job_id: str):
+            """Reactive-watch tick (2026-07-16): poll the watch's shell
+            condition and fire its reaction ONLY on the transition to true
+            (edge-triggered). The condition runs in the agent's sandbox — same
+            security posture as every other command the agent runs — so it can
+            reach the LAN/tailnet directly (per the egress guard) for real ops
+            checks. Idle-time work: deferred behind a live user request."""
+            import time as _time
+            rec = _tools_tasks.get_watch_record(job_id)
+            if not rec:
+                return
+            check_command = str(rec.get("check_command") or "")
+            reaction_prompt = str(rec.get("prompt") or "")
+            last_fired = bool(rec.get("last_fired"))
+            task_name = str(rec.get("task_name") or job_id)
+            if not check_command:
+                return
+            if _tools_tasks.should_defer_scheduled_task(
+                    getattr(context, "llm_client", None)):
+                return
+            mgr = getattr(context, "sandbox_manager", None)
+            if mgr is None or not hasattr(mgr, "execute"):
+                return
+            try:
+                out, code = await asyncio.to_thread(mgr.execute, check_command, 60)
+            except Exception as e:  # noqa: BLE001
+                pretty_log("Watch Check Error",
+                           f"{job_id} ({task_name}): {type(e).__name__}: {e}",
+                           level="WARNING", icon=Icons.WARN)
+                return
+            condition_met = (code == 0)
+            if condition_met and not last_fired:
+                _tools_tasks.set_watch_state(job_id, True)   # edge → armed
+                pretty_log("Watch Fired",
+                           f"{job_id} ({task_name}): condition became TRUE — reacting",
+                           icon=Icons.BRAIN_PLAN)
+                ctx_out = (out or "").strip()[:1500]
+                full_prompt = (
+                    f"{reaction_prompt}\n\n[This was triggered by your watch "
+                    f"'{task_name}': the condition `{check_command}` just became "
+                    f"true (exit 0). Its output:\n{ctx_out}\n]")
+                await _run_proactive_task(job_id, full_prompt)
+            elif not condition_met and last_fired:
+                _tools_tasks.set_watch_state(job_id, False)  # cleared → re-armable
+                pretty_log("Watch Reset",
+                           f"{job_id} ({task_name}): condition cleared",
+                           icon=Icons.SKIP)
+            # else: no edge — silent (a watch that keeps polling is not news)
+
+        # Bind the runner functions into the tasks module so
+        # `tool_schedule_task` / `tool_watch_condition` can pass them to
+        # `scheduler.add_job`.
         _tools_tasks.run_proactive_task_fn = _run_proactive_task
+        _tools_tasks.run_watch_condition_fn = _run_watch_condition
 
         # Persistent task store (2026-07-14): the AsyncIOScheduler jobstore
         # is in-memory and the operator deploys by killing the agent, so
