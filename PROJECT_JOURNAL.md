@@ -780,6 +780,31 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-17 (later 7) — CLI inline images
+`interface/externals/cli/ghost` now draws reply-referenced images (`![…](name.png)`) in the
+terminal, fetched from the sandbox via the existing `/api/download` (in-memory, 25MB cap, ≤4 per
+reply; http/data schemes skipped). Rendering AFTER the reply settles — the escape protocols are
+raw byte streams a rich Live repaint would shred. Auto-detection: iTerm2/WezTerm OSC-1337 →
+kitty graphics (PNG-only `f=100`; non-PNG transcodes via Pillow) → universal half-block `▀`
+truecolor fallback → none; `GHOST_CLI_IMAGES=off|iterm|kitty|halfblock` overrides. `/download`
+of an image renders it too. Pillow added to the PEP-723 deps, OPTIONAL at runtime. Verified
+end-to-end against the live agent (upload → reference → fetch → half-block draw). Tests:
+test_ghost_cli.py 11→22 (ambient LC_TERMINAL leaks into detection tests — scrub it). Docs:
+interfaces/cli.html. No agent restart needed (client-side; bin symlink serves the live copy).
+FIRST LIVE USE found two gaps, fixed same hour: (1) the model embedded the FULL API path
+(`![…](/api/download/gen_x.png)`) → double-prefixed fetch → 404 — refs now normalized
+(api/workspace/sandbox prefixes stripped, anchored; 404 on a pathed ref retries the flat
+basename); (2) operator runs tmux-on-iTerm2 — tmux swallows OSC-1337 unless allow-passthrough
+(default off ≥3.3), so auto-detection under tmux now picks half-block (always visible);
+explicit GHOST_CLI_IMAGES=iterm wraps in DCS passthrough framing (needs `set -g
+allow-passthrough on`). Tests 22→28 (incl. TMUX ambient scrub in detection tests).
+SECOND live report: passthrough images VANISH on tmux resize/pane-switch — inherent (overlay;
+tmux repaints from its char grid). Fix: pure-python SIXEL encoder (`_render_sixel`, 256-color
+quantize + RLE, ~0.4s/640px) — a sixel-built tmux (operator: Homebrew 3.7b) consumes and OWNS
+the image, repainting it across redraws; emitted RAW, never passthrough-wrapped. Auto under
+tmux: sixel when tmux≥3.4 + iTerm2/WezTerm + Pillow, else half-block; GHOST_CLI_IMAGES=sixel
+forces. Tests 28→32.
+
 ### 2026-07-17 (later 6) — INCIDENT: "worker broke, cache doesn't work, tools not firing" — triage + fixes
 Operator report after the later-5 deploy. Three distinct causes, all resolved:
 - **Cache + tools** — self-inflicted by `--no-native-tools`: schemas moved into the prompt but the

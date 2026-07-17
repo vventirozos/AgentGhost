@@ -5,6 +5,7 @@
 #     "requests>=2.28",
 #     "prompt_toolkit>=3.0",
 #     "rich>=13",
+#     "pillow>=10",
 # ]
 # ///
 
@@ -16,6 +17,16 @@ agent's real feature surface:
 
 * **Rendered replies** — the stream is rendered live as Markdown (rich):
   headers, lists, tables, bold/italic, and syntax-highlighted code blocks.
+* **Inline images** — after a reply settles, ``![…](file.png)`` references
+  are fetched from the agent sandbox (``/api/download``) and drawn in the
+  terminal: iTerm2/WezTerm inline-image escape, kitty graphics protocol,
+  or a universal half-block fallback (any truecolor terminal, via Pillow).
+  ``GHOST_CLI_IMAGES=off|iterm|kitty|sixel|halfblock`` overrides detection;
+  under tmux, sixel is preferred when the whole stack supports it (a
+  sixel-built tmux owns the image and repaints it across resizes —
+  passthrough overlays vanish on any redraw).
+  Escape-protocol images can't be drawn INSIDE the live-render region, so
+  they appear right below the finished reply — same order as referenced.
 * **Durable sessions** — every turn carries a ``session_id`` so the server
   persists the conversation; ``/sessions`` lists them and ``/resume``
   continues one from any device. (The old ``conversation_id`` field was
@@ -40,8 +51,10 @@ raw text when piped, rendered when stdout is a terminal.
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -182,6 +195,367 @@ def _reply_renderable(text: str) -> Group:
     return Group(Text("👻", style="ghost"), Markdown(text, code_theme=CODE_THEME))
 
 
+# --- inline terminal images -------------------------------------------------
+# Replies reference agent-generated images as markdown (`![…](name.png)`,
+# sandbox-relative — the same references the web UI and uConsole resolve via
+# GET /api/download/{name}). Rendering happens AFTER the live region settles:
+# the iTerm2/kitty escapes are raw byte streams that a rich Live repaint
+# would shred, so images are drawn below the finished reply, in reference
+# order. Half-block is the everywhere-fallback: two vertical pixels per
+# character cell via '▀' with truecolor fg/bg — coarse but genuinely inline.
+
+_IMG_MD_RE = re.compile(r'!\[[^\]]*\]\(([^)\s]+)\)')
+_IMG_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")
+_IMG_MAX_BYTES = 25 * 1024 * 1024
+_IMG_MAX_PER_REPLY = 4
+_PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _pil():
+    """Pillow, or None — optional at runtime. The escape protocols ship raw
+    file bytes and work without it; half-block (and kitty transcoding of
+    non-PNG formats) need it."""
+    try:
+        from PIL import Image
+        return Image
+    except Exception:  # noqa: BLE001 — absence is a supported state
+        return None
+
+
+def _in_tmux() -> bool:
+    return bool(os.environ.get("TMUX")) or \
+        (os.environ.get("TERM") or "").startswith(("screen", "tmux"))
+
+
+def _tmux_supports_sixel() -> bool:
+    """tmux ≥3.4 built with sixel treats a sixel image as part of its own
+    grid and REPAINTS it on resize/pane-switch — the persistence that
+    passthrough overlays fundamentally can't have (tmux redraws from its
+    character cells; an OSC-1337 image is an iTerm2 overlay it never knew
+    about, so any redraw erases it — operator report 2026-07-17).
+    Version is a proxy for the build flag (Homebrew enables sixel since
+    3.4); a sixel-less custom build would print garbage — GHOST_CLI_IMAGES
+    overrides exist for that case."""
+    try:
+        import subprocess
+        v = subprocess.run(["tmux", "-V"], capture_output=True, text=True,
+                           timeout=3).stdout.strip()
+        m = re.search(r"(\d+)\.(\d+)", v)
+        return bool(m) and (int(m.group(1)), int(m.group(2))) >= (3, 4)
+    except Exception:  # noqa: BLE001 — no tmux binary / weird output
+        return False
+
+
+_TMUX_CELL_CACHE: tuple[int, int] | None = None
+
+
+def _tmux_cell_px() -> tuple[int, int]:
+    """(cell_width_px, cell_height_px) as tmux reports for the attached
+    client — the ground truth for how many GRID CELLS a sixel image
+    occupies. Cached per process; conservative defaults when the query
+    fails."""
+    global _TMUX_CELL_CACHE
+    if _TMUX_CELL_CACHE is None:
+        w, h = 10, 20
+        try:
+            import subprocess
+            out = subprocess.run(
+                ["tmux", "display", "-p",
+                 "#{client_cell_width} #{client_cell_height}"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout.split()
+            if len(out) == 2 and int(out[0]) > 0 and int(out[1]) > 0:
+                w, h = int(out[0]), int(out[1])
+        except Exception:  # noqa: BLE001 — defaults are safe
+            pass
+        _TMUX_CELL_CACHE = (w, h)
+    return _TMUX_CELL_CACHE
+
+
+def _outer_term_sixel_capable() -> bool:
+    """Best-effort: is the terminal BEHIND tmux one we know renders
+    sixel? tmux ≥3.3 masks TERM_PROGRAM as 'tmux', but iTerm2's
+    LC_TERMINAL usually survives into panes."""
+    return (os.environ.get("LC_TERMINAL") == "iTerm2"
+            or os.environ.get("TERM_PROGRAM") in ("iTerm.app", "WezTerm"))
+
+
+def _term_image_mode() -> str:
+    """'iterm' | 'kitty' | 'halfblock' | 'none'. GHOST_CLI_IMAGES overrides
+    detection (off/iterm/kitty/halfblock); ssh carries LC_TERMINAL for
+    iTerm2. Detection is env-only — no terminal round-trips.
+
+    Under tmux the escape protocols are NOT auto-selected: tmux swallows
+    them unless `allow-passthrough` is on (off by default since 3.3), and
+    a swallowed escape looks like "no image at all" (operator report,
+    2026-07-17, tmux-on-iTerm2). Half-block always shows. An explicit
+    GHOST_CLI_IMAGES=iterm|kitty opts back in — the emitters then wrap
+    sequences in tmux passthrough framing."""
+    override = (os.environ.get("GHOST_CLI_IMAGES") or "").strip().lower()
+    if override in ("off", "none", "0", "false"):
+        return "none"
+    if override in ("iterm", "kitty", "halfblock", "sixel"):
+        return override
+    if not sys.stdout.isatty():
+        return "none"
+    if _in_tmux():
+        # Sixel when the whole stack supports it (redraw-persistent);
+        # half-block otherwise (always visible, survives redraws too).
+        if _pil() and _outer_term_sixel_capable() and _tmux_supports_sixel():
+            return "sixel"
+        return "halfblock" if _pil() else "none"
+    if (os.environ.get("TERM_PROGRAM") in ("iTerm.app", "WezTerm")
+            or os.environ.get("LC_TERMINAL") == "iTerm2"):
+        return "iterm"
+    if (os.environ.get("KITTY_WINDOW_ID")
+            or "kitty" in (os.environ.get("TERM") or "")):
+        return "kitty"
+    return "halfblock" if _pil() else "none"
+
+
+_REF_PREFIXES = ("/api/download/", "api/download/", "/workspace/",
+                 "workspace/", "sandbox:/", "sandbox/")
+
+
+def _normalize_image_ref(ref: str) -> str:
+    """Map whatever the model wrote to the sandbox-relative name
+    /api/download expects. Live 2026-07-17: the reply embedded the FULL
+    API path (`![…](/api/download/gen_x.png)`), so the fetch built
+    /api/download//api/download/… → 404. Absolute workspace paths and
+    sandbox: pseudo-schemes get the same treatment."""
+    ref = ref.strip().strip("'\"")
+    low = ref.lower()
+    for pfx in _REF_PREFIXES:
+        if low.startswith(pfx):
+            ref = ref[len(pfx):]
+            break
+    return ref.lstrip("/")
+
+
+def _extract_image_refs(text: str) -> list[str]:
+    """Sandbox-relative image paths referenced by the reply — image
+    extensions only, schemes (http/attachment/data) skipped (the CLI only
+    fetches from the agent), de-duplicated in order, capped."""
+    out: list[str] = []
+    for ref in _IMG_MD_RE.findall(text or ""):
+        ref = ref.strip().strip("'\"")
+        if not ref or "://" in ref or ref.startswith("data:"):
+            continue
+        ref = _normalize_image_ref(ref)
+        if not ref or not ref.lower().endswith(_IMG_EXTS):
+            continue
+        if ref not in out:
+            out.append(ref)
+    return out[:_IMG_MAX_PER_REPLY]
+
+
+def _image_cells() -> int:
+    return max(20, min(console.width - 4, 100))
+
+
+def _emit_raw(seq: str) -> None:
+    """Escape sequences must bypass rich's markup/width machinery. Under
+    tmux (explicit GHOST_CLI_IMAGES=iterm|kitty — auto-detection avoids
+    tmux) the sequence is wrapped in DCS passthrough framing with ESC
+    doubled, the same trick iTerm2's imgcat uses; tmux ≥3.3 additionally
+    needs `set -g allow-passthrough on` in .tmux.conf."""
+    if _in_tmux() and seq.startswith("\x1b"):
+        seq = "\x1bPtmux;" + seq.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+    sys.stdout.write(seq)
+    sys.stdout.flush()
+
+
+def _render_iterm(data: bytes, name: str) -> bool:
+    b64 = base64.b64encode(data).decode("ascii")
+    b64name = base64.b64encode(name.encode("utf-8", "replace")).decode("ascii")
+    _emit_raw(
+        f"\x1b]1337;File=name={b64name};size={len(data)};inline=1;"
+        f"width={_image_cells()};preserveAspectRatio=1:{b64}\x07\n"
+    )
+    return True
+
+
+def _render_kitty(data: bytes, name: str) -> bool:
+    """Kitty graphics protocol (a=T direct transmit). f=100 is PNG-only —
+    other formats are transcoded via Pillow or skipped."""
+    if not data.startswith(_PNG_MAGIC):
+        Image = _pil()
+        if Image is None:
+            return False
+        import io
+        try:
+            buf = io.BytesIO()
+            Image.open(io.BytesIO(data)).convert("RGB").save(buf, "PNG")
+            data = buf.getvalue()
+        except Exception:  # noqa: BLE001 — undecodable → let caller fall back
+            return False
+    b64 = base64.b64encode(data).decode("ascii")
+    chunks = [b64[i:i + 4096] for i in range(0, len(b64), 4096)] or [""]
+    for i, chunk in enumerate(chunks):
+        more = 0 if i == len(chunks) - 1 else 1
+        ctrl = (f"a=T,f=100,c={_image_cells()},m={more}" if i == 0
+                else f"m={more}")
+        _emit_raw(f"\x1b_G{ctrl};{chunk}\x1b\\")
+    _emit_raw("\n")
+    return True
+
+
+def _render_sixel(data: bytes, name: str) -> bool:
+    """DEC sixel, pure-python (Pillow quantize → ≤256-color palette →
+    6-row bands with run-length encoding). Emitted RAW even under tmux —
+    a sixel-built tmux consumes the sequence itself and OWNS the image
+    (that's the whole point: it survives resizes); passthrough framing
+    would hide it from tmux and reintroduce the overlay problem."""
+    Image = _pil()
+    if Image is None:
+        return False
+    import io
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:  # noqa: BLE001 — undecodable bytes
+        return False
+    # Size by REAL cell geometry under tmux — sixel pixels map to the
+    # client's pixels, and an image wider than cols×cell_width px gets
+    # clipped by the pane (18×8 cells measured live on the operator's
+    # setup; the old 10px/cell guess overflowed the pane by ~25%).
+    cell_w, cell_h = _tmux_cell_px() if _in_tmux() else (10, 20)
+    max_w = min(_image_cells(), 80) * cell_w
+    if img.width > max_w:
+        img = img.resize(
+            (max_w, max(1, round(img.height * max_w / img.width))))
+    pal_img = img.quantize(colors=256)
+    W, H = pal_img.size
+    palette = pal_img.getpalette() or []
+    pix = list(pal_img.getdata())                  # flat, row-major
+    parts = [f"\x1bPq\"1;1;{W};{H}"]
+    ncolors = max(pix) + 1 if pix else 1
+    for i in range(ncolors):
+        r, g, b = (palette[3 * i:3 * i + 3] + [0, 0, 0])[:3]
+        parts.append(f"#{i};2;{r * 100 // 255};{g * 100 // 255};"
+                     f"{b * 100 // 255}")
+    for y0 in range(0, H, 6):
+        rows = min(6, H - y0)
+        band = [pix[(y0 + dy) * W:(y0 + dy) * W + W] for dy in range(rows)]
+        colors = set()
+        for row in band:
+            colors.update(row)
+        first = True
+        for c in sorted(colors):
+            if not first:
+                parts.append("$")                  # overprint next color
+            first = False
+            parts.append(f"#{c}")
+            run_ch, run_len, seq = None, 0, []
+            for x in range(W):
+                bits = 0
+                for dy in range(rows):
+                    if band[dy][x] == c:
+                        bits |= 1 << dy
+                ch = chr(63 + bits)
+                if ch == run_ch:
+                    run_len += 1
+                else:
+                    if run_ch is not None:
+                        seq.append(run_ch if run_len == 1
+                                   else f"!{run_len}{run_ch}")
+                    run_ch, run_len = ch, 1
+            if run_ch is not None:
+                seq.append(run_ch if run_len == 1 else f"!{run_len}{run_ch}")
+            parts.append("".join(seq))
+        parts.append("-")                          # next 6-pixel band
+    parts.append("\x1b\\")
+    tail = "\n"
+    if _in_tmux():
+        # tmux anchors the image to the grid at the cursor WITHOUT
+        # advancing it. The caption printed next would land ON the
+        # image's cells — and tmux invalidates an image whose cells are
+        # overwritten, so it vanished before it could be seen (live
+        # report: "doesn't really show at all"). Advance the cursor past
+        # the image's full cell height first.
+        tail = "\n" * (-(-H // cell_h) + 1)
+    sys.stdout.write("".join(parts) + tail)
+    sys.stdout.flush()
+    return True
+
+
+def _render_halfblock(data: bytes, name: str) -> bool:
+    Image = _pil()
+    if Image is None:
+        return False
+    import io
+    try:
+        img = Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:  # noqa: BLE001 — undecodable bytes
+        return False
+    cols = min(_image_cells(), 80)
+    # A terminal cell is ~2:1 (h:w); '▀' packs two pixel rows per cell, so
+    # rows_px = cols * (h/w) * cell-aspect ≈ cols * h/w * 0.9, even-rounded.
+    rows_px = max(2, round(cols * (img.height / max(1, img.width)) * 0.9))
+    rows_px += rows_px % 2
+    img = img.resize((cols, rows_px))
+    px = img.load()
+    for y in range(0, rows_px, 2):
+        line = Text()
+        for x in range(cols):
+            r1, g1, b1 = px[x, y]
+            r2, g2, b2 = px[x, y + 1]
+            line.append("▀", style=f"rgb({r1},{g1},{b1}) on rgb({r2},{g2},{b2})")
+        console.print(line)
+    return True
+
+
+def render_image_bytes(name: str, data: bytes,
+                       mode: str | None = None) -> bool:
+    """Draw one image inline. Falls through iterm/kitty → halfblock when a
+    protocol path can't handle the bytes. Returns True when something was
+    drawn. Never raises — an undrawable image is a notice, not a crash."""
+    mode = mode or _term_image_mode()
+    if mode == "none" or not data:
+        return False
+    try:
+        drawn = (mode == "iterm" and _render_iterm(data, name)) \
+            or (mode == "kitty" and _render_kitty(data, name)) \
+            or (mode == "sixel" and _render_sixel(data, name)) \
+            or (mode == "halfblock" and _render_halfblock(data, name))
+        if not drawn and mode in ("iterm", "kitty", "sixel"):
+            drawn = _render_halfblock(data, name)
+        if drawn:
+            console.print(Text(f"  🖼 {name} · {len(data):,} bytes",
+                               style="mute"))
+        return drawn
+    except Exception as e:  # noqa: BLE001 — rendering is best-effort
+        console.print(Text(f"  🖼 {name}: could not render "
+                           f"({type(e).__name__})", style="mute"))
+        return False
+
+
+def render_reply_images(api: "GhostAPI", text: str) -> None:
+    """Fetch + draw every image the reply references. Quiet on a clean
+    reply; one mute line per fetch failure so a missing file never looks
+    like a rendering bug."""
+    mode = _term_image_mode()
+    if mode == "none":
+        return
+    for ref in _extract_image_refs(text):
+        try:
+            status, data = api.download_bytes(ref)
+            # The reply's path may not match the sandbox layout (scoped
+            # project dirs, stale prefixes) — the flat basename is where
+            # generated images actually land, so try it before giving up.
+            if (status != 200 or not data) and "/" in ref:
+                base = ref.rsplit("/", 1)[1]
+                status, data = api.download_bytes(base)
+                if status == 200 and data:
+                    ref = base
+        except requests.RequestException:
+            status, data = 0, b""
+        if status != 200 or not data:
+            console.print(Text(f"  🖼 {ref}: not fetchable from the sandbox "
+                               f"(HTTP {status})", style="mute"))
+            continue
+        render_image_bytes(ref, data, mode)
+
+
 HELP = """[bold]conversation[/]
   [you]/clear[/]                 fresh context (new session — old one stays resumable)
   [you]/new[/] \\[title]           start a new, optionally titled, session
@@ -206,7 +580,8 @@ HELP = """[bold]conversation[/]
 [bold]misc[/]
   [you]/help[/]   [you]/exit[/]  [dim](or Ctrl-D)[/]
 [dim]Enter submits · paste multi-line freely · Alt+Enter force-submits
-replies render as Markdown with highlighted code
+replies render as Markdown with highlighted code · images the reply
+references draw inline after it (GHOST_CLI_IMAGES=off|iterm|kitty|sixel|halfblock)
 Ctrl-C aborts a reply AND cancels the turn on the agent[/]"""
 
 
@@ -307,6 +682,22 @@ class GhostAPI:
             return self._json("POST", "/api/upload",
                               files={"file": (path.name, fh)},
                               timeout=(10, 600))
+
+    def download_bytes(self, name: str,
+                       cap: int = _IMG_MAX_BYTES) -> tuple[int, bytes]:
+        """Fetch a sandbox file into memory (inline image rendering).
+        Returns (status, bytes) — bytes empty on error or when ``cap`` is
+        exceeded (a runaway file must not balloon the CLI)."""
+        with self.http.get(self._url(f"/api/download/{quote(name)}"),
+                           stream=True, timeout=(10, 120)) as r:
+            if r.status_code != 200:
+                return r.status_code, b""
+            buf = bytearray()
+            for chunk in r.iter_content(65536):
+                buf.extend(chunk)
+                if len(buf) > cap:
+                    return 200, b""
+            return 200, bytes(buf)
 
     def download(self, name: str, dest: Path) -> tuple[int, int]:
         """Stream a sandbox file to ``dest``. Returns (status, bytes_written)."""
@@ -514,6 +905,7 @@ class GhostCLI:
         reply = self.stream_reply(request_id)
         console.print()
         if reply:
+            render_reply_images(self.api, reply)
             self.history.append({"role": "assistant", "content": reply})
         else:
             # Nothing came back (error / abort before the first token):
@@ -711,6 +1103,12 @@ class GhostCLI:
             status, size = self.api.download(name, dest)
         if status == 200:
             self.notice(f"✓ {dest} ({size:,} bytes)", "ok")
+            # A downloaded image is worth a look right here.
+            if dest.suffix.lower() in _IMG_EXTS and size <= _IMG_MAX_BYTES:
+                try:
+                    render_image_bytes(dest.name, dest.read_bytes())
+                except OSError:
+                    pass
         else:
             dest.unlink(missing_ok=True)
             self.notice(f"✖ HTTP {status} — no such file in the sandbox?", "err")
@@ -1004,6 +1402,8 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                 live = None
             if not render:
                 sys.stdout.write("\n")
+            elif out:
+                render_reply_images(api, "".join(out))
             return 1 if got_error else 0
     except requests.RequestException as e:
         print(f"ghost: {type(e).__name__}: cannot reach the agent", file=sys.stderr)

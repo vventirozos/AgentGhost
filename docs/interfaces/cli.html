@@ -57,12 +57,53 @@
     </tbody>
   </table>
 
+  <h2>Inline images (2026-07-17)</h2>
+  <p>After a reply settles, <code>![…](name.png)</code> references are fetched from the agent
+  sandbox (<code>GET /api/download/{name}</code>, in-memory, 25&nbsp;MB cap, ≤4 per reply,
+  de-duplicated; http/data schemes skipped — the CLI only fetches from the agent) and drawn in
+  the terminal below the reply. Protocol auto-detection: <strong>iTerm2/WezTerm</strong>
+  (OSC&nbsp;1337 inline escape; <code>LC_TERMINAL</code> honoured over ssh) →
+  <strong>kitty</strong> (graphics protocol, <code>f=100</code> PNG-only so non-PNG transcodes
+  via Pillow or falls through) → <strong>half-block</strong> (universal truecolor fallback: two
+  vertical pixels per cell via <code>▀</code>, needs Pillow) → none. Escape-protocol failures
+  fall through to half-block. Images can't be drawn INSIDE the rich Live region (the escapes
+  are raw byte streams a repaint would shred), hence after-the-reply placement.
+  <code>/download</code> of an image also renders it. Override with
+  <code>GHOST_CLI_IMAGES=off|iterm|kitty|halfblock</code>. Pillow rides the PEP-723 deps but is
+  optional at runtime (protocol paths ship raw bytes without it).</p>
+  <p><strong>Ref normalization + tmux (2026-07-17, first live use).</strong> Replies embed
+  whatever path shape the model chose — the first live image arrived as the FULL API path
+  (<code>![…](/api/download/gen_x.png)</code>), which double-prefixed the fetch → 404.
+  <code>_normalize_image_ref</code> strips <code>/api/download/</code>, <code>/workspace/</code>
+  and <code>sandbox:</code> prefixes (anchored, not mid-path); a pathed ref that still 404s is
+  retried as its flat basename (generated images land at the sandbox root). And under
+  <strong>tmux</strong>, auto-detection picks half-block instead of an escape protocol — tmux
+  swallows OSC-1337/kitty sequences unless <code>allow-passthrough</code> is on (off by default
+  since tmux 3.3), and a swallowed escape looks like no image at all. Forcing
+  <code>GHOST_CLI_IMAGES=iterm</code> under tmux wraps sequences in DCS passthrough framing
+  (ESC-doubled, the imgcat trick) — full-resolution images inside tmux panes, provided
+  <code>set -g allow-passthrough on</code> is in <code>.tmux.conf</code>.</p>
+  <p><strong>Sixel — redraw-persistent images in tmux (2026-07-17, second live report).</strong>
+  Passthrough images are OVERLAYS: tmux repaints panes from its character grid, so any redraw —
+  a resize, a pane switch — erases them (operator: "disappears if I slightly resize"). Sixel
+  fixes this structurally: a sixel-built tmux (Homebrew builds it in since 3.4; the operator
+  runs 3.7b) consumes the sequence itself, stores the image in its own model, and repaints it
+  across resizes. New pure-python encoder (<code>_render_sixel</code>: Pillow 256-color
+  quantize → 6-row bands, RLE, ~0.4s for 640×480) — emitted RAW even under tmux, never
+  passthrough-wrapped (tmux must SEE it to own it). Auto-detection under tmux now prefers sixel
+  when the stack supports it (tmux ≥3.4 + iTerm2/WezTerm outer + Pillow), falling back to
+  half-block; <code>GHOST_CLI_IMAGES=sixel</code> forces it.</p>
+
   <h2>Tests</h2>
-  <p><code>tests/test_ghost_cli.py</code> (11) — loads the extensionless script by path;
+  <p><code>tests/test_ghost_cli.py</code> — loads the extensionless script by path;
   covers repo location + the bin symlink contract, the formatting helpers, error-shape
   extraction (<code>GhostAPI.error_of</code>), base-URL normalization (stray path/query
-  → <code>scheme://netloc</code>), header key wiring, and env-vs-file key precedence.
-  Network paths are deliberately not exercised.</p>
+  → <code>scheme://netloc</code>), header key wiring, env-vs-file key precedence, and the
+  inline-image stack (ref extraction/dedupe/caps, mode detection incl. ambient
+  <code>LC_TERMINAL</code> scrub, iTerm2/kitty escape shapes, kitty PNG-only guard,
+  half-block render, fetch-failure resilience). Live network paths are exercised manually
+  (verified 2026-07-17: upload → reference → fetch → half-block render against the running
+  agent).</p>
 </main>
 </body>
 </html>
