@@ -129,6 +129,112 @@ def test_souvlaki_regression_shape_both_outputs_present():
     assert "403 Forbidden" in out
 
 
+# ---------- budget redistribution + URL squeeze (2026-07-17) ----------
+#
+# Regression target (req 4dab5067, the naftemporiki turn): one-pass
+# newest-heavy allocation gave a 106-char weather report — the NEWEST
+# tool — 65% of the budget, which it left unused, while the 4KB RSS
+# feed (the OLDEST tool) was cut mid-item #4. The verifier then
+# REFUTED the answer's items #5–#10 as "not in the evidence" and a
+# correct answer burned an auto-repair round, got its lessons
+# scrubbed, and queued a bogus next-turn correction. Slack is now
+# redistributed to still-truncated items, and long tracking URLs
+# (zero entailment value, ~70% of RSS payloads) are trimmed first.
+
+
+def test_tiny_newest_does_not_starve_large_oldest():
+    tools = [
+        {"name": "naftemporiki_headlines",
+         "content": "H" * 3800 + " FINAL_HEADLINE_MARKER"},
+        {"name": "system_utility",
+         "content": "REPORT: Weather in Athens Temp: 34.4C"},
+    ]
+    out = _collect_verifier_evidence(tools)
+    assert len(out) <= 4000
+    # The big oldest output survives INTACT: the weather's unused slice
+    # was handed back instead of dying as dead budget.
+    assert "FINAL_HEADLINE_MARKER" in out
+    assert "34.4C" in out
+
+
+def test_long_tracking_urls_are_trimmed_short_urls_kept():
+    long_url = ("https://www.naftemporiki.gr/politics/2139006/syriza-thrasos-"
+                "toy-mitsotaki-na-zitaei-kai-ta-resta-gia-ton-opekepe/"
+                "?utm_source=rss&utm_medium=rss&utm_campaign=syriza-thrasos")
+    short_url = "https://example.com/a"
+    tools = [{
+        "name": "browser",
+        "content": f'"title": "REAL TITLE", "link": "{long_url}" and {short_url}',
+    }]
+    out = _collect_verifier_evidence(tools)
+    assert "REAL TITLE" in out
+    assert short_url in out          # short URLs untouched
+    assert long_url not in out       # tracking tail gone…
+    assert "https://www.naftemporiki.gr/politics/" in out  # …stub kept
+    assert "…" in out
+
+
+def test_naftemporiki_regression_all_items_survive():
+    """Realistic failing shape: 10 titled entries each dragging a
+    ~340-char UTM URL, followed by a tiny weather report. Every title
+    must reach the verifier."""
+    entries = "".join(
+        f'{{"title": "TITLE_{i} unique headline text number {i}",\n'
+        f'"link": "https://www.naftemporiki.gr/section/213{i:04d}/'
+        + ("slug-" * 40)
+        + f'?utm_source=rss&utm_campaign=item{i}"}},\n'
+        for i in range(10)
+    )
+    tools = [
+        {"name": "naftemporiki_headlines",
+         "content": '{"headlines": [' + entries + '], "count": 10}'},
+        {"name": "system_utility",
+         "content": "REPORT: Weather in Athens Temp: 34.4C Wind: 19 km/h"},
+    ]
+    out = _collect_verifier_evidence(tools)
+    assert len(out) <= 4000
+    for i in range(10):
+        assert f"TITLE_{i}" in out, f"headline {i} was cut from evidence"
+    assert "34.4C" in out
+
+
+def test_redistribution_still_respects_budget_when_everything_overflows():
+    tools = [
+        {"name": "a", "content": "a" * 5000},
+        {"name": "b", "content": "b" * 5000},
+        {"name": "c", "content": "c" * 5000},
+    ]
+    out = _collect_verifier_evidence(tools, budget=4000)
+    assert len(out) <= 4000
+    # No slack existed, so newest-heavy ordering is unchanged.
+    assert out.count("c") > out.count("b") > out.count("a")
+
+
+# ---------- repair directive: standalone rewrite, no critic-talk ----------
+
+
+def test_repair_suffix_forbids_acknowledging_the_alert():
+    from ghost_agent.core.agent import _REPAIR_STANDALONE_SUFFIX
+    lowered = _REPAIR_STANDALONE_SUFFIX.lower()
+    assert "never saw" in lowered
+    assert "standalone" in lowered
+    assert "do not acknowledge" in lowered
+    assert "apologise" in lowered
+    assert "verifier" in lowered
+
+
+def test_repair_suffix_is_wired_into_the_do_repair_block():
+    """Source-level guard (house precedent: test_narrative_nothink_wiring):
+    the suffix must be appended where the repair directive is injected —
+    deleting the append silently reintroduces the req-4dab5067 leakage."""
+    import ghost_agent.core.agent as agent_mod
+    src = open(agent_mod.__file__, encoding="utf-8").read()
+    idx = src.find("if _do_repair:")
+    assert idx != -1
+    block = src[idx:idx + 400]
+    assert "_directive += _REPAIR_STANDALONE_SUFFIX" in block
+
+
 # ---------- gate wiring: _compute_verifier_verdict passes the digest ----------
 
 

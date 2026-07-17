@@ -235,6 +235,33 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
 _EVIDENCE_BUDGET_WEIGHTS = ([1.0], [0.65, 0.35], [0.5, 0.3, 0.2])
 
 
+# A URL this long is feed/tracking plumbing (UTM params, slug echoes), not
+# evidence — the claim under audit never cites it, and on RSS-shaped output
+# it can be ~70% of the payload. Trimmed to a stub so the host+path still
+# attribute the item while the chars go to verifiable content instead.
+_EVIDENCE_LONG_URL_RE = re.compile(r"https?://\S{72,}")
+
+# Appended to every auto-repair directive. The directive rides a user-role
+# message and the refuted draft is discarded, so the REAL user never saw
+# what is being corrected — without this, the model answers the alert
+# conversationally and the acknowledgement ("You're right — I was
+# embellishing…") leaks checker-facing dialogue into the only reply the
+# user gets (req 4dab5067, 2026-07-17).
+_REPAIR_STANDALONE_SUFFIX = (
+    " IMPORTANT: the user never saw the draft this alert refers to and "
+    "cannot see this alert. Write the corrected answer as a clean, "
+    "standalone reply to the user's original request — do NOT acknowledge "
+    "this alert, do NOT apologise or say what you fixed, and do NOT "
+    "mention any verifier, review, or correction."
+)
+
+
+def _squeeze_evidence_noise(text: str) -> str:
+    """Collapse zero-entailment-value bulk (long tracking URLs) in a tool
+    output before it competes for the verifier's evidence budget."""
+    return _EVIDENCE_LONG_URL_RE.sub(lambda m: m.group(0)[:64] + "…", text)
+
+
 def _collect_verifier_evidence(tools_run: Optional[list],
                                max_items: int = 3,
                                budget: int = 4000) -> str:
@@ -257,7 +284,10 @@ def _collect_verifier_evidence(tools_run: Optional[list],
     judge reads the turn the way it happened), each item prefixed with
     ``[tool_name]`` so the prompt can attribute failures to a single
     tool, and budgets are newest-heavy (the final answer usually leans
-    most on the latest evidence). Total length is capped at ``budget``
+    most on the latest evidence) with unused slack redistributed to
+    still-truncated items — a tiny newest output must not starve a
+    large older one. Long tracking URLs are trimmed first; they carry
+    no entailment value. Total length is capped at ``budget``
     INCLUDING labels/separators, so ``verify_claim``'s own ``[:4000]``
     guard never truncates the newest item away. Returns ``""`` when no
     substantive tool exists — callers fall back / skip exactly as the
@@ -280,16 +310,33 @@ def _collect_verifier_evidence(tools_run: Optional[list],
         return ""
     picked.reverse()  # chronological: oldest → newest
     weights = _EVIDENCE_BUDGET_WEIGHTS[len(picked) - 1]
-    parts = []
-    # weights are newest-first; picked is oldest-first — walk them
-    # together from opposite ends so the NEWEST output gets the biggest
-    # slice.
-    for tool, weight in zip(picked, reversed(weights)):
-        label = f"[{str(tool.get('name', 'tool'))[:80]}] "
-        # Each item's cap covers its label and the joining separator, so
-        # the assembled string can never exceed `budget`.
-        body_cap = max(1, int(budget * weight) - len(label) - 2)
-        parts.append(label + str(tool.get("content", ""))[:body_cap])
+    labels = [f"[{str(t.get('name', 'tool'))[:80]}] " for t in picked]
+    bodies = [_squeeze_evidence_noise(str(t.get("content", "")))
+              for t in picked]
+    # Pass 1 — weighted caps. weights are newest-first; picked is
+    # oldest-first — walk them from opposite ends so the NEWEST output
+    # gets the biggest slice. Each cap covers its label and the joining
+    # separator, so the assembled string can never exceed `budget`.
+    caps = [max(1, int(budget * w) - len(lbl) - 2)
+            for lbl, w in zip(labels, reversed(weights))]
+    granted = [min(len(b), c) for b, c in zip(bodies, caps)]
+    # Pass 2 — redistribute slack. A weighted slice its item doesn't fill
+    # is dead budget under one-pass allocation: on the 2026-07-17
+    # naftemporiki turn (req 4dab5067) a 106-char weather report — the
+    # NEWEST tool — held 65% of the budget while the 4KB headlines feed
+    # was cut mid-item #4, and the verifier then REFUTED the answer's
+    # items #5–#10 as "not in the evidence". Unused chars go to
+    # still-truncated items, newest first.
+    spare = sum(c - g for c, g in zip(caps, granted))
+    for i in reversed(range(len(picked))):
+        if spare <= 0:
+            break
+        need = len(bodies[i]) - granted[i]
+        if need > 0:
+            take = min(need, spare)
+            granted[i] += take
+            spare -= take
+    parts = [lbl + b[:g] for lbl, b, g in zip(labels, bodies, granted)]
     return "\n\n".join(parts)
 
 
@@ -7560,6 +7607,31 @@ class GhostAgent:
                 prev_key = key
             final_ai_content = "\n\n".join(deduped)
 
+        # Multi-turn reply smoothing (2026-07-17, operator-picked option):
+        # a turn that ran several tool batches accumulates each
+        # iteration's working narration ("Let me fix both:", "Now add the
+        # resize logic:") and often a pre-verification summary that the
+        # post-verification one restates. Drop those two shapes from the
+        # DELIVERED reply — the live stream already showed them as
+        # progress. Gated on ≥2 real tool runs so conversational and
+        # single-tool answers are never touched; runs BEFORE the verifier
+        # gate so the verdict judges the text the user actually receives.
+        if sum(1 for t in tools_run_this_turn
+               if t and not t.get("_synthetic")) >= 2:
+            try:
+                from .reply_smoothing import smooth_reply
+                _smoothed = smooth_reply(final_ai_content)
+                if _smoothed != final_ai_content:
+                    pretty_log(
+                        "Reply Smoothing",
+                        f"trimmed working narration: "
+                        f"{len(final_ai_content)} → {len(_smoothed)} chars",
+                        icon=Icons.BRAIN_SUM,
+                    )
+                    final_ai_content = _smoothed
+            except Exception as _sm_exc:
+                logger.debug("reply smoothing skipped: %s", _sm_exc)
+
         # --- THE "PERFECT IT" PROTOCOL INJECTION ---
         # Only trigger proactive optimization for heavy engineering/research tasks
         heavy_tools_used = any(t.get('name') in ['execute', 'deep_research'] for t in tools_run_this_turn)
@@ -8309,6 +8381,7 @@ class GhostAgent:
                 is_internal_request as _is_internal_req2,
                 render_activity_digest as _render_adg,
                 load_offset as _act_load, save_offset as _act_save,
+                SEVERITY_NOTIFY as _SEV_NOTIFY,
             )
             _alog = _get_alog(self.context)
             if (_alog is not None and final_ai_content
@@ -8325,8 +8398,16 @@ class GhostAgent:
                     # current_req_id: don't echo records THIS turn wrote
                     # (e.g. its own notify_operator call) back at the
                     # operator as "while you were away".
+                    # notify-only (operator decision 2026-07-17): routine
+                    # maintenance (dream/PRM/router/calibration/self-play)
+                    # is info-severity and reads as noise in chat — it
+                    # stays in the ledger, reachable on demand via
+                    # `introspect action='activity'`. The watermark still
+                    # advances over info records below, so they are
+                    # "seen" without ever rendering.
                     _adg = _render_adg(_recs,
-                                       current_req_id=str(fs.req_id or ""))
+                                       current_req_id=str(fs.req_id or ""),
+                                       severities=(_SEV_NOTIFY,))
                     if _adg and _adg[:40] not in final_ai_content:
                         final_ai_content = (
                             f"{_adg}\n\n---\n\n{final_ai_content}")
@@ -11703,6 +11784,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 )
                                 _do_repair = False
                             if _do_repair:
+                                _directive += _REPAIR_STANDALONE_SUFFIX
                                 messages.append(msg)
                                 messages.append({"role": "user", "content": _directive})
                                 repair_round += 1
@@ -12672,6 +12754,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             outcome=Outcome.UNKNOWN.value,  # user turns have no validator
             final_response=final_response[:16000],
         )
+        # Stamp the turn's wall-clock from the pretty-log request clock.
+        # The writer used to leave duration_s at the schema default (0.0)
+        # on every chat turn, so per-turn latency was invisible to the
+        # corpus consumers (PRM features, reflection). None (request
+        # already closed / sim context) keeps the default.
+        try:
+            _elapsed = _glog.request_elapsed_s(req_id or "")
+            if _elapsed is not None:
+                traj_kwargs["duration_s"] = round(_elapsed, 3)
+        except Exception:
+            pass
         # Use the pre-allocated id from `handle_chat` when present so
         # in-turn writers (Perfection-Protocol's lesson save) and the
         # eventual on-disk record share one stable id. Falls back to

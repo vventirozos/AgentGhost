@@ -120,6 +120,38 @@
   </ul>
   <p>Covered by <code>tests/test_streaming_dequadratic.py</code>; the unchanged detector functions and cap-escalation behavior stay green under <code>tests/test_thinking_loop_guards.py</code> and <code>tests/test_thinking_cap_escalation.py</code>.</p>
 
+  <h2>Multi-turn reply smoothing (2026-07-17)</h2>
+  <p>The turn loop appends every iteration's visible text (<code>ui_content</code>) to
+  <code>final_ai_content</code>, so a multi-tool fix used to arrive as stacked working
+  narration ("Let me fix both:", "Now add the resize logic in openWindow:") with the
+  summary stated twice — once before a verify/restart step, once after (operator report:
+  the WebOS minesweeper turn). The system prompt's execution-mode rule already forbids
+  narrating during tool use (and was sharpened: no summaries until the whole task is
+  done, never restate one); the model doesn't reliably comply, so
+  <code>core/reply_smoothing.smooth_reply()</code> cleans the DELIVERED reply
+  deterministically in <code>_finalize_and_return</code>, right after the
+  adjacent-duplicate collapse and BEFORE the verifier gate (the verdict judges the text
+  the user actually receives). The live stream is untouched — narration keeps serving as
+  progress; only the persisted/delivered reply (session store, Slack, trajectories,
+  banners) is smoothed.</p>
+  <ul>
+    <li><strong>Gate:</strong> only turns with ≥2 non-synthetic tool runs — conversational
+    and single-tool replies are never rewritten.</li>
+    <li><strong>Shape 1 — connective narration:</strong> a non-final paragraph ≤300 chars
+    opening with a progress connective (Let me / Now / Good, / Okay / Next, / I'll / I
+    need to / Time to …). Fences and list items are exempt.</li>
+    <li><strong>Shape 2 — superseded summary group:</strong> a ':'-lead-in plus its list
+    items whose content words are ≥55% Jaccard-covered by a later group of comparable
+    size (≥60%) — the pre-verification summary; the last statement wins. Groups containing
+    fences are never dropped.</li>
+    <li><strong>Fail-open:</strong> fenced blocks are split-atomic (blank lines inside a
+    fence don't split it), the final block is never dropped, and an over-scrub that would
+    empty the reply returns the original. Idempotent.</li>
+  </ul>
+  <p>Tests: <code>tests/test_reply_smoothing.py</code> (12 — including the verbatim WebOS
+  transcript as the regression fixture). Note: the prompt edit changes the byte-stable
+  system prefix, so the first boot after deploy re-prefills the main-node cache once.</p>
+
   <h2 id="truncated-answer-continuation">Truncated-answer auto-continuation</h2>
   <p>The streaming consume loop records the last non-null <code>finish_reason</code> seen on the upstream stream. When a <em>text</em> turn (no <code>&lt;tool_call&gt;</code> / <code>&lt;function&gt;</code> in flight) ends with <code>finish_reason == "length"</code>, the answer was cut off at the model's token cap — shipping it would hand the user a mid-sentence reply, which the <a href="verifier.html">Verifier</a> correctly REFUTES (truncated output, and any explicit question left unanswered).</p>
   <p>Instead of surfacing the fragment, <code>handle_chat</code> transparently continues the generation: it replays the request with the partial answer as a prior <code>assistant</code> turn plus a "your reply was cut off — continue from exactly where it stopped, don't repeat anything" instruction, and appends the result to <code>full_content</code>. This repeats until the upstream returns a non-<code>length</code> finish or <code>MAX_TRUNCATION_CONTINUATIONS</code> (3) round-trips are spent — the bound prevents a model that mis-reports <code>length</code> on every reply from looping forever. The continuation payload drops <code>tools</code>/<code>tool_choice</code> so it can only produce prose, and strips any <code>&lt;think&gt;</code> prelude the continuation emits before appending. Turns that produced a tool call are unaffected — those go through the parse/retry path, not this user-facing-prose path.</p>

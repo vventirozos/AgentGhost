@@ -213,6 +213,93 @@ class TestRenderDigest:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Severity gate + dedupe (2026-07-17) — the finalize banner is notify-only
+# (operator decision: info-severity maintenance read as noise in chat);
+# info records stay reachable via the on-demand report below.
+# ──────────────────────────────────────────────────────────────────────
+
+class TestRenderDigestSeverityGate:
+    def test_notify_only_filter_hides_info(self):
+        out = render_activity_digest([
+            _rec("dream", "REM cycle ran"),
+            _rec("scheduled_task", "cron conclusion", SEVERITY_NOTIFY),
+        ], severities=(SEVERITY_NOTIFY,))
+        assert "cron conclusion" in out
+        assert "REM cycle ran" not in out
+
+    def test_notify_only_all_info_is_empty_no_banner(self):
+        out = render_activity_digest(
+            [_rec("dream", "a"), _rec("prm_train", "b"),
+             _rec("calibration", "c")],
+            severities=(SEVERITY_NOTIFY,))
+        assert out == ""
+
+    def test_default_remains_all_severities(self):
+        out = render_activity_digest([_rec("dream", "info item")])
+        assert "info item" in out
+
+    def test_duplicate_lines_collapse_with_count(self):
+        out = render_activity_digest([
+            _rec("dream", "REM cycle ran (memory consolidation)"),
+            _rec("dream", "REM cycle ran (memory consolidation)"),
+        ])
+        assert out.count("REM cycle ran") == 1
+        assert "(×2)" in out
+
+
+class TestRenderActivityReport:
+    def test_empty_window_message(self):
+        from ghost_agent.core.autonomous_activity import (
+            render_activity_report,
+        )
+        assert "No background activity" in render_activity_report([])
+
+    def test_all_severities_newest_first_with_ages(self):
+        from ghost_agent.core.autonomous_activity import (
+            render_activity_report,
+        )
+        now = time.time()
+        recs = [
+            ActivityRecord(ts=now - 7200, phase="prm_train",
+                           summary="value model refit"),
+            ActivityRecord(ts=now - 60, phase="scheduled_task",
+                           summary="cron conclusion",
+                           severity=SEVERITY_NOTIFY),
+        ]
+        out = render_activity_report(recs, now=now)
+        # Info-severity maintenance IS included here — that's the point.
+        assert "value model refit" in out
+        assert "cron conclusion" in out
+        assert out.index("cron conclusion") < out.index("value model refit")
+        assert "2.0h ago" in out and "just now" in out
+        assert "❗" in out  # notify marker
+
+    def test_window_cutoff_excludes_old_records(self):
+        from ghost_agent.core.autonomous_activity import (
+            render_activity_report,
+        )
+        now = time.time()
+        recs = [ActivityRecord(ts=now - 3 * 86400, phase="dream",
+                               summary="ancient cycle")]
+        out = render_activity_report(recs, hours=24, now=now)
+        assert "ancient cycle" not in out
+        assert "No background activity" in out
+
+    def test_collapse_and_limit_tail(self):
+        from ghost_agent.core.autonomous_activity import (
+            render_activity_report,
+        )
+        now = time.time()
+        recs = ([ActivityRecord(ts=now - i, phase="dream",
+                                summary="REM cycle ran") for i in range(3)]
+                + [ActivityRecord(ts=now - 100 - i, phase="router_train",
+                                  summary=f"refit {i}") for i in range(5)])
+        out = render_activity_report(recs, limit=2, now=now)
+        assert "(×3)" in out
+        assert "more distinct item(s)" in out
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Scheduled-turn capture helpers
 # ──────────────────────────────────────────────────────────────────────
 
@@ -528,6 +615,9 @@ class TestWiring:
         assert "render_activity_digest" in src
         assert src.count("is_internal_request") >= 2  # project + activity
         assert "activity_digest.json" in src
+        # Notify-only banner (2026-07-17): dropping this filter would
+        # resurrect the maintenance-noise banner the operator asked to kill.
+        assert "severities=(_SEV_NOTIFY,)" in src
 
     def test_biological_phases_record_activity(self):
         import re as _re

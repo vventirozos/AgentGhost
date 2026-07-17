@@ -186,3 +186,46 @@ def test_record_trajectory_list_content_gets_flattened(tmp_path):
     )
     [t] = list(collector.iter_trajectories())
     assert "describe the image" in t.user_request
+
+
+def test_record_trajectory_stamps_duration_from_request_clock(tmp_path):
+    """duration_s comes from the pretty-log request clock (2026-07-17):
+    the writer used to leave it at the schema default 0.0 on every chat
+    turn, so per-turn latency was invisible to corpus consumers."""
+    import time
+    from ghost_agent.utils import logging as glog
+
+    collector = TrajectoryCollector(root=tmp_path, session_id="dur")
+    agent = _agent_with_collector(collector)
+    req_id = "req-duration-test"
+    with glog._REQ_STATE_LOCK:
+        glog._REQ_STATE[req_id] = {"started": time.monotonic() - 3.0}
+    try:
+        agent._record_turn_trajectory(
+            messages=[{"role": "user", "content": "hi"},
+                      {"role": "assistant", "content": "hello"}],
+            final_content="hello",
+            req_id=req_id,
+            model="m",
+        )
+    finally:
+        with glog._REQ_STATE_LOCK:
+            glog._REQ_STATE.pop(req_id, None)
+    [t] = list(collector.iter_trajectories())
+    assert t.duration_s >= 2.5
+
+
+def test_record_trajectory_duration_defaults_when_request_untracked(tmp_path):
+    """An untracked req_id (request already closed, sim contexts) keeps
+    the schema default rather than raising or stamping garbage."""
+    collector = TrajectoryCollector(root=tmp_path, session_id="dur0")
+    agent = _agent_with_collector(collector)
+    agent._record_turn_trajectory(
+        messages=[{"role": "user", "content": "hi"},
+                  {"role": "assistant", "content": "hello"}],
+        final_content="hello",
+        req_id="req-never-opened",
+        model="m",
+    )
+    [t] = list(collector.iter_trajectories())
+    assert t.duration_s == 0.0

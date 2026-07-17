@@ -246,3 +246,63 @@ def test_introspect_dispatch_lambda_passes_self_model(tmp_path: Path):
     tools = get_available_tools(ctx)
     assert "introspect" in tools
     assert callable(tools["introspect"])
+
+
+# ──────────────────────────────────────────────────────────────────────
+# action='activity' — the on-demand background-activity report
+# (2026-07-17: the finalize banner went notify-only; this is where the
+# routine maintenance answers "what did you do while I was away?")
+# ──────────────────────────────────────────────────────────────────────
+
+
+def _ctx_with_ledger(tmp_path: Path):
+    from ghost_agent.core.autonomous_activity import ActivityLog
+    log = ActivityLog(tmp_path / "activity.jsonl")
+    return SimpleNamespace(activity_log=log), log
+
+
+async def test_activity_renders_info_and_notify(tmp_path: Path):
+    ctx, log = _ctx_with_ledger(tmp_path)
+    log.record("dream", "REM cycle ran (memory consolidation)")
+    log.record("prm_train", "value model refit on 879 samples")
+    log.record("scheduled_task", "'netmon-check': all hosts up",
+               severity="notify")
+    out = await tool_introspect(action="activity", context=ctx)
+    assert "REM cycle ran" in out
+    assert "value model refit" in out
+    assert "netmon-check" in out
+
+
+async def test_activity_works_without_self_model(tmp_path: Path):
+    """The ledger is not the SelfModel — a disabled selfhood must not
+    block the activity report."""
+    ctx, log = _ctx_with_ledger(tmp_path)
+    log.record("dream", "REM cycle ran")
+    out = await tool_introspect(action="activity", context=ctx,
+                                self_model=None)
+    assert "REM cycle ran" in out
+    assert "unavailable" not in out.lower()
+
+
+async def test_activity_without_ledger_degrades_cleanly():
+    out = await tool_introspect(action="activity",
+                                context=SimpleNamespace(activity_log=None))
+    assert "not attached" in out
+
+
+async def test_activity_clamps_bad_hours_and_limit(tmp_path: Path):
+    ctx, log = _ctx_with_ledger(tmp_path)
+    log.record("dream", "REM cycle ran")
+    out = await tool_introspect(action="activity", context=ctx,
+                                hours="garbage", limit="also-garbage")
+    assert "REM cycle ran" in out
+
+
+def test_activity_in_tool_definition_enum():
+    from ghost_agent.tools.registry import TOOL_DEFINITIONS
+    intro = next(d for d in TOOL_DEFINITIONS
+                 if d["function"]["name"] == "introspect")
+    assert "activity" in intro["function"]["parameters"][
+        "properties"]["action"]["enum"]
+    assert "hours" in intro["function"]["parameters"]["properties"]
+    assert "while I was away" in intro["function"]["description"]

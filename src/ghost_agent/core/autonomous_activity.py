@@ -276,31 +276,101 @@ def save_consumer_offset(path, consumer: str, offset: int) -> None:
 def render_activity_digest(records: List[ActivityRecord], *,
                            max_items: int = 6,
                            exclude_phases=DIGEST_EXCLUDED_PHASES,
-                           current_req_id: str = "") -> str:
+                           current_req_id: str = "",
+                           severities=None) -> str:
     """Render unseen records as a short markdown header block. Empty string
     when nothing digest-worthy. Notify-severity items lead (stable order
     otherwise). ``current_req_id`` filters out records THIS turn authored
     (a notify_operator call mid-turn must not be echoed back as "while you
-    were away" in the same reply)."""
+    were away" in the same reply). ``severities`` restricts the render to
+    those severities (None = all) — the finalize banner passes
+    ``(SEVERITY_NOTIFY,)`` so routine maintenance stays out of the chat
+    (operator decision 2026-07-17: the info-severity refit lines read as
+    noise; they remain reachable via ``introspect action='activity'``).
+    Identical (phase, summary) repeats collapse into one "×N" line."""
     items = [r for r in (records or [])
              if r.summary and r.phase not in (exclude_phases or ())
+             and (severities is None or r.severity in severities)
              and not (current_req_id
                       and r.meta.get("req_id") == current_req_id)]
     if not items:
         return ""
     items.sort(key=lambda r: 0 if r.severity == SEVERITY_NOTIFY else 1)
+    # Collapse exact repeats (two REM cycles between turns rendered as two
+    # identical bullets) while preserving first-seen order.
+    counts: Dict[Tuple[str, str], int] = {}
+    ordered: List[ActivityRecord] = []
+    for r in items:
+        key = (r.phase, r.summary)
+        if key in counts:
+            counts[key] += 1
+        else:
+            counts[key] = 1
+            ordered.append(r)
     lines = ["**Background activity while you were away:**"]
-    for r in items[:max_items]:
+    for r in ordered[:max_items]:
         label = _PHASE_LABELS.get(r.phase, r.phase)
         # Per-item clamp keeps the whole block comfortably under the
         # 1500-char leading-banner bound `_strip_leading_banners` peels —
         # a longer block would defeat the correction-fingerprint peel and
         # resurrect the stash/lookup mismatch fixed 2026-07-07.
         s = r.summary if len(r.summary) <= 140 else r.summary[:139] + "…"
-        lines.append(f"  - [{label}] {s}")
-    extra = len(items) - max_items
+        n = counts[(r.phase, r.summary)]
+        lines.append(f"  - [{label}] {s}" + (f" (×{n})" if n > 1 else ""))
+    extra = len(ordered) - max_items
     if extra > 0:
         lines.append(f"  - …and {extra} more")
+    return "\n".join(lines)
+
+
+def _age_str(ts: float, now: Optional[float] = None) -> str:
+    delta = max(0.0, (now if now is not None else time.time()) - float(ts or 0))
+    if delta < 90:
+        return "just now"
+    if delta < 5400:
+        return f"{int(delta // 60)}m ago"
+    if delta < 129600:
+        return f"{delta / 3600:.1f}h ago"
+    return f"{delta / 86400:.1f}d ago"
+
+
+def render_activity_report(records: List[ActivityRecord], *,
+                           hours: float = 24.0,
+                           limit: int = 30,
+                           now: Optional[float] = None) -> str:
+    """On-demand full view of the ledger — ALL severities including the
+    routine maintenance the finalize banner no longer auto-surfaces. The
+    answer to "what did you do while I was away?" (via ``introspect
+    action='activity'``). Newest first, timestamped, ×N-collapsed."""
+    now_ts = now if now is not None else time.time()
+    cutoff = now_ts - float(hours) * 3600.0
+    items = [r for r in (records or []) if r.summary and r.ts >= cutoff]
+    if not items:
+        return (f"No background activity recorded in the last "
+                f"{hours:g} hours.")
+    items.sort(key=lambda r: r.ts, reverse=True)
+    # Collapse exact repeats, keeping the NEWEST timestamp for the line.
+    counts: Dict[Tuple[str, str], int] = {}
+    ordered: List[ActivityRecord] = []
+    for r in items:
+        key = (r.phase, r.summary)
+        if key in counts:
+            counts[key] += 1
+        else:
+            counts[key] = 1
+            ordered.append(r)
+    shown = ordered[:max(1, int(limit))]
+    lines = [f"Background activity (last {hours:g}h, newest first):"]
+    for r in shown:
+        label = _PHASE_LABELS.get(r.phase, r.phase)
+        mark = "❗" if r.severity == SEVERITY_NOTIFY else "·"
+        s = r.summary if len(r.summary) <= 300 else r.summary[:299] + "…"
+        n = counts[(r.phase, r.summary)]
+        lines.append(f"  {mark} [{label}] {_age_str(r.ts, now_ts)} — {s}"
+                     + (f" (×{n})" if n > 1 else ""))
+    extra = len(ordered) - len(shown)
+    if extra > 0:
+        lines.append(f"  … and {extra} more distinct item(s) in the window")
     return "\n".join(lines)
 
 
@@ -370,7 +440,7 @@ __all__ = [
     "is_internal_request",
     "load_offset", "save_offset",
     "load_consumer_offset", "save_consumer_offset",
-    "render_activity_digest",
+    "render_activity_digest", "render_activity_report",
     "summarize_turn_content", "record_scheduled_result",
     "get_activity_log",
 ]

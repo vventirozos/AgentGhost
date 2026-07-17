@@ -778,6 +778,78 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-17 (later 2) — multi-turn replies smoothed: narration + double-summary scrub at finalize
+Operator: replies on multi-tool fixes read as the raw loop transcript (WebOS minesweeper turn:
+"Let me fix both:", "Now add the resize logic:", summary stated twice around the verify/restart
+step) — "how can we fix the replies to be smoother?". Option picked (of three): finalize scrub +
+prompt rule; no client changes (live stream keeps narration as progress; the delivered/persisted
+reply is cleaned).
+- **New `core/reply_smoothing.smooth_reply()`** — pure text→text, two removable shapes only:
+  (1) non-final connective narration paragraphs (≤300 chars, "Let me/Now/Good,/I'll/…" starters;
+  lists+fences exempt); (2) superseded summary groups — ':'-lead-in + list restated by a later
+  near-duplicate group (word-Jaccard ≥0.55, size ≥0.6) — last statement wins. Fence-atomic
+  splitting, final block never dropped, fail-open, idempotent.
+- **Wired in `_finalize_and_return`** after the adjacent-duplicate collapse, BEFORE the verifier
+  gate (verdict judges delivered text). Gated on ≥2 non-synthetic tool runs — conversational and
+  single-tool replies never rewritten. Logs "Reply Smoothing — trimmed … chars" when it fires.
+- **Prompt sharpened** (EXECUTION MODE): no working notes alongside tool calls, no summary until
+  the whole task (incl. verification/restart) is done, never restate a summary. NOTE: changes the
+  byte-stable system prefix → one-time main-node cache re-prefill on next boot.
+- Tests: tests/test_reply_smoothing.py (12; verbatim WebOS transcript is the fixture — asserts all
+  6 narration paragraphs dropped, pre-verify summary superseded, final summary + port line intact,
+  diagnosis kept conservatively). Docs: core/agent.html new section.
+
+### 2026-07-17 (later) — activity banner tamed: notify-only in chat + on-demand `introspect activity`
+Operator: the "Background activity while you were away" block (dream ×2, PRM/router/calibration
+refits…) "is not very elegant — only if asked?". Decision (operator-picked from three options):
+notable-only banner + on-demand report.
+- **Banner** (`render_activity_digest` + the finalize call site): renders `severity="notify"` only —
+  scheduled-task conclusions, deliberate `notify_operator` messages, failures. Info-severity
+  maintenance no longer auto-surfaces in chat (it's already on the live pretty-stream; Slack push
+  was always notify-only). Watermark still advances over info records (seen-but-silent). Identical
+  (phase, summary) repeats collapse to one `(×N)` line.
+- **On-demand**: new `introspect action='activity'` → `render_activity_report` — ALL severities,
+  newest first, timestamped ages, ×N-collapsed, `hours` window (default 24h, cap 14d) + `limit`
+  (30/100). Reads the ledger from byte 0 (≈100KB/week), does NOT consume the banner watermark.
+  Branches before the tool's self_model gate (works with selfhood disabled); registry now passes
+  `context` into tool_introspect; tool description names "what did you do while I was away?" so the
+  semantic router finds it. Kept OUT of `_BOOKKEEPING_TOOL_NAMES` deliberately — the report is real
+  evidence for a reply summarizing it.
+- Tests: test_autonomous_activity.py 48→57 (severity gate, dedupe, report render, wiring pin on
+  `severities=(_SEV_NOTIFY,)`), test_selfhood_introspect_tool.py 17→22. Docs:
+  core/autonomous_activity.html (consumer 1 updated, consumer 4 added).
+
+### 2026-07-17 — verifier evidence STARVATION: slack redistribution + URL squeeze + repair-leak guard
+Operator asked for an evaluation of the latest request (req 4dab5067, "whats the news" →
+naftemporiki RSS skill + weather). The answer was fully supported by the feed, yet the verifier
+REFUTED it twice (sync → repair round, then LATE 100% → lessons scrubbed, corpus backfilled
+`failed`, bogus next-turn correction queued). Root cause was NOT the worker model or Greek text
+(first hypothesis, discarded on evidence): the 2026-07-16 one-pass newest-heavy budget split let a
+106-char weather report — the NEWEST tool — hold 65% of the 4000-char evidence budget unused while
+the 4KB headlines feed was cut mid-item #4. Every refuted item (#5–#10) sat past the cut; the
+verifier was right about the sliver it was shown.
+- **FIX 1 — `_collect_verifier_evidence` two-pass allocation.** Weighted caps as before, then
+  unused slack is redistributed to still-truncated items (newest first). Plus
+  `_squeeze_evidence_noise`: tracking-length URLs (`https?://\S{72,}` → 64-char stub + `…`) are
+  trimmed before budgeting — zero entailment value, ~70% of the RSS payload. Replayed on the
+  failing turn's real trajectory data: all 10 headlines + weather now fit in 2212/4000 chars.
+- **FIX 2 — repair directive standalone-rewrite suffix.** The repaired reply had leaked
+  checker-facing dialogue to the user ("You're right — I was interpreting and embellishing…" —
+  addressed to a verifier the user can't see, about a draft the user never received). Both repair
+  directives now append `_REPAIR_STANDALONE_SUFFIX` (agent.py): no acknowledgements, no apologies,
+  no mention of verifier/review/correction.
+- **FIX 3 — `duration_s` stamped on chat trajectories** from the pretty-log request clock (new
+  public `request_elapsed_s()` in utils/logging). Was schema-default 0.0 on every turn.
+  `tokens_in/out` stay 0 — needs usage accumulation on the streaming client path; scoped out.
+- **Corpus repair:** appended an `operator_overlay` line to trajectories/corrections.jsonl
+  reverting 2466f380 `failed` → `unknown` (overlay reader is last-write-wins; original line kept
+  for audit). The in-memory bogus pending-correction cleared with the deploy restart.
+- Residual noted, not built: translation slips in the reply itself (ΟΠΕΚΕΠΕ→"OPEKED",
+  "ξενόδουλη"→"tourist opposition") — genuine errors the verifier didn't catch; cross-lingual
+  claim-vs-evidence quality on the worker model remains unmeasured.
+- Tests: test_verifier_evidence_window.py +6 (2026-07-17 section), test_wiring_trajectory_logging.py
+  +2. Docs: core/verifier.html (three new 2026-07-17 subsections).
+
 ### 2026-07-16 (later 3) — verifier triage: verify-sized timeout + widened evidence window + finalize stagger
 Operator report: "verifier either refutes valid answers or timeouts on work node." Log forensics
 (requests 73/35/E0/BD, the Athens food-research turns) found two distinct mechanisms that compounded:

@@ -115,7 +115,18 @@
     the 1500-char bound <code>_strip_leading_banners</code> peels — a longer
     block would break the correction-fingerprint peel (the 2026-07-07 bug
     class). The banner-peel loop allows up to 5 stacked blocks now
-    (correction + clarifying + project digest + activity digest + headroom).</li>
+    (correction + clarifying + project digest + activity digest + headroom).
+    <br><strong>Notify-only since 2026-07-17 (operator decision).</strong> The
+    banner renders <code>severity="notify"</code> records only
+    (<code>severities=(SEVERITY_NOTIFY,)</code> at the call site): scheduled-task
+    conclusions, deliberate <code>notify_operator</code> messages, failures.
+    Routine info-severity maintenance (dream/REM, PRM / router / calibration
+    retrains, self-play, skills graduation) had every post-idle reply opening
+    with a wall of refit bullets the operator already saw on the live stream —
+    it no longer auto-surfaces anywhere in chat. The watermark still advances
+    over info records (seen-but-silent), and identical (phase, summary) repeats
+    collapse into one <code>(×N)</code> line. The info records remain reachable
+    on demand — see consumer 4.</li>
     <li><strong>Outbound push</strong> — <code>utils.notify.OutboundNotifier</code>,
     wired as the ledger's <code>on_notify</code> callback in <code>main.py</code>.
     Transports: <code>--notify-webhook</code> (JSON POST) and/or
@@ -159,6 +170,18 @@
     <code>/pending</code> then returned nothing and re-echoed the huge watermark,
     so no future record was ever served. Ack now clamps to
     <code>[0, current_offset()]</code>.</li>
+    <li><strong>On-demand report (2026-07-17)</strong> —
+    <code>introspect action='activity'</code> (tools/introspect.py →
+    <code>render_activity_report</code>): the model-facing answer to
+    <em>"what did you do while I was away?"</em> now that maintenance is
+    silent in the banner. ALL severities, newest first, timestamped ages,
+    <code>(×N)</code>-collapsed; <code>hours</code> window (default 24, cap
+    336) and <code>limit</code> (default 30, cap 100). Reads the whole ledger
+    from byte 0 (≈100KB/week — cheaper than a second watermark) and does NOT
+    consume the banner watermark: it is a read, not an ack. Branches BEFORE
+    the tool's <code>self_model</code> gate, so it works with selfhood
+    disabled; the registry passes <code>context</code> through for
+    <code>get_activity_log</code>.</li>
   </ol>
 
   <h2>Internal-request gate</h2>
@@ -170,9 +193,13 @@
   consumed the <em>project</em> digest watermark.</p>
 
   <h2>Tests</h2>
-  <p><code>tests/test_autonomous_activity.py</code> (64) — ledger roundtrip /
+  <p><code>tests/test_autonomous_activity.py</code> — ledger roundtrip /
   offsets / corruption / partial-tail, watermark + consumer semantics, digest
-  rendering incl. the banner-strip contract, scheduled-turn capture, notifier
+  rendering incl. the banner-strip contract, the notify-only severity gate +
+  ×N dedupe + on-demand report (2026-07-17;
+  <code>introspect action='activity'</code> coverage lives in
+  <code>tests/test_selfhood_introspect_tool.py</code>), scheduled-turn
+  capture, notifier
   egress routing + MockTransport delivery, the /api/notifications endpoints,
   and source-inspection wiring checks for main.py / agent.py /
   project_advancer.py / the Slack poller.</p>

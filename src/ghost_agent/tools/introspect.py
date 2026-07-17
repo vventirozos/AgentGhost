@@ -28,12 +28,21 @@ from ..utils.logging import Icons, pretty_log
 logger = logging.getLogger("GhostAgent")
 
 
-_VALID_ACTIONS = frozenset({"summary", "stats", "narrative", "recent", "recall"})
+_VALID_ACTIONS = frozenset({"summary", "stats", "narrative", "recent",
+                            "recall", "activity"})
 
 _DEFAULT_RECENT = 5
 _DEFAULT_RECALL = 5
 _MAX_LIMIT = 25
 _SUMMARY_RECENT_N = 5
+
+# action='activity' window/size defaults. Separate caps from the selfhood
+# actions: the ledger view is line-per-event and 30 lines is already a
+# screenful.
+_DEFAULT_ACTIVITY_HOURS = 24.0
+_MAX_ACTIVITY_HOURS = 24.0 * 14
+_DEFAULT_ACTIVITY_LIMIT = 30
+_MAX_ACTIVITY_LIMIT = 100
 
 
 def _format_experience(exp) -> str:
@@ -134,11 +143,42 @@ def _render_recall(self_model, query: str, limit: int) -> str:
     return "\n".join(lines)
 
 
+def _render_activity(context, *, hours=None, limit=None) -> str:
+    """Full-ledger view (ALL severities) over a bounded recent window.
+    Reads from byte 0 — the ledger is small (≈100KB/week) and the render
+    caps output, so a full replay is cheaper than tracking a second
+    watermark; the finalize banner's watermark is deliberately NOT
+    consumed (this is a read, not an ack)."""
+    from ..core.autonomous_activity import (
+        get_activity_log, render_activity_report,
+    )
+    log = get_activity_log(context)
+    if log is None:
+        return ("Background-activity ledger is not attached in this "
+                "session — nothing to report.")
+    try:
+        h = float(hours) if hours else _DEFAULT_ACTIVITY_HOURS
+    except (TypeError, ValueError):
+        h = _DEFAULT_ACTIVITY_HOURS
+    h = max(0.25, min(h, _MAX_ACTIVITY_HOURS))
+    try:
+        n = int(limit) if limit else _DEFAULT_ACTIVITY_LIMIT
+    except (TypeError, ValueError):
+        n = _DEFAULT_ACTIVITY_LIMIT
+    n = max(1, min(n, _MAX_ACTIVITY_LIMIT))
+    records, _off = log.read_since(0)
+    pretty_log("Introspect", f"activity report requested ({h:g}h window)",
+               icon=Icons.BRAIN_SUM)
+    return render_activity_report(records, hours=h, limit=n)
+
+
 async def tool_introspect(
     action: str = None,
     query: str = None,
     limit: int = None,
+    hours: float = None,
     self_model=None,
+    context=None,
     **kwargs,
 ) -> str:
     """Read-only introspection over the agent's selfhood.
@@ -151,6 +191,14 @@ async def tool_introspect(
             "SYSTEM ERROR: 'action' must be one of "
             f"{sorted(_VALID_ACTIONS)}."
         )
+
+    # 'activity' reads the autonomous-activity ledger, not the SelfModel —
+    # it must keep working when selfhood is disabled, so it branches before
+    # the self_model gate. This is the on-demand home of the maintenance
+    # records the finalize banner no longer auto-surfaces (2026-07-17):
+    # "what did you do while I was away?" lands here.
+    if raw_action == "activity":
+        return _render_activity(context, hours=hours, limit=limit)
 
     if self_model is None or not getattr(self_model, "enabled", False):
         return (

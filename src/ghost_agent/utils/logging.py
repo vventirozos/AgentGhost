@@ -180,6 +180,18 @@ def _req_started(req_id: str) -> Optional[float]:
         return s["started"] if s else None
 
 
+def request_elapsed_s(req_id: str) -> Optional[float]:
+    """Seconds since the request's BEGIN marker, or ``None`` when the
+    request isn't being tracked (already closed, or never opened —
+    e.g. sim/ablation contexts). Public twin of the pretty-log delta
+    so end-of-turn writers (trajectory corpus) can stamp the same
+    wall-clock the operator sees in the stream."""
+    started = _req_started(req_id)
+    if started is None:
+        return None
+    return time.monotonic() - started
+
+
 def _format_delta(req_id: str) -> str:
     """`+12.3s` since the request began, or 6 spaces if not tracked."""
     started = _req_started(req_id)
