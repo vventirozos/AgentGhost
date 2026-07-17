@@ -1,0 +1,1068 @@
+#!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "requests>=2.28",
+#     "prompt_toolkit>=3.0",
+#     "rich>=13",
+# ]
+# ///
+
+"""Ghost Agent CLI — a small, pretty streaming client for the whole agent.
+
+Talks DIRECTLY to the agent's API (``/v1/chat/completions`` + ``/api/*``);
+the key rides in the ``X-Ghost-Key`` header. Beyond chat it drives the
+agent's real feature surface:
+
+* **Rendered replies** — the stream is rendered live as Markdown (rich):
+  headers, lists, tables, bold/italic, and syntax-highlighted code blocks.
+* **Durable sessions** — every turn carries a ``session_id`` so the server
+  persists the conversation; ``/sessions`` lists them and ``/resume``
+  continues one from any device. (The old ``conversation_id`` field was
+  never read by the agent and has been retired in favour of this.)
+* **Real turn cancellation** — each request sends an ``X-Request-ID`` that
+  keys the agent's turn registry, so Ctrl-C actually cancels the running
+  turn server-side (releasing the global turn lock) instead of merely
+  closing our socket while the agent keeps working. ``/turns`` shows
+  what's running or queued; ``/cancel [hard]`` unwedges a stuck turn.
+* **Operations** — ``/health`` (runtime introspection), ``/notify``
+  (pending autonomous-activity notifications, watermark-acked),
+  ``/memory fix|rm`` (surgical vector-memory corrections).
+* **Files & workspace** — ``/upload``/``/download`` move files in and out
+  of the sandbox; ``/save``/``/load`` snapshot and restore the whole
+  workspace (chat + scratchpad + sandbox) as a zip.
+* **Projects** — list/inspect/switch/resume/advance the agent's long-term
+  projects and their task plans.
+
+Also works one-shot for scripting: ``ghost -p "question"`` (or pipe stdin) —
+raw text when piped, rendered when stdout is a terminal.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import sys
+import time
+import uuid
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlparse
+
+import requests
+from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
+from prompt_toolkit.completion import NestedCompleter, PathCompleter
+from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style
+from rich.console import Console, Group
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.prompt import Confirm
+from rich.table import Table
+from rich.text import Text
+from rich.theme import Theme
+
+DEFAULT_HOST = os.environ.get("GHOST_URL", "http://eva:8000")
+HISTORY_FILE = Path.home() / ".ghost_history"
+NOTIFY_CONSUMER = "ghost-cli"
+CODE_THEME = "monokai"
+
+# One console for all output. Rich handles non-tty and NO_COLOR by itself;
+# highlight=False stops it from auto-colouring numbers inside plain notices
+# (Markdown code blocks still get full pygments highlighting).
+console = Console(theme=Theme({
+    "you":    "bold color(81)",     # you / prompt
+    "ghost":  "color(141)",         # ghost
+    "notice": "color(215)",         # system notices
+    "err":    "color(203)",         # errors
+    "ok":     "color(114)",         # healthy / done
+    "mute":   "color(245)",         # dim chrome
+}), highlight=False)
+
+
+def _default_key() -> str:
+    """Resolve the API key: GHOST_API_KEY env, then the canonical secret
+    file shared with the agent/interface/Slack-bot launchers (2026-07-13 —
+    the agent now enforces a real key; the old ghost-secret-123 fallback is
+    the publicly-known retired default and no longer works)."""
+    env = (os.environ.get("GHOST_API_KEY") or "").strip()
+    if env:                      # blank/whitespace env must not shadow the file
+        return env
+    try:
+        return (Path.home() / "Data/AI/.ghost_api_key").read_text().strip()
+    except OSError:
+        return ""
+
+
+DEFAULT_KEY = _default_key()
+
+PROMPT_STYLE = Style.from_dict({"p": "bold #5fd7ff"})
+
+bindings = KeyBindings()
+@bindings.add("c-d")
+def _(event):                       # Ctrl-D → clean exit (prompt returns None)
+    event.app.exit(result=None)
+@bindings.add("escape", "enter")
+def _(event):                       # Alt+Enter → force submit (multi-line)
+    event.current_buffer.validate_and_handle()
+
+
+COMPLETER = NestedCompleter.from_nested_dict({
+    "/help": None, "/exit": None, "/quit": None,
+    "/clear": None, "/new": None,
+    "/sessions": {"rm": None},
+    "/resume": None,
+    "/health": None, "/turns": None,
+    "/cancel": {"hard": None},
+    "/notify": None,
+    "/memory": {"fix": None, "rm": None},
+    "/upload": PathCompleter(expanduser=True),
+    "/download": None,
+    "/save": PathCompleter(expanduser=True),
+    "/load": PathCompleter(expanduser=True),
+    "/projects": None,
+    "/project": {"info": None, "use": None, "resume": None,
+                 "advance": None, "tasks": None, "new": None},
+})
+
+
+# --- small formatting helpers ---------------------------------------------
+
+def _ago(ts: float | None) -> str:
+    """'42s ago' / '3m ago' / '5h ago' / '2d ago' from an epoch float."""
+    if not ts:
+        return "—"
+    d = max(0.0, time.time() - float(ts))
+    if d < 90:
+        return f"{d:.0f}s ago"
+    if d < 5400:
+        return f"{d / 60:.0f}m ago"
+    if d < 129600:
+        return f"{d / 3600:.0f}h ago"
+    return f"{d / 86400:.0f}d ago"
+
+
+def _dur(seconds: float | None) -> str:
+    if seconds is None:
+        return "—"
+    s = int(seconds)
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{s // 60}m {s % 60}s"
+    if s < 129600:
+        return f"{s // 3600}h {s % 3600 // 60}m"
+    return f"{s // 86400}d {s % 86400 // 3600}h"
+
+
+def _trim(text: Any, width: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> None:
+    """Muted-header, borderless table. Cells are plain text (never parsed
+    as rich markup — titles/previews can contain anything)."""
+    if not rows:
+        return
+    t = Table(box=None, header_style="mute", pad_edge=False,
+              padding=(0, 2, 0, 0))
+    for h in headers:
+        t.add_column(h)
+    for r in rows:
+        t.add_row(*[Text(str(c)) for c in r])
+    console.print(t)
+
+
+def _reply_renderable(text: str) -> Group:
+    """The ghost's reply as it renders in the transcript: label + Markdown."""
+    return Group(Text("👻", style="ghost"), Markdown(text, code_theme=CODE_THEME))
+
+
+HELP = """[bold]conversation[/]
+  [you]/clear[/]                 fresh context (new session — old one stays resumable)
+  [you]/new[/] \\[title]           start a new, optionally titled, session
+  [you]/sessions[/]              list server-side sessions   [dim]· /sessions rm <id> deletes[/]
+  [you]/resume[/] <id>           continue a session (id prefix is enough)
+  [you]/save[/] \\[file.zip]       snapshot workspace (chat + sandbox) to a zip
+  [you]/load[/] <file.zip>       restore a workspace zip [dim](replaces agent sandbox)[/]
+[bold]agent[/]
+  [you]/health[/]                runtime health of the agent
+  [you]/turns[/]                 in-flight + queued turns
+  [you]/cancel[/] \\[hard]         cancel the running turn (hard = force-release)
+  [you]/notify[/]                show + ack pending autonomous-activity notifications
+  [you]/memory fix[/] "old" "new"  correct one vector-memory fragment
+  [you]/memory rm[/] "text"        delete one vector-memory fragment
+[bold]files[/]
+  [you]/upload[/] <path>         put a local file into the agent sandbox
+  [you]/download[/] <name> \\[to]  fetch a sandbox file
+[bold]projects[/]
+  [you]/projects[/]              list long-term projects
+  [you]/project[/] info|use|resume|advance|tasks <id>
+  [you]/project new[/] "title" \\["goal"]
+[bold]misc[/]
+  [you]/help[/]   [you]/exit[/]  [dim](or Ctrl-D)[/]
+[dim]Enter submits · paste multi-line freely · Alt+Enter force-submits
+replies render as Markdown with highlighted code
+Ctrl-C aborts a reply AND cancels the turn on the agent[/]"""
+
+
+class GhostAPI:
+    """Thin typed wrapper over the agent's HTTP surface."""
+
+    def __init__(self, base_url: str, api_key: str):
+        # Reduce to scheme://host:port — request paths are appended, so a
+        # stray path/query on base_url would build a malformed URL (→ 405).
+        p = urlparse(base_url)
+        self.base_url = (f"{p.scheme}://{p.netloc}"
+                         if p.scheme and p.netloc else base_url.rstrip("/"))
+        self.http = requests.Session()
+        self.http.headers["X-Ghost-Key"] = api_key
+
+    def _url(self, path: str) -> str:
+        return f"{self.base_url}{path}"
+
+    def _json(self, method: str, path: str, *, body: dict | None = None,
+              params: dict | None = None, files: dict | None = None,
+              timeout: tuple = (10, 60)) -> tuple[int, Any]:
+        """One JSON round-trip → (status_code, parsed body). Non-JSON bodies
+        come back as {'raw': text} so callers never need a second parse."""
+        r = self.http.request(method, self._url(path), json=body,
+                              params=params, files=files, timeout=timeout)
+        try:
+            return r.status_code, r.json()
+        except ValueError:
+            return r.status_code, {"raw": (r.text or "").strip()[:300]}
+
+    @staticmethod
+    def error_of(data: Any) -> str:
+        """Human message out of any of the agent's error shapes:
+        {'error': {'message': ...}} / {'error': str} / {'detail': ...} / raw."""
+        if isinstance(data, dict):
+            err = data.get("error")
+            if isinstance(err, dict):
+                return str(err.get("message") or err)
+            if err:
+                return str(err)
+            return str(data.get("detail") or data.get("raw") or data)
+        return str(data)
+
+    # -- chat --------------------------------------------------------------
+    def chat_stream(self, messages: list[dict], session_id: str,
+                    request_id: str) -> requests.Response:
+        return self.http.post(
+            self._url("/v1/chat/completions"),
+            json={"messages": messages, "stream": True,
+                  "session_id": session_id},
+            headers={"X-Request-ID": request_id},
+            stream=True, timeout=(10, None),   # connect 10s; agent ends the read
+        )
+
+    # -- sessions ------------------------------------------------------------
+    def sessions_list(self, limit: int = 50) -> tuple[int, Any]:
+        return self._json("GET", "/api/sessions", params={"limit": limit})
+
+    def session_get(self, sid: str) -> tuple[int, Any]:
+        return self._json("GET", f"/api/sessions/{quote(sid, safe='')}")
+
+    def session_create(self, title: str = "") -> tuple[int, Any]:
+        return self._json("POST", "/api/sessions", body={"title": title})
+
+    def session_delete(self, sid: str) -> tuple[int, Any]:
+        return self._json("DELETE", f"/api/sessions/{quote(sid, safe='')}")
+
+    # -- turns / ops -----------------------------------------------------------
+    def turns(self) -> tuple[int, Any]:
+        return self._json("GET", "/api/turns")
+
+    def cancel_turn(self, request_id: str | None = None,
+                    hard: bool = False) -> tuple[int, Any]:
+        return self._json("POST", "/api/turn/cancel",
+                          body={"request_id": request_id, "hard": hard})
+
+    def health(self, timeout: tuple = (10, 30)) -> tuple[int, Any]:
+        return self._json("GET", "/api/health", timeout=timeout)
+
+    def notifications(self, consumer: str, limit: int = 50) -> tuple[int, Any]:
+        return self._json("GET", "/api/notifications/pending",
+                          params={"consumer": consumer, "limit": limit})
+
+    def notifications_ack(self, consumer: str, watermark: int) -> tuple[int, Any]:
+        return self._json("POST", "/api/notifications/ack",
+                          body={"consumer": consumer, "watermark": watermark})
+
+    def memory_correct(self, match: str, replacement: str) -> tuple[int, Any]:
+        return self._json("POST", "/api/memory/correct",
+                          body={"match": match, "replacement": replacement})
+
+    def memory_delete(self, match: str) -> tuple[int, Any]:
+        return self._json("POST", "/api/memory/delete", body={"match": match})
+
+    # -- files / workspace ------------------------------------------------------
+    def upload(self, path: Path) -> tuple[int, Any]:
+        with path.open("rb") as fh:
+            return self._json("POST", "/api/upload",
+                              files={"file": (path.name, fh)},
+                              timeout=(10, 600))
+
+    def download(self, name: str, dest: Path) -> tuple[int, int]:
+        """Stream a sandbox file to ``dest``. Returns (status, bytes_written)."""
+        with self.http.get(self._url(f"/api/download/{quote(name)}"),
+                           stream=True, timeout=(10, 600)) as r:
+            if r.status_code != 200:
+                return r.status_code, 0
+            written = 0
+            with dest.open("wb") as fh:
+                for chunk in r.iter_content(65536):
+                    fh.write(chunk)
+                    written += len(chunk)
+            return 200, written
+
+    def workspace_save(self, history: list[dict], dest: Path) -> tuple[int, int]:
+        with self.http.post(self._url("/api/workspace/save"),
+                            json={"chat_history": history},
+                            stream=True, timeout=(10, 600)) as r:
+            if r.status_code != 200:
+                return r.status_code, 0
+            written = 0
+            with dest.open("wb") as fh:
+                for chunk in r.iter_content(65536):
+                    fh.write(chunk)
+                    written += len(chunk)
+            return 200, written
+
+    def workspace_load(self, path: Path) -> tuple[int, Any]:
+        with path.open("rb") as fh:
+            return self._json("POST", "/api/workspace/load",
+                              files={"file": (path.name, fh)},
+                              timeout=(10, 600))
+
+    # -- projects ---------------------------------------------------------------
+    def projects_list(self) -> tuple[int, Any]:
+        return self._json("GET", "/api/projects")
+
+    def project_get(self, pid: str) -> tuple[int, Any]:
+        return self._json("GET", f"/api/projects/{quote(pid, safe='')}")
+
+    def project_create(self, title: str, goal: str = "") -> tuple[int, Any]:
+        return self._json("POST", "/api/projects",
+                          body={"title": title, "goal": goal})
+
+    def project_switch(self, pid: str) -> tuple[int, Any]:
+        return self._json("POST", f"/api/projects/{quote(pid, safe='')}/switch")
+
+    def project_resume(self, pid: str) -> tuple[int, Any]:
+        return self._json("POST", f"/api/projects/{quote(pid, safe='')}/resume")
+
+    def project_advance(self, pid: str) -> tuple[int, Any]:
+        # An advance runs a full agent task — allow it to take its time.
+        return self._json("POST", f"/api/projects/{quote(pid, safe='')}/advance",
+                          timeout=(10, 900))
+
+    def project_tasks(self, pid: str) -> tuple[int, Any]:
+        return self._json("GET", f"/api/projects/{quote(pid, safe='')}/tasks")
+
+
+class GhostCLI:
+    def __init__(self, api: GhostAPI, session_id: str | None = None):
+        self.api = api
+        self.history: list[dict] = []
+        # Durable server-side session: the agent persists every turn under
+        # this id (created lazily on first append), so any client can resume
+        # it later. Must match the server's ^[A-Za-z0-9_-]{1,64}$ rule.
+        self.session_id = session_id or uuid.uuid4().hex
+        # Built lazily in chat(): constructing a PromptSession on a non-tty
+        # stdin (e.g. `ghost --health` from a script) warns on stderr.
+        self.prompt_session: PromptSession | None = None
+
+    # -- presentation ----------------------------------------------------
+    def banner(self) -> None:
+        rule = Text("─" * 52, style="mute")
+        console.print()
+        console.print(rule)
+        head = Text.assemble(
+            ("  👻 GHOST", "bold ghost"),
+            (f"   {self.api.base_url}  ·  {self.session_id[:8]}  ·  ", "mute"))
+        head.append_text(self._probe())
+        console.print(head)
+        console.print(Text.assemble(
+            ("  type ", "dim"), ("/help", "you"),
+            (" for commands · Tab completes · Ctrl-D to exit", "dim")))
+        console.print(rule)
+        console.print()
+
+    def _probe(self) -> Text:
+        """One cheap health ping for the banner: reachability + key check."""
+        try:
+            status, data = self.api.health(timeout=(2, 5))
+        except requests.RequestException:
+            return Text("○ unreachable", style="err")
+        if status == 200:
+            return Text.assemble(("● online", "ok"),
+                                 (f" · up {_dur(data.get('uptime_s'))}", "mute"))
+        if status == 403:
+            return Text("● key rejected", style="err")
+        return Text(f"● HTTP {status}", style="notice")
+
+    @staticmethod
+    def notice(msg: str, style: str = "notice") -> None:
+        # Text() keeps the message literal — never parsed as rich markup
+        # (error details / titles can contain anything, including brackets).
+        console.print(Text(msg, style=style))
+
+    def fail(self, status: int, data: Any) -> None:
+        self.notice(f"✖ HTTP {status}: {self.api.error_of(data)}", "err")
+
+    # -- chat turn ---------------------------------------------------------
+    def stream_reply(self, request_id: str) -> str:
+        """POST the history and render the streamed reply live as Markdown.
+        Returns its text (possibly partial, if aborted) so the caller can
+        keep context."""
+        out: list[str] = []
+        status_spin = console.status(Text("thinking…", style="mute"),
+                                     spinner="dots")
+        status_spin.start()
+        waiting = True                 # spinner up, no token yet
+        live: Live | None = None
+
+        def _settle() -> None:
+            """Idempotent screen hand-off: whoever is drawing, stop them.
+            Called from every exit branch BEFORE printing a notice, so the
+            notice never lands inside a live-render region."""
+            nonlocal waiting, live
+            if waiting:
+                status_spin.stop()
+                waiting = False
+            if live is not None:
+                live.stop()
+                live = None
+
+        try:
+            with self.api.chat_stream(self.history, self.session_id,
+                                      request_id) as resp:
+                if resp.status_code != 200:
+                    _settle()
+                    try:
+                        detail = self.api.error_of(resp.json())
+                    except ValueError:
+                        detail = (resp.text or "").strip()[:300]
+                    self.notice(f"✖ HTTP {resp.status_code}: {detail}", "err")
+                    return ""
+                for raw in resp.iter_lines():
+                    if not raw:
+                        continue
+                    line = raw.decode("utf-8", "replace")
+                    if not line.startswith("data: "):
+                        continue          # SSE comments & `event:` names
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        obj = json.loads(data)
+                    except json.JSONDecodeError:
+                        continue
+                    if obj.get("error"):
+                        _settle()
+                        self.notice(f"✖ {self.api.error_of(obj)}", "err")
+                        break
+                    chunk = ((obj.get("choices") or [{}])[0]
+                             .get("delta", {}).get("content", ""))
+                    if not chunk:
+                        continue
+                    if waiting:            # first token: spinner → live render
+                        status_spin.stop()
+                        waiting = False
+                        live = Live(console=console, refresh_per_second=12,
+                                    vertical_overflow="visible")
+                        live.start()
+                    out.append(chunk)
+                    live.update(_reply_renderable("".join(out)))
+        except KeyboardInterrupt:
+            _settle()
+            self._abort_turn(request_id)
+        except requests.exceptions.ConnectionError:
+            _settle()
+            self.notice("✖ cannot reach the agent — is it running?", "err")
+        except Exception as e:                     # noqa: BLE001 — surface anything
+            _settle()
+            self.notice(f"✖ {type(e).__name__}: {e}", "err")
+        finally:
+            _settle()
+        return "".join(out)
+
+    def _abort_turn(self, request_id: str) -> None:
+        """Ctrl-C: we closed our socket, but turns are globally serialized on
+        the agent — an abandoned turn would keep working AND keep the lock.
+        Cancel it server-side (cooperatively) via the turn registry."""
+        try:
+            status, data = self.api.cancel_turn(request_id=request_id)
+            if status == 200 and isinstance(data, dict) and data.get("cancelled"):
+                self.notice("⛔ aborted — agent turn cancelled", "mute")
+            else:
+                self.notice("⛔ aborted (turn already finished)", "mute")
+        except requests.RequestException:
+            self.notice("⛔ aborted locally — couldn't reach the agent "
+                        "to cancel; /turns to check, /cancel to retry", "mute")
+
+    def chat_turn(self, line: str) -> None:
+        self.history.append({"role": "user", "content": line})
+        request_id = uuid.uuid4().hex[:16]
+        console.print()
+        reply = self.stream_reply(request_id)
+        console.print()
+        if reply:
+            self.history.append({"role": "assistant", "content": reply})
+        else:
+            # Nothing came back (error / abort before the first token):
+            # drop the user message so a retry doesn't double it.
+            self.history.pop()
+
+    # -- sessions ----------------------------------------------------------
+    def cmd_sessions(self) -> None:
+        status, data = self.api.sessions_list()
+        if status != 200:
+            return self.fail(status, data)
+        if not data.get("enabled"):
+            return self.notice("server-side sessions are disabled on the agent")
+        rows = [[s["id"][:8],
+                 str(s.get("message_count", "—")),
+                 _ago(s.get("updated_at")),
+                 _trim(s.get("title") or "(untitled)", 48)]
+                for s in data.get("sessions", [])]
+        if not rows:
+            return self.notice("no saved sessions yet", "mute")
+        _table(["id", "msgs", "updated", "title"], rows)
+
+    def _resolve_session(self, prefix: str) -> str | None:
+        """Full id, or a unique id prefix, → full id. Notices on any miss."""
+        status, _ = self.api.session_get(prefix)
+        if status == 200:
+            return prefix
+        status, data = self.api.sessions_list(limit=200)
+        hits = ([s["id"] for s in data.get("sessions", [])
+                 if s["id"].startswith(prefix)]
+                if status == 200 and data.get("enabled") else [])
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            self.notice(f"ambiguous — matches {', '.join(h[:8] for h in hits)}")
+        else:
+            self.notice(f"✖ no session matching '{prefix}'", "err")
+        return None
+
+    def cmd_resume(self, prefix: str) -> None:
+        sid = self._resolve_session(prefix)
+        if sid is None:
+            return
+        status, data = self.api.session_get(sid)
+        if status != 200:
+            return self.fail(status, data)
+        self.history = list(data.get("messages") or [])
+        self.session_id = sid
+        title = data.get("title") or "(untitled)"
+        self.notice(f"resumed {sid[:8]} · {title} · "
+                    f"{len(self.history)} messages", "mute")
+        # Re-orient: show the tail of the conversation being resumed.
+        for m in self.history[-2:]:
+            who = ("❯", "you") if m.get("role") == "user" else ("👻", "ghost")
+            console.print(Text.assemble("  ", who, "  ",
+                                        (_trim(m.get("content"), 100), "")))
+
+    def cmd_new(self, title: str) -> None:
+        self.history.clear()
+        if title:
+            try:
+                status, data = self.api.session_create(title)
+                if status == 201 and isinstance(data, dict) and data.get("id"):
+                    self.session_id = data["id"]
+                    return self.notice(
+                        f"new session · {self.session_id[:8]} · {title}", "mute")
+            except requests.RequestException:
+                pass
+            self.notice("(server session create failed — continuing locally)", "mute")
+        self.session_id = uuid.uuid4().hex
+        self.notice(f"new session · {self.session_id[:8]}", "mute")
+
+    def cmd_clear(self) -> None:
+        # With durable sessions, clearing ONLY the local view would be a lie:
+        # the server merges the stored history back into the next turn. A
+        # real context clear needs a fresh session id — the old conversation
+        # stays on the server, one /resume away.
+        old = self.session_id[:8]
+        self.history.clear()
+        self.session_id = uuid.uuid4().hex
+        self.notice(f"context cleared — new session {self.session_id[:8]} "
+                    f"(/resume {old} brings the old one back)", "mute")
+
+    # -- ops ------------------------------------------------------------------
+    def cmd_health(self) -> None:
+        status, data = self.api.health()
+        if status != 200:
+            return self.fail(status, data)
+        ok, bad = ("✓", "ok"), ("✗", "err")
+        rss = data.get("rss_mb")
+        limit = data.get("rss_limit_mb") or 0
+        rss_s = f"{rss} MB" + (f" / {limit:.0f} MB" if limit else "")
+        rows: list[tuple[str, Any]] = [
+            ("status", data.get("status", "?")),
+            ("uptime", _dur(data.get("uptime_s"))),
+            ("memory (rss)", rss_s),
+            ("asyncio tasks", data.get("asyncio_tasks")),
+            ("foreground reqs", data.get("foreground_requests")),
+            ("bio watchdog", ok if data.get("biological_watchdog_alive") else bad),
+            ("memory system", ok if data.get("memory_system_loaded") else bad),
+            ("scheduler jobs", data.get("scheduler_jobs")),
+        ]
+        for pool, urls in (data.get("nodes") or {}).items():
+            if urls:
+                rows.append((f"node {pool}", ", ".join(urls)))
+        for key, val in rows:
+            line = Text.assemble(("  "), (f"{key:<16}", "mute"))
+            line.append_text(Text.assemble(val) if isinstance(val, tuple)
+                             else Text(str(val)))
+            console.print(line)
+
+    def cmd_turns(self) -> None:
+        status, data = self.api.turns()
+        if status != 200:
+            return self.fail(status, data)
+        turns = data.get("turns", [])
+        if not turns:
+            return self.notice("no turns in flight", "mute")
+        rows = [[t.get("request_id", "?")[:16],
+                 "running" if t.get("running") else "queued",
+                 _dur(t.get("age_s")),
+                 _trim(t.get("preview"), 50)]
+                for t in turns]
+        _table(["request", "state", "age", "preview"], rows)
+
+    def cmd_cancel(self, hard: bool) -> None:
+        status, data = self.api.cancel_turn(hard=hard)
+        if status == 200 and isinstance(data, dict) and data.get("cancelled"):
+            mode = "hard-cancelled" if hard else "cancelled (cooperative)"
+            self.notice(f"⛔ turn {mode}", "mute")
+        elif status == 404:
+            self.notice("nothing to cancel — no turn running", "mute")
+        else:
+            self.fail(status, data)
+
+    def cmd_notify(self) -> None:
+        status, data = self.api.notifications(NOTIFY_CONSUMER)
+        if status != 200:
+            return self.fail(status, data)
+        if not data.get("enabled"):
+            return self.notice("autonomous-activity notifications are disabled")
+        records = data.get("records", [])
+        watermark = data.get("watermark", 0)
+        if data.get("baseline"):
+            self.api.notifications_ack(NOTIFY_CONSUMER, watermark)
+            return self.notice("notification feed baselined — new agent "
+                               "activity will show up here from now on", "mute")
+        if not records:
+            return self.notice("no new notifications", "mute")
+        for r in records:
+            sev = str(r.get("severity", ""))
+            sev_style = "err" if sev in ("error", "critical") else "notice"
+            console.print(Text.assemble(
+                "  ", (f"{_ago(r.get('ts')):>8}", "mute"), "  ",
+                (f"{r.get('phase', '?'):<14}", sev_style),
+                (_trim(r.get("summary"), 90), "")))
+        # Ack AFTER displaying — a crash mid-print re-serves them next time.
+        self.api.notifications_ack(NOTIFY_CONSUMER, watermark)
+        self.notice(f"({len(records)} notification(s) acknowledged)", "mute")
+
+    def cmd_memory(self, sub: str, args: list[str]) -> None:
+        if sub == "fix" and len(args) == 2:
+            status, data = self.api.memory_correct(args[0], args[1])
+        elif sub == "rm" and len(args) == 1:
+            status, data = self.api.memory_delete(args[0])
+        else:
+            return self.notice(
+                'usage: /memory fix "<match>" "<replacement>"  ·  '
+                '/memory rm "<match>"')
+        if status == 200 and isinstance(data, dict) and data.get("ok"):
+            detail = json.dumps({k: v for k, v in data.items() if k != "ok"})
+            self.notice(f"✓ memory updated: {detail}", "ok")
+        else:
+            self.fail(status, data)
+
+    # -- files / workspace -------------------------------------------------------
+    def cmd_upload(self, arg: str) -> None:
+        path = Path(arg).expanduser()
+        if not path.is_file():
+            return self.notice(f"✖ not a file: {path}", "err")
+        with console.status(Text(f"uploading {path.name}…", style="mute"),
+                            spinner="dots"):
+            status, data = self.api.upload(path)
+        if status == 200:
+            self.notice(f"✓ {data.get('filename', path.name)} → agent sandbox", "ok")
+        else:
+            self.fail(status, data)
+
+    def cmd_download(self, name: str, dest_arg: str) -> None:
+        dest = Path(dest_arg).expanduser() if dest_arg else Path(Path(name).name)
+        if dest.is_dir():
+            dest = dest / Path(name).name
+        with console.status(Text(f"downloading {name}…", style="mute"),
+                            spinner="dots"):
+            status, size = self.api.download(name, dest)
+        if status == 200:
+            self.notice(f"✓ {dest} ({size:,} bytes)", "ok")
+        else:
+            dest.unlink(missing_ok=True)
+            self.notice(f"✖ HTTP {status} — no such file in the sandbox?", "err")
+
+    def cmd_save(self, arg: str) -> None:
+        dest = (Path(arg).expanduser() if arg
+                else Path(time.strftime("workspace_%Y%m%d-%H%M%S.zip")))
+        with console.status(Text("packing workspace…", style="mute"),
+                            spinner="dots"):
+            status, size = self.api.workspace_save(self.history, dest)
+        if status == 200:
+            self.notice(f"✓ workspace saved → {dest} ({size:,} bytes)", "ok")
+        else:
+            dest.unlink(missing_ok=True)
+            self.notice(f"✖ HTTP {status} — workspace save failed", "err")
+
+    def cmd_load(self, arg: str) -> None:
+        path = Path(arg).expanduser()
+        if not path.is_file():
+            return self.notice(f"✖ not a file: {path}", "err")
+        self.notice("this REPLACES the agent's sandbox and scratchpad "
+                    "with the archive's contents")
+        if not Confirm.ask("proceed?", default=False, console=console):
+            return self.notice("cancelled", "mute")
+        with console.status(Text("restoring workspace…", style="mute"),
+                            spinner="dots"):
+            status, data = self.api.workspace_load(path)
+        if status == 200:
+            restored = data.get("chat_history") or []
+            if restored:
+                self.history = list(restored)
+            self.notice(f"✓ workspace restored ({len(restored)} chat messages)", "ok")
+        else:
+            self.fail(status, data)
+
+    # -- projects -----------------------------------------------------------------
+    def _resolve_project(self, prefix: str) -> str | None:
+        status, data = self.api.projects_list()
+        if status != 200:
+            self.fail(status, data)
+            return None
+        ids = [p.get("id", "") for p in data.get("projects", [])]
+        if prefix in ids:
+            return prefix
+        hits = [i for i in ids if i.lower().startswith(prefix.lower())]
+        if len(hits) == 1:
+            return hits[0]
+        if len(hits) > 1:
+            self.notice(f"ambiguous — matches {', '.join(hits)}")
+        else:
+            self.notice(f"✖ no project matching '{prefix}'", "err")
+        return None
+
+    def cmd_projects(self) -> None:
+        status, data = self.api.projects_list()
+        if status != 200:
+            return self.fail(status, data)
+        projects = data.get("projects", [])
+        if not projects:
+            return self.notice("no projects yet — /project new \"title\"", "mute")
+        current = data.get("current")
+        rows = [[("▸" if p.get("id") == current else " "),
+                 str(p.get("id", "?")),
+                 str(p.get("status", "?")),
+                 str(p.get("kind", "")),
+                 _trim(p.get("title"), 44)]
+                for p in projects]
+        _table([" ", "id", "status", "kind", "title"], rows)
+
+    def cmd_project(self, sub: str, args: list[str]) -> None:
+        if sub == "new":
+            if not args:
+                return self.notice('usage: /project new "title" ["goal"]')
+            status, data = self.api.project_create(
+                args[0], args[1] if len(args) > 1 else "")
+            if status == 201:
+                self.notice(f"✓ project created · {data.get('id')}", "ok")
+            else:
+                self.fail(status, data)
+            return
+
+        if not args:
+            return self.notice(f"usage: /project {sub} <id>")
+        pid = self._resolve_project(args[0])
+        if pid is None:
+            return
+
+        if sub == "info":
+            status, data = self.api.project_get(pid)
+            if status != 200:
+                return self.fail(status, data)
+            for key in ("id", "title", "kind", "status", "goal"):
+                if data.get(key):
+                    console.print(Text.assemble(
+                        "  ", (f"{key:<10}", "mute"),
+                        (_trim(data[key], 100), "")))
+            if data.get("updated_at"):
+                console.print(Text.assemble(
+                    "  ", (f"{'updated':<10}", "mute"),
+                    (_ago(data["updated_at"]), "")))
+        elif sub in ("use", "resume"):
+            call = (self.api.project_switch if sub == "use"
+                    else self.api.project_resume)
+            status, data = call(pid)
+            if status != 200:
+                return self.fail(status, data)
+            self.notice(f"✓ active project → {pid}", "ok")
+            briefing = (data or {}).get("briefing")
+            if briefing:
+                console.print(Text(str(briefing), style="mute"))
+        elif sub == "advance":
+            with console.status(Text(f"advancing {pid}…", style="mute"),
+                                spinner="dots"):
+                status, data = self.api.project_advance(pid)
+            if status != 200:
+                return self.fail(status, data)
+            mark = ("✓", "ok") if data.get("ok") else ("✗", "err")
+            console.print(Text.assemble(
+                "  ", mark, f" {data.get('classification', '?')} · "
+                f"task {data.get('task_id', '—')}"))
+            if data.get("summary"):
+                console.print(Text(f"  {_trim(data['summary'], 400)}"))
+        elif sub == "tasks":
+            status, data = self.api.project_tasks(pid)
+            if status != 200:
+                return self.fail(status, data)
+            tasks = data.get("tasks", [])
+            if not tasks:
+                return self.notice("no tasks in this project", "mute")
+            icons = {"DONE": ("✓", "ok"), "FAILED": ("✗", "err"),
+                     "IN_PROGRESS": ("▸", "notice"), "BLOCKED": ("⊘", "err")}
+            for t in tasks:
+                st = str(t.get("status", "")).upper()
+                console.print(Text.assemble(
+                    "  ", icons.get(st, ("·", "mute")), " ",
+                    (f"{str(t.get('id', ''))[:8]}", "mute"), " ",
+                    (_trim(t.get("description"), 76), "")))
+        else:
+            self.notice(f"unknown subcommand '/project {sub}' — see /help")
+
+    # -- dispatch -------------------------------------------------------------
+    def dispatch(self, line: str) -> bool:
+        """Handle one input line. Returns False when the REPL should exit."""
+        lowered = line.lower()
+        if lowered in ("/exit", "/quit", "/bye", "exit", "quit"):
+            return False
+        if not line.startswith("/"):
+            self.chat_turn(line)
+            return True
+
+        try:
+            parts = shlex.split(line)
+        except ValueError as e:
+            self.notice(f"✖ {e} — quote arguments like /memory fix \"a\" \"b\"", "err")
+            return True
+        cmd, args = parts[0].lower(), parts[1:]
+
+        try:
+            match cmd:
+                case "/help":
+                    console.print(HELP)
+                case "/clear":
+                    self.cmd_clear()
+                case "/new":
+                    self.cmd_new(" ".join(args))
+                case "/sessions" if args[:1] == ["rm"] and len(args) == 2:
+                    sid = self._resolve_session(args[1])
+                    if sid:
+                        status, data = self.api.session_delete(sid)
+                        if status == 200:
+                            self.notice(f"✓ session {sid[:8]} deleted", "mute")
+                        else:
+                            self.fail(status, data)
+                case "/sessions" if not args:
+                    self.cmd_sessions()
+                case "/resume" if len(args) == 1:
+                    self.cmd_resume(args[0])
+                case "/health":
+                    self.cmd_health()
+                case "/turns":
+                    self.cmd_turns()
+                case "/cancel":
+                    self.cmd_cancel(hard=args[:1] == ["hard"])
+                case "/notify":
+                    self.cmd_notify()
+                case "/memory" if args:
+                    self.cmd_memory(args[0].lower(), args[1:])
+                case "/upload" if args:
+                    self.cmd_upload(" ".join(args))
+                case "/download" if len(args) in (1, 2):
+                    self.cmd_download(args[0], args[1] if len(args) == 2 else "")
+                case "/save":
+                    self.cmd_save(" ".join(args))
+                case "/load" if args:
+                    self.cmd_load(" ".join(args))
+                case "/projects":
+                    self.cmd_projects()
+                case "/project" if args:
+                    self.cmd_project(args[0].lower(), args[1:])
+                case _:
+                    self.notice(f"unknown or incomplete command '{line}' — "
+                                f"see /help (plain text talks to the agent)")
+        except requests.RequestException as e:
+            self.notice(f"✖ {type(e).__name__}: cannot reach the agent", "err")
+        return True
+
+    # -- main loop -------------------------------------------------------
+    def chat(self) -> None:
+        self.prompt_session = PromptSession(
+            key_bindings=bindings,
+            style=PROMPT_STYLE,
+            completer=COMPLETER,
+            history=FileHistory(str(HISTORY_FILE)),
+            auto_suggest=AutoSuggestFromHistory(),
+        )
+        self.banner()
+        while True:
+            try:
+                line = self.prompt_session.prompt([("class:p", "❯ ")])
+            except (EOFError, KeyboardInterrupt):
+                break
+            if line is None:                        # Ctrl-D
+                break
+            line = line.strip()
+            if not line:
+                continue
+            if not self.dispatch(line):
+                break
+        console.print(Text("👋 disconnected", style="dim"))
+
+
+# --- one-shot (scripting) mode ---------------------------------------------
+
+def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
+    """Send one message and stream the reply to stdout — rendered Markdown
+    when stdout is a terminal, raw text when piped (script-friendly).
+    With --session the server merges the stored history in, so this can
+    continue a real conversation from a shell script."""
+    body: dict[str, Any] = {"messages": [{"role": "user", "content": prompt}],
+                            "stream": True}
+    if session_id:
+        body["session_id"] = session_id
+    render = sys.stdout.isatty()
+    out: list[str] = []
+    live: Live | None = None
+    try:
+        with api.http.post(api._url("/v1/chat/completions"), json=body,
+                           headers={"X-Request-ID": uuid.uuid4().hex[:16]},
+                           stream=True, timeout=(10, None)) as resp:
+            if resp.status_code != 200:
+                try:
+                    detail = api.error_of(resp.json())
+                except ValueError:
+                    detail = (resp.text or "").strip()[:300]
+                print(f"ghost: HTTP {resp.status_code}: {detail}", file=sys.stderr)
+                return 1
+            got_error = False
+            for raw in resp.iter_lines():
+                if not raw:
+                    continue
+                line = raw.decode("utf-8", "replace")
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("error"):
+                    print(f"ghost: {api.error_of(obj)}", file=sys.stderr)
+                    got_error = True
+                    break
+                chunk = ((obj.get("choices") or [{}])[0]
+                         .get("delta", {}).get("content", ""))
+                if not chunk:
+                    continue
+                if render:
+                    if live is None:
+                        live = Live(console=console, refresh_per_second=12,
+                                    vertical_overflow="visible")
+                        live.start()
+                    out.append(chunk)
+                    live.update(Markdown("".join(out), code_theme=CODE_THEME))
+                else:
+                    sys.stdout.write(chunk)
+                    sys.stdout.flush()
+            if live is not None:
+                live.stop()
+                live = None
+            if not render:
+                sys.stdout.write("\n")
+            return 1 if got_error else 0
+    except requests.RequestException as e:
+        print(f"ghost: {type(e).__name__}: cannot reach the agent", file=sys.stderr)
+        return 1
+    finally:
+        if live is not None:
+            live.stop()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Ghost Agent CLI — chat, sessions, files, projects, ops.")
+    parser.add_argument("--url", default=DEFAULT_HOST, help="Agent URL")
+    parser.add_argument("--key", default=DEFAULT_KEY, help="API key (X-Ghost-Key)")
+    parser.add_argument("-p", "--prompt", metavar="TEXT",
+                        help="one-shot: send TEXT ('-' reads stdin), print reply, exit")
+    parser.add_argument("--session", metavar="ID",
+                        help="server-side session id to resume / continue")
+    parser.add_argument("--health", action="store_true",
+                        help="print agent health and exit")
+    args = parser.parse_args()
+
+    api = GhostAPI(args.url, args.key)
+
+    if args.health:
+        cli = GhostCLI(api)
+        try:
+            cli.cmd_health()
+        except requests.RequestException as e:
+            print(f"ghost: {type(e).__name__}: cannot reach the agent",
+                  file=sys.stderr)
+            return 1
+        return 0
+
+    prompt = args.prompt
+    if prompt is None and not sys.stdin.isatty():
+        prompt = sys.stdin.read()          # `echo q | ghost` == `ghost -p -`
+    if prompt is not None:
+        if prompt == "-":
+            prompt = sys.stdin.read()
+        prompt = prompt.strip()
+        if not prompt:
+            print("ghost: empty prompt", file=sys.stderr)
+            return 1
+        return one_shot(api, prompt, args.session)
+
+    cli = GhostCLI(api, session_id=args.session)
+    if args.session:
+        try:
+            cli.cmd_resume(args.session)
+        except requests.RequestException:
+            cli.notice("(couldn't resume that session — starting fresh)", "mute")
+    cli.chat()
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

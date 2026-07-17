@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ghost CLI — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Interfaces</h3>
+    <a href="web_server.html">Web server</a>
+    <a href="slack_bot.html">Slack bot</a>
+    <a href="voice_server.html">Voice server</a>
+    <a href="image_gen_server.html">Image-gen server</a>
+    <a href="clockwork_ghost.html">Clockwork Ghost</a>
+    <a class="current" href="cli.html">CLI</a>
+  </nav>
+</aside>
+<main>
+  <h1>interface / externals / cli</h1>
+  <p class="subtitle">Terminal client: streaming Markdown chat, durable sessions, real turn cancellation, files/workspace, projects, and ops — one PEP-723 script.</p>
+
+  <h2>Location &amp; launch</h2>
+  <p>One extensionless executable script, <code>interface/externals/cli/ghost</code>
+  (moved into the repo 2026-07-17; previously it lived only at
+  <code>~/Data/AI/bin/ghost</code>, which is now a <strong>symlink</strong> to the repo copy —
+  that directory is on the operator's PATH, so the command stays <code>ghost</code> and edits
+  land in exactly one place). Dependencies are declared PEP-723 inline
+  (<code>requests</code>, <code>prompt_toolkit</code>, <code>rich</code>) so <code>uv run ghost</code>
+  works anywhere; on the operator's machine the system python has them installed.</p>
+
+  <h2>Connection</h2>
+  <p>Talks DIRECTLY to the agent (<code>GHOST_URL</code>, default <code>http://eva:8000</code>) —
+  not through the web-interface proxy. The key rides <code>X-Ghost-Key</code>, resolved
+  env-first then <code>~/Data/AI/.ghost_api_key</code> (blank env never shadows the file —
+  the Slack-bot <code>" "</code> incident class). Each turn sends an <code>X-Request-ID</code>
+  keying the agent's turn registry, so Ctrl-C cancels the turn <em>server-side</em>
+  (releasing the global turn lock) instead of just closing the socket.</p>
+
+  <h2>Feature surface</h2>
+  <table>
+    <thead><tr><th>Command</th><th>Backend</th></tr></thead>
+    <tbody>
+      <tr><td>chat (plain text)</td><td><code>POST /v1/chat/completions</code> (SSE stream, rendered live as rich Markdown; <code>session_id</code> persists the conversation server-side)</td></tr>
+      <tr><td><code>/sessions · /resume · /new · /clear</code></td><td><code>/api/sessions</code> CRUD — <code>/clear</code> rotates the session id (a local-only clear would lie: the server merges stored history back in)</td></tr>
+      <tr><td><code>/health · /turns · /cancel [hard]</code></td><td><code>/api/health</code>, <code>/api/turns</code>, <code>/api/turn/cancel</code></td></tr>
+      <tr><td><code>/notify</code></td><td><code>/api/notifications/pending</code> + ack, consumer <code>ghost-cli</code> (watermark acked AFTER display so a crash re-serves)</td></tr>
+      <tr><td><code>/memory fix|rm</code></td><td><code>/api/memory/correct</code> · <code>/api/memory/delete</code></td></tr>
+      <tr><td><code>/upload · /download</code></td><td><code>/api/upload</code> · <code>/api/download/{name}</code> (sandbox files)</td></tr>
+      <tr><td><code>/save · /load</code></td><td><code>/api/workspace/save|load</code> — full workspace zip incl. chat history</td></tr>
+      <tr><td><code>/projects · /project …</code></td><td><code>/api/projects</code> list/info/switch/resume/advance/tasks</td></tr>
+      <tr><td>one-shot: <code>ghost -p "q"</code> / pipe stdin</td><td>same chat stream; Markdown when stdout is a tty, raw text when piped</td></tr>
+    </tbody>
+  </table>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_ghost_cli.py</code> (11) — loads the extensionless script by path;
+  covers repo location + the bin symlink contract, the formatting helpers, error-shape
+  extraction (<code>GhostAPI.error_of</code>), base-URL normalization (stray path/query
+  → <code>scheme://netloc</code>), header key wiring, and env-vs-file key precedence.
+  Network paths are deliberately not exercised.</p>
+</main>
+</body>
+</html>

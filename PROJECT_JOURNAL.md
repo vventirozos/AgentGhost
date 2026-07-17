@@ -778,6 +778,17 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-17 (later 3) — ghost CLI moved into the repo (interface/externals/cli/)
+The terminal client lived ONLY at `~/Data/AI/bin/ghost` — outside version control, invisible to
+the test suite, and un-diffable against anything (the exact "device copy accumulates live fixes"
+trap the uConsole hit on 2026-07-13). Moved to `interface/externals/cli/ghost` (exec bit kept,
+PEP-723 inline deps unchanged); `~/Data/AI/bin/ghost` is now a symlink to the repo copy, so the
+`ghost` command (that dir is on PATH) and its `uv run` shebang behavior are unchanged. Verified
+live: `ghost --health` against the running agent through the symlink. Tests:
+tests/test_ghost_cli.py (11 — loads the extensionless script by path; location + symlink
+contract, formatting helpers, error_of shapes, base-URL normalization, key precedence). Docs:
+docs/interfaces/cli.html (new) + sidebar links on the 5 sibling interface pages and index.html.
+
 ### 2026-07-17 (later 2) — multi-turn replies smoothed: narration + double-summary scrub at finalize
 Operator: replies on multi-tool fixes read as the raw loop transcript (WebOS minesweeper turn:
 "Let me fix both:", "Now add the resize logic:", summary stated twice around the verify/restart
