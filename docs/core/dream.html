@@ -173,6 +173,24 @@
   <p>End-to-end walkthrough: see <a href="../algorithms/dream_cycle.html">algorithms / dream cycle</a>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2>Counterfactual replay — regression-of-learning, phase 1 (2026-07-17)</h2>
+  <p><code>core/counterfactual.py</code>. Every concluded self-play sim now persists its
+  challenge spec (prompt + setup + validator + outcome) to
+  <code>$GHOST_HOME/system/counterfactual/challenges.jsonl</code>; ~1 idle self-play slot in 4
+  (when a backlog exists) REPLAYS a past challenge against the CURRENT lessons via the new
+  <code>synthetic_self_play(injected_challenge=…)</code> seam — same isolated sandbox, same
+  validator, generation paths skipped; the only variable is what the agent has learned since.
+  Verdicts: past FAILURE→SUCCESS = <em>generalized</em> (the learning works, measurably);
+  past SUCCESS→FAILURE = <em>regression</em> — the lessons hydrated into the failing replay are
+  QUARANTINED (kept on disk with reason, excluded from prompts — never auto-deleted; see
+  <a href="../memory/skills.html">skills</a>) and the operator is notified at notify-severity.
+  Replays are not re-persisted (no ledger compounding); results land in
+  <code>results.jsonl</code> so each challenge replays once. Phase-1 scope is deliberately
+  validator-backed tasks only — user-turn counterfactuals need pre-turn workspace snapshots,
+  and verifier-scored replays would inherit the verifier's own failure modes. Attribution
+  substrate: every chat trajectory now stamps <code>extra.hydrated_lessons</code>
+  (the playbook triggers actually injected that turn). Tests:
+  <code>tests/test_counterfactual.py</code>.</p>
 </main>
 </body>
 </html>

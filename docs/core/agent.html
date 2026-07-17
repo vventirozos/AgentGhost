@@ -152,6 +152,34 @@
   transcript as the regression fixture). Note: the prompt edit changes the byte-stable
   system prefix, so the first boot after deploy re-prefills the main-node cache once.</p>
 
+  <h2>Grammar-constrained tool calls (2026-07-17)</h2>
+  <p><code>core/tool_grammar.py</code> builds a llama.cpp GBNF grammar from the registry's tool
+  schemas (memoized on the same frozen signature as the XML-schema serialiser) and the payload
+  attaches it LAZILY on every non-final tool turn: <code>grammar</code> +
+  <code>grammar_lazy</code> + a PATTERN-type trigger on <code>\n&lt;tool_call&gt;</code>
+  (newline-anchored so a tag QUOTED inline in thinking can't arm it — the think-strip incident
+  shape). Dormant through reasoning and prose; from the trigger on, only valid framing, known
+  tool names, known parameter names, enum-legal values and numeric-legal integers can decode —
+  the malformed-call strike class dies at the sampler. Validated live before wiring: full
+  39-tool grammar compiled server-side; <code>action='bogus_action'</code> was coerced to a
+  legal enum (value rules are deliberately TIGHT — whitespace padding gave the sampler an
+  escape hatch and it stalled on tabs). String values use a
+  <code>&lt;/parameter&gt;</code> prefix-exclusion chain so file content with markup keeps
+  working; required-ness stays with the tool layer. Paired with <code>--no-native-tools</code>
+  in the launcher: the upstream parser (two corruption shapes on VALID output: merged
+  multi-tool args 2026-07-05/AF, value duplication AF/43) is retired and the agent's own robust
+  XML parser consumes the output. The XML schema block returns to the
+  prompt (~7K tokens, absorbed by the stable-prefix prefill).</p>
+  <p><strong>Status: OPT-IN (<code>GHOST_TOOL_GRAMMAR=1</code>), default OFF</strong> — first
+  production request (req 9f1c3173) exposed a thinking-turn blind spot the probes missed (they
+  ran with <code>/no_think</code>): the model DRAFTS the literal <code>&lt;tool_call&gt;</code>
+  inside its reasoning block, the pattern trigger armed mid-think, and generation died at
+  <code>&lt;tool</code> on every retry — a hard-fail loop. Re-enable only after the trigger is
+  upgraded to llama.cpp's think-aware PATTERN_FULL semantics (capture-group marks where
+  constrained text begins, anchored past <code>&lt;/think&gt;</code>) and validated on a
+  THINKING turn. <code>--no-native-tools</code> stays: the XML parser path was the pre-native
+  default and is verified live post-restart. Tests: <code>tests/test_tool_grammar.py</code>.</p>
+
   <h2>AUTO-DIAGNOSTIC request re-anchor + native-repair payload logging (2026-07-17)</h2>
   <p>Two smaller fixes from the same log evaluation (req 43): (1) the AUTO-DIAGNOSTIC injection
   (failure context + full sandbox listing — several KB of user-role text) now ends with

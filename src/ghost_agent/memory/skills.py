@@ -1207,7 +1207,54 @@ class SkillMemory:
             query, memory_system,
             distance_threshold=distance_threshold, limit=limit,
         )
-        return items
+        return self._filter_quarantined(items)
+
+    def _filter_quarantined(self, items):
+        """Drop lessons a counterfactual regression QUARANTINED (2026-07-17).
+        Quarantine, not deletion: the lesson body and its history stay in
+        the playbook for the operator to review/reinstate; it just stops
+        entering prompts. Single chokepoint over both retrieval surfaces
+        (get_playbook_context + get_playbook_items), so vector-branch
+        candidates are covered too."""
+        try:
+            if not items:
+                return items
+            with self._get_lock():
+                playbook = self._load_playbook()
+            bad = {(p.get("trigger") or p.get("task") or "").strip().lower()
+                   for p in playbook if p.get("quarantined")}
+            bad.discard("")
+            if not bad:
+                return items
+            return [it for it in items
+                    if (it.get("trigger") or "").strip().lower() not in bad]
+        except Exception:
+            return items
+
+    def quarantine_lesson(self, trigger: str, reason: str = "") -> int:
+        """Mark every lesson matching ``trigger`` (case-insensitive) as
+        quarantined — excluded from prompt injection, kept on disk with
+        the reason + timestamp for review. Returns lessons updated."""
+        key = (trigger or "").strip().lower()
+        if not key:
+            return 0
+        updated = 0
+        try:
+            with self._get_lock():
+                playbook = self._load_playbook()
+                for idx, raw in enumerate(playbook):
+                    t = (raw.get("trigger") or raw.get("task") or "").strip().lower()
+                    if t == key and not raw.get("quarantined"):
+                        raw["quarantined"] = True
+                        raw["quarantine_reason"] = str(reason or "")[:300]
+                        raw["quarantined_at"] = _now_iso()
+                        playbook[idx] = raw
+                        updated += 1
+                if updated:
+                    self._save_playbook_unlocked(playbook)
+        except Exception as e:
+            logger.debug(f"quarantine_lesson failed: {e}")
+        return updated
 
     def record_retrievals_bulk(self, triggers) -> int:
         """Bump retrieval counters for many lessons in ONE playbook write.
@@ -1391,6 +1438,20 @@ class SkillMemory:
             return ""
         if branch == "empty_playbook":
             return "No lessons learned yet."
+
+        items = self._filter_quarantined(items)
+        # Hydration side-channel (counterfactual phase 1, 2026-07-17):
+        # which lessons entered THIS prompt. Turns are globally
+        # serialized (agent semaphore), so a plain attribute is safe;
+        # _record_turn_trajectory stamps it into the trajectory's extra
+        # so a later regression can be attributed to the lessons that
+        # were actually in context — without this, attribution data is
+        # unrecoverable after the fact.
+        try:
+            self.last_playbook_triggers = [
+                it["trigger"] for it in items if it.get("trigger")]
+        except Exception:
+            self.last_playbook_triggers = []
 
         if record_retrievals and items:
             try:

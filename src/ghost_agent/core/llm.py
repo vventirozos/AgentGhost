@@ -510,6 +510,8 @@ class LLMClient:
 
         try:
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+            self._maybe_record_call(payload, content, kind="route",
+                                    task=str(task))
             return content if content else fallback
         except Exception:
             return fallback
@@ -1283,17 +1285,42 @@ class LLMClient:
             if targets_main_node:
                 await self._wait_for_foreground_clear()
             async with self._bg_queue_sem:
-                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
+                _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
+                self._maybe_record_call(payload, _result,
+                                        use_worker=use_worker,
+                                        use_vision=use_vision,
+                                        use_critic=use_critic,
+                                        task_label=task_label,
+                                        background=True)
+                return _result
         else:
             async with self._foreground_lock:
                 self.foreground_tasks += 1
             try:
-                return await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
+                _result = await self._do_chat_completion(payload, use_swarm, use_worker, use_vision, use_coding, use_critic, timeout, off_main_only, task_label)
+                self._maybe_record_call(payload, _result,
+                                        use_worker=use_worker,
+                                        use_vision=use_vision,
+                                        use_critic=use_critic,
+                                        task_label=task_label)
+                return _result
             finally:
                 async with self._foreground_lock:
                     self.foreground_tasks -= 1
                     if self.foreground_tasks < 0:
                         self.foreground_tasks = 0
+
+    @staticmethod
+    def _maybe_record_call(payload, result, kind: str = "chat_completion",
+                          **meta) -> None:
+        """LLM-boundary recording hook (GHOST_LLM_RECORD=1; off by
+        default — payloads carry unredacted memory/profile text). Best-
+        effort by contract; see core/llm_recording.py."""
+        try:
+            from .llm_recording import maybe_record
+            maybe_record(kind, payload, result, **meta)
+        except Exception:
+            pass
 
     async def get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """

@@ -124,6 +124,18 @@
   </table>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2>Lesson quarantine + hydration side-channel (2026-07-17)</h2>
+  <p><code>quarantine_lesson(trigger, reason)</code> marks matching playbook entries
+  <code>quarantined</code> — excluded from BOTH retrieval surfaces
+  (<code>get_playbook_context</code> and <code>get_playbook_items</code> share the
+  <code>_filter_quarantined</code> chokepoint, covering the vector branch too) but kept on
+  disk with reason + timestamp for operator review/reinstatement. Written for
+  <a href="../core/dream.html">counterfactual replay</a>'s regression verdicts — a false
+  regression must never silently delete a good lesson. Additionally,
+  <code>get_playbook_context</code> stashes <code>last_playbook_triggers</code> (the lessons
+  that actually entered the prompt this turn; turns are globally serialized) and
+  <code>_record_turn_trajectory</code> stamps them into the trajectory's
+  <code>extra.hydrated_lessons</code> — the attribution set a future regression points at.</p>
 </main>
 </body>
 </html>

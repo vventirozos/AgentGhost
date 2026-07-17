@@ -2327,7 +2327,7 @@ Return ONLY a JSON object with:
             return True
         return False
 
-    async def synthetic_self_play(self, model_name: str = "qwen-3.6-35b-a3", is_background: bool = False):
+    async def synthetic_self_play(self, model_name: str = "qwen-3.6-35b-a3", is_background: bool = False, injected_challenge: dict = None):
         import tempfile
         from pathlib import Path
         from ..sandbox.docker import DockerSandbox
@@ -2478,6 +2478,29 @@ Return ONLY a JSON object with:
         rejection_feedback = ""
         gen_ok = False
 
+        # --- Counterfactual injection seam (2026-07-17) ---------------------
+        # A replay hands in a PERSISTED past challenge verbatim; every
+        # generation path below (template bank, journal mining, LLM) is
+        # skipped. Same isolation, same validator — the only variable is
+        # the CURRENT skills/lessons/router state, which is the point.
+        # See core/counterfactual.py.
+        if injected_challenge:
+            challenge = str(injected_challenge.get("challenge") or "")
+            setup_script = str(injected_challenge.get("setup_script") or "")
+            validation_script = str(
+                injected_challenge.get("validation_script") or "")
+            if challenge and validation_script:
+                validation_script, _ = sanitize_code(
+                    validation_script, ".validator.py")
+                setup_script, _ = sanitize_code(setup_script, ".setup.py")
+                gen_ok = True
+                pretty_log(
+                    "Counterfactual",
+                    "replaying an injected past challenge — generation "
+                    "paths skipped",
+                    icon=Icons.BRAIN_AIM,
+                )
+
         # --- Template fast path ---------------------------------------------
         # Before spending ~120s on LLM-generated challenge XML, check the
         # deterministic template bank. Covers the clusters we see most
@@ -2546,7 +2569,7 @@ Return ONLY a JSON object with:
         # new to teach the agent, so journal-mined challenges become
         # the PRIMARY source of novel material: bump the probability
         # to 0.75 so the loop actually reaches for them.
-        if _tpl is None:
+        if _tpl is None and not gen_ok:
             journal_prob = 0.75 if _saturated else 0.25
             _journal_tpl = self._try_journal_challenge(probability=journal_prob)
             if _journal_tpl is not None:
@@ -4438,7 +4461,27 @@ Return ONLY a JSON object with:
                         logger.debug(f"Scratchpad write skipped: {_spe}")
 
                 pretty_log("Self-Play Concluded", f"Simulation ended with status: {status_str}.", icon=Icons.OK)
-                
+                # Counterfactual phase 1 (2026-07-17): expose the outcome
+                # on the instance (the runner reads it — parsing the
+                # narrative return string would be brittle) and persist
+                # the concluded challenge spec so it is REPLAYABLE later.
+                # Replays themselves are NOT re-persisted — a replayed
+                # replay would compound the ledger forever.
+                self.last_self_play_status = str(status_str)
+                if not injected_challenge:
+                    try:
+                        from .counterfactual import persist_challenge
+                        persist_challenge(
+                            challenge=challenge,
+                            setup_script=setup_script,
+                            validation_script=validation_script,
+                            status=str(status_str),
+                            cluster=str(locals().get("cluster_key") or ""),
+                            source=str(locals().get("_tpl_source") or ""),
+                        )
+                    except Exception as _cf_exc:
+                        logger.debug("challenge persist skipped: %s", _cf_exc)
+
             except Exception as e:
                 pretty_log("Self-Play Error", str(e), level="ERROR", icon=Icons.FAIL)
                 return f"Self-Play encountered an error: {e}"

@@ -209,6 +209,19 @@
   Covered by <code>tests/test_main_prefix_warmup.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2>LLM-boundary recording &amp; stub-replay (2026-07-17)</h2>
+  <p><code>core/llm_recording.py</code>. With <code>GHOST_LLM_RECORD=1</code> every
+  <code>chat_completion</code> result (foreground + background branches) and every
+  <code>route()</code> verdict appends one JSONL line — request id, per-process ordinal, exact
+  payload, response, routing flags — under <code>$GHOST_HOME/system/llm_recordings/&lt;day&gt;.jsonl</code>.
+  <strong>OFF by default, deliberately:</strong> payloads carry the rendered system prompt
+  (memory + user profile) verbatim, bypassing the corpus redaction contract — enable for a
+  debugging session, harvest fixtures, turn it off. <code>ReplayLLMClient</code> serves a
+  recording back in order (fingerprint of <code>messages</code> verified; mismatches flagged on
+  <code>.mismatches</code>, exhaustion raises) — deterministic stub-replay for harness tests and
+  forensics. Live same-seed re-generation was REJECTED as a goal: llama.cpp on Metal with
+  prefix-cache reuse is not byte-stable run-to-run. Tests:
+  <code>tests/test_llm_recording.py</code>.</p>
 </main>
 </body>
 </html>

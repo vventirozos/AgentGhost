@@ -3634,14 +3634,39 @@ class GhostAgent:
                 # caught by the cooldown next tick.
                 self._last_selfplay_at = datetime.datetime.now()
                 try:
-                    await dreamer.synthetic_self_play(
-                        model_name=getattr(ctx.args, 'model', 'default'),
-                        is_background=True
-                    )
-                    self._record_autonomous_activity(
-                        "self_play",
-                        "synthetic self-play session ran (new lessons land "
-                        "in the skills playbook)")
+                    # Counterfactual phase 1 (2026-07-17): ~1 idle slot in 4
+                    # replays PAST challenges against the current lessons
+                    # instead of generating fresh ones — the measurement leg
+                    # of the post-mortem→lesson loop. Only when a backlog
+                    # exists; otherwise the slot stays a normal self-play.
+                    _ran_cf = False
+                    if self._bio_roll(0.25):
+                        try:
+                            from .counterfactual import (
+                                load_replay_candidates, run_counterfactual_batch)
+                            if load_replay_candidates(1):
+                                _cf = await run_counterfactual_batch(
+                                    dreamer, ctx)
+                                if _cf.get("replayed"):
+                                    _ran_cf = True
+                                    self._record_autonomous_activity(
+                                        "self_play",
+                                        f"counterfactual replay: "
+                                        f"{_cf['replayed']} challenge(s) — "
+                                        f"{_cf['generalized']} generalized, "
+                                        f"{_cf['regressions']} regression(s), "
+                                        f"{_cf['stable']} stable")
+                        except Exception as _cfe:
+                            logger.debug("counterfactual slot skipped: %s", _cfe)
+                    if not _ran_cf:
+                        await dreamer.synthetic_self_play(
+                            model_name=getattr(ctx.args, 'model', 'default'),
+                            is_background=True
+                        )
+                        self._record_autonomous_activity(
+                            "self_play",
+                            "synthetic self-play session ran (new lessons land "
+                            "in the skills playbook)")
                 finally:
                     ctx.last_activity_time = datetime.datetime.now()
                     self._last_selfplay_at = datetime.datetime.now()
@@ -10319,6 +10344,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         except Exception:
                             pass
 
+                    # Grammar-constrained tool calls (2026-07-17): attach a
+                    # LAZY GBNF grammar built from the active tool schemas.
+                    # Dormant through thinking/prose; from the moment the
+                    # model opens a line with `<tool_call>` only valid
+                    # framing / known tools / known parameter names /
+                    # enum-legal values / numeric-legal integers can decode
+                    # — the malformed-call strike class dies at the sampler.
+                    # Validated against the live llama-server build before
+                    # wiring (pattern-type triggers; /v1/chat/completions).
+                    # Best-effort: `{}` on any failure, and servers without
+                    # the fields ignore them. GHOST_TOOL_GRAMMAR=0 disables.
+                    if not is_final_generation and all_tools:
+                        try:
+                            from .tool_grammar import grammar_payload_fields
+                            payload.update(grammar_payload_fields(all_tools))
+                        except Exception as _tg_exc:
+                            logger.debug("tool grammar skipped: %s", _tg_exc)
+
                     pretty_log("LLM Request", f"Turn {turn+1} | Temp {sampling_params['temperature']:.2f}", icon=Icons.LLM_ASK)
 
                     if is_final_generation and stream_response:
@@ -12873,6 +12916,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             _elapsed = _glog.request_elapsed_s(req_id or "")
             if _elapsed is not None:
                 traj_kwargs["duration_s"] = round(_elapsed, 3)
+        except Exception:
+            pass
+        # Hydrated-lesson attribution (counterfactual phase 1,
+        # 2026-07-17): stamp WHICH playbook lessons were injected into
+        # this turn's prompt (side-channel set by get_playbook_context —
+        # turns are globally serialized). When a future counterfactual
+        # flags a regression, this is the candidate set; without it,
+        # attribution is unrecoverable after the fact.
+        try:
+            _sm_h = getattr(self.context, "skill_memory", None)
+            _trigs = list(getattr(_sm_h, "last_playbook_triggers", []) or [])
+            if _trigs:
+                traj_kwargs["extra"] = {"hydrated_lessons": _trigs[:10]}
         except Exception:
             pass
         # Use the pre-allocated id from `handle_chat` when present so

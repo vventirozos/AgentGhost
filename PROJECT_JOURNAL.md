@@ -60,8 +60,10 @@ wired). Repo is versioned on another server (local git intentionally absent).
 `/Library/LaunchDaemons/com.local.ghost-agent.plist` (**KeepAlive=true**). Live flags (2026-07-13):
 `--verbose --deep-reason --smart-memory 0.9 --max-context 240000 --mandatory-tor
 --autoadvance-idle --enable-metacog --metacog-mem-high 98 --metacog-mem-floor-mb 300
---visual-nodes http://127.0.0.1:8088|Eva --image-gen-nodes http://192.168.0.155:8000|Ghost
---worker-nodes http://192.168.0.20:8088|Nova`.
+--visual-nodes http://127.0.0.1:8088|Eva --image-gen-nodes http://100.122.46.101:8000|Ghost
+--worker-nodes http://100.83.184.117:8088|Nova`. (Off-main nodes use TAILNET IPs since
+2026-07-17 — macOS Tahoe's Local Network privacy silently drops a system daemon's packets to
+192.168.x before the wire; tailnet/utun is exempt. See §6 that date.)
 Env: `GHOST_HOME=/Users/vasilis/Data/AI/Data/`, `GHOST_CRITIC_ASYNC=1`, `GHOST_CRITIC_NO_THINK=0`,
 `GHOST_PIN_TOOL_SCHEMAS=1`, **`GHOST_API_KEY=$(cat ~/Data/AI/.ghost_api_key)`** (auth ENABLED
 2026-07-13 — the launcher reads the canonical mode-600 secret file and exports the env var; no
@@ -777,6 +779,65 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-17 (later 6) — INCIDENT: "worker broke, cache doesn't work, tools not firing" — triage + fixes
+Operator report after the later-5 deploy. Three distinct causes, all resolved:
+- **Cache + tools** — self-inflicted by `--no-native-tools`: schemas moved into the prompt but the
+  boot warmup still prefilled the NATIVE-mode head (~5.7K tok vs the new ~84K-char request
+  prefix) → every conversation re-paid a ~20K-token prefill, turn-1 latency 12s→47s; separately
+  the GBNF trigger armed INSIDE thinking (model drafts literal `<tool_call>` while reasoning) and
+  hard-killed tool turns. REVERTED same hour (native ON, grammar opt-in-off). Re-attempt
+  prerequisites documented in the launcher comment block.
+- **Worker (Nova) — NOT my deploy, NOT Nova: macOS Tahoe Local Network privacy.** The agent runs
+  as a SYSTEM launchd daemon (UserName key); Tahoe silently denies daemons access to physical-LAN
+  addresses. PROOF: (a) tcpdump — the agent's SYNs to 192.168.0.20:8088 never reached the wire
+  while a terminal curl handshook cleanly in the same capture; (b) a one-shot probe daemon
+  bootstrapped into the system domain got `errno 65 No route to host` on the LAN IP but **200 on
+  the tailnet IP** and loopback. Loopback + internet unaffected — which is why only worker/image
+  nodes died. Onset ~17:00-17:30 with no reboot/update — Tahoe's policy attribution is opaque;
+  mechanism proven even if the trigger moment isn't.
+- **FIX:** `--worker-nodes http://100.83.184.117:8088|Nova` and `--image-gen-nodes
+  http://100.122.46.101:8000|Ghost` (tailnet IPs; `compute_tor_proxy`'s CGNAT rule already
+  bypasses Tor for 100.64/10). LIVE-VERIFIED: verify → Nova → CONFIRMED (100%) in 4.3s.
+  Alternative left to operator: grant Local Network to the venv python in System Settings and
+  revert to LAN IPs. Diagnostic ladder that worked: fresh-process repro (isolate code) →
+  `ps eww` env diff → tcpdump (in-host vs wire) → same-domain probe daemon (context isolation).
+
+### 2026-07-17 (later 5) — THREE features: GBNF tool grammar, LLM record/replay, counterfactual phase 1
+Operator-approved evaluation → "proceed with all 3". All landed with kill switches.
+- **Grammar-constrained tool calls** (core/tool_grammar.py + payload wiring + launcher
+  `--no-native-tools`): lazy GBNF from the registry schemas, PATTERN trigger on `\n<tool_call>`
+  (newline-anchored — a quoted tag in thinking can't arm it). LIVE-VALIDATED before wiring:
+  the running llama-server accepts per-request grammar+lazy triggers (word-type needs preserved
+  tokens → pattern-type used); full 39-tool grammar (26KB) compiled and emitted canonical calls;
+  `action='bogus_action'` coerced to a legal enum. GOTCHA FOUND ON PROBE: whitespace padding in
+  value rules let the sampler stall on tabs instead of committing — value rules are TIGHT.
+  Native upstream parsing RETIRED (its two corruption shapes hit 3× in two weeks on VALID
+  output); the agent's XML parser consumes the output. XML schema block returns to the prompt
+  (~7K tok, prefill-cached). **GRAMMAR DEMOTED TO OPT-IN same session** (req 9f1c3173): first
+  production request hard-failed — with THINKING on, the model drafts literal `<tool_call>`
+  inside reasoning, the pattern trigger armed mid-think, generation died at `<tool` every
+  retry. The probes' blind spot: all ran /no_think. Default now OFF (`GHOST_TOOL_GRAMMAR=1`
+  re-enables); next step is llama.cpp PATTERN_FULL think-aware triggers, validated on a
+  thinking turn. `--no-native-tools` STAYS — XML-parser path live-verified post-restart
+  ("list your projects" → clean manage_projects call, no repairs/stalls).
+- **LLM-boundary record/replay** (core/llm_recording.py): `GHOST_LLM_RECORD=1` records every
+  chat_completion + route() call (payload/response/ordinal/request-id) to
+  system/llm_recordings/; OFF by default — raw prompts bypass redaction (operator-only
+  retention). `ReplayLLMClient` = deterministic stub-replay for fixture minting. Byte-exact
+  LIVE re-generation rejected as a goal (Metal + prefix-cache ≠ byte-stable).
+- **Counterfactual replay phase 1** (core/counterfactual.py): concluded self-play challenges
+  persist (prompt+setup+validator+outcome); ~1 idle self-play slot in 4 replays a past
+  challenge via new `synthetic_self_play(injected_challenge=…)` seam (generation skipped,
+  journal path guarded with `not gen_ok`); FAILURE→SUCCESS = "generalized",
+  SUCCESS→FAILURE = "regression" → hydrated lessons QUARANTINED (skills.py:
+  `quarantine_lesson` + `_filter_quarantined` chokepoint over both retrieval surfaces; kept on
+  disk, never deleted) + notify-severity ledger record. Chat trajectories stamp
+  `extra.hydrated_lessons` (attribution substrate). Scope: validator-backed tasks only;
+  user-turn replays need workspace snapshots (phase 2).
+- Tests: test_tool_grammar.py (13), test_llm_recording.py (9), test_counterfactual.py (12).
+  Docs: core/agent.html, core/llm.html, core/dream.html, memory/skills.html. Deploy note:
+  agent restart picks up grammar+native-off together (launcher edit).
 
 ### 2026-07-17 (later 4) — log-eval fixes: interaction cap, click bound, name-case, dup guard, re-anchor
 Operator asked for a model-vs-harness evaluation of the day's 4 requests (WebOS drag session,
