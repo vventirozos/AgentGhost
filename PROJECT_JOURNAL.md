@@ -778,6 +778,39 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-17 (later 4) — log-eval fixes: interaction cap, click bound, name-case, dup guard, re-anchor
+Operator asked for a model-vs-harness evaluation of the day's 4 requests (WebOS drag session,
+reqs 75/AF/43), then "proceed with all". Five harness fixes:
+- **Verifier interaction-claim cap** (the big one): AF's drag fix got CONFIRMED (100%) from text
+  entailment + a load-clean WEB-EXEC probe — and was still broken (req 43 = the user reporting
+  it). New `_is_interaction_intent` + `_has_interaction_evidence` (reads `STATUS: OK`/`OP:` from
+  browser results); pointer-behavior claims with no successful click/interact this turn cap
+  CONFIRMED at 0.6 (below all ≥0.7 consumption gates), reasoning annotated. Same philosophy as
+  the req-70 web-exec-inconclusive cap.
+- **Browser click bounded** (runner): attached ≠ actionable — a hidden start-menu item passed the
+  2026-07-14 probe then page.click burned Playwright's full 30s default, raw TimeoutError, no
+  steer (so the model abandoned behavioral testing). Click now runs with timeout=probe_ms (≤8s);
+  timeout re-raises with the hidden-until-opened explanation + the op='interact' escape.
+- **Service names case-insensitive** (`_resolve_name` in sandbox/services.py): restart 'WebOS' vs
+  registered 'webos' missed → duplicate service, port conflict, kill dance. stop/restart/status/
+  logs/start now resolve exact-first then unique case-insensitive; registered spelling wins.
+  (The workspace still carries the leftover WebOS.cmd.sh twin from the incident — harmless, the
+  running entry is 'WebOS'.)
+- **file_search filename==pattern guard** (sibling of the replace content==replace_with guard,
+  2026-07-05): upstream value-duplication put the search pattern in 'filename' → rg on a
+  nonexistent path. Now heals (drops corrupt filename, searches workspace, NOTE in result).
+  Plus: `_repair_native_tool_calls` firing now logs raw pre-repair calls (4 KB) — was
+  undiagnosable from traces.
+- **AUTO-DIAGNOSTIC re-anchor**: the failure-context+listing flood made the model re-run the
+  PREVIOUS request's flow for 3 turns (43/22-24); the injection now ends with "REMINDER — the
+  CURRENT user request…".
+- Deferred with reasons: prefix-growth turn-1 latency (design tradeoff, not a bug); surfacing
+  fresh post-mortem lessons into in-flight fixes (real feature, own design pass — noted: AF's
+  auto-lesson described exactly the generalization whose absence caused 43).
+- Tests: test_log_eval_fixes_20260717.py (10), test_sandbox_services.py +4, 
+  test_file_system_search_container_path.py +3. Docs: core/verifier.html, core/agent.html,
+  tools/browser.html, tools/file_system.html, sandbox/services.html.
+
 ### 2026-07-17 (later 3) — ghost CLI moved into the repo (interface/externals/cli/)
 The terminal client lived ONLY at `~/Data/AI/bin/ghost` — outside version control, invisible to
 the test suite, and un-diffable against anything (the exact "device copy accumulates live fixes"

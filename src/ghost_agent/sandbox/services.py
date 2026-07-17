@@ -320,6 +320,12 @@ class ServiceSupervisor:
         name = str(name)
         with self._lock:
             reg = self._load()
+            # A case-variant of a registered name is the SAME service —
+            # adopt the registered spelling instead of creating a twin
+            # (the req-43 'WebOS' vs 'webos' duplicate + port conflict).
+            key = self._resolve_name(reg, name)
+            if key is not None:
+                name = key
             entry = reg.get(name)
             if entry and self._pid_alive(entry.get("pid")):
                 return (f"Error: service '{name}' is already running "
@@ -585,17 +591,32 @@ class ServiceSupervisor:
                 pass
         return dead
 
+    @staticmethod
+    def _resolve_name(reg: Dict[str, dict], name: str) -> Optional[str]:
+        """Registered key for ``name`` — exact match first, then a UNIQUE
+        case-insensitive match. Req 43 (2026-07-17): the model asked to
+        restart 'WebOS' while the registry held 'webos'; the exact-only
+        miss spawned a DUPLICATE service for the same port and an
+        "Address already in use" kill dance. Names differing only by
+        case are one service to any human reading the log."""
+        name = str(name)
+        if name in reg:
+            return name
+        hits = [k for k in reg if k.lower() == name.lower()]
+        return hits[0] if len(hits) == 1 else None
+
     def stop(self, name: str) -> str:
         err = self._validate_name(name)
         if err:
             return err
-        name = str(name)
         with self._lock:
             reg = self._load()
-            entry = reg.pop(name, None)
+            key = self._resolve_name(reg, name)
+            entry = reg.pop(key, None) if key else None
             if entry is None:
                 return (f"Error: no service named '{name}' "
                         f"(action='status' lists them).")
+            name = key
             was_alive = self._kill_service(entry)
             self._save(reg)
         state = "stopped" if was_alive else "was already dead; removed"
@@ -625,21 +646,24 @@ class ServiceSupervisor:
         err = self._validate_name(name)
         if err:
             return err
-        entry = self._load().get(str(name))
+        reg = self._load()
+        key = self._resolve_name(reg, name)
+        entry = reg.get(key) if key else None
         if entry is None:
             return (f"Error: no service named '{name}' to restart "
                     f"(use action='start' with a command).")
-        self.stop(name)
-        return self.start(name, entry.get("command") or "",
+        self.stop(key)
+        return self.start(key, entry.get("command") or "",
                           port=entry.get("port"),
                           workdir=entry.get("workdir"))
 
     def status(self, name: Optional[str] = None) -> str:
         reg = self._load()
         if name:
-            entries = {str(name): reg.get(str(name))}
-            if entries[str(name)] is None:
+            key = self._resolve_name(reg, name)
+            if key is None:
                 return f"Error: no service named '{name}'."
+            entries = {key: reg.get(key)}
         else:
             entries = reg
         if not entries:
@@ -679,8 +703,10 @@ class ServiceSupervisor:
         err = self._validate_name(name)
         if err:
             return err
-        if self._load().get(str(name)) is None and not (
-                self.host_dir / f"{name}.log").exists():
+        key = self._resolve_name(self._load(), name)
+        if key is not None:
+            name = key
+        elif not (self.host_dir / f"{name}.log").exists():
             return f"Error: no service (or log) named '{name}'."
         try:
             lines = max(1, min(int(lines), 400))

@@ -84,6 +84,21 @@
   <h3>Repair directive demands a standalone rewrite (2026-07-17)</h3>
   <p>The auto-repair directive rides a <em>user-role</em> message while the refuted draft is discarded — the real user never saw what is being corrected. The model treated the alert conversationally, so its "corrected" reply opened with checker-facing dialogue (<em>"You're right — I was interpreting and embellishing…"</em>, req 4dab5067) addressed to nobody the user knows about. Both repair directives (REFUTED and unverified-mutation) now append <code>_REPAIR_STANDALONE_SUFFIX</code>: the user never saw the draft or the alert; write a clean standalone reply; no acknowledgements, apologies, or mention of any verifier/review/correction. Wiring guarded by <code>tests/test_verifier_evidence_window.py</code>.</p>
 
+  <h3>Interaction-claim confidence cap (2026-07-17, later)</h3>
+  <p>Reqs AF/43 (the WebOS drag bug): the user reported a POINTER behavior defect ("moving a
+  window doesn't work"), the agent fixed-and-shipped, and the gate produced CONFIRMED (100%) from
+  text entailment plus a load-clean WEB-EXEC probe — for a fix that was still broken. A
+  drag/click/resize behavior claim cannot be supported by evidence that never exercised the
+  interaction. Same philosophy as the web-exec-inconclusive cap: when
+  <code>_is_interaction_intent(last_user_content)</code> (pointer/keyboard verb near a UI-element
+  noun, both directions) and no browser <code>click</code>/<code>interact</code> op SUCCEEDED this
+  turn (<code>_has_interaction_evidence</code> reads the <code>STATUS: OK</code> / <code>OP: …</code>
+  result header — tools_run entries carry no arguments), a CONFIRMED above
+  <code>_WEB_EXEC_SKIP_CONF_CAP</code> (0.6) is capped to it, below every ≥0.7 consumption gate
+  (backfill "passed", auditor note, calibration), with the reasoning annotated
+  <code>[INTERACTION untested…]</code>. A successful interaction this turn leaves the verdict
+  untouched. Tests: <code>tests/test_log_eval_fixes_20260717.py</code>.</p>
+
   <h3>Turn duration stamped into the trajectory corpus (2026-07-17)</h3>
   <p>Same incident, adjacent gap: <code>_record_turn_trajectory</code> left <code>duration_s</code> at the schema default 0.0 on every chat turn. It now stamps the wall-clock from the pretty-log request clock via <code>ghost_agent.utils.logging.request_elapsed_s(req_id)</code> (None — closed request / sim contexts — keeps the default), so corpus consumers (PRM features, reflection) can see per-turn latency. <code>tokens_in/out</code> remain 0: no usage accumulation exists on the streaming client path — a deliberate scope-out, not an oversight. Covered by <code>tests/test_wiring_trajectory_logging.py</code>.</p>
 

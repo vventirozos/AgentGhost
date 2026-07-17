@@ -2333,6 +2333,25 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
         # sees actually exists. Path safety / traversal protection still
         # comes from ``_get_safe_path`` rejecting anything that resolves
         # outside ``sandbox_dir``.
+        # IDENTICAL-ARGS CORRUPTION GUARD (2026-07-17) — sibling of the
+        # replace content==replace_with guard: upstream native tool-call
+        # transport can duplicate one argument's value into the next slot.
+        # Observed live (req AF): filename arrived == the search pattern, so
+        # rg ran against '<workspace>/makeDraggable' — a path that cannot
+        # exist — and the turn was wasted on "No such file". A file named
+        # exactly like the pattern being searched IN it is never intentional;
+        # heal by dropping the corrupt filename and searching the workspace.
+        _healed_dup_filename = False
+        if filename and str(filename).strip() == str(pattern).strip("'\""):
+            pretty_log(
+                "File Search Corruption Guard",
+                f"filename == search pattern ({str(pattern)[:60]!r}) — "
+                "suspected upstream argument duplication; searching the "
+                "whole workspace instead",
+                level="WARNING", icon=Icons.WARN,
+            )
+            filename = None
+            _healed_dup_filename = True
         if filename:
             search_path = _get_safe_path(sandbox_dir, filename)
             if not search_path.exists():
@@ -2375,9 +2394,13 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
         if exit_code == 1 and (
                 not _out_stripped
                 or _out_stripped == "[SYSTEM ERROR]: Process failed (Exit 1) with no output."):
+            _dup_note = (
+                " [NOTE: your 'filename' arrived identical to the pattern — "
+                "suspected upstream argument duplication; the whole "
+                "workspace was searched.]" if _healed_dup_filename else "")
             return (f"Report: No matches found for '{pattern}'. (rg exited 1, "
                     f"which for a search means the pattern was NOT FOUND — "
-                    f"the search itself did not fail.)")
+                    f"the search itself did not fail.){_dup_note}")
 
         # Cap search output but keep BOTH head and tail. Without the tail
         # we'd silently hide the last matches in the file, which is the
@@ -2404,6 +2427,13 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
             # Truncation is best-effort; never crash the search.
             pass
 
+        if _healed_dup_filename and isinstance(output, str) and output.strip():
+            output = (
+                "[NOTE: your 'filename' argument arrived IDENTICAL to the "
+                "search pattern — suspected upstream argument duplication; "
+                "the whole workspace was searched instead. Pass the real "
+                "filename if you meant one file.]\n" + output
+            )
         return output if output.strip() else "Report: No matches found. (Tip: Use list_files to verify the path)"
 
     except ValueError as ve: return str(ve)

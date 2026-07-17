@@ -248,3 +248,46 @@ async def test_find_files_rejects_outside_sandbox_path(sandbox):
     # Must NOT have run a find command that points at the host etc/
     assert sm.execute.call_count == 0
     assert "outside" in res.lower() or "security" in res.lower()
+
+
+# ------------------------------------------- filename==pattern corruption guard
+
+
+@pytest.mark.asyncio
+async def test_search_heals_filename_equal_to_pattern(sandbox):
+    """2026-07-17 (req AF): upstream native tool-call transport duplicated
+    the search pattern into 'filename', so rg ran against
+    '<workspace>/makeDraggable' — a path that cannot exist — and the turn
+    was wasted. The guard drops the corrupt filename, searches the whole
+    workspace, and NAMES the healing in the result."""
+    sm = _make_sandbox_manager(
+        stdout="/workspace/index.html:438:makeDraggable()\n", exit_code=0)
+    result = await tool_file_search("makeDraggable", sandbox,
+                                    "makeDraggable", sm)
+    cmd = sm.execute.call_args[0][0]
+    # Searched the workspace, not a file named like the pattern.
+    assert cmd.rstrip().endswith("/workspace")
+    assert "/workspace/makeDraggable" not in cmd
+    assert "argument duplication" in result
+    assert "makeDraggable()" in result
+
+
+@pytest.mark.asyncio
+async def test_search_heal_note_on_no_matches_too(sandbox):
+    sm = _make_sandbox_manager(stdout="", exit_code=1)
+    result = await tool_file_search("zZzNotThere", sandbox, "zZzNotThere", sm)
+    assert "No matches found" in result
+    assert "argument duplication" in result
+
+
+@pytest.mark.asyncio
+async def test_search_distinct_filename_untouched(sandbox):
+    """A real filename must never trip the guard."""
+    target = sandbox / "app.js"
+    target.write_text("var makeDraggable = 1;\n")
+    sm = _make_sandbox_manager(
+        stdout="/workspace/app.js:1:var makeDraggable = 1;\n", exit_code=0)
+    result = await tool_file_search("makeDraggable", sandbox, "app.js", sm)
+    cmd = sm.execute.call_args[0][0]
+    assert "/workspace/app.js" in cmd
+    assert "argument duplication" not in result

@@ -723,7 +723,32 @@ async def op_click(op):
                 f"opener>\"}}, {{\"action\":\"click\",\"selector\":"
                 f"\"{selector}\"}}]."
             )
-        await page.click(selector)
+        # Attached ≠ actionable: an element can be IN the DOM yet hidden
+        # until its opener is clicked (start-menu items, dropdown rows) —
+        # the probe above passes, then an unbounded page.click waits the
+        # FULL default 30s for visibility and dies with a raw
+        # TimeoutError that carries no escape hint (req 43, 2026-07-17:
+        # '.start-menu-item:nth-child(1)' on a freshly-loaded page whose
+        # menu was closed). Bound the actionability wait like the probe
+        # and NAME the op='interact' escape on timeout.
+        try:
+            await page.click(selector, timeout=probe_ms)
+        except Exception as _ce:
+            # Type-name check ONLY (playwright raises TimeoutError): a
+            # message-content check matched unrelated errors that merely
+            # mention the word (e.g. a TypeError about the timeout kwarg).
+            if "Timeout" not in type(_ce).__name__:
+                raise
+            raise RuntimeError(
+                f"selector {selector!r} is in the DOM but never became "
+                f"clickable within {probe_ms}ms — it is likely HIDDEN until "
+                f"an opener (menu/dialog/dropdown) is clicked first, and "
+                f"this atomic op reloaded the page so that opened state is "
+                f"gone. Run the whole flow in ONE context with "
+                f"op='interact', e.g. actions=[{{\"action\":\"click\","
+                f"\"selector\":\"<the opener>\"}}, {{\"action\":\"click\","
+                f"\"selector\":\"{selector}\"}}]."
+            )
         # Wait for any navigation triggered by the click to settle.
         try:
             await page.wait_for_load_state("load", timeout=op["timeout_ms"])

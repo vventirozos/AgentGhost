@@ -771,3 +771,49 @@ class TestPortConflictRetry:
         assert "containers.run(**run_kwargs)" in block
         assert block.index("remove(force=True)") < \
             block.index("containers.run(**run_kwargs)")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Case-insensitive name resolution (2026-07-17, req 43)
+# 'restart WebOS' missed the registered 'webos', spawned a duplicate
+# service for the same port, and triggered an "Address already in use"
+# kill dance. A case-variant of a registered name is the SAME service.
+# ──────────────────────────────────────────────────────────────────────
+
+
+class TestCaseInsensitiveNames:
+    def _running(self, tmp_path):
+        sb = FakeSandbox(tmp_path, happy_handler())
+        sup = ServiceSupervisor(sb)
+        sup.start("webos", "python3 -m http.server 8100", port=8100)
+        return sup
+
+    def test_restart_matches_case_variant(self, tmp_path):
+        sup = self._running(tmp_path)
+        out = sup.restart("WebOS")
+        assert "no service named" not in out
+        # The registered spelling is kept — no twin registry entry.
+        reg = json.loads(
+            (tmp_path / ".services" / "registry.json").read_text())
+        assert list(reg.keys()) == ["webos"]
+
+    def test_status_and_stop_match_case_variant(self, tmp_path):
+        sup = self._running(tmp_path)
+        assert "no service named" not in sup.status("WEBOS")
+        out = sup.stop("WebOS")
+        assert "no service named" not in out
+        assert "webos" in out  # message uses the registered spelling
+
+    def test_start_adopts_registered_spelling_instead_of_twin(self, tmp_path):
+        sup = self._running(tmp_path)
+        # Case-variant start of a RUNNING service errors like the exact
+        # name would (already running) instead of creating a duplicate.
+        out = sup.start("WebOS", "python3 -m http.server 8100", port=8100)
+        assert "already running" in out
+        reg = json.loads(
+            (tmp_path / ".services" / "registry.json").read_text())
+        assert list(reg.keys()) == ["webos"]
+
+    def test_unknown_name_still_errors(self, tmp_path):
+        sup = self._running(tmp_path)
+        assert "no service named" in sup.restart("dashboard")

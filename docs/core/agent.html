@@ -152,6 +152,18 @@
   transcript as the regression fixture). Note: the prompt edit changes the byte-stable
   system prefix, so the first boot after deploy re-prefills the main-node cache once.</p>
 
+  <h2>AUTO-DIAGNOSTIC request re-anchor + native-repair payload logging (2026-07-17)</h2>
+  <p>Two smaller fixes from the same log evaluation (req 43): (1) the AUTO-DIAGNOSTIC injection
+  (failure context + full sandbox listing — several KB of user-role text) now ends with
+  <em>"REMINDER — the CURRENT user request you are working on: …"</em>. Right after a
+  <code>manage_services</code> miss flooded the context, the model re-anchored on the PREVIOUS
+  request's "resume the project" framing for three turns before recovering; restating the live
+  request pins it. (2) <code>_repair_native_tool_calls</code> firing now logs the RAW pre-repair
+  tool_calls (truncated to 4&nbsp;KB) via <code>logger.warning</code> — the repair was previously
+  undiagnosable from traces, and attributing the req-AF <code>path=query</code> duplication took a
+  session of guesswork (the same lesson the XML parse-error path learned on 2026-07-05). Both
+  pinned by <code>tests/test_log_eval_fixes_20260717.py</code>.</p>
+
   <h2 id="truncated-answer-continuation">Truncated-answer auto-continuation</h2>
   <p>The streaming consume loop records the last non-null <code>finish_reason</code> seen on the upstream stream. When a <em>text</em> turn (no <code>&lt;tool_call&gt;</code> / <code>&lt;function&gt;</code> in flight) ends with <code>finish_reason == "length"</code>, the answer was cut off at the model's token cap — shipping it would hand the user a mid-sentence reply, which the <a href="verifier.html">Verifier</a> correctly REFUTES (truncated output, and any explicit question left unanswered).</p>
   <p>Instead of surfacing the fragment, <code>handle_chat</code> transparently continues the generation: it replays the request with the partial answer as a prior <code>assistant</code> turn plus a "your reply was cut off — continue from exactly where it stopped, don't repeat anything" instruction, and appends the result to <code>full_content</code>. This repeats until the upstream returns a non-<code>length</code> finish or <code>MAX_TRUNCATION_CONTINUATIONS</code> (3) round-trips are spent — the bound prevents a model that mis-reports <code>length</code> on every reply from looping forever. The continuation payload drops <code>tools</code>/<code>tool_choice</code> so it can only produce prose, and strips any <code>&lt;think&gt;</code> prelude the continuation emits before appending. Turns that produced a tool call are unaffected — those go through the parse/retry path, not this user-facing-prose path.</p>

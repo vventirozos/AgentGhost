@@ -182,6 +182,17 @@ SyntaxError: Unexpected identifier 't'</pre>
   <h2>Content-less replace steer (2026-07-08)</h2>
   <p>A <code>replace</code> call without <code>content</code> (model slip or the known native-args transport corruption) now returns an error that names the escape: use <code>operation='write'</code> with the full file — do not retry <code>replace</code> without the exact existing text. Paired with the operation-aware pre-flight guard key, the write path stays legal after replace failures.</p>
 
+  <h2>Search filename==pattern corruption guard (2026-07-17)</h2>
+  <p>Sibling of the 2026-07-05 replace-argument guard, for the OTHER known shape of upstream
+  native tool-call corruption: one argument's value duplicated into the next slot. Req AF:
+  <code>filename</code> arrived identical to the search pattern, so rg ran against
+  <code>&lt;workspace&gt;/makeDraggable</code> — a path that cannot exist — and the turn was
+  wasted on "No such file". A file named exactly like the pattern being searched <em>in</em> it
+  is never intentional; <code>tool_file_search</code> now drops the corrupt filename, searches
+  the whole workspace, and prefixes the result with a NOTE naming the healing (also on the
+  no-matches path). A real, distinct filename never trips it. Tests in
+  <code>tests/test_file_system_search_container_path.py</code>.</p>
+
   <h2>Marker-leak guards, js/html rollback, node under launchd, search exit-1 (2026-07-14)</h2>
   <p><strong>The incident.</strong> Asked to change WebOS's default wallpaper, the model packed TWO edits into one <code>&lt;&lt;&lt;&lt; SEARCH … ==== … &gt;&gt;&gt;&gt;</code> envelope. Only the <em>first</em> <code>====</code> is the separator, so the second edit's <code>====</code> lines and text were captured as part of the replacement and written into <code>index.html</code> literally — with a SUCCESS result. The user's next two messages were the browser's <code>Unexpected token '==='</code> and <code>Identifier 'zIndex' has already been declared</code>. Four independent gaps let that happen; each now has a guard:</p>
   <ol>

@@ -49,7 +49,7 @@ class _FakePage:
     async def evaluate(self, script):
         return self._body
 
-    async def click(self, selector):
+    async def click(self, selector, timeout=None):
         return None
 
     async def wait_for_selector(self, selector, state="visible", timeout=None):

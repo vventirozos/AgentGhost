@@ -47,7 +47,7 @@ class _FakePage:
         self.url = url
         return None
 
-    async def click(self, selector, force=False):
+    async def click(self, selector, force=False, timeout=None):
         self.click_calls.append(selector)
 
     async def wait_for_selector(self, selector, state="visible", timeout=None):

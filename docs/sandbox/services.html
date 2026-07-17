@@ -218,8 +218,16 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   exact <code>serve-remote.sh</code> command + URL whenever a service comes up
   on a published port, so the operator never has to remember the recipe.</p>
 
+  <h2>Case-insensitive name resolution (2026-07-17)</h2>
+  <p>Lookups (<code>stop</code> / <code>restart</code> / <code>status</code> / <code>logs</code>,
+  and <code>start</code>'s already-running check) resolve the registered key exact-first, then by
+  a UNIQUE case-insensitive match (<code>_resolve_name</code>). Req 43: the model asked to restart
+  <code>WebOS</code> while the registry held <code>webos</code> — the exact-only miss spawned a
+  duplicate service for the same port and an "Address already in use" kill dance. Names differing
+  only by case are one service; the registered spelling always wins, so no twin registry entries.</p>
+
   <h2>Tests</h2>
-  <p><code>tests/test_sandbox_services.py</code> (59) — port-spec parsing,
+  <p><code>tests/test_sandbox_services.py</code> — port-spec parsing,
   validation rails, lifecycle (start/immediate-exit/stop-group-kill/restart/
   status/logs), registry-driven browser allowlist (host guard + the runner
   guard exec'd functionally with playwright stubbed), tool arg-healing,

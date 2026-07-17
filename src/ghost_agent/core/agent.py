@@ -481,6 +481,51 @@ def _is_visual_intent(text: Optional[str]) -> bool:
     return bool(_VISUAL_INTENT_RE.search(text))
 
 
+# ── Interaction-claim verification gap ───────────────────────────────
+# A pointer/keyboard behavior ("dragging a window", "clicking the button")
+# can only be confirmed by EXERCISING it. The WEB-EXEC probe proves the
+# page loads without exceptions — nothing more — yet text entailment over
+# a load-clean result happily CONFIRMED a still-broken drag fix at 100%
+# (reqs AF/43, 2026-07-17). These helpers gate a confidence cap: the
+# symptom is interaction-shaped AND no browser click/interact succeeded
+# this turn → CONFIRMED is capped below the ≥0.7 consumption gates.
+_INTERACTION_INTENT_RE = re.compile(
+    r"\b(?:drag(?:ging|ged)?|resiz(?:e|ing|ed)|mov(?:e|ing|ed)|"
+    r"scroll(?:ing)?|hover(?:ing)?|click(?:ing|ed)?|double[- ]click|"
+    r"drop(?:ping|ped)?|typ(?:e|ing)|key(?:board|press)|swip(?:e|ing))\b"
+    r".{0,60}?\b(?:window|element|button|icon|menu|item|panel|tab|card|"
+    r"widget|handle|dialog|modal|slider|div|box)s?\b"
+    r"|\b(?:window|element|button|icon|menu|item|panel|tab|card|widget|"
+    r"handle|dialog|modal|slider)s?\b.{0,50}?"
+    r"\b(?:drag|resiz|mov|click|scroll|hover|drop|swip)\w*\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_interaction_intent(text: Optional[str]) -> bool:
+    """Cheap (no-LLM) gate: the request describes a pointer/keyboard
+    behavior on a UI element ("moving a window doesn't work")."""
+    return bool(text and _INTERACTION_INTENT_RE.search(str(text)))
+
+
+def _has_interaction_evidence(tools_run: Optional[list]) -> bool:
+    """True when a browser click/interact op SUCCEEDED this turn — the
+    only tool evidence that can support an interaction-behavior claim.
+    Detection reads the tool result header (``STATUS: OK`` + ``OP: …``)
+    because tools_run entries carry name+content, not arguments."""
+    for tool in (tools_run or []):
+        if not isinstance(tool, dict) or tool.get("_synthetic"):
+            continue
+        if str(tool.get("name", "")).lower() != "browser":
+            continue
+        content = str(tool.get("content", ""))
+        if "STATUS: OK" not in content:
+            continue
+        if re.search(r"^OP: (?:click|interact)\b", content, re.MULTILINE):
+            return True
+    return False
+
+
 _BUG_REPORT_RE = re.compile(
     r"(nothing happens|doesn'?t work|does not work|not working|"
     r"isn'?t working|stopped working|won'?t (load|start|open|run)|"
@@ -4850,6 +4895,42 @@ class GhostAgent:
                 f"FILE-ARTIFACT check error: {type(_fa_exc).__name__}: {_fa_exc}",
                 icon=Icons.WARN, level="WARNING",
             )
+        # Interaction-claim cap (2026-07-17, reqs AF/43): the user reported a
+        # POINTER/KEYBOARD behavior defect ("moving a window doesn't work"),
+        # and a load-clean WEB-EXEC probe plus text entailment produced
+        # CONFIRMED (100%) for a fix that was, in fact, still broken — a
+        # drag/click behavior claim cannot be supported by evidence that
+        # never exercised the interaction. Same philosophy as the
+        # web-exec-inconclusive cap above: keep the verdict, cap the
+        # confidence below every ≥0.7 consumption gate unless a browser
+        # click/interact op actually SUCCEEDED this turn.
+        try:
+            if (v_result is not None
+                    and v_result.verdict == VerifyVerdict.CONFIRMED
+                    and v_result.confidence > self._WEB_EXEC_SKIP_CONF_CAP
+                    and _is_interaction_intent(last_user_content)
+                    and not _has_interaction_evidence(tools_run_this_turn)):
+                v_result.confidence = self._WEB_EXEC_SKIP_CONF_CAP
+                v_result.reasoning = (
+                    (v_result.reasoning or "")
+                    + " [INTERACTION untested: the request is about a "
+                      "pointer/keyboard behavior, but no browser "
+                      "click/interact succeeded this turn — a load-clean "
+                      "page cannot confirm it; confidence capped.]"
+                ).strip()
+                pretty_log(
+                    "Verifier",
+                    "INTERACTION untested → CONFIRMED capped at "
+                    f"{self._WEB_EXEC_SKIP_CONF_CAP:.0%} "
+                    "(behavior never exercised)",
+                    icon=Icons.BRAIN_THINK, level="WARNING",
+                )
+        except Exception as _ic_exc:
+            pretty_log(
+                "Verifier",
+                f"interaction-cap check error: {type(_ic_exc).__name__}: {_ic_exc}",
+                icon=Icons.WARN, level="WARNING",
+            )
         return v_result, last_tool
 
     @staticmethod
@@ -6077,6 +6158,16 @@ class GhostAgent:
             if tool_calls:
                 _avail = (list(self.available_tools.keys())
                           if hasattr(self, 'available_tools') else None)
+                # Snapshot the raw pre-repair calls: when a repair fires,
+                # log them. Without this the repair was undiagnosable from
+                # traces (the AF/43 path=query duplication took a session
+                # of guesswork to attribute) — same lesson the XML
+                # parse-error path learned on 2026-07-05.
+                try:
+                    _raw_tc_snapshot = json.dumps(
+                        tool_calls, ensure_ascii=False, default=str)[:4096]
+                except Exception:
+                    _raw_tc_snapshot = str(tool_calls)[:4096]
                 tool_calls, _repaired = _repair_native_tool_calls(tool_calls, _avail)
                 if _repaired:
                     pretty_log(
@@ -6085,6 +6176,11 @@ class GhostAgent:
                         "multi-tool reply into one call's arguments — recovered the "
                         "intended value and split the leaked calls.",
                         level="WARNING", icon=Icons.WARN,
+                    )
+                    logger.warning(
+                        "native tool_call repair fired; raw pre-repair "
+                        "calls (truncated to 4 KB): %s",
+                        _raw_tc_snapshot.replace("\n", "\\n"),
                     )
 
             if not tool_calls and parse_target.strip().startswith('{'):
@@ -7329,7 +7425,21 @@ class GhostAgent:
 
                     from ..tools.file_system import tool_list_files, project_scoped_sandbox
                     sandbox_state = await tool_list_files(project_scoped_sandbox(self.context)[0], self.context.memory_system)
-                    messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {multi_op_summary}{diagnostic_msg}{fallback_hint}\n\n{sandbox_state}"})
+                    # Re-anchor on the LIVE request. This diagnostic floods
+                    # several KB of user-role text (failure context + full
+                    # sandbox listing) into a long turn, and the model has
+                    # been observed re-anchoring on STALE framing right
+                    # after it (req 43, 2026-07-17: a manage_services miss
+                    # → this flood → three turns re-running the PREVIOUS
+                    # request's "resume the project" flow before
+                    # recovering). Restating the current request pins it.
+                    _anchor = (
+                        "\n\nREMINDER — the CURRENT user request you are "
+                        f"working on: \"{str(last_user_content)[:300]}\". "
+                        "Continue that task from where it stands; do NOT "
+                        "restart earlier requests' flows."
+                    ) if last_user_content else ""
+                    messages.append({"role": "user", "content": f"AUTO-DIAGNOSTIC: {multi_op_summary}{diagnostic_msg}{fallback_hint}\n\n{sandbox_state}{_anchor}"})
 
                     total_fail = execution_failure_count + transient_failure_count
                     # System 3 Crisis Pivot — fires at structural strike 4
