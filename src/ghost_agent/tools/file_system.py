@@ -1908,6 +1908,24 @@ async def _syntax_regression_js_html(prev_content: str, new_content: str,
     return ""
 
 
+def _would_be_snippet(new_content: str, regression: str,
+                      context: int = 2) -> str:
+    """Numbered lines of the REJECTED content around the error line named
+    in ``regression`` ('… (line N, col M)'), '>' marking the line itself.
+    Empty when no line number is present or it's out of range."""
+    m = re.search(r"\(line (\d+)", regression or "")
+    if not m:
+        return ""
+    ln = int(m.group(1))
+    lines = (new_content or "").split("\n")
+    if not (1 <= ln <= len(lines)):
+        return ""
+    lo, hi = max(1, ln - context), min(len(lines), ln + context)
+    return "\n".join(
+        f"{'>' if i == ln else ' '}{i:5d} | {lines[i - 1][:160]}"
+        for i in range(lo, hi + 1))
+
+
 async def _write_replace_guarded(path: Path, prev_content: str, new_content: str,
                                  filename: str, success_msg: str) -> str:
     """Apply a replace result with a syntax-regression rollback guard.
@@ -1942,13 +1960,26 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
         regression = await _syntax_regression_js_html(
             prev_content, new_content, filename)
     if regression:
+        # Detail in the LOG LINE too (req A3, 2026-07-17): the tool result
+        # always carried the error+line, but the operator-facing log said
+        # only "would break syntax", so three straight rejections read as
+        # an opaque mystery from the stream.
         pretty_log("Replace Rejected",
-                   f"{filename}: edit would break syntax — file left unchanged",
+                   f"{filename}: edit would break syntax ({regression}) — "
+                   f"file left unchanged",
                    icon=Icons.WARN, level="WARNING")
+        # Show the model the WOULD-BE lines around the error. Knowing
+        # "unexpected indent (line 238)" wasn't enough — the model blamed
+        # "hidden characters" and escaped to an unguarded patch script
+        # that corrupted the file. Seeing its own broken output makes the
+        # mistake self-evident.
+        _snippet = _would_be_snippet(new_content, regression)
         return (
             f"REJECTED: that replace would introduce a syntax error and was "
-            f"NOT applied — '{filename}' is unchanged on disk: {regression}. "
-            f"Your replacement block's indentation or structure is off. "
+            f"NOT applied — '{filename}' is unchanged on disk: {regression}."
+            + (f"\nThe REJECTED result around that line would have read:\n"
+               f"{_snippet}\n" if _snippet else " ")
+            + f"Your replacement block's indentation or structure is off. "
             f"Re-read the file, then emit a TIGHT single-line SEARCH/REPLACE "
             f"for the surgical edit. Do NOT rewrite the whole file."
         )

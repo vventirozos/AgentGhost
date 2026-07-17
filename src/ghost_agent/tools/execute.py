@@ -526,11 +526,21 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     spill_large_output=True, **_workdir_kw)
                 if _re_code == 0 or not _looks_like_file_not_found(_re_out):
                     output, exit_code = _re_out, _re_code
-                    if exit_code == 0:
-                        output = (output or "") + (
-                            f"\n[SYSTEM NOTE: paths under /workspace were remapped to "
-                            f"{container_workdir} (the active project's workspace). "
-                            f"Reference project files by BARE relative path instead.]")
+                    # Teach on EVERY adopted remap, not just clean exits.
+                    # The note used to ride only exit_code == 0 — so when a
+                    # remapped run failed for its own reasons (req A3: the
+                    # parser crashed on assembly expressions), the model was
+                    # never told its paths were being rewritten and kept
+                    # misaddressing /workspace for all 22 turns. The lesson
+                    # is about the PATH, not the run outcome.
+                    output = (output or "") + (
+                        f"\n[SYSTEM NOTE: paths under /workspace were remapped to "
+                        f"{container_workdir} (the active project's workspace) and "
+                        f"the command ran there"
+                        + ("" if exit_code == 0 else
+                           " (it failed for reasons UNRELATED to the path)")
+                        + ". Reference project files by BARE relative path "
+                          "instead.]")
             else:
                 # Root-cwd retry (relative paths, file at the sandbox root).
                 _re_out, _re_code = await asyncio.to_thread(

@@ -229,3 +229,42 @@ async def test_search_matches_still_returned(sandbox):
     mgr = _FakeSandboxManager("1:hello", 0)
     res = await tool_file_search("hello", sandbox, "f.txt", mgr)
     assert "1:hello" in res
+
+
+# ---------------------------------------------------------------------------
+# 4. Syntax rejection carries the WOULD-BE lines (2026-07-17, req A3)
+# ---------------------------------------------------------------------------
+
+async def test_py_syntax_rejection_shows_would_be_snippet(sandbox):
+    """Three opaque rejections in a row sent the model to an unguarded
+    patch script that corrupted the file. The rejection must show the
+    rejected content around the error line so the mistake is visible,
+    and the log line carries the error too (operator-side opacity)."""
+    target = sandbox / "parser.py"
+    original = ("def parse(x):\n"
+                "    if x:\n"
+                "        return 1\n"
+                "    return 0\n")
+    target.write_text(original)
+    payload = (
+        "<<<< SEARCH\n"
+        "        return 1\n"
+        "====\n"
+        "return 99\n"   # dedented out of the if-block → IndentationError
+        ">>>>"
+    )
+    res = await tool_replace_text("parser.py", payload, None, sandbox)
+    assert "REJECTED" in res and "syntax error" in res
+    assert "(line 3" in res                       # error location named
+    assert "would have read" in res               # snippet header
+    assert ">    3 | return 99" in res   # the offending line, marked
+    assert "    2 |" in res                       # context line present
+    assert target.read_text() == original
+
+
+def test_would_be_snippet_edge_cases():
+    from ghost_agent.tools.file_system import _would_be_snippet
+    assert _would_be_snippet("a\nb", "no line info here") == ""
+    assert _would_be_snippet("a\nb", "boom (line 99, col 1)") == ""
+    out = _would_be_snippet("l1\nl2\nl3\nl4\nl5", "x (line 1, col 1)")
+    assert out.splitlines()[0].startswith(">    1 | l1")

@@ -256,3 +256,25 @@ async def test_inline_bash_autoconvert_has_no_pythonpath(tmp_path):
     ran = mgr.execute.call_args[0][0]
     assert "PYTHONPATH" not in ran
     assert re.search(r'bash /tmp/_ghost_inline_\w+\.sh', ran)
+
+
+async def test_remap_note_rides_failed_runs_too(tmp_path):
+    """Req A3 (2026-07-17): the teaching note rode only exit-0 remapped
+    runs, so when the remapped command failed for its OWN reasons (the
+    model's parser crashing) the model was never told about the rewrite
+    and kept misaddressing /workspace for 22 straight turns. The note is
+    about the PATH, not the outcome — it must ride every adopted remap."""
+    fnf = ("python3: can't open file '/workspace/parser.py': "
+           "[Errno 2] No such file or directory", 2)
+    crash = ("Traceback (most recent call last):\n"
+             "ValueError: invalid literal for int()", 1)
+    mgr = _mock_mgr(returns=[fnf, crash])
+    result = await tool_execute(
+        command="python3 /workspace/parser.py",
+        sandbox_dir=tmp_path, sandbox_manager=mgr,
+        container_workdir="/workspace/projects/77adb3005a92")
+    assert mgr.execute.call_count == 2
+    assert "remapped" in result
+    assert "UNRELATED to the path" in result
+    # The real failure still comes through untouched.
+    assert "ValueError" in result

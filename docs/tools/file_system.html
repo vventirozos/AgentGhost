@@ -182,6 +182,17 @@ SyntaxError: Unexpected identifier 't'</pre>
   <h2>Content-less replace steer (2026-07-08)</h2>
   <p>A <code>replace</code> call without <code>content</code> (model slip or the known native-args transport corruption) now returns an error that names the escape: use <code>operation='write'</code> with the full file — do not retry <code>replace</code> without the exact existing text. Paired with the operation-aware pre-flight guard key, the write path stays legal after replace failures.</p>
 
+  <h2>Syntax rejection shows the would-be lines (2026-07-17)</h2>
+  <p>Req A3: three syntax-guard rejections in a row read as an opaque mystery — the model
+  (which DID receive the error + line number in the tool result) blamed "hidden characters" and
+  escaped to an unguarded execute-side patch script that then corrupted the file's indentation,
+  exactly what the guard exists to prevent. Two changes: the operator-facing LOG line now carries
+  the error detail (it said only "would break syntax"), and the rejection message includes a
+  numbered snippet of the REJECTED content around the error line (<code>_would_be_snippet</code>,
+  '&gt;' marking the line) — seeing its own broken output makes the indentation mistake
+  self-evident instead of a guessing game. Tests:
+  <code>tests/test_replace_marker_leak_guard.py</code>.</p>
+
   <h2>Search filename==pattern corruption guard (2026-07-17)</h2>
   <p>Sibling of the 2026-07-05 replace-argument guard, for the OTHER known shape of upstream
   native tool-call corruption: one argument's value duplicated into the next slot. Req AF:

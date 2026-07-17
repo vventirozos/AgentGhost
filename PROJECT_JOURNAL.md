@@ -780,6 +780,20 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-17 (later 8) — A3 trace fixes: remap note on failures + syntax-reject would-be snippet
+From evaluating the Prince-of-Persia parser request (A3, 22 turns, late-REFUTED correctly):
+- **Remap teaching note rides failed runs** (tools/execute.py): the "/workspace → project scope"
+  heal taught the model the bare-relative-path rule only on exit-0 runs; A3's remapped runs
+  failed for their own reasons → zero learning across 5 heals/22 turns. Note now rides every
+  adopted remap, with "(failed for reasons UNRELATED to the path)" on non-zero exits.
+- **Syntax rejection shows the rejected lines** (tools/file_system.py): the tool result already
+  carried "msg (line N, col M)" but the LOG line didn't (operator opacity), and the model still
+  couldn't SEE its mistake — it blamed "hidden characters" and corrupted the file via an
+  unguarded patch script. Log line now carries the detail; the rejection includes a numbered
+  `_would_be_snippet` of the rejected content around the error line ('>' marker).
+- Tests: test_execute_path_and_exit1_heal.py +1, test_replace_marker_leak_guard.py +2. Docs:
+  tools/execute.html, tools/file_system.html.
+
 ### 2026-07-17 (later 7) — CLI inline images
 `interface/externals/cli/ghost` now draws reply-referenced images (`![…](name.png)`) in the
 terminal, fetched from the sandbox via the existing `/api/download` (in-memory, 25MB cap, ≤4 per

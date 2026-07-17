@@ -122,6 +122,15 @@ STDOUT/STDERR:
   </ul>
   <p>Covered by <code>tests/test_execute_audit_fixes.py</code>.</p>
 
+  <h2>Remap teaching note rides FAILED runs too (2026-07-17)</h2>
+  <p>The <code>/workspace</code>→project-scope remap retry appended its "reference project files
+  by BARE relative path" SYSTEM NOTE only on exit-0 runs. Req A3: both early remapped runs failed
+  for their own reasons (the model's parser crashing on assembly expressions), so the model was
+  never told its paths were being rewritten and misaddressed <code>/workspace</code> for all 22
+  turns — five silent heals, zero learning. The note now rides every ADOPTED remap; on non-zero
+  exits it adds "(it failed for reasons UNRELATED to the path)" so the model doesn't conflate the
+  two. Tests: <code>tests/test_execute_path_and_exit1_heal.py</code>.</p>
+
   <h2>Inline <code>-c</code> AST rescue (2026-07-14)</h2>
   <p>The auto-convert's <em>quote-safe</em> gate (no unescaped delimiter in the body) is a proxy for "shlex can reconstruct what bash would run" — but the base64 transport never hands the body to bash at all, so that gate over-blocked the one case repair loops hit constantly: a long, valid Python one-liner that mixes both quote types (live 2026-07-14: a 769-char corruption-cleanup script was SYSTEM-BLOCKED, costing a strike plus a ~4-step write-probe detour, twice in one afternoon). Now, when the shlex path can't run, the guard tries <code>ast.parse</code> on the <em>raw regex-captured body</em> (first quote after <code>-c</code> to the last quote): a body that parses is almost certainly the code the model intended — transport-mangled or mis-captured bodies essentially never parse — so it ships via base64 and runs as a file, byte-exact. Python only (bash has no cheap host-side parse), never for acquired-skill wraps, and never with a trailing pipe. Invalid bodies still get the SYSTEM BLOCK with the write-then-execute steer. Covered by <code>tests/test_pending_action_and_inline_rescue.py</code> and the updated <code>tests/test_inline_c_guard_cd_prefix.py</code>.</p>
 
