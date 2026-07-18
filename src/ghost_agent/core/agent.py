@@ -7598,6 +7598,71 @@ class GhostAgent:
                                     )})
                         except Exception:
                             pass
+                    # Edit-run futility breaker (2026-07-18). Every existing
+                    # breaker watches FAILURES or identical observations —
+                    # all-success thrash at the GOAL level was invisible: the
+                    # xrick session rewrote extract_data.py 5x and reran it
+                    # 5x (each run exit 0, counts still wrong) for 33 minutes
+                    # until the thinking-loop guard killed the request. On
+                    # the 3rd rewrite + 2nd rerun of the same code file, one
+                    # strategy-shift steer: record confirmed facts NOW,
+                    # verify a minimal slice, switch approach class. Tracked
+                    # for ALL requests, project-bound or not.
+                    try:
+                        _si = getattr(self.context, "_script_iter", None)
+                        if isinstance(_si, dict) and fname and not _res_is_error:
+                            _CODE_EXTS = (".py", ".sh", ".js", ".mjs", ".ts")
+                            if fname == "file_system" and is_mutating and ptarget:
+                                _bn = str(ptarget).replace("\\", "/").rsplit("/", 1)[-1].lower()
+                                if _bn.endswith(_CODE_EXTS):
+                                    _rec = _si.setdefault(_bn, {"writes": 0, "runs": 0})
+                                    _rec["writes"] += 1
+                            elif fname == "execute":
+                                _blob = str(a_hash).lower()
+                                for _bn, _rec in _si.items():
+                                    if _bn in _blob:
+                                        _rec["runs"] += 1
+                            if not getattr(self.context, "_futility_steer_done", False):
+                                for _bn, _rec in _si.items():
+                                    if _rec["writes"] >= 3 and _rec["runs"] >= 2:
+                                        self.context._futility_steer_done = True
+                                        pretty_log(
+                                            "Futility Breaker",
+                                            f"'{_bn}' rewritten {_rec['writes']}x and "
+                                            f"rerun {_rec['runs']}x this request without "
+                                            "a declared result — steering strategy shift",
+                                            level="WARNING", icon=Icons.WARN,
+                                        )
+                                        messages.append({"role": "user", "content": (
+                                            f"SYSTEM ALERT (futility breaker): you have "
+                                            f"rewritten '{_bn}' {_rec['writes']} times and "
+                                            f"rerun it {_rec['runs']} times this request "
+                                            "and the goal is still not met. STOP patching "
+                                            "the same approach. Do these IN ORDER:\n"
+                                            "1. RECORD every fact you have CONFIRMED about "
+                                            "the data/format so far (exact structures, "
+                                            "counts, edge cases) in the project ledger "
+                                            "(manage_projects action=ledger) or a notes "
+                                            "file NOW — discoveries must survive this "
+                                            "request.\n"
+                                            "2. SHRINK the problem: make the script "
+                                            "process the SINGLE smallest unit (one "
+                                            "record/sprite/tile), print its parsed output "
+                                            "next to the raw source lines, and verify that "
+                                            "one unit end-to-end before scaling up.\n"
+                                            "3. If the approach CLASS keeps failing (e.g. "
+                                            "regex over nested structures), switch class — "
+                                            "a tokenizer / brace-counting walk / an "
+                                            "existing parser — instead of tuning the old "
+                                            "one.\n"
+                                            "If the goal metric has not moved after ONE "
+                                            "more iteration, stop and report exactly what "
+                                            "is known and what is blocked."
+                                        )})
+                                        break
+                    except Exception:
+                        pass
+
                     if fname and not is_mutating and not _res_is_error:
                         # threshold=2 (was 3): the SECOND identical
                         # read is already zero-information — nudge
@@ -9381,6 +9446,11 @@ class GhostAgent:
                 self.context._project_work_tools = {}
                 self.context._project_work_cmds = []
                 self.context._offproject_steer_done = False
+                # Edit-run futility tracking: basename -> {writes, runs} for
+                # code files this request. See the futility breaker in the
+                # dispatch pipeline.
+                self.context._script_iter = {}
+                self.context._futility_steer_done = False
                 # Context-pressure lockdown: set after the SECOND overflow in
                 # one request (read budget drops to zero for its remainder).
                 self.context._ctx_pressure_lockdown = False
@@ -12611,6 +12681,32 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         transient_failure_count = _ts.transient_failure_count
                     if _dispatch_should_break:
                         break
+
+                else:
+                    # Natural exhaustion of the turn budget (2026-07-18): the
+                    # loop ended WITHOUT a break, i.e. no deliberate finish —
+                    # the request simply ran out of turns mid-work. Observed
+                    # live (xrick request 5b9fcc8f): an n-gram thinking kill
+                    # landed ON turn 40, its grounding retry had no next
+                    # iteration, and the request finalized with trimmed
+                    # working narration presented as the answer — which the
+                    # verifier then late-refuted. Flag the reply as partial
+                    # honestly and point the next request at the recorded
+                    # state instead of letting it re-derive everything.
+                    pretty_log(
+                        "Turn Budget",
+                        f"all {effective_max_turns} turns used without a "
+                        "deliberate finish — flagging the reply as PARTIAL",
+                        level="WARNING", icon=Icons.STOP,
+                    )
+                    final_ai_content = (
+                        f"[TURN BUDGET EXHAUSTED] I used all {effective_max_turns} "
+                        "reasoning turns without completing this task — what follows "
+                        "is my working state, NOT a finished result. Ask me to "
+                        "continue and I will resume from the recorded findings "
+                        "(project work log / ledger / notes) instead of starting over.\n\n"
+                        + (final_ai_content or "")
+                    )
 
                 # #5 step 3: the finalization chain lives in _finalize_and_return
                 # (verbatim extraction; FinalizeState is read-only inputs — see the

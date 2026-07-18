@@ -366,6 +366,26 @@
   <h2>Pre-flight guard: operation-aware key + block budget (2026-07-08)</h2>
   <p><code>RecentFailureGuard</code> now keys on <code>(tool, target, operation)</code> — previously <code>(tool, target)</code>, which blocked the model's correct <code>replace→write</code> recovery three times in a row (each after ~80&nbsp;s of full-file generation) because any file_system call on the failed target counted as a "repeat". The block message names legal alternatives (different operation/tool, fix the cause, ask the user), and a per-request <strong>block budget</strong> forces a final reply after 2 guard blocks — with operation-aware keying, two blocks mean genuinely identical re-issues of a known failure, so continuing is pure waste. Covered by <code>tests/test_guard_box_fixes.py</code>.</p>
 
+  <h2>Edit-run futility breaker + turn-budget honesty (2026-07-18)</h2>
+  <p>Companion to the context governor, from the same coding-session postmortem (request
+  5b9fcc8f): the agent rewrote <code>extract_data.py</code> five times and reran it five times
+  — every run exit&nbsp;0, the goal counts never met — for 33 minutes. Every existing breaker
+  watches FAILURES or identical observations; all-success thrash at the <em>goal</em> level was
+  invisible. Two additions:</p>
+  <ul>
+    <li><strong>Futility breaker</strong> — per-request write/run counters per code file
+    (<code>.py/.sh/.js/.mjs/.ts</code>). On the 3rd rewrite + 2nd rerun of the same file, ONE
+    strategy-shift steer: record every confirmed format fact in the ledger/notes NOW, verify a
+    single smallest unit end-to-end before scaling, and switch approach CLASS (tokenizer /
+    brace-walk, not another regex tune) if the class itself keeps failing.</li>
+    <li><strong>Turn-budget exhaustion banner</strong> — the turn loop gained a <code>for/else</code>:
+    natural exhaustion (no deliberate finish) now logs <em>"all 40 turns used"</em> and prefixes
+    the reply with <code>[TURN BUDGET EXHAUSTED]</code> + "working state, NOT a finished result".
+    Previously the 5B request's n-gram kill landed ON turn 40, its grounding retry had no next
+    iteration, and trimmed working narration shipped as the answer (late-refuted).</li>
+  </ul>
+  <p>Covered by <code>tests/test_futility_breaker_trio.py</code>.</p>
+
   <h2>Context-pressure governor (2026-07-18)</h2>
   <p>Source incident (xrick feasibility): ~60 whole-file reads across turns — each batch
   cleared its own per-turn <code>ReadBudget</code> while the conversation grew unboundedly —

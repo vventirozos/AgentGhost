@@ -179,6 +179,16 @@ SyntaxError: Unexpected identifier 't'</pre>
   </ul>
   <p>Covered by <code>tests/test_replace_arg_corruption_guard.py</code>.</p>
 
+  <h2>Syntax-gate fix recipes (2026-07-18)</h2>
+  <p>The write-time syntax check named the error but not the fix — and for the backslash trap
+  (<code>if c == \'\\\':</code> → "unterminated string literal") the model failed FOUR consecutive
+  repairs in one request and rewrote the identical bug from scratch in the next.
+  <code>_SYNTAX_FIX_RECIPES</code> now appends a targeted RECIPE line for known traps
+  (single backslash → <code>'\\\\'</code> or <code>chr(92)</code>; line-continuation strays;
+  f-string brace nesting), same tiny/high-precision philosophy as
+  <a href="tool_failure.html">tool_failure</a>'s hint table. Covered by
+  <code>tests/test_futility_breaker_trio.py</code>.</p>
+
   <h2>Generated-file sampling + zero-budget refusal (2026-07-18)</h2>
   <p>Two additions to <code>tool_read_file</code> from the xrick-session postmortem:
   (1) files &gt;96&nbsp;KB whose 8&nbsp;KB head looks machine-generated (&gt;300 <code>0x</code>

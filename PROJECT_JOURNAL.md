@@ -780,6 +780,31 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-18 (later 6) — coding-struggle mitigations: futility breaker + syntax recipes + turn-budget honesty
+Postmortem of requests 5b9fcc8f/39b4b62f/800a982d (xrick data extraction, 33 min + still
+grinding): rewrote extract_data.py 5x/reran 5x with exit 0 every time (goal counts never met
+— invisible to every failure-keyed breaker); failed 4 consecutive repairs of the same
+`if c == '\':` unterminated-string bug and re-wrote the identical bug in the NEXT request;
+n-gram thinking kill landed ON turn 40 so the grounding retry had no next iteration and
+working narration shipped as the "answer" (late-refuted).
+- **Futility breaker** (dispatch): per-request {writes, runs} per code-file basename
+  (.py/.sh/.js/.mjs/.ts; runs matched via command text). 3 writes + 2 runs → ONE steer:
+  record confirmed facts in ledger/notes NOW, verify ONE smallest unit end-to-end, switch
+  approach CLASS. All-success goal-thrash finally has a detector.
+- **Syntax-gate recipes** (file_system `_SYNTAX_FIX_RECIPES`): error-keyed RECIPE line
+  appended to the write-time syntax warning — backslash traps ('\\' / chr(92)), line
+  continuation strays, f-string brace nesting.
+- **Turn-budget honesty** (handle_chat): `for/else` on the turn loop — natural exhaustion
+  logs "all N turns used" and prefixes the reply with [TURN BUDGET EXHAUSTED] + "working
+  state, NOT a finished result; ask me to continue from recorded findings".
+- NOTE: the n-gram first-kill grounding retry already existed and worked — the 5B death was
+  the turn cap, not a missing retry. Verified via turn count (40/40).
+- Structural gotcha fixed during work: inserting a 20-indent block between two 24-indent
+  siblings silently swallowed the off-project steer into the new except-handler suite
+  (valid Python!) — caught by nesting assert, restructured.
+- Tests: tests/test_futility_breaker_trio.py (new, 7). Docs: core/agent.html,
+  tools/file_system.html.
+
 ### 2026-07-18 (later 5) — context-pressure governor: the xrick-session postmortem
 Log eval of the Rick Dangerous feasibility session: ~60 whole-file reads (incl. dat_*.c
 generated hex tables) → 398k est. tokens, 2 compactions, "successful" prune whose verbatim

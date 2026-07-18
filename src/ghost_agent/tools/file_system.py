@@ -1771,12 +1771,48 @@ async def _syntax_feedback(path: Path, filename: str) -> str:
         f"{filename}: {err.splitlines()[0] if err.splitlines() else err}",
         icon=Icons.FAIL, level="WARNING",
     )
+    # Error-keyed fix recipes (2026-07-18): for known traps the bare parser
+    # message sends the model into a fix spiral — the xrick session failed
+    # FOUR consecutive repairs of `if c == '\':` (unterminated string
+    # literal: replace, replace, full rewrite with the SAME bug, sed) and a
+    # later request rewrote the identical bug from scratch. Name the exact
+    # cause and the exact fix in the same breath as the error.
+    recipe = ""
+    _err_low = err.lower()
+    for _pat, _rec in _SYNTAX_FIX_RECIPES:
+        if _pat in _err_low:
+            recipe = f"\nRECIPE: {_rec}"
+            break
     return (
         f"\n⚠ SYNTAX CHECK FAILED: '{filename}' was written but does NOT "
         f"parse. Fix this BEFORE any other step — a browser loads a broken "
         f"script silently and every downstream symptom (dead buttons, blank "
-        f"page) traces back here:\n{err}"
+        f"page) traces back here:\n{err}{recipe}"
     )
+
+
+# Known parse-error traps → the exact fix. Matched as substrings of the
+# lower-cased checker message. Kept tiny and high-precision (same philosophy
+# as tool_failure._FALLBACK_HINTS): a recipe on the wrong error is noise.
+_SYNTAX_FIX_RECIPES = (
+    ("unterminated string literal",
+     "when the flagged line contains a backslash, the backslash is swallowing "
+     "the closing quote (classic: `if c == '\\':`). A SINGLE literal backslash "
+     "is written '\\\\' (two backslashes) in source, or use chr(92). Do NOT "
+     "re-emit the same line unchanged — rewrite exactly that comparison. If "
+     "there is no backslash, an earlier quote on the line is unclosed."),
+    ("eol while scanning string literal",
+     "same trap as 'unterminated string literal': a trailing backslash or an "
+     "unclosed quote on that line. A single literal backslash is '\\\\' "
+     "(doubled) or chr(92)."),
+    ("unexpected character after line continuation",
+     "a stray backslash sits outside any string on that line — delete it, or "
+     "double it if a literal backslash was intended."),
+    ("closing parenthesis '}' does not match",
+     "an f-string brace holds a `[`, `(` or quote the parser can't nest — "
+     "pre-compute the value into a plain variable first, then interpolate "
+     "the bare name (v = d['k'][0]; f\"got {v}\")."),
+)
 
 
 def _reindent_replacement(file_content: str, matched_text: str, new_text: str) -> str:
