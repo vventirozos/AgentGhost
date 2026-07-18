@@ -763,6 +763,43 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
             return _rng
 
         file_size = path.stat().st_size
+
+        # Generated/data-shaped file sampling (2026-07-18): embedded data
+        # tables (dat_tilesPC.c-style hex arrays, giant JSON blobs, minified
+        # bundles) carry thousands of tokens with near-zero analytical value
+        # per line — reading them whole is what blew the xrick feasibility
+        # session to 398k tokens. Runs BEFORE the per-file cap so an
+        # over-cap data table returns a USEFUL sample instead of the generic
+        # too-large error. Heuristics on the 8 KB head: dense "0x" literals
+        # (a C data table) or very long average lines (minified/single-line
+        # data). Ranged reads and search remain available for specifics.
+        if file_size > 96 * 1024:
+            try:
+                _s_head = await asyncio.to_thread(_read_head, path, 8192)
+            except OSError as oe:
+                return f"Error: failed to read '{filename}': {oe}"
+            if not _looks_like_binary(_s_head):
+                _s_txt = _s_head.decode("utf-8", "replace") if isinstance(
+                    _s_head, (bytes, bytearray)) else str(_s_head)
+                _head_lines = _s_txt.split("\n")
+                _avg_line = len(_s_txt) / max(1, len(_head_lines))
+                _hex_density = _s_txt.count("0x")
+                if _avg_line > 240 or _hex_density > 300:
+                    _shape = ("dense hex data table" if _hex_density > 300
+                              else f"very long lines (avg ≈{_avg_line:.0f} chars)")
+                    sample = _s_txt[:4096]
+                    if read_budget is not None:
+                        read_budget.charge(len(sample))
+                    return (
+                        f"{_fb_note}--- {filename} SAMPLE ONLY ({file_size / 1024:.0f} KB, "
+                        f"looks machine-generated: {_shape}) ---\n{sample}\n"
+                        f"--- END SAMPLE (first 4 KB of {file_size / 1024:.0f} KB) ---\n"
+                        f"Reading this file whole would waste the context window on "
+                        f"generated data. Use operation='search' for specific symbols, "
+                        f"a ranged read (start_line/end_line), or an 'execute' script "
+                        f"to compute whatever digest you actually need."
+                    )
+
         max_bytes = read_byte_budget(max_context)
         if file_size > max_bytes: # dynamic limit for raw reads
             return f"Error: File '{filename}' is too large to read entirely ({file_size / 1024:.1f} KB) into your chat context window. Limit is {max_bytes / 1024:.1f} KB. Note: This limit only applies to a WHOLE-file 'read'. Best option: read only the region you need — file_system(operation='read', path='{filename}', start_line=200, end_line=260) (line-ranged, exempt from this cap, chains directly from 'search' line numbers). Also: operation='read_chunked' to page through it, operation='search' to find specific lines, operation='inspect' for the first few lines, knowledge_base(action='ingest_document') (NO size limit) to index it, or a Python script via 'execute'."
@@ -774,8 +811,23 @@ async def tool_read_file(filename: str, sandbox_dir: Path, max_context: int = 81
         # since the per-file cap already bounds it). This is the guard that
         # stops parallel whole-file reads from overflowing: each passes alone,
         # together they don't fit.
-        if (read_budget is not None and read_budget.spent > 0
-                and file_size > read_budget.remaining):
+        if (read_budget is not None and file_size > read_budget.remaining
+                and (read_budget.spent > 0 or read_budget.remaining <= 0)):
+            if read_budget.spent == 0:
+                # Zero capacity BEFORE any read: the conversation itself is
+                # already near the context ceiling (occupancy-aware budget,
+                # 2026-07-18) — bulk gathering must stop, not just pause.
+                return (
+                    f"Error: Reading '{filename}' is refused — the conversation is "
+                    f"already near the context ceiling, so there is NO whole-file "
+                    f"read budget left this turn. STOP bulk-reading. Instead: "
+                    f"(1) write what you have learned so far into a compact notes "
+                    f"file in the project (file_system write, e.g. 'analysis_notes.md') "
+                    f"so it survives compaction; (2) pull only targeted evidence — "
+                    f"operation='search', a ranged read (start_line/end_line — exempt "
+                    f"from this cap), or an 'execute' script that prints a ~50-line "
+                    f"digest; (3) if you already have enough, produce the deliverable NOW."
+                )
             return (
                 f"Error: Reading '{filename}' ({file_size / 1024:.1f} KB) now would "
                 f"overflow the context window. {read_budget.spent / 1024:.1f} KB of file "

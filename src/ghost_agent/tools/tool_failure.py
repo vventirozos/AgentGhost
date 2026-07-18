@@ -192,6 +192,7 @@ _FALLBACK_HINTS = {
         ("PermissionError", "The sandbox blocked this operation. Use file_system instead of raw OS calls, and avoid touching paths outside /workspace."),
         ("Syntax Error", "Re-read the script you submitted; the parser rejected it. Most common cause is unbalanced quotes/brackets or a stray markdown fence."),
         ("Kernel Timeout", "The Jupyter kernel exceeded 5 minutes. Split the work into smaller chunks or drop stateful=True for a fresh process."),
+        ("command not found", "The sandbox container is minimal — that utility isn't installed. Use built-in equivalents: `file <f>` → `head -c 16 <f> | od -An -tx1` (or python3 with open(...,'rb')); `xxd` → `od -A x -t x1z`; check availability first with `command -v <tool>`."),
     ],
     "file_system": [
         ("not found", "The path doesn't exist. Run file_system(operation='list_files') to see what IS in the sandbox before re-trying."),

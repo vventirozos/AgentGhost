@@ -1121,11 +1121,15 @@ class ProjectStore:
     def add_work_log(self, project_id: str, *, request: str = "",
                      files: Optional[List[str]] = None,
                      tools: Optional[Dict[str, int]] = None,
+                     commands: Optional[List[str]] = None,
                      outcome: str = "",
                      note: str = "") -> int:
         """Append one bounded work-log event for a request that did real
         work on this project. ``files`` = project-relative paths written;
-        ``tools`` = {tool_name: successful_call_count}; ``outcome`` = a
+        ``tools`` = {tool_name: successful_call_count}; ``commands`` =
+        heads of successful shell commands (execute-created state — clones,
+        script outputs — is invisible to the file accumulator, and its
+        absence caused a re-clone strike on 2026-07-18); ``outcome`` = a
         short label ("completed" / verifier outcome / "had_failures");
         ``note`` = the head of the final response (what was concluded)."""
         file_list = sorted({str(f).strip() for f in (files or []) if str(f).strip()})
@@ -1135,6 +1139,8 @@ class ProjectStore:
             "files": file_list[: self.WORK_LOG_MAX_FILES],
             "files_truncated": max(0, extra),
             "tools": {str(k): int(v) for k, v in list((tools or {}).items())[:8]},
+            "commands": [" ".join(str(c).split())[:90]
+                         for c in (commands or [])[:5] if str(c).strip()],
             "outcome": str(outcome or "")[:60],
             "note": " ".join(str(note or "").split())[: self.WORK_LOG_NOTE_CHARS],
         }

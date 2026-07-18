@@ -67,19 +67,25 @@ async def test_tool_read_file_dynamic_limit(tmp_path):
     # ReadBudget this prevents parallel whole-file reads from overflowing.
     # max_bytes = max(150000, int(131072 * 3.5 * 0.40)) = 183500
 
-    # 1. Test size = 170000 (Should pass — under the 183500 cap)
+    # Fixtures are multi-line since 2026-07-18: a single-line 170 KB char
+    # run now (correctly) classifies as data-shaped and gets SAMPLE ONLY —
+    # this test pins the PER-FILE CAP, so its files must read as text.
+    _line = "A" * 80 + "\n"
+
+    # 1. Test size ≈ 170000 (Should pass — under the 183500 cap)
     pass_file = sandbox_dir / "pass.txt"
+    pass_body = _line * (170000 // len(_line))
     with open(pass_file, "w") as f:
-        f.write("A" * 170000)
+        f.write(pass_body)
 
     result_pass = await tool_read_file("pass.txt", sandbox_dir, max_context=131072)
-    assert len(result_pass) == 170000 + len("--- pass.txt CONTENTS ---\n")
+    assert len(result_pass) == len(pass_body) + len("--- pass.txt CONTENTS ---\n")
     assert "Error" not in result_pass
 
-    # 2. Test size = 190000 (Should fail — over the 183500 cap)
+    # 2. Test size ≈ 190000 (Should fail — over the 183500 cap)
     fail_file = sandbox_dir / "fail.txt"
     with open(fail_file, "w") as f:
-        f.write("B" * 190000)
+        f.write(("B" * 80 + "\n") * (190000 // 81 + 1))
 
     result_fail = await tool_read_file("fail.txt", sandbox_dir, max_context=131072)
     assert "Error: File 'fail.txt' is too large to read entirely" in result_fail

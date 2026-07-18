@@ -1793,6 +1793,37 @@ async def tool_browser(
         return _err(f"sandbox execute failed: {e}")
 
     ok, parsed = _parse_runner_output(output or "")
+
+    # Degraded-milestone navigate retry (2026-07-18). Over Tor a slow exit
+    # circuit stalls subresources and even `domcontentloaded` can miss the
+    # window, producing two IDENTICAL timeouts that the no-progress breaker
+    # then kills (observed: jordanmechner.com navigate failed 2x → turn
+    # forced to conclude). Chromium cannot do SOCKS auth, so a fresh Tor
+    # circuit per attempt isn't available — but `commit` (navigation
+    # committed, HTML streaming) is a much weaker milestone that usually
+    # lands on the same circuit. One retry, only for proxied navigates that
+    # timed out, and only when the caller didn't already pin `commit`.
+    if (not ok and operation == "navigate" and tor_proxy
+            and payload.get("wait_until") != "commit"
+            and "timeout" in str(parsed).lower()):
+        pretty_log("Browser Retry",
+                   "navigate timed out — retrying once with wait_until='commit' "
+                   "(weakest milestone; slow Tor exit suspected)",
+                   icon=Icons.RETRY, level="WARNING")
+        retry_payload = dict(payload, wait_until="commit")
+        retry_cmd = (
+            f"python3 -u {_BROWSER_RUNNER_FILENAME} "
+            f"{shlex.quote(json.dumps(retry_payload))}"
+        )
+        try:
+            async with _BROWSER_PROFILE_LOCK:
+                output, exit_code = await asyncio.to_thread(
+                    sandbox_manager.execute, retry_cmd,
+                    timeout=subprocess_timeout, **_wd_kw
+                )
+            ok, parsed = _parse_runner_output(output or "")
+        except Exception as e:
+            logger.debug("navigate commit-retry failed: %s", e)
     if not ok:
         # Surface the ACTUAL failure cause in the operator's live stream,
         # not just "runner exit 1". `parsed` holds the runner's

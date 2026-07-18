@@ -538,6 +538,25 @@ _BUG_REPORT_RE = re.compile(
 )
 
 
+def _estimate_messages_tokens(messages) -> int:
+    """Rough token estimate over a message list (text parts only) — the
+    shared basis for the occupancy-aware read budget and the context-
+    pressure steers. Never raises."""
+    total = 0
+    try:
+        for m in messages or []:
+            c = m.get("content", "")
+            if isinstance(c, str):
+                total += estimate_tokens(c)
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        total += estimate_tokens(str(part.get("text", "")))
+    except Exception:
+        return total
+    return total
+
+
 def _render_cwd_pin(project_id: Optional[str]) -> str:
     """The top-of-dynamic-state CWD pin for coding turns.
 
@@ -2385,6 +2404,52 @@ class GhostAgent:
             self._context_manager = cm
         return cm
 
+    @staticmethod
+    def _cap_oversized_tail(msgs: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
+        """Post-assembly budget enforcement for ``_prune_context``.
+
+        The summarization pass keeps the last ~6 messages VERBATIM — so a
+        tail holding several parallel whole-file reads rode through a
+        "successful" prune untouched, and the post-prune request still hit
+        the upstream at 333k tokens against a 262k n_ctx (HTTP 400 → failed
+        recovery → dead turn; 2026-07-18 xrick feasibility session). This
+        pass truncates the LARGEST non-system contents (head+tail kept,
+        marker inserted) until the estimate fits inside ~92% of the budget,
+        leaving headroom for the dynamic state appended later. Mutates the
+        message dicts in place — shrinking the durable history is the point."""
+        target = int(max_tokens * 0.92)
+
+        def _tok(m):
+            c = m.get("content", "")
+            if isinstance(c, list):
+                c = " ".join(str(b.get("text", "")) for b in c
+                             if isinstance(b, dict) and b.get("type") == "text")
+            return estimate_tokens(str(c))
+
+        guard = 0
+        while sum(_tok(m) for m in msgs) > target and guard < 64:
+            guard += 1
+            cand = None
+            for m in msgs:
+                if m.get("role") == "system":
+                    continue
+                c = m.get("content", "")
+                if isinstance(c, str) and len(c) > 4000 and (
+                        cand is None or len(c) > len(cand.get("content") or "")):
+                    cand = m
+            if cand is None:
+                break
+            c = cand["content"]
+            keep = max(1500, len(c) // 3)
+            half = keep // 2
+            cand["content"] = (
+                c[:half]
+                + f"\n[... {len(c) - keep:,} chars dropped by context budget enforcement — "
+                  "re-read the specific region with start_line/end_line if needed ...]\n"
+                + c[-half:]
+            )
+        return msgs
+
     async def _prune_context(self, messages: List[Dict[str, Any]], max_tokens: int = 12000, model: str = "test-model") -> List[Dict[str, Any]]:
         current_tokens = 0
         for m in messages:
@@ -2472,7 +2537,9 @@ class GhostAgent:
 
         if not middle_messages:
             all_anchors = anchor_messages + ([recent_tool_anchor] if recent_tool_anchor else [])
-            return system_msgs + [original_goal] + all_anchors + recent_context
+            return self._cap_oversized_tail(
+                system_msgs + [original_goal] + all_anchors + recent_context,
+                max_tokens)
 
         # Condense the middle messages using a fast LLM worker
         condense_prompt = "The following is the middle segment of a long conversational transcript between an AI Agent and a User. Summarize the key actions taken, facts learned, and the current state of progress. Be concise. DO NOT write code. ONLY output the summary.\n\nTRANSCRIPT:\n"
@@ -2536,7 +2603,10 @@ class GhostAgent:
         # the fresh stuff last), re-attach anchored findings and the tool
         # result we hoisted out of the middle.
         all_anchors = anchor_messages + ([recent_tool_anchor] if recent_tool_anchor else [])
-        return system_msgs + [original_goal, {"role": "assistant", "content": summary}] + all_anchors + recent_context
+        return self._cap_oversized_tail(
+            system_msgs + [original_goal, {"role": "assistant", "content": summary}]
+            + all_anchors + recent_context,
+            max_tokens)
 
     # Common LLM hallucination patterns → canonical tool names.
     _TOOL_ALIAS_TABLE = {
@@ -6550,7 +6620,25 @@ class GhostAgent:
             try:
                 from ..tools.file_system import ReadBudget, read_byte_budget
                 _mc = int(getattr(self.context.args, "max_context", 8192) or 8192)
-                self.context._read_budget = ReadBudget(read_byte_budget(_mc))
+                _cap = read_byte_budget(_mc)
+                # Occupancy-aware shrink (2026-07-18): the per-turn cap alone
+                # let a 60-file feasibility session balloon to 398k tokens —
+                # every batch cleared its OWN budget while the conversation
+                # grew without bound (xrick session: 2 compactions, then an
+                # upstream 400). Raw reads this turn may only fill what
+                # remains below ~80% of the window; at high occupancy the
+                # budget hits zero and every whole-file read is refused with
+                # the summarize-first steer (ranged reads stay exempt).
+                try:
+                    _occ = _estimate_messages_tokens(messages)
+                    _headroom = int(max(0, 0.80 * _mc - _occ) * 3.5)
+                    _cap = min(_cap, _headroom)
+                except Exception:
+                    pass
+                if getattr(self.context, "_ctx_pressure_lockdown", False):
+                    # Second overflow this request → no more whole-file reads.
+                    _cap = 0
+                self.context._read_budget = ReadBudget(_cap)
             except Exception:
                 self.context._read_budget = None
 
@@ -7452,6 +7540,23 @@ class GhostAgent:
                                               "_project_work_tools", None)
                                 if isinstance(_wt, dict):
                                     _wt[fname] = _wt.get(fname, 0) + 1
+                            # Command heads for the work log (2026-07-18):
+                            # execute-created files (git clone, script
+                            # outputs) are invisible to the file accumulator,
+                            # so a failed turn's work-log said nothing about
+                            # the clone that HAD succeeded — and the retry
+                            # re-cloned into the existing dir (strike). The
+                            # command text itself is the record.
+                            if fname == "execute":
+                                _wc = getattr(self.context,
+                                              "_project_work_cmds", None)
+                                if isinstance(_wc, list) and len(_wc) < 5:
+                                    _cargs = json.loads(a_hash.split(":", 1)[1])
+                                    _cmd = " ".join(str(
+                                        _cargs.get("command")
+                                        or _cargs.get("filename") or "").split())[:90]
+                                    if _cmd:
+                                        _wc.append(_cmd)
                         except Exception:
                             pass
                         # Off-project escape steer (2026-07-18): a SUCCESSFUL
@@ -9039,6 +9144,8 @@ class GhostAgent:
                     request=last_user_content or "",
                     files=list(_wl_files),
                     tools=dict(_wl_tools),
+                    commands=list(getattr(self.context,
+                                          "_project_work_cmds", None) or []),
                     outcome=_wl_outcome,
                     note=final_ai_content or "",
                 )
@@ -9272,7 +9379,11 @@ class GhostAgent:
                 # turns are serialized by the agent semaphore.
                 self.context._project_work_files = set()
                 self.context._project_work_tools = {}
+                self.context._project_work_cmds = []
                 self.context._offproject_steer_done = False
+                # Context-pressure lockdown: set after the SECOND overflow in
+                # one request (read budget drops to zero for its remainder).
+                self.context._ctx_pressure_lockdown = False
                 # Snapshot the project that was active when THIS user message
                 # arrived — the delete-eligibility gate in tools.projects
                 # only honours a bare "delete it" against this project. A
@@ -10005,6 +10116,10 @@ class GhostAgent:
                 # steered once" set is loop-local.
                 repeated_action_steered: set = set()
                 preflight_blocks_this_request = 0
+                # Context-pressure steers issued this request (governor,
+                # 2026-07-18): first overflow → externalize-notes steer;
+                # second → synthesize-now steer + whole-file-read lockdown.
+                context_pressure_steers = 0
 
                 # Self-play can cap a single attempt's turn count via
                 # `max_turns_override` on the GhostAgent instance, so a
@@ -10331,7 +10446,46 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         logger.debug("progressive compression skipped: %s", _cmx)
 
                     # Proactive Context Pruning before request
+                    _pre_prune_tokens = _estimate_messages_tokens(messages)
                     messages = await self._prune_context(messages, max_tokens=self.context.args.max_context, model=model)
+                    # Context-pressure governor (2026-07-18). A prune that
+                    # actually fired means detail was just summarized away —
+                    # without a steer the model keeps bulk-reading, re-reads
+                    # what compaction destroyed, and spirals (xrick session:
+                    # 60 file reads, 2 compactions, 25+ min, dead turn).
+                    if _pre_prune_tokens > int(getattr(self.context.args, "max_context", 0) or 0):
+                        context_pressure_steers += 1
+                        if context_pressure_steers == 1:
+                            messages.append({"role": "user", "content": (
+                                "SYSTEM ALERT (context pressure): the conversation "
+                                "just exceeded the context window and older detail was "
+                                "summarized away. STOP bulk-gathering NOW. This turn: "
+                                "(1) WRITE everything learned so far as compact notes "
+                                "to a file in the project (e.g. 'analysis_notes.md' "
+                                "via file_system) — notes on disk survive compaction, "
+                                "context does not; (2) from now on consult those notes "
+                                "instead of re-reading sources; (3) gather only "
+                                "targeted evidence: operation='search', ranged reads "
+                                "(start_line/end_line), or an 'execute' script that "
+                                "prints a compact digest. If you already have enough, "
+                                "produce the deliverable NOW."
+                            )})
+                        elif context_pressure_steers == 2:
+                            self.context._ctx_pressure_lockdown = True
+                            pretty_log(
+                                "Context Governor",
+                                "second overflow this request — whole-file reads "
+                                "locked for the remainder; steering to synthesize",
+                                level="WARNING", icon=Icons.CUT,
+                            )
+                            messages.append({"role": "user", "content": (
+                                "SYSTEM ALERT (context pressure — SECOND overflow): "
+                                "whole-file reads are now DISABLED for the rest of "
+                                "this request. Produce the deliverable NOW from your "
+                                "notes and what you already know. If something "
+                                "specific is missing, fetch ONLY that via "
+                                "operation='search' or a ranged read."
+                            )})
 
                     # Dynamic Context Cache Tool Injection (Context Bloat Fix)
                     # ARCHITECTURAL OPTIMISATION #4 + #7: cached lookups via
@@ -11831,9 +11985,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                             recovery_msgs.append({"role": "user", "content": "SYSTEM ALERT: The conversation history was truncated to fit within context limits. Continue task. Assume previous context has been handled."})
 
-                            # RETRY ONCE with pruned context
+                            # RETRY ONCE with pruned context. `stream` MUST
+                            # be off: the turn loop sets payload["stream"]=True
+                            # every iteration, and chat_completion is the
+                            # non-streaming API — reusing the flag made the
+                            # upstream answer the recovery with SSE frames
+                            # that parsed as "non-JSON body" and killed the
+                            # turn (2026-07-18, xrick feasibility session).
                             try:
                                 payload["messages"] = recovery_msgs
+                                payload["stream"] = False
                                 messages = recovery_msgs
                                 data = await self.context.llm_client.chat_completion(payload, use_coding=has_coding_intent)
                                 if "choices" in data and len(data["choices"]) > 0:

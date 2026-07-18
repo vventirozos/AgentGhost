@@ -179,6 +179,18 @@ SyntaxError: Unexpected identifier 't'</pre>
   </ul>
   <p>Covered by <code>tests/test_replace_arg_corruption_guard.py</code>.</p>
 
+  <h2>Generated-file sampling + zero-budget refusal (2026-07-18)</h2>
+  <p>Two additions to <code>tool_read_file</code> from the xrick-session postmortem:
+  (1) files &gt;96&nbsp;KB whose 8&nbsp;KB head looks machine-generated (&gt;300 <code>0x</code>
+  literals, or average line &gt;240 chars — embedded data tables, minified bundles, single-line
+  blobs) return a bounded 4&nbsp;KB <strong>SAMPLE ONLY</strong> with stats and pointers to
+  search/ranged-read/execute-digest, instead of flooding the window; runs BEFORE the per-file
+  cap so an over-cap data table still yields a useful sample. (2) When the occupancy-aware
+  <code>ReadBudget</code> arrives with ZERO capacity (conversation already near the context
+  ceiling), the first-read exemption no longer applies: every whole-file read is refused with
+  the externalize-notes steer. Ranged reads (<code>start_line</code>/<code>end_line</code>)
+  remain exempt from both. Covered by <code>tests/test_context_governor.py</code>.</p>
+
   <h2>Content-less replace steer (2026-07-08)</h2>
   <p>A <code>replace</code> call without <code>content</code> (model slip or the known native-args transport corruption) now returns an error that names the escape: use <code>operation='write'</code> with the full file — do not retry <code>replace</code> without the exact existing text. Paired with the operation-aware pre-flight guard key, the write path stays legal after replace failures.</p>
 

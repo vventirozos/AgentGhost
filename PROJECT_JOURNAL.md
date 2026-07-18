@@ -780,6 +780,33 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-18 (later 5) — context-pressure governor: the xrick-session postmortem
+Log eval of the Rick Dangerous feasibility session: ~60 whole-file reads (incl. dat_*.c
+generated hex tables) → 398k est. tokens, 2 compactions, "successful" prune whose verbatim
+last-6 tail still carried 5 parallel reads → 333k sent vs 262k n_ctx (HTTP 400) → recovery
+reused the STREAMING payload on the non-stream API → 102KB SSE read as "non-JSON" → dead
+turn; retry request ground 25+ min doing the same thing. Fixes:
+- **Occupancy-aware ReadBudget** (agent.py dispatch): per-turn cap now min(old cap, bytes
+  remaining below 80% of window given current conversation size). Zero capacity → every
+  whole-file read refused with externalize-notes steer (tool_read_file: first-read exemption
+  no longer applies at zero; ranged reads/search stay exempt).
+- **Pressure steers** (handle_chat): prune actually fired → SYSTEM ALERT (write notes to
+  disk, consult notes not sources, targeted evidence only); 2nd overflow same request →
+  `_ctx_pressure_lockdown` (read budget pinned to 0) + synthesize-NOW steer.
+- **`_cap_oversized_tail`**: post-prune enforcement — truncate largest non-system contents
+  (head+tail kept) until ≤92% of max_context. Both _prune_context returns wrapped.
+- **Recovery stream fix**: overflow recovery sets payload["stream"]=False; llm.py non-JSON
+  retry also strips a leftover stream flag (SSE-body detection in the log line).
+- **Generated-file sampling** (file_system): >96KB + (0x-dense head or avg line >240) →
+  4KB SAMPLE ONLY + digest pointers, BEFORE the per-file cap.
+- **Minors**: `command not found` fallback hint (file→od); browser navigate over Tor retries
+  once with wait_until='commit' on timeout (Chromium can't SOCKS-auth for fresh circuits);
+  work_log gains `commands` heads (execute-created state like git clones was invisible —
+  caused the re-clone strike) + briefing renders "ran: …" when no files.
+- Tests: tests/test_context_governor.py (new, 13); test_read_budget_overflow.py fixtures →
+  multi-line (single-line char runs now correctly classify as data-shaped). Docs:
+  core/agent.html, core/llm.html, tools/file_system.html, tools/browser.html.
+
 ### 2026-07-18 (later 4) — project-scope escape guards: CWD pin + off-project steer
 Log eval of the recreated Prince-of-Persia project (requests f0fdb2f1/6f14407f): with the
 project BOUND and constraints replayed, the agent cloned the repo and wrote

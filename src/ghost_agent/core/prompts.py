@@ -275,6 +275,11 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                 more = (len(files) - 4) + extra
                 if more > 0:
                     fdesc += f" (+{more})"
+            elif p.get("commands"):
+                # No file mutations — surface what the shell DID (a git
+                # clone, a build) so a future turn doesn't redo it.
+                fdesc = " · ran: " + "; ".join(
+                    str(c)[:60] for c in (p.get("commands") or [])[:2])
             outcome = p.get("outcome") or ""
             note = (p.get("note") or "")[:110]
             lines.append(f"  - \"{req}\"{fdesc} · {outcome}: {note}")

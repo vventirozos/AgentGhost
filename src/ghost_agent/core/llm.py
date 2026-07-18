@@ -1187,8 +1187,21 @@ class LLMClient:
                     # and thus unbound on this (no-swarm) path.
                     body_len = len(resp.text or "")
                     if attempt < 1:
+                        # A LARGE non-JSON 200 body that starts with "data:"
+                        # is SSE — the caller passed a payload that still
+                        # carries the main loop's `stream: true` into this
+                        # NON-streaming API (observed 2026-07-18: the
+                        # context-overflow recovery reused the turn payload
+                        # and got 102 KB of SSE frames, read as "empty/
+                        # non-JSON" → fatal). Strip the flag for the retry;
+                        # harmless when the body was genuinely empty.
+                        _note = ""
+                        if payload.get("stream"):
+                            payload["stream"] = False
+                            if (resp.text or "").lstrip().startswith("data:"):
+                                _note = " (SSE body on a non-streaming call — stripped stream flag)"
                         pretty_log("Upstream Empty Body",
-                                   f"HTTP {resp.status_code} with non-JSON body ({body_len} B) — retrying",
+                                   f"HTTP {resp.status_code} with non-JSON body ({body_len} B) — retrying{_note}",
                                    level="WARNING", icon=Icons.RETRY)
                         await asyncio.sleep(2)
                         continue

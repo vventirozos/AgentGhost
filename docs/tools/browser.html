@@ -233,6 +233,14 @@ Any claim that content renders is UNSUPPORTED by this screenshot…</code></pre>
   <p><code>op_click</code> now probes the selector right after <code>goto</code> with a bounded <code>wait_for_selector(state='attached', timeout=min(8s, timeout_ms))</code>. Absent → fail in ≤8s with an error that explains the state reset and names the escape verbatim (<code>op='interact'</code> with an <code>actions</code> list running the whole flow in one context). Present-but-animating elements pass the probe (<code>attached</code>, not <code>visible</code>) and proceed to <code>page.click</code>'s own actionability wait, so overlay/stability failures keep Playwright's precise diagnostics. The outer tool's failure hint and the <code>click</code> op description now carry the same steer. Covered by <code>tests/test_browser_click_failfast.py</code>.</p>
   <p><strong>Bounded actionability wait (2026-07-17, req 43).</strong> The probe had a hole: attached ≠ actionable. A start-menu item that is IN the DOM but hidden until its opener is clicked passed the <code>attached</code> probe, and the unbounded <code>page.click</code> then waited Playwright's full 30s default for visibility before dying with the same opaque TimeoutError — no steer, so the model abandoned behavioral verification entirely. <code>page.click</code> now runs with <code>timeout=probe_ms</code> (≤8s) and a timeout re-raises with the hidden-until-opened explanation plus the same <code>op='interact'</code> escape; non-timeout click errors propagate untouched. Pinned by <code>tests/test_log_eval_fixes_20260717.py</code>.</p>
 
+  <h2>Degraded-milestone navigate retry (2026-07-18)</h2>
+  <p>Over Tor a slow exit circuit can stall even <code>domcontentloaded</code>, producing two
+  IDENTICAL timeouts that the no-progress breaker then kills (observed live: jordanmechner.com).
+  Chromium cannot do SOCKS auth, so a fresh circuit per attempt is not available — instead a
+  proxied <code>navigate</code> that timed out is retried ONCE with <code>wait_until='commit'</code>
+  (navigation committed, HTML streaming — the weakest milestone), which usually lands on the same
+  circuit. Skipped when the caller already pinned <code>commit</code>.</p>
+
   <h2>Related</h2>
   <ul>
     <li><a href="execute.html">execute</a> — raw Playwright fallback path.</li>

@@ -72,6 +72,17 @@ def sandbox(tmp_path):
     return tmp_path
 
 
+def _lines(char, total):
+    """Multi-line filler (~80-char lines). Fixtures were single-line char
+    runs until 2026-07-18, when the generated-file sampler started
+    (correctly) classifying those as data-shaped and returning a sample —
+    these tests pin BUDGET semantics, so their fixtures must read as
+    ordinary text."""
+    line = char * 80 + "\n"
+    return line * (total // len(line) + 1)
+
+
+
 async def test_first_read_proceeds_and_charges(sandbox):
     f = sandbox / "a.txt"
     body = "x" * 5000
@@ -86,15 +97,15 @@ async def test_first_read_proceeds_and_charges(sandbox):
 async def test_second_read_refused_when_it_would_overflow(sandbox):
     big1 = sandbox / "exp1.json"
     big2 = sandbox / "exp3.json"
-    big1.write_text("1" * 170_000)
-    big2.write_text("3" * 170_000)
+    big1.write_text(_lines("1", 170_000))
+    big2.write_text(_lines("3", 170_000))
     # Mirror the live failure: budget ~183 KB; one 170 KB read fits, the
     # second does not.
     budget = ReadBudget(read_byte_budget(131072))
 
     first = await tool_read_file("exp1.json", sandbox, max_context=131072, read_budget=budget)
     assert "CONTENTS" in first                      # first read succeeds
-    assert budget.spent == 170_000
+    assert budget.spent == len(_lines("1", 170_000))
 
     second = await tool_read_file("exp3.json", sandbox, max_context=131072, read_budget=budget)
     assert second.startswith("Error:")              # refused before injecting
@@ -102,12 +113,12 @@ async def test_second_read_refused_when_it_would_overflow(sandbox):
     # Steers to the cheaper paths.
     assert "read_chunked" in second and "execute" in second
     # A refused read must NOT charge the budget.
-    assert budget.spent == 170_000
+    assert budget.spent == len(_lines("1", 170_000))
 
 
 async def test_per_file_cap_still_blocks_oversized_single_file(sandbox):
     huge = sandbox / "huge.json"
-    huge.write_text("z" * (read_byte_budget(131072) + 1))
+    huge.write_text(_lines("z", read_byte_budget(131072) + 100))
     budget = ReadBudget(read_byte_budget(131072))
     out = await tool_read_file("huge.json", sandbox, max_context=131072, read_budget=budget)
     assert out.startswith("Error:") and "too large" in out
@@ -118,8 +129,8 @@ async def test_no_budget_preserves_legacy_behaviour(sandbox):
     # Two large reads with NO budget object behave exactly as before: both
     # succeed as long as each clears the per-file cap. (Backward compat for
     # callers / tests that don't pass a budget.)
-    a = sandbox / "a.json"; a.write_text("a" * 170_000)
-    b = sandbox / "b.json"; b.write_text("b" * 170_000)
+    a = sandbox / "a.json"; a.write_text(_lines("a", 170_000))
+    b = sandbox / "b.json"; b.write_text(_lines("b", 170_000))
     out_a = await tool_read_file("a.json", sandbox, max_context=131072)
     out_b = await tool_read_file("b.json", sandbox, max_context=131072)
     assert "CONTENTS" in out_a and "CONTENTS" in out_b

@@ -209,6 +209,13 @@
   Covered by <code>tests/test_main_prefix_warmup.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
+  <h2>Non-JSON-body retry strips a leftover stream flag (2026-07-18)</h2>
+  <p>A 200 response whose large body starts with <code>data:</code> is SSE — the caller passed a
+  payload still carrying the turn loop's <code>stream: true</code> into the NON-streaming
+  <code>chat_completion</code> (observed: the context-overflow recovery got 102&nbsp;KB of SSE
+  frames, read as "empty/non-JSON" → fatal). The retry now forces <code>stream=False</code> and
+  says so in the log line; harmless when the body was genuinely empty.</p>
+
   <h2>LLM-boundary recording &amp; stub-replay (2026-07-17)</h2>
   <p><code>core/llm_recording.py</code>. With <code>GHOST_LLM_RECORD=1</code> every
   <code>chat_completion</code> result (foreground + background branches) and every

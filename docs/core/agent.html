@@ -366,6 +366,37 @@
   <h2>Pre-flight guard: operation-aware key + block budget (2026-07-08)</h2>
   <p><code>RecentFailureGuard</code> now keys on <code>(tool, target, operation)</code> — previously <code>(tool, target)</code>, which blocked the model's correct <code>replace→write</code> recovery three times in a row (each after ~80&nbsp;s of full-file generation) because any file_system call on the failed target counted as a "repeat". The block message names legal alternatives (different operation/tool, fix the cause, ask the user), and a per-request <strong>block budget</strong> forces a final reply after 2 guard blocks — with operation-aware keying, two blocks mean genuinely identical re-issues of a known failure, so continuing is pure waste. Covered by <code>tests/test_guard_box_fixes.py</code>.</p>
 
+  <h2>Context-pressure governor (2026-07-18)</h2>
+  <p>Source incident (xrick feasibility): ~60 whole-file reads across turns — each batch
+  cleared its own per-turn <code>ReadBudget</code> while the conversation grew unboundedly —
+  two compactions, then a "successful" summarization prune whose kept tail still carried five
+  parallel reads of generated data files, a <strong>333k-token send against a 262k n_ctx</strong>
+  (HTTP&nbsp;400), and a recovery retry that reused the streaming payload and read SSE frames as
+  a "non-JSON body" → dead turn, 25+ minutes lost. Five layers now cooperate:</p>
+  <ul>
+    <li><strong>Occupancy-aware read budget</strong> — the per-turn <code>ReadBudget</code> is
+    capped at what remains below ~80% of the window given the CURRENT conversation size
+    (<code>_estimate_messages_tokens</code>); at high occupancy it reaches zero and
+    <code>tool_read_file</code> refuses whole-file reads with an externalize-notes steer
+    (ranged reads and search stay exempt).</li>
+    <li><strong>Pressure steers</strong> — a prune that actually fired injects a SYSTEM ALERT:
+    write findings to a notes file (disk survives compaction, context does not), consult notes
+    instead of re-reading, gather only targeted evidence. A SECOND overflow in the same request
+    sets <code>_ctx_pressure_lockdown</code>: whole-file reads are disabled for the request's
+    remainder and the model is steered to produce the deliverable now.</li>
+    <li><strong>Post-prune enforcement</strong> — <code>_cap_oversized_tail</code> truncates the
+    largest non-system contents (head+tail kept) until the pruned list fits ~92% of
+    <code>max_context</code>; the verbatim last-6 tail can no longer carry an overflow through a
+    "successful" prune.</li>
+    <li><strong>Recovery stream fix</strong> — the context-overflow recovery now forces
+    <code>stream=False</code> (the turn loop re-sets it each iteration), and
+    <a href="llm.html">core.llm</a>'s non-JSON retry strips a leftover stream flag itself.</li>
+    <li><strong>Generated-file sampling</strong> — see <a href="../tools/file_system.html">tools.file_system</a>.</li>
+  </ul>
+  <p>Covered by <code>tests/test_context_governor.py</code> (fixtures in
+  <code>tests/test_read_budget_overflow.py</code> updated to multi-line text — single-line char
+  runs now correctly classify as data-shaped).</p>
+
   <h2>Project-scope escape guards (2026-07-18)</h2>
   <p>With a project bound, the shell genuinely starts in
   <code>/workspace/projects/&lt;id&gt;</code> — but the coding-turn CWD pin was static
