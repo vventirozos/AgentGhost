@@ -829,9 +829,40 @@ false-positive rate. Two changes:
   packer shape, now QUANTIFIED — rubric wording doesn't fix it); (d) confidence pinned at
   0.9–1.0 everywhere → the ≥0.7 actionable gate is effectively verdict-only on this judge.
   Full 12-case A/B (~90 min on nova) pending — operator to schedule.
-- Tests: test_verifier_two_stage.py (+20), test_verify_bench.py (+23), all prior
-  verifier/critic suites green (8131-suite: 1 stale count assertion in
-  test_verifier_critic_routing pinned to single-stage). Docs: core/verifier.html.
+- **POST-DEPLOY DISCOVERY — the verifier gate never runs on STREAMED turns.** Operator
+  asked why a project turn got no verdict: log had no verdict/late/skip lines (the late
+  recorder logs every outcome), USR2 task dump showed no verdict task, and the code shows
+  `_compute_verifier_verdict_gated` is called ONLY from `_finalize_and_return`
+  (non-streaming) + the in-loop repair block on that same path — the streaming closure
+  (decomposition step-4 leftover) has zero verifier calls. Interface turns stream → every
+  streamed answer ships unverified, silently. Yesterday's 9C late-refute came via a
+  non-streaming client. NOT caused by the two-stage change or the restart — pre-existing
+  coverage gap, unwired-loop shape.
+- **FIXED same session — streaming verifier gate wired:** stream_wrapper's post-drain
+  bookkeeping now spawns `_compute_verifier_verdict` + attaches the late handler. Always
+  late regardless of GHOST_CRITIC_ASYNC (text already shipped; zero client latency);
+  `force_correction=True` threaded through `_attach_late_verdict_handler` →
+  `_record_late_verdict` so a high-conf late REFUTED queues the next-turn banner even
+  outside async mode (streams never get an inline note; banner already surfaces via
+  `_take_active_correction`). Gotchas handled: outer finally deletes messages/tools →
+  full shallow copy + EAGER `_conversation_fingerprint(messages)` at closure creation
+  (messages[-10:] loses the first user msg the fp is keyed on → corrections would
+  silently drop); toolless turns skipped (noise); <think> stripped from claim (2000-char
+  budget). Tests: test_streaming_verifier_gate.py (+8 incl. source-wiring pins). Docs:
+  core/verifier.html new section.
+- **Live validation of the 19:21 deploy (2 findings):** (a) STREAMED requests split into
+  TWO sub-paths — spontaneous-final turns (model just answers, e.g. the weather test req
+  1b05b803) finalize via `_finalize_and_return` and re-stream, so they ALWAYS had the
+  gate: 1B produced a real `LATE REFUTED (90%)` (claim cited Elefsis-station data for an
+  Athens ask — two-stage on nova, e2e proof incl. lesson scrub + correction queue);
+  forced-final turns (xrick auto-advance) take the live `stream_wrapper` path = the new
+  gate. (b) The new gate stayed SILENT on xrick turns and every skip/except channel was
+  logger.debug = captured nowhere → indistinguishable from never-ran. Gate rewritten
+  LOUD: each skip branch (no claim after think-strip / no substantive tool / no verifier)
+  + spawn-success + spawn-failure logs at INFO/WARNING, log-only. Activates on next
+  restart (operator restarts at will; NO restart from assistant per operator
+  instruction). Next xrick turn after that restart names the silent branch. Suite: 8143
+  green.
 
 ### 2026-07-18 (later 7) — 9C postmortem: scope-flap heal + pivot timeout
 Request 9c9b75aa (76 min, strike-cap death) ran on a boot WITH the later-6 trio: the

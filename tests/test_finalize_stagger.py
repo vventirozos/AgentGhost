@@ -144,7 +144,8 @@ class TestLateVerdictHandlerPublishesTask:
         # done-callback clears the stagger handle and applies side effects.
         assert agent._deferred_verdict_task is None
         agent._record_late_verdict.assert_called_once_with(
-            "vr", "traj-1", "conv-1", last_tool="lt")
+            "vr", "traj-1", "conv-1", last_tool="lt",
+            force_correction=False)
 
     async def test_cancelled_verdict_still_clears_handle(self):
         agent = GhostAgent.__new__(GhostAgent)

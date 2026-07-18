@@ -5543,7 +5543,8 @@ class GhostAgent:
         except Exception:
             return ""
 
-    def _attach_late_verdict_handler(self, task, trajectory_id, conv_fp=""):
+    def _attach_late_verdict_handler(self, task, trajectory_id, conv_fp="",
+                                     force_correction=False):
         """Apply the safety-critical side effects of a verdict that lands
         AFTER its response already shipped.
 
@@ -5555,6 +5556,13 @@ class GhostAgent:
         is keyed by ``trajectory_id`` and idempotent, so running it a beat
         late is safe. ``conv_fp`` tags any queued correction with the
         conversation it belongs to, so it only surfaces back there.
+
+        ``force_correction``: queue the next-turn correction banner on a
+        high-confidence REFUTED even outside async-critic mode. Set by
+        the STREAMING gate, whose replies never carry an inline Verifier
+        note — without it, a refuted streamed answer under the default
+        (non-async) config would be scrubbed/backfilled but the user
+        would never hear about it.
         """
         def _on_done(t):
             # Release the finalize-burst stagger (see
@@ -5580,7 +5588,8 @@ class GhostAgent:
                 )
                 return
             self._record_late_verdict(v_result, trajectory_id, conv_fp,
-                                      last_tool=_lt)
+                                      last_tool=_lt,
+                                      force_correction=force_correction)
 
         # Published so _judge_hydration_safe can serialise the finalize
         # burst behind the in-flight verdict (both used to hit the single
@@ -5652,7 +5661,7 @@ class GhostAgent:
             )
 
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
-                             last_tool=None):
+                             last_tool=None, force_correction=False):
         """Apply the side effects of a verdict that lands AFTER its
         response shipped. Extracted from the done-callback so it is
         unit-testable. On a high-confidence REFUTED: log it, scrub any
@@ -5740,7 +5749,7 @@ class GhostAgent:
             # a monotonic timestamp (for scoping + TTL), and the queue is
             # capped so a busy multi-conversation process can't accumulate an
             # unbounded banner chain.
-            if self._critic_async_enabled():
+            if self._critic_async_enabled() or force_correction:
                 if not isinstance(getattr(self, "_pending_corrections", None), list):
                     self._pending_corrections = []
                 self._pending_corrections.append({
@@ -11023,6 +11032,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         stream_tools_snapshot = list(tools_run_this_turn)
                         stream_thought = thought_content
                         stream_model = model
+                        # Verifier-gate captures (2026-07-18). The verdict's
+                        # code-reconstruction walks tool_call ids across the
+                        # WHOLE message list, and the correction banner is
+                        # keyed by the conversation fingerprint of the FIRST
+                        # user message — messages[-10:] loses both on long
+                        # turns, and the live `messages` is deleted by the
+                        # outer finally before the stream drains. Shallow
+                        # copy + eager fingerprint, taken while it's alive.
+                        stream_verify_messages = list(messages)
+                        stream_conv_fp = self._conversation_fingerprint(messages)
 
                         # NEW: Capture accumulated intermediate text (like image tags from previous turns)
                         # Prepend any deferred async-verdict correction (banner)
@@ -11532,6 +11551,97 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             # matching the non-streaming site.
                             self._judge_hydration_safe(
                                 full_content, turn_id=str(req_id or ""))
+
+                            # --- VERIFIER GATE (STREAM), 2026-07-18 ---
+                            # The gated verdict was historically invoked only
+                            # from _finalize_and_return — the NON-streaming
+                            # finalization — so every streamed answer shipped
+                            # unverified, with no log line of any kind (found
+                            # when the operator asked why a turn had no
+                            # verdict and the USR2 task dump showed none).
+                            # The text is already out, so an inline verdict
+                            # could never amend it: the verdict ALWAYS runs
+                            # late here, regardless of GHOST_CRITIC_ASYNC —
+                            # spawn the pure computation and hand it to the
+                            # late handler (logs every outcome, scrubs
+                            # poisoned lessons, backfills the trajectory).
+                            # force_correction=True because a streamed reply
+                            # never carries an inline Verifier note — a
+                            # high-conf REFUTED queues a banner that the next
+                            # stream already prepends via
+                            # _take_active_correction. Skipped when the turn
+                            # carried no verifiable evidence (toolless chat):
+                            # spawning there adds only a no-op task and a
+                            # noise line per message. The claim strips
+                            # <think> blocks — they streamed to the client
+                            # but are not part of the answer, and they would
+                            # eat the verifier's 2000-char claim budget.
+                            # Every branch is LOUD (log-only, INFO): the
+                            # first live deploy produced total silence on
+                            # streamed project turns and none of the debug
+                            # channels are captured at INFO — a gate whose
+                            # skip reasons are invisible cannot be
+                            # distinguished from a gate that never ran
+                            # (same lesson as _on_done's once-silent
+                            # exception path).
+                            try:
+                                _sv_claim = re.sub(
+                                    r'<think>.*?(?:</think>|$)', '',
+                                    full_content,
+                                    flags=re.DOTALL | re.IGNORECASE,
+                                ).strip()
+                                _sv_tool = _find_substantive_tool_for_verifier(
+                                    stream_tools_snapshot)
+                                if getattr(self.context.args,
+                                           "no_verifier", False):
+                                    pass  # ablation off-switch: silent
+                                elif getattr(self.context, "verifier",
+                                             None) is None:
+                                    pretty_log(
+                                        "Verifier",
+                                        "stream gate: no verifier attached "
+                                        "— skipped",
+                                        icon=Icons.BRAIN_THINK)
+                                elif not _sv_claim:
+                                    pretty_log(
+                                        "Verifier",
+                                        "stream gate: empty claim after "
+                                        "think-strip — skipped",
+                                        icon=Icons.BRAIN_THINK)
+                                elif _sv_tool is None:
+                                    pretty_log(
+                                        "Verifier",
+                                        "stream gate: no substantive tool "
+                                        f"in {len(stream_tools_snapshot)} "
+                                        "record(s) — skipped "
+                                        "(bookkeeping-only turn)",
+                                        icon=Icons.BRAIN_THINK)
+                                else:
+                                    _sv_task = _glog.spawn_task(
+                                        self._compute_verifier_verdict(
+                                            tools_run_this_turn=stream_tools_snapshot,
+                                            messages=stream_verify_messages,
+                                            final_ai_content=_sv_claim,
+                                            last_user_content=last_user_content,
+                                            lc=lc,
+                                        ))
+                                    self._attach_late_verdict_handler(
+                                        _sv_task, current_trajectory_id,
+                                        stream_conv_fp,
+                                        force_correction=True)
+                                    pretty_log(
+                                        "Verifier",
+                                        "stream gate: verdict deferred — "
+                                        "verifying asynchronously after "
+                                        "the stream",
+                                        icon=Icons.BRAIN_THINK)
+                            except Exception as _svx:
+                                pretty_log(
+                                    "Verifier",
+                                    "stream gate spawn failed: "
+                                    f"{type(_svx).__name__}: "
+                                    f"{str(_svx)[:160]}",
+                                    icon=Icons.WARN, level="WARNING")
 
                             # Retrieval feedback loop: credit lessons that
                             # were surfaced during this turn whenever the
