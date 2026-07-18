@@ -538,6 +538,89 @@ _BUG_REPORT_RE = re.compile(
 )
 
 
+def _render_cwd_pin(project_id: Optional[str]) -> str:
+    """The top-of-dynamic-state CWD pin for coding turns.
+
+    Project-aware since 2026-07-18: the pin used to say "SHELL CWD IS
+    /workspace" as static text even while a project was bound and the
+    shell actually started in /workspace/projects/<id> — so the model
+    trusted the pin over the (quieter) workspace note and ran
+    `cd /workspace && git clone …`, planting a repo and the feasibility
+    report at the sandbox ROOT where the project's manifest, briefing
+    and cleanup never see them (observed live, request 6f14407f)."""
+    if project_id:
+        proj = f"/workspace/projects/{project_id}"
+        return (
+            f"⚠️  SHELL CWD IS {proj} — YOUR PROJECT WORKSPACE — DO NOT `cd` OUT OF IT  ⚠️\n"
+            "The shell session ALREADY starts inside the project directory. "
+            "Relative paths land INSIDE the project — exactly where its "
+            "files belong. Anything written to /workspace/ outside "
+            f"projects/{project_id}/ is OUTSIDE the project: invisible to "
+            "its deliverables manifest, its briefing, and its cleanup. "
+            "Paths like /sandbox, /home/user, /root, /app do NOT exist.\n"
+            "  ✓  git clone <url> repo-src ; ls repo-src/\n"
+            "  ✓  python3 parser.py ; cat output/report.md\n"
+            f"  ✗  cd /workspace && …            (ESCAPES the project!)\n"
+            f"  ✗  /workspace/some-dir/file.md   (outside the project)\n\n"
+        )
+    return (
+        "⚠️  SHELL CWD IS /workspace — DO NOT USE `cd` ANYWHERE  ⚠️\n"
+        "The shell session ALREADY starts in /workspace. "
+        "Paths like /sandbox, /home/user, /root, /app, /tmp "
+        "do NOT exist in this container and `cd` to any of "
+        "them will fail with 'No such file or directory' "
+        "and BURN A STRIKE. Run commands directly with "
+        "relative paths:\n"
+        "  ✓  python3 test_foo.py\n"
+        "  ✓  python -m unittest tests.test_parser\n"
+        "  ✓  ls subdir/ ; cat a/b.py\n"
+        "  ✗  cd /home/user && python3 …   (FAILS)\n"
+        "  ✗  cd /sandbox && …              (FAILS)\n\n"
+    )
+
+
+# `cd /workspace` as a token (not followed by /projects/), or an explicit
+# /workspace/<seg> reference whose first segment is not projects/ — the two
+# shapes by which a project-scoped shell escapes to the sandbox root.
+_OFFPROJECT_CD_RE = re.compile(
+    r"cd\s+/workspace(?:(?=[\s\"'&;|)])|/(?!projects/)|$)"
+)
+_OFFPROJECT_PATH_RE = re.compile(
+    r"/workspace/(?!projects/)[\w.-]+"
+)
+
+
+def _offproject_target(fname, ptarget, a_hash, project_id) -> Optional[str]:
+    """Return the offending path when a SUCCESSFUL tool call operated at the
+    sandbox root while a project is bound, else None.
+
+    The scoping machinery re-roots RELATIVE paths into projects/<id>/, and
+    the /workspace→project heal fires only on file-not-found — so a call
+    that succeeds with an explicit root-absolute path escapes every guard
+    silently (observed live, request 6f14407f: `cd /workspace && git clone
+    … prince-persia-repo` planted the repo and then the feasibility report
+    at the root; the project dir stayed empty). This detector powers the
+    once-per-request corrective steer in the dispatch pipeline."""
+    if not project_id:
+        return None
+    if fname == "file_system":
+        t = str(ptarget or "")
+        if t.startswith("/workspace/") and not t.startswith(
+                f"/workspace/projects/{project_id}"):
+            if not t.startswith("/workspace/projects/"):
+                return t
+        return None
+    if fname == "execute":
+        blob = str(a_hash or "")
+        m = _OFFPROJECT_CD_RE.search(blob)
+        if m:
+            return "cd /workspace (escapes the project scope)"
+        m = _OFFPROJECT_PATH_RE.search(blob)
+        if m:
+            return m.group(0)
+    return None
+
+
 def _is_bug_report_intent(text: Optional[str]) -> bool:
     """Cheap (no-LLM) gate: the user is REPORTING a defect in something
     that already exists ("when I click X nothing happens"). These turns
@@ -7371,6 +7454,45 @@ class GhostAgent:
                                     _wt[fname] = _wt.get(fname, 0) + 1
                         except Exception:
                             pass
+                        # Off-project escape steer (2026-07-18): a SUCCESSFUL
+                        # call that operated at the sandbox root while a
+                        # project is bound gets one corrective steer per
+                        # request. The remap heal only fires on errors, so a
+                        # clean `cd /workspace && git clone` (request
+                        # 6f14407f) used to escape every guard: repo +
+                        # feasibility report at the root, project dir empty.
+                        try:
+                            _pid_now = self.context.current_project_id
+                            if not getattr(self.context,
+                                           "_offproject_steer_done", False):
+                                _off = _offproject_target(
+                                    fname, ptarget, a_hash, _pid_now)
+                                if _off:
+                                    self.context._offproject_steer_done = True
+                                    pretty_log(
+                                        "Project Scope",
+                                        f"'{fname}' touched {_off} — outside "
+                                        f"projects/{_pid_now}/ — steering "
+                                        "relocation",
+                                        level="WARNING", icon=Icons.WARN,
+                                    )
+                                    messages.append({"role": "user", "content": (
+                                        f"SYSTEM ALERT (project scope): your last "
+                                        f"'{fname}' call touched {_off}, which is "
+                                        f"OUTSIDE the active project's workspace "
+                                        f"(/workspace/projects/{_pid_now}/). Project "
+                                        "files MUST live inside the project directory "
+                                        "— anything at the sandbox root is invisible "
+                                        "to the project's manifest, briefing, and "
+                                        "cleanup. If you just created files there, "
+                                        "MOVE them into the project now (e.g. "
+                                        f"`mv /workspace/<name> /workspace/projects/"
+                                        f"{_pid_now}/<name>`), then continue with "
+                                        "RELATIVE paths — the shell already starts "
+                                        "inside the project directory."
+                                    )})
+                        except Exception:
+                            pass
                     if fname and not is_mutating and not _res_is_error:
                         # threshold=2 (was 3): the SECOND identical
                         # read is already zero-information — nudge
@@ -9150,6 +9272,7 @@ class GhostAgent:
                 # turns are serialized by the agent semaphore.
                 self.context._project_work_files = set()
                 self.context._project_work_tools = {}
+                self.context._offproject_steer_done = False
                 # Snapshot the project that was active when THIS user message
                 # arrived — the delete-eligibility gate in tools.projects
                 # only honours a bare "delete it" against this project. A
@@ -10382,20 +10505,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # project briefing / SANDBOX STATE follow normally.
                     dynamic_state = ""
                     if has_coding_intent:
-                        dynamic_state += (
-                            "⚠️  SHELL CWD IS /workspace — DO NOT USE `cd` ANYWHERE  ⚠️\n"
-                            "The shell session ALREADY starts in /workspace. "
-                            "Paths like /sandbox, /home/user, /root, /app, /tmp "
-                            "do NOT exist in this container and `cd` to any of "
-                            "them will fail with 'No such file or directory' "
-                            "and BURN A STRIKE. Run commands directly with "
-                            "relative paths:\n"
-                            "  ✓  python3 test_foo.py\n"
-                            "  ✓  python -m unittest tests.test_parser\n"
-                            "  ✓  ls subdir/ ; cat a/b.py\n"
-                            "  ✗  cd /home/user && python3 …   (FAILS)\n"
-                            "  ✗  cd /sandbox && …              (FAILS)\n\n"
-                        )
+                        # Project-aware since 2026-07-18: the static
+                        # "/workspace" wording taught the model to `cd`
+                        # OUT of its project scope (see _render_cwd_pin).
+                        dynamic_state += _render_cwd_pin(
+                            getattr(self.context, "current_project_id", None))
                     # Minute precision (not seconds): a second-precision
                     # timestamp changes on every turn of the same request,
                     # busting the upstream prefix KV-cache for everything that

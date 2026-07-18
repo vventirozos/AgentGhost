@@ -366,6 +366,31 @@
   <h2>Pre-flight guard: operation-aware key + block budget (2026-07-08)</h2>
   <p><code>RecentFailureGuard</code> now keys on <code>(tool, target, operation)</code> — previously <code>(tool, target)</code>, which blocked the model's correct <code>replace→write</code> recovery three times in a row (each after ~80&nbsp;s of full-file generation) because any file_system call on the failed target counted as a "repeat". The block message names legal alternatives (different operation/tool, fix the cause, ask the user), and a per-request <strong>block budget</strong> forces a final reply after 2 guard blocks — with operation-aware keying, two blocks mean genuinely identical re-issues of a known failure, so continuing is pure waste. Covered by <code>tests/test_guard_box_fixes.py</code>.</p>
 
+  <h2>Project-scope escape guards (2026-07-18)</h2>
+  <p>With a project bound, the shell genuinely starts in
+  <code>/workspace/projects/&lt;id&gt;</code> — but the coding-turn CWD pin was static
+  text claiming <em>"SHELL CWD IS /workspace"</em>, so the model trusted the louder
+  signal and ran <code>cd /workspace &amp;&amp; git clone … prince-persia-repo</code>,
+  planting a repo and then the feasibility report at the sandbox ROOT (request
+  6f14407f; the project dir stayed empty and the deliverable artifact pointed at a
+  path outside the workspace). Absolute <code>/workspace/…</code> paths bypass scoping
+  by design, and the remap heal fires only on file-not-found — a successful escape
+  was invisible to every guard. Two fixes:</p>
+  <ul>
+    <li><strong>Project-aware CWD pin</strong> (<code>_render_cwd_pin</code>): when a project
+    is bound the pin names <code>/workspace/projects/&lt;id&gt;</code> as the working
+    directory, warns that root-level writes are invisible to the project's manifest/
+    briefing/cleanup, and shows <code>cd /workspace &amp;&amp; …</code> as the ✗ example.
+    Free-chat wording unchanged.</li>
+    <li><strong>Off-project success steer</strong> (<code>_offproject_target</code> + dispatch
+    wiring): a SUCCESSFUL <code>file_system</code> mutation targeting a root-absolute path,
+    or an <code>execute</code> whose command <code>cd</code>s to /workspace root or references
+    a root-level path, triggers one corrective steer per request — move the files into
+    the project, continue with relative paths. Cross-project absolute paths are treated
+    as deliberate and not flagged.</li>
+  </ul>
+  <p>Covered by <code>tests/test_offproject_scope_guard.py</code>.</p>
+
   <h2>Fix-verify unblocking + idle no-op skip gates (2026-07-18)</h2>
   <p>Three fixes from the 2026-07-17 overnight log evaluation:</p>
   <ul>

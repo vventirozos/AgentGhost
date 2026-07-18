@@ -780,6 +780,25 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-18 (later 4) — project-scope escape guards: CWD pin + off-project steer
+Log eval of the recreated Prince-of-Persia project (requests f0fdb2f1/6f14407f): with the
+project BOUND and constraints replayed, the agent cloned the repo and wrote
+feasibility_report.md at the sandbox ROOT (/workspace/prince-persia-repo/), project dir
+empty. Why: (1) the coding-turn CWD pin was STATIC text "SHELL CWD IS /workspace" even
+though exec starts in /workspace/projects/<id> — the model obeyed the louder wrong signal
+with `cd /workspace && git clone`; (2) absolute /workspace paths bypass scoping by design;
+(3) the remap heal fires only on file-not-found — successful escapes hit no guard.
+- **_render_cwd_pin(project_id)**: pin now names /workspace/projects/<id> when bound, with
+  `cd /workspace && …` as the ✗ example; free-chat wording unchanged.
+- **_offproject_target + dispatch steer**: successful file_system mutation to a
+  root-absolute path, or execute with cd-to-root / root-path reference, gets ONE
+  corrective steer per request (move files in, use relative paths). Cross-project
+  absolute paths deliberately not flagged.
+- Data repair moot: user deleted both Prince projects (tombstones 08:54/09:11) and
+  cleaned the root strays by hand before the fix landed.
+- Tests: tests/test_offproject_scope_guard.py (new, 10). Docs: core/agent.html.
+- NOTE: agent restarted at ~09:11 — this fix (and anything after) needs the NEXT restart.
+
 ### 2026-07-18 (later 3) — recurring workspace tidy: the agent cleans up after itself
 Operator complaint: projects leave screenshots/debug scripts behind for manual deletion.
 Root cause: the DONE sweep fires ONCE on the transition; all verification/debugging
