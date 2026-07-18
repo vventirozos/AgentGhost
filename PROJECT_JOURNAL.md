@@ -780,6 +780,78 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-18 (later 8) — verifier two-stage prompt + fault-injection calibration bench
+From the "Mechanisms of Introspective Awareness" paper (arXiv:2603.21396): yes/no detection
+probes are dominated by a default-No gate that suppresses latent signal; forced
+identification extracts it, and detection is only meaningful measured against a controlled
+false-positive rate. Two changes:
+- **Two-stage verify_claim** (core/verifier.py): stage 1 FORCES the judge to name 1–3
+  weakest fragments (quote + alignment/support/constraint/artifact, sanitized to 3×300
+  chars); stage 2 adjudicates each suspect against the evidence under the strict rubric
+  (all outputs together; paraphrase ≠ fabrication; truncated-but-consistent evidence →
+  UNCERTAIN at most, never REFUTED — the packer lesson). Same verdict JSON out, so the
+  ≥0.7 gates/repair/late-verdict paths are untouched; suspects ride on
+  VerifyResult.suspects. Fail-safe fallback to the classic single prompt on any stage
+  failure. Kill switch GHOST_VERIFY_TWO_STAGE=0 (read per call). Cost: one extra
+  VERIFY-route call per claim verdict; code/visual paths unchanged.
+- **Fault-injection bench** (eval/verify_bench.py + scripts/verify_bench.py +
+  scripts/verify_bench_cases.jsonl, 12 seed cases): inject KNOWN corruptions (fact_swap,
+  fabrication, wrong_topic, silent_failure, artifact_leak, constraint_violation → expect
+  REFUTED; evidence_truncation → expect NOT refuted) into clean triples, run against the
+  live judge endpoint, report per-fault TPR + clean-case FPR, raw AND at the production
+  ≥0.7 actionable gate. Mints extra cases from GHOST_LLM_RECORD day-files by inverting the
+  rendered claim prompt (template-derived literals, survives template edits).
+  `--two-stage both` A/Bs the new prompt vs. classic per fault class.
+- **Live-judge probes forced a stage-call payload discipline** (measured on Nova/Gemma 4
+  E4B heretic): raw stage calls cost 600–1200 tokens / 30–90s per 60-token verdict via
+  three failure modes — nondeterministic `<|channel>thought` prelude (adjudicate prompt),
+  fenced/pretty JSON, and verdict-looping to the cap (server runs repeat_penalty=1.0).
+  Fix: no-think soft+hard switch (GHOST_VERIFY_STAGE_NO_THINK=0 to disable), stop=["\n"],
+  "MUST start with {" prompt line, GHOST_VERIFY_STAGE_MAX_TOKENS=1024 cap. After: enum
+  ~41 tok/3–5s, adjudicate ~63 tok/~4s, 100% valid JSON. response_format=json_object was
+  tried and REJECTED — grammar sampling made the judge MORE verbose (41→786+ tok,
+  cap-truncation). NOTE: the CLASSIC deployed prompt measured 637 tok/42s on the same
+  judge — brushing the 45s worker timeout; two-stage with discipline is now FASTER than
+  classic (~8–12s vs ~42s). The 2026-07-16 "7–11s uncontended" verdict figure no longer
+  reproduces on nova.
+- **First live A/B (2 seed cases vs nova) — the bench caught its own feature regressing.**
+  Classic arm: TPR 0.6–0.75 / FPR 0 at ~40s/verdict. Disciplined two-stage v1: TPR 0.42
+  (terse stage 1 named one trivial suspect, missed the injected fabrication; stage 2 only
+  judged named suspects). v2 fixes: stage 1 = EXACTLY 3 suspects incl. ≥1 word-by-word
+  checked fact; stage 2 = per-suspect "checks" array generated BEFORE the verdict keys
+  (structured deliberation replacing the removed free-think) + may flag beyond-suspects
+  problems. Re-measured: **TPR 0.75 / FPR 0.0 at ~16s/verdict — classic catch rate at
+  ~2.5× speed**. Default stays ON.
+- **Judge-level blind spots (every arm, prompt-independent), the real backlog:** (a)
+  injected diff-markers (artifact_leak) 0/6 caught — CONFIRMED conf 1.0; consider a cheap
+  regex artifact gate before the LLM verdict; (b) single-digit fact swaps (34→35°C)
+  usually missed; (c) truncated evidence draws spurious REFUTEs in all configs (the
+  packer shape, now QUANTIFIED — rubric wording doesn't fix it); (d) confidence pinned at
+  0.9–1.0 everywhere → the ≥0.7 actionable gate is effectively verdict-only on this judge.
+  Full 12-case A/B (~90 min on nova) pending — operator to schedule.
+- Tests: test_verifier_two_stage.py (+20), test_verify_bench.py (+23), all prior
+  verifier/critic suites green (8131-suite: 1 stale count assertion in
+  test_verifier_critic_routing pinned to single-stage). Docs: core/verifier.html.
+
+### 2026-07-18 (later 7) — 9C postmortem: scope-flap heal + pivot timeout
+Request 9c9b75aa (76 min, strike-cap death) ran on a boot WITH the later-6 trio: the
+futility breaker fired correctly at +684s; the fatal was infra, not iteration:
+- **Scope-flap**: `python3 extract_data.py` failed 4x with "can't open
+  /workspace/extract_data.py" while the file sat in projects/7c990a4baf59/ — those calls
+  ran WITHOUT the project workdir (stateful opts out of scoping by design; transient scope
+  clears do the same). A `pwd` on a scoped call showed the right cwd → model diagnosed
+  correctly 3x, retried the correct command, failed again. The remap heal was gated on the
+  workdir kwarg = disabled exactly then. FIX (tools/execute.py): fnf + no workdir + canonical
+  project id on the workspace-model mirror → one retry from /workspace/projects/<id> + note
+  naming the mechanism (drop stateful or use absolute path).
+- **System-3 pivot ReadTimeout burned 20 min** (+2886→+4101 dead air): generator+evaluator
+  calls now timeout=120.0, fail-open.
+- Working as designed in the same request: futility breaker (+684s), n-gram kill at 30k
+  chars, "Same failure ×3" freeze, chunked reads, CWD-pin/steer (commands were bare
+  relative — correct!), late verifier refute + queued correction.
+- Tests: test_execute_path_and_exit1_heal.py +5 (§5 scope-flap), test_futility_breaker_trio.py
+  +1 (pivot pin). Docs: tools/execute.html, core/agent.html.
+
 ### 2026-07-18 (later 6) — coding-struggle mitigations: futility breaker + syntax recipes + turn-budget honesty
 Postmortem of requests 5b9fcc8f/39b4b62f/800a982d (xrick data extraction, 33 min + still
 grinding): rewrote extract_data.py 5x/reran 5x with exit 0 every time (goal counts never met

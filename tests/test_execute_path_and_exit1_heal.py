@@ -278,3 +278,74 @@ async def test_remap_note_rides_failed_runs_too(tmp_path):
     assert "UNRELATED to the path" in result
     # The real failure still comes through untouched.
     assert "ValueError" in result
+
+
+# --- 5. scope-flap heal: file-not-found with NO workdir + bound project ------
+# (2026-07-18, request 9c9b75aa: stateful/scope-flap calls ran at /workspace
+# while extract_data.py sat in the project dir — four strikes burned on one
+# repeated infra failure because the remap heal above is gated on the workdir
+# kwarg, i.e. disabled exactly when this happens.)
+
+async def test_no_workdir_fnf_retries_from_bound_project(tmp_path):
+    fnf = ("python3: can't open file '/workspace/extract_data.py': "
+           "[Errno 2] No such file or directory", 2)
+    mgr = _mock_mgr(returns=[fnf, ("extracted 155 sprites", 0)])
+    wm = MagicMock()
+    wm.current_project_id = "7c990a4baf59"
+    result = await tool_execute(
+        command="python3 extract_data.py",
+        sandbox_dir=tmp_path, sandbox_manager=mgr,
+        workspace_model=wm)                     # NOTE: no container_workdir
+    assert mgr.execute.call_count == 2
+    retry_kwargs = mgr.execute.call_args_list[1][1]
+    assert retry_kwargs.get("workdir") == "/workspace/projects/7c990a4baf59"
+    assert "extracted 155 sprites" in result
+    assert "opted out of project scoping" in result
+
+
+async def test_no_workdir_fnf_without_project_binding_no_retry(tmp_path):
+    fnf = ("python3: can't open file '/workspace/x.py': "
+           "[Errno 2] No such file or directory", 2)
+    mgr = _mock_mgr(returns=[fnf])
+    wm = MagicMock()
+    wm.current_project_id = ""
+    await tool_execute(command="python3 x.py", sandbox_dir=tmp_path,
+                       sandbox_manager=mgr, workspace_model=wm)
+    assert mgr.execute.call_count == 1
+
+
+async def test_no_workdir_fnf_garbage_mirror_no_retry(tmp_path):
+    # A MagicMock-shaped / non-canonical id must not fabricate a workdir.
+    fnf = ("python3: can't open file '/workspace/x.py': "
+           "[Errno 2] No such file or directory", 2)
+    mgr = _mock_mgr(returns=[fnf])
+    wm = MagicMock()  # current_project_id left as auto-MagicMock
+    await tool_execute(command="python3 x.py", sandbox_dir=tmp_path,
+                       sandbox_manager=mgr, workspace_model=wm)
+    assert mgr.execute.call_count == 1
+
+
+async def test_no_workdir_non_fnf_failure_no_retry(tmp_path):
+    boom = ("Traceback (most recent call last): ...ValueError", 1)
+    mgr = _mock_mgr(returns=[boom])
+    wm = MagicMock()
+    wm.current_project_id = "7c990a4baf59"
+    await tool_execute(command="python3 x.py", sandbox_dir=tmp_path,
+                       sandbox_manager=mgr, workspace_model=wm)
+    assert mgr.execute.call_count == 1
+
+
+async def test_no_workdir_fnf_retry_still_fnf_keeps_original_error(tmp_path):
+    fnf1 = ("python3: can't open file '/workspace/x.py': "
+            "[Errno 2] No such file or directory", 2)
+    fnf2 = ("python3: can't open file "
+            "'/workspace/projects/7c990a4baf59/x.py': "
+            "[Errno 2] No such file or directory", 2)
+    mgr = _mock_mgr(returns=[fnf1, fnf2])
+    wm = MagicMock()
+    wm.current_project_id = "7c990a4baf59"
+    result = await tool_execute(command="python3 x.py", sandbox_dir=tmp_path,
+                                sandbox_manager=mgr, workspace_model=wm)
+    assert mgr.execute.call_count == 2
+    # the file genuinely doesn't exist anywhere — no misleading note
+    assert "opted out of project scoping" not in result

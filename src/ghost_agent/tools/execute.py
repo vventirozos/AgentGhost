@@ -493,6 +493,51 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # scoped cwd fails). If the scoped run failed with a file-not-found
         # signature, retry once from the root. Safe: "can't open file" means
         # nothing executed, so there are no partial side effects to repeat.
+        # Scope-flap heal (2026-07-18): the INVERSE of the heal below. This
+        # call ran WITHOUT a project workdir — stateful sessions opt out of
+        # scoping by design (kernel conn file pinned to /workspace), and a
+        # transient scope clear does the same — while a project is actually
+        # bound. A relative `python3 extract_data.py` then resolved against
+        # /workspace and died even though the file sits in the project dir.
+        # Live request 9c9b75aa burned FOUR strikes on this exact shape (the
+        # model even ran `pwd` — a later, scoped call — saw the right cwd,
+        # retried, failed again): the remap heal below is gated on the
+        # workdir kwarg, i.e. disabled precisely when this happens. Re-derive
+        # the project dir from the workspace-model mirror and retry once
+        # from there, with a note naming the actual mechanism.
+        if exit_code != 0 and not _workdir_kw and _looks_like_file_not_found(output):
+            _flap_pid = ""
+            try:
+                _flap_pid = str(getattr(
+                    workspace_model, "current_project_id", "") or "").strip().lower()
+            except Exception:
+                _flap_pid = ""
+            # Canonical 12-hex project ids only — a mocked/garbage mirror
+            # must not fabricate a workdir.
+            if not re.fullmatch(r"[0-9a-f]{12}", _flap_pid or ""):
+                _flap_pid = ""
+            if _flap_pid:
+                _proj_wd = f"/workspace/projects/{_flap_pid}"
+                pretty_log(
+                    "Project Path Heal",
+                    f"file-not-found with no project cwd while project "
+                    f"'{_flap_pid}' is bound — retrying from {_proj_wd}",
+                    level="WARNING", icon=Icons.SHIELD,
+                )
+                _fh_out, _fh_code = await asyncio.to_thread(
+                    sandbox_manager.execute, cmd_str, timeout=600,
+                    spill_large_output=True, workdir=_proj_wd)
+                if _fh_code == 0 or not _looks_like_file_not_found(_fh_out):
+                    output, exit_code = _fh_out, _fh_code
+                    output = (output or "") + (
+                        f"\n[SYSTEM NOTE: the original attempt ran at /workspace "
+                        f"because this call opted out of project scoping (most "
+                        f"often stateful=true — the kernel session is pinned to "
+                        f"/workspace). It was retried from {_proj_wd} (the active "
+                        f"project) and that is the output above. For project "
+                        f"files either drop stateful, or use the absolute "
+                        f"project path.]")
+
         if exit_code != 0 and _workdir_kw and _looks_like_file_not_found(output):
             # Absolute-path variant first: when the command names files under
             # `/workspace/...` a workdir change can't help (absolute paths are

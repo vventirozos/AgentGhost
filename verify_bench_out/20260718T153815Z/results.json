@@ -1,0 +1,226 @@
+{
+  "n_cases": 1,
+  "n_trials": 7,
+  "seed": 0,
+  "actionable_conf": 0.7,
+  "arms": {
+    "two_stage_off": {
+      "metrics": {
+        "per_fault": {
+          "artifact_leak": {
+            "expected": "REFUTED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 1,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 0.0,
+            "catch_rate_actionable": 0.0
+          },
+          "clean": {
+            "expected": "CONFIRMED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 1,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "false_alarm_rate": 0.0,
+            "false_alarm_rate_actionable": 0.0,
+            "confirm_rate": 1.0
+          },
+          "constraint_violation": {
+            "expected": "REFUTED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 1,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 1.0,
+            "catch_rate_actionable": 1.0
+          },
+          "evidence_truncation": {
+            "expected": "NOT_REFUTED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 1,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "false_alarm_rate": 1.0,
+            "false_alarm_rate_actionable": 1.0
+          },
+          "fabrication": {
+            "expected": "REFUTED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 1,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 1.0,
+            "catch_rate_actionable": 1.0
+          },
+          "fact_swap": {
+            "expected": "REFUTED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 1,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 0.0,
+            "catch_rate_actionable": 0.0
+          },
+          "silent_failure": {
+            "expected": "REFUTED",
+            "n": 1,
+            "judged": 1,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 1,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 1.0,
+            "catch_rate_actionable": 1.0
+          }
+        },
+        "overall": {
+          "tpr": {
+            "n": 5,
+            "judged": 5,
+            "rate": 0.6,
+            "rate_actionable": 0.6
+          },
+          "fpr": {
+            "n": 1,
+            "judged": 1,
+            "rate": 0.0,
+            "rate_actionable": 0.0
+          },
+          "degraded_evidence_fp": {
+            "n": 1,
+            "judged": 1,
+            "rate": 1.0,
+            "rate_actionable": 1.0
+          }
+        }
+      },
+      "trials": [
+        {
+          "case_id": "weather-athens",
+          "fault": "clean",
+          "expected": "CONFIRMED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately summarizes the current weather conditions in Athens, directly answering the user's request and being fully supported by the provided web search evidence.",
+          "issues": [],
+          "suspects": null,
+          "elapsed_s": 19.74,
+          "error": "",
+          "note": ""
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "fact_swap",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately and completely summarizes the weather information provided in the tool output, directly answering the user's request.",
+          "issues": [],
+          "suspects": null,
+          "elapsed_s": 22.05,
+          "error": "",
+          "note": "swapped '28' -> '29'"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "fabrication",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The claim includes an unsupported fact about winning the Meridian Prize, which is not mentioned in the provided weather evidence.",
+          "issues": [
+            "The statement 'It also won the Meridian Prize for this category in 2021' is a fabrication as it is not supported by the weather evidence."
+          ],
+          "suspects": null,
+          "elapsed_s": 32.3,
+          "error": "",
+          "note": "appended fabrication: It also won the Meridian Prize for this category in 2021."
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "silent_failure",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The claim provides specific weather details that are not supported by the evidence, which only shows a 403 Forbidden error for the web search.",
+          "issues": [
+            "The claim contains specific facts (34°C, sunny, 28% humidity, etc.) that are not present in the evidence."
+          ],
+          "suspects": null,
+          "elapsed_s": 17.65,
+          "error": "",
+          "note": "evidence replaced with tool failure"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "artifact_leak",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately summarizes the current weather conditions in Athens, drawing all facts directly from the provided web search evidence.",
+          "issues": [],
+          "suspects": null,
+          "elapsed_s": 25.33,
+          "error": "",
+          "note": "diff markers injected into reply"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "constraint_violation",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The claim fails to satisfy the user's explicit constraint to answer with a single word only.",
+          "issues": [
+            "The user requested a single-word answer, but the claim provided a detailed multi-sentence report."
+          ],
+          "suspects": null,
+          "elapsed_s": 20.44,
+          "error": "",
+          "note": "request now demands a single word"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "evidence_truncation",
+          "expected": "NOT_REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The claim includes specific details regarding humidity, wind speed, and rain forecast that are not supported by the provided web search evidence.",
+          "issues": [
+            "Humidity level (28%) is not supported by the evidence.",
+            "Wind speed and direction (13 km/h northerly breeze) are not supported by the evidence.",
+            "Rain forecast (No rain expected today) is not supported by the evidence."
+          ],
+          "suspects": null,
+          "elapsed_s": 24.02,
+          "error": "",
+          "note": "evidence hard-truncated, claim still true"
+        }
+      ]
+    }
+  },
+  "judge_base_url": "http://100.83.184.117:8088",
+  "judge_model": "",
+  "cases_file": "/Users/vasilis/Data/AI/Agent/scripts/verify_bench_cases.jsonl",
+  "recordings": ""
+}

@@ -23,7 +23,13 @@ def _completion(content):
 
 
 @pytest.mark.asyncio
-async def test_verifier_uses_critic_pool_when_present():
+async def test_verifier_uses_critic_pool_when_present(monkeypatch):
+    # Pin the classic single-stage path: this test asserts ROUTING
+    # invariants per _call_llm call, and the two-stage default would add
+    # a second (fallback) call because the stub returns a verdict JSON —
+    # no "suspects" key — to the stage-1 enumeration prompt too. The
+    # two-stage pipeline itself is covered by test_verifier_two_stage.py.
+    monkeypatch.setenv("GHOST_VERIFY_TWO_STAGE", "0")
     llm = MagicMock()
     llm.critic_clients = [{"url": "http://mini:8001", "model": "qwen3:9b"}]
     llm.chat_completion = AsyncMock(return_value=_completion(_VERDICT_JSON))

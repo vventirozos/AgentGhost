@@ -39,6 +39,19 @@
   <h1>tools / execute.py</h1>
   <p class="subtitle">Sandboxed code execution with multiple validation guards and stateful Jupyter support.</p>
 
+  <h2>Scope-flap heal — file-not-found with NO project cwd (2026-07-18)</h2>
+  <p>The /workspace→project remap heal is gated on the workdir kwarg — i.e. it is
+  DISABLED exactly when a call ran without project scoping. Stateful sessions opt out of
+  scoping by design (the kernel conn file is pinned to /workspace), and a transient scope
+  clear does the same — so a relative <code>python3 extract_data.py</code> resolved against
+  /workspace and died while the file sat in the project dir. Live request 9c9b75aa burned
+  FOUR strikes on this one repeated infra failure (the model even ran <code>pwd</code>, saw
+  the right cwd on a scoped call, retried, failed again). Now: file-not-found + no workdir
+  kwarg + a canonical project id on the workspace-model mirror → one retry from
+  <code>/workspace/projects/&lt;id&gt;</code>, with a note naming the mechanism ("this call
+  opted out of project scoping — most often stateful=true") so the model stops guessing.
+  Covered by <code>tests/test_execute_path_and_exit1_heal.py</code> (§5).</p>
+
   <h2>Tool: <code>execute</code></h2>
   <p>Three execution modes selected from arguments:</p>
 

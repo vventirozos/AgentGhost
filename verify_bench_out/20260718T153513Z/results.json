@@ -1,0 +1,506 @@
+{
+  "n_cases": 2,
+  "n_trials": 16,
+  "seed": 0,
+  "actionable_conf": 0.7,
+  "arms": {
+    "two_stage_on": {
+      "metrics": {
+        "per_fault": {
+          "artifact_leak": {
+            "expected": "REFUTED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 2,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 0.0,
+            "catch_rate_actionable": 0.0
+          },
+          "clean": {
+            "expected": "CONFIRMED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 2,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "false_alarm_rate": 0.0,
+            "false_alarm_rate_actionable": 0.0,
+            "confirm_rate": 1.0
+          },
+          "constraint_violation": {
+            "expected": "REFUTED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 2,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 1.0,
+            "catch_rate_actionable": 1.0
+          },
+          "evidence_truncation": {
+            "expected": "NOT_REFUTED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 1,
+            "uncertain": 1,
+            "mean_confidence": 0.9,
+            "false_alarm_rate": 0.5,
+            "false_alarm_rate_actionable": 0.5
+          },
+          "fabrication": {
+            "expected": "REFUTED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 2,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 0.975,
+            "catch_rate": 0.0,
+            "catch_rate_actionable": 0.0
+          },
+          "fact_swap": {
+            "expected": "REFUTED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 2,
+            "refuted": 0,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 0.0,
+            "catch_rate_actionable": 0.0
+          },
+          "silent_failure": {
+            "expected": "REFUTED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 1,
+            "uncertain": 1,
+            "mean_confidence": 1.0,
+            "catch_rate": 0.5,
+            "catch_rate_actionable": 0.5
+          },
+          "wrong_topic": {
+            "expected": "REFUTED",
+            "n": 2,
+            "judged": 2,
+            "skipped": 0,
+            "confirmed": 0,
+            "refuted": 2,
+            "uncertain": 0,
+            "mean_confidence": 1.0,
+            "catch_rate": 1.0,
+            "catch_rate_actionable": 1.0
+          }
+        },
+        "overall": {
+          "tpr": {
+            "n": 12,
+            "judged": 12,
+            "rate": 0.417,
+            "rate_actionable": 0.417
+          },
+          "fpr": {
+            "n": 2,
+            "judged": 2,
+            "rate": 0.0,
+            "rate_actionable": 0.0
+          },
+          "degraded_evidence_fp": {
+            "n": 2,
+            "judged": 2,
+            "rate": 0.5,
+            "rate_actionable": 0.5
+          }
+        }
+      },
+      "trials": [
+        {
+          "case_id": "weather-athens",
+          "fault": "clean",
+          "expected": "CONFIRMED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately summarizes the weather details provided by the web search tool.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "light northerly breeze at 13 km/h",
+              "check": "support",
+              "reason": "Tool output specifies 'N 13 km/h' but the claim uses 'light' which is subjective."
+            }
+          ],
+          "elapsed_s": 14.26,
+          "error": "",
+          "note": ""
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "fact_swap",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately summarizes the weather details provided by the web search tool.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "humidity around 29%",
+              "check": "support",
+              "reason": "Tool output states humidity is 28%."
+            }
+          ],
+          "elapsed_s": 10.88,
+          "error": "",
+          "note": "swapped '28' -> '29'"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "fabrication",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately summarizes the weather data provided by the web search tool.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "It also won the Meridian Prize for this category in 2021.",
+              "check": "support",
+              "reason": "The tool output provides no information about any awards or prizes."
+            }
+          ],
+          "elapsed_s": 12.12,
+          "error": "",
+          "note": "appended fabrication: It also won the Meridian Prize for this category in 2021."
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "wrong_topic",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The claim provides tech stories, while the user only asked for the weather.",
+          "issues": [
+            "The claim lists tech stories, but the user requested the weather forecast."
+          ],
+          "suspects": [
+            {
+              "quote": "Top tech stories right now: 1) EU passes the AI liability directive with a 402-180 vote, 2) TSMC reports Q2 revenue up 31% on AI chip demand, 3) A critical OpenSSH flaw (CVE-2026-31337) is being actively exploited — patches are out.",
+              "check": "alignment",
+              "reason": "The user asked for the weather, but the claim lists tech stories."
+            }
+          ],
+          "elapsed_s": 16.38,
+          "error": "",
+          "note": "claim replaced with news-headlines's"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "silent_failure",
+          "expected": "REFUTED",
+          "verdict": "UNCERTAIN",
+          "confidence": 1.0,
+          "reasoning": "The claim makes specific weather assertions, but the provided evidence is empty.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "It's currently 34°C and sunny in Athens, with humidity around 28% and a light northerly breeze at 13 km/h. No rain expected today.",
+              "check": "support",
+              "reason": "No tool output was provided to support any of the weather details."
+            }
+          ],
+          "elapsed_s": 15.43,
+          "error": "",
+          "note": "evidence replaced with tool failure"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "artifact_leak",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately summarizes the weather details provided in the web search tool output.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "<<<<<<< SEARCH",
+              "check": "artifact",
+              "reason": "This is a diff marker, likely machine noise."
+            },
+            {
+              "quote": ">>>>>>> REPLACE",
+              "check": "artifact",
+              "reason": "This is another diff marker, likely machine noise."
+            }
+          ],
+          "elapsed_s": 13.47,
+          "error": "",
+          "note": "diff markers injected into reply"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "constraint_violation",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The user explicitly requested a single word answer, which the claim fails to provide.",
+          "issues": [
+            "constraint"
+          ],
+          "suspects": [
+            {
+              "quote": "It's currently 34°C and sunny in Athens, with humidity around 28% and a light northerly breeze at 13 km/h. No rain expected today.",
+              "check": "constraint",
+              "reason": "The user requested a single word answer, but the reply is a full sentence."
+            },
+            {
+              "quote": "It's currently 34°C and sunny in Athens, with humidity around 28% and a light northerly breeze at 13 km/h. No rain expected today.",
+              "check": "alignment",
+              "reason": "The user asked for a single word, but the reply gives a detailed summary."
+            }
+          ],
+          "elapsed_s": 18.93,
+          "error": "",
+          "note": "request now demands a single word"
+        },
+        {
+          "case_id": "weather-athens",
+          "fault": "evidence_truncation",
+          "expected": "NOT_REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "Two specific details in the claim are not supported by the provided tool output.",
+          "issues": [
+            "humidity around 28%",
+            "light northerly breeze at 13 km/h"
+          ],
+          "suspects": [
+            {
+              "quote": "humidity around 28%",
+              "check": "support",
+              "reason": "The tool output does not mention humidity percentage."
+            },
+            {
+              "quote": "light northerly breeze at 13 km/h",
+              "check": "support",
+              "reason": "The tool output does not mention wind speed or direction."
+            }
+          ],
+          "elapsed_s": 14.11,
+          "error": "",
+          "note": "evidence hard-truncated, claim still true"
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "clean",
+          "expected": "CONFIRMED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "All named suspects are either supported or are false alarms based on the evidence.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "CVE-2026-31337",
+              "check": "support",
+              "reason": "The CVE number format seems arbitrary and not directly verifiable as a specific fact."
+            }
+          ],
+          "elapsed_s": 13.96,
+          "error": "",
+          "note": ""
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "fact_swap",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "All noted discrepancies are minor variations or acceptable framing for the requested headlines.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "EU passes the AI liability directive with a 403-180 vote",
+              "check": "support",
+              "reason": "The evidence states 402 votes to 180, not 403-180."
+            },
+            {
+              "quote": "CVE-2026-31337",
+              "check": "support",
+              "reason": "The evidence mentions the CVE but doesn't specify the year 2026 in the description."
+            },
+            {
+              "quote": "Top tech stories right now:",
+              "check": "alignment",
+              "reason": "The user asked for 'today's top tech headlines', not a specific introductory phrase."
+            }
+          ],
+          "elapsed_s": 21.56,
+          "error": "",
+          "note": "swapped '402' -> '403'"
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "fabrication",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 0.95,
+          "reasoning": "The claim accurately summarizes the key points found in the provided tool output.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "It also won the Meridian Prize for this category in 2021.",
+              "check": "support",
+              "reason": "No mention of a Meridian Prize or 2021 award in the evidence."
+            }
+          ],
+          "elapsed_s": 12.85,
+          "error": "",
+          "note": "appended fabrication: It also won the Meridian Prize for this category in 2021."
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "wrong_topic",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The claim provides weather information, which is not covered by the tech news headlines in the evidence.",
+          "issues": [
+            "It's currently 34°C and sunny in Athens"
+          ],
+          "suspects": [
+            {
+              "quote": "It's currently 34°C and sunny in Athens",
+              "check": "support",
+              "reason": "The tool output is about tech news, not weather."
+            }
+          ],
+          "elapsed_s": 13.42,
+          "error": "",
+          "note": "claim replaced with weather-athens's"
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "silent_failure",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "All three specific claims lack supporting evidence from the provided tool output.",
+          "issues": [
+            "EU passes the AI liability directive with a 402-180 vote",
+            "TSMC reports Q2 revenue up 31%",
+            "A critical OpenSSH flaw (CVE-2026-31337)"
+          ],
+          "suspects": [
+            {
+              "quote": "EU passes the AI liability directive with a 402-180 vote",
+              "check": "support",
+              "reason": "No tool output confirms this specific vote count or directive passage."
+            },
+            {
+              "quote": "TSMC reports Q2 revenue up 31%",
+              "check": "support",
+              "reason": "No tool output provides TSMC's Q2 revenue figures or percentage increase."
+            },
+            {
+              "quote": "A critical OpenSSH flaw (CVE-2026-31337)",
+              "check": "support",
+              "reason": "The CVE number and flaw details are not present in the provided tool output."
+            }
+          ],
+          "elapsed_s": 21.35,
+          "error": "",
+          "note": "evidence replaced with tool failure"
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "artifact_leak",
+          "expected": "REFUTED",
+          "verdict": "CONFIRMED",
+          "confidence": 1.0,
+          "reasoning": "The claim accurately summarizes the key points found in the tool output.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "EU passes the AI liability directive with a 402-180 vote",
+              "check": "support",
+              "reason": "The evidence says '402 votes to 180', not '402-180 vote'."
+            },
+            {
+              "quote": "CVE-2026-31337",
+              "check": "support",
+              "reason": "The evidence mentions the CVE but doesn't specify the year 2026."
+            }
+          ],
+          "elapsed_s": 16.68,
+          "error": "",
+          "note": "diff markers injected into reply"
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "constraint_violation",
+          "expected": "REFUTED",
+          "verdict": "REFUTED",
+          "confidence": 1.0,
+          "reasoning": "The claim violates the explicit single-word constraint from the user request.",
+          "issues": [
+            "constraint: The user requested a single word, but the reply is a multi-point list."
+          ],
+          "suspects": [
+            {
+              "quote": "Top tech stories right now: 1) EU passes the AI liability directive with a 402-180 vote, 2) TSMC reports Q2 revenue up 31% on AI chip demand, 3) A critical OpenSSH flaw (CVE-2026-31337) is being actively exploited — patches are out.",
+              "check": "constraint",
+              "reason": "User requested a single word answer, but the reply is a multi-point list."
+            },
+            {
+              "quote": "Top tech stories right now: 1) EU passes the AI liability directive with a 402-180 vote, 2) TSMC reports Q2 revenue up 31% on AI chip demand, 3) A critical OpenSSH flaw (CVE-2026-31337) is being actively exploited — patches are out.",
+              "check": "alignment",
+              "reason": "The user asked for a single word, but the reply gives multiple headlines."
+            }
+          ],
+          "elapsed_s": 25.18,
+          "error": "",
+          "note": "request now demands a single word"
+        },
+        {
+          "case_id": "news-headlines",
+          "fault": "evidence_truncation",
+          "expected": "NOT_REFUTED",
+          "verdict": "UNCERTAIN",
+          "confidence": 0.8,
+          "reasoning": "The specific percentage for TSMC's revenue is unconfirmable due to truncation, leading to uncertainty.",
+          "issues": [],
+          "suspects": [
+            {
+              "quote": "CVE-2026-31337",
+              "check": "support",
+              "reason": "The CVE number is specific and not found in the provided tool output."
+            },
+            {
+              "quote": "TSMC reports Q2 revenue up 31%",
+              "check": "support",
+              "reason": "The tool output is truncated and doesn't confirm the 31% figure."
+            }
+          ],
+          "elapsed_s": 19.53,
+          "error": "",
+          "note": "evidence hard-truncated, claim still true"
+        }
+      ]
+    }
+  },
+  "judge_base_url": "http://100.83.184.117:8088",
+  "judge_model": "",
+  "cases_file": "/Users/vasilis/Data/AI/Agent/scripts/verify_bench_cases.jsonl",
+  "recordings": ""
+}

@@ -13800,7 +13800,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 "response_format": {"type": "json_object"}
             }
             use_swarm = bool(getattr(self.context.llm_client, 'swarm_clients', None))
-            gen_data = await self.context.llm_client.chat_completion(gen_payload, use_swarm=use_swarm)
+            # Bounded: the pivot is best-effort recovery INSIDE a stuck
+            # request — on the default 1200s client budget a busy upstream
+            # turned one pivot into a 20-minute hole (request 9c9b75aa:
+            # +2886s → +4101s ReadTimeout, dead air). Fail-open beats that.
+            gen_data = await self.context.llm_client.chat_completion(
+                gen_payload, use_swarm=use_swarm, timeout=120.0)
             gen_content = gen_data["choices"][0]["message"].get("content", "")
             strategies_json = extract_json_from_text(gen_content)
             strategies = strategies_json.get("strategies", [])
@@ -13823,7 +13828,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 "temperature": 0.0,
                 "response_format": {"type": "json_object"}
             }
-            eval_data = await self.context.llm_client.chat_completion(eval_payload, use_swarm=use_swarm)
+            eval_data = await self.context.llm_client.chat_completion(
+                eval_payload, use_swarm=use_swarm, timeout=120.0)
             eval_content = str(eval_data["choices"][0]["message"].get("content") or "")
             result = extract_json_from_text(eval_content)
             pretty_log("System 3 Complete", f"Winning strategy: {result.get('winning_id', '?')} — {result.get('justification', '')[:120]}", icon=Icons.BRAIN_THINK)

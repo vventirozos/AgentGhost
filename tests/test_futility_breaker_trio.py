@@ -201,3 +201,17 @@ def test_turn_loop_has_else_clause_with_banner():
                 assert "NOT a finished result" in seg
                 found = True
     assert found
+
+
+# ── System-3 pivot timeout pin (2026-07-18, round 2) ─────────────────
+
+def test_system3_pivot_calls_are_bounded():
+    import ghost_agent.core.agent as agent_mod
+    src = inspect.getsource(agent_mod)
+    start = src.index("SYSTEM 3 PIVOT")
+    # both pivot LLM calls (generator + evaluator) carry an explicit
+    # timeout — the default 1200s budget turned one pivot into a
+    # 20-minute dead-air hole (request 9c9b75aa, +2886s → +4101s).
+    region = src[src.index("System 3 Evaluator") - 4000:
+                 src.index("System 3 pivot failed")]
+    assert region.count("timeout=120.0") >= 2

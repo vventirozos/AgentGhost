@@ -366,6 +366,15 @@
   <h2>Pre-flight guard: operation-aware key + block budget (2026-07-08)</h2>
   <p><code>RecentFailureGuard</code> now keys on <code>(tool, target, operation)</code> — previously <code>(tool, target)</code>, which blocked the model's correct <code>replace→write</code> recovery three times in a row (each after ~80&nbsp;s of full-file generation) because any file_system call on the failed target counted as a "repeat". The block message names legal alternatives (different operation/tool, fix the cause, ask the user), and a per-request <strong>block budget</strong> forces a final reply after 2 guard blocks — with operation-aware keying, two blocks mean genuinely identical re-issues of a known failure, so continuing is pure waste. Covered by <code>tests/test_guard_box_fixes.py</code>.</p>
 
+  <h2>System-3 pivot calls bounded to 120s (2026-07-18)</h2>
+  <p>The pivot's generator and evaluator LLM calls ran on the client's default 1200s
+  budget — a busy upstream turned one best-effort recovery pivot into a 20-minute
+  dead-air hole inside an already-stuck request (9c9b75aa: +2886s → +4101s
+  ReadTimeout, then the request died at the strike cap anyway). Both calls now pass
+  <code>timeout=120.0</code>; a pivot that can't answer in two minutes fails open
+  (returns <code>{}</code>) and the turn loop proceeds. Pinned by
+  <code>tests/test_futility_breaker_trio.py</code>.</p>
+
   <h2>Edit-run futility breaker + turn-budget honesty (2026-07-18)</h2>
   <p>Companion to the context governor, from the same coding-session postmortem (request
   5b9fcc8f): the agent rewrote <code>extract_data.py</code> five times and reran it five times

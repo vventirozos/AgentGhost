@@ -72,6 +72,62 @@ except ValueError:
 _MAX_VISUAL_BYTES = 16 * 1024 * 1024
 
 
+def _two_stage_enabled() -> bool:
+    """Two-stage claim verification (forced identification → adjudication).
+
+    A yes/no "is this acceptable?" probe is dominated by a default-No/
+    default-Yes prior: the judge model often carries the signal that a
+    specific fact is unsupported yet never surfaces it because nothing
+    forced it to look at that fact ("Mechanisms of Introspective
+    Awareness", arXiv:2603.21396 — detection-willingness gates suppress
+    latent detection; forced identification bypasses the gate). Stage 1
+    therefore FORCES the judge to name the reply's weakest fragments
+    without ruling on them; stage 2 adjudicates each named suspect
+    against the evidence under the strict rubric, which restores the
+    false-positive control that forced enumeration alone would lose.
+
+    Read per call (not at import) so the flag can be flipped without a
+    restart — same idiom as llm_recording.recording_enabled(). Kill
+    switch: GHOST_VERIFY_TWO_STAGE=0 restores the single-prompt path.
+    """
+    return os.getenv("GHOST_VERIFY_TWO_STAGE", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
+# Suspect hygiene caps: a runaway stage-1 response must not blow the
+# stage-2 prompt (which re-embeds claim + evidence + suspects).
+_MAX_SUSPECTS = 3
+_MAX_SUSPECT_FIELD_CHARS = 300
+_SUSPECT_CHECKS = ("alignment", "support", "constraint", "artifact")
+
+# Output budget for each two-stage call. Measured on the live judge
+# (Gemma 4 E4B on nova, 2026-07-18, ~15 tok/s): with the default 2048
+# budget the model pretty-printed fenced JSON with essay-length reasons —
+# 1217 completion tokens / 89s for one enumerate call, which would blow
+# the 45s worker-route timeout and dump every verdict onto the foreground
+# slot. The stage prompts demand minified single-line JSON with short
+# fields; this cap is the hard backstop. A thinking judge that burns the
+# whole budget on a <think> prelude parses empty → classic-prompt
+# fallback, so the failure mode is a wasted call, never a wrong verdict.
+try:
+    _STAGE_MAX_TOKENS = int(
+        os.getenv("GHOST_VERIFY_STAGE_MAX_TOKENS", "1024") or 1024)
+except ValueError:
+    _STAGE_MAX_TOKENS = 1024
+
+# Thinking off for the two stage calls (same soft+hard switch as the
+# critic path). Measured on the live judge (Gemma 4 E4B heretic, nova,
+# 2026-07-18): the adjudicate prompt non-deterministically opened a
+# <|channel>thought prelude — 600-1200 tokens / 30-70s for a 60-token
+# verdict; with /no_think + enable_thinking=False it answered in ~4s,
+# 6/6 valid JSON. Override with GHOST_VERIFY_STAGE_NO_THINK=0 to let a
+# judge model think (expect to raise GHOST_VERIFY_STAGE_MAX_TOKENS and
+# the worker timeout with it).
+_STAGE_NO_THINK = os.getenv(
+    "GHOST_VERIFY_STAGE_NO_THINK", "1").strip().lower() not in (
+        "0", "false", "no")
+
+
 class VerifyVerdict(str, Enum):
     CONFIRMED = "CONFIRMED"
     REFUTED = "REFUTED"
@@ -84,17 +140,24 @@ class VerifyResult:
     confidence: float  # 0.0 – 1.0
     reasoning: str = ""
     issues: List[str] = field(default_factory=list)
+    # Two-stage path only: the forced-identification suspects that stage 2
+    # adjudicated ([{"quote","check","reason"}, ...]). None on the classic
+    # single-stage path so downstream dict shapes are unchanged there.
+    suspects: Optional[List[Dict[str, str]]] = None
 
     def passed(self) -> bool:
         return self.verdict == VerifyVerdict.CONFIRMED
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d = {
             "verdict": self.verdict.value,
             "confidence": self.confidence,
             "reasoning": self.reasoning,
             "issues": self.issues,
         }
+        if self.suspects is not None:
+            d["suspects"] = self.suspects
+        return d
 
 
 # ── Prompts ──────────────────────────────────────────────────────────
@@ -128,6 +191,67 @@ Respond ONLY with a JSON object:
   "reasoning": "one sentence",
   "issues": ["list of specific problems, if any"]
 }}"""
+
+# Stage 1 of the two-stage claim path: forced identification. Deliberately
+# does NOT ask for a verdict — asking "do you detect a problem?" lets a
+# default-No prior swallow real signal; commanding "name the weakest parts"
+# extracts it. False positives are expected and fine here: stage 2 exists
+# to dismiss them.
+_VERIFY_ENUMERATE_PROMPT = """You are auditing an agent's reply. Do NOT decide whether the reply is acceptable overall — that is a later pass. Your ONLY job is forced identification: name the fragments of the reply that are MOST LIKELY to be wrong. Every reply, even a perfect one, has weakest parts; you MUST name EXACTLY 3 of them, and at least one MUST be a specific checkable fact (a number, name, date, price, or event) quoted from the reply — cross-check every such fact against the EVIDENCE word by word before choosing.
+
+CLAIM (the agent's reply to the user):
+{claim}
+
+EVIDENCE (the tool output(s) the claim was built from — may contain the outputs of SEVERAL tools from the same turn, in chronological order, each prefixed with [tool_name]):
+{evidence}
+
+USER REQUEST (what the user actually asked for):
+{context}
+
+For each suspect, quote the exact fragment of the CLAIM (or write "WHOLE REPLY" if the problem is the reply as a whole) and classify which check it might fail:
+- "alignment" — the reply answers a different question than the USER REQUEST asked
+- "support" — a specific fact (name, date, number, price, ranking, award) appears in NO tool output, or contradicts the tool outputs
+- "constraint" — the reply violates an explicit format constraint stated in the USER REQUEST ("just the code", "in one sentence", "as JSON")
+- "artifact" — the reply contains machine noise that should never reach a user (error text presented as content, diff/merge markers, template fragments, raw tool syntax)
+
+Order the suspects most-suspicious first. Prefer specific factual fragments (names, numbers, dates) over vague ones.
+
+Be terse: at most 3 suspects, each quote at most 15 words, each reason at most 20 words. Respond ONLY with a MINIFIED single-line JSON object — no code fences, no prose before or after, no extra keys. Your response MUST start with the character {{ and contain no newlines:
+{{"suspects": [{{"quote": "exact fragment of the CLAIM", "check": "alignment|support|constraint|artifact", "reason": "why this fragment might fail that check"}}]}}"""
+
+# Stage 2: adjudication. Re-applies the strict single-prompt rubric to each
+# named suspect — this is where the false-positive control lives, so its
+# dismissal rules must stay at least as strict as _VERIFY_CLAIM_PROMPT's.
+_VERIFY_ADJUDICATE_PROMPT = """You are a rigorous auditor delivering a final verdict. The agent ran tool(s) and gave the user the CLAIM below as its final reply. A prior audit pass was FORCED to name the reply's weakest fragments — the SUSPECTS list below. Because naming was forced, suspects exist even for perfect replies: expect many, often all, of them to be false alarms.
+
+CLAIM (the agent's reply to the user):
+{claim}
+
+EVIDENCE (the tool output(s) the claim was built from — may contain the outputs of SEVERAL tools from the same turn, in chronological order, each prefixed with [tool_name]):
+{evidence}
+
+USER REQUEST (what the user actually asked for):
+{context}
+
+SUSPECTS (from the forced identification pass, most-suspicious first):
+{suspects}
+
+For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a FALSE ALARM:
+- "support" suspects are REAL only if the fact appears in NO tool output (fabrication) or directly contradicts one. Judge against ALL tool outputs TOGETHER: one tool failing (403/timeout/empty) does NOT make a fact wrong when ANOTHER output supports it. Paraphrase, rounding, and unit conversion of what the evidence says are NOT fabrications.
+- "alignment" suspects are REAL only if the reply as a whole answers a different question than the USER REQUEST. If the USER REQUEST is empty or whitespace, alignment suspects are automatically FALSE ALARMS. A reply that answers the request and adds extra detail is NOT misaligned.
+- "constraint" suspects are REAL only if the USER REQUEST explicitly states that constraint in its own wording.
+- "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text.
+
+The SUSPECTS list is a starting point, not a boundary: if you notice a REAL problem the suspects missed — a fact in the CLAIM that appears in no tool output or contradicts one, machine noise in the reply, a violated explicit constraint — count it as a real problem and name it in "issues".
+
+Then give the overall verdict:
+- Any REAL problem → "REFUTED"; list each real problem in "issues".
+- Every suspect a FALSE ALARM and no other real problem found, and the reply answers the request with evidence support → "CONFIRMED" with empty "issues".
+- You genuinely cannot tell (a load-bearing fact is unjudgeable because the evidence is too truncated or ambiguous) → "UNCERTAIN".
+Do NOT refute the CLAIM for weaknesses of the EVIDENCE pipeline itself — tool output that is truncated or noisy but still consistent with the claim is grounds for UNCERTAIN at most, never REFUTED.
+
+Be terse: each "why" and each issue at most 20 words, reasoning at most one short sentence. Fill "checks" FIRST — one entry per suspect, in order, deciding each against the EVIDENCE — before the verdict fields. Respond ONLY with a MINIFIED single-line JSON object — no code fences, no prose before or after, no extra keys. Your response MUST start with the character {{ and contain no newlines:
+{{"checks": [{{"suspect": 1, "real": true, "why": "checked against which tool output, found what"}}], "extra_problems": ["REAL problems the suspects missed; empty if none"], "verdict": "CONFIRMED|REFUTED|UNCERTAIN", "confidence": 0.0-1.0, "reasoning": "one short sentence", "issues": ["each REAL problem; empty if none"]}}"""
 
 _VERIFY_CODE_PROMPT = """You are a code output auditor. Determine whether the agent's RESPONSE actually answers the user's INTENT — including any explicit constraints in the user's wording.
 
@@ -222,13 +346,18 @@ class Verifier:
     def __init__(self, llm_client: Any = None):
         self.llm_client = llm_client
 
-    async def _call_llm(self, prompt: str, temperature: float = 0.1) -> dict:
+    async def _call_llm(self, prompt: str, temperature: float = 0.1,
+                        max_tokens: int = 2048,
+                        json_only: bool = False) -> dict:
         """Make a verification LLM call, preferring worker nodes for cost.
 
-        Token budget is sized for thinking models (Qwen/DeepSeek-R1 style)
-        that emit a <think>...</think> prelude before the JSON — a 512
-        cap was getting consumed entirely by the prelude on the default
-        qwen-3.5-27b, so every verifier call came back empty.
+        Default token budget is sized for thinking models (Qwen/DeepSeek-R1
+        style) that emit a <think>...</think> prelude before the JSON — a
+        512 cap was getting consumed entirely by the prelude on the default
+        qwen-3.5-27b, so every verifier call came back empty. The two-stage
+        claim path passes a tighter budget (_STAGE_MAX_TOKENS) because its
+        prompts demand minified JSON and a verbose judge otherwise blows
+        the worker-route timeout.
         """
         if not self.llm_client:
             return {}
@@ -236,9 +365,29 @@ class Verifier:
         payload = {
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "stream": False,
         }
+        if json_only:
+            # Single-line-JSON discipline for the two-stage calls, all
+            # three measured necessary on the live judge (2026-07-18):
+            # - no-think switch: kills the <|channel>thought prelude
+            #   (600-1200 tokens of deliberation for a 60-token verdict);
+            # - stop at first newline: a minified answer is one line, so
+            #   any newline is either the natural end or a malformed
+            #   (fenced/pretty/looping) answer — cut both instantly;
+            # - the prompt's "MUST start with {" line keeps the fence
+            #   from ever being the first token.
+            # NOT response_format=json_object: grammar-constrained
+            # sampling made this judge MORE verbose (41 -> 786+ tokens,
+            # truncating at the cap). A malformed answer here fails fast
+            # (~3 tokens) and falls back to the classic prompt.
+            if _STAGE_NO_THINK:
+                payload["messages"][0]["content"] = \
+                    prompt + "\n\n/no_think"
+                payload["chat_template_kwargs"] = {
+                    "enable_thinking": False}
+            payload["stop"] = ["\n"]
 
         # Dedicated critic pool takes precedence when configured
         # (--critic-nodes). It keeps the verdict off the foreground
@@ -274,6 +423,8 @@ class Verifier:
                     "stream": False,
                     "chat_template_kwargs": {"enable_thinking": False},
                 }
+                if json_only:
+                    critic_payload["stop"] = ["\n"]
             else:
                 critic_payload = payload
             try:
@@ -300,7 +451,7 @@ class Verifier:
         if route_fn:
             try:
                 result = await route_fn(
-                    "VERIFY", payload, max_tokens=2048,
+                    "VERIFY", payload, max_tokens=max_tokens,
                     temperature=temperature, fallback=None,
                     # Verify-sized budget — see _VERIFY_WORKER_TIMEOUT_S.
                     # route()'s 12s default killed contended verdicts.
@@ -401,13 +552,102 @@ class Verifier:
             issues=data.get("issues", []),
         )
 
+    @staticmethod
+    def _sanitize_suspects(raw: Any) -> List[Dict[str, str]]:
+        """Coerce a stage-1 response's ``suspects`` into a bounded, typed
+        list. Anything that isn't a dict with a usable quote/reason is
+        dropped; unknown check labels degrade to "support" (the most
+        evidence-anchored adjudication rule). Returns [] when nothing
+        usable survives — the caller treats that as a stage failure."""
+        out: List[Dict[str, str]] = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            quote = str(item.get("quote") or "").strip()
+            reason = str(item.get("reason") or "").strip()
+            if not quote and not reason:
+                continue
+            check = str(item.get("check") or "").strip().lower()
+            if check not in _SUSPECT_CHECKS:
+                check = "support"
+            out.append({
+                "quote": quote[:_MAX_SUSPECT_FIELD_CHARS],
+                "check": check,
+                "reason": reason[:_MAX_SUSPECT_FIELD_CHARS],
+            })
+            if len(out) >= _MAX_SUSPECTS:
+                break
+        return out
+
+    @staticmethod
+    def _format_suspects_block(suspects: List[Dict[str, str]]) -> str:
+        lines = []
+        for i, s in enumerate(suspects, 1):
+            lines.append(
+                f'{i}. [{s["check"]}] "{s["quote"]}" — {s["reason"]}')
+        return "\n".join(lines)
+
+    async def _verify_claim_two_stage(self, claim: str, evidence: str,
+                                      context: str
+                                      ) -> Optional[VerifyResult]:
+        """Forced identification (stage 1) → adjudication (stage 2).
+
+        Returns ``None`` whenever either stage yields nothing usable, so
+        ``verify_claim`` can fall back to the classic single-prompt path —
+        the two-stage pipeline must never make the verifier LESS available
+        than it was before.
+        """
+        enum_prompt = _VERIFY_ENUMERATE_PROMPT.format(
+            claim=claim, evidence=evidence, context=context)
+        stage1 = await self._call_llm(enum_prompt, temperature=0.1,
+                                      max_tokens=_STAGE_MAX_TOKENS,
+                                      json_only=True)
+        suspects = self._sanitize_suspects((stage1 or {}).get("suspects"))
+        if not suspects:
+            # Parse failure OR an empty enumeration despite the forced-pick
+            # instruction — either way there is nothing to adjudicate.
+            logger.debug("Verifier two-stage: no usable suspects, "
+                         "falling back to single-stage")
+            return None
+
+        adj_prompt = _VERIFY_ADJUDICATE_PROMPT.format(
+            claim=claim, evidence=evidence, context=context,
+            suspects=self._format_suspects_block(suspects))
+        stage2 = await self._call_llm(adj_prompt, temperature=0.1,
+                                      max_tokens=_STAGE_MAX_TOKENS,
+                                      json_only=True)
+        result = self._build_verify_result(stage2)
+        if result is None:
+            logger.debug("Verifier two-stage: adjudication unparseable, "
+                         "falling back to single-stage")
+            return None
+        result.suspects = suspects
+        return result
+
     async def verify_claim(self, claim: str, evidence: str,
                            context: str = "") -> Optional[VerifyResult]:
-        """Check whether *claim* is supported by *evidence*."""
+        """Check whether *claim* is supported by *evidence*.
+
+        Default path (GHOST_VERIFY_TWO_STAGE, on unless =0) is two LLM
+        calls: forced identification of the reply's weakest fragments,
+        then per-suspect adjudication against the evidence. Falls back to
+        the classic single-prompt verdict when either stage fails, so the
+        worst case matches the old behavior (plus one bounded extra call).
+        """
+        claim_t = claim[:2000]
+        evidence_t = evidence[:4000]
+        context_t = context[:1000]
+        if _two_stage_enabled():
+            result = await self._verify_claim_two_stage(
+                claim_t, evidence_t, context_t)
+            if result is not None:
+                return result
         prompt = _VERIFY_CLAIM_PROMPT.format(
-            claim=claim[:2000],
-            evidence=evidence[:4000],
-            context=context[:1000],
+            claim=claim_t,
+            evidence=evidence_t,
+            context=context_t,
         )
         data = await self._call_llm(prompt, temperature=0.1)
         return self._build_verify_result(data)
