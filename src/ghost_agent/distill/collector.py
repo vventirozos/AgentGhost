@@ -17,6 +17,7 @@ continues; a failed trajectory write must never break a user request.
 from __future__ import annotations
 
 import datetime
+import hashlib
 import logging
 import os
 import threading
@@ -276,6 +277,31 @@ class TrajectoryCollector:
                             yield traj
                 except OSError as e:
                     logger.warning("cannot read trajectory file %s: %s", file_path, e)
+
+    def corpus_fingerprint(self) -> str:
+        """Stat-level fingerprint of the on-disk corpus: name, size and
+        mtime of every ``.jsonl`` under ``root`` (day files AND the
+        corrections file). Equal fingerprints ⇒ nothing was appended or
+        corrected since the last look, so an idle retrain over
+        ``iter_trajectories()`` would refit on byte-identical data — the
+        caller can skip the whole pass (2026-07-17 overnight log: PRM and
+        router each refit 3× on an unchanged 693-trajectory corpus,
+        logging identical reports every time). Never raises; unreadable
+        entries are skipped, a missing root returns ``"empty"``."""
+        if not self.root.exists():
+            return "empty"
+        h = hashlib.sha1()
+        try:
+            files = sorted(self.root.rglob("*.jsonl"))
+        except OSError:
+            return "unstattable"
+        for p in files:
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            h.update(f"{p.name}|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8"))
+        return h.hexdigest()[:16]
 
     def count(self) -> int:
         """Cheap count: iterates lazily without parsing the whole trajectory."""

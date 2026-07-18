@@ -116,3 +116,56 @@ def test_gate_shared_by_dream_import():
     from ghost_agent.core.dream import _is_actionable_heuristic as dh
     from ghost_agent.memory.lesson_quality import _is_actionable_heuristic as lq
     assert dh is lq
+
+
+class TestConversationalTrigger:
+    """2026-07-18: mistake-bearing lessons used to bypass the gate entirely,
+    letting the overnight REM cycle write corrections keyed on raw user chat
+    ("proceed with the next task", "it still does the same…"). A trigger is
+    the lesson's retrieval key — a chat fragment matches no future query."""
+
+    @pytest.mark.parametrize("trigger", [
+        "proceed with the next task.",
+        "it still does the same. the game never starts, notify me in slack when it's fixed",
+        "ok now try again",
+        "continue",
+        "that didn't work, do it again please",
+    ])
+    def test_chat_fragment_triggers_reject_even_with_real_mistake(self, trigger):
+        assert not is_actionable_lesson(
+            mistake="verifier refuted (late): claim not aligned with request",
+            solution="Confirm the concrete next step before advancing.",
+            task=trigger)
+
+    @pytest.mark.parametrize("trigger", [
+        "deploy fails with EACCES",
+        "Uncaught TypeError: enemyManager.loadLevel is not a function",
+        "When fixing a game, verify the existence of core project files",
+        "Complex SQL aggregation and string formatting",
+        # "you"-phrasing is legitimate rule language addressed to the agent
+        "verify core files exist before you edit them",
+        # user-QUESTION triggers are legitimate recurring retrieval keys —
+        # the paraphrase dedup counts on them (bare pronouns/please must
+        # NOT reject)
+        "How do I parse JSON?",
+        "Please parse JSON!",
+    ])
+    def test_situation_keys_still_pass_with_real_mistake(self, trigger):
+        assert is_actionable_lesson(
+            mistake="edited a file that did not exist",
+            solution="List the project directory first.",
+            task=trigger)
+
+    def test_empty_trigger_still_passes_mistake_bearing_lesson(self):
+        # pre-2026-07-18 behaviour preserved: no trigger ≠ conversational
+        assert is_actionable_lesson(
+            mistake="real mistake", solution="real fix", task="")
+
+    def test_long_resume_scenario_trigger_not_rejected_as_turn_command(self):
+        # turn-command rejection only applies to SHORT bare commands
+        trigger = ("resume of a long-running batch job after a crash requires "
+                   "replaying the journal before accepting new work")
+        assert is_actionable_lesson(
+            mistake="accepted new work before replaying the journal",
+            solution="Replay the journal first.",
+            task=trigger)

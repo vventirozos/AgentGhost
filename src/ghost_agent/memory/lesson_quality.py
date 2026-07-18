@@ -95,12 +95,80 @@ def _is_mistake_less(mistake) -> bool:
     return (str(mistake or "").strip().lower() in ("none", "", "n/a"))
 
 
+# --- conversational-trigger detection (2026-07-18) -------------------------
+#
+# The 2026-07-16 gate waves through any lesson that records a real mistake.
+# The overnight 2026-07-17/18 REM cycle showed the gap: real mistakes
+# attached to TRIGGERS lifted verbatim from user chat — "proceed with the
+# next task", "it still does the same. the game never starts, notify me in
+# slack when…". A trigger is the lesson's retrieval key; raw conversation
+# fragments are keys no future query will ever match, so such entries are
+# permanent playbook noise no matter how genuine the mistake was.
+#
+# Default-ACCEPT here (the inverse of the heuristic gate): a false reject
+# throws away a real correction, so only unambiguous user-speech tells
+# reject. "you/your" is deliberately allowed — rules addressed to the agent
+# ("…before you edit") legitimately use it.
+
+# Direct-address phrases — the agent being asked to contact/inform the
+# operator mid-conversation ("notify me in slack when…"). Deliberately
+# PHRASE-level, not bare pronouns: user-QUESTION triggers ("How do I
+# parse JSON?", "Please parse JSON!") are legitimate recurring retrieval
+# keys — the paraphrase-normalised dedup counts on them — so a bare
+# `\bi\b` / `please` match would reject real corrections.
+_TRIGGER_USER_SPEECH_RE = re.compile(
+    r"\b(?:notify|tell|ping|remind|message|text|email|send|slack)\s+(?:me|us)\b"
+    r"|\blet me know\b",
+    re.IGNORECASE,
+)
+
+# Pronoun-initial fragments with no antecedent ("it still does the same…")
+# and mid-conversation continuations. As PREFIXES of the normalised text.
+_TRIGGER_FRAGMENT_STARTERS = (
+    "it ", "its ", "it's ", "that ", "this ", "these ", "those ",
+    "same ", "still ", "again ", "and ", "but ", "also ",
+    "ok ", "okay ", "yes ", "no ", "now ",
+)
+
+# Bare turn-level commands ("proceed with the next task") — instructions
+# about the CONVERSATION, not about any recurring technical situation.
+# Only short triggers reject on these: a long trigger starting with
+# "continue" may legitimately describe a resume-a-job scenario.
+_TRIGGER_TURN_COMMANDS = (
+    "proceed", "continue", "go ahead", "try again", "do it", "next",
+    "carry on", "keep going", "retry", "resume",
+)
+_TRIGGER_TURN_COMMAND_MAX_LEN = 60
+
+
+def _is_conversational_trigger(trigger) -> bool:
+    """True iff ``trigger`` reads as a raw chat fragment rather than a
+    generalisable situation key."""
+    if not isinstance(trigger, str):
+        return False
+    t = " ".join(trigger.split())
+    if not t:
+        return False
+    low = t.lower()
+    if _TRIGGER_USER_SPEECH_RE.search(low):
+        return True
+    if any(low.startswith(s) for s in _TRIGGER_FRAGMENT_STARTERS):
+        return True
+    if len(low) <= _TRIGGER_TURN_COMMAND_MAX_LEN and any(
+        low.startswith(c) for c in _TRIGGER_TURN_COMMANDS
+    ):
+        return True
+    return False
+
+
 def is_actionable_lesson(mistake, solution, task) -> bool:
     """The lesson-level gate applied at the write chokepoint (2026-07-16).
 
-    A lesson that records a REAL mistake is a genuine correction — always
-    keep it (its solution phrasing is secondary to the fact that something
-    went wrong and was fixed). A MISTAKE-LESS entry is a rule/observation,
+    A lesson that records a REAL mistake is a genuine correction — keep it
+    unless its trigger is a raw chat fragment (2026-07-18; see
+    ``_is_conversational_trigger``), since the solution phrasing is
+    secondary to the fact that something went wrong and was fixed but the
+    trigger must still be a matchable key. A MISTAKE-LESS entry is a rule/observation,
     so its SOLUTION must read as an actionable heuristic; otherwise it is a
     pseudo-lesson (an observation / profile note / snippet) that matches no
     real query yet dominates retrieval.
@@ -110,8 +178,16 @@ def is_actionable_lesson(mistake, solution, task) -> bool:
     so equality is the normal shape of a valid short rule, not a degeneracy.
     """
     if not _is_mistake_less(mistake):
-        return True
+        # Real correction — keep, UNLESS its retrieval key is raw chat
+        # (see _is_conversational_trigger above). An empty task/trigger
+        # is not conversational and still passes, as before.
+        return not _is_conversational_trigger(task)
     return _is_actionable_heuristic(str(solution or "").strip())
 
 
-__all__ = ["_is_actionable_heuristic", "is_actionable_lesson", "_is_mistake_less"]
+__all__ = [
+    "_is_actionable_heuristic",
+    "is_actionable_lesson",
+    "_is_mistake_less",
+    "_is_conversational_trigger",
+]

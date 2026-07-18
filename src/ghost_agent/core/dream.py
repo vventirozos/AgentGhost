@@ -262,6 +262,85 @@ def _extract_filename_literals(source: str) -> set:
     return found
 
 
+def _datetime_misuse(source: str) -> str:
+    """Static lint for the datetime-module misuse family that killed two
+    self-play cycles in one overnight session (2026-07-17/18): the
+    generator writes `from datetime import datetime` and then calls
+    `datetime.timedelta(...)` (AttributeError: type object
+    'datetime.datetime' has no attribute 'timedelta'), or spells out
+    `datetime.datetime.timedelta`. Both are deterministic module-scope
+    crashes, but the setup script's only static gate is a syntax check
+    and the validator dry-run deliberately swallows AttributeError — so
+    they surfaced only at run/score time, wasting a whole cycle (and, at
+    score time, unfairly charging the agent). Returns a human-readable
+    description of the first misuse found, or '' when clean / unparseable
+    (syntax errors are the syntax gate's job, not ours).
+    """
+    if not source:
+        return ""
+    import ast as _ast
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return ""
+    class_bound = False   # `from datetime import datetime` → name binds the CLASS
+    module_bound = False  # `import datetime` → name binds the MODULE
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.ImportFrom) and node.module == "datetime":
+            for a in node.names:
+                if a.name == "datetime" and (a.asname or a.name) == "datetime":
+                    class_bound = True
+        elif isinstance(node, _ast.Import):
+            for a in node.names:
+                if a.name == "datetime" and (a.asname or a.name) == "datetime":
+                    module_bound = True
+    # Names that exist on the datetime MODULE but not (usably) on the
+    # datetime CLASS. Accessing them through the class raises
+    # AttributeError (timedelta, timezone, MINYEAR, MAXYEAR) or produces
+    # an unbound-descriptor TypeError at call time (date, time).
+    _module_only = {"timedelta", "timezone", "date", "time", "MINYEAR", "MAXYEAR"}
+    fix_hint = (
+        "Pick ONE import style: `import datetime` with "
+        "`datetime.datetime.strptime(...)` / `datetime.timedelta(...)`, "
+        "OR `from datetime import datetime, timedelta` with bare "
+        "`datetime.strptime(...)` / `timedelta(...)`."
+    )
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Attribute):
+            continue
+        # `datetime.datetime.<module-only-name>` — wrong regardless of
+        # import style (also catches `datetime.datetime.datetime`).
+        inner = node.value
+        if (
+            isinstance(inner, _ast.Attribute)
+            and isinstance(inner.value, _ast.Name)
+            and inner.value.id == "datetime"
+            and inner.attr == "datetime"
+            and node.attr in (_module_only | {"datetime"})
+        ):
+            return (
+                f"uses `datetime.datetime.{node.attr}` — that attribute "
+                f"lives on the datetime MODULE, not the datetime CLASS, "
+                f"so this crashes at runtime. {fix_hint}"
+            )
+        # `datetime.<module-only-name>` when `datetime` is the CLASS
+        # (from datetime import datetime) — the exact overnight crash.
+        if (
+            class_bound
+            and not module_bound
+            and isinstance(inner, _ast.Name)
+            and inner.id == "datetime"
+            and node.attr in _module_only
+        ):
+            return (
+                f"does `from datetime import datetime` and then uses "
+                f"`datetime.{node.attr}` — after that import, `datetime` "
+                f"is the CLASS and has no `{node.attr}`, so this crashes "
+                f"at runtime. {fix_hint}"
+            )
+    return ""
+
+
 def validate_reference_solution(setup_script: str, reference_solution: str) -> tuple:
     """Static gate on an LLM challenge's <reference_solution>.
 
@@ -340,6 +419,19 @@ def validate_challenge_quality(setup_script: str, validation_script: str) -> tup
             return False, (
                 f"setup_script has SyntaxError at line {e.lineno}: {e.msg}."
             )
+
+    # Datetime import-style misuse is a deterministic runtime crash the
+    # syntax check can't see — and it killed two cycles in one overnight
+    # session (setup crashed pre-attempt; validator crashed at SCORE
+    # time, turning an agent-solved run into a recorded failure).
+    # Rejecting here feeds the precise fix back into the regen loop.
+    for _label, _src in (
+        ("setup_script", setup_script or ""),
+        ("validation_script", validation_script),
+    ):
+        _misuse = _datetime_misuse(_src)
+        if _misuse:
+            return False, f"{_label} {_misuse}"
 
     # Strip comments/docstrings/strings before scanning for marker
     # tokens — otherwise a comment like `# do not use random.seed`
@@ -2342,7 +2434,7 @@ Return ONLY a JSON object with:
         system_message = SYNTHETIC_CHALLENGE_PROMPT
 
         # Add strict constraint to prevent token overflow
-        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags IN THIS ORDER: <challenge_prompt>, <setup_script>, <reference_solution>, and <validation_script> LAST. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </reference_solution>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements.\n11. F-STRING SAFETY: Inside f-string `{...}` braces, do NOT embed `[`, `(`, `'`, or `\"`. The Python parser frequently rejects these as 'closing parenthesis }' does not match opening parenthesis '['' or 'unterminated string'. Pre-compute the value into a local variable first and then interpolate the plain name. Example — bad: `print(f\"got {data['key'][0]}\")`; good: `v = data['key'][0]; print(f\"got {v}\")`. To print a literal brace, double it (`{{` / `}}`). This applies to BOTH setup_script and validation_script.\n12. REFERENCE SOLUTION: <reference_solution> is a complete, runnable solution.py that solves YOUR challenge by READING the mock files your setup_script wrote and COMPUTING the answer from them at runtime — NEVER print hardcoded expected values. It will be executed against your setup data and MUST pass your validator; if it does not, the entire challenge is discarded as internally inconsistent. Keep it under 40 lines."
+        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags IN THIS ORDER: <challenge_prompt>, <setup_script>, <reference_solution>, and <validation_script> LAST. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </reference_solution>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements.\n11. F-STRING SAFETY: Inside f-string `{...}` braces, do NOT embed `[`, `(`, `'`, or `\"`. The Python parser frequently rejects these as 'closing parenthesis }' does not match opening parenthesis '['' or 'unterminated string'. Pre-compute the value into a local variable first and then interpolate the plain name. Example — bad: `print(f\"got {data['key'][0]}\")`; good: `v = data['key'][0]; print(f\"got {v}\")`. To print a literal brace, double it (`{{` / `}}`). This applies to BOTH setup_script and validation_script.\n12. REFERENCE SOLUTION: <reference_solution> is a complete, runnable solution.py that solves YOUR challenge by READING the mock files your setup_script wrote and COMPUTING the answer from them at runtime — NEVER print hardcoded expected values. It will be executed against your setup data and MUST pass your validator; if it does not, the entire challenge is discarded as internally inconsistent. Keep it under 40 lines.\n13. DATETIME IMPORTS: pick ONE style and stick to it in EVERY script. Either `import datetime` and write `datetime.datetime.strptime(...)` / `datetime.timedelta(...)`, OR `from datetime import datetime, timedelta` and write bare `datetime.strptime(...)` / `timedelta(...)`. NEVER write `datetime.datetime.timedelta` and NEVER use `datetime.timedelta(...)` after `from datetime import datetime` — both crash with AttributeError at runtime."
 
         # Curiosity / frontier targeting: survey the FrontierTracker on the
         # real context (not the isolated one — this runs before isolation) to
@@ -2427,6 +2519,27 @@ Return ONLY a JSON object with:
             pretty_log("Self-Play Frontier", f"Targeting cluster '{seed.get('cluster_key')}' (mode={seed['mode']})", icon=Icons.BRAIN_AIM)
         else:
             pretty_log("Self-Play Frontier", f"Mode={seed['mode']} (no frontier seed)", icon=Icons.BRAIN_AIM)
+
+        # Feed the diversity window FORWARD as negative examples, so the
+        # first generation attempt already avoids recent themes instead
+        # of burning a regen on the similarity reject below. (The reject
+        # gate stays — this is the cheap first line, that is the backstop.)
+        if frontier_tracker is not None:
+            try:
+                _recent_heads = frontier_tracker.recent_generated_challenges(limit=5)
+            except Exception:
+                _recent_heads = []
+            if _recent_heads:
+                _themes = "\n".join(
+                    f"- {h[:160]}" for h in _recent_heads
+                )
+                system_message += (
+                    "\n\n### RECENTLY GENERATED CHALLENGES (do NOT repeat)\n"
+                    "The following themes were used in recent cycles. Your "
+                    "new challenge MUST differ from ALL of them in domain, "
+                    "mock-file name AND analytical goal — a reworded copy "
+                    "will be rejected:\n" + _themes
+                )
 
         # When the frontier is saturated, the LLM falls back to open-
         # ended challenge generation — and its default creative range
@@ -2938,6 +3051,31 @@ Return ONLY a JSON object with:
                 ok, reason = validate_reference_solution(
                     setup_script, reference_solution
                 )
+            # Diversity gate — reject a near-duplicate of a recently
+            # generated challenge BEFORE a solver attempt is spent on it.
+            # The generator mode-collapses onto a pet theme when left
+            # alone (4 of 6 challenges in the 2026-07-17 overnight run
+            # were the same transaction_log.csv fraud scan, reworded);
+            # a repeat pass carries no new signal and pollutes the
+            # cluster stats with duplicate data points.
+            if ok and frontier_tracker is not None and challenge:
+                try:
+                    _dup_sim, _dup_head = (
+                        frontier_tracker.most_similar_recent_challenge(challenge)
+                    )
+                except Exception as _dg_exc:
+                    logger.debug(f"Diversity guard check failed: {_dg_exc}")
+                    _dup_sim, _dup_head = 0.0, ""
+                if _dup_sim >= 0.60:
+                    ok = False
+                    reason = (
+                        f"challenge is a near-duplicate (token overlap "
+                        f"{_dup_sim:.2f}) of one generated recently: "
+                        f"\"{_dup_head[:140]}…\". Generate a challenge on a "
+                        f"DIFFERENT theme: new domain, new file format, new "
+                        f"analytical goal — do not reuse the same mock "
+                        f"dataset name or scenario."
+                    )
             if ok and not reference_solution:
                 # Soft requirement: the challenge is still usable, but the
                 # sandbox consistency gate will be skipped — surface that.
@@ -2949,6 +3087,16 @@ Return ONLY a JSON object with:
                 )
             if ok:
                 gen_ok = True
+                # Feed the diversity window (LLM-generated path only —
+                # deterministic templates rotate by design and must not
+                # be crowded out of their own themes).
+                if frontier_tracker is not None and challenge:
+                    try:
+                        await asyncio.to_thread(
+                            frontier_tracker.note_generated_challenge, challenge
+                        )
+                    except Exception as _dn_exc:
+                        logger.debug(f"Diversity window note failed: {_dn_exc}")
                 break
             pretty_log(
                 "Self-Play Quality Gate",
@@ -3403,7 +3551,13 @@ Return ONLY a JSON object with:
                     "    sys.exit(1)\n"
                     "try:\n"
                     "    exec(compile(src, '.validator.py', 'exec'), {'__name__': '__dry_run__'})\n"
-                    "except (NameError, ImportError, ModuleNotFoundError) as e:\n"
+                    # AttributeError joined the fatal set 2026-07-18: a
+                    # module-scope attribute-resolution bug (the datetime
+                    # import-style family) is deterministic — it cannot
+                    # depend on solution.py existing — and swallowing it
+                    # let a broken validator reach SCORE time, where its
+                    # crash was charged to the agent as a failed run.
+                    "except (NameError, ImportError, ModuleNotFoundError, AttributeError) as e:\n"
                     "    print(f'PRE-FLIGHT {type(e).__name__}: {e}', file=sys.stderr)\n"
                     "    sys.exit(2)\n"
                     "except SystemExit:\n"
@@ -3825,6 +3979,16 @@ Return ONLY a JSON object with:
                 # recording a "mistake" would poison the skill store)
                 # and to label status_str correctly.
                 aborted_by_solver = False
+                # Validator crashed in its OWN frame at score time — a
+                # GENERATOR infrastructure bug, not an agent failure.
+                # 2026-07-18 04:50 live run: the agent's solution.py ran
+                # clean (exit 0) but the validator died on a module-scope
+                # datetime AttributeError, and the run was recorded as
+                # FAILURE with a -1.0 frontier delta against the cluster.
+                # This flag routes such runs past the frontier record,
+                # the correctness score, and the adversarial-generator
+                # tracker — none of which should see generator noise.
+                validator_infra_crash = False
                 for attempt in range(3):
                     # Before every attempt (including attempt 0, which is
                     # a no-op because the setup just ran), restore the mock
@@ -3940,7 +4104,8 @@ Return ONLY a JSON object with:
                                         is_validator_crash = True
 
                             if is_validator_crash:
-                                pretty_log("Self-Play Abort", f"Validator script crashed or has syntax errors. Aborting. Feedback:\n{feedback[:250]}", level="ERROR", icon=Icons.STOP)
+                                validator_infra_crash = True
+                                pretty_log("Self-Play Abort", f"Validator script crashed or has syntax errors. Aborting (infra — not charged to the agent). Feedback:\n{feedback[:250]}", level="ERROR", icon=Icons.STOP)
                                 break
                                 
                             if len(feedback) > 1500:
@@ -4016,6 +4181,11 @@ Return ONLY a JSON object with:
                     status_str = f"SUCCESS (in {attempt + 1} attempts)"
                 elif aborted_by_solver:
                     status_str = f"ABORTED_BY_SOLVER (attempt {attempt + 1}/3)"
+                elif validator_infra_crash:
+                    status_str = (
+                        f"INFRA_ABORT (validator crashed on attempt "
+                        f"{attempt + 1} — generator bug, agent not charged)"
+                    )
                 elif attempt < 2:
                     status_str = f"FAILURE (Aborted on attempt {attempt + 1})"
                 else:
@@ -4089,7 +4259,20 @@ Return ONLY a JSON object with:
                     template_key = seed.get("cluster_key") or ""
 
                 frontier_result = {"compression_delta": 0.0, "is_new_cluster": True, "mastered": False}
-                if frontier_tracker is not None:
+                if frontier_tracker is not None and validator_infra_crash:
+                    # A broken validator says nothing about the agent's
+                    # competence on this cluster — recording it as a
+                    # failed run would push a real -1.0 delta into the
+                    # frontier stats (observed 2026-07-18 04:50: solution
+                    # ran clean, validator crashed, data_analysis got
+                    # delta=-1.000). Neutral no-op instead.
+                    pretty_log(
+                        "Self-Play Frontier",
+                        f"cluster={cluster_key} — record SKIPPED "
+                        "(validator infra crash; no delta recorded)",
+                        icon=Icons.BRAIN_AIM,
+                    )
+                elif frontier_tracker is not None:
                     try:
                         recorded = await asyncio.to_thread(
                             frontier_tracker.record_run,
@@ -4130,6 +4313,15 @@ Return ONLY a JSON object with:
                     gate_reason = (
                         "solver aborted (challenge structurally "
                         "unwinnable) → no agent-side lesson to write"
+                    )
+                elif validator_infra_crash:
+                    # Same poisoning risk as the solver-abort case: the
+                    # agent may well have SOLVED this challenge (the
+                    # 04:50 run had solution.py exit 0) — a "failure"
+                    # lesson from a generator bug would be pure noise.
+                    gate_reason = (
+                        "validator infra crash (generator bug, not an "
+                        "agent failure) → no lesson"
                     )
                 elif mastered:
                     gate_reason = "cluster mastered — skipping skill write"
@@ -4196,19 +4388,31 @@ Return ONLY a JSON object with:
                 # tool errors is penalised, a passing run with no errors
                 # and a positive compression delta gets a score > 1.
                 tool_errors = count_tool_errors(body.get("messages") or [])
-                cw_score = correctness_weighted_score(
-                    passed=bool(passed),
-                    compression_delta=compression_delta,
-                    tool_errors=tool_errors,
-                    novelty=solution_novelty,
-                    attempts_used=attempt + 1,
-                )
-                pretty_log(
-                    "Self-Play Score",
-                    f"correctness-weighted score={cw_score:+.3f} "
-                    f"(passed={passed}, Δ={compression_delta:+.3f}, tool_errors={tool_errors})",
-                    icon=Icons.BRAIN_AIM,
-                )
+                if validator_infra_crash:
+                    # `passed=False` here is an artifact of the broken
+                    # validator, not a measured outcome — a score would
+                    # be generator noise wearing an agent label.
+                    cw_score = 0.0
+                    pretty_log(
+                        "Self-Play Score",
+                        "skipped — validator infra crash, run not scored "
+                        "against the agent",
+                        icon=Icons.BRAIN_AIM,
+                    )
+                else:
+                    cw_score = correctness_weighted_score(
+                        passed=bool(passed),
+                        compression_delta=compression_delta,
+                        tool_errors=tool_errors,
+                        novelty=solution_novelty,
+                        attempts_used=attempt + 1,
+                    )
+                    pretty_log(
+                        "Self-Play Score",
+                        f"correctness-weighted score={cw_score:+.3f} "
+                        f"(passed={passed}, Δ={compression_delta:+.3f}, tool_errors={tool_errors})",
+                        icon=Icons.BRAIN_AIM,
+                    )
                 # (The correctness-weighted score is surfaced via the log
                 # line above; the watchdog cooldown reads last_compression_delta
                 # — set at the frontier-record step — not these. Earlier dead
@@ -4227,7 +4431,11 @@ Return ONLY a JSON object with:
                         fingerprint_prompt,
                     )
                     mem_dir = getattr(self.context, "memory_dir", None)
-                    if mem_dir is not None and not _tpl:
+                    # Infra crashes are excluded: a crash-prone generator
+                    # fingerprint would read as "hard challenge"
+                    # (passed=False) and get REINFORCED — the opposite of
+                    # what the tracker is for.
+                    if mem_dir is not None and not _tpl and not validator_infra_crash:
                         adv_tracker = AdversarialGeneratorTracker(Path(mem_dir))
                         fp = fingerprint_prompt(seed.get("hint", "") or "")
                         await asyncio.to_thread(

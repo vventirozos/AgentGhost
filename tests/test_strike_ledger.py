@@ -118,3 +118,42 @@ def test_note_action_distinct_targets_dont_trip():
     for n in range(5):
         tripped = led.note_action("browser", f".icon-{n}", fp)[2]
         assert tripped is False
+
+
+# ── world-changed reset (2026-07-18) ─────────────────────────────────────────
+# A successful file mutation invalidates accumulated no-progress
+# observations: re-observing after an edit is verification, not thrash.
+# Overnight log 2026-07-17: every fix-verify turn (requests 26/3B/72/1E/91)
+# had its post-fix browser navigate killed by the 2x-repeat breaker, and the
+# verifier then refuted the turn for missing post-fix evidence.
+
+def test_note_world_changed_resets_action_counts():
+    led = StrikeLedger()
+    fp = action_result_fingerprint("<html>landing page</html>")
+    led.note_action("browser", "http://127.0.0.1:8103/", fp, threshold=2)
+    assert led.note_action("browser", "http://127.0.0.1:8103/", fp, threshold=2)[2] is True
+    led.note_world_changed()
+    sig, count, tripped = led.note_action(
+        "browser", "http://127.0.0.1:8103/", fp, threshold=2)
+    assert count == 1
+    assert tripped is False
+
+
+def test_note_world_changed_clears_all_observation_signatures():
+    led = StrikeLedger()
+    fp = action_result_fingerprint("same")
+    led.note_action("browser", "http://a/", fp)
+    led.note_action("file_system", "game.js", fp)
+    led.note_world_changed()
+    assert led.action_sigs == {}
+
+
+def test_note_world_changed_leaves_failure_state_alone():
+    led = StrikeLedger()
+    for _ in range(3):
+        led.note_failure("read", "'x' not found")
+    assert led.decay_frozen
+    led.note_world_changed()
+    # failure-loop tracking is orthogonal — a file write must not unfreeze it
+    assert led.decay_frozen
+    assert led.failure_sigs

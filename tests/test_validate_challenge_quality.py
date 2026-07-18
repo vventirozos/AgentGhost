@@ -223,3 +223,99 @@ class TestValidatorRejectsUnwinnableSplitPattern:
         )
         ok, reason = validate_challenge_quality(setup, validator)
         assert ok is True, f"false-reject on non-len compare: {reason}"
+
+
+# ── datetime import-style lint (2026-07-18) ──────────────────────────────────
+# Two overnight cycles died on the same generated-script bug family:
+# `from datetime import datetime` + `datetime.timedelta(...)` (setup crashed
+# pre-attempt) and a `datetime.datetime.*` module-attr misuse in a validator
+# (crashed at SCORE time, charging the agent for a generator bug).
+
+from ghost_agent.core.dream import _datetime_misuse
+
+
+class TestDatetimeMisuseLint:
+    def test_class_import_then_module_attr_flagged(self):
+        src = (
+            "from datetime import datetime\n"
+            "start = datetime(2026, 1, 1)\n"
+            "ts = start + datetime.timedelta(seconds=30)\n"
+        )
+        msg = _datetime_misuse(src)
+        assert "datetime.timedelta" in msg
+
+    def test_double_qualified_module_attr_flagged(self):
+        src = (
+            "import datetime\n"
+            "delta = datetime.datetime.timedelta(days=1)\n"
+        )
+        msg = _datetime_misuse(src)
+        assert "datetime.datetime.timedelta" in msg
+
+    def test_module_import_style_clean(self):
+        src = (
+            "import datetime\n"
+            "t = datetime.datetime.strptime('2026-01-01', '%Y-%m-%d')\n"
+            "d = datetime.timedelta(days=2)\n"
+            "now = datetime.datetime.now()\n"
+        )
+        assert _datetime_misuse(src) == ""
+
+    def test_class_import_style_clean(self):
+        src = (
+            "from datetime import datetime, timedelta\n"
+            "t = datetime.strptime('2026-01-01', '%Y-%m-%d')\n"
+            "d = timedelta(days=2)\n"
+        )
+        assert _datetime_misuse(src) == ""
+
+    def test_both_import_styles_present_is_ambiguous_and_skipped(self):
+        # `import datetime` AND `from datetime import datetime` (rebinding) —
+        # resolution order is textual, not static; don't guess.
+        src = (
+            "import datetime\n"
+            "from datetime import datetime\n"
+            "d = datetime.timedelta(days=1)\n"
+        )
+        assert _datetime_misuse(src) == ""
+
+    def test_syntax_error_returns_clean(self):
+        # syntax problems are the syntax gate's job
+        assert _datetime_misuse("def broken(:\n    pass") == ""
+
+    def test_quality_gate_rejects_setup_with_misuse(self):
+        setup = (
+            "from datetime import datetime\n"
+            "import csv\n"
+            "with open('transaction_log.csv', 'w') as f:\n"
+            "    w = csv.writer(f)\n"
+            "    w.writerow(['ts'])\n"
+            "    w.writerow([str(datetime(2026,1,1) + datetime.timedelta(seconds=5))])\n"
+        )
+        validator = (
+            "with open('transaction_log.csv') as f:\n"
+            "    data = f.read()\n"
+            "import subprocess, sys\n"
+            "sys.exit(0)\n"
+        )
+        ok, reason = validate_challenge_quality(setup, validator)
+        assert not ok
+        assert "setup_script" in reason
+        assert "timedelta" in reason
+
+    def test_quality_gate_rejects_validator_with_misuse(self):
+        setup = (
+            "import csv\n"
+            "with open('transaction_log.csv', 'w') as f:\n"
+            "    csv.writer(f).writerow(['ts'])\n"
+        )
+        validator = (
+            "import datetime\n"
+            "with open('transaction_log.csv') as f:\n"
+            "    ts = datetime.datetime.timezone\n"
+            "import sys\n"
+            "sys.exit(0)\n"
+        )
+        ok, reason = validate_challenge_quality(setup, validator)
+        assert not ok
+        assert "validation_script" in reason

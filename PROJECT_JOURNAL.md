@@ -780,6 +780,43 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-18 — overnight log-eval fixes: fix-verify unblocked + self-play infra fairness + idle no-op skips
+From evaluating the 2026-07-17 21:01 → 07-18 06:25 log (game project bd75420e2d96 + idle loop):
+- **World-changed reset** (core/strikes.py + dispatch pipeline): a successful file_system
+  mutation clears the no-progress observation ledger + steer set + batch trip. Every fix-verify
+  turn (26/3B/72/1E/91) had its post-fix navigate killed by "repeated 2x with no new info";
+  in 3B the verifier then REFUTED for missing post-fix evidence — two guards fighting.
+  `execute` probes deliberately do NOT reset (probe loops must still trip).
+- **Batch dedup of identical read-only calls** (core/agent.py dispatch): the 22:14 batch ran
+  144 byte-identical file_system reads; dups now execute once, result fanned out, breaker
+  counts unchanged. Mutating dups never collapse.
+- **Self-play validator crashes = INFRA_ABORT** (core/dream.py): score-time validator crash no
+  longer records FAILURE/Δ=-1.0/score/adversarial-fingerprint (04:50 run: solution.py exit 0,
+  broken validator charged the agent). Pre-flight dry-run now also fails on module-scope
+  AttributeError; new `_datetime_misuse` AST lint rejects both observed datetime import-style
+  crashes at generation time (+ prompt rule 13).
+- **Challenge diversity guard** (memory/frontier.py + dream.py): rolling 12-head window of
+  recent LLM challenges; containment + shared-mock-filename bonus ≥0.60 rejects reworded
+  repeats (4/6 overnight were the same transaction_log.csv fraud scan); recent heads also fed
+  forward as negative examples in the gen prompt.
+- **Conversational-trigger gate** (memory/lesson_quality.py): mistake-bearing lessons no longer
+  bypass quality — triggers that are raw chat ("proceed with the next task", "it still does
+  the same… notify me in slack") reject; user-question triggers ("How do I parse JSON?") kept.
+- **Skip-if-unchanged idle gates** (distill/collector.py `corpus_fingerprint` + agent.py): PRM
+  retrain, router retrain, and reflection tick skip when the trajectory corpus is byte-identical
+  to the last completed pass (overnight: 3 identical refits each; 8× "reflected 0/60" walks).
+- **Game status**: the 06:20 menu-bounce fix VERIFIED working headless (overlays clear, 60fps
+  loop, no console errors) — but the canvas still renders BLACK: `Animation "undefined" not
+  found` every frame (animation.js startAnimation called with undefined name). That bug is
+  still open in the game project; the agent never got a clean in-turn verification of it
+  (loop-breaker conflict above — now fixed).
+- Tests: test_strike_ledger.py +3, test_dispatch_pipeline_extraction.py +4,
+  test_dream_synthetic.py +1, test_validate_challenge_quality.py +9,
+  test_frontier_diversity_guard.py (new, 7), test_distill_collector.py +4,
+  test_lesson_quality_gate.py +1 class; 2 old fixtures renamed (conversational-trigger
+  collisions). Docs: core/strikes.html, core/dream.html, core/agent.html, memory/frontier.html,
+  memory/skills.html.
+
 ### 2026-07-17 (later 8) — A3 trace fixes: remap note on failures + syntax-reject would-be snippet
 From evaluating the Prince-of-Persia parser request (A3, 22 turns, late-REFUTED correctly):
 - **Remap teaching note rides failed runs** (tools/execute.py): the "/workspace → project scope"

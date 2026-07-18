@@ -366,6 +366,14 @@
   <h2>Pre-flight guard: operation-aware key + block budget (2026-07-08)</h2>
   <p><code>RecentFailureGuard</code> now keys on <code>(tool, target, operation)</code> — previously <code>(tool, target)</code>, which blocked the model's correct <code>replace→write</code> recovery three times in a row (each after ~80&nbsp;s of full-file generation) because any file_system call on the failed target counted as a "repeat". The block message names legal alternatives (different operation/tool, fix the cause, ask the user), and a per-request <strong>block budget</strong> forces a final reply after 2 guard blocks — with operation-aware keying, two blocks mean genuinely identical re-issues of a known failure, so continuing is pure waste. Covered by <code>tests/test_guard_box_fixes.py</code>.</p>
 
+  <h2>Fix-verify unblocking + idle no-op skip gates (2026-07-18)</h2>
+  <p>Three fixes from the 2026-07-17 overnight log evaluation:</p>
+  <ul>
+    <li><strong>World-changed reset.</strong> A successful <code>file_system</code> mutation clears the no-progress observation ledger (<code>StrikeLedger.note_world_changed</code>), the once-per-signature steer set, and any batch-local trip — so the post-fix verification navigate is no longer killed as "repeated 2x with no new info". Every fix-verify turn of the overnight session died this way, and in one the verifier then REFUTED the turn for missing post-fix evidence. Details on the <a href="strikes.html#worldchanged">strikes page</a>.</li>
+    <li><strong>Batch dedup of identical read-only calls.</strong> One 22:14 batch carried 144 byte-identical <code>file_system</code> reads; duplicates now execute once and share the result (every <code>tool_call_id</code> still answered; the breaker's counts unchanged). Mutating duplicates never collapse. Covered by <code>tests/test_dispatch_pipeline_extraction.py</code>.</li>
+    <li><strong>Skip-if-unchanged idle gates.</strong> The PRM retrain, router retrain, and reflection phases now fingerprint the trajectory corpus (<code>TrajectoryCollector.corpus_fingerprint</code> — stat-level: name/size/mtime of every <code>.jsonl</code>) and skip the pass when nothing changed since the last completed one (reflection additionally requires the previous tick to have been all-duplicate). The overnight run refit PRM and router 3× each on an unchanged 693-trajectory corpus and re-walked the same 60 failures every reflection tick. Covered by <code>tests/test_distill_collector.py</code>.</li>
+  </ul>
+
   <h2>Finish-line honesty guards (2026-07-14)</h2>
   <p>Two ways a turn's ending could silently misrepresent what happened, both observed live during the code-correction failure-chain session (journal 2026-07-14j):</p>
   <ul>

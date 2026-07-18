@@ -72,6 +72,15 @@
   </ul>
   <p>The earlier implementation returned early on dedup without any state update. For deterministic templates the hash is stable across every re-roll, so a single struggled-then-won run would fossilise the cluster's <code>recent_outcomes[-1]</code> forever — no amount of subsequent clean wins could rotate the cluster out of the brittle pool. Incident 2026-04-21 11:56: 5 consecutive sql cycles all targeted the same template because the 09:06 DD struggled-then-won entry was pinned as the most-recent outcome.</p>
 
+  <h2>Generation-time diversity window (2026-07-18)</h2>
+  <p>The hash dedup above only refuses to <em>record</em> a byte-identical prompt — it cannot see a reworded near-duplicate, and it acts after the cycle already ran. State key <code>recent_challenges</code> now holds the head text (<code>RECENT_CHALLENGE_HEAD</code>&nbsp;=&nbsp;600 chars) of the last <code>RECENT_CHALLENGE_KEEP</code>&nbsp;=&nbsp;12 accepted LLM-generated challenges (templates excluded — they rotate by design and must not be crowded out of their own themes).</p>
+  <ul>
+    <li><code>note_generated_challenge(text)</code> — append at generation-accept time, independent of whether the run later records (an infra-aborted cycle still consumed the theme).</li>
+    <li><code>recent_generated_challenges(limit)</code> — newest-last heads, injected into the generation prompt as negative examples.</li>
+    <li><code>most_similar_recent_challenge(text) → (sim, head)</code> — token-set <em>containment</em> (|A∩B| / min|A|,|B| — robust to padded rewordings where Jaccard under-scores) plus <code>RECENT_CHALLENGE_FILE_BONUS</code>&nbsp;=&nbsp;0.25 when both texts name the same mock data file (the strongest repeat tell: the mode-collapsed generator reuses <code>transaction_log.csv</code> even when it rewords everything else). The dreamer rejects at ≥&nbsp;0.60. Measured: reworded fraud-scan pair → 0.66&nbsp;+&nbsp;bonus&nbsp;=&nbsp;0.91; different theme → 0.24.</li>
+  </ul>
+  <div class="note"><strong>Why:</strong> 4 of 6 LLM-generated challenges in the 2026-07-17 overnight run were the same <code>transaction_log.csv</code> fraud scan — each accepted, solved on attempt 1, recorded; zero new signal. Tests: <code>tests/test_frontier_diversity_guard.py</code>.</div>
+
   <h2>Saturation detection</h2>
   <p>A cluster is <strong>saturated</strong> when <code>_cluster_is_saturated(stats)</code> returns True: its last <code>SATURATION_WINDOW</code> runs are all first-try passes with delta &le; <code>SATURATION_DELTA_EPSILON</code>. Semantics: the template bank has no new learning signal for this cluster — continuing to target it burns cycles on material the agent already aces.</p>
   <p>Saturated clusters are filtered out of <code>_get_brittle_clusters_scored</code> so the brittleness lottery never re-picks them. <code>pick_seed</code> handles the "everything saturated" case by returning <code>mode="exploration"</code> with a <code>saturated_clusters</code> list attached for the caller:</p>

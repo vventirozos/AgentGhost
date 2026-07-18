@@ -138,3 +138,115 @@ async def test_finally_repacks_state_when_pipeline_raises():
         # final_ai_content; the finally-repack must still deliver it
         await agent._dispatch_and_process_tool_batch(ts)
     assert ts.final_ai_content == "A\n\nB"
+
+
+# ── batch-local duplicate collapse (2026-07-18) ─────────────────────────────
+# One response can carry a runaway burst of byte-identical read-only calls
+# (2026-07-17 22:14: 144 identical file_system reads in a single batch). The
+# dispatch now executes such duplicates ONCE and fans the result out; every
+# tool_call_id still gets a reply, and the no-progress ledger still counts
+# each repeat. Mutating duplicates are never collapsed.
+
+from ghost_agent.core.strikes import StrikeLedger
+
+
+@pytest.mark.asyncio
+async def test_duplicate_readonly_calls_execute_once_but_all_answered():
+    agent = _make_agent()
+    calls = {"n": 0}
+
+    async def probe(**kwargs):
+        calls["n"] += 1
+        return f"probe-result-{calls['n']}"
+
+    agent.available_tools = {"probe_tool": probe}
+    tc = [
+        {"id": f"t{i}", "type": "function",
+         "function": {"name": "probe_tool", "arguments": '{"q": "same"}'}}
+        for i in range(3)
+    ]
+    ts = _make_ts(tool_calls=tc, strikes=StrikeLedger(),
+                  repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts)
+
+    assert calls["n"] == 1  # executed exactly once
+    tool_msgs = [m for m in ts.messages if m.get("role") == "tool"]
+    assert len(tool_msgs) == 3  # every call id answered
+    assert len({m["content"] for m in tool_msgs}) == 1  # shared result
+
+
+@pytest.mark.asyncio
+async def test_distinct_readonly_calls_not_collapsed():
+    agent = _make_agent()
+    calls = {"n": 0}
+
+    async def probe(**kwargs):
+        calls["n"] += 1
+        return f"probe-result-{calls['n']}"
+
+    agent.available_tools = {"probe_tool": probe}
+    tc = [
+        {"id": "t0", "type": "function",
+         "function": {"name": "probe_tool", "arguments": '{"q": "alpha"}'}},
+        {"id": "t1", "type": "function",
+         "function": {"name": "probe_tool", "arguments": '{"q": "beta"}'}},
+    ]
+    ts = _make_ts(tool_calls=tc, strikes=StrikeLedger(),
+                  repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts)
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_duplicate_mutating_calls_not_collapsed():
+    agent = _make_agent()
+    calls = {"n": 0}
+
+    async def fs(**kwargs):
+        calls["n"] += 1
+        return "written"
+
+    agent.available_tools = {"file_system": fs}
+    tc = [
+        {"id": f"m{i}", "type": "function",
+         "function": {"name": "file_system",
+                      "arguments": '{"operation": "write", "path": "a.txt", "content": "x"}'}}
+        for i in range(2)
+    ]
+    ts = _make_ts(tool_calls=tc, strikes=StrikeLedger(),
+                  repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts)
+    assert calls["n"] == 2  # a repeated write may be intentional — run both
+
+
+@pytest.mark.asyncio
+async def test_successful_file_write_resets_noprogress_ledger():
+    """World-changed reset: a file mutation clears accumulated no-progress
+    observations, so a post-fix re-observation is verification, not a loop."""
+    agent = _make_agent()
+
+    async def probe(**kwargs):
+        return "same page content"
+
+    async def fs(**kwargs):
+        return "SUCCESS: wrote a.txt"
+
+    agent.available_tools = {"probe_tool": probe, "file_system": fs}
+    strikes = StrikeLedger()
+
+    # accumulate one observation of the page
+    ts1 = _make_ts(tool_calls=[
+        {"id": "t0", "type": "function",
+         "function": {"name": "probe_tool", "arguments": '{"q": "page"}'}},
+    ], strikes=strikes, repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts1)
+    assert strikes.action_sigs  # observation counted
+
+    # a successful write must clear the observation ledger
+    ts2 = _make_ts(tool_calls=[
+        {"id": "m0", "type": "function",
+         "function": {"name": "file_system",
+                      "arguments": '{"operation": "write", "path": "a.txt", "content": "x"}'}},
+    ], strikes=strikes, repeated_action_steered=set())
+    await agent._dispatch_and_process_tool_batch(ts2)
+    assert strikes.action_sigs == {}

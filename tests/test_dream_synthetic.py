@@ -490,3 +490,59 @@ async def test_synthetic_self_play_regex_fallback_eof(mock_ghost_agent_class, mo
     
     # Validation should succeed and not crash with "Failed to extract challenge..."
     assert "SUCCESS" in result
+
+
+@pytest.mark.asyncio
+@patch("ghost_agent.sandbox.docker.DockerSandbox")
+@patch("ghost_agent.core.agent.GhostAgent")
+async def test_synthetic_self_play_validator_crash_is_infra_abort(
+    mock_ghost_agent_class, mock_docker_sandbox_class, mock_context,
+    disable_self_play_templates,
+):
+    """2026-07-18: a validator that crashes in its OWN frame at score time is
+    a GENERATOR bug — the run must conclude INFRA_ABORT, not FAILURE (the
+    04:50 overnight run had solution.py exit 0 yet recorded a -1.0 frontier
+    delta because the broken validator was charged to the agent)."""
+    dreamer = Dreamer(mock_context)
+
+    llm_payload = {
+        "setup_script": "print('mock data ready')",
+        "challenge_prompt": "Compute the answer from the mock data",
+        "validation_script": "import sys\nsys.exit(1)\n",
+    }
+    mock_context.llm_client.chat_completion = AsyncMock(return_value={
+        "choices": [{"message": {"content": dict_to_xml(llm_payload)}}]
+    })
+
+    mock_agent_instance = MagicMock()
+    mock_agent_instance.handle_chat = AsyncMock(
+        return_value=("solution.py written and executed cleanly", None, None))
+    mock_agent_instance._get_recent_transcript.return_value = "Mock transcript"
+    mock_ghost_agent_class.return_value = mock_agent_instance
+
+    crash_tb = (
+        "Traceback (most recent call last):\n"
+        '  File "/workspace/.validator.py", line 15, in <module>\n'
+        "    current_ts = datetime.datetime.strptime(row['timestamp'], fmt)\n"
+        "AttributeError: type object 'datetime.datetime' has no attribute 'foo'"
+    )
+
+    mock_sandbox_instance = MagicMock()
+
+    def side_effect(cmd, *args, **kwargs):
+        if ".preflight.py" in cmd or "py_compile" in cmd:
+            return ("", 0)
+        if "python3 .setup.py" in cmd:
+            return ("setup ok", 0)
+        if "python3 .validator.py" in cmd:
+            return (crash_tb, 1)
+        return ("ok", 0)
+
+    mock_sandbox_instance.execute.side_effect = side_effect
+    mock_docker_sandbox_class.return_value = mock_sandbox_instance
+
+    result = await dreamer.synthetic_self_play("test-model")
+
+    assert "INFRA_ABORT" in result
+    # neutral cooldown signal — a generator bug must not read as a failure
+    assert dreamer.last_compression_delta == 0.0

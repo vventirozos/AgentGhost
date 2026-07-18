@@ -188,6 +188,94 @@ class FrontierTracker:
             return ""
         return hashlib.sha1(challenge.strip().encode("utf-8")).hexdigest()[:16]
 
+    # -- generation-time diversity guard ---------------------------------
+    #
+    # The exact-hash dedup above only refuses to RECORD a byte-identical
+    # prompt; it cannot see a reworded near-duplicate, and it acts after
+    # the cycle already ran. Observed 2026-07-17/18: 4 of 6 overnight
+    # LLM-generated challenges were the same "transaction_log.csv fraud
+    # scan" task in fresh wording — each solved on attempt 1, each
+    # recorded, zero new signal. The guard below keeps the HEAD TEXT of
+    # recently generated challenges and lets the dreamer reject a new
+    # candidate whose token overlap with any of them is too high, before
+    # a solver attempt is spent on it.
+
+    #: rolling window of recent challenge heads kept for similarity checks.
+    RECENT_CHALLENGE_KEEP = 12
+    #: how much of each challenge text to retain — enough for a stable
+    #: token profile, small enough to keep the frontier JSON tight.
+    RECENT_CHALLENGE_HEAD = 600
+
+    @staticmethod
+    def _challenge_token_set(text: str) -> set:
+        """Lower-cased identifier-ish tokens (len>2) — the comparison
+        basis for near-duplicate detection. Filenames, column names and
+        domain nouns dominate the set, which is exactly what repeats when
+        the generator is stuck on a theme."""
+        return {t for t in re.findall(r"[a-z0-9_]+", (text or "").lower()) if len(t) > 2}
+
+    def note_generated_challenge(self, challenge: str) -> None:
+        """Remember a freshly ACCEPTED challenge's head for the diversity
+        guard. Called at generation time, independent of whether the run
+        later records a result (an infra-aborted cycle still consumed the
+        theme — the generator must not serve it again next hour)."""
+        head = (challenge or "").strip()[: self.RECENT_CHALLENGE_HEAD]
+        if not head:
+            return
+        with self._lock, self._crossproc_lock():
+            state = self._load()
+            recent = state.setdefault("recent_challenges", [])
+            recent.append(head)
+            del recent[: max(0, len(recent) - self.RECENT_CHALLENGE_KEEP)]
+            self._save(state)
+
+    def recent_generated_challenges(self, limit: int = 5) -> list:
+        """Most recent challenge heads (newest last), for use as negative
+        examples in the generation prompt."""
+        with self._lock:
+            recent = self._load().get("recent_challenges", []) or []
+        return list(recent[-max(0, int(limit)):])
+
+    #: filename-looking literals — the single strongest repeat tell: the
+    #: mode-collapsed generator reuses the same mock dataset name even
+    #: when it rewords everything else (`transaction_log.csv`, 4× in the
+    #: 2026-07-17 overnight run). A shared filename adds this bonus.
+    _CHALLENGE_FILE_RE = re.compile(
+        r"[\w./-]+\.(?:csv|tsv|json|jsonl|db|sqlite|txt|log|parquet|xml|yaml|yml)\b"
+    )
+    RECENT_CHALLENGE_FILE_BONUS = 0.25
+
+    def most_similar_recent_challenge(self, challenge: str) -> tuple:
+        """Return ``(similarity, head)`` for the recently generated
+        challenge most similar to ``challenge``. Similarity is token-set
+        CONTAINMENT (|A∩B| / min(|A|,|B|) — robust to one text being a
+        padded rewording of the other, where plain Jaccard under-scores)
+        plus ``RECENT_CHALLENGE_FILE_BONUS`` when both texts name the
+        same mock data file. Capped at 1.0. ``(0.0, "")`` when there is
+        no history or no tokens. Measured on the overnight duplicates:
+        reworded fraud-scan pair → 0.66 + bonus = 0.91; genuinely
+        different theme → 0.24, no bonus."""
+        cand = self._challenge_token_set(challenge)
+        if not cand:
+            return 0.0, ""
+        cand_files = set(self._CHALLENGE_FILE_RE.findall((challenge or "").lower()))
+        with self._lock:
+            recent = self._load().get("recent_challenges", []) or []
+        best, best_head = 0.0, ""
+        for head in recent:
+            prior = self._challenge_token_set(head)
+            if not prior:
+                continue
+            denom = min(len(cand), len(prior))
+            sim = (len(cand & prior) / denom) if denom else 0.0
+            if cand_files and cand_files & set(
+                self._CHALLENGE_FILE_RE.findall(head.lower())
+            ):
+                sim = min(1.0, sim + self.RECENT_CHALLENGE_FILE_BONUS)
+            if sim > best:
+                best, best_head = sim, head
+        return best, best_head
+
     def get_cluster_stats(self, cluster_key: str) -> dict:
         with self._lock:
             return self._load().get("clusters", {}).get(cluster_key, {})

@@ -2747,6 +2747,16 @@ class GhostAgent:
             self._last_stale_questions_at = datetime.datetime.min
         if not hasattr(self, '_last_router_train_at'):
             self._last_router_train_at = datetime.datetime.min
+        # Corpus fingerprints from the last COMPLETED PRM / router refit.
+        # When the trajectory corpus hasn't changed since, the refit would
+        # reproduce the identical model — skip the pass entirely (the
+        # 2026-07-17 overnight run refit both 3× on an unchanged corpus).
+        if not hasattr(self, '_prm_corpus_fp'):
+            self._prm_corpus_fp = None
+        if not hasattr(self, '_router_corpus_fp'):
+            self._router_corpus_fp = None
+        if not hasattr(self, '_reflection_corpus_fp'):
+            self._reflection_corpus_fp = None
         if not hasattr(self, '_last_calib_refit_at'):
             self._last_calib_refit_at = datetime.datetime.min
         if not hasattr(self, '_last_autoadvance_at'):
@@ -2876,6 +2886,30 @@ class GhostAgent:
             if since_last_reflection >= self._REFLECTION_COOLDOWN:
                 reflector = getattr(ctx, 'reflector', None)
                 traj_collector = getattr(ctx, 'trajectory_collector', None)
+                # Skip-if-unchanged gate (2026-07-18): when the trajectory
+                # corpus is byte-identical to the previous tick's AND that
+                # tick reflected nothing new, this tick will deterministically
+                # walk the same failures into the same dedup set again
+                # (overnight log: eight consecutive "reflected 0/60,
+                # dup-skipped 60" cycles). One stat pass replaces a full
+                # JSONL parse of every day file. Any corpus change — or a
+                # tick that DID reflect something — re-arms the phase.
+                _refl_corpus_fp = None
+                if reflector is not None and traj_collector is not None:
+                    try:
+                        _refl_fp_fn = getattr(traj_collector, 'corpus_fingerprint', None)
+                        if callable(_refl_fp_fn):
+                            _refl_corpus_fp = await asyncio.to_thread(_refl_fp_fn)
+                    except Exception:
+                        _refl_corpus_fp = None
+                    if (_refl_corpus_fp is not None
+                            and _refl_corpus_fp == getattr(self, '_reflection_corpus_fp', None)):
+                        self._last_reflection_at = datetime.datetime.now()
+                        logger.debug(
+                            "Reflection tick skipped: corpus unchanged since "
+                            "an all-duplicate pass (%s)", _refl_corpus_fp,
+                        )
+                        reflector = None  # falls through the phase gate below
                 if reflector is not None and traj_collector is not None:
                     pretty_log(
                         "Biological Hook",
@@ -2906,6 +2940,15 @@ class GhostAgent:
                         # Persist the advanced dedup set so the progress
                         # survives the next restart.
                         self._persist_reflected_ids()
+                        # Arm the skip gate ONLY after a do-nothing pass
+                        # (everything dup-skipped, no errors): the next
+                        # tick can then bail on the fingerprint alone.
+                        # Errors stay re-armed — they may be transient.
+                        if (report.reflected_ok == 0
+                                and report.reflected_errors == 0):
+                            self._reflection_corpus_fp = _refl_corpus_fp
+                        else:
+                            self._reflection_corpus_fp = None
                         pretty_log(
                             "Biological Hook",
                             f"Reflection complete: {report.summary()}",
@@ -3174,48 +3217,71 @@ class GhostAgent:
                     and isinstance(prm_scorer, _PRMScorer)
                 ):
                     self._last_prm_train_at = datetime.datetime.now()
+                    # Skip-if-unchanged gate: stat-level corpus fingerprint.
+                    # Same-fingerprint ⇒ identical training data ⇒ the refit
+                    # is a guaranteed no-op — don't burn the pass or log a
+                    # "refit" line that implies fresh signal.
+                    _corpus_fp = None
                     try:
-                        from ..prm import PRMTrainer
-                        save_path = getattr(ctx, '_prm_checkpoint_path', None)
-                        if save_path is None:
-                            base_mem = getattr(ctx, 'memory_dir', None)
-                            if base_mem is not None:
-                                save_path = base_mem.parent / "prm" / "checkpoint.json"
-                        trainer = PRMTrainer()
-                        report = await asyncio.to_thread(
-                            trainer.run,
-                            trajectories=traj_collector.iter_trajectories(),
-                            save_path=save_path,
+                        _fp_fn = getattr(traj_collector, 'corpus_fingerprint', None)
+                        if callable(_fp_fn):
+                            _corpus_fp = await asyncio.to_thread(_fp_fn)
+                    except Exception:
+                        _corpus_fp = None
+                    if _corpus_fp is not None and _corpus_fp == self._prm_corpus_fp:
+                        pretty_log(
+                            "PRM Retrain",
+                            "skipped — trajectory corpus unchanged since last refit",
+                            icon=Icons.SKIP,
                         )
-                        if report.fit_succeeded and trainer.model is not None:
-                            prm_scorer.set_model(trainer.model)
-                            # Plug into MCTS if it's attached but not yet
-                            # using the PRM (first-ever fit case).
-                            mcts = getattr(ctx, 'mcts_reasoner', None)
-                            mcts_note = ""
-                            if mcts is not None and getattr(mcts, 'prm_scorer', None) is None:
-                                mcts.prm_scorer = prm_scorer
-                                mcts_note = " · MCTS now scoring via PRM"
-                            elif mcts is not None and getattr(mcts, 'prm_scorer', None) is prm_scorer:
-                                mcts_note = " · MCTS weights refreshed"
-                            pretty_log(
-                                "PRM Retrain",
-                                f"value model refit on idle: {report.summary()}{mcts_note}",
-                                icon=Icons.BRAIN_PLAN,
+                    else:
+                        try:
+                            from ..prm import PRMTrainer
+                            save_path = getattr(ctx, '_prm_checkpoint_path', None)
+                            if save_path is None:
+                                base_mem = getattr(ctx, 'memory_dir', None)
+                                if base_mem is not None:
+                                    save_path = base_mem.parent / "prm" / "checkpoint.json"
+                            trainer = PRMTrainer()
+                            report = await asyncio.to_thread(
+                                trainer.run,
+                                trajectories=traj_collector.iter_trajectories(),
+                                save_path=save_path,
                             )
-                            self._record_autonomous_activity(
-                                "prm_train",
-                                f"value model refit: {report.summary()}"
-                                f"{mcts_note}")
-                        else:
-                            logger.debug(
-                                "PRM idle retrain skipped: %s",
-                                report.bail_reason or "unknown",
-                            )
-                    except Exception as e:
-                        logger.warning(f"PRM retrain phase failed: {e}")
-                    finally:
-                        self._last_prm_train_at = datetime.datetime.now()
+                            # Record the fingerprint once the pass ran to
+                            # completion (fit OR clean bail) — both are
+                            # deterministic in the corpus, so re-running on
+                            # the same bytes is pointless either way.
+                            self._prm_corpus_fp = _corpus_fp
+                            if report.fit_succeeded and trainer.model is not None:
+                                prm_scorer.set_model(trainer.model)
+                                # Plug into MCTS if it's attached but not yet
+                                # using the PRM (first-ever fit case).
+                                mcts = getattr(ctx, 'mcts_reasoner', None)
+                                mcts_note = ""
+                                if mcts is not None and getattr(mcts, 'prm_scorer', None) is None:
+                                    mcts.prm_scorer = prm_scorer
+                                    mcts_note = " · MCTS now scoring via PRM"
+                                elif mcts is not None and getattr(mcts, 'prm_scorer', None) is prm_scorer:
+                                    mcts_note = " · MCTS weights refreshed"
+                                pretty_log(
+                                    "PRM Retrain",
+                                    f"value model refit on idle: {report.summary()}{mcts_note}",
+                                    icon=Icons.BRAIN_PLAN,
+                                )
+                                self._record_autonomous_activity(
+                                    "prm_train",
+                                    f"value model refit: {report.summary()}"
+                                    f"{mcts_note}")
+                            else:
+                                logger.debug(
+                                    "PRM idle retrain skipped: %s",
+                                    report.bail_reason or "unknown",
+                                )
+                        except Exception as e:
+                            logger.warning(f"PRM retrain phase failed: {e}")
+                        finally:
+                            self._last_prm_train_at = datetime.datetime.now()
 
         # Phase 2.7b: Router classifier retrain on accumulated trajectories.
         # Mirrors the PRM phase. The router ships UNTRAINED (escalates every
@@ -3236,50 +3302,68 @@ class GhostAgent:
                 if (isinstance(traj_collector, _TrajColCls)
                         and isinstance(dispatcher, _ComplexityDispatcher)):
                     self._last_router_train_at = datetime.datetime.now()
+                    # Skip-if-unchanged gate — same rationale as the PRM
+                    # phase above: identical corpus ⇒ identical classifier.
+                    _rt_corpus_fp = None
                     try:
-                        from ..router import RouterTrainer
-                        save_path = getattr(ctx, '_router_checkpoint_path', None)
-                        if save_path is None:
-                            base_mem = getattr(ctx, 'memory_dir', None)
-                            if base_mem is not None:
-                                save_path = base_mem.parent / "router" / "checkpoint.json"
-                        trainer = RouterTrainer()
-                        report = await asyncio.to_thread(
-                            trainer.run,
-                            trajectories=traj_collector.iter_trajectories(),
-                            save_path=save_path,
+                        _rt_fp_fn = getattr(traj_collector, 'corpus_fingerprint', None)
+                        if callable(_rt_fp_fn):
+                            _rt_corpus_fp = await asyncio.to_thread(_rt_fp_fn)
+                    except Exception:
+                        _rt_corpus_fp = None
+                    if (_rt_corpus_fp is not None
+                            and _rt_corpus_fp == self._router_corpus_fp):
+                        pretty_log(
+                            "Router Retrain",
+                            "skipped — trajectory corpus unchanged since last refit",
+                            icon=Icons.SKIP,
                         )
-                        _new_clf = trainer.classifier
-                        if (report.fit_succeeded and _new_clf is not None
-                                and _new_clf.is_finite()):
-                            # Hot-swap: the dispatcher re-reads .classifier /
-                            # .disabled on every route() call, so this takes
-                            # effect immediately (no restart). The is_finite()
-                            # gate is defence-in-depth — fit() already raises on
-                            # divergence, but a NaN classifier must NEVER reach
-                            # the live router (it would return NaN confidences).
-                            dispatcher.classifier = _new_clf
-                            dispatcher.disabled = False
-                            pretty_log(
-                                "Router Retrain",
-                                f"classifier refit on idle: {report.summary()} · "
-                                f"router now routing (was escalate-all)",
-                                icon=Icons.BRAIN_PLAN,
+                    else:
+                        try:
+                            from ..router import RouterTrainer
+                            save_path = getattr(ctx, '_router_checkpoint_path', None)
+                            if save_path is None:
+                                base_mem = getattr(ctx, 'memory_dir', None)
+                                if base_mem is not None:
+                                    save_path = base_mem.parent / "router" / "checkpoint.json"
+                            trainer = RouterTrainer()
+                            report = await asyncio.to_thread(
+                                trainer.run,
+                                trajectories=traj_collector.iter_trajectories(),
+                                save_path=save_path,
                             )
-                            self._record_autonomous_activity(
-                                "router_train",
-                                f"complexity router refit: {report.summary()}")
-                        elif _new_clf is not None and not _new_clf.is_finite():
-                            logger.warning(
-                                "Router idle retrain produced a non-finite model "
-                                "— NOT hot-swapping; router stays escalate-all."
-                            )
-                        else:
-                            logger.debug("Router idle retrain skipped: %s", report.bail_reason or "unknown")
-                    except Exception as e:
-                        logger.warning(f"Router retrain phase failed: {e}")
-                    finally:
-                        self._last_router_train_at = datetime.datetime.now()
+                            self._router_corpus_fp = _rt_corpus_fp
+                            _new_clf = trainer.classifier
+                            if (report.fit_succeeded and _new_clf is not None
+                                    and _new_clf.is_finite()):
+                                # Hot-swap: the dispatcher re-reads .classifier /
+                                # .disabled on every route() call, so this takes
+                                # effect immediately (no restart). The is_finite()
+                                # gate is defence-in-depth — fit() already raises on
+                                # divergence, but a NaN classifier must NEVER reach
+                                # the live router (it would return NaN confidences).
+                                dispatcher.classifier = _new_clf
+                                dispatcher.disabled = False
+                                pretty_log(
+                                    "Router Retrain",
+                                    f"classifier refit on idle: {report.summary()} · "
+                                    f"router now routing (was escalate-all)",
+                                    icon=Icons.BRAIN_PLAN,
+                                )
+                                self._record_autonomous_activity(
+                                    "router_train",
+                                    f"complexity router refit: {report.summary()}")
+                            elif _new_clf is not None and not _new_clf.is_finite():
+                                logger.warning(
+                                    "Router idle retrain produced a non-finite model "
+                                    "— NOT hot-swapping; router stays escalate-all."
+                                )
+                            else:
+                                logger.debug("Router idle retrain skipped: %s", report.bail_reason or "unknown")
+                        except Exception as e:
+                            logger.warning(f"Router retrain phase failed: {e}")
+                        finally:
+                            self._last_router_train_at = datetime.datetime.now()
 
         # Phase 2.7c: Calibration refit (roadmap phase 2.5). Re-fits the
         # confidence threshold τ + entropy/competence weights + the
@@ -6356,6 +6440,19 @@ class GhostAgent:
             # SUCCESS (a failed call must not block its own
             # corrected retry on the next iteration).
             pending_idempotent = set()
+            # Batch-local collapse of byte-identical READ-ONLY calls: a
+            # single response can carry a runaway burst of duplicates
+            # (2026-07-17 22:14 request: one batch held 144 identical
+            # file_system reads of the same path — the no-progress
+            # breaker aborted correctly, but only after the sandbox
+            # executed every one of them). Duplicates execute ONCE; the
+            # other tool_call_ids receive a copy of that result, so the
+            # model still gets one reply per call and the no-progress
+            # ledger still counts every repeat (the breaker's view is
+            # unchanged). Mutating calls are never collapsed — repeating
+            # a write can be intentional.
+            batch_seen_reads: dict = {}   # a_hash -> index of first dispatch
+            batch_dup_of: dict = {}       # dup index -> source index
             for _tc_idx, tool in enumerate(tool_calls):
                 # Strike cap inside the per-tool loop. The outer cap
                 # at the top of the turn loop only runs at turn
@@ -6826,9 +6923,22 @@ class GhostAgent:
                         # duration lands in tool_durations[idx] (parallel to
                         # results/metadata) — feeds the metacog runtime-budget
                         # anomaly window.
-                        _coro = self.available_tools[fname](**t_args)
-                        tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
-                        tool_durations.append(None)
+                        _dup_src_idx = None if is_mutating else batch_seen_reads.get(a_hash)
+                        if _dup_src_idx is not None:
+                            # Duplicate read-only call in the SAME batch —
+                            # register a placeholder task; the result is
+                            # copied from the first instance after the
+                            # gather phases. The coroutine is deliberately
+                            # never created (an unawaited coroutine warns).
+                            batch_dup_of[len(tool_tasks)] = _dup_src_idx
+                            tool_tasks.append(None)
+                            tool_durations.append(None)
+                        else:
+                            _coro = self.available_tools[fname](**t_args)
+                            tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
+                            tool_durations.append(None)
+                            if not is_mutating:
+                                batch_seen_reads[a_hash] = len(tool_tasks) - 1
                         tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or "")))
                         # The DURABLE idempotency hash is recorded at
                         # the RESULT-processing site, and only when
@@ -6876,6 +6986,8 @@ class GhostAgent:
                 # Phase 1: Mutations
                 mutation_coros = []
                 for i, (task, meta) in enumerate(zip(tool_tasks, tool_call_metadata)):
+                    if task is None:
+                        continue  # batch-dedup placeholder, filled below
                     if meta[0] == "file_system":
                         mutation_coros.append((i, task))
 
@@ -6887,6 +6999,8 @@ class GhostAgent:
                 # Phase 2: Executions
                 exec_coros = []
                 for i, (task, meta) in enumerate(zip(tool_tasks, tool_call_metadata)):
+                    if task is None:
+                        continue  # batch-dedup placeholder, filled below
                     if meta[0] != "file_system":
                         exec_coros.append((i, task))
 
@@ -6894,6 +7008,19 @@ class GhostAgent:
                     exec_results = await asyncio.gather(*(c[1] for c in exec_coros), return_exceptions=True)
                     for (i, _), res in zip(exec_coros, exec_results):
                         results[i] = res
+
+                # Phase 3: fan the first instance's result out to its
+                # batch-local duplicates (read-only calls collapsed at
+                # dispatch — see batch_seen_reads above).
+                if batch_dup_of:
+                    for i, src in batch_dup_of.items():
+                        results[i] = results[src]
+                    pretty_log(
+                        "Batch Dedup",
+                        f"Collapsed {len(batch_dup_of)} duplicate read-only "
+                        f"call(s) in one batch — executed once, result shared.",
+                        icon=Icons.SKIP,
+                    )
 
                 turn_has_failure = False
                 last_error_res = ""
@@ -7164,6 +7291,24 @@ class GhostAgent:
                     _res_is_error = isinstance(result, Exception) or str_res.lstrip().startswith(
                         ("Error", "ERROR", "SYSTEM ERROR", "Critical Tool Error")
                     ) or "Traceback" in str_res
+                    # World-changed reset: a SUCCESSFUL file mutation
+                    # invalidates every no-progress observation counted so
+                    # far — re-observing after an edit is verification of
+                    # the change, not thrash, even when the observation
+                    # comes back byte-identical (a landing page can be
+                    # unchanged while the fix targets a deeper state).
+                    # Scoped to file_system mutations on purpose: `execute`
+                    # probes stay exempt, so a probe loop that keeps
+                    # returning identical results still trips the breaker
+                    # (the steer message explicitly tells the model to
+                    # probe — resetting on probes would nullify the trip).
+                    # See StrikeLedger.note_world_changed for the observed
+                    # failure this closes.
+                    if (fname == "file_system" and is_mutating
+                            and not _res_is_error):
+                        strikes.note_world_changed()
+                        repeated_action_steered.clear()
+                        _noprogress_trip = None
                     if fname and not is_mutating and not _res_is_error:
                         # threshold=2 (was 3): the SECOND identical
                         # read is already zero-information — nudge

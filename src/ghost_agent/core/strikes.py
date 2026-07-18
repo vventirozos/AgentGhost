@@ -207,6 +207,27 @@ class StrikeLedger:
             self.action_sigs, fname, target, result_fp, threshold
         )
 
+    def note_world_changed(self) -> None:
+        """Forget every accumulated no-progress observation. Called when a
+        file mutation SUCCEEDS: the workspace just changed, so a repeat of
+        an earlier observation (re-navigate the served page, re-read the
+        file) is now VERIFICATION of the change, not an ungrounded loop —
+        even when the observation comes back byte-identical (the fix may
+        target a different page state than the one being re-observed).
+
+        Without this reset the breaker and the verifier fight each other:
+        every fix-verify turn of the 2026-07-17 overnight session
+        (requests 26/3B/72/1E/91) ended with the post-fix browser
+        navigate killed by "repeated 2x with no new info", and in request
+        3B the verifier gate then REFUTED the turn precisely because the
+        evidence only showed the pre-fix page load — the auto-repair
+        round's evidence-gathering navigate was itself cut by the
+        breaker. Counts restart from zero; the abort backstop still
+        protects against endless edit→observe cycles because each fresh
+        observation run needs threshold repeats WITHOUT an intervening
+        write to trip again, and the turn cap bounds the whole loop."""
+        self.action_sigs.clear()
+
     @property
     def decay_frozen(self) -> bool:
         """True while success-decay should be suppressed (a failure loop is

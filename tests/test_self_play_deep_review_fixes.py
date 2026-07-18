@@ -399,8 +399,11 @@ class TestUtilityAwareTrim:
         sm = SkillMemory(tmp_path)
         # Seed with one verified lesson that must survive even when
         # many new unverified ones are added.
+        # ("keep me" was renamed 2026-07-18: the conversational-trigger
+        # gate now rejects first-person chat fragments, and this test is
+        # about trim priority, not trigger quality.)
         sm.learn_lesson(
-            "keep me", "m", "s", trigger="keep me",
+            "keep-this-anchor", "m", "s", trigger="keep-this-anchor",
             correct_pattern="fix", verified=True, confidence=0.8,
         )
         for i in range(PLAYBOOK_MAX + 10):
@@ -411,7 +414,7 @@ class TestUtilityAwareTrim:
         playbook = json.loads(sm.file_path.read_text())
         assert len(playbook) <= PLAYBOOK_MAX
         triggers = [p["trigger"] for p in playbook]
-        assert "keep me" in triggers
+        assert "keep-this-anchor" in triggers
 
 
 # ---------------------------------------------------------------------------

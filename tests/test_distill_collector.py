@@ -136,3 +136,42 @@ def test_roundtrip_preserves_tool_calls(tmp_path):
     [rt] = list(c.iter_trajectories())
     names = [tc.name for tc in rt.tool_calls]
     assert names == ["file_system", "execute"]
+
+
+# ── corpus fingerprint (2026-07-18) ──────────────────────────────────────────
+# Stat-level fingerprint of the trajectory corpus, used by the idle PRM /
+# router / reflection phases to skip retrains and rescans when nothing was
+# appended since the last pass (overnight log: 3 identical refits per night).
+
+def test_corpus_fingerprint_stable_when_unchanged(tmp_path):
+    c = TrajectoryCollector(root=tmp_path, session_id="fp-sess")
+    c.append(_sample())
+    fp1 = c.corpus_fingerprint()
+    fp2 = c.corpus_fingerprint()
+    assert fp1 == fp2
+    assert fp1 not in ("", "empty")
+
+
+def test_corpus_fingerprint_changes_on_append(tmp_path):
+    c = TrajectoryCollector(root=tmp_path, session_id="fp-sess")
+    c.append(_sample())
+    fp1 = c.corpus_fingerprint()
+    c.append(_sample(user_request="second"))
+    assert c.corpus_fingerprint() != fp1
+
+
+def test_corpus_fingerprint_changes_on_outcome_correction(tmp_path):
+    # corrections live in a sibling .jsonl — they alter the training data
+    # (outcome flips), so the fingerprint must move too.
+    c = TrajectoryCollector(root=tmp_path, session_id="fp-sess")
+    path = c.append(_sample())
+    assert path is not None
+    fp1 = c.corpus_fingerprint()
+    line = json.loads(path.read_text().splitlines()[0])
+    c.update_outcome(line["id"], "failed", reason="user correction")
+    assert c.corpus_fingerprint() != fp1
+
+
+def test_corpus_fingerprint_missing_root(tmp_path):
+    c = TrajectoryCollector(root=tmp_path / "never-created", session_id="s")
+    assert c.corpus_fingerprint() == "empty"
