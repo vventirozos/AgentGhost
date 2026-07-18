@@ -122,6 +122,29 @@
   cheap; losing the build is catastrophic and non-obvious (it happens at the
   success moment, when nobody is watching for damage).</p>
 
+  <h2>Recurring tidy — post-completion debris (2026-07-18)</h2>
+  <p>The DONE sweep fires exactly once, on the transition — but verification and
+  post-completion debugging keep producing screenshots and scaffolding <em>after</em>
+  it. Live case: the game project rolled DONE at 21:41 and had six unswept
+  screenshots by the next morning; the operator was deleting them by hand.
+  <code>tidy_project_workspace(store, project_id, min_age_hours=24, dry_run=False)</code>
+  is the recurring counterpart — safe on ANY project status, repeatedly. It deletes
+  only: categorical debris (<code>_is_debris</code>) and unregistered <strong>media</strong>
+  files (<code>_MEDIA_SUFFIXES</code>) that are older than the age gate, not in the
+  keep-set, AND not referenced by any source file (<code>_referenced_media</code> —
+  basename scan of source-like files ≤512&nbsp;KB, so a sprite sheet an
+  <code>index.html</code> points at is treated as an asset, never a screenshot).
+  Source/document files are NEVER deleted here regardless of registration — on a
+  non-terminal project today's unregistered helper script may be tomorrow's
+  deliverable; judging unregistered scratch scripts remains the DONE sweep's job.
+  One <code>workspace_tidy</code> project event records what was removed.</p>
+  <p><strong>Triggers:</strong> biological-watchdog phase 2.7d (idle, every
+  <code>_WORKSPACE_TIDY_COOLDOWN</code> = 6&nbsp;h, walks all projects, 24&nbsp;h age
+  gate) and the explicit <code>manage_projects action=cleanup</code> (no age gate —
+  the user asked now). Note the tidy walks only <code>projects/&lt;id&gt;/</code>
+  trees: stray directories at the sandbox ROOT (repo clones, ad-hoc analysis dirs)
+  are the free-chat workspace and deliberately stay untouched.</p>
+
   <h2>Tests</h2>
   <p><code>tests/test_workspace_cleanup.py</code> — keep/delete split, nested
   deliverables, <code>__pycache__</code> removal, dry-run, the three skip

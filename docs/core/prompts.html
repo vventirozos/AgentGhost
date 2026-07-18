@@ -59,6 +59,50 @@
   re-reading files, and to record durable decisions in the ledger as it goes.
   Covered by <code>tests/test_project_working_memory.py</code>.</p>
 
+  <h2>Project working memory II — RECENT WORK LOG &amp; STUCK TASKS (2026-07-18)</h2>
+  <p>The 2026-06-20 layers cover work done <em>inside</em> tasks. The 2026-07-17
+  overnight session exposed the complement: once the game project rolled to DONE,
+  an entire evening of debugging (6 requests) plus the next morning's root-cause
+  fix wrote <strong>nothing</strong> to the store — the model has no open task to
+  <code>task_update</code>, so the voluntary write-back path never fires — and the
+  06:20 turn re-read every file and re-derived the bug from scratch. Two new
+  briefing sections close the gap:</p>
+  <ul>
+    <li><strong>RECENT WORK LOG</strong> — the last <code>max_work_logs</code> (5) automatic
+    per-request records written by the finalize chain (<code>work_log</code> events:
+    request head · files touched · tool counts · verifier-aware outcome · head of the
+    final answer). Deterministic — requires no model cooperation — and rendered for
+    DONE projects too, which is precisely when it is the only record. Header tells the
+    model to trust it before re-reading files.</li>
+    <li><strong>STUCK TASKS</strong> — FAILED/BLOCKED tasks <em>with their
+    <code>failure_reason</code></em> (≤<code>max_stuck_tasks</code>, 4). Previously invisible:
+    the OPEN filter excludes both statuses and DONE SO FAR only shows DONE, so
+    "work pending because it failed" never reached the model at all.</li>
+  </ul>
+  <p>Write side and defect-reopening live in <a href="agent.html">core.agent</a> /
+  <a href="../memory/projects.html">memory.projects</a>. Covered by
+  <code>tests/test_project_work_log.py</code>.</p>
+
+  <h2>Project working memory III — DELIVERABLES, RETROSPECTIVE, DREAM DIGEST (2026-07-18)</h2>
+  <p>Same session, the remaining write-only records gained read sides in the briefing:</p>
+  <ul>
+    <li><strong>DELIVERABLES</strong> — the deduped file manifest from <code>kind='file'</code>
+    artifacts (<code>ProjectStore.list_deliverables</code>), ≤<code>max_deliverables</code> (12)
+    paths comma-joined + "(+N more)", with a pointer to
+    <code>manage_projects action=artifact_list</code> for per-task detail. Previously these
+    were registered on every DONE task purely as the cleanup keep-set — the model re-listed
+    the sandbox to learn what its own project had built.</li>
+    <li><strong>RETROSPECTIVE</strong> — rendered only for terminal-status projects
+    (DONE/FAILED/ARCHIVED): <code>TaskTree.generate_retrospective()</code>'s summary line,
+    up to 3 <code>what_failed</code> entries with reasons, and the measured-effort total from
+    the (now written) <code>actual_cost</code> column. Computed lazily from task rows —
+    nothing persisted, always current. The generator previously had no caller at all.</li>
+    <li><strong>LAST DREAM DIGEST</strong> — one line from the newest <code>dream_digest</code>
+    event ("what did I do last night"), which was reachable only via a manual
+    <code>event_log</code> call — i.e. never.</li>
+  </ul>
+  <p>Covered by <code>tests/test_project_readside_plumbing.py</code>.</p>
+
   <h2>Project pacing — ONE TASK AT A TIME (2026-06-20)</h2>
   <p>The project briefing previously opened with a <em>PARALLEL TASK
   EXECUTION — HARD RULE</em> that told the agent to scan the whole task tree

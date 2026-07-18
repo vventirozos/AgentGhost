@@ -159,6 +159,42 @@
   <h2>Delete / archive resolution</h2>
   <p>Users refer to a project by NAME ("delete the minecraft clone project"), but the destructive actions key on the opaque hex id. <code>delete</code> and <code>archive</code> now run the reference through <code>_resolve_project_ref</code>: a real id is used directly; otherwise a case-insensitive <strong>title match</strong> is tried (the model can pass the name as <code>project_id</code>, or an explicit <code>title</code>). If nothing matches, the action <strong>fails loudly with an ERROR</strong> rather than silently no-op'ing — a silent <code>deleted:false</code> is what previously let a "delete" be reported as done while the project survived (and was then resurrected by the duplicate guard). Several projects sharing a title resolve to an <em>ambiguous</em> error listing the candidate ids, so the caller must disambiguate instead of deleting the wrong one. Covered by <code>tests/test_project_delete_and_guard.py</code>.</p>
 
+  <h2><code>artifact_list</code> — artifacts become readable (2026-07-18)</h2>
+  <p>The artifact store had a write action (<code>artifact_add</code>) and no read action —
+  the deliverable manifest, <code>note</code>/<code>url</code> artifacts, and autoadvance's
+  stored <code>tool_call</code> outputs (up to 8&nbsp;k chars each) were unreachable through
+  the tool surface. <code>action=artifact_list</code> lists them: project-wide by default,
+  scoped with <code>task_id</code>, filtered with <code>artifact_kind</code>, paged with
+  <code>limit</code> (newest kept). Non-<code>file</code> payloads are truncated to 400 chars;
+  file paths are returned whole. The status snapshot also gained
+  <code>deliverables</code> / <code>retrospective</code> (terminal states only) /
+  <code>last_dream_digest</code> keys. Covered by
+  <code>tests/test_project_readside_plumbing.py</code>.</p>
+
+  <h2><code>cleanup</code> — tidy the workspace on demand (2026-07-18)</h2>
+  <p><code>action=cleanup</code> runs the recurring tidy
+  (<a href="../core/workspace_cleanup.html">workspace_cleanup.tidy_project_workspace</a>)
+  on the bound project with <strong>no age gate</strong>: stray screenshots, caches and
+  browser scaffolding go immediately; deliverables, source files and media referenced
+  by the code are never touched. The same tidy also runs automatically from the idle
+  loop (phase 2.7d, 6-hourly, 24&nbsp;h age gate) — this action is for "clean up the
+  project" asked directly. Covered by <code>tests/test_workspace_tidy.py</code>.</p>
+
+  <h2>Defect reports reopen DONE projects (2026-07-18)</h2>
+  <p>A bug-report-shaped request (the same <code>_is_bug_report_intent</code> gate
+  that drives the repro-first nudge) arriving while a <strong>DONE</strong> project is
+  bound now records a <code>FIX (defect): &lt;request head&gt;</code> task via
+  <code>GhostAgent._note_defect_on_done_project</code>. <code>add_task</code>'s
+  DONE→ACTIVE semantic (2026-07-11) reopens the project, and the defect shows in
+  OPEN TASKS on every later turn — so "work pending" survives across sessions.
+  Deduped: while any open <code>FIX (defect):</code> task exists, repeated
+  "still broken" messages don't stack duplicates. Before this, a completed
+  project's briefing kept saying "DONE, no open tasks" through an entire evening
+  of fix attempts, and the surviving defect lived nowhere. The
+  <code>action=status</code> snapshot also now carries <code>recent_work_log</code>
+  (see <a href="../memory/projects.html">memory.projects</a>). Covered by
+  <code>tests/test_project_work_log.py</code>.</p>
+
   <h2>DONE-gate for visual/runnable tasks (2026-06-09)</h2>
   <p><code>task_update status=DONE</code> on a task that builds a <strong>runnable/visual artifact</strong> is <strong>held</strong> when no verification evidence is given (no <code>result</code> and no existing <code>result_summary</code>). The gated ids + an instruction are returned: verify with the browser tool (<code>screenshot</code>, <code>click_center=true</code> for a game), read the <a href="browser.html"><code>RENDER_CHECK</code> / <code>PRE_INTERACTION</code></a> lines, then re-call with a <code>result</code> describing what rendered. This targets the live anti-pattern where the agent wrote <code>index.html</code>, marked every task DONE before testing, and claimed a blank game "works".</p>
   <p><strong>Precision (2026-06-09, after a false-positive).</strong> The matcher (<code>_is_visual_artifact_task</code>) is HIGH-precision and word-boundary anchored. The first cut used broad words and misfired on a <em>philosophy</em> project — a text reflection "…whether the <em>scene</em> is pre-existing or being constructed" matched " scene", and "<em>game</em> theory" matched "game" — gating ordinary research tasks for ~6 wasted turns. The keyword set is now limited to tokens unambiguous in software work (<code>webgl, three.js, canvas, shader, hud, sprite, playable, gameplay, game loop, render loop, minecraft, frontend, …</code>), matched on word boundaries (so "hud" can't fire inside "shudder", nor "3d" inside "add"). <strong>Escape hatch:</strong> the gate message offers two clears — verify (for a real visual artifact) <em>or</em>, for a text/research/markdown task the gate misfired on, simply re-call with a one-line <code>result</code>. The handler also accepts <code>result_summary</code>/<code>summary</code> as aliases for <code>result</code> (the model's natural names), so the bypass works first try. Covered by <code>tests/test_run_failure_fixes.py</code>.</p>

@@ -98,6 +98,32 @@
     IDs are generated as lowercase 12-char hex (<code>uuid4().hex[:12]</code>), but an LLM that echoes one back in a <code>manage_projects</code> tool call routinely mangles the case of an opaque hex token — e.g. <code>9b5bd5cd812b</code> → <code>9B5Bd5Cd812B</code> — which used to make the case-sensitive <code>WHERE id = ?</code> lookups miss with <em>"project not found"</em>. Every store method that accepts a <code>project_id</code> / <code>task_id</code> now normalises it via <code>_canon_id</code> (strip + lowercase), and the <code>manage_projects</code> tool canonicalises model-supplied ids at the boundary, so generation and resolution always agree regardless of how the id was transmitted. Covered by <code>tests/test_project_id_canon.py</code>.
   </p>
 
+  <h2>Work log — the automatic interactive-turn record (2026-07-18)</h2>
+  <p><code>add_work_log(project_id, request=, files=, tools=, outcome=, note=)</code>
+  appends one bounded <code>work_log</code> event (request head ≤220 chars, ≤12
+  deduped file paths + truncation count, ≤8 tool counters, outcome label, note
+  ≤300 chars); <code>recent_work_logs(project_id, limit)</code> reads them newest
+  first. Written by the agent's finalize chain for every request that did real
+  work (mutated files or ran execute/browser/vision) while a project was bound —
+  the first store write-path that does not depend on the model volunteering a
+  <code>task_update</code>. Motivation: the 2026-07-17 game session — 7 interactive
+  debugging requests after roll-up, zero store events after 21:41, and the
+  next-morning turn re-derived the bug from scratch. Surfaced in the turn briefing
+  (<a href="../core/prompts.html">RECENT WORK LOG</a>) and the
+  <code>action=status</code> snapshot (<code>recent_work_log</code>). Covered by
+  <code>tests/test_project_work_log.py</code>.</p>
+
+  <h2>Deliverables manifest read-side (2026-07-18)</h2>
+  <p><code>list_deliverables(project_id)</code> returns the deduped, insertion-ordered
+  file paths registered as <code>kind='file'</code> artifacts across the project's
+  tasks — the project's own record of what it built. The registration path
+  (<code>register_file_artifact</code>, driving the end-of-project cleanup keep-set)
+  existed since 2026-06; this is its first reader. Surfaced as the briefing's
+  DELIVERABLES section and the status snapshot's <code>deliverables</code> key;
+  the raw rows (all kinds, incl. <code>tool_call</code> payloads) are now readable
+  via <code>manage_projects action=artifact_list</code>. Covered by
+  <code>tests/test_project_readside_plumbing.py</code>.</p>
+
   <h2>Public API</h2>
   <h3>Projects</h3>
   <ul>

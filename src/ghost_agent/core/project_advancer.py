@@ -397,9 +397,14 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                            result=cres.summary, actual_tool="code_executor")
         _metacog_set_task(context, None)
         _increment_budget(store, project_id)
-        record_runtime(store, project_id,
-                       seconds=max(0.0, time.time() - tick_started_at),
-                       tool_calls=1)
+        _tick_secs = max(0.0, time.time() - tick_started_at)
+        record_runtime(store, project_id, seconds=_tick_secs, tool_calls=1)
+        # Stamp the task's real wall-clock cost. The column was dead
+        # (never written) until 2026-07-18; the retrospective now sums it.
+        try:
+            store.update_task(nxt.id, actual_cost=_tick_secs)
+        except Exception:
+            logger.debug("actual_cost stamp skipped", exc_info=True)
         store.log_event(project_id, nxt.id, "autoadvance_step",
                         {"tool": "code_executor", "classification": "coding",
                          "files": list(cres.files or [])[:8]})
@@ -410,6 +415,13 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                        failure_reason=f"code_executor: {cres.summary}")
     _metacog_set_task(context, None)
     _increment_budget(store, project_id)
+    # A failed build cost real time too — stamp it so the retrospective's
+    # cost total reflects effort spent, not just effort that succeeded.
+    try:
+        store.update_task(nxt.id,
+                          actual_cost=max(0.0, time.time() - tick_started_at))
+    except Exception:
+        logger.debug("actual_cost stamp skipped", exc_info=True)
     store.log_event(project_id, nxt.id, "autoadvance_failed",
                     {"tool": "code_executor", "reason": (cres.summary or "")[:200]})
     return AdvanceResult(True, nxt.id, "coding",
@@ -879,9 +891,14 @@ async def advance_once(
     _metacog_set_task(context, None)  # node finished → don't replan a done task
     _increment_budget(store, project_id)
     from .project_safety import record_runtime as _record
-    _record(store, project_id,
-            seconds=max(0.0, time.time() - _tick_started_at),
+    _tool_tick_secs = max(0.0, time.time() - _tick_started_at)
+    _record(store, project_id, seconds=_tool_tick_secs,
             tool_calls=1 if tool_runner is not None else 0)
+    # Stamp the task's real wall-clock cost (see _finalize_coding).
+    try:
+        store.update_task(nxt.id, actual_cost=_tool_tick_secs)
+    except Exception:
+        logger.debug("actual_cost stamp skipped", exc_info=True)
     step_payload: Dict[str, Any] = {"tool": tool_name,
                                      "classification": classification}
     if research_path:

@@ -2659,6 +2659,7 @@ class GhostAgent:
     _STALE_QUESTIONS_COOLDOWN = 7200  # 2 h between stale open-question surfacings (phase 2.8b)
     _ROUTER_TRAIN_COOLDOWN = 10800   # 3 h between router-classifier retrains (phase 2.7b)
     _CALIB_REFIT_COOLDOWN = 3600  # 60 min between calibration refits (phase 2.7c)
+    _WORKSPACE_TIDY_COOLDOWN = 21600  # 6 h between recurring workspace tidy passes (phase 2.7d)
     _AUTOADVANCE_COOLDOWN = 1800  # 30 min between autonomous project-advance ticks (phase 2.95)
     _SELFPLAY_COOLDOWN = 3600     # 60 min between self-plays
     # Belt-and-braces guard for phase 1. The journal-empty self-disarm
@@ -2757,6 +2758,8 @@ class GhostAgent:
             self._router_corpus_fp = None
         if not hasattr(self, '_reflection_corpus_fp'):
             self._reflection_corpus_fp = None
+        if not hasattr(self, '_last_workspace_tidy_at'):
+            self._last_workspace_tidy_at = datetime.datetime.min
         if not hasattr(self, '_last_calib_refit_at'):
             self._last_calib_refit_at = datetime.datetime.min
         if not hasattr(self, '_last_autoadvance_at'):
@@ -3422,6 +3425,43 @@ class GhostAgent:
                     logger.warning(f"Calibration refit phase failed: {e}")
                 finally:
                     self._last_calib_refit_at = datetime.datetime.now()
+
+        # Phase 2.7d: Recurring workspace tidy (2026-07-18). The DONE
+        # sweep fires once, on the transition — but verification and
+        # post-completion debugging keep producing screenshots and
+        # scaffolding AFTER it (live case: six unswept screenshots on
+        # the DONE game project by the next morning), which the
+        # operator was deleting by hand. This phase walks every project
+        # workspace and removes categorical debris + unregistered,
+        # unreferenced media older than TIDY_MIN_AGE_HOURS. Narrow by
+        # design: never touches source files or the keep-set — see
+        # workspace_cleanup.tidy_project_workspace.
+        if self._bio_scaled(900) < idle_secs <= self._bio_scaled(3600):
+            since_last_tidy = (datetime.datetime.now()
+                               - self._last_workspace_tidy_at).total_seconds()
+            if since_last_tidy >= self._WORKSPACE_TIDY_COOLDOWN:
+                _tidy_store = getattr(ctx, 'project_store', None)
+                if _tidy_store is not None:
+                    self._last_workspace_tidy_at = datetime.datetime.now()
+                    try:
+                        from .workspace_cleanup import tidy_project_workspace
+                        _tidy_deleted = 0
+                        _tidy_freed = 0
+                        for _tp in await asyncio.to_thread(_tidy_store.list_projects):
+                            _ts = await asyncio.to_thread(
+                                tidy_project_workspace, _tidy_store, _tp["id"])
+                            _tidy_deleted += len(_ts.get("deleted") or [])
+                            _tidy_freed += int(_ts.get("freed_bytes") or 0)
+                        if _tidy_deleted:
+                            self._record_autonomous_activity(
+                                "workspace_tidy",
+                                f"removed {_tidy_deleted} debris file(s) "
+                                f"({_tidy_freed:,} bytes) across project "
+                                "workspaces")
+                    except Exception as e:
+                        logger.warning(f"Workspace tidy phase failed: {e}")
+                    finally:
+                        self._last_workspace_tidy_at = datetime.datetime.now()
 
         # Phase 2.95: Autonomous project advancement (opt-in
         # --autoadvance-idle). The project autoadvancer existed but was
@@ -7309,6 +7349,28 @@ class GhostAgent:
                         strikes.note_world_changed()
                         repeated_action_steered.clear()
                         _noprogress_trip = None
+                    # Work-log accumulation (2026-07-18): while a project is
+                    # bound, record which files this request mutated and
+                    # which work tools ran successfully. Read once by the
+                    # finalize chain to write the project's automatic
+                    # per-request work_log event — the write-back that
+                    # finally makes interactive (incl. post-DONE debugging)
+                    # work visible to future turns.
+                    if not _res_is_error and fname and getattr(
+                            self.context, "current_project_id", None):
+                        try:
+                            if fname == "file_system" and is_mutating and ptarget:
+                                getattr(self.context, "_project_work_files",
+                                        set()).add(str(ptarget))
+                            if (fname in ("execute", "browser",
+                                          "vision_analysis")
+                                    or (fname == "file_system" and is_mutating)):
+                                _wt = getattr(self.context,
+                                              "_project_work_tools", None)
+                                if isinstance(_wt, dict):
+                                    _wt[fname] = _wt.get(fname, 0) + 1
+                        except Exception:
+                            pass
                     if fname and not is_mutating and not _res_is_error:
                         # threshold=2 (was 3): the SECOND identical
                         # read is already zero-information — nudge
@@ -7768,6 +7830,49 @@ class GhostAgent:
             ts.preflight_blocks_this_request = preflight_blocks_this_request
             ts.request_sandbox_state = request_sandbox_state
             ts.transient_failure_count = transient_failure_count
+
+    def _note_defect_on_done_project(self, lc: str) -> bool:
+        """Record a bug report against a DONE project as a defect task.
+
+        Called from the repro-first nudge path (the request already
+        classified as a bug report). Before 2026-07-18 such a report
+        changed nothing in the store — the briefing kept saying "DONE,
+        no open tasks" through an entire evening of fix attempts, and
+        the open defect (game canvas renders black) lived nowhere.
+        Adding the task both reopens the project (add_task's
+        DONE→ACTIVE semantic, 2026-07-11) and puts the pending work in
+        OPEN TASKS on every subsequent turn. Deduped against existing
+        open defect tasks so a repeated "still broken" message doesn't
+        stack duplicates. Returns True iff a task was recorded.
+        Never raises."""
+        try:
+            pid = getattr(self.context, "current_project_id", None)
+            store = getattr(self.context, "project_store", None)
+            if not pid or store is None:
+                return False
+            proj = store.get_project(pid)
+            if not proj or str(proj.get("status", "")).upper() != "DONE":
+                return False
+            open_defects = [
+                t for t in store.list_tasks(pid)
+                if str(t.get("status", "")).upper() in (
+                    "PENDING", "READY", "IN_PROGRESS", "PAUSED", "NEEDS_USER")
+                and str(t.get("description", "")).startswith("FIX (defect):")
+            ]
+            if open_defects:
+                return False
+            desc = "FIX (defect): " + " ".join((lc or "").split())[:180]
+            store.add_task(pid, desc)
+            pretty_log(
+                "Project Scope",
+                f"Defect report on DONE project '{pid}' — reopened with a "
+                "defect task so the pending work is on the books",
+                icon=Icons.BRAIN_PLAN,
+            )
+            return True
+        except Exception as exc:
+            logger.debug(f"defect-task recording skipped: {exc}")
+            return False
 
     async def _finalize_and_return(self, fs: "FinalizeState"):
         """The post-turn-loop finalization chain — output scrubbers,
@@ -8786,6 +8891,45 @@ class GhostAgent:
         except Exception:
             pass
 
+        # Turn→project write-back (2026-07-18). While a project was
+        # bound, any request that did real work (mutated files or ran
+        # work tools) leaves ONE bounded work_log event on the project —
+        # request head, files touched, tool counts, outcome (verifier-
+        # aware), and the head of the final answer. This is the record
+        # the store previously never got for interactive turns: agent.py
+        # wrote nothing itself, so all post-completion debugging was
+        # invisible to future turns (2026-07-17 session: 7 requests of
+        # game debugging, zero store events after 21:41). Non-fatal.
+        try:
+            _wl_pid = getattr(self.context, "current_project_id", None)
+            _wl_store = getattr(self.context, "project_store", None)
+            _wl_files = getattr(self.context, "_project_work_files", None) or set()
+            _wl_tools = getattr(self.context, "_project_work_tools", None) or {}
+            if _wl_pid and _wl_store is not None and (_wl_files or _wl_tools):
+                if verifier_backfill is not None:
+                    _wl_outcome = f"verifier:{verifier_backfill[0]}"
+                elif execution_failure_count > 0:
+                    _wl_outcome = "had_failures"
+                else:
+                    _wl_outcome = "completed"
+                await asyncio.to_thread(
+                    _wl_store.add_work_log, _wl_pid,
+                    request=last_user_content or "",
+                    files=list(_wl_files),
+                    tools=dict(_wl_tools),
+                    outcome=_wl_outcome,
+                    note=final_ai_content or "",
+                )
+                # Consumed — a queued follow-up in the same process must
+                # not re-attribute this request's work.
+                try:
+                    self.context._project_work_files = set()
+                    self.context._project_work_tools = {}
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"project work-log write skipped: {type(e).__name__}: {e}")
+
         # Stage-1 self-improvement: append the turn's trajectory
         # to the distill log. No-op when the collector isn't
         # wired. Deliberately non-fatal — trajectory logging
@@ -8999,6 +9143,13 @@ class GhostAgent:
                     )
                 except Exception as e:
                     logger.debug(f"project conversation reconcile skipped: {e}")
+                # Work-log accumulators for THIS request (read by the
+                # finalize chain's project write-back). Reset AFTER the
+                # reconcile so they always describe work done under the
+                # project binding that survived it. Process-global is safe:
+                # turns are serialized by the agent semaphore.
+                self.context._project_work_files = set()
+                self.context._project_work_tools = {}
                 # Snapshot the project that was active when THIS user message
                 # arrived — the delete-eligibility gate in tools.projects
                 # only honours a bare "delete it" against this project. A
@@ -9047,6 +9198,10 @@ class GhostAgent:
                             "to an observed error message."
                         ),
                     })
+                    # Defect report against a DONE project (2026-07-18):
+                    # record the pending work IN the project — see
+                    # _note_defect_on_done_project.
+                    self._note_defect_on_done_project(lc)
 
                 # Stage-1 self-improvement: user-correction promotion.
                 # If `last_user_content` looks like a correction of the

@@ -49,7 +49,9 @@ _ACTIONS = {
     # task-level
     "task_add", "task_update", "task_decompose", "task_next", "task_list",
     # artifacts / events / durable working memory
-    "artifact_add", "event_log", "ledger", "config",
+    "artifact_add", "artifact_list", "event_log", "ledger", "config",
+    # workspace hygiene
+    "cleanup",
     # inbox promotion (suggestion-accepted path)
     "promote_from_context",
     # self-advancing loop
@@ -910,6 +912,34 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
         ]
     except Exception:
         research = []
+    # Recent interactive work (the automatic finalize-chain record,
+    # 2026-07-18) — without it a status/resume answer for a project
+    # whose tasks all closed reads "DONE, nothing open" even after an
+    # evening of post-completion debugging.
+    try:
+        work_log = [
+            {"ts": w["ts"], **(w.get("payload") or {})}
+            for w in store.recent_work_logs(project_id, limit=5)
+        ]
+    except Exception:
+        work_log = []
+    # Deliverable manifest + terminal-state retrospective + last dream
+    # digest (2026-07-18) — the remaining write-only plumbing, now read.
+    try:
+        deliverables = store.list_deliverables(project_id)[:20]
+    except Exception:
+        deliverables = []
+    retrospective = None
+    if str(proj.get("status", "")).upper() in ("DONE", "FAILED", "ARCHIVED"):
+        try:
+            retrospective = plan.tree.generate_retrospective()
+        except Exception:
+            retrospective = None
+    try:
+        _dd = store.list_events(project_id, limit=1, event_type="dream_digest")
+        last_dream_digest = (_dd[0].get("payload") or {}) if _dd else None
+    except Exception:
+        last_dream_digest = None
     return {
         "project": {
             "id": proj["id"],
@@ -927,6 +957,10 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
             {"type": e["type"], "ts": e["ts"], "payload": e["payload"]}
             for e in events
         ],
+        "recent_work_log": work_log,
+        "deliverables": deliverables,
+        "retrospective": retrospective,
+        "last_dream_digest": last_dream_digest,
         "research": research,
     }
 
@@ -1986,6 +2020,35 @@ async def tool_manage_projects(
             aid = store.add_artifact(task_id, artifact_kind, payload)
             return _ok({"artifact_id": aid})
 
+        if act == "artifact_list":
+            # Read side of the artifact store (2026-07-18). Until now
+            # artifacts were write-only through the tool surface: the
+            # deliverable manifest, autoadvance's tool_call output
+            # payloads (up to 8k chars each) and note artifacts were
+            # unreachable — the model literally could not read back
+            # what it had recorded. Scope with task_id, filter with
+            # artifact_kind, page with limit. Payload heads are bounded
+            # except `file` (a path IS the payload).
+            if not task_id and not project_id:
+                return _err("no active project (pass project_id, task_id, "
+                            "or switch first)")
+            arts = (store.list_artifacts(task_id=task_id) if task_id
+                    else store.list_artifacts(project_id=project_id))
+            if artifact_kind:
+                arts = [a for a in arts
+                        if str(a.get("kind") or "") == artifact_kind]
+            total = len(arts)
+            arts = arts[-max(1, int(limit)):]
+            out = []
+            for a in arts:
+                p = str(a.get("payload") or "")
+                if str(a.get("kind")) != "file" and len(p) > 400:
+                    p = p[:400] + f"… [truncated; {len(p)} chars total]"
+                out.append({"task_id": a.get("task_id"),
+                            "kind": a.get("kind"), "payload": p})
+            return _ok({"artifacts": out, "total": total,
+                        "shown": len(out)})
+
         if act == "event_log":
             if not project_id:
                 return _err("no active project (pass project_id or switch first)")
@@ -1993,6 +2056,26 @@ async def tool_manage_projects(
                 "events": store.list_events(
                     project_id, limit=limit, event_type=event_type
                 ),
+            })
+
+        if act == "cleanup":
+            # Explicit, user-triggered tidy (2026-07-18): same narrow
+            # deletion set as the recurring idle pass (debris +
+            # unregistered, UNREFERENCED media; never source files,
+            # never the keep-set) but with NO age gate — the user asked
+            # NOW. The DONE transition still runs the full sweep; this
+            # is for "clean up the project" mid-flight or post-DONE.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            from ..core.workspace_cleanup import tidy_project_workspace
+            ts = tidy_project_workspace(store, project_id, min_age_hours=0.0)
+            return _ok({
+                "status": ts.get("status"),
+                "deleted": ts.get("deleted"),
+                "freed_bytes": ts.get("freed_bytes"),
+                "kept_referenced_assets": ts.get("kept_referenced"),
+                "note": ("Deliverables, source files and referenced media "
+                         "are never touched by cleanup."),
             })
 
         if act == "ledger":
@@ -2238,7 +2321,15 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "is summarized into research/<slug>.md in the project workspace "
             "and listed under RESEARCH NOTES in the briefing; `research_list` "
             "to see what has already been researched (read a brief with "
-            "file_system before re-researching the same thing)."
+            "file_system before re-researching the same thing). "
+            "`artifact_list` to read back recorded artifacts — the "
+            "deliverable file manifest, notes, urls, and stored tool_call "
+            "outputs (optionally scope with task_id and/or artifact_kind; "
+            "long payloads are truncated to 400 chars). "
+            "`cleanup` to remove debris from the project workspace NOW "
+            "(stray screenshots, caches, helper scaffolding) — "
+            "deliverables, source files and media referenced by the code "
+            "are never touched; use when the user asks to tidy up."
         ),
         "parameters": {
             "type": "object",

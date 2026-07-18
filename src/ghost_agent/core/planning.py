@@ -520,12 +520,22 @@ class TaskTree:
         revised_tasks = [n for n in self.nodes.values() if n.revision_count > 0]
         total = len(self.nodes)
 
+        # Wall-clock actually spent, from tasks.actual_cost (seconds).
+        # The column existed since the schema's birth but nothing wrote
+        # it until 2026-07-18 (the advancer now stamps each tick's
+        # elapsed time), so treat 0 as "not measured", not "free".
+        total_cost_s = sum(
+            float(getattr(n, "actual_cost", 0.0) or 0.0)
+            for n in self.nodes.values()
+        )
+
         retro = {
             "total_tasks": total,
             "completed": len(done_tasks),
             "failed": len(failed_tasks),
             "revised": len(revised_tasks),
             "success_rate": len(done_tasks) / total if total > 0 else 0.0,
+            "total_actual_cost_s": round(total_cost_s, 1),
             "what_worked": [
                 {"id": n.id, "description": n.description, "tool": n.actual_tool_used}
                 for n in done_tasks

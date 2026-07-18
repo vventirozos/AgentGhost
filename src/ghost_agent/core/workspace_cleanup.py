@@ -424,3 +424,203 @@ def sweep_project_workspace(store, project_id: str, *,
             icon=Icons.CUT,
         )
     return summary
+
+
+# ── recurring tidy (2026-07-18) ─────────────────────────────────────────
+#
+# The DONE sweep above fires exactly once, on the transition. But work on
+# a project doesn't stop at DONE: verification and post-completion
+# debugging keep producing screenshots and helper scripts, and those land
+# AFTER the sweep — so they accumulate until the operator deletes them by
+# hand. Live case: the game project rolled DONE at 21:41 and had SIX
+# unswept screenshots by the next morning (debug_start.png at 21:55
+# through screenshot.png at 08:13). The tidy pass below is the recurring
+# counterpart: safe to run on ANY project in ANY status, repeatedly.
+#
+# It is deliberately MUCH narrower than the DONE sweep. It deletes only:
+#   * categorical debris (`_is_debris` — caches, browser scaffolding,
+#     swap/backup files), and
+#   * unregistered MEDIA files (screenshot-shaped: .png/.jpg/…)
+#     that are (a) older than the age gate, (b) not in the keep-set,
+#     (c) not referenced by any of the project's source files — a sprite
+#     sheet an index.html points at is an asset, not a screenshot.
+# Source/document files are NEVER deleted here regardless of
+# registration — on a non-terminal project, today's unregistered helper
+# script may be tomorrow's deliverable; the DONE sweep is the place where
+# unregistered scratch scripts get judged.
+
+#: media suffixes the tidy treats as screenshot-shaped scratch candidates.
+_MEDIA_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff",
+}
+
+#: how old (hours) an unregistered media file must be before the idle
+#: tidy will delete it. In-flight verification screenshots stay put.
+TIDY_MIN_AGE_HOURS = 24.0
+
+#: bound on how much source text the referenced-media check will read
+#: per file — plenty for any real index.html/css, keeps the scan cheap.
+_REFERENCE_SCAN_MAX_BYTES = 512 * 1024
+
+
+def _referenced_media(root: Path, media_rels: List[str]) -> Set[str]:
+    """Return the subset of ``media_rels`` whose BASENAME appears in any
+    source-like file of the project — i.e. media that is an asset the
+    build points at (sprite sheet, texture, favicon), not a stray
+    screenshot. Basename matching is deliberately loose: a false KEEP
+    costs a few kilobytes, a false DELETE breaks the build."""
+    if not media_rels:
+        return set()
+    basenames = {rel: rel.split("/")[-1] for rel in media_rels}
+    hit: Set[str] = set()
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        for fname in filenames:
+            fpath = base / fname
+            try:
+                rel = fpath.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if not _is_source_like(rel):
+                continue
+            try:
+                if fpath.is_symlink() or fpath.stat().st_size > _REFERENCE_SCAN_MAX_BYTES:
+                    continue
+                text = fpath.read_text(errors="replace")
+            except OSError:
+                continue
+            for mrel, mname in basenames.items():
+                if mrel not in hit and mname in text:
+                    hit.add(mrel)
+        if len(hit) == len(basenames):
+            break
+    return hit
+
+
+def tidy_project_workspace(store, project_id: str, *,
+                           min_age_hours: float = TIDY_MIN_AGE_HOURS,
+                           dry_run: bool = False) -> Dict[str, Any]:
+    """Recurring, status-agnostic debris tidy for one project workspace.
+
+    Deletes categorical debris plus unregistered, unreferenced,
+    older-than-``min_age_hours`` media files (see module note above);
+    never touches source/document files or anything in the keep-set.
+    Logs one ``workspace_tidy`` project event when something was removed.
+    Returns the same summary shape as ``sweep_project_workspace``;
+    never raises."""
+    import time as _time
+
+    summary: Dict[str, Any] = {
+        "project_id": project_id, "status": "ok",
+        "deleted": [], "kept": [], "dirs_removed": [], "freed_bytes": 0,
+    }
+    proj_dir = _project_dir(store, project_id)
+    if proj_dir is None:
+        summary["status"] = "skipped: no sandbox_root"
+        return summary
+    try:
+        root = proj_dir.resolve()
+    except OSError:
+        summary["status"] = "skipped: unresolvable dir"
+        return summary
+    if not root.is_dir():
+        summary["status"] = "skipped: no project dir"
+        return summary
+    keep = _keep_set(store, project_id)
+    if keep is None:
+        # fail-safe, same contract as the sweep: unreadable keep-set ⇒
+        # delete nothing.
+        summary["status"] = "skipped: artifact read failed"
+        return summary
+
+    age_cutoff = _time.time() - max(0.0, float(min_age_hours)) * 3600.0
+
+    # Collect candidates first so the referenced-media scan runs once.
+    debris: List[str] = []
+    media_candidates: List[str] = []
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        for fname in filenames:
+            fpath = base / fname
+            try:
+                rel = fpath.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if rel in keep:
+                continue
+            if _is_debris(rel):
+                debris.append(rel)
+                continue
+            if _is_source_like(rel):
+                continue  # never the tidy's business
+            name = rel.split("/")[-1].lower()
+            dot = name.rfind(".")
+            if dot > 0 and name[dot:] in _MEDIA_SUFFIXES:
+                try:
+                    if fpath.is_symlink() or fpath.stat().st_mtime <= age_cutoff:
+                        media_candidates.append(rel)
+                except OSError:
+                    continue
+
+    referenced = _referenced_media(root, media_candidates)
+    to_delete = debris + [m for m in media_candidates if m not in referenced]
+
+    deleted: List[str] = []
+    freed = 0
+    for rel in to_delete:
+        fpath = root / rel
+        try:
+            size = 0 if fpath.is_symlink() else fpath.stat().st_size
+        except OSError:
+            size = 0
+        if dry_run:
+            deleted.append(rel)
+            freed += size
+            continue
+        try:
+            fpath.unlink()
+            deleted.append(rel)
+            freed += size
+        except OSError as e:
+            logger.debug("workspace tidy: could not unlink %s: %s", fpath, e)
+
+    # Prune dirs left empty (never the project root), mirroring the sweep.
+    dirs_removed: List[str] = []
+    if not dry_run and deleted:
+        for dirpath, _dirnames, _filenames in os.walk(root, topdown=False, followlinks=False):
+            d = Path(dirpath)
+            if d == root:
+                continue
+            try:
+                next(d.iterdir())
+            except StopIteration:
+                try:
+                    d.rmdir()
+                    dirs_removed.append(d.relative_to(root).as_posix())
+                except OSError:
+                    pass
+            except OSError:
+                pass
+
+    summary.update(deleted=deleted, dirs_removed=dirs_removed,
+                   freed_bytes=freed,
+                   kept_referenced=sorted(referenced))
+    if deleted:
+        verb = "would remove" if dry_run else "removed"
+        pretty_log(
+            "Workspace Tidy",
+            f"project {project_id}: {verb} {len(deleted)} debris file(s) "
+            f"({freed:,} bytes)"
+            + (f", kept {len(referenced)} referenced asset(s)" if referenced else ""),
+            icon=Icons.CUT,
+        )
+        if not dry_run:
+            try:
+                store.log_event(project_id, None, "workspace_tidy", {
+                    "deleted": deleted[:20],
+                    "deleted_count": len(deleted),
+                    "freed_bytes": freed,
+                })
+            except Exception:
+                logger.debug("workspace_tidy event skipped", exc_info=True)
+    return summary

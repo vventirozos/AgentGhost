@@ -780,6 +780,70 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-18 (later 3) — recurring workspace tidy: the agent cleans up after itself
+Operator complaint: projects leave screenshots/debug scripts behind for manual deletion.
+Root cause: the DONE sweep fires ONCE on the transition; all verification/debugging
+debris lands AFTER it (game project: 6 unswept screenshots between the 21:41 roll-up and
+next morning). Fixes:
+- **`tidy_project_workspace`** (core/workspace_cleanup.py): recurring, status-agnostic,
+  much narrower than the sweep — deletes only categorical debris + unregistered media
+  older than 24h that is NOT in the keep-set AND NOT referenced by any source file
+  (basename scan ≤512KB/file — a sprite sheet index.html points at is an asset, not a
+  screenshot). Source files never deleted regardless of registration. One
+  `workspace_tidy` event per pass that removed something.
+- **Watchdog phase 2.7d**: idle, 6h cooldown, walks all project workspaces (24h age
+  gate). Sandbox-ROOT strays (repo clones, analysis/, chess/) deliberately untouched —
+  that's the free-chat workspace.
+- **`manage_projects action=cleanup`**: explicit user-triggered tidy, NO age gate.
+- Note: re-DONE after the defect-reopen flow re-fires the full sweep (hook fires on
+  every transition) — verified in code, no change needed.
+- Tests: tests/test_workspace_tidy.py (new, 12). Docs: core/workspace_cleanup.html,
+  tools/projects.html.
+
+### 2026-07-18 (later 2) — write-only project plumbing gains read sides
+Follow-up to the work-log session: the five records catalogued as persisted-but-invisible
+are now all readable:
+- **Deliverables manifest**: `ProjectStore.list_deliverables` (deduped kind='file'
+  artifacts) → briefing DELIVERABLES section (≤12 paths, "+N more") + status snapshot key.
+- **tool_call/note/url artifact payloads**: new `manage_projects action=artifact_list`
+  (project-wide / task_id scope / artifact_kind filter / limit, non-file payloads
+  truncated 400 chars) — the artifact store previously had a write action and NO read.
+- **Retrospectives**: `generate_retrospective` had no caller; now rendered lazily for
+  terminal-status projects (briefing RETROSPECTIVE: summary + ≤3 what_failed + measured
+  effort) and in the status snapshot.
+- **dream_digest events**: LAST DREAM DIGEST one-liner in the briefing (newest event).
+- **Cost columns**: `actual_cost` finally WRITTEN (advancer stamps tick seconds on all
+  three finalize paths, incl. failed builds) and READ (retro `total_actual_cost_s`).
+- Tests: tests/test_project_readside_plumbing.py (new, 13). Docs: core/prompts.html,
+  core/project_advancer.html, memory/projects.html, tools/projects.html.
+
+### 2026-07-18 (later) — project context closed-loop: work log + defect reopening + briefing gaps
+Root cause of "agent forgets project work already done / pending": interactive turns NEVER
+wrote to the project store (agent.py had zero store writes — everything relied on the model
+volunteering task_update, which has no trigger once tasks are closed). Case study: game
+project bd75420e2d96 rolled DONE at 21:41; 6 evening debugging requests + the 06:20
+root-cause fix left ZERO store events; briefing kept saying "DONE, no open tasks"; the
+morning turn re-read all files and re-derived the bug from scratch.
+- **Work log (write side)**: memory/projects.py `add_work_log`/`recent_work_logs` — one
+  bounded `work_log` event per working request (request head, ≤12 files, tool counts,
+  verifier-aware outcome, note head). agent.py: accumulators reset at request start
+  (after conversation reconcile), filled in the dispatch results loop (project-scoped
+  successful mutations + execute/browser/vision), written in `_finalize_and_return`
+  before trajectory recording. No LLM cooperation required.
+- **Work log (read side)**: build_project_briefing gains RECENT WORK LOG (5 newest,
+  "trust this before re-reading files") — rendered for DONE projects too, which is
+  exactly when it's the only record. `action=status` snapshot gains `recent_work_log`.
+- **STUCK TASKS in briefing**: FAILED/BLOCKED tasks + failure_reason were write-only
+  (OPEN filter excludes both; DONE SO FAR only shows DONE) — now surfaced (≤4).
+- **Defect reopening**: bug-report intent (existing repro-first gate) against a DONE
+  project → `_note_defect_on_done_project` adds "FIX (defect): <head>" task; add_task's
+  DONE→ACTIVE semantic reopens; deduped while an open defect task exists.
+- Explorer's full-subsystem map also catalogued remaining write-only plumbing (artifacts/
+  deliverables manifest, tool_call artifact payloads, retrospectives, dream_digest events,
+  costs) — deliberately NOT surfaced yet; work log covers the acute gap.
+- Tests: tests/test_project_work_log.py (new, 17). Docs: core/prompts.html,
+  core/agent.html, memory/projects.html, tools/projects.html.
+
 ### 2026-07-18 — overnight log-eval fixes: fix-verify unblocked + self-play infra fairness + idle no-op skips
 From evaluating the 2026-07-17 21:01 → 07-18 06:25 log (game project bd75420e2d96 + idle loop):
 - **World-changed reset** (core/strikes.py + dispatch pipeline): a successful file_system

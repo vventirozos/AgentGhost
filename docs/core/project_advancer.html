@@ -123,6 +123,17 @@
     <li>Mark DONE; increment <code>steps_used</code>; record runtime + tool_calls; stamp <code>last_autoadvance_ts</code> (drives round-robin project selection — see phase 2.95).</li>
   </ol>
 
+  <h2>Per-task cost stamping (2026-07-18)</h2>
+  <p>The <code>tasks.actual_cost</code> column existed since the schema's birth with no
+  writer and no reader. Both finalize paths (coding — success AND failure — and the
+  tool/research path) now stamp it with the tick's wall-clock seconds, alongside the
+  existing project-level <code>record_runtime</code>. Read side:
+  <code>TaskTree.generate_retrospective()</code> sums it into
+  <code>total_actual_cost_s</code>, shown as "measured effort N min" in the terminal-state
+  RETROSPECTIVE briefing section (<a href="prompts.html">core.prompts</a>). A failed build
+  is stamped too — the cost total reflects effort spent, not just effort that succeeded.
+  Covered by <code>tests/test_project_readside_plumbing.py</code>.</p>
+
   <h2>Budget enforcement</h2>
   <p><code>_get_budget()</code> reads <code>steps_cap / steps_used</code> from project metadata; <code>_increment_budget()</code> bumps after each tick. Checked via <a href="project_safety.html">check_budget()</a> across <code>steps</code>, <code>runtime_seconds</code>, and <code>tool_calls</code>.</p>
 

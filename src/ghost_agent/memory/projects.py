@@ -835,6 +835,25 @@ class ProjectStore:
                 return art.get("id")
         return self.add_artifact(task_id, "file", rel)
 
+    def list_deliverables(self, project_id: str) -> List[str]:
+        """Deduped, insertion-ordered file paths registered as deliverable
+        (`kind='file'`) artifacts across the project's tasks — the
+        project's own manifest of what it built. Until 2026-07-18 this
+        data was write-only: registered on every DONE task (it drives the
+        end-of-project cleanup keep-set) but never readable as a list, so
+        the model re-derived "what exists" from sandbox listings every
+        time."""
+        seen: set = set()
+        out: List[str] = []
+        for a in self.list_artifacts(project_id=project_id):
+            if str(a.get("kind") or "") != "file":
+                continue
+            p = str(a.get("payload") or "").strip()
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
     def list_artifacts(self, project_id: Optional[str] = None,
                        task_id: Optional[str] = None) -> List[Dict[str, Any]]:
         project_id = _canon_id(project_id) or None
@@ -1080,6 +1099,50 @@ class ProjectStore:
                 )
             conn.commit()
             return new_id
+
+    # ── work log (2026-07-18) ────────────────────────────────────────
+    #
+    # The automatic per-request record of interactive work on a project.
+    # Before this, agent.py never wrote to the project store — everything
+    # depended on the model voluntarily calling task_update, so any work
+    # outside an open task (all post-completion debugging, notably) left
+    # zero trace: the 2026-07-17 game-project session logged 6 debugging
+    # requests and one root-cause fix, and the store recorded none of it
+    # (last event 21:41, session ran to 06:20). The work log is the
+    # deterministic write-back: one bounded `work_log` event per request
+    # that did real work while the project was bound, written by the
+    # finalize chain — no LLM cooperation required.
+
+    #: hard caps so a work_log event stays a compact, injectable record.
+    WORK_LOG_REQUEST_CHARS = 220
+    WORK_LOG_NOTE_CHARS = 300
+    WORK_LOG_MAX_FILES = 12
+
+    def add_work_log(self, project_id: str, *, request: str = "",
+                     files: Optional[List[str]] = None,
+                     tools: Optional[Dict[str, int]] = None,
+                     outcome: str = "",
+                     note: str = "") -> int:
+        """Append one bounded work-log event for a request that did real
+        work on this project. ``files`` = project-relative paths written;
+        ``tools`` = {tool_name: successful_call_count}; ``outcome`` = a
+        short label ("completed" / verifier outcome / "had_failures");
+        ``note`` = the head of the final response (what was concluded)."""
+        file_list = sorted({str(f).strip() for f in (files or []) if str(f).strip()})
+        extra = len(file_list) - self.WORK_LOG_MAX_FILES
+        payload = {
+            "request": " ".join(str(request or "").split())[: self.WORK_LOG_REQUEST_CHARS],
+            "files": file_list[: self.WORK_LOG_MAX_FILES],
+            "files_truncated": max(0, extra),
+            "tools": {str(k): int(v) for k, v in list((tools or {}).items())[:8]},
+            "outcome": str(outcome or "")[:60],
+            "note": " ".join(str(note or "").split())[: self.WORK_LOG_NOTE_CHARS],
+        }
+        return self.log_event(project_id, None, "work_log", payload)
+
+    def recent_work_logs(self, project_id: str, limit: int = 6) -> List[Dict[str, Any]]:
+        """Newest-first work-log events, for the briefing and status views."""
+        return self.list_events(project_id, limit=limit, event_type="work_log")
 
     def list_events(self, project_id: str, limit: int = 50,
                     event_type: Optional[str] = None) -> List[Dict[str, Any]]:

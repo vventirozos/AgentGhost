@@ -9,6 +9,9 @@ _LEDGER_BRIEFING_LINES = 20
 def build_project_briefing(store, project_id: str, max_events: int = 3,
                            max_open_tasks: int = 8,
                            max_done_tasks: int = 5,
+                           max_stuck_tasks: int = 4,
+                           max_work_logs: int = 5,
+                           max_deliverables: int = 12,
                            suppress_next_task: bool = False,
                            graph_memory=None) -> str:
     """Render a compact project-scope briefing for the system prompt.
@@ -34,8 +37,12 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         NEXT TASK: [id] description
         OPEN TASKS (≤N):
           - [id] description  (STATUS)
+        STUCK TASKS (≤N of M …):
+          - [id] description  (FAILED|BLOCKED) — failure reason
         DONE SO FAR (≤N, most recent first):
           - [id] description → result summary
+        RECENT WORK LOG (≤N — newest first …):
+          - "request head" · files: … · outcome: note head
         RECENT EVENTS (≤N):
           - ts  type  payload-preview
     """
@@ -188,6 +195,24 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                 desc = (n.description or "")[:110]
                 lines.append(f"  - [{n.id}] {desc}  ({n.status.value})")
 
+        # STUCK TASKS — FAILED/BLOCKED tasks WITH their failure reasons.
+        # These were invisible before 2026-07-18: the OPEN filter above
+        # excludes both statuses and DONE SO FAR only shows DONE, so a
+        # task that failed (and WHY it failed) never reached the model —
+        # `failure_reason` was write-only plumbing. A stuck task is
+        # exactly the "work pending" a future turn must know about.
+        stuck_nodes = [n for n in plan.tree.nodes.values()
+                       if n.status in (TaskStatus.FAILED, TaskStatus.BLOCKED)]
+        if stuck_nodes:
+            lines.append(f"STUCK TASKS ({min(len(stuck_nodes), max_stuck_tasks)}"
+                         f" of {len(stuck_nodes)} — these need unblocking or a "
+                         "decision, they are NOT done):")
+            for n in stuck_nodes[:max_stuck_tasks]:
+                desc = (n.description or "")[:90]
+                why = " ".join((n.failure_reason or "").split())[:120]
+                why = f" — {why}" if why else ""
+                lines.append(f"  - [{n.id}] {desc}  ({n.status.value}){why}")
+
     # DONE SO FAR — recently-completed tasks plus the one-line result the
     # agent recorded on completion. This is "what's already built and how",
     # the antidote to a fresh turn re-reading files to reconstruct state.
@@ -222,6 +247,77 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
             res = " ".join((t.get("result_summary") or "").split())
             res = f" → {res[:170]}" if res else ""
             lines.append(f"  - [{t.get('id')}] {desc}{res}")
+
+    # RECENT WORK LOG — the automatic per-request record of interactive
+    # work (request → files touched → outcome → conclusion), written by
+    # the finalize chain since 2026-07-18. This is what preserves the
+    # details of work done OUTSIDE any open task — post-completion
+    # debugging above all: an entire evening of fix attempts used to
+    # leave the store untouched, so the next morning's turn re-read
+    # every file and re-derived the bug from scratch. Shown for DONE
+    # projects too — that is precisely when it is the only record.
+    try:
+        work_logs = store.recent_work_logs(project_id, limit=max_work_logs)
+    except Exception:
+        work_logs = []
+    if work_logs:
+        lines.append(f"RECENT WORK LOG ({len(work_logs)} — newest first; what "
+                     "was already tried/changed, trust this before re-reading "
+                     "files):")
+        for w in work_logs:
+            p = w.get("payload") or {}
+            req = (p.get("request") or "")[:70]
+            files = p.get("files") or []
+            extra = int(p.get("files_truncated") or 0)
+            fdesc = ""
+            if files:
+                fdesc = " · files: " + ", ".join(files[:4])
+                more = (len(files) - 4) + extra
+                if more > 0:
+                    fdesc += f" (+{more})"
+            outcome = p.get("outcome") or ""
+            note = (p.get("note") or "")[:110]
+            lines.append(f"  - \"{req}\"{fdesc} · {outcome}: {note}")
+
+    # DELIVERABLES — the project's own manifest of files it built
+    # (deduped `kind='file'` artifacts). Write-only until 2026-07-18:
+    # registered on every DONE task for the cleanup keep-set, never
+    # readable — so the model re-listed the sandbox to learn what
+    # exists. Compact by construction: paths only, comma-joined.
+    try:
+        deliverables = store.list_deliverables(project_id)
+    except Exception:
+        deliverables = []
+    if deliverables:
+        shown_files = deliverables[:max_deliverables]
+        more_files = len(deliverables) - len(shown_files)
+        lines.append(
+            f"DELIVERABLES ({len(deliverables)} file(s) the project built — "
+            "per-task detail via manage_projects action=artifact_list):")
+        lines.append("  " + ", ".join(shown_files)
+                     + (f"  (+{more_files} more)" if more_files > 0 else ""))
+
+    # RETROSPECTIVE — only for projects in a terminal state, where the
+    # structured what-worked/what-failed record (assembled from
+    # actual_tool_used / failure_reason / revision_count / actual_cost)
+    # is the durable lesson. Computed lazily from task rows — nothing
+    # to persist, always current. Before 2026-07-18 generate_retrospective
+    # had no reader at all.
+    _status_up = str(proj.get("status", "")).upper()
+    if _status_up in ("DONE", "FAILED", "ARCHIVED") and plan is not None:
+        try:
+            retro = plan.tree.generate_retrospective()
+        except Exception:
+            retro = None
+        if retro and retro.get("total_tasks"):
+            _cost_s = float(retro.get("total_actual_cost_s") or 0.0)
+            _cost_txt = (f" · measured effort {_cost_s/60:.0f} min"
+                         if _cost_s >= 60 else "")
+            lines.append(f"RETROSPECTIVE: {retro.get('summary', '')}{_cost_txt}")
+            for f in (retro.get("what_failed") or [])[:3]:
+                _fr = " ".join(str(f.get("reason") or "").split())[:90]
+                _fr = f" — {_fr}" if _fr else ""
+                lines.append(f"  ✗ {str(f.get('description') or '')[:70]}{_fr}")
     # Research awareness: surface the project's persisted research briefs so
     # the agent knows what it has already looked into (and where the file
     # lives) on every turn it works the project — instead of re-researching
@@ -256,6 +352,20 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                 items = list(payload.items())[:2]
                 preview = ", ".join(f"{k}={str(v)[:40]}" for k, v in items)
             lines.append(f"  - {e['type']}  {preview}".rstrip())
+
+    # LAST DREAM DIGEST — the overnight consolidation note the dream
+    # cycle writes per project ("what did I do last night"). Written
+    # since the dream pass existed, readable only via a manual
+    # event_log call until 2026-07-18 — i.e. never. One line.
+    try:
+        _dd = store.list_events(project_id, limit=1, event_type="dream_digest")
+    except Exception:
+        _dd = []
+    if _dd:
+        _ddp = _dd[0].get("payload") or {}
+        _dd_txt = str(_ddp.get("summary")
+                      or f"{_ddp.get('event_count', 0)} events consolidated")
+        lines.append(f"LAST DREAM DIGEST: {' '.join(_dd_txt.split())[:140]}")
 
     # RELATED WORK — other projects that share a library/technique with this
     # one (feature 3B). Surfaced so a fresh turn reuses prior solutions
