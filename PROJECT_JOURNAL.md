@@ -780,6 +780,34 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-18 (later 9) — Rick Dangerous churn loop: wrong refute + reopen/advance grind (FIXED)
+Operator: "fix the wrongly refuted / auto advance loop that grinds turns." Diagnosis from
+event log + trajectories: (1) user asked "restart the service" (req 4836cc14); verifier
+REFUTED the correct reply with "the project is already complete — 14/14 tasks done" —
+TASK-LEDGER STATE USED AS A VERDICT (the manage_projects listing rode along in the
+evidence window); (2) that refute queued a correction banner; each surfaced banner led
+the next turn and drove more "corrective" work → refuted again; (3) independently, a
+user bug report reopens the DONE project (defect task, DONE→ACTIVE) and
+--autoadvance-idle immediately grinds the reopened project (project_reopened 19:22 →
+autoadvance_failed 20:18 → rollup DONE 20:33 → next refute reopens...). Three brakes:
+- **Verifier prompts** (classic + stage-2 adjudicate): bookkeeping/ledger state ("all
+  tasks done", "project complete") is NEVER by itself grounds for REFUTED; operational
+  asks (restart/check/fix/run) judged on their own evidence. VALIDATED live on nova:
+  the exact failing shape (new seed case service-restart-done-project, #13) now
+  CONFIRMED conf=1.00 on BOTH arms.
+- **Correction dedup** (_record_late_verdict): identical (note, conversation) banner
+  queues at most once — repeated identical refutes can't stack banners that feed the
+  loop.
+- **Defect-reopen cap** (_note_defect_on_done_project): max _DEFECT_REOPEN_CAP=2
+  reopens per rolling 24h per project, enforced via one _atomic_metadata_update
+  (cross-process safe); past the cap → loud WARNING + no reopen, operator decides.
+- Ruled out: advancer re-grinding FAILED tasks (next_ready_leaf selects PENDING/READY
+  only); interface/server retry loops (one upstream POST per client send; resume replays
+  the buffer). NEEDS RESTART to go live; until then the queued wrong correction for the
+  Rick conversation surfaces once more.
+- Tests: work_log +2 (cap + window expiry), streaming gate +2 (dedup), two-stage +1
+  (prompt pins); seed set 13 cases. Docs: core/verifier.html.
+
 ### 2026-07-18 (later 8) — verifier two-stage prompt + fault-injection calibration bench
 From the "Mechanisms of Introspective Awareness" paper (arXiv:2603.21396): yes/no detection
 probes are dominated by a default-No gate that suppresses latent signal; forced

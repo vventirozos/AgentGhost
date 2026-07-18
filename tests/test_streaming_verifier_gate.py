@@ -110,6 +110,46 @@ def test_low_confidence_refuted_never_queues_even_forced(agent, monkeypatch):
     assert agent._pending_corrections == []
 
 
+# ---------- correction dedup (churn brake) ----------
+
+
+def test_identical_correction_is_not_stacked(agent, monkeypatch):
+    """Observed churn (2026-07-18, Rick Dangerous): repeated refutes on
+    the same conversation queued the same banner repeatedly; each banner
+    led the next turn and drove more 'corrective' grinding. An identical
+    (note, conversation) pair must queue at most once."""
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    agent.context.skill_memory = MagicMock()
+    agent._pending_corrections = []
+    with patch("ghost_agent.core.agent.pretty_log"), \
+         patch("ghost_agent.core.agent._glog.spawn_task"):
+        for _ in range(3):
+            agent._record_late_verdict(
+                _refuted(issues=["same problem"]),
+                trajectory_id="traj-d1", conv_fp="fp-same",
+            )
+    assert len(agent._pending_corrections) == 1
+
+
+def test_distinct_corrections_still_queue(agent, monkeypatch):
+    monkeypatch.setenv("GHOST_CRITIC_ASYNC", "1")
+    agent.context.skill_memory = MagicMock()
+    agent._pending_corrections = []
+    with patch("ghost_agent.core.agent.pretty_log"), \
+         patch("ghost_agent.core.agent._glog.spawn_task"):
+        agent._record_late_verdict(
+            _refuted(issues=["problem A"]),
+            trajectory_id="t1", conv_fp="fp-x")
+        agent._record_late_verdict(
+            _refuted(issues=["problem B"]),
+            trajectory_id="t2", conv_fp="fp-x")
+        # Same note but a DIFFERENT conversation is not a duplicate.
+        agent._record_late_verdict(
+            _refuted(issues=["problem A"]),
+            trajectory_id="t3", conv_fp="fp-y")
+    assert len(agent._pending_corrections) == 3
+
+
 # ---------- handler threads the flag ----------
 
 

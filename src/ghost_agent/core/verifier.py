@@ -182,6 +182,8 @@ Check, in order:
    - Specific facts in the CLAIM (names, dates, awards, rankings, prices) that appear in NO tool output are fabrications — REFUTED, no matter how plausible they sound.
 3. **Constraint satisfaction.** If the user's wording included explicit constraints on the form of the answer ("just the code", "in one sentence", "as JSON", "list only the names"), does the CLAIM satisfy them?
 
+Bookkeeping is not a verdict: the state of any project/task ledger appearing in the EVIDENCE ("all tasks done", "project complete", "nothing left to do") is NEVER by itself grounds for REFUTED. If the USER REQUEST is an operational ask (restart/check/fix/show/run something) and the CLAIM reports doing exactly that with evidence support, it is on-topic and confirmable regardless of what the ledger says about completion. (Live failure this rule pins: user asked to restart a service; the agent restarted it; the judge refuted with "the project is already complete" — wrong.)
+
 A verdict of CONFIRMED requires ALL THREE to hold. If alignment fails, return REFUTED regardless of how well the claim matches the evidence.
 
 Respond ONLY with a JSON object:
@@ -241,6 +243,7 @@ For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a 
 - "alignment" suspects are REAL only if the reply as a whole answers a different question than the USER REQUEST. If the USER REQUEST is empty or whitespace, alignment suspects are automatically FALSE ALARMS. A reply that answers the request and adds extra detail is NOT misaligned.
 - "constraint" suspects are REAL only if the USER REQUEST explicitly states that constraint in its own wording.
 - "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text.
+- Suspects that only cite project/task bookkeeping state ("the project is already complete", "all tasks are done", "nothing left to do") are FALSE ALARMS unless the USER REQUEST explicitly asked about completion state — a ledger's state never contradicts an operational reply (restart/check/fix/run) on its own.
 
 The SUSPECTS list is a starting point, not a boundary: if you notice a REAL problem the suspects missed — a fact in the CLAIM that appears in no tool output or contradicts one, machine noise in the reply, a violated explicit constraint — count it as a real problem and name it in "issues".
 

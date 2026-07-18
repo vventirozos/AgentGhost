@@ -263,6 +263,26 @@ async def test_stage_no_think_kill_switch(monkeypatch):
         importlib.reload(vmod)
 
 
+# ---------- bookkeeping-state is never grounds to refute ----------
+
+
+def test_prompts_carry_bookkeeping_dismissal_rule():
+    """Live wrongly-refuted regression (2026-07-18, req 4836cc14): the
+    user asked to restart a service, the agent restarted it, and the
+    judge REFUTED with "the project is already complete — 14/14 tasks
+    done" — task-ledger state used as a verdict. That refute queued a
+    correction banner that drove another grinding turn. Both the classic
+    prompt and the stage-2 adjudication must carry the dismissal rule."""
+    from ghost_agent.core.verifier import (
+        _VERIFY_ADJUDICATE_PROMPT,
+        _VERIFY_CLAIM_PROMPT,
+    )
+    assert "NEVER by itself grounds for REFUTED" in _VERIFY_CLAIM_PROMPT
+    assert "already complete" in _VERIFY_ADJUDICATE_PROMPT
+    assert "FALSE ALARMS unless the USER REQUEST explicitly asked" \
+        in _VERIFY_ADJUDICATE_PROMPT
+
+
 # ---------- input truncation ----------
 
 

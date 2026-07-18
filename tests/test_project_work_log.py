@@ -169,6 +169,54 @@ def test_second_defect_report_does_not_stack_duplicates(store, pid):
     assert len(defects) == 1
 
 
+def test_defect_reopen_cap_blocks_third_reopen_in_window(store, pid):
+    """Churn brake (2026-07-18, Rick Dangerous): report→reopen→advance→
+    rollup cycled indefinitely on a DONE project with --autoadvance-idle
+    on. At most _DEFECT_REOPEN_CAP reopens per rolling window; past the
+    cap the report is surfaced loudly instead of reopening."""
+    from ghost_agent.core.agent import _DEFECT_REOPEN_CAP
+
+    agent = _agent_with(store, pid)
+    for i in range(_DEFECT_REOPEN_CAP):
+        store.update_project(pid, status="DONE")
+        # Close any open defect so the dedup guard doesn't short-circuit
+        # before the cap check.
+        for t in store.list_tasks(pid):
+            if t["status"] in ("PENDING", "READY"):
+                store.update_task(t["id"], status="DONE",
+                                  result_summary="fixed")
+        assert agent._note_defect_on_done_project(
+            f"defect number {i}: still broken") is True
+
+    store.update_project(pid, status="DONE")
+    for t in store.list_tasks(pid):
+        if t["status"] in ("PENDING", "READY"):
+            store.update_task(t["id"], status="DONE", result_summary="fixed")
+    # Cap reached inside the window: no reopen, project stays DONE.
+    assert agent._note_defect_on_done_project(
+        "defect again: STILL broken") is False
+    assert store.get_project(pid)["status"] == "DONE"
+
+
+def test_defect_reopen_cap_window_expires(store, pid):
+    """Stale reopen timestamps outside the rolling window don't count."""
+    import time as _time
+    from ghost_agent.core.agent import (
+        _DEFECT_REOPEN_CAP, _DEFECT_REOPEN_WINDOW_S)
+
+    agent = _agent_with(store, pid)
+    stale = _time.time() - _DEFECT_REOPEN_WINDOW_S - 60
+    store._atomic_metadata_update(
+        pid, lambda m: m.update(
+            defect_reopens=[stale] * _DEFECT_REOPEN_CAP) or m)
+    store.update_project(pid, status="DONE")
+    assert agent._note_defect_on_done_project(
+        "fresh defect after quiet day") is True
+    meta = store.get_project(pid).get("metadata") or {}
+    # Stale entries pruned, fresh reopen recorded.
+    assert len(meta.get("defect_reopens") or []) == 1
+
+
 def test_defect_hook_ignores_active_projects(store, pid):
     agent = _agent_with(store, pid)  # project is ACTIVE
     assert agent._note_defect_on_done_project("the button broke") is False

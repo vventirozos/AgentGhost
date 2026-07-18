@@ -181,6 +181,16 @@ _EXTENDED_THINK_KEYWORDS = {
 # turn, the verifier's "is the claim supported by evidence" question
 # degenerates to "does 'I built a parser' follow from '{exited: …}'"
 # — always REFUTED. Skip or look further back.
+# Defect-reopen churn brake (2026-07-18, Rick Dangerous). A DONE project
+# can be reopened by a user bug report (add_task's DONE→ACTIVE semantic),
+# and with --autoadvance-idle ON a reopened project immediately becomes
+# advanceable — so a report/refute/reopen/advance/rollup cycle can grind
+# turns indefinitely on a finished project. Cap reopens per rolling
+# window; past the cap the report is surfaced LOUDLY for the operator
+# instead of silently re-entering the grinder.
+_DEFECT_REOPEN_CAP = 2
+_DEFECT_REOPEN_WINDOW_S = 86_400.0
+
 _BOOKKEEPING_TOOL_NAMES = frozenset({
     "manage_projects", "manage_tasks", "manage_skills",
     "scratchpad", "learn_skill", "update_profile",
@@ -5752,18 +5762,36 @@ class GhostAgent:
             if self._critic_async_enabled() or force_correction:
                 if not isinstance(getattr(self, "_pending_corrections", None), list):
                     self._pending_corrections = []
-                self._pending_corrections.append({
-                    "note": issues_str[:300],
-                    "conv": conv_fp or "",
-                    "ts": time.monotonic(),
-                })
-                if len(self._pending_corrections) > _CORRECTION_MAX:
-                    self._pending_corrections = self._pending_corrections[-_CORRECTION_MAX:]
-                pretty_log(
-                    "Verifier",
-                    "queued a correction to surface on the next message of this conversation",
-                    icon=Icons.IDEA,
-                )
+                _corr_note = issues_str[:300]
+                # Dedup: an identical note already queued for this
+                # conversation must not stack. Observed churn shape
+                # (2026-07-18, Rick Dangerous): a repeated refute on the
+                # same conversation queued the same banner again, each
+                # surfaced banner led the next turn, and the model kept
+                # re-doing "corrective" work — banners fed the very loop
+                # the verdicts were complaining about.
+                if any(c.get("note") == _corr_note
+                       and c.get("conv") == (conv_fp or "")
+                       for c in self._pending_corrections):
+                    pretty_log(
+                        "Verifier",
+                        "identical correction already queued for this "
+                        "conversation — not stacking",
+                        icon=Icons.BRAIN_THINK,
+                    )
+                else:
+                    self._pending_corrections.append({
+                        "note": _corr_note,
+                        "conv": conv_fp or "",
+                        "ts": time.monotonic(),
+                    })
+                    if len(self._pending_corrections) > _CORRECTION_MAX:
+                        self._pending_corrections = self._pending_corrections[-_CORRECTION_MAX:]
+                    pretty_log(
+                        "Verifier",
+                        "queued a correction to surface on the next message of this conversation",
+                        icon=Icons.IDEA,
+                    )
         else:
             pretty_log(
                 "Verifier",
@@ -8161,6 +8189,37 @@ class GhostAgent:
                 and str(t.get("description", "")).startswith("FIX (defect):")
             ]
             if open_defects:
+                return False
+            # Churn brake: at most _DEFECT_REOPEN_CAP reopens per rolling
+            # window per project. The prune + count + append runs in ONE
+            # atomic metadata update (cross-process safe). Past the cap,
+            # surface the report loudly instead of reopening — the
+            # operator decides whether the project really needs another
+            # round, not the grinder.
+            _now_ts = time.time()
+            _reopen_ok = {"ok": False}
+
+            def _reopen_gate(meta):
+                raw = meta.get("defect_reopens") or []
+                recent = [float(t) for t in raw
+                          if _now_ts - float(t) < _DEFECT_REOPEN_WINDOW_S]
+                if len(recent) < _DEFECT_REOPEN_CAP:
+                    recent.append(_now_ts)
+                    _reopen_ok["ok"] = True
+                meta["defect_reopens"] = recent
+                return meta
+
+            store._atomic_metadata_update(pid, _reopen_gate)
+            if not _reopen_ok["ok"]:
+                pretty_log(
+                    "Project Scope",
+                    f"defect report on DONE project '{pid}' NOT reopened — "
+                    f"reopen cap hit ({_DEFECT_REOPEN_CAP} per "
+                    f"{int(_DEFECT_REOPEN_WINDOW_S / 3600)}h). The project "
+                    "has churned through report→reopen→advance cycles; "
+                    "review it manually or raise the cap.",
+                    icon=Icons.WARN, level="WARNING",
+                )
                 return False
             desc = "FIX (defect): " + " ".join((lc or "").split())[:180]
             store.add_task(pid, desc)
