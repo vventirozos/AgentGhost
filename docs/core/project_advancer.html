@@ -34,7 +34,7 @@
       <tr><td><code>async advance_many(context, project_id, *, max_tasks, …, stop_on_fail=True) -&gt; AdvanceManyResult</code></td><td>BOUNDED loop of <code>advance_once</code> ticks for the batch case (see below).</td></tr>
       <tr><td><code>classify_advance_intent(text) -&gt; {mode, count}</code></td><td>Map a user pacing directive to <code>one</code> / <code>n</code> / <code>all</code>. Recognizes enumerated tasks — <em>"task 3 and 4"</em>, <em>"tasks 3, 4 and 5"</em> → <code>n</code> with <code>count</code>=the number of indices (2026-06-22); without this they parsed as a single go-ahead and the one-task-per-turn gate stopped after the first, leaving the rest half-done.</td></tr>
       <tr><td><code>default_llm_classifier(context)</code> · <code>default_code_generator(context)</code></td><td>Build the LLM-backed per-task executors (or <code>None</code>); shared by the tool path and the idle autoadvancer.</td></tr>
-      <tr><td><code>project_dream_pass(store, llm_summarize)</code></td><td>Consolidate accumulated project events into a daily digest.</td></tr>
+      <tr><td><code>project_dream_pass(store, llm_summarize)</code></td><td>Consolidate accumulated project events into a <code>dream_digest</code>. Since 2026-07-19 it finally has its promised caller (every REM cycle, <a href="dream.html">core/dream.py</a>), an event-id watermark (only events since the last digest count — re-digestion spam was the failure mode of wiring it without one), and failure-outcome <code>work_log</code> events join the digest with a <code>failures</code> count in the payload.</td></tr>
     </tbody>
   </table>
 

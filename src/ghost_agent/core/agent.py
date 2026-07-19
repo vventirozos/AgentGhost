@@ -3004,6 +3004,16 @@ class GhostAgent:
                         _dream_eligible = await asyncio.to_thread(_tsa, ctx)
                     except Exception as _tfx:
                         logger.debug("dream trajectory eligibility failed: %s", _tfx)
+                if not _dream_eligible and isinstance(res, dict):
+                    # Self-play fallback (2026-07-19): dream() also seeds
+                    # from frontier-tracker outcome digests — same
+                    # gate-must-match reasoning as the trajectory probe.
+                    try:
+                        from .dream import selfplay_dream_fragments as _spf
+                        _sp_ids, _ = await asyncio.to_thread(_spf, ctx)
+                        _dream_eligible = len(_sp_ids) >= 3
+                    except Exception as _spx:
+                        logger.debug("dream self-play eligibility failed: %s", _spx)
                 if _dream_eligible:
                     if self._bio_roll(0.5):
                         from .dream import Dreamer
@@ -7931,6 +7941,13 @@ class GhostAgent:
                     # Classify the failure to route to the right budget
                     from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context, summarize_multi_op_outcomes
                     failure_class, failure_match = classify_tool_failure(last_error_res or last_error_preview)
+                    # Capture the failure head for harness-dimension
+                    # attribution at finalize time (bounded: 6 per turn).
+                    _ftexts = getattr(self.context, "_turn_failure_texts", None)
+                    if isinstance(_ftexts, list) and len(_ftexts) < 6:
+                        _ftexts.append(
+                            f"{fname} [{failure_class.value}]: "
+                            f"{(last_error_res or last_error_preview)[:300]}")
                     # Partial-failure summary (empty unless this turn
                     # mixed successes and failures across >=2 calls).
                     multi_op_summary = summarize_multi_op_outcomes(op_outcomes)
@@ -9272,6 +9289,34 @@ class GhostAgent:
                     _wl_outcome = "had_failures"
                 else:
                     _wl_outcome = "completed"
+                # Harness-dimension attribution (2026-07-19): classify the
+                # turn's captured failure heads so the work_log names the
+                # layer that failed (a prior for debugging and the group
+                # key for dream-side distillation — not a verdict).
+                _wl_dim = ""
+                if _wl_outcome != "completed":
+                    try:
+                        from .failure_dimension import (
+                            classify_failure_dimension, failure_dim_enabled)
+                        if failure_dim_enabled():
+                            _parts = list(getattr(
+                                self.context, "_turn_failure_texts",
+                                None) or [])[-3:]
+                            if (verifier_backfill is not None
+                                    and verifier_backfill[0] == "failed"):
+                                _parts.insert(
+                                    0, f"verifier: {verifier_backfill[1]}")
+                            if _parts:
+                                _wl_dim, _wl_dim_sig = \
+                                    classify_failure_dimension("\n".join(_parts))
+                                if _wl_dim == "unknown":
+                                    _wl_dim = ""
+                                else:
+                                    logger.debug(
+                                        "work_log dimension=%s (signal: %r)",
+                                        _wl_dim, str(_wl_dim_sig)[:60])
+                    except Exception:
+                        _wl_dim = ""
                 await asyncio.to_thread(
                     _wl_store.add_work_log, _wl_pid,
                     request=last_user_content or "",
@@ -9281,12 +9326,14 @@ class GhostAgent:
                                           "_project_work_cmds", None) or []),
                     outcome=_wl_outcome,
                     note=final_ai_content or "",
+                    failure_dimension=_wl_dim,
                 )
                 # Consumed — a queued follow-up in the same process must
                 # not re-attribute this request's work.
                 try:
                     self.context._project_work_files = set()
                     self.context._project_work_tools = {}
+                    self.context._turn_failure_texts = []
                 except Exception:
                     pass
         except Exception as e:
@@ -9513,6 +9560,12 @@ class GhostAgent:
                 self.context._project_work_files = set()
                 self.context._project_work_tools = {}
                 self.context._project_work_cmds = []
+                # Failure-text capture for harness-dimension attribution
+                # (core/failure_dimension.py). Filled in the dispatch loop
+                # next to classify_tool_failure; classified and consumed by
+                # the finalize chain's work-log write-back. Not project-
+                # gated: future lesson producers read it too.
+                self.context._turn_failure_texts = []
                 self.context._offproject_steer_done = False
                 # Edit-run futility tracking: basename -> {writes, runs} for
                 # code files this request. See the futility breaker in the

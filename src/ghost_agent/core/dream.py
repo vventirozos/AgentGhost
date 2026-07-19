@@ -653,6 +653,66 @@ def trajectory_dream_fragments(context, limit: int = 40):
     return ids, docs
 
 
+def selfplay_dream_fragments(context, limit: int = 20):
+    """Digest recent self-play outcomes into REM seed fragments.
+
+    The trajectory fallback above only refreshes when a REAL request
+    writes a trajectory — self-play sim runs deliberately detach the
+    collector (fake trajectories must not pollute the distill corpus),
+    so an overnight box doing hourly self-play presents the SAME last-40
+    digest window to every REM cycle and the idempotency guard skips
+    38/40 of them (2026-07-19 log eval). The frontier tracker, however,
+    durably records every self-play outcome (cluster, passed, attempts,
+    mistake) — digest those so the dream pool actually changes when the
+    only thing the agent did was self-play, and its mistakes become REM
+    heuristic material.
+
+    Returns ``(ids, docs)`` — ids are ``selfplay:<cluster>:<timestamp>``
+    (NOT vector-store ids; the caller must not run the merge/delete
+    consolidation pass against them). Never raises."""
+    try:
+        from ..memory.frontier import FrontierTracker as _FTCls
+        tracker = getattr(context, "frontier_tracker", None)
+        # isinstance gate mirrors synthetic_self_play: a MagicMock
+        # context auto-creates attributes, so truthiness is not enough.
+        if not isinstance(tracker, _FTCls):
+            return [], []
+        state = tracker._load()
+    except Exception:
+        return [], []
+    outcomes = []
+    try:
+        clusters = state.get("clusters") or {}
+        for cluster_key, cluster in clusters.items():
+            if not isinstance(cluster, dict):
+                continue
+            for o in cluster.get("recent_outcomes") or []:
+                if isinstance(o, dict):
+                    outcomes.append((str(o.get("timestamp") or ""),
+                                     str(cluster_key), o))
+    except Exception:
+        return [], []
+    outcomes.sort(key=lambda x: x[0])
+    ids, docs = [], []
+    for ts, cluster_key, o in outcomes[-int(limit):]:
+        try:
+            passed = bool(o.get("passed"))
+            attempts = int(o.get("attempts_used", 1) or 1)
+            doc = (
+                f"SELF-PLAY: {cluster_key}"
+                f" | OUTCOME: {'PASSED' if passed else 'FAILED'}"
+                f" | ATTEMPTS: {attempts}"
+            )
+            mistake = " ".join(str(o.get("mistake") or "").split())
+            if mistake:
+                doc += f" | MISTAKE: {mistake[:200]}"
+            ids.append(f"selfplay:{cluster_key}:{ts}")
+            docs.append(doc)
+        except Exception:
+            continue
+    return ids, docs
+
+
 def detect_tool_patterns(skill_memory) -> list:
     """Scan the skill playbook for recurring tool-call sequences.
 
@@ -1199,6 +1259,39 @@ class Dreamer:
         except Exception as ee:
             logger.debug(f"Episode consolidation skipped: {ee}")
 
+        # --- FAILURE-CLUSTER DISTILLATION -------------------------------
+        # MemoHarness-style global-pattern pass (2026-07-19): recurring
+        # (dimension, cluster) failure groups distill into one preventive
+        # lesson each. Runs BEFORE the entropy/idempotency gates for the
+        # same reason as episodes: its corpus (playbook, work_logs,
+        # counterfactual results) is independent of the auto-memory pool.
+        distilled_lessons = 0
+        try:
+            from .failure_distill import distill_failure_clusters
+            distilled_lessons = await distill_failure_clusters(self.context)
+        except Exception as fe:
+            logger.debug(f"Failure distillation skipped: {fe}")
+
+        # --- PROJECT DREAM PASS -----------------------------------------
+        # project_dream_pass finally gets the caller its docstring always
+        # promised. Watermarked internally, so re-running every REM cycle
+        # only digests events that arrived since the last digest.
+        project_digests = 0
+        try:
+            from .project_advancer import project_dream_pass
+            _pstore = getattr(self.context, "project_store", None)
+            if _pstore is not None and type(_pstore).__module__.startswith("ghost_agent"):
+                project_digests = await asyncio.to_thread(
+                    project_dream_pass, _pstore)
+                if project_digests:
+                    pretty_log(
+                        "Dream Projects",
+                        f"Consolidated {project_digests} project digest(s)",
+                        icon=Icons.BRAIN_SUM,
+                    )
+        except Exception as pde:
+            logger.debug(f"project dream pass skipped: {pde}")
+
         try:
             results = await asyncio.to_thread(
                 self.memory.collection.get,
@@ -1218,22 +1311,34 @@ class Dreamer:
         if len(documents) < 3:
             # Trajectory fallback (2026-07-09): the auto-memory pool is
             # organically unsatisfiable — see trajectory_dream_fragments.
+            # Self-play digests joined 2026-07-19: overnight the ONLY new
+            # experience is self-play (which detaches the trajectory
+            # collector by design), so without them the digest window is
+            # static and the idempotency guard skips every cycle.
             t_ids, t_docs = await asyncio.to_thread(
                 trajectory_dream_fragments, self.context)
-            if len(t_docs) >= 3:
+            sp_ids, sp_docs = await asyncio.to_thread(
+                selfplay_dream_fragments, self.context)
+            if len(t_docs) + len(sp_docs) >= 3:
                 seeded_from_trajectories = True
-                ids, documents = t_ids, t_docs
+                ids = t_ids + sp_ids
+                documents = t_docs + sp_docs
                 pretty_log(
                     "Dream Mode",
                     f"Auto-memory pool thin ({len(results['ids'])}) — "
-                    f"dreaming over {len(t_docs)} trajectory digests instead",
+                    f"dreaming over {len(t_docs)} trajectory + "
+                    f"{len(sp_docs)} self-play digests instead",
                     icon=Icons.DREAM,
                 )
             else:
                 msg = ("Not enough entropy to dream. (Need ≥3 auto-memories "
-                       "or ≥3 trajectories to form heuristics)")
+                       "or ≥3 trajectory/self-play digests to form heuristics)")
                 if episode_lessons:
                     msg += f" Episodic pass still learned {episode_lessons} strategy lessons."
+                if distilled_lessons:
+                    msg += f" Distilled {distilled_lessons} failure-pattern lesson(s)."
+                if project_digests:
+                    msg += f" Wrote {project_digests} project digest(s)."
                 pretty_log("Dream Mode", msg, icon=Icons.DREAM)
                 return msg
 
@@ -1253,6 +1358,10 @@ class Dreamer:
             msg = f"Skipping REM — fragment set unchanged ({len(ids)} memories, no new input since last cycle)."
             if episode_lessons:
                 msg += f" Episodic pass still learned {episode_lessons} strategy lessons."
+            if distilled_lessons:
+                msg += f" Distilled {distilled_lessons} failure-pattern lesson(s)."
+            if project_digests:
+                msg += f" Wrote {project_digests} project digest(s)."
             pretty_log("Dream Mode", msg, icon=Icons.SKIP)
             return msg
 
@@ -1524,6 +1633,10 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 metrics_note += f" ({pruned_count} low-utility lessons pruned)"
             if episode_lessons > 0:
                 metrics_note += f" ({episode_lessons} episode strategies learned)"
+            if distilled_lessons:
+                metrics_note += f" ({distilled_lessons} failure-pattern lessons distilled)"
+            if project_digests:
+                metrics_note += f" ({project_digests} project digests written)"
 
             # Graph forgetting: drop weight-1 stale edges so the only uncapped
             # memory tier gets a decay story (IMPROVEMENTS.md #27c). Reinforced
@@ -2434,7 +2547,7 @@ Return ONLY a JSON object with:
         system_message = SYNTHETIC_CHALLENGE_PROMPT
 
         # Add strict constraint to prevent token overflow
-        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags IN THIS ORDER: <challenge_prompt>, <setup_script>, <reference_solution>, and <validation_script> LAST. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </reference_solution>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements.\n11. F-STRING SAFETY: Inside f-string `{...}` braces, do NOT embed `[`, `(`, `'`, or `\"`. The Python parser frequently rejects these as 'closing parenthesis }' does not match opening parenthesis '['' or 'unterminated string'. Pre-compute the value into a local variable first and then interpolate the plain name. Example — bad: `print(f\"got {data['key'][0]}\")`; good: `v = data['key'][0]; print(f\"got {v}\")`. To print a literal brace, double it (`{{` / `}}`). This applies to BOTH setup_script and validation_script.\n12. REFERENCE SOLUTION: <reference_solution> is a complete, runnable solution.py that solves YOUR challenge by READING the mock files your setup_script wrote and COMPUTING the answer from them at runtime — NEVER print hardcoded expected values. It will be executed against your setup data and MUST pass your validator; if it does not, the entire challenge is discarded as internally inconsistent. Keep it under 40 lines.\n13. DATETIME IMPORTS: pick ONE style and stick to it in EVERY script. Either `import datetime` and write `datetime.datetime.strptime(...)` / `datetime.timedelta(...)`, OR `from datetime import datetime, timedelta` and write bare `datetime.strptime(...)` / `timedelta(...)`. NEVER write `datetime.datetime.timedelta` and NEVER use `datetime.timedelta(...)` after `from datetime import datetime` — both crash with AttributeError at runtime."
+        system_message += "\n\nCRITICAL REQUIREMENTS:\n1. Keep scripts concise (under 30 lines) but DO NOT combine multiple Python statements onto a single line to save space. Always use normal python indentation and newlines.\n2. Generate data via loops, NEVER hardcode large strings.\n3. Output your response using strict XML tags IN THIS ORDER: <challenge_prompt>, <setup_script>, <reference_solution>, and <validation_script> LAST. Each tag MUST have a proper closing tag (</challenge_prompt>, </setup_script>, </reference_solution>, </validation_script>).\n4. SPELLING RULE: DO NOT use typos or misspellings (e.g., 'ANOMLY') as a trick. Use standard English spelling for all columns and outputs.\n5. ROBUST VALIDATOR: When comparing output, the validator MUST split by lines and strip whitespace before comparing, rather than using raw string equality.\n6. STDLIB ONLY in setup scripts: the sandbox has pandas/numpy/sklearn, but your setup_script must use ONLY Python stdlib (random, string, datetime, csv, sqlite3, json, os, pathlib). NEVER import `faker` or any third-party data generator — they are not installed and the setup will crash.\n7. The validator script ALSO must use stdlib + subprocess only.\n8. FLOAT FORMATTING: When your validator compares numeric output, ALWAYS convert both sides to float() and compare with tolerance (abs(a-b) < 0.01), NEVER compare formatted strings directly. Python's round() and f-string formatting produce different trailing zeros (14428.8 vs 14428.80).\n9. SCHEMA CONSISTENCY: In setup_script, if CREATE TABLE has N columns, INSERT must have exactly N values. If CSV header has N fields, each data row must have exactly N fields. Count your columns carefully.\n10. SETUP SCRIPT MUST BE VALID PYTHON: Mentally trace your setup_script. Common bugs: wrong number of VALUES in INSERT, tuple vs list confusion in executemany(), missing commas between tuple elements.\n11. F-STRING SAFETY: Inside f-string `{...}` braces, do NOT embed `[`, `(`, `'`, or `\"`. The Python parser frequently rejects these as 'closing parenthesis }' does not match opening parenthesis '['' or 'unterminated string'. Pre-compute the value into a local variable first and then interpolate the plain name. Example — bad: `print(f\"got {data['key'][0]}\")`; good: `v = data['key'][0]; print(f\"got {v}\")`. To print a literal brace, double it (`{{` / `}}`). This applies to BOTH setup_script and validation_script.\n12. REFERENCE SOLUTION: <reference_solution> is a complete, runnable solution.py that solves YOUR challenge by READING the mock files your setup_script wrote and COMPUTING the answer from them at runtime — NEVER print hardcoded expected values. It will be executed against your setup data and MUST pass your validator; if it does not, the entire challenge is discarded as internally inconsistent. Keep it under 40 lines.\n13. DATETIME IMPORTS: pick ONE style and stick to it in EVERY script. Either `import datetime` and write `datetime.datetime.strptime(...)` / `datetime.timedelta(...)`, OR `from datetime import datetime, timedelta` and write bare `datetime.strptime(...)` / `timedelta(...)`. NEVER write `datetime.datetime.timedelta` and NEVER use `datetime.timedelta(...)` after `from datetime import datetime` — both crash with AttributeError at runtime.\n14. EXPLICIT OUTPUT ORDER: whenever the expected output contains more than one line or more than one key:value pair, the challenge_prompt MUST state the exact ordering (e.g. 'sorted ascending by user_id', 'in order of first appearance in the file'), and your validator and reference_solution must expect exactly that stated order. NEVER leave ordering implicit — a solver that computes correct values in an unstated order must not fail."
 
         # Curiosity / frontier targeting: survey the FrontierTracker on the
         # real context (not the isolated one — this runs before isolation) to
@@ -3076,15 +3189,135 @@ Return ONLY a JSON object with:
                         f"analytical goal — do not reuse the same mock "
                         f"dataset name or scenario."
                     )
-            if ok and not reference_solution:
-                # Soft requirement: the challenge is still usable, but the
-                # sandbox consistency gate will be skipped — surface that.
+            if (
+                ok
+                and not reference_solution
+                and setup_script
+                and _extract_filename_literals(setup_script)
+            ):
+                # Fail-closed (2026-07-19 log eval): accepting a DATA-BACKED
+                # challenge without a <reference_solution> silently skips the
+                # validator-vs-data consistency gate, and the only solver
+                # failure that night was exactly the class the gate exists
+                # to catch (a validator quirk the challenge text never
+                # stated). Challenges whose setup writes no data files stay
+                # exempt — there is no data for the validator to disagree
+                # with, so the gate has nothing to check. Before burning a
+                # full ~35s regeneration, try a targeted ~10s repair that
+                # asks ONLY for the missing block — mirrors the validator
+                # repair below.
                 pretty_log(
-                    "Self-Play Quality Gate",
-                    "Model omitted <reference_solution> — accepting challenge "
-                    "but the validator-vs-data consistency gate will be SKIPPED.",
+                    "Reference Repair",
+                    "Model omitted <reference_solution> — attempting "
+                    "targeted regeneration before rejecting.",
                     level="WARNING", icon=Icons.WARN,
                 )
+                ref_repair_prompt = (
+                    "You previously wrote a <challenge_prompt>, "
+                    "<setup_script> and <validation_script> that were "
+                    "accepted, but you omitted the REQUIRED "
+                    "<reference_solution> block. Write ONLY the reference "
+                    "solution now. Requirements:\n\n"
+                    "1. It is a complete, runnable solution.py that solves "
+                    "the challenge below by READING the file(s) the "
+                    "setup_script wrote and COMPUTING the answer from them "
+                    "at runtime — NEVER print hardcoded expected values.\n"
+                    "2. Its stdout must be EXACTLY what the "
+                    "validation_script expects (including any ordering the "
+                    "validator implies), so read the validator carefully.\n"
+                    "3. Python stdlib only. Keep it under 40 lines.\n\n"
+                    "### CHALLENGE\n"
+                    f"{challenge}\n\n"
+                    "### SETUP SCRIPT (already executed, files exist in cwd)\n"
+                    "```python\n"
+                    f"{setup_script}\n"
+                    "```\n\n"
+                    "### VALIDATION SCRIPT (will judge solution.py)\n"
+                    "```python\n"
+                    f"{validation_script}\n"
+                    "```\n\n"
+                    "Output ONLY the <reference_solution>..."
+                    "</reference_solution> block. Do not repeat the other "
+                    "blocks.\n"
+                    "\n/no_think"
+                )
+                ref_repair_sampling = dict(CODING_SAMPLING_PARAMS)
+                ref_repair_sampling["temperature"] = 0.2
+                ref_repair_payload = {
+                    "model": model_name,
+                    "messages": [
+                        {"role": "system", "content": "You are an AI training coordinator. Output only the requested XML block."},
+                        {"role": "user", "content": ref_repair_prompt},
+                    ],
+                    "chat_template_kwargs": {"enable_thinking": False},
+                    **ref_repair_sampling,
+                    "max_tokens": 4096,
+                    "stop": ["</reference_solution>"],
+                }
+                repaired_ref = ""
+                try:
+                    ref_repair_data = await self.context.llm_client.chat_completion(
+                        ref_repair_payload,
+                        use_coding=has_coding_node,
+                        use_worker=not has_coding_node,
+                        is_background=False,
+                    )
+                    ref_repair_text = ref_repair_data["choices"][0]["message"]["content"]
+                    ref_repair_text = re.sub(
+                        r"<think>.*?</think>", "",
+                        ref_repair_text,
+                        flags=re.DOTALL | re.IGNORECASE,
+                    )
+                    _rr = re.search(
+                        r'<reference_solution[^>]*>(.*)</reference_solution\s*>',
+                        ref_repair_text, re.DOTALL | re.IGNORECASE,
+                    )
+                    if not _rr:
+                        _rr = re.search(
+                            r'<reference_solution[^>]*>(.*?)$',
+                            ref_repair_text, re.DOTALL | re.IGNORECASE,
+                        )
+                    repaired_ref = _rr.group(1).strip() if _rr else ""
+                    if repaired_ref:
+                        repaired_ref = extract_code_from_markdown(repaired_ref)
+                        repaired_ref, _ = sanitize_code(repaired_ref, "solution.py")
+                except Exception as e:
+                    pretty_log(
+                        "Reference Repair",
+                        f"Repair call raised {type(e).__name__}: {e}",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    repaired_ref = ""
+                if repaired_ref:
+                    ref_ok, ref_reason = validate_reference_solution(
+                        setup_script, repaired_ref
+                    )
+                    if ref_ok:
+                        reference_solution = repaired_ref
+                        pretty_log(
+                            "Reference Repair",
+                            "Targeted regeneration produced a usable "
+                            "<reference_solution>.",
+                            icon=Icons.OK,
+                        )
+                    else:
+                        repaired_ref = ""
+                        pretty_log(
+                            "Reference Repair",
+                            f"Repaired reference failed the static gate: {ref_reason}",
+                            level="WARNING", icon=Icons.WARN,
+                        )
+                if not reference_solution:
+                    ok = False
+                    reason = (
+                        "your output omitted the <reference_solution> block "
+                        "and a targeted repair did not produce a usable one. "
+                        "Without it the validator-vs-data consistency gate "
+                        "cannot run, so the challenge is rejected. Include a "
+                        "<reference_solution> that COMPUTES the answer from "
+                        "the setup files at runtime and passes your own "
+                        "validator."
+                    )
             if ok:
                 gen_ok = True
                 # Feed the diversity window (LLM-generated path only —

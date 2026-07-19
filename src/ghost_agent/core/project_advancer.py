@@ -1233,9 +1233,10 @@ def project_dream_pass(store, llm_summarize=None) -> int:
     """Per-project consolidation step run from ``core/dream.py``.
 
     Walks every ACTIVE project, collects any ``autoadvance_step`` /
-    ``task_updated`` events since the last dream pass, and writes a
-    single consolidated ``dream_digest`` event with the takeaways.
-    Returns the number of digests written.
+    ``task_updated`` / ``artifact_added`` events — plus failure-outcome
+    ``work_log`` events — since the last dream pass (event-id
+    watermark), and writes a single consolidated ``dream_digest`` event
+    with the takeaways. Returns the number of digests written.
 
     The ``llm_summarize`` arg is optional — when absent, we log a
     raw event count so the dream pass is still useful without an LLM.
@@ -1244,17 +1245,35 @@ def project_dream_pass(store, llm_summarize=None) -> int:
     """
     if store is None:
         return 0
+
+    def _wl_failed(e) -> bool:
+        oc = str((e.get("payload") or {}).get("outcome") or "")
+        return oc == "had_failures" or oc.startswith("verifier:failed")
+
     count = 0
     for proj in store.list_projects(status_filter="ACTIVE"):
         pid = proj["id"]
         events = store.list_events(pid, limit=200)
+        # Watermark on the last digest's event id. Required now that the
+        # dream cycle actually calls this every REM tick (2026-07-19) —
+        # without it the same last-200 events would be re-digested
+        # forever, degrading the LAST DREAM DIGEST briefing into noise.
+        last_digest_id = max(
+            (e["id"] for e in events if e["type"] == "dream_digest"),
+            default=0)
         relevant = [
             e for e in events
-            if e["type"] in {"autoadvance_step", "task_updated", "artifact_added"}
+            if e["id"] > last_digest_id
+            and (e["type"] in {"autoadvance_step", "task_updated",
+                               "artifact_added"}
+                 or (e["type"] == "work_log" and _wl_failed(e)))
         ]
         if not relevant:
             continue
         payload: Dict[str, Any] = {"event_count": len(relevant)}
+        failures = sum(1 for e in relevant if e["type"] == "work_log")
+        if failures:
+            payload["failures"] = failures
         if llm_summarize is not None:
             try:
                 payload["summary"] = llm_summarize(relevant)

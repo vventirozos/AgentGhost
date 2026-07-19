@@ -267,3 +267,46 @@ def test_handle_chat_resets_accumulators_and_calls_defect_hook():
     # defect hook rides the bug-report gate
     assert (src.index("_is_bug_report_intent(lc)")
             < src.index("_note_defect_on_done_project(lc)"))
+
+
+# --------------------------------------- failure dimension (2026-07-19)
+
+def test_work_log_payload_carries_failure_dimension(store, pid):
+    store.add_work_log(pid, request="fix the parser",
+                       outcome="had_failures",
+                       failure_dimension="output_processing")
+    p = store.recent_work_logs(pid)[0]["payload"]
+    assert p["failure_dimension"] == "output_processing"
+
+
+def test_work_log_failure_dimension_defaults_empty_and_bounded(store, pid):
+    store.add_work_log(pid, request="r")
+    assert store.recent_work_logs(pid)[0]["payload"]["failure_dimension"] == ""
+    store.add_work_log(pid, request="r2", failure_dimension="x" * 100)
+    p = store.recent_work_logs(pid)[0]["payload"]
+    assert len(p["failure_dimension"]) == 24
+
+
+def test_finalize_chain_classifies_failure_dimension():
+    import inspect
+    import ghost_agent.core.agent as agent_mod
+    src = inspect.getsource(agent_mod.GhostAgent._finalize_and_return)
+    assert "failure_dimension=_wl_dim" in src
+    assert "_turn_failure_texts" in src
+    # only failed turns pay for classification
+    assert 'if _wl_outcome != "completed":' in src
+
+
+def test_dispatch_captures_failure_texts():
+    import inspect
+    import ghost_agent.core.agent as agent_mod
+    src = inspect.getsource(
+        agent_mod.GhostAgent._dispatch_and_process_tool_batch)
+    assert "_turn_failure_texts" in src
+
+
+def test_handle_chat_inits_failure_texts():
+    import inspect
+    import ghost_agent.core.agent as agent_mod
+    src = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    assert "_turn_failure_texts = []" in src

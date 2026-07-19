@@ -209,6 +209,11 @@ def _normalize_lesson(lesson: dict) -> dict:
     out["helpful_retrievals"] = int(out.get("helpful_retrievals") or 0)
     out.setdefault("last_retrieved_at", "")
     out.setdefault("source", "")
+    # Harness dimension the recorded failure was attributed to (see
+    # core/failure_dimension.py). Empty for legacy lessons, mistake-less
+    # rules, and records the heuristics couldn't classify — the dream
+    # distillation pass adjudicates those offline.
+    out.setdefault("dimension", "")
     # Trajectory id of the turn that produced this lesson. Used by
     # `retract_lessons_from_trajectory` to scrub poisoned lessons
     # when the source trajectory is later promoted to FAILED (e.g.
@@ -235,10 +240,16 @@ def build_lesson(
     source: str = "",
     source_trajectory_id: str = "",
     source_refs=None,
+    dimension: str = "",
 ) -> dict:
     """Construct a canonical structured lesson. Callers that only have
     legacy `task/mistake/solution` can pass those as trigger/
     anti_pattern/correct_pattern — the normalizer fills the rest.
+
+    ``dimension`` names the harness layer the recorded failure was
+    attributed to (one of ``failure_dimension.DIMENSIONS``, or empty).
+    Kept separate from ``domains`` for the same retrieval reasons as
+    ``source`` — it is diagnostic metadata, not query language.
 
     `source` is free-form provenance metadata (e.g. ``self_play``,
     ``post_mortem``). It is deliberately NOT mixed into the trigger
@@ -281,6 +292,7 @@ def build_lesson(
         "source": source or "",
         "source_trajectory_id": source_trajectory_id or "",
         "source_refs": [str(r) for r in (source_refs or [])][:20],
+        "dimension": dimension or "",
     }
     return lesson
 
@@ -679,6 +691,7 @@ class SkillMemory:
         source: str = "",
         source_trajectory_id: str = "",
         source_refs=None,
+        dimension: str = "",
     ):
         """Write a lesson to the playbook. Accepts both legacy positional
         args (task/mistake/solution) and the new structured kwargs.
@@ -710,6 +723,31 @@ class SkillMemory:
                     "learn_lesson: dropped non-actionable %s lesson: %r",
                     source or "?", (effective_correct or effective_trigger)[:80])
                 return
+
+            # Harness-dimension attribution (2026-07-19). Chokepoint
+            # placement covers every producer without touching them: when
+            # the caller didn't attribute explicitly and the lesson records
+            # a real mistake, classify it heuristically. Mistake-less rules
+            # get no dimension (there is no failure to attribute), and
+            # "unknown" stays empty so the dream-side adjudication pass can
+            # find unattributed records. Kill switch: GHOST_FAILURE_DIM=0.
+            effective_dim = (dimension or "").strip()
+            if not effective_dim:
+                try:
+                    from ..core.failure_dimension import (
+                        classify_failure_dimension, failure_dim_enabled)
+                    from .lesson_quality import _is_mistake_less
+                    if failure_dim_enabled() and not _is_mistake_less(effective_anti):
+                        effective_dim, _dim_signal = classify_failure_dimension(
+                            f"{effective_trigger}\n{effective_anti}")
+                        if effective_dim == "unknown":
+                            effective_dim = ""
+                        elif _dim_signal:
+                            logger.debug(
+                                "learn_lesson: dimension=%s (signal: %r)",
+                                effective_dim, _dim_signal[:60])
+                except Exception:
+                    effective_dim = ""
 
             # Dedup uses legacy fields for compatibility with older
             # playbooks & vector entries written before the redesign.
@@ -755,6 +793,8 @@ class SkillMemory:
                                     + [str(r) for r in source_refs]
                                 ))[:20]
                                 existing["source_refs"] = merged_refs
+                            if effective_dim and not existing.get("dimension"):
+                                existing["dimension"] = effective_dim
                             existing["timestamp"] = _now_iso()
                             playbook[idx] = existing
                             self._save_playbook_unlocked(playbook)
@@ -798,6 +838,8 @@ class SkillMemory:
                                     + [str(r) for r in source_refs]
                                 ))[:20]
                                 existing["source_refs"] = merged_refs
+                            if effective_dim and not existing.get("dimension"):
+                                existing["dimension"] = effective_dim
                             existing["timestamp"] = _now_iso()
                             playbook[idx] = existing
                             self._save_playbook_unlocked(playbook)
@@ -827,6 +869,7 @@ class SkillMemory:
                 source=source,
                 source_trajectory_id=source_trajectory_id,
                 source_refs=source_refs,
+                dimension=effective_dim,
             )
 
             with self._get_lock():
@@ -859,6 +902,9 @@ class SkillMemory:
                     # Evidence handles (e.g. "ep:12,ep:15") so recall hits
                     # can surface where the lesson was generalized from.
                     "source_refs": ",".join(new_lesson.get("source_refs") or [])[:400],
+                    # Harness dimension for future where-filtered recall;
+                    # read-side plumbing needs nothing today.
+                    "dimension": new_lesson.get("dimension", "") or "",
                 }
                 memory_system.add(text, meta)
 

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>core.failure_dimension — Ghost Agent</title>
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h1>Ghost Agent</h1>
+  <nav>
+    <a href="../index.html">← Home</a>
+    <h3>Core</h3>
+    <a href="agent.html">agent</a>
+    <a href="llm.html">llm</a>
+    <a href="dream.html">dream</a>
+    <a href="verifier.html">verifier</a>
+    <a class="current" href="failure_dimension.html">failure_dimension</a>
+    <a href="project_advancer.html">project_advancer</a>
+    <h3>Related</h3>
+    <a href="../tools/tool_failure.html">tool_failure</a>
+    <a href="../memory/skills.html">skills (lessons)</a>
+    <a href="../algorithms/node_offload.html">node offload</a>
+    <a href="../algorithms/dream_cycle.html">dream cycle</a>
+  </nav>
+</aside>
+<main>
+  <h1>core / failure_dimension.py + failure_distill.py</h1>
+  <p class="subtitle">Harness-dimension failure attribution and the dream-side failure-cluster distillation pass (MemoHarness adaptation, 2026-07-19).</p>
+
+  <h2>Why</h2>
+  <p>Three multi-day debugging episodes in this project's history were rooted in the same mistake — a <em>harness</em> failure read as a <em>model</em> failure: the verifier "not in evidence" refutes (evidence-packer truncation, not the judge), the code-correction failures (fail-open SEARCH/REPLACE parser, not the LLM), and the introspect breakage (native-tools arg corruption). Every failure record now carries a <code>dimension</code> naming the harness layer it was attributed to, so the debugging prior is <strong>audit the harness before blaming the model</strong> — and so recurring failures can be grouped and distilled into preventive lessons.</p>
+
+  <h2>Taxonomy (adapted from MemoHarness D1–D6, arXiv:2607.14159)</h2>
+  <table>
+    <thead><tr><th>Dimension</th><th>Covers</th><th>Example signals</th></tr></thead>
+    <tbody>
+      <tr><td><code>context_assembly</code></td><td>hydration, briefing, evidence packing, context pruning/overflow, prompt assembly</td><td>"evidence … truncated" · "context overflow" · "[truncated"</td></tr>
+      <tr><td><code>tool_interaction</code></td><td>tool routing/args, browser, search, network, sandbox</td><td>"invalid arg" · "element not found" · ECONNRESET · "command not found"</td></tr>
+      <tr><td><code>generation_control</code></td><td>sampling, token budgets, LLM-call timeouts</td><td>"finish_reason length" · ReadTimeout · "empty completion"</td></tr>
+      <tr><td><code>orchestration</code></td><td>verifier route, loop-breaker, strikes, dispatch, planning</td><td>"verifier REFUTED" · "loop-breaker" · "replan"</td></tr>
+      <tr><td><code>memory</code></td><td>recall, lessons/playbook, knowledge base, project store</td><td>"quarantined" · "stale hint" · "counterfactual regression"</td></tr>
+      <tr><td><code>output_processing</code></td><td>parsers, SEARCH/REPLACE blocks, scrub, schema validation</td><td>"SEARCH/REPLACE" · JSONDecodeError · "malformed output"</td></tr>
+      <tr><td><code>model</code></td><td>base-model reasoning error despite correct context/tooling</td><td>"hallucinated" · "miscalculated" · "refused"</td></tr>
+      <tr><td><code>unknown</code></td><td>no signal matched — offline-adjudication candidates</td><td>—</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Precedence:</strong> first-match-wins over the tables in the order <code>output_processing → memory → context_assembly → orchestration → tool_interaction → generation_control → model</code>. Harness dimensions are deliberately checked before <code>model</code>, and specific beats generic — a <em>network</em> timeout (ETIMEDOUT) lands on tool_interaction while an <em>LLM</em> timeout (ReadTimeout) lands on generation_control.</p>
+  <p><strong>The tag is a prior, not a verdict.</strong> Regex over failure text sees where a failure <em>surfaced</em>, not necessarily where it originated. Individual tags can be wrong; the aggregate distribution (a month of tags showing one dimension spiking) is the reliable signal. The matched signal is debug-logged at each write for spot audits.</p>
+
+  <h2>Where attribution happens</h2>
+  <ul>
+    <li><strong>Lessons</strong> — inside the single write chokepoint <a href="../memory/skills.html"><code>SkillMemory.learn_lesson</code></a>: real-mistake lessons are classified from <code>trigger + anti_pattern</code>; mistake-less rules get no dimension; an explicit <code>dimension=</code> kwarg wins. Stored on the JSON row and the vector-twin metadata.</li>
+    <li><strong>Work logs</strong> — the finalize chain captures failure heads next to <code>classify_tool_failure</code> (<code>context._turn_failure_texts</code>, capped at 6/turn) and classifies them (plus the verifier reason on a <code>verifier:failed</code> outcome) into the work_log payload's <code>failure_dimension</code>. Only failed turns pay for classification.</li>
+    <li><strong>Counterfactual regressions</strong> — deterministically <code>memory</code>: a previously-passing challenge failing after lesson hydration means a learned lesson degraded behaviour.</li>
+  </ul>
+
+  <h2>failure_distill.py — the dream-side pass</h2>
+  <p>Runs at the top of every REM cycle (before the entropy/idempotency gates — see <a href="../algorithms/dream_cycle.html">dream cycle</a>). Gathers the last 14 days of failure records from playbook + work_logs + counterfactual results, groups by <code>(dimension, cluster)</code> (cluster via <code>frontier.classify_cluster</code>), and for each group of ≥3 cases asks the worker model to distill ONE cross-case pattern lesson:</p>
+  <ul>
+    <li>Write-back goes through <code>learn_lesson</code> with <code>source="distilled"</code>, <code>confidence=0.6</code>, <code>domains=[cluster, dimension]</code> and the case handles as <code>source_refs</code> — so the <strong>existing hydration path retrieves it with zero new read-side plumbing</strong>.</li>
+    <li>The trigger is <code>distilled(&lt;dim&gt;/&lt;cluster&gt;): &lt;pattern&gt;</code>; on re-distillation the prior trigger is reused <em>verbatim</em> so dedup bumps frequency instead of adding rows (steady-state: one playbook slot per cluster).</li>
+    <li>An evidence fingerprint per cluster (<code>$GHOST_HOME/system/failure_distill_state.json</code>) skips clusters whose case set hasn't changed — same evidence would only re-mint the same lesson.</li>
+    <li>Records the heuristics left <code>unknown</code> are first re-classified by the worker (<code>CLASSIFY_FAILURE</code> route, ≤8/cycle) and the verdicts persisted onto the playbook.</li>
+    <li>Capped at <code>GHOST_FAILURE_DISTILL_MAX</code> (default 2) lessons per cycle; every path fails open to 0.</li>
+  </ul>
+
+  <h2>Knobs</h2>
+  <table>
+    <thead><tr><th>Env var</th><th>Default</th><th>Effect</th></tr></thead>
+    <tbody>
+      <tr><td><code>GHOST_FAILURE_DIM</code></td><td>1</td><td>Attribution at record time (lessons + work_logs). <code>0</code> kills.</td></tr>
+      <tr><td><code>GHOST_FAILURE_DISTILL</code></td><td>1</td><td>The dream-cycle distillation pass. <code>0</code> kills.</td></tr>
+      <tr><td><code>GHOST_FAILURE_ADJUDICATE</code></td><td>1</td><td>Worker-LLM re-classification of unknowns during the pass.</td></tr>
+      <tr><td><code>GHOST_FAILURE_DISTILL_MAX</code></td><td>2</td><td>Distilled pattern lessons per dream cycle.</td></tr>
+    </tbody>
+  </table>
+  <p>All read per call (no restart needed) — the <code>GHOST_VERIFY_TWO_STAGE</code> idiom. Routing labels: <code>CLASSIFY_FAILURE</code> (adjudication, 8 tokens) and <code>DISTILL_PATTERN</code> (synthesis, 400 tokens, 60s) — both worker-only via <a href="../algorithms/node_offload.html"><code>LLMClient.route()</code></a>, falling back to the heuristic / skipping on any failure.</p>
+
+  <h2>Tests</h2>
+  <p><code>tests/test_failure_dimension.py</code> · <code>tests/test_lesson_dimension.py</code> · <code>tests/test_failure_distill.py</code> · <code>tests/test_dream_failure_distill_wiring.py</code> · additions in <code>tests/test_project_work_log.py</code> and <code>tests/test_project_advancer.py</code>.</p>
+
+  <footer><a href="../index.html">← Back to index</a></footer>
+</main>
+</body>
+</html>

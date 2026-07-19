@@ -294,6 +294,8 @@ graded factual Q&A classified "conversational" → temp 1.0 + presence_penalty 1
 | Normalized graduation + discriminative credit + mints a `proposed` macro | `skills_auto` | live |
 | Router trains/loads at startup (not escalate-all) | `router/trainer.bootstrap_router` | live |
 | Selfhood wake-up prefix OFF; workspace prefix gated on active project | `_SELFHOOD_PREFIX_ENABLED = False` | **OFF** |
+| Harness-dimension failure attribution (lessons + work_logs) | `GHOST_FAILURE_DIM` env kill; `learn_lesson` chokepoint + finalize work_log (2026-07-19) | live |
+| Failure-cluster distillation + project dream pass (REM pre-gate) | `GHOST_FAILURE_DISTILL` / `GHOST_FAILURE_ADJUDICATE` / `GHOST_FAILURE_DISTILL_MAX` env kills; `dream()` pre-gate (2026-07-19) | live |
 
 **Re-enable criteria (why each OFF toggle is parked, not deleted):**
 - `_MCTS_TURNSTART_ENABLED` — only with an **execution-grounded** value fn (not self-prediction).
@@ -302,6 +304,12 @@ graded factual Q&A classified "conversational" → temp 1.0 + presence_penalty 1
 - `_SELFHOOD_PREFIX_ENABLED` — the prefix injects no facts/tools/constraints (pure token cost). The
   load-bearing selfhood path is the cross-session memory substrate (Track B), which IS proven.
 - `_METACOG_ARBITER_ENABLED` — net-negative as built; superseded by #18.
+
+**Kill criteria for the 2026-07-19 ON toggles** (spot-audit after ~2 weeks): kill
+`GHOST_FAILURE_DIM` if the dimension distribution in work_logs reads as noise in spot audits
+(misattribution > ~30% — the tag is a prior, not a verdict; the debug log carries the matched
+signal for auditing). Kill `GHOST_FAILURE_DISTILL` if distilled lessons crowd playbook slots or
+their `helpful_retrievals` stay at zero while occupying retrieval budget.
 
 **Do NOT re-enable an OFF layer** without meeting its criterion or a fresh paired-ablation win.
 The default-OFF state is the measured-neutral configuration, not an accident.
@@ -779,6 +787,85 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-19 — harness-dimension failure attribution + failure-cluster distillation
+MemoHarness adaptation (arXiv:2607.14159): every failure record now names the harness
+layer it was attributed to, and recurring failure clusters distill into preventive
+pattern lessons during REM. Motivation: three multi-day debugging episodes (verifier
+evidence-packer truncation, fail-open SEARCH/REPLACE parser, native-tools arg
+corruption) were all harness failures initially blamed on the model.
+- **`core/failure_dimension.py`** (new, leaf): 8-value taxonomy
+  (context_assembly / tool_interaction / generation_control / orchestration / memory /
+  output_processing / model / unknown), first-match-wins regex tables ordered
+  harness-before-model ("audit the harness first"; network ETIMEDOUT →
+  tool_interaction, LLM ReadTimeout → generation_control), worker adjudication via
+  new `CLASSIFY_FAILURE` route label. Env helpers read per-call.
+- **Lessons**: `dimension` field on the schema (additive, `_normalize_lesson`
+  back-fill, vector-twin meta); auto-classified at the `learn_lesson` chokepoint for
+  real-mistake lessons (mistake-less rules stay empty; explicit kwarg wins; dedup
+  merges back-fill it). No producer call-sites touched.
+- **Work logs**: dispatch loop captures failure heads next to
+  `classify_tool_failure` (`context._turn_failure_texts`, ≤6/turn); finalize
+  classifies them (+ verifier reason) into the payload's `failure_dimension`
+  (only non-completed outcomes pay).
+- **`core/failure_distill.py`** (new): REM pre-gate pass — corpus from playbook +
+  all-project failure work_logs + counterfactual regressions (deterministically
+  `memory`), grouped by (dimension, `frontier.classify_cluster`), ≥3 cases →
+  ONE pattern lesson via worker route `DISTILL_PATTERN` (400 tok, 60s), written
+  through `learn_lesson` with `source="distilled"` so EXISTING hydration retrieves
+  it — zero new read-side plumbing. Verbatim trigger reuse
+  (`distilled(<dim>/<cluster>):`) → freq bump not row growth; evidence-fingerprint
+  watermark in `$GHOST_HOME/system/failure_distill_state.json` skips unchanged
+  clusters; unknowns adjudicated (≤8/cycle) and persisted. Cap 2/cycle.
+- **`project_dream_pass` finally wired** (built-but-unwired since Phase 5): called
+  from `dream()` alongside the distill pass, both BEFORE the entropy/idempotency
+  gates (episodes-pass rationale). Gained the event-id watermark wiring it demanded
+  (re-digestion spam otherwise) + failure work_logs join the digest with a
+  `failures` count. LAST DREAM DIGEST briefing line now actually populates.
+- Gotcha for future readers: the dimension tag is a **prior, not a verdict** — regex
+  sees where a failure *surfaced*, not where it originated (the evidence-packer bug
+  would have tagged `orchestration` from the refute text). The aggregate
+  distribution is the reliable signal; §3 lists the kill criteria.
+Toggles (all default ON, per-call env read): `GHOST_FAILURE_DIM`,
+`GHOST_FAILURE_DISTILL`, `GHOST_FAILURE_ADJUDICATE`, `GHOST_FAILURE_DISTILL_MAX=2`.
+Tests: `tests/test_failure_dimension.py` (23), `tests/test_lesson_dimension.py` (10),
+`tests/test_failure_distill.py` (12), `tests/test_dream_failure_distill_wiring.py` (4),
++ additions in `test_project_work_log.py` / `test_project_advancer.py`. Docs:
+`docs/core/failure_dimension.html` (new), `docs/core/dream.html`,
+`docs/algorithms/dream_cycle.html`, `docs/memory/skills.html`,
+`docs/core/project_advancer.html`, `docs/index.html`.
+
+### 2026-07-19 — log-eval fixes: REM input starvation closed + reference gate fail-closed
+22.5h log eval (clean day: 30/30 requests finished, 20/20 self-play solved, zero
+tracebacks) surfaced two structural gaps; both fixed:
+- **REM idle-spinning** (item 1): 40 REM cycles entered, 38 skipped "fragment set
+  unchanged", `Auto-memory pool thin (0)` every single cycle. Root cause chain: auto
+  pool has ~zero inflow (smart-memory ≥0.9 gate — known, journal §6 2026-07-09) AND
+  the trajectory-digest fallback only refreshes on REAL requests (self-play detaches
+  the collector by design), so overnight hourly self-play never changed the digest
+  window. Fix: `selfplay_dream_fragments()` (core/dream.py) digests the frontier
+  tracker's per-cluster `recent_outcomes` (cluster/passed/attempts/mistake, ids
+  `selfplay:<cluster>:<ts>`, newest 20) and `dream()` merges them into the thin-pool
+  fallback — a new self-play outcome reopens the idempotency guard, no new material
+  still skips. Watchdog eligibility gate (agent.py phase 2) mirrors the new fallback.
+  Self-play ids never reach the merge/delete pass (same contract as `traj:`).
+- **Reference gate fail-open** (item 2): 3 challenges accepted that day with
+  "Model omitted <reference_solution> — consistency gate SKIPPED", and the night's
+  only solver failure was a validator ordering quirk (first-encounter order expected,
+  never stated — solver's sorted output arithmetically correct, judged FAIL; the
+  minted "insertion order" lesson at conf=1.00 generalizes that quirk). Fix, in the
+  gen loop (core/dream.py): omission on a DATA-BACKED challenge (setup writes literal
+  files) now triggers a targeted ~10s repair (regenerate ONLY the block,
+  stop=</reference_solution>, mirrors validator repair); unusable repair → attempt
+  REJECTED into the regeneration loop (fail-closed). No-data challenges stay exempt
+  (nothing for the validator to disagree with). Plus generation CRITICAL REQUIREMENT
+  #14 EXPLICIT OUTPUT ORDER: multi-line/multi-pair output must state its exact
+  ordering in the challenge prompt — the quirk-lesson source class, cut off at
+  generation.
+- Tests: tests/test_dream_selfplay_seeds.py (new, 9) + test_selfplay_reference_gate.py
+  (+5: fail-closed pins, repair/reject/exempt functional paths). Docs:
+  docs/core/dream.html (§4b fail-closed, Self-play-seeded REM). Needs restart to go
+  live (dream.py/agent.py are hot only on boot).
 
 ### 2026-07-18 (later 9) — Rick Dangerous churn loop: wrong refute + reopen/advance grind (FIXED)
 Operator: "fix the wrongly refuted / auto advance loop that grinds turns." Diagnosis from

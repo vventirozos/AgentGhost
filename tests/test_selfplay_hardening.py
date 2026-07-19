@@ -204,6 +204,12 @@ async def test_quality_gate_regenerates_on_bad_validator(
             '    lines = f.readlines()\n'
             'subprocess.run(["python3","solution.py"])\n'
         ),
+        # Data-backed challenges must ship a reference since the 2026-07-19
+        # fail-closed change — omission would trigger repair/rejection here.
+        "reference_solution": (
+            'with open("sales.csv") as f:\n'
+            '    print(len(f.readlines()))\n'
+        ),
     }
     learning_payload = {
         "choices": [

@@ -1123,7 +1123,8 @@ class ProjectStore:
                      tools: Optional[Dict[str, int]] = None,
                      commands: Optional[List[str]] = None,
                      outcome: str = "",
-                     note: str = "") -> int:
+                     note: str = "",
+                     failure_dimension: str = "") -> int:
         """Append one bounded work-log event for a request that did real
         work on this project. ``files`` = project-relative paths written;
         ``tools`` = {tool_name: successful_call_count}; ``commands`` =
@@ -1131,7 +1132,9 @@ class ProjectStore:
         script outputs — is invisible to the file accumulator, and its
         absence caused a re-clone strike on 2026-07-18); ``outcome`` = a
         short label ("completed" / verifier outcome / "had_failures");
-        ``note`` = the head of the final response (what was concluded)."""
+        ``note`` = the head of the final response (what was concluded);
+        ``failure_dimension`` = harness dimension the turn's failures were
+        attributed to (core/failure_dimension.py), empty on success."""
         file_list = sorted({str(f).strip() for f in (files or []) if str(f).strip()})
         extra = len(file_list) - self.WORK_LOG_MAX_FILES
         payload = {
@@ -1143,6 +1146,7 @@ class ProjectStore:
                          for c in (commands or [])[:5] if str(c).strip()],
             "outcome": str(outcome or "")[:60],
             "note": " ".join(str(note or "").split())[: self.WORK_LOG_NOTE_CHARS],
+            "failure_dimension": str(failure_dimension or "")[:24],
         }
         return self.log_event(project_id, None, "work_log", payload)
 

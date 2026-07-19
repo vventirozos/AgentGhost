@@ -392,3 +392,38 @@ def test_project_dream_pass_accepts_llm_summarizer(store):
 
 def test_project_dream_pass_handles_nil_store():
     assert project_dream_pass(None) == 0
+
+
+# 2026-07-19: the pass gained its promised dream.py caller, an event-id
+# watermark, and failure-outcome work_log inclusion.
+
+def test_project_dream_pass_includes_failure_work_logs(store):
+    pid = store.create_project("P")
+    store.add_work_log(pid, request="fix the parser", tools={"execute": 1},
+                       outcome="had_failures", note="markers left in file")
+    n = project_dream_pass(store)
+    assert n == 1
+    ev = store.list_events(pid, event_type="dream_digest")[0]
+    assert ev["payload"]["event_count"] == 1
+    assert ev["payload"]["failures"] == 1
+
+
+def test_project_dream_pass_excludes_completed_work_logs(store):
+    pid = store.create_project("P")
+    store.add_work_log(pid, request="all fine", tools={"execute": 1},
+                       outcome="completed", note="done")
+    assert project_dream_pass(store) == 0
+
+
+def test_project_dream_pass_watermark_prevents_redigestion(store):
+    pid = store.create_project("P")
+    store.log_event(pid, None, "autoadvance_step", {"tool": "x"})
+    assert project_dream_pass(store) == 1
+    # nothing new since the digest → nothing to write
+    assert project_dream_pass(store) == 0
+    store.log_event(pid, None, "autoadvance_step", {"tool": "y"})
+    assert project_dream_pass(store) == 1
+    digests = store.list_events(pid, event_type="dream_digest")
+    assert len(digests) == 2
+    # the second digest covers ONLY the post-watermark event
+    assert digests[0]["payload"]["event_count"] == 1

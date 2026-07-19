@@ -16,10 +16,26 @@ The fix has three parts:
      with an equally-hardcoded validator, making the sandbox gate vacuous.
   3. A sandbox gate runs the reference against the real setup data and
      discards the challenge unless the validator passes it.
+
+Fail-closed extension (2026-07-19 log eval): a data-backed challenge whose
+generation OMITTED the <reference_solution> used to be accepted with the
+consistency gate silently skipped ("fail-open") — and the only solver
+failure that night was exactly the class the gate exists to catch (a
+validator ordering quirk the challenge text never stated). Now the
+orchestrator first attempts a targeted repair (regenerate ONLY the missing
+block, mirroring the validator repair), and rejects the challenge if the
+repair doesn't produce a usable reference. Challenges WITHOUT a
+setup_script stay exempt: there is no data for the validator to disagree
+with, so the gate has nothing to check.
 """
 import inspect
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from ghost_agent.core.dream import (
+    Dreamer,
     validate_reference_solution,
     validate_challenge_quality,
 )
@@ -104,3 +120,189 @@ class TestGateWiring:
         assert "validate_reference_solution(" in src.replace(
             "def validate_reference_solution(", "", 1
         )
+
+    def test_omission_is_fail_closed_not_fail_open(self):
+        src = self._source()
+        # The fail-open acceptance is gone…
+        assert "consistency gate will be SKIPPED" not in src
+        # …replaced by targeted repair + rejection.
+        assert "Reference Repair" in src
+        assert "targeted repair did not produce a usable one" in src
+        assert '"stop": ["</reference_solution>"]' in src
+
+    def test_generation_prompt_demands_explicit_output_order(self):
+        # The 2026-07-19 failure was an ordering ambiguity: correct values,
+        # unstated order. The prompt must forbid implicit ordering.
+        src = self._source()
+        assert "EXPLICIT OUTPUT ORDER" in src
+
+
+# ── functional: the generation loop end-to-end ───────────────────────────────
+
+SETUP_CSV = """import csv
+rows = [["u1", "10.0"], ["u2", "20.0"]]
+with open("data.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["user", "amount"])
+    w.writerows(rows)
+"""
+
+VALIDATOR_CSV = """import subprocess, csv
+with open("data.csv") as f:
+    rows = list(csv.reader(f))[1:]
+exp = sum(float(r[1]) for r in rows)
+out = subprocess.run(["python3", "solution.py"], capture_output=True, text=True)
+ok = abs(float(out.stdout.strip()) - float(exp)) < 0.01
+raise SystemExit(0 if ok else 1)
+"""
+
+REFERENCE_CSV = """import csv
+with open("data.csv") as f:
+    rows = list(csv.reader(f))[1:]
+print(sum(float(r[1]) for r in rows))
+"""
+
+GEN_XML_NO_REFERENCE = (
+    "<challenge_prompt>Sum the amount column of data.csv and print the "
+    "total.</challenge_prompt>\n"
+    f"<setup_script>{SETUP_CSV}</setup_script>\n"
+    f"<validation_script>{VALIDATOR_CSV}</validation_script>\n"
+)
+
+
+def _make_context(tmp_path):
+    context = MagicMock()
+    context.memory_system = MagicMock()
+    context.skill_memory = MagicMock()
+    context.skill_memory.get_recent_failures.return_value = "No failures"
+    context.llm_client = MagicMock()
+    context.args = MagicMock()
+    context.args.perfect_it = True
+    context.args.smart_memory = 1.0
+    context.sandbox_manager = MagicMock()
+    context.sandbox_dir = str(tmp_path)
+    context.tor_proxy = None
+    context.scratchpad = MagicMock()
+    context.frontier_tracker = None
+    return context
+
+
+def _make_sandbox():
+    sandbox = MagicMock()
+
+    def execute(cmd, *a, **kw):
+        if "py_compile" in cmd:
+            return ("Syntax OK", 0)
+        return ("", 0)
+
+    sandbox.execute.side_effect = execute
+    return sandbox
+
+
+def _is_reference_repair(payload):
+    return payload.get("stop") == ["</reference_solution>"]
+
+
+@pytest.mark.asyncio
+@patch("ghost_agent.sandbox.docker.DockerSandbox")
+@patch("ghost_agent.core.agent.GhostAgent")
+async def test_omitted_reference_is_repaired_and_challenge_accepted(
+    mock_agent_cls, mock_sandbox_cls, tmp_path, disable_self_play_templates
+):
+    ctx = _make_context(tmp_path)
+    repair_calls = []
+
+    async def llm(payload, **kw):
+        if _is_reference_repair(payload):
+            repair_calls.append(payload)
+            return {"choices": [{"message": {"content":
+                f"<reference_solution>{REFERENCE_CSV}</reference_solution>"}}]}
+        return {"choices": [{"message": {"content": GEN_XML_NO_REFERENCE}}]}
+
+    ctx.llm_client.chat_completion = AsyncMock(side_effect=llm)
+
+    mock_agent = MagicMock()
+    mock_agent.handle_chat = AsyncMock(return_value=("ok", None, None))
+    mock_agent._get_recent_transcript.return_value = "transcript"
+    mock_agent_cls.return_value = mock_agent
+    mock_sandbox_cls.return_value = _make_sandbox()
+
+    dreamer = Dreamer(ctx)
+    result = await dreamer.synthetic_self_play("test-model")
+
+    assert len(repair_calls) == 1, "exactly one targeted repair expected"
+    assert "generation failed the quality gate" not in str(result)
+    # The repaired challenge was ACCEPTED: the solver actually ran.
+    mock_agent.handle_chat.assert_awaited()
+
+
+@pytest.mark.asyncio
+@patch("ghost_agent.sandbox.docker.DockerSandbox")
+@patch("ghost_agent.core.agent.GhostAgent")
+async def test_unrepairable_omission_rejects_challenge(
+    mock_agent_cls, mock_sandbox_cls, tmp_path, disable_self_play_templates
+):
+    ctx = _make_context(tmp_path)
+    repair_calls = []
+
+    async def llm(payload, **kw):
+        if _is_reference_repair(payload):
+            repair_calls.append(payload)
+            # repair also fails to produce the block
+            return {"choices": [{"message": {"content": "no block here"}}]}
+        return {"choices": [{"message": {"content": GEN_XML_NO_REFERENCE}}]}
+
+    ctx.llm_client.chat_completion = AsyncMock(side_effect=llm)
+
+    mock_agent = MagicMock()
+    mock_agent.handle_chat = AsyncMock(return_value=("ok", None, None))
+    mock_agent_cls.return_value = mock_agent
+    mock_sandbox_cls.return_value = _make_sandbox()
+
+    dreamer = Dreamer(ctx)
+    result = await dreamer.synthetic_self_play("test-model")
+
+    # fail-closed: every gen attempt repaired-then-rejected, solver never ran
+    assert len(repair_calls) == 3
+    assert "failed the quality gate" in str(result)
+    mock_agent.handle_chat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@patch("ghost_agent.sandbox.docker.DockerSandbox")
+@patch("ghost_agent.core.agent.GhostAgent")
+async def test_no_setup_challenge_stays_exempt(
+    mock_agent_cls, mock_sandbox_cls, tmp_path, disable_self_play_templates
+):
+    # Without a setup_script there is no data for the validator to disagree
+    # with — the consistency gate has nothing to check, so omission must
+    # not trigger repair or rejection (pre-existing toy-challenge shape).
+    ctx = _make_context(tmp_path)
+    repair_calls = []
+
+    async def llm(payload, **kw):
+        if _is_reference_repair(payload):
+            repair_calls.append(payload)
+            return {"choices": [{"message": {"content": "no block"}}]}
+        return {"choices": [{"message": {"content":
+            "<challenge_prompt>Print the string OK.</challenge_prompt>\n"
+            "<validation_script>import subprocess\n"
+            "out = subprocess.run(['python3', 'solution.py'], "
+            "capture_output=True, text=True)\n"
+            "raise SystemExit(0 if out.stdout.strip() == 'OK' else 1)\n"
+            "</validation_script>"}}]}
+
+    ctx.llm_client.chat_completion = AsyncMock(side_effect=llm)
+
+    mock_agent = MagicMock()
+    mock_agent.handle_chat = AsyncMock(return_value=("ok", None, None))
+    mock_agent._get_recent_transcript.return_value = "transcript"
+    mock_agent_cls.return_value = mock_agent
+    mock_sandbox_cls.return_value = _make_sandbox()
+
+    dreamer = Dreamer(ctx)
+    result = await dreamer.synthetic_self_play("test-model")
+
+    assert repair_calls == []
+    assert "failed the quality gate" not in str(result)
+    mock_agent.handle_chat.assert_awaited()
