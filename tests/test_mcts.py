@@ -99,6 +99,38 @@ class TestMCTSReasoner:
         mcts.clear()
         assert not mcts._backtrack_stack
 
+    def test_backtrack_stack_bounded(self):
+        # The reasoner lives for the process lifetime and nothing pops
+        # the stack, so it must be capped — oldest alternatives drop off.
+        m = MCTSReasoner()
+        for i in range(MCTSReasoner.BACKTRACK_CAP * 3):
+            m._backtrack_stack.append([ActionCandidate(description=f"alt{i}")])
+        assert len(m._backtrack_stack) == MCTSReasoner.BACKTRACK_CAP
+        assert m._backtrack_stack[-1][0].description == \
+            f"alt{MCTSReasoner.BACKTRACK_CAP * 3 - 1}"  # newest retained
+        m.clear()  # clear() API unchanged
+        assert not m._backtrack_stack
+
+    async def test_expand_disables_thinking(self, mcts, mock_llm_client):
+        # Mirror of the _sim regression: _expand is the same cheap
+        # utility call on a reasoning model — without the no-think
+        # switches the whole 1024-token budget went to <think> and
+        # expansion returned zero candidates.
+        captured = {}
+
+        async def _cc(payload, *a, **k):
+            captured.update(payload)
+            return {"choices": [{"message": {"content": json.dumps({
+                "candidates": [{"description": "read the file",
+                                "tool_name": "file_system", "risk": "low"}],
+            })}}]}
+
+        mock_llm_client.chat_completion.side_effect = _cc
+        out = await mcts._expand("task", "state", ["file_system"], "ctx")
+        assert captured.get("chat_template_kwargs") == {"enable_thinking": False}
+        assert captured["messages"][0]["content"].rstrip().endswith("/no_think")
+        assert out and out[0].description == "read the file"
+
     async def test_expand_handles_exception(self, mcts, mock_llm_client):
         mock_llm_client.chat_completion.side_effect = Exception("boom")
         result = await mcts._expand("task", "state", ["tools"], "context")

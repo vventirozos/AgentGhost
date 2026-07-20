@@ -48,21 +48,33 @@ class ContradictionLog:
         ----------
         new_fact : str
             The incoming fact that triggered the revision.
-        old_facts : list[dict]
-            The old facts that were superseded (each has 'id' and 'text').
+        old_facts : list[dict] | list[str]
+            The old facts that were superseded. The contradiction engine
+            passes dicts (each has 'id' and 'text'); the project-advancer
+            path (core.project_safety.route_contradiction) passes plain
+            strings with no ids to match.
         deleted_ids : list[str]
             IDs of the memories that were actually deleted.
         reason : str, optional
             Free-form reason from the contradiction engine.
         """
+        if not isinstance(old_facts, (list, tuple)):
+            old_facts = [old_facts] if old_facts else []
+        deleted_ids = deleted_ids if isinstance(deleted_ids, list) else list(deleted_ids or [])
+        superseded = []
+        for f in old_facts:
+            if isinstance(f, dict):
+                if f.get("id") in deleted_ids or str(f.get("id", "")).replace("ID:", "").strip() in deleted_ids:
+                    superseded.append({"id": f.get("id", "?"), "text": f.get("text", "?")})
+            elif f is not None:
+                # String-sourced fact: no id to match against deleted_ids,
+                # so include it unconditionally — dropping it would leave
+                # the revision unexplainable.
+                superseded.append({"id": "", "text": str(f)})
         entry = {
             "timestamp": datetime.now().isoformat(),
             "new_fact": new_fact,
-            "superseded": [
-                {"id": f.get("id", "?"), "text": f.get("text", "?")}
-                for f in old_facts
-                if f.get("id") in deleted_ids or str(f.get("id", "")).replace("ID:", "").strip() in deleted_ids
-            ],
+            "superseded": superseded,
             "deleted_ids": deleted_ids,
             "reason": reason,
         }

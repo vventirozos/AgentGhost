@@ -21,8 +21,9 @@ import json
 import logging
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional
 
 if TYPE_CHECKING:  # avoid a runtime cycle: prm imports nothing from core.
     from ..prm.features import PlanState
@@ -140,6 +141,12 @@ class MCTSReasoner:
     existing public contract for callers that haven't been updated.
     """
 
+    #: Backtrack-memory cap. The reasoner lives for the process lifetime
+    #: and nothing pops the stack (``select_best_action`` only appends;
+    #: ``clear()`` has no periodic caller), so an unbounded list grows
+    #: forever — the deque silently drops the OLDEST alternatives instead.
+    BACKTRACK_CAP = 32
+
     def __init__(self, llm_client: Any = None, max_candidates: int = 3,
                  max_depth: int = 2,
                  prm_scorer: Optional["PRMScorer"] = None,
@@ -156,7 +163,8 @@ class MCTSReasoner:
         # behaviour, kept so existing callers and tests don't shift.
         self.uncertainty_penalty = float(max(0.0, uncertainty_penalty))
         # Cache of unexplored alternatives for backtracking
-        self._backtrack_stack: List[List[ActionCandidate]] = []
+        self._backtrack_stack: Deque[List[ActionCandidate]] = deque(
+            maxlen=self.BACKTRACK_CAP)
 
     async def select_best_action(
         self,
@@ -217,13 +225,19 @@ class MCTSReasoner:
         if not self.llm_client:
             return []
 
+        # Mirror _sim's no-think treatment (see the comment there): the
+        # expansion prompt is the same cheap utility-call shape on a
+        # REASONING model — without both switches the model spends the
+        # whole max_tokens budget in the <think> channel and returns
+        # EMPTY content, so _parse_json gets nothing and expansion
+        # yields zero candidates.
         prompt = _EXPAND_PROMPT.format(
             n=self.max_candidates,
             task=task[:2000],
             plan_state=plan_state[:1000],
             tools=", ".join(tools[:20]),
             context=context[:2000],
-        )
+        ) + "\n\n/no_think"
 
         try:
             result = await self.llm_client.chat_completion({
@@ -231,6 +245,7 @@ class MCTSReasoner:
                 "temperature": 0.5,
                 "max_tokens": 1024,
                 "stream": False,
+                "chat_template_kwargs": {"enable_thinking": False},
             })
             text = (
                 result.get("choices", [{}])[0]

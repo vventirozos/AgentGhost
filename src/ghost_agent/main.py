@@ -838,6 +838,12 @@ async def lifespan(app):
     # sites unconditionally do `ctx.prm_scorer.score(state, action)`
     # without branching on availability.
     context.prm_scorer = PRMScorer()
+    # Mirrors the router wiring below: when --prm-model is unset, fall
+    # back to the default checkpoint the idle retrain phase writes
+    # (memory_dir.parent/prm/checkpoint.json). Without this, every
+    # restart orphaned the trained checkpoint — the scorer booted
+    # neutral-0.5 and the PRM↔MCTS hookup never fired until an idle
+    # retrain ≥3h later.
     prm_path_resolved: Optional[Path] = None
     if getattr(args, "prm_model", None):
         prm_path = Path(args.prm_model)
@@ -864,6 +870,24 @@ async def lifespan(app):
                 level="WARNING",
                 icon=Icons.WARN,
             )
+    else:
+        _prm_default = context.memory_dir.parent / "prm" / "checkpoint.json"
+        prm_path_resolved = _prm_default
+        if _prm_default.exists():
+            try:
+                context.prm_scorer = PRMScorer.load(_prm_default)
+                pretty_log(
+                    "PRM",
+                    f"Loaded idle-trained Process Reward Model from {_prm_default}",
+                    icon=Icons.BRAIN_PLAN,
+                )
+            except Exception as e:
+                pretty_log(
+                    "PRM Failed",
+                    f"could not load {_prm_default}: {type(e).__name__}: {e}",
+                    level="WARNING",
+                    icon=Icons.WARN,
+                )
 
     # When MCTS is enabled AND the PRM has a trained model, plug the
     # scorer in so candidate scoring uses the fast PRM path instead of
@@ -995,11 +1019,29 @@ async def lifespan(app):
                     (res or {}).get("choices", [{}])[0]
                     .get("message", {}).get("content", "") or ""
                 )
-                up = content.upper()
-                c_pos = up.find("CONFIRMED")
-                r_pos = up.find("REFUTED")
-                verified = c_pos != -1 and (r_pos == -1 or c_pos < r_pos)
                 lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+                # Verdict = the FIRST line's leading token, per the demanded
+                # format. The old anywhere-substring scan false-verified
+                # paraphrases like "cannot be considered CONFIRMED — it
+                # ignores the failure cause" (no "REFUTED" present). A
+                # non-conforming reply now falls back to a whole-content
+                # scan that requires CONFIRMED to appear WITHOUT a nearby
+                # negation, else fails closed.
+                first = (lines[0].upper() if lines else "")
+                if first.startswith("CONFIRMED"):
+                    verified = True
+                elif first.startswith("REFUTED"):
+                    verified = False
+                else:
+                    up = content.upper()
+                    c_pos = up.find("CONFIRMED")
+                    _neg_window = up[max(0, c_pos - 60):c_pos]
+                    verified = (
+                        c_pos != -1
+                        and up.find("REFUTED") == -1
+                        and not any(n in _neg_window for n in
+                                    ("NOT ", "CANNOT", "CAN'T", "NEVER", "ISN'T"))
+                    )
                 note = (lines[0] if lines else "no verdict")[:200]
                 return verified, note
 
@@ -1025,15 +1067,14 @@ async def lifespan(app):
                 per_call_timeout_s=120.0,
                 max_failures=3,
                 model=args.model,
-                # Proposal F (2026-05-17): also pick up self-play
-                # trajectories that PASSED but with structural novelty
-                # below 0.15 — those are cycles where the agent
-                # re-emitted a known winning shape, producing no new
-                # learning signal under the new score. The reflector
-                # is what asks "why was this boring?" and either
-                # writes a meta-lesson or expands the curriculum.
-                accept_low_novelty_passes=True,
-                novelty_threshold=0.15,
+                # Proposal F (accept_low_novelty_passes) was removed
+                # 2026-07-20: it was dead-by-construction — no producer
+                # ever wrote extra["solution_novelty"] into collector
+                # trajectories (novelty only flows to the frontier
+                # tracker), and the live dream loop's isolated context
+                # has no trajectory_collector at all. Re-adding it
+                # requires wiring self-play trajectories into the
+                # collector first.
             )
 
             # The Reflector is handed a COMPOSITE sink — it persists every
@@ -1496,18 +1537,27 @@ async def lifespan(app):
             async def _host_signal_to_bus(sig):
                 # severity is "info" / "warning" / "critical" — same
                 # set the trigger bus uses, so we forward verbatim.
+                # Thresholds report the CONFIGURED trip points, not the
+                # old hardcoded 85/90 — an operator running
+                # --metacog-mem-high 97 used to read `threshold=85.00`
+                # in the very signal that fired at 97.
                 metric = "ram"
                 observed = sig.snapshot.mem_percent
-                threshold = 85.0
+                threshold = float(getattr(args, "metacog_mem_high", 85.0) or 85.0)
                 if "free<" in sig.reason:
                     metric = "ram_floor"
+                    threshold = float(
+                        getattr(args, "metacog_mem_floor_mb", 0.0) or 0.0)
                 elif "CPU" in sig.reason:
                     metric = "cpu"
                     observed = sig.snapshot.cpu_percent
+                    threshold = float(
+                        getattr(args, "metacog_cpu_high", 85.0) or 85.0)
                 elif "disk" in sig.reason:
                     metric = "disk"
                     observed = sig.snapshot.disk_percent
-                    threshold = 90.0
+                    threshold = float(
+                        getattr(args, "metacog_disk_high", 90.0) or 90.0)
                 # Pre-uplift this signal was silent — operators couldn't
                 # tell whether the telemetry poller was even running. Now
                 # every signal lands as a structured log line at the
@@ -1544,13 +1594,24 @@ async def lifespan(app):
             context.metacog.telemetry.subscribe(_host_signal_to_bus)
             await context.metacog.telemetry.start()
             from .core.metacog_log import emit as _mc_emit, Subsystem as _mc_ss
+            from .core import agent as _agent_mod
             _tel = context.metacog.telemetry
             _mc_emit(
                 _mc_ss.BOOT,
                 state="enabled",
                 threshold=context.metacog.confidence_threshold,
                 logprobs="on" if context.metacog.logprobs_enabled else "off",
-                arbiter="on" if context.metacog.arbiter_enabled else "off",
+                # Report the EFFECTIVE state: the dual-solver call site is
+                # hard-gated by the module constant in core/agent.py (§3
+                # cognitive-layer toggle), so `arbiter=on` from the bundle
+                # flag alone misled operators — the gate can never fire
+                # while the constant is False, whatever the flags say.
+                arbiter=(
+                    "on" if (context.metacog.arbiter_enabled
+                             and getattr(_agent_mod, "_METACOG_ARBITER_ENABLED", False))
+                    else ("off (module toggle)"
+                          if context.metacog.arbiter_enabled else "off")
+                ),
                 gated_domains=",".join(sorted(context.metacog.GATED_DOMAINS)),
                 cap_per_request=context.metacog.MAX_ARBITRATIONS_PER_REQUEST,
                 cpu_hi=_tel.cpu_high,

@@ -96,9 +96,18 @@ class TrajectoryCollector:
             path = self._file_for(ts)
             with self._lock:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                with path.open("a", encoding="utf-8") as f:
-                    f.write(redacted.to_jsonl())
-                    f.write("\n")
+                # a+b (not plain "a") so we can probe the tail: a crash
+                # mid-append leaves a truncated line with no trailing \n,
+                # and appending straight onto it concatenates two records
+                # into one line every JSONL reader drops — BOTH records
+                # lost. One repair byte re-syncs to a newline boundary.
+                with path.open("a+b") as f:
+                    if f.seek(0, os.SEEK_END) > 0:
+                        f.seek(-1, os.SEEK_END)
+                        if f.read(1) != b"\n":
+                            f.write(b"\n")
+                    f.write(redacted.to_jsonl().encode("utf-8"))
+                    f.write(b"\n")
                     f.flush()
             return path
         except Exception as e:

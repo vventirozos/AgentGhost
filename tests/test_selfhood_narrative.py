@@ -133,6 +133,71 @@ async def test_narrative_skips_regeneration_on_unchanged_input(tmp_path: Path):
     assert third == "Run 2."
 
 
+async def test_narrative_failed_persist_does_not_commit_key(
+    tmp_path: Path, monkeypatch,
+):
+    # A transient disk error during persist must NOT commit the
+    # idempotency key — otherwise the guard passes via the OLDER
+    # narrative file on the next run and staleness becomes permanent.
+    autobio = AutobiographicalMemory(tmp_path)
+    autobio.append(Experience(summary="I fixed the parser.", outcome="passed"))
+
+    async def fake_critique(prompt: str) -> str:
+        return "Fresh entry."
+
+    n = NarrativeSummariser(tmp_path, critique_fn=fake_critique)
+    # An OLDER narrative already on disk — what the guard would pass via.
+    (tmp_path / "narrative.md").write_text("Stale entry.", encoding="utf-8")
+
+    calls = [0]
+    real_write_text = Path.write_text
+
+    def flaky_write_text(self, *args, **kwargs):
+        if self.name.endswith(".md.tmp"):
+            calls[0] += 1
+            if calls[0] == 1:
+                raise OSError("disk full")
+        return real_write_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", flaky_write_text)
+
+    await n.regenerate(autobio=autobio)
+    assert n._last_input_key == ""  # not committed on failure
+    assert n.latest() == "Stale entry."
+
+    # Same input again → guard must not skip; the retry persists.
+    second = await n.regenerate(autobio=autobio)
+    assert second == "Fresh entry."
+    assert n.latest() == "Fresh entry."
+    assert n._last_input_key != ""
+
+
+async def test_narrative_history_compaction_caps_file(tmp_path: Path):
+    from ghost_agent.selfhood.narrative import (
+        _HISTORY_COMPACT_KEEP_LINES,
+        _HISTORY_COMPACT_MAX_BYTES,
+    )
+    n = NarrativeSummariser(tmp_path)
+    history_path = tmp_path / "narrative.history.jsonl"
+    # Prefill the audit history past the byte cap with fat records.
+    pad = "x" * 4096
+    with history_path.open("w", encoding="utf-8") as f:
+        for i in range(300):
+            f.write(json.dumps({"timestamp": f"t{i}", "text": pad}) + "\n")
+    assert history_path.stat().st_size > _HISTORY_COMPACT_MAX_BYTES
+
+    assert n._persist("fresh", used_llm=False, source_count=1) is True
+
+    lines = [l for l in history_path.read_text(
+        encoding="utf-8").splitlines() if l]
+    assert len(lines) == _HISTORY_COMPACT_KEEP_LINES
+    assert history_path.stat().st_size <= _HISTORY_COMPACT_MAX_BYTES
+    # Newest tail kept — the just-persisted record is last, the oldest
+    # prefilled records are gone.
+    assert json.loads(lines[-1])["text"] == "fresh"
+    assert json.loads(lines[0])["timestamp"] != "t0"
+
+
 async def test_narrative_filters_trivial_experiences(tmp_path: Path):
     # Live failure shape (2026-07-13): ping-shaped turns (no tools, no
     # verdict, tiny request) dominated the recent window, so the diary

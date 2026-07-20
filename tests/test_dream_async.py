@@ -208,10 +208,15 @@ async def test_dream_skips_when_fragment_set_unchanged(mock_context):
     })
 
     # First run — the LLM must be called and the fragment key cached.
+    # Namespace-aware since 2026-07-20: the cache is a dict keyed by the
+    # seed source ("auto" here) so an oscillating seed source can't make
+    # unchanged material look fresh.
     result1 = await dreamer.dream()
     assert "Dream Complete" in result1
     assert mock_context.llm_client.chat_completion.await_count == 1
-    assert getattr(mock_context, "_last_dream_fragment_ids", None) == frozenset(fragment_ids)
+    assert getattr(mock_context, "_last_dream_fragment_ids", None) == {
+        "auto": frozenset(fragment_ids)
+    }
 
     # Second run with identical ids — must skip the LLM call entirely.
     result2 = await dreamer.dream()
@@ -275,11 +280,11 @@ async def test_dream_error_does_not_poison_idempotency_cache(mock_context):
 
     result = await dreamer.dream()
     assert "Dream error" in result
-    # Code must not have assigned a frozenset to the cache attribute.
+    # Code must not have assigned a real cache value to the attribute.
     # (On MagicMock, attribute access autocreates a child mock — so
     # checking `is None` wouldn't work; check the type instead.)
     cached = getattr(mock_context, "_last_dream_fragment_ids", None)
-    assert not isinstance(cached, frozenset)
+    assert not isinstance(cached, (frozenset, dict))
 
 
 @pytest.mark.asyncio

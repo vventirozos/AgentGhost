@@ -50,6 +50,21 @@ _DECISIVE = ("SUCCESS", "FAILURE")
 # Cap replays per batch — each is a full multi-minute sim on the single
 # inference slot; the idle battery must stay a battery, not a furnace.
 DEFAULT_BATCH_LIMIT = 2
+# Inconclusive replays (infra aborts, solver aborts, empty status) may be
+# retried, but only this many times before the challenge is dropped quietly.
+MAX_INCONCLUSIVE_ATTEMPTS = 3
+
+
+def _normalize_status(status: Any) -> Optional[str]:
+    """Bare decisive token for a (possibly decorated) sim status — the live
+    caller emits e.g. "SUCCESS (in 2 attempts)" / "FAILURE (Exhausted 3
+    attempts)". Returns None for non-agent outcomes (ABORTED_BY_SOLVER,
+    INFRA_ABORT, empty/UNKNOWN)."""
+    s = str(status or "").strip().upper()
+    for token in _DECISIVE:
+        if s.startswith(token):
+            return token
+    return None
 
 
 def _root() -> Optional[Path]:
@@ -68,8 +83,8 @@ def persist_challenge(*, challenge: str, setup_script: str,
     Never raises — persistence must not break a sim conclusion."""
     try:
         root = _root()
-        status = str(status or "").upper()
-        if (root is None or status not in _DECISIVE
+        status = _normalize_status(status)
+        if (root is None or status is None
                 or not (challenge or "").strip()
                 or not (validation_script or "").strip()):
             return None
@@ -109,6 +124,24 @@ def _read_jsonl(path: Path) -> List[dict]:
     return out
 
 
+def _replay_state(root: Path) -> tuple:
+    """(concluded challenge ids, per-challenge inconclusive attempt counts)
+    from the results ledger. An inconclusive replay does not conclude a
+    challenge — it earns a retry, bounded by MAX_INCONCLUSIVE_ATTEMPTS."""
+    done: set = set()
+    attempts: Dict[str, int] = {}
+    for r in _read_jsonl(root / "results.jsonl"):
+        cid = r.get("challenge_id")
+        if not cid:
+            continue
+        if r.get("verdict") == "inconclusive":
+            attempts[cid] = max(attempts.get(cid, 0) + 1,
+                                int(r.get("attempts") or 0))
+        else:
+            done.add(cid)
+    return done, attempts
+
+
 def load_replay_candidates(limit: int = DEFAULT_BATCH_LIMIT) -> List[dict]:
     """Challenges not yet replayed, oldest-decisive-first. Alternates
     value: past FAILUREs prove generalization, past SUCCESSes catch
@@ -117,16 +150,21 @@ def load_replay_candidates(limit: int = DEFAULT_BATCH_LIMIT) -> List[dict]:
     if root is None:
         return []
     challenges = _read_jsonl(root / "challenges.jsonl")
-    done = {r.get("challenge_id") for r in _read_jsonl(root / "results.jsonl")}
+    done, attempts = _replay_state(root)
     fresh = [c for c in challenges
              if c.get("id") and c["id"] not in done
-             and c.get("status") in _DECISIVE]
+             and attempts.get(c["id"], 0) < MAX_INCONCLUSIVE_ATTEMPTS
+             and _normalize_status(c.get("status")) is not None]
     return fresh[:max(0, int(limit))]
 
 
 def classify(original: str, replay: str) -> str:
-    o = str(original or "").upper() == "SUCCESS"
-    r = str(replay or "").upper() == "SUCCESS"
+    on = _normalize_status(original)
+    rn = _normalize_status(replay)
+    if on is None or rn is None:
+        return "inconclusive"
+    o = on == "SUCCESS"
+    r = rn == "SUCCESS"
     if not o and r:
         return "generalized"
     if o and not r:
@@ -135,7 +173,8 @@ def classify(original: str, replay: str) -> str:
 
 
 def record_result(*, challenge_id: str, original: str, replay: str,
-                  verdict: str, quarantined: Optional[list] = None) -> None:
+                  verdict: str, quarantined: Optional[list] = None,
+                  attempts: Optional[int] = None) -> None:
     root = _root()
     if root is None:
         return
@@ -148,6 +187,8 @@ def record_result(*, challenge_id: str, original: str, replay: str,
             "verdict": verdict,
             "quarantined": list(quarantined or []),
         }
+        if attempts is not None:
+            rec["attempts"] = int(attempts)
         with _LOCK:
             root.mkdir(parents=True, exist_ok=True)
             with (root / "results.jsonl").open("a", encoding="utf-8") as f:
@@ -162,7 +203,7 @@ async def run_counterfactual_batch(dreamer, context,
     injected-challenge seam. Returns a summary dict (also written to the
     ledger + activity log). Never raises."""
     summary = {"replayed": 0, "generalized": 0, "regressions": 0,
-               "stable": 0, "quarantined": []}
+               "stable": 0, "inconclusive": 0, "quarantined": []}
     try:
         candidates = load_replay_candidates(limit)
         if not candidates:
@@ -195,11 +236,25 @@ async def run_counterfactual_batch(dreamer, context,
             verdict = classify(cand["status"], replay_status)
             summary["replayed"] += 1
             quarantined: List[str] = []
+            if verdict == "inconclusive":
+                # The sim never produced an agent outcome (infra abort,
+                # solver abort, early return): not evidence for or against
+                # any lesson. Record an attempt so the retry stays bounded,
+                # but leave the challenge eligible for another replay.
+                summary["inconclusive"] += 1
+                _, attempts = _replay_state(_root())
+                record_result(challenge_id=cand["id"],
+                              original=cand["status"],
+                              replay=replay_status, verdict=verdict,
+                              attempts=attempts.get(cand["id"], 0) + 1)
+                _report(context, cand, replay_status, verdict, quarantined)
+                continue
             if verdict == "generalized":
                 summary["generalized"] += 1
             elif verdict == "regression":
                 summary["regressions"] += 1
-                quarantined = _quarantine_replay_lessons(context, cand)
+                quarantined = _quarantine_replay_lessons(context, cand,
+                                                         dreamer)
                 summary["quarantined"].extend(quarantined)
             else:
                 summary["stable"] += 1
@@ -212,16 +267,26 @@ async def run_counterfactual_batch(dreamer, context,
     return summary
 
 
-def _quarantine_replay_lessons(context, cand) -> List[str]:
+def _quarantine_replay_lessons(context, cand, dreamer=None) -> List[str]:
     """A past-SUCCESS challenge failed on replay: quarantine the lessons
-    that were hydrated into the failing run (the side-channel the sim's
-    playbook reads set), NOT everything — and never delete."""
+    that were hydrated into the failing run, NOT everything — and never
+    delete. Prefer the dreamer's ``last_selfplay_hydrated_triggers``
+    snapshot (stamped at sim conclusion, same moment as
+    ``last_self_play_status``): ``skill_memory.last_playbook_triggers``
+    is shared mutable state a concurrent user turn can re-stamp
+    mid-replay, hitting that turn's unrelated lessons. An empty snapshot
+    list means the sim hydrated nothing — quarantine nothing; only a
+    missing/None snapshot falls back to the skill_memory attribute."""
     out: List[str] = []
     try:
         sm = getattr(context, "skill_memory", None)
         if sm is None:
             return out
-        triggers = list(getattr(sm, "last_playbook_triggers", []) or [])
+        snapshot = getattr(dreamer, "last_selfplay_hydrated_triggers", None)
+        if snapshot is None:
+            triggers = list(getattr(sm, "last_playbook_triggers", []) or [])
+        else:
+            triggers = list(snapshot)
         for trig in triggers[:5]:
             n = sm.quarantine_lesson(
                 trig,

@@ -130,6 +130,25 @@ _TRIGGER_FRAGMENT_STARTERS = (
     "ok ", "okay ", "yes ", "no ", "now ",
 )
 
+# Error-signature exemption (2026-07-20): genuine error-keyed triggers
+# legitimately start with fragment-starter words — "No module named
+# 'requests' when running sandbox scripts", "No such file or directory:
+# /workspace/out.csv", "Still ENOENT after the path fix". An error message
+# is a prime retrieval key (exactly what the trigger field is for), so a
+# fragment-starter prefix only rejects when no error cue is present.
+# Cues: canonical errno phrasings, error/exception vocabulary, errno
+# constants and CamelCase exception names (case-sensitive on purpose —
+# "eat"/"error-free prose" must not match the constant patterns), and
+# quoted identifiers ('requests', "utils.py").
+_TRIGGER_ERROR_SIGNATURE_RE = re.compile(
+    r"(?i:^no (?:module named|such file|matching|attribute|space left)\b)"
+    r"|(?i:\b(?:error|errno|exception|traceback|not found|failed|failing|"
+    r"denied|refused|timed? ?out)\b)"
+    r"|\bE[A-Z]{2,}\b"
+    r"|\b[A-Z][a-zA-Z]+(?:Error|Exception|Warning)\b"
+    r"|['\"][\w.\-/]{2,}['\"]"
+)
+
 # Bare turn-level commands ("proceed with the next task") — instructions
 # about the CONVERSATION, not about any recurring technical situation.
 # Only short triggers reject on these: a long trigger starting with
@@ -153,7 +172,9 @@ def _is_conversational_trigger(trigger) -> bool:
     if _TRIGGER_USER_SPEECH_RE.search(low):
         return True
     if any(low.startswith(s) for s in _TRIGGER_FRAGMENT_STARTERS):
-        return True
+        # Searched on the case-preserved text: the errno/exception-name
+        # cues in the regex are deliberately case-sensitive.
+        return not _TRIGGER_ERROR_SIGNATURE_RE.search(t)
     if len(low) <= _TRIGGER_TURN_COMMAND_MAX_LEN and any(
         low.startswith(c) for c in _TRIGGER_TURN_COMMANDS
     ):

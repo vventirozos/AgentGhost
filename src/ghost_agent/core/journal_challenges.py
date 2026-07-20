@@ -16,10 +16,18 @@ challenges into `synthetic_self_play` alongside the templates.
 
 from __future__ import annotations
 
+import datetime
 import hashlib
+import json
+import logging
+import os
 import re
+import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger("GhostAgent")
 
 
 # Journal entry shapes we know how to mine. Everything else is ignored.
@@ -332,13 +340,16 @@ def _synthesize_challenge(entry: dict) -> Optional[MinedChallenge]:
 
 def mine_challenges(journal_entries: list, max_out: int = 3) -> List[MinedChallenge]:
     """Extract up to `max_out` challenges from a list of raw journal
-    entries. Only failure-flagged post_mortem entries are considered.
-    Dedupes by challenge hash so repeated similar journal entries don't
-    produce N near-identical challenges.
+    entries, NEWEST first. Only failure-flagged post_mortem entries are
+    considered. Dedupes by challenge hash so repeated similar journal
+    entries don't produce N near-identical challenges.
     """
     out: List[MinedChallenge] = []
     seen = set()
-    for entry in (journal_entries or [])[-50:]:  # last 50 is plenty
+    # Newest-first: journal entries append chronologically, and callers
+    # (pick_journal_challenge takes out[0]) are promised the most recent
+    # mineable entry — oldest-first drilled the same stale entry forever.
+    for entry in reversed((journal_entries or [])[-50:]):  # last 50 is plenty
         if not isinstance(entry, dict):
             continue
         if (entry.get("type") or "").lower() not in _MINEABLE_TYPES:
@@ -370,3 +381,136 @@ def pick_journal_challenge(journal) -> Optional[MinedChallenge]:
         return None
     mined = mine_challenges(entries, max_out=1)
     return mined[0] if mined else None
+
+
+# ---------------------------------------------------------------------------
+# Persisted mineable stash
+# ---------------------------------------------------------------------------
+#
+# The live-journal path above can essentially never fire: phase-1
+# `process_journal_queue` (agent.py, ~2min idle) pops the whole journal
+# long before phase-3 self-play (>60min idle) samples it, and nothing
+# produces the other mineable type ("failure"). The stash is a small
+# bounded ledger of mineable entries that phase-1 copies aside BEFORE
+# consuming the queue; `pick_stashed_challenge` is the self-play
+# fallback when the live journal yields nothing. Each stashed entry
+# carries a `replayed` marker so the same entry isn't drilled
+# repeatedly.
+#
+# File: $GHOST_HOME/system/selfplay/journal_stash.json
+
+_STASH_CAP = 20
+_STASH_LOCK = threading.Lock()
+
+
+def _stash_path(ghost_home=None) -> Optional[Path]:
+    """Resolve the stash file path. `ghost_home` is the GHOST_HOME root
+    directory (str/Path); when None, $GHOST_HOME is used. Returns None
+    when no home is available (stash disabled)."""
+    home = ghost_home if ghost_home is not None else os.getenv("GHOST_HOME", "").strip()
+    if not home:
+        return None
+    try:
+        return Path(home) / "system" / "selfplay" / "journal_stash.json"
+    except Exception:
+        return None
+
+
+def _load_stash(path: Path) -> list:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8") or "[]")
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def _write_stash(path: Path, records: list) -> None:
+    """Atomic tmp + os.replace write, mirroring the store convention
+    (SkillMemory._save_playbook_unlocked / FrontierTracker)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(records, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def stash_mineable(entries: list, ghost_home=None) -> int:
+    """Persist the mineable subset of `entries` into the bounded stash.
+
+    Called by phase-1 `process_journal_queue` with the raw popped items
+    BEFORE consuming them. Filters to entries `mine_challenges` could
+    actually use (mineable type, failure-flagged, synthesizable),
+    dedupes by journal hash against what's already stashed, appends,
+    and trims to the newest ``_STASH_CAP``. Returns the number of
+    entries newly stashed. Never raises.
+    """
+    try:
+        path = _stash_path(ghost_home)
+        if path is None:
+            return 0
+        fresh = []
+        for entry in entries or []:
+            if not isinstance(entry, dict):
+                continue
+            if (entry.get("type") or "").lower() not in _MINEABLE_TYPES:
+                continue
+            if not _looks_like_failure(entry):
+                continue
+            mined = _synthesize_challenge(entry)
+            if mined is None:
+                continue
+            fresh.append({
+                "type": entry.get("type"),
+                "data": entry.get("data"),
+                "journal_hash": mined.journal_hash,
+                "stashed_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "replayed": False,
+            })
+        if not fresh:
+            return 0
+        with _STASH_LOCK:
+            records = _load_stash(path)
+            known = {r.get("journal_hash") for r in records if isinstance(r, dict)}
+            added = [r for r in fresh if r["journal_hash"] not in known]
+            if not added:
+                return 0
+            records.extend(added)
+            _write_stash(path, records[-_STASH_CAP:])
+        return len(added)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("journal stash write skipped: %s", e)
+        return 0
+
+
+def pick_stashed_challenge(ghost_home=None) -> Optional[MinedChallenge]:
+    """Self-play fallback loader: newest un-replayed stash entry, or
+    None. Marks the picked entry ``replayed`` (persisted atomically) so
+    the same stashed failure isn't drilled every cycle. Never raises.
+    """
+    try:
+        path = _stash_path(ghost_home)
+        if path is None or not path.exists():
+            return None
+        with _STASH_LOCK:
+            records = _load_stash(path)
+            dirty = False
+            for rec in reversed(records):  # newest-first
+                if not isinstance(rec, dict) or rec.get("replayed"):
+                    continue
+                mined = _synthesize_challenge(rec)
+                if mined is None:
+                    # Un-synthesizable garbage — mark it so it isn't
+                    # re-inspected forever.
+                    rec["replayed"] = True
+                    dirty = True
+                    continue
+                rec["replayed"] = True
+                _write_stash(path, records)
+                return mined
+            if dirty:
+                # Persist the garbage-marking done above.
+                _write_stash(path, records)
+        return None
+    except Exception as e:  # noqa: BLE001
+        logger.debug("journal stash pick skipped: %s", e)
+        return None

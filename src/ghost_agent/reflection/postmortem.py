@@ -47,7 +47,7 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
-from typing import Any, Awaitable, Callable, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 from ..distill.schema import Trajectory, ToolCall, Outcome
 from .postmortem_prompts import (
@@ -75,6 +75,11 @@ CATEGORY_CODE_DEFECT = "code_defect"
 _VALID_CATEGORIES = frozenset(
     {CATEGORY_BEHAVIOURAL, CATEGORY_CONFIGURATION, CATEGORY_CODE_DEFECT}
 )
+
+# Cap on the per-process failed-analysis exclusion set (FIFO eviction).
+# Big enough that a tick's worth of permafails can't cycle back within a
+# session; small enough that memory stays trivial.
+_FAILED_ANALYSIS_CAP = 128
 
 
 def primary_target_from_args(args) -> str:
@@ -608,6 +613,14 @@ class PostMortemEngine:
         self.min_severity = float(min_severity)
         self.include_unknown = bool(include_unknown)
         self.model = model
+        # Signatures whose analysis failed (timeout / unparseable reply).
+        # Excluded from selection alongside queue.known_signatures(), or
+        # a permanently-unanalysable trajectory is re-selected every tick
+        # — severity-ordered selection has no other exit — wasting one
+        # LLM call per tick and starving lower-severity failures.
+        # Per-process and bounded; insertion-ordered dict for FIFO
+        # eviction, so a restart (or cap overflow) allows a retry.
+        self._failed_analysis_sigs: Dict[str, None] = {}
 
     async def run(
         self,
@@ -635,7 +648,7 @@ class PostMortemEngine:
             trajectories,
             limit=self.max_runs,
             min_severity=self.min_severity,
-            exclude_signatures=known,
+            exclude_signatures=known | self._failed_analysis_sigs.keys(),
             include_unknown=self.include_unknown,
         )
         report.selected = len(selected)
@@ -646,9 +659,11 @@ class PostMortemEngine:
             except Exception as e:
                 logger.warning("post-mortem analyse failed: %s", e)
                 report.analysed_errors += 1
+                self._note_failed_analysis(sig.hash)
                 continue
             if rep is None:
                 report.analysed_errors += 1
+                self._note_failed_analysis(sig.hash)
                 continue
             report.analysed_ok += 1
             report.reports.append(rep)
@@ -675,6 +690,13 @@ class PostMortemEngine:
                 report.skipped_duplicate += 1
 
         return report
+
+    def _note_failed_analysis(self, sig_hash: str) -> None:
+        """Remember a signature whose analysis failed so the next tick's
+        selection skips it instead of burning another LLM call on it."""
+        self._failed_analysis_sigs[sig_hash] = None
+        while len(self._failed_analysis_sigs) > _FAILED_ANALYSIS_CAP:
+            self._failed_analysis_sigs.pop(next(iter(self._failed_analysis_sigs)))
 
     async def _call(self, fn, prompt: str, timeout: float) -> str:
         call = fn(prompt)
@@ -758,37 +780,34 @@ class PostMortemEngine:
 def _split_patch_output(text: str) -> Tuple[str, str]:
     """Split the coding model's reply into (test, diff).
 
-    Looks for ``REPRODUCING TEST`` and ``PATCH`` / ``DIFF`` section
-    markers; falls back to fenced code blocks, then to putting
-    everything in the patch slot. Lenient by design — same posture as
-    the reflection parser."""
+    Markers count only as line-start section headers (``REPRODUCING
+    TEST:`` / ``PATCH:`` / a ```` ```diff ```` fence) — a mid-line
+    ``patch`` (e.g. ``mock.patch`` inside the reproducing test) or
+    ``diff`` in prose must not truncate the test or pollute the diff.
+    Falls back to fenced code blocks, then to putting everything in the
+    patch slot. Lenient by design — same posture as the reflection
+    parser."""
     if not text:
         return "", ""
     import re
-    lower = text.lower()
 
-    def _find(markers):
-        # Word-boundary match so "patch" doesn't hit "dispatch"/"patchwork",
-        # "diff" doesn't hit "difference", and "test:" doesn't hit "latest:".
-        for marker in markers:
-            pat = r"\b" + re.escape(marker)
-            if marker[-1].isalnum():
-                pat += r"\b"
-            m = re.search(pat, lower)
+    def _find(patterns):
+        for pat in patterns:
+            m = re.search(pat, text, flags=re.IGNORECASE | re.MULTILINE)
             if m:
                 return m.start()
         return -1
 
-    test_pos = _find(("reproducing test", "failing test", "test:"))
-    patch_pos = -1
-    for marker in ("patch", "diff", "unified diff"):
-        pat = r"\b" + re.escape(marker)
-        if marker[-1].isalnum():
-            pat += r"\b"
-        m = re.search(pat, lower)
-        if m and m.start() != test_pos:
-            patch_pos = m.start()
-            break
+    test_pos = _find((
+        r"^[ \t]*(?:reproducing|failing)\s+test\b[ \t]*:?",
+        r"^[ \t]*test[ \t]*:",
+    ))
+    # Bare `patch` counts only as a whole line (`(?::|$)`): a header with
+    # or without the colon, but never `mock.patch(...)` or prose.
+    patch_pos = _find((
+        r"^[ \t]*(?:unified\s+diff|patch|diff)[ \t]*(?::|$)",
+        r"^[ \t]*```diff\b",
+    ))
     if test_pos != -1 and patch_pos != -1 and patch_pos > test_pos:
         return text[test_pos:patch_pos].strip(), text[patch_pos:].strip()
     # Fallback: two fenced blocks → first is test, second is diff.

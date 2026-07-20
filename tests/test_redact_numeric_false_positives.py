@@ -92,3 +92,16 @@ def test_selfhood_phone_still_redacted():
 def test_selfhood_cc_luhn_gated():
     assert "[REDACTED_CC]" in redact_pii("card 4111111111111111")
     assert redact_pii("id 9007199254740991") == "id 9007199254740991"
+
+
+def test_digit_run_inside_hex_id_survives():
+    # 2026-07-20 corpus-scrub finding: 13+ digit runs embedded in 32-hex
+    # trajectory/request ids Luhn-passed ~10% of the time and the redaction
+    # corrupted referential ids. Letter-adjacent runs are identifiers.
+    s = "trajectory b49d7819c2394b49b8721340923412f0 resolved"
+    assert redact_text(s) == s
+
+
+def test_digit_run_glued_to_letters_survives():
+    s = "session id a5567db8ae1c4d27b4111111111111111e2"
+    assert redact_text(s) == s

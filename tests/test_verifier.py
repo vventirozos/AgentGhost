@@ -125,3 +125,31 @@ class TestVerifier:
     def test_parse_json_empty(self):
         assert Verifier._parse_json("") == {}
         assert Verifier._parse_json(None) == {}
+
+    def test_parse_json_never_returns_non_dict(self):
+        # A judge replying with a bare array/string used to escape as-is;
+        # callers do `.get(...)` on the result, so that AttributeError'd
+        # out of verify_claim and the whole pass was silently skipped.
+        assert Verifier._parse_json("[1, 2, 3]") == {}
+        assert Verifier._parse_json('"just a string"') == {}
+        assert Verifier._parse_json(json.dumps(["a", "b"])) == {}
+        # Array of dicts: the fragment walk may salvage one, but the
+        # return value must still be a dict.
+        assert isinstance(
+            Verifier._parse_json('[{"a": 1}, {"b": 2}]'), dict)
+
+    def test_parse_json_salvages_singleton_dict_array(self):
+        wrapped = json.dumps([{"verdict": "CONFIRMED", "confidence": 0.8}])
+        assert Verifier._parse_json(wrapped) == {
+            "verdict": "CONFIRMED", "confidence": 0.8}
+
+    def test_build_verify_result_requires_verdict_key(self, verifier):
+        # A parseable dict with no "verdict" key (typically an inner
+        # fragment of a truncated reply) is not a verdict — it must read
+        # as "skipped" (None), not fabricate UNCERTAIN@0.5.
+        assert verifier._build_verify_result(
+            {"suspect": 2, "real": True}) is None
+        # Key present but null still degrades to UNCERTAIN (unchanged).
+        res = verifier._build_verify_result({"verdict": None})
+        assert res is not None
+        assert res.verdict == VerifyVerdict.UNCERTAIN

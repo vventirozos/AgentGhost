@@ -275,6 +275,98 @@ async def test_replan_bridge_handles_tree_indirection():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# ReplanBridge counter hook — feeds the metacog shutdown-summary
+# replans_tried/replans_ok counters (which previously had NO producer,
+# so the summary always printed replans 0/0)
+# ──────────────────────────────────────────────────────────────────────
+
+class _RevisablePlan:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.calls: list = []
+
+    def request_revision(self, task_id, reason):
+        self.calls.append((task_id, reason))
+        return self.ok
+
+
+@pytest.mark.asyncio
+async def test_counter_hook_fires_on_attempt_and_success():
+    bus = TriggerBus()
+    counted: list = []
+    bridge = ReplanBridge(
+        bus, plan_getter=lambda: _RevisablePlan(ok=True),
+        current_task_getter=lambda: "t1",
+        counter_hook=lambda **kw: counted.append(kw),
+    )
+    bridge.attach()
+    await bus.publish(loop_event("looped", severity="warning"))
+    assert counted == [{"replan_attempt": True}, {"replan_succeeded": True}]
+
+
+@pytest.mark.asyncio
+async def test_counter_hook_attempt_only_when_revision_rejected():
+    bus = TriggerBus()
+    counted: list = []
+    bridge = ReplanBridge(
+        bus, plan_getter=lambda: _RevisablePlan(ok=False),
+        current_task_getter=lambda: "t1",
+        counter_hook=lambda **kw: counted.append(kw),
+    )
+    bridge.attach()
+    await bus.publish(loop_event("looped", severity="warning"))
+    assert counted == [{"replan_attempt": True}]
+
+
+@pytest.mark.asyncio
+async def test_counter_hook_silent_on_noop_paths():
+    # info severity and no-plan events never reached request_revision,
+    # so they must not count as attempts.
+    bus = TriggerBus()
+    counted: list = []
+    bridge = ReplanBridge(
+        bus, plan_getter=lambda: None, current_task_getter=lambda: None,
+        counter_hook=lambda **kw: counted.append(kw),
+    )
+    bridge.attach()
+    await bus.publish(loop_event("no plan", severity="warning"))
+    await bus.publish(loop_event("observability only", severity="info"))
+    assert counted == []
+
+
+@pytest.mark.asyncio
+async def test_counter_hook_error_does_not_break_replan():
+    bus = TriggerBus()
+
+    def bad_hook(**kw):
+        raise RuntimeError("counter down")
+
+    plan = _RevisablePlan(ok=True)
+    bridge = ReplanBridge(
+        bus, plan_getter=lambda: plan, current_task_getter=lambda: "t1",
+        counter_hook=bad_hook,
+    )
+    bridge.attach()
+    await bus.publish(loop_event("looped", severity="warning"))
+    # The revision itself still landed and was audited.
+    assert plan.calls == [("t1", "loop/warning: looped")]
+    assert bridge.revisions[-1]["action"] == "revised"
+
+
+@pytest.mark.asyncio
+async def test_counter_hook_defaults_to_none():
+    # Default-None path behaves exactly as before the hook existed.
+    bus = TriggerBus()
+    plan = _RevisablePlan(ok=True)
+    bridge = ReplanBridge(bus, plan_getter=lambda: plan,
+                          current_task_getter=lambda: "t1")
+    assert bridge.counter_hook is None
+    bridge.attach()
+    await bus.publish(loop_event("looped", severity="warning"))
+    assert bridge.revisions[-1]["action"] == "revised"
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Event factories
 # ──────────────────────────────────────────────────────────────────────
 

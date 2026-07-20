@@ -284,6 +284,69 @@ async def test_arbiter_exception_returns_none(bundle):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Synthetic-steer skip — the turn loop appends user-ROLE steers
+# (AUTO-DIAGNOSTIC, SYSTEM ALERT, condensation summaries, …), so "the
+# most recent user message" is often not the human's request
+# ──────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("steer", [
+    "SYSTEM ALERT: You have failed too many times.",
+    "SYSTEM ALERT (futility breaker): you have burned 6 turns.",
+    "AUTO-DIAGNOSTIC: last call failed with exit 1.",
+    "SYSTEM 3 PIVOT #2: The previous approach failed.",
+    "### ACTIVE STRATEGY: Proceed directly to using a tool.",
+    "[SYSTEM: PREVIOUS TURNS SUMMARIZED]\n\nEarlier the user asked...",
+    '<tool_response name="execute">\nexit 0\n</tool_response>',
+    "CRITICAL: You have not fulfilled the learning instructions.",
+])
+async def test_synthetic_user_steers_skipped_as_prompt(bundle, steer):
+    bundle.record_confidence(_below_threshold_reading())
+    bundle.arbiter.arbitrate = AsyncMock(return_value=_stub_decision())
+    messages = [
+        {"role": "user", "content": "drop the staging db"},
+        {"role": "assistant", "content": "on it"},
+        {"role": "user", "content": steer},
+    ]
+    out = await bundle.arbitrate_tool_calls(
+        messages=messages, tool_name="postgres_admin",
+    )
+    assert out is not None
+    # Arbitration ran on the genuine request, not the injected steer.
+    bundle.arbiter.arbitrate.assert_called_once_with("drop the staging db")
+
+
+@pytest.mark.asyncio
+async def test_only_synthetic_user_messages_returns_none(bundle):
+    bundle.record_confidence(_below_threshold_reading())
+    bundle.arbiter.arbitrate = AsyncMock(return_value=_stub_decision())
+    messages = [
+        {"role": "assistant", "content": "thinking..."},
+        {"role": "user", "content": "SYSTEM ALERT: stop retrying."},
+        {"role": "user", "content": "AUTO-DIAGNOSTIC: sandbox state dump"},
+    ]
+    out = await bundle.arbitrate_tool_calls(
+        messages=messages, tool_name="execute",
+    )
+    assert out is None
+    bundle.arbiter.arbitrate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_genuine_message_mentioning_marker_mid_text_not_skipped(bundle):
+    # Only PREFIX matches are synthetic — a human asking ABOUT the
+    # markers is a genuine prompt.
+    bundle.record_confidence(_below_threshold_reading())
+    bundle.arbiter.arbitrate = AsyncMock(return_value=_stub_decision())
+    genuine = "why did I get a SYSTEM ALERT about the db yesterday?"
+    out = await bundle.arbitrate_tool_calls(
+        messages=[{"role": "user", "content": genuine}], tool_name="execute",
+    )
+    assert out is not None
+    bundle.arbiter.arbitrate.assert_called_once_with(genuine)
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Confidence stash round-trip
 # ──────────────────────────────────────────────────────────────────────
 

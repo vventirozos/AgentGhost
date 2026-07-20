@@ -40,6 +40,13 @@ MOOD_HISTORY_FILENAME = "mood.history.jsonl"
 MAX_OPEN_QUESTIONS = 10
 MAX_UNFINISHED = 10
 
+# Bounded growth for the mood audit trail (mirrors autobiographical's
+# _COMPACT_MAX_BYTES pattern). The file is append-only and
+# ``mood_history()`` does a full read on every narrative regeneration,
+# so an uncapped file grows both disk and read cost without bound.
+_MOOD_COMPACT_MAX_BYTES = 512 * 1024
+_MOOD_COMPACT_KEEP_LINES = 1000
+
 
 class SelfStateThread:
     """Single-file persisted self-state.
@@ -188,9 +195,31 @@ class SelfStateThread:
                 with self.mood_history_path.open("a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False))
                     f.write("\n")
+                self._maybe_compact_mood_history_locked()
             except Exception as e:
                 logger.warning("mood history append failed: %s", e)
             return mood
+
+    def _maybe_compact_mood_history_locked(self) -> None:
+        """Rewrite the mood history keeping the newest
+        ``_MOOD_COMPACT_KEEP_LINES`` records once it passes the byte cap.
+        Caller holds ``self._lock``. Best-effort — a failed compaction
+        must never fail the mood write that triggered it."""
+        try:
+            if self.mood_history_path.stat().st_size <= _MOOD_COMPACT_MAX_BYTES:
+                return
+            from collections import deque
+            with self.mood_history_path.open("r", encoding="utf-8") as f:
+                tail = deque(f, maxlen=_MOOD_COMPACT_KEEP_LINES)
+            tmp = self.mood_history_path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                f.writelines(tail)
+            tmp.replace(self.mood_history_path)
+            logger.info(
+                "mood history compacted to newest %d records", len(tail),
+            )
+        except Exception as e:
+            logger.warning("mood history compaction failed: %s", e)
 
     def mood_history(self, *, limit: int = 20) -> List[Mood]:
         """Tail of the mood history, oldest first within the returned

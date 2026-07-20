@@ -150,14 +150,16 @@ class WorkspaceNarrative:
             logger.warning("workspace narrative read failed: %s", e)
             return ""
 
-    def _persist(self, text: str) -> None:
+    def _persist(self, text: str) -> bool:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".txt.tmp")
             tmp.write_text(text, encoding="utf-8")
             tmp.replace(self.path)
+            return True
         except Exception as e:  # noqa: BLE001
             logger.warning("workspace narrative persist failed: %s", e)
+            return False
 
     async def regenerate(
         self,
@@ -217,6 +219,9 @@ class WorkspaceNarrative:
             logger.warning("workspace narrative LLM critique failed: %s", e)
             text = ""
         text = (text or "").strip() or template
-        self._persist(text)
-        self._last_input_key = input_key
+        # Commit the idempotency key only on a successful persist — a
+        # transient disk error otherwise becomes persistent staleness
+        # (the unchanged-input guard keeps serving the stale file).
+        if self._persist(text):
+            self._last_input_key = input_key
         return text

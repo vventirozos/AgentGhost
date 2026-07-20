@@ -179,6 +179,87 @@ def test_atomic_browser_calls_count_toward_selector_thrash():
     assert classify_chat_outcome(t).promoted
 
 
+def test_interact_goto_subaction_resets_selector_window():
+    """The live browser tool's multi-step shape is op="interact" with
+    the navigation INSIDE the actions list. Four pagination turns —
+    each a goto to a NEW page plus a click on the same #next-page —
+    are progress, not thrash, and must NOT be promoted."""
+    calls = [
+        ToolCall(
+            name="browser",
+            arguments={"operation": "interact", "actions": [
+                {"action": "goto", "url": f"https://ex.com/results?page={i}"},
+                {"action": "click", "selector": "#next-page"},
+            ]},
+            result="ok",
+        )
+        for i in range(4)
+    ]
+    t = _traj(tool_calls=calls)
+    assert classify_chat_outcome(t).promoted is False
+
+
+def test_interact_goto_still_counts_within_call_thrash():
+    """The reset clears the CROSS-call window only: a single interact
+    that navigates and then hammers the same selector four times is
+    still the webOS stuck shape."""
+    t = _traj(
+        tool_calls=[ToolCall(
+            name="browser",
+            arguments={"operation": "interact", "actions": [
+                {"action": "goto", "url": "https://ex.com/app"},
+                {"action": "click", "selector": "#start-btn"},
+                {"action": "click", "selector": "#start-btn"},
+                {"action": "click", "selector": "#start-btn"},
+                {"action": "click", "selector": "#start-btn"},
+            ]},
+            result="ok",
+        )],
+    )
+    v = classify_chat_outcome(t)
+    assert v.promoted
+    assert "#start-btn" in v.reason
+
+
+def test_failed_interact_goto_does_not_reset_window():
+    """An interact whose result is an error is not progress, goto
+    sub-action or not — repeats across such calls still promote."""
+    calls = [
+        ToolCall(
+            name="browser",
+            arguments={"operation": "interact", "actions": [
+                {"action": "goto", "url": "https://ex.com/retry"},
+                {"action": "click", "selector": "#retry"},
+            ]},
+            result="Error: net::ERR_CONNECTION_REFUSED",
+        )
+        for _ in range(4)
+    ]
+    t = _traj(tool_calls=calls)
+    v = classify_chat_outcome(t)
+    assert v.promoted
+    assert "#retry" in v.reason
+
+
+def test_aborted_interact_sequence_does_not_reset_window():
+    """The SEQUENCE ABORTED banner doesn't trip the error text sniff
+    (no "error:"/"failed:" marker), so it needs its own guard — an
+    aborted goto never ran the later steps and is not progress."""
+    calls = [
+        ToolCall(
+            name="browser",
+            arguments={"operation": "interact", "actions": [
+                {"action": "goto", "url": "file:///bad.html"},
+                {"action": "click", "selector": "#next-page"},
+            ]},
+            result="⚠ SEQUENCE ABORTED: goto_failed. The first goto failed; later actions skipped.",
+        )
+        for _ in range(4)
+    ]
+    t = _traj(tool_calls=calls)
+    assert classify_chat_outcome(t).promoted
+
+
 # ---------------------------------------------------------------- signal 3: repeated tool errors
 
 

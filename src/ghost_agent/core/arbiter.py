@@ -307,11 +307,27 @@ class DualSolverArbiter:
         output_text = ""
         err = ""
         try:
-            result = self.runner(payload)
+            if inspect.iscoroutinefunction(self.runner):
+                pending = self.runner(payload)
+            else:
+                # The Runner alias permits plain-sync callables; calling
+                # one inline would block the event loop with no deadline
+                # (only the awaitable case ever reached wait_for).
+                # to_thread keeps the per-sample timeout authoritative
+                # for both kinds.
+                pending = asyncio.to_thread(self.runner, payload)
+            result = await asyncio.wait_for(
+                pending, timeout=self.per_sample_timeout_s,
+            )
             if inspect.isawaitable(result):
-                result = await asyncio.wait_for(
-                    result, timeout=self.per_sample_timeout_s,
+                # Sync callable that RETURNS an awaitable (the third
+                # Runner shape). Await it under the remaining budget so
+                # one sample can never exceed the per-sample timeout.
+                remaining = max(
+                    0.0,
+                    self.per_sample_timeout_s - (time.monotonic() - start),
                 )
+                result = await asyncio.wait_for(result, timeout=remaining)
             if isinstance(result, dict):
                 output_text = str(result.get("output") or "")
             else:

@@ -48,15 +48,19 @@ def note_repeated_failure(sigs: dict, fname, error, threshold: int = 3):
 
 
 def action_result_fingerprint(result: str) -> str:
-    """Whitespace-normalised, bounded fingerprint of a tool result.
+    """Whitespace-normalised fingerprint of a tool result.
 
     Used by ``note_repeated_action`` to decide whether two SUCCESSFUL
     calls produced "the same observation". Whitespace-only normalisation
     (digits intentionally kept) so a result whose content genuinely
     changed — a re-read that now returns edited bytes, a counter that
     advanced — looks different and does NOT count as a no-progress
-    repeat. Bounded slice keeps it cheap and stable."""
-    norm = re.sub(r"\s+", " ", str(result or "")).strip().lower()[:600]
+    repeat. The FULL normalised string is hashed: a head-only slice made
+    long outputs with a stable header (a polling loop whose progress
+    only shows past the slice) collide, so genuine progress got steered
+    and then hard-aborted as "no new info". Hashing is cheap; slicing
+    was the expensive part."""
+    norm = re.sub(r"\s+", " ", str(result or "")).strip().lower()
     return hashlib.sha1(norm.encode("utf-8", "ignore")).hexdigest()[:12]
 
 
@@ -99,8 +103,8 @@ def note_repeated_action(sigs: dict, fname, target, result_fp, threshold: int = 
 #: scrubbed by the final-generation stream guard — the change never landed.
 #:
 #: For these tools the breaker still STEERS the model off the wasteful re-read
-#: but leaves tools available so the write can land. The >=5 hard stop is the
-#: backstop if it genuinely keeps thrashing.
+#: but leaves tools available so the write can land. The
+#: :data:`READWRITE_HARD_STOP` backstop fires if it genuinely keeps thrashing.
 READWRITE_LOOP_TOOLS = frozenset({
     "manage_composed_skills",
     "manage_tasks",
@@ -120,6 +124,17 @@ READWRITE_LOOP_TOOLS = frozenset({
     "knowledge_base",
     "update_profile",
 })
+
+#: Hard-stop threshold for a no-progress loop on a READWRITE_LOOP_TOOLS
+#: tool. Two-tier contract, stated ONLY here (agent.py imports this
+#: constant rather than restating the number): every tool gets the
+#: corrective STEER at the general no-progress threshold (2), but the
+#: exempt read/write tools skip the first-trip force-final so the pending
+#: WRITE can still land — backstopped by a hard stop once the identical
+#: (action, target, result) has repeated this many times. When the general
+#: threshold moved 3→2, the enforcement site silently drifted down to >=3
+#: with it; pinning the value here keeps the two tiers independent.
+READWRITE_HARD_STOP = 5
 
 
 def is_readwrite_loop_exempt(fname) -> bool:

@@ -82,14 +82,39 @@ class MemoryJournal:
         temp_path.write_text(json.dumps(data, indent=2))
         os.replace(temp_path, self.file_path)
 
+    def _quarantine_corrupt(self) -> list:
+        """Corruption: PRESERVE the raw bytes in a timestamped sidecar
+        BEFORE any subsequent _save() overwrites them, then start clean.
+        Without this, a partial write silently discarded every queued
+        post_mortem / smart_memory entry (the dream consolidator's work
+        queue). Matches the SkillMemory / FrontierTracker recovery policy."""
+        try:
+            sidecar = self.file_path.with_suffix(f".corrupt-{int(time.time())}.json")
+            os.replace(self.file_path, sidecar)
+            logger.warning(
+                "memory_journal.json was corrupt; preserved to %s and "
+                "started a fresh journal.", sidecar.name,
+            )
+        except Exception:
+            pass
+        return []
+
     def load(self):
         with self._lock:
             try:
                 content = self.file_path.read_text()
             except FileNotFoundError:
                 return []
-            except Exception:
-                return []
+            except UnicodeDecodeError:
+                # Undecodable bytes are corruption, not disk sickness —
+                # same preserve-and-restart path as bad JSON below.
+                return self._quarantine_corrupt()
+            # Any OTHER OSError (EIO, EACCES, disk full…) propagates:
+            # treating a transient read failure as "empty journal" let the
+            # next append() atomically overwrite the intact on-disk queue
+            # with a single-entry list — silent data loss. Callers' append
+            # wrappers log a warning (same fail-loud policy as
+            # SkillMemory._load_playbook).
             if not content.strip():
                 return []
             try:
@@ -100,22 +125,7 @@ class MemoryJournal:
                     raise ValueError(f"journal is a {type(data).__name__}, expected list")
                 return data
             except Exception:
-                # Corruption: PRESERVE the raw bytes in a timestamped
-                # sidecar BEFORE any subsequent _save() overwrites them,
-                # then start clean. Without this, a partial write silently
-                # discarded every queued post_mortem / smart_memory entry
-                # (the dream consolidator's work queue). Matches the
-                # SkillMemory / FrontierTracker recovery policy.
-                try:
-                    sidecar = self.file_path.with_suffix(f".corrupt-{int(time.time())}.json")
-                    os.replace(self.file_path, sidecar)
-                    logger.warning(
-                        "memory_journal.json was corrupt; preserved to %s and "
-                        "started a fresh journal.", sidecar.name,
-                    )
-                except Exception:
-                    pass
-                return []
+                return self._quarantine_corrupt()
 
     def append(self, item_type: str, data: dict):
         data = _redact_journal_data(data)

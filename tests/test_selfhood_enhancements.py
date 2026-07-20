@@ -139,6 +139,37 @@ def test_redact_passthrough_when_clean():
     assert redact_pii(text) == text
 
 
+@pytest.mark.parametrize("text", [
+    "I went skateboarding yesterday",
+    "photograph the skyscraper downtown",
+    "it's a skeleton-key metaphor",
+])
+def test_redact_key_leaves_bare_sk_words_alone(text):
+    # Empirical false positive: `sk` as a bare word-prefix ate ordinary
+    # words ("skateboarding" → "[REDACTED_KEY] yesterday").
+    assert redact_pii(text) == text
+
+
+def test_redact_key_structured_prefixes_still_caught():
+    out = redact_pii("leaked sk-live-abcdef1234567890 in the logs")
+    assert "sk-live-abcdef1234567890" not in out
+    assert "REDACTED_KEY" in out
+
+
+def test_redact_key_value_assignment():
+    # Empirical miss: the common real leak shape passed straight through
+    # (`=` splits the token, so the prefix rule never saw it).
+    out = redact_pii("run with api_key=abcd1234efgh please")
+    assert "abcd1234efgh" not in out
+    assert "REDACTED_KEY" in out
+
+
+def test_redact_key_colon_assignment():
+    out = redact_pii("config had password: hunter2hunter2 in it")
+    assert "hunter2hunter2" not in out
+    assert "REDACTED_KEY" in out
+
+
 def test_capture_turn_redacts_user_first_words(tmp_path: Path):
     sm = SelfModel(tmp_path)
     sm.capture_turn(
@@ -411,6 +442,32 @@ def test_mood_history_handles_corrupt_lines(tmp_path: Path):
     assert [m.label for m in hist] == ["curious", "satisfied"]
 
 
+def test_mood_history_compaction_caps_file(tmp_path: Path):
+    from ghost_agent.selfhood.state import (
+        _MOOD_COMPACT_KEEP_LINES,
+        _MOOD_COMPACT_MAX_BYTES,
+    )
+    state = SelfStateThread(tmp_path)
+    # Prefill the history past the byte cap with fat records.
+    pad = "e" * 1024
+    with state.mood_history_path.open("w", encoding="utf-8") as f:
+        for i in range(1500):
+            f.write(json.dumps(
+                {"label": f"mood{i}", "evidence": pad, "set_at": "t"}
+            ) + "\n")
+    assert state.mood_history_path.stat().st_size > _MOOD_COMPACT_MAX_BYTES
+
+    state.set_mood("satisfied", "shipped it")
+
+    lines = [l for l in state.mood_history_path.read_text(
+        encoding="utf-8").splitlines() if l]
+    assert len(lines) == _MOOD_COMPACT_KEEP_LINES
+    # Newest tail kept — the just-written mood is the last record, the
+    # oldest prefilled records are gone.
+    assert json.loads(lines[-1])["label"] == "satisfied"
+    assert json.loads(lines[0])["label"] != "mood0"
+
+
 # ---------------------------------------------------------------------
 # #12 — IDF cache
 # ---------------------------------------------------------------------
@@ -583,3 +640,18 @@ async def test_narrative_sanitises_meta_insights(tmp_path: Path):
     prompt = seen[0]
     assert "ATTEMPT_ABORTED_THINKING_LOOP" not in prompt
     assert "Traceback" not in prompt
+
+
+def test_redact_pii_digit_run_inside_hex_id_survives():
+    # 2026-07-20 corpus-scrub finding: digit runs embedded in the 32-hex
+    # experience/trajectory ids the diary joins on Luhn-passed and got
+    # eaten as card numbers, corrupting the ids. Letter-adjacent runs
+    # are identifiers, not cards.
+    from ghost_agent.selfhood.autobiographical import redact_pii
+    s = "outcome backfilled for 411e4def63394fa28a9070199254740993a"
+    assert redact_pii(s) == s
+
+
+def test_redact_pii_bare_card_still_redacted():
+    from ghost_agent.selfhood.autobiographical import redact_pii
+    assert "[REDACTED_CC]" in redact_pii("paid with 4111111111111111 today")

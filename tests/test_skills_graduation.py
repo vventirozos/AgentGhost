@@ -139,3 +139,36 @@ def test_credit_is_idempotent_per_retrieval(tmp_path):
     assert first == 1
     assert second == 0  # same retrieval not double-counted
     assert _helpful(sm, "parse JSON file") == 1
+
+
+# --------------------------------------------------------------------------
+# 4. judge credit stamps last_credited_at → fallback can't double-credit
+# --------------------------------------------------------------------------
+def test_record_helpful_retrieval_stamps_last_credited_at(tmp_path):
+    sm = _seed_two_retrieved_lessons(tmp_path)
+
+    assert sm.record_helpful_retrieval("parse JSON file") is True
+
+    lesson = next(
+        l for l in sm._load_playbook()
+        if (l.get("trigger") or l.get("task")) == "parse JSON file")
+    stamped = lesson.get("last_credited_at") or ""
+    assert stamped
+    # The fallback's idempotency check keys on
+    # last_credited_at >= last_retrieved_at (same naive-isoformat clock,
+    # so string comparison mirrors the datetime comparison).
+    assert stamped >= (lesson.get("last_retrieved_at") or "")
+
+
+def test_judge_credited_lesson_not_double_credited_by_fallback(tmp_path):
+    sm = _seed_two_retrieved_lessons(tmp_path)
+
+    # Post-turn usefulness judge credits one lesson...
+    assert sm.record_helpful_retrieval("parse JSON file") is True
+    # ...then the post-mortem fallback sweeps the same window (legacy
+    # credit-everything path). Judge-credited lessons must be excluded.
+    credited = sm.credit_recent_retrievals()
+
+    assert credited == 1  # only the not-yet-credited k8s lesson
+    assert _helpful(sm, "parse JSON file") == 1  # NOT 2
+    assert _helpful(sm, "deploy kubernetes cluster") == 1

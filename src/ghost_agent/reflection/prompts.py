@@ -136,6 +136,10 @@ def parse_reflection_output(text: str) -> tuple[str, List[str]]:
       * step markers `1.`, `1)`, `-`, `*`, `•`
       * any amount of surrounding prose
 
+    Plan headers are recognised only as whole lines — a mid-sentence
+    "plan" (e.g. `DIAGNOSIS: The plan failed because:`) never opens
+    the plan section.
+
     Empty return means neither a diagnosis header nor a plan section
     was detected — the caller treats that as an unparseable response.
     """
@@ -154,6 +158,18 @@ def parse_reflection_output(text: str) -> tuple[str, List[str]]:
     stripped_text = re.sub(r"^#+\s*", "", stripped_text, flags=re.MULTILINE)
     lower = stripped_text.lower()
 
+    # A plan header must BE a line: line start, optional "revised"/
+    # "corrected" qualifier, "plan", optional colon, then end-of-line or
+    # the first step marker. A bare `\bplan\b` matched anywhere, which
+    # let diagnosis prose (`DIAGNOSIS: The plan failed because:`) open
+    # the "plan" section — its bullets were captured as the revised plan
+    # and the blank-line break stopped before the real REVISED PLAN.
+    plan_header_re = re.compile(
+        r"^[ \t]*(?:(?:revised|corrected)\s+)?plan\b[ \t]*:?[ \t]*"
+        r"(?=$|\d+[.)\-]|[\-\*•])",
+        re.MULTILINE,
+    )
+
     # --- DIAGNOSIS ---
     # Colon-only separator: a bare `-` after the keyword risks eating a
     # following bullet marker. The prompt itself asks for `:`.
@@ -161,12 +177,8 @@ def parse_reflection_output(text: str) -> tuple[str, List[str]]:
     if d_match:
         start = d_match.end()
         # End at either the plan section or the next blank line, whichever comes first.
-        plan_hits = [
-            m.start() for m in re.finditer(
-                r"\b(?:revised\s+plan|corrected\s+plan|plan)\b\s*[:\-]", lower[start:]
-            )
-        ]
-        plan_pos = (start + plan_hits[0]) if plan_hits else -1
+        plan_hit = plan_header_re.search(lower, start)
+        plan_pos = plan_hit.start() if plan_hit else -1
         blank_pos = lower.find("\n\n", start)
         candidates = [p for p in (plan_pos, blank_pos) if p != -1]
         end = min(candidates) if candidates else len(stripped_text)
@@ -182,10 +194,7 @@ def parse_reflection_output(text: str) -> tuple[str, List[str]]:
             diagnosis = diagnosis_block[:400]
 
     # --- PLAN ---
-    plan_match = re.search(
-        r"\b(?:revised\s+plan|corrected\s+plan|plan)\b\s*:?\s*",
-        lower,
-    )
+    plan_match = plan_header_re.search(lower)
     if plan_match:
         remainder = stripped_text[plan_match.end():].strip()
         for line in remainder.splitlines():

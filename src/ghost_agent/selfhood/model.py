@@ -78,6 +78,11 @@ class SelfModel:
             self.state = None
             self.narrative = None
             self.values = None
+        # Ids of the experiences the most recent wake-up prefix surfaced.
+        # note_referenced_experiences unions these into its candidate pool
+        # — the IDF-retrieved entries in the prefix are precisely the ones
+        # likely older than the recent(50) window it scans.
+        self._last_prefix_experience_ids: tuple = ()
 
     # -----------------------------------------------------------------
     # Hot-path APIs (called by handle_chat per turn)
@@ -97,7 +102,7 @@ class SelfModel:
         if not self.enabled:
             return ""
         narrative_text = self.narrative.latest() if self.narrative is not None else ""
-        return build_wakeup_prefix(
+        prefix = build_wakeup_prefix(
             autobio=self.autobio,
             state=self.state,
             narrative=narrative_text,
@@ -105,6 +110,41 @@ class SelfModel:
             recent_experiences_n=recent_experiences_n,
             query=query,
         )
+        self._last_prefix_experience_ids = self._prefix_experience_ids(
+            recent_experiences_n=recent_experiences_n, query=query,
+        )
+        return prefix
+
+    def _prefix_experience_ids(
+        self,
+        *,
+        recent_experiences_n: int,
+        query: Optional[str],
+        relevant_experiences_n: int = 3,
+    ) -> tuple:
+        """Ids of the experiences the wake-up prefix surfaces — mirrors
+        the recent+relevant retrieval in ``recognition.build_wakeup_prefix``
+        (which renders text, not ids). Cheap: ``recent`` is a bounded tail
+        read and the search rides the (mtime, size)-keyed index cache the
+        prefix build just warmed. Never raises."""
+        if self.autobio is None:
+            return ()
+        ids: list = []
+        try:
+            if recent_experiences_n > 0:
+                ids = [e.id for e in self.autobio.recent(limit=recent_experiences_n)]
+            if query and query.strip() and relevant_experiences_n > 0:
+                seen = set(ids)
+                relevant = [
+                    e for e in self.autobio.search_my_past(
+                        query, limit=relevant_experiences_n + len(seen),
+                    )
+                    if e.id not in seen
+                ][:relevant_experiences_n]
+                ids.extend(e.id for e in relevant)
+        except Exception as e:
+            logger.debug("prefix experience-id stamp skipped: %s", e)
+        return tuple(ids)
 
     # -----------------------------------------------------------------
     # Values / principles (normative substrate)
@@ -278,6 +318,19 @@ class SelfModel:
             recent_pool = self.autobio.recent(limit=50)
         except Exception:
             recent_pool = []
+        # Union in the experiences the wake-up prefix actually surfaced:
+        # the IDF-retrieved ones are exactly the entries likely older than
+        # the newest 50, and a recall-surfaced memory the model echoed
+        # must be creditable too.
+        stamped = getattr(self, "_last_prefix_experience_ids", ())
+        if stamped:
+            try:
+                pool_ids = {e.id for e in recent_pool}
+                missing = [i for i in stamped if i not in pool_ids]
+                if missing:
+                    recent_pool = recent_pool + self.autobio.get_by_ids(missing)
+            except Exception as e:
+                logger.debug("prefix-id pool union skipped: %s", e)
         try:
             ids = detect_referenced_experiences(
                 prefix_text=prefix_text,

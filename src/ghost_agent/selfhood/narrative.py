@@ -37,6 +37,13 @@ logger = logging.getLogger("GhostSelfhood")
 NARRATIVE_FILENAME = "narrative.md"
 NARRATIVE_HISTORY_FILENAME = "narrative.history.jsonl"
 
+# Bounded growth for the audit history (mirrors autobiographical's
+# _COMPACT_MAX_BYTES pattern). Each record embeds the full narrative
+# text, so an idle agent's periodic regenerations grow the file without
+# bound. Past the byte cap we keep only the newest records.
+_HISTORY_COMPACT_MAX_BYTES = 512 * 1024
+_HISTORY_COMPACT_KEEP_LINES = 100
+
 
 # Patterns we strip from meta_insights before feeding it to the LLM
 # diary prompt. The LLM faithfully echoes whatever it's shown, so
@@ -383,13 +390,17 @@ class NarrativeSummariser:
             if mi:
                 text += f"\n\nWhat I've noticed about myself: {mi}"
 
-        self._persist(text, used_llm=used_llm, source_count=len(recent))
         # Only remembered after a successful persist — a transient LLM
-        # error must not poison the guard against a valid retry.
-        self._last_input_key = input_key
+        # or disk error must not poison the guard against a valid retry
+        # (the guard would otherwise pass via an OLDER narrative file,
+        # turning a transient failure into persistent staleness).
+        if self._persist(text, used_llm=used_llm, source_count=len(recent)):
+            self._last_input_key = input_key
         return text
 
-    def _persist(self, text: str, *, used_llm: bool, source_count: int) -> None:
+    def _persist(self, text: str, *, used_llm: bool, source_count: int) -> bool:
+        """Write the latest narrative + append the audit record. Returns
+        True only when both landed on disk."""
         try:
             with self._lock:
                 self.root.mkdir(parents=True, exist_ok=True)
@@ -397,7 +408,7 @@ class NarrativeSummariser:
                 tmp = self.path.with_suffix(".md.tmp")
                 tmp.write_text(text, encoding="utf-8")
                 tmp.replace(self.path)
-                # Audit history — append-only.
+                # Audit history — append-only, byte-capped.
                 record = {
                     "timestamp": _utcnow_iso(),
                     "used_llm": bool(used_llm),
@@ -408,5 +419,29 @@ class NarrativeSummariser:
                     f.write(json.dumps(record, ensure_ascii=False))
                     f.write("\n")
                     f.flush()
+                self._maybe_compact_history_locked()
+            return True
         except Exception as e:
             logger.warning("narrative persist failed: %s", e)
+            return False
+
+    def _maybe_compact_history_locked(self) -> None:
+        """Rewrite the audit history keeping the newest
+        ``_HISTORY_COMPACT_KEEP_LINES`` records once it passes the byte
+        cap. Caller holds ``self._lock``. Best-effort — a failed
+        compaction must never fail the persist that triggered it."""
+        try:
+            if self.history_path.stat().st_size <= _HISTORY_COMPACT_MAX_BYTES:
+                return
+            from collections import deque
+            with self.history_path.open("r", encoding="utf-8") as f:
+                tail = deque(f, maxlen=_HISTORY_COMPACT_KEEP_LINES)
+            tmp = self.history_path.with_suffix(".jsonl.tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                f.writelines(tail)
+            tmp.replace(self.history_path)
+            logger.info(
+                "narrative history compacted to newest %d records", len(tail),
+            )
+        except Exception as e:
+            logger.warning("narrative history compaction failed: %s", e)

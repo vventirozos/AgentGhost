@@ -13,6 +13,7 @@ import pytest
 
 from ghost_agent.memory.lesson_quality import (
     is_actionable_lesson, _is_actionable_heuristic, _is_mistake_less,
+    _is_conversational_trigger,
 )
 from ghost_agent.memory.skills import SkillMemory
 
@@ -168,4 +169,42 @@ class TestConversationalTrigger:
         assert is_actionable_lesson(
             mistake="accepted new work before replaying the journal",
             solution="Replay the journal first.",
+            task=trigger)
+
+
+class TestErrorSignatureTriggers:
+    """2026-07-20: the 'no '/'now '/'still ' fragment-starter prefixes were
+    rejecting genuine error-keyed triggers at the write chokepoint —
+    "No module named 'requests'…" is a prime retrieval key, not chat."""
+
+    @pytest.mark.parametrize("trigger", [
+        "No module named 'requests' when running sandbox scripts",
+        "No such file or directory: /workspace/out.csv",
+        "no matching distribution found for torch==2.9",
+        "No space left on device during pip install",
+        "no attribute 'loadLevel' on EnemyManager",
+        "still getting ImportError after reinstalling the package",
+        "Still ENOENT after correcting the workspace path",
+        "still failing with EACCES on the publish path",
+    ])
+    def test_error_keyed_triggers_pass(self, trigger):
+        assert not _is_conversational_trigger(trigger)
+        assert is_actionable_lesson(
+            mistake="retried without checking the environment",
+            solution="Probe the sandbox environment first.",
+            task=trigger)
+
+    @pytest.mark.parametrize("trigger", [
+        "no that's wrong",
+        "no wait use the other file",
+        "now do the other one",
+        "now try the second option",
+        "still the same, try something else",
+        "it still does the same thing",
+    ])
+    def test_genuine_conversational_fragments_still_rejected(self, trigger):
+        assert _is_conversational_trigger(trigger)
+        assert not is_actionable_lesson(
+            mistake="verifier refuted the claim",
+            solution="Confirm the concrete next step before advancing.",
             task=trigger)

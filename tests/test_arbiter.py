@@ -258,6 +258,54 @@ async def test_dict_runner_output_extracted():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Sync runners — the Runner alias permits plain-sync callables, whose
+# results used to bypass asyncio.wait_for entirely (the call blocked the
+# event loop with no deadline)
+# ──────────────────────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sync_runner_supported():
+    def runner(payload):
+        return f"answer at T={payload['temperature']}"
+
+    arbiter = DualSolverArbiter(runner=runner)
+    decision = await arbiter.arbitrate("question")
+    assert all(c.ok for c in decision.candidates)
+    assert decision.chosen.output.startswith("answer at T=")
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_timeout_applies():
+    import time as _time
+
+    def runner(payload):
+        _time.sleep(0.5)  # would previously block the loop, deadline-free
+        return "late"
+
+    arbiter = DualSolverArbiter(runner=runner, per_sample_timeout_s=0.05)
+    decision = await arbiter.arbitrate("question")
+    assert decision.action == "ask_user"
+    assert all("timeout" in c.error for c in decision.candidates)
+    # The deadline actually applied — the samples returned at ~0.05s,
+    # not after the runner's 0.5s block.
+    assert all(c.duration_s < 0.4 for c in decision.candidates)
+
+
+@pytest.mark.asyncio
+async def test_sync_runner_returning_awaitable_still_works():
+    # Third Runner shape: a sync callable that RETURNS an awaitable.
+    def runner(payload):
+        async def _inner():
+            return "from awaitable"
+        return _inner()
+
+    arbiter = DualSolverArbiter(runner=runner)
+    decision = await arbiter.arbitrate("question")
+    assert decision.action == "execute"
+    assert decision.chosen.output == "from awaitable"
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Convergence with text-only fallback
 # ──────────────────────────────────────────────────────────────────────
 

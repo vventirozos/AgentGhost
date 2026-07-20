@@ -2196,6 +2196,7 @@ class FinalizeState:
     """
     body: Any
     created_time: Any
+    current_plan_json: Any
     current_trajectory_id: Any
     execution_failure_count: Any
     final_ai_content: Any
@@ -2210,6 +2211,7 @@ class FinalizeState:
     req_id: Any
     thought_content: Any
     tools_run_this_turn: Any
+    wakeup_prefix: Any
     was_complex_task: Any
     _stable_conv_fp: Any
     _verdict_is_fresh: Any
@@ -3593,7 +3595,7 @@ class GhostAgent:
             if not isinstance(_calib_cd_override, (int, float)):
                 _calib_cd_override = None
             _calib_cooldown = (
-                float(_calib_cd_override) if _calib_cd_override
+                float(_calib_cd_override) if _calib_cd_override is not None
                 else float(self._CALIB_REFIT_COOLDOWN)
             )
             since_last_calib = (
@@ -4021,6 +4023,20 @@ class GhostAgent:
 
         items = await asyncio.to_thread(self.context.journal.pop_all)
         if not items: return
+
+        # Tee the mineable subset into the self-play replay stash BEFORE
+        # consuming: this drain fires at ~2min idle while journal-mined
+        # challenge generation fires at >60min idle, so without the stash
+        # phase 3 always found an empty queue and the journal-replay
+        # curriculum never ran.
+        try:
+            from .journal_challenges import stash_mineable
+            _mineable = [i for i in items
+                         if isinstance(i, dict) and i.get("type") == "post_mortem"]
+            if _mineable:
+                await asyncio.to_thread(stash_mineable, _mineable)
+        except Exception as _stash_exc:
+            logger.debug("journal mineable stash skipped: %s", _stash_exc)
 
         pretty_log("Hippocampus", f"Waking up to process {len(items)} buffered memories...", icon=Icons.BRAIN_THINK)
 
@@ -5735,11 +5751,14 @@ class GhostAgent:
                 if reason and outcome == _Outcome.FAILED.value \
                         and not (cached.failure_reason or ""):
                     cached.failure_reason = reason
-            _glog.spawn_task(asyncio.to_thread(
+            # spawn_bg: strong ref + warning-level failure logging + shutdown
+            # drain — a GC'd or silently-failed backfill loses the corpus
+            # outcome with no trace (same rule as the user-correction path).
+            _glog.spawn_bg(asyncio.to_thread(
                 collector.update_outcome,
                 trajectory_id, outcome,
                 reason=reason, source="verifier_late",
-            ))
+            ), name="late-verdict-outcome-backfill")
             pretty_log(
                 "Verifier",
                 f"late verdict backfilled into the corpus: trajectory "
@@ -5828,13 +5847,16 @@ class GhostAgent:
             )
             _sm = getattr(self.context, "skill_memory", None)
             if _sm is not None and trajectory_id:
-                _glog.spawn_task(asyncio.to_thread(
+                # spawn_bg: a GC'd retraction leaves a poisoned lesson
+                # retrievable with nothing logged — this write must land
+                # or fail loudly.
+                _glog.spawn_bg(asyncio.to_thread(
                     _sm.retract_lessons_from_trajectory,
                     trajectory_id,
                     memory_system=getattr(
                         self.context, "memory_system", None
                     ),
-                ))
+                ), name="late-verdict-lesson-retraction")
             # Async mode: stash a correction to surface on the next turn OF
             # THE SAME CONVERSATION, since the response is already out and
             # can't be repaired. Tagged with the conversation fingerprint and
@@ -7531,7 +7553,14 @@ class GhostAgent:
                             logger.debug("metacog trigger publish failed: %s", _trexc)
                         try:
                             # Feed the budget window + competence profile.
-                            _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
+                            # A validator/policy block ("SYSTEM BLOCK: ...")
+                            # means the action never RAN — it is evidence
+                            # about the guard, not about domain competence:
+                            # recording it as success inflated p(success)
+                            # for statements that were rejected. Skip the
+                            # sample entirely.
+                            if not _lstr.startswith("SYSTEM BLOCK"):
+                                _mc.record_outcome(fname, success=not _tool_failed, duration_s=_dur)
                         except Exception as _mcexc:
                             logger.debug("metacog outcome hook failed: %s", _mcexc)
 
@@ -7925,7 +7954,17 @@ class GhostAgent:
                 if _noprogress_trip is not None and not force_stop and not force_final_response:
                     _asig, _acnt, _afname, _atarget = _noprogress_trip
                     _tgt_desc = f" on '{_atarget}'" if _atarget else ""
-                    if _acnt >= 3:
+                    # Two-tier hard stop: read/write-exempt tools keep the
+                    # documented >=5 backstop — after the soft steer they
+                    # legitimately re-READ once to orient before the pending
+                    # WRITE, and aborting at 3 re-created the "barred
+                    # pending write" failure the exemption exists to
+                    # prevent. Everything else aborts at 3.
+                    from . import strikes as _strk
+                    _hard_n = (getattr(_strk, "READWRITE_HARD_STOP", 5)
+                               if _afname in getattr(_strk, "READWRITE_LOOP_TOOLS", frozenset())
+                               else 3)
+                    if _acnt >= _hard_n:
                         pretty_log(
                             "Loop Breaker",
                             f"No-progress loop: '{_afname}'{_tgt_desc} repeated {_acnt}x "
@@ -8339,6 +8378,7 @@ class GhostAgent:
         """
         body = fs.body
         created_time = fs.created_time
+        current_plan_json = fs.current_plan_json
         current_trajectory_id = fs.current_trajectory_id
         execution_failure_count = fs.execution_failure_count
         final_ai_content = fs.final_ai_content
@@ -8353,6 +8393,7 @@ class GhostAgent:
         req_id = fs.req_id
         thought_content = fs.thought_content
         tools_run_this_turn = fs.tools_run_this_turn
+        wakeup_prefix = fs.wakeup_prefix
         was_complex_task = fs.was_complex_task
         _stable_conv_fp = fs._stable_conv_fp
         _verdict_is_fresh = fs._verdict_is_fresh
@@ -8836,7 +8877,7 @@ class GhostAgent:
         # response that misses a declared postcondition gets a
         # visible note rather than passing silently. Non-fatal.
         try:
-            _plan_json = locals().get('current_plan_json')
+            _plan_json = current_plan_json
             if _plan_json and final_ai_content:
                 from .planning import TaskTree as _PlanTree
                 _ptree = _PlanTree()
@@ -8892,7 +8933,17 @@ class GhostAgent:
         if sm is not None and execution_failure_count == 0:
             try:
                 if hasattr(sm, 'credit_recent_retrievals'):
-                    await asyncio.to_thread(sm.credit_recent_retrievals, 300)
+                    # Discriminative form: only lessons relevant to THIS
+                    # turn's query (or actually hydrated this turn) get
+                    # credit — the legacy no-arg form credited every
+                    # lesson surfaced in the window, re-creating the
+                    # helpful≈retrievals noise the mode was built to fix.
+                    await asyncio.to_thread(
+                        sm.credit_recent_retrievals, 300,
+                        query=str(last_user_content or ""),
+                        top_triggers=list(
+                            getattr(sm, "last_playbook_triggers", []) or []),
+                    )
             except Exception:
                 pass
 
@@ -8910,6 +8961,13 @@ class GhostAgent:
         try:
             _ct = getattr(self.context, "calibration_tracker", None)
             _pending = getattr(self.context, "_calib_pending", None)
+            # The stash is (req_id, reading): accept only a reading this
+            # request produced. A cross-request leftover (an overlapping
+            # streamed turn's drain fired after our turn-start reset)
+            # falls through to the compute-now path below, which pairs
+            # THIS turn's own signals with THIS turn's outcome.
+            if isinstance(_pending, tuple) and len(_pending) == 2:
+                _pending = _pending[1] if _pending[0] == req_id else None
             # Finalization fallback (the load-bearing path in practice):
             # most turns never enter the streaming
             # is_final_generation+stream_response branch where the
@@ -9080,19 +9138,6 @@ class GhostAgent:
                                 tracker.resolve_unknown(_u, "resolved via tool output this turn")
                 except Exception:
                     pass
-                # Verify-side of the lifecycle (previously unwired): if the
-                # turn completed cleanly (a response, no error/failure
-                # markers), treat the assumptions the agent proceeded on as
-                # borne out (was_correct=True). Conservative — only confirms
-                # on a clean turn, never marks them wrong.
-                try:
-                    _turn_clean = bool(final_ai_content) and "error" not in final_ai_content[:80].lower()
-                    if _turn_clean:
-                        for _a in list(tracker.assumptions):
-                            if not getattr(_a, "verified", False):
-                                tracker.verify_assumption(_a, True)
-                except Exception:
-                    pass
                 # Metacognitive gate (proposal item #6): if a
                 # critical unknown still needs the user, surface
                 # the clarifying question at the TOP of the reply
@@ -9112,6 +9157,22 @@ class GhostAgent:
                 risk = tracker.get_risk_summary()
                 if risk and final_ai_content and risk[:60] not in final_ai_content:
                     final_ai_content = f"{final_ai_content}\n\n---\n{risk}"
+                # Verify-side of the lifecycle: if the turn completed
+                # cleanly (a response, no error/failure markers), treat
+                # the assumptions the agent proceeded on as borne out
+                # (was_correct=True). Conservative — only confirms on a
+                # clean turn, never marks them wrong. MUST run AFTER the
+                # gate/footer above: marking verified first blanked the
+                # "Assumptions I made" footer on every clean turn and
+                # fabricated verification for assumptions nothing checked.
+                try:
+                    _turn_clean = bool(final_ai_content) and "error" not in final_ai_content[:80].lower()
+                    if _turn_clean:
+                        for _a in list(tracker.assumptions):
+                            if not getattr(_a, "verified", False):
+                                tracker.verify_assumption(_a, True)
+                except Exception:
+                    pass
                 # Reset in-memory turn state; the durable persisted
                 # log is untouched so recurring blind-spots survive.
                 tracker.reset()
@@ -9426,7 +9487,14 @@ class GhostAgent:
                 # Consolidate the corpus outcome with the same signals
                 # calibration + selfhood use (was heuristics-only here).
                 verifier=(verifier_backfill[0] if verifier_backfill else None),
-                execution_failed=(execution_failure_count > 0),
+                # `execution_failure_count` is a decayed-strike ledger, not
+                # a terminal state — a turn that recovered mid-way can end
+                # with a residual strike. Only call the execution FAILED
+                # (priority-1 in resolve_turn_outcome, overrides a verifier
+                # PASS) when the strike ledger is non-zero AND the final
+                # tool call actually failed.
+                execution_failed=(execution_failure_count > 0
+                                  and bool(last_was_failure)),
             )
         except Exception as e:
             # Debug-level: a turn-logging failure must never be
@@ -9443,7 +9511,7 @@ class GhostAgent:
         try:
             _sm = getattr(self.context, "self_model", None)
             if _sm is not None and getattr(_sm, "enabled", False):
-                _wp = locals().get("wakeup_prefix", "") or ""
+                _wp = wakeup_prefix if isinstance(wakeup_prefix, str) else ""
                 if _wp and final_ai_content:
                     await asyncio.to_thread(
                         _sm.note_referenced_experiences,
@@ -9464,7 +9532,11 @@ class GhostAgent:
                 _sm_bf = getattr(self.context, 'self_model', None)
                 if isinstance(_sm_bf, _SelfModelBF) and getattr(_sm_bf, 'enabled', False):
                     _bf_outcome, _bf_reason = verifier_backfill
-                    _sm_bf.record_outcome(
+                    # to_thread: at the autobiographical log's steady-state
+                    # byte cap this is a full-file read+rewrite — inline it
+                    # stalls every concurrent SSE stream on the event loop.
+                    await asyncio.to_thread(
+                        _sm_bf.record_outcome,
                         current_trajectory_id, _bf_outcome,
                         failure_reason=_bf_reason,
                     )
@@ -9606,6 +9678,17 @@ class GhostAgent:
                 # that stale reading with ITS OWN outcome, systematically
                 # mispairing the calibration JSONL.
                 self.context._calib_pending = None
+                # Clear turn-scoped uncertainty state from a previous
+                # request that died before its finalize (the only reset
+                # used to be at finalize-END, so an aborted turn leaked
+                # its unknowns/assumptions into the next request's
+                # clarifying-question gate and pressure() reading).
+                try:
+                    _ut_prev = getattr(self.context, "uncertainty_tracker", None)
+                    if _ut_prev is not None:
+                        _ut_prev.reset()
+                except Exception:
+                    pass
 
                 # CONVERSATION-SCOPED PROJECT BINDING. `current_project_id`
                 # is process-global; reconcile it against THIS request's
@@ -9811,6 +9894,9 @@ class GhostAgent:
                 # become a MagicMock-arithmetic object and downstream
                 # `messages[0]["content"]` would be unverifiable
                 # garbage. Same defensive pattern as the PRM phase.
+                # Pre-bind: FinalizeState carries the prefix to the
+                # reference-count pass; the binding below is conditional.
+                wakeup_prefix = ""
                 try:
                     from ..selfhood import SelfModel as _SelfModel
                     self_model = getattr(self.context, 'self_model', None)
@@ -11617,7 +11703,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 # outcome). Last reading of the turn
                                                 # wins — that's the one we score
                                                 # against the turn's outcome.
-                                                self.context._calib_pending = _cr
+                                                # Tagged with THIS request's id: the
+                                                # SSE drain runs after the semaphore
+                                                # is released, so this write can land
+                                                # mid-turn-B — the tag lets B's
+                                                # finalize reject a reading that
+                                                # isn't its own instead of pairing
+                                                # A's confidence with B's outcome.
+                                                self.context._calib_pending = (req_id, _cr)
                                                 # Push the reading into the
                                                 # bundle so the mid-turn
                                                 # arbiter gate (consulted
@@ -11736,6 +11829,50 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             self._judge_hydration_safe(
                                 full_content, turn_id=str(req_id or ""))
 
+                            # Streamed-turn trajectory backfill: the record
+                            # written at finalize carried final_response=""
+                            # (the text lived in the SSE frames), which made
+                            # the correction-lookup stash reject it — the
+                            # user-correction promotion loop and the
+                            # abort-marker heuristics were dead for every
+                            # streamed turn. Now that the full text exists,
+                            # backfill the in-memory trajectory, re-run the
+                            # shape heuristics, land any promotion via the
+                            # corrections sidecar, and stash for the next
+                            # turn's correction hook.
+                            try:
+                                _spend = getattr(
+                                    self.context, "_streamed_traj_pending", None)
+                                if (_spend and _spend[0] == req_id
+                                        and isinstance(full_content, str)
+                                        and full_content.strip()):
+                                    _straj = _spend[1]
+                                    _straj.final_response = full_content[:16000]
+                                    try:
+                                        from ..distill.outcome_heuristics import (
+                                            apply_chat_outcome_heuristics)
+                                        from ..distill.schema import Outcome as _SOut
+                                        if (_straj.outcome == _SOut.UNKNOWN.value
+                                                and apply_chat_outcome_heuristics(_straj)):
+                                            _scol = getattr(
+                                                self.context,
+                                                "trajectory_collector", None)
+                                            if _scol is not None:
+                                                _glog.spawn_bg(asyncio.to_thread(
+                                                    _scol.update_outcome,
+                                                    _straj.id, _straj.outcome,
+                                                    reason=_straj.failure_reason,
+                                                    source="stream_backfill",
+                                                ), name="stream-outcome-backfill")
+                                    except Exception:
+                                        pass
+                                    self._stash_trajectory_for_correction_lookup(_straj)
+                                    self.context._streamed_traj_pending = None
+                            except Exception as _sbf_exc:
+                                logger.debug(
+                                    "streamed trajectory backfill skipped: %s",
+                                    _sbf_exc)
+
                             # --- VERIFIER GATE (STREAM), 2026-07-18 ---
                             # The gated verdict was historically invoked only
                             # from _finalize_and_return — the NON-streaming
@@ -11846,7 +11983,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             if sm is not None and execution_failure_count == 0:
                                 try:
                                     if hasattr(sm, 'credit_recent_retrievals'):
-                                        await asyncio.to_thread(sm.credit_recent_retrievals, 300)
+                                        # Discriminative form — see the
+                                        # finalize-path call for rationale.
+                                        await asyncio.to_thread(
+                                            sm.credit_recent_retrievals, 300,
+                                            query=str(last_user_content or ""),
+                                            top_triggers=list(
+                                                getattr(sm, "last_playbook_triggers", []) or []),
+                                        )
                                 except Exception:
                                     pass
 
@@ -12782,10 +12926,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     # note (the production gap under
                                     # GHOST_CRITIC_ASYNC=1). Only when the last
                                     # tool is substantive and the mutation guard
-                                    # didn't already trip; on timeout we DEFER
-                                    # exactly as before (verdict finishes in the
-                                    # background, still scrubbing poisoned
-                                    # lessons via its done-callback).
+                                    # didn't already trip; on timeout we hand the
+                                    # still-running task to the late-verdict
+                                    # handler (its side effects — correction
+                                    # stash, poisoned-lesson scrub — land when
+                                    # the verdict does) and mark the verdict
+                                    # cache as "skipped" so the post-loop gate
+                                    # doesn't spawn a SECOND full verdict for
+                                    # the same turn on the already-contended
+                                    # worker.
                                     _rbudget = self._critic_repair_await_budget()
                                     if (_rbudget > 0 and _lt is not None
                                             and not _unverified):
@@ -12812,6 +12961,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                     and _vr.verdict == _VV.REFUTED
                                                     and _vr.confidence >= 0.7
                                                 )
+                                            else:
+                                                self._attach_late_verdict_handler(
+                                                    _vtask, current_trajectory_id,
+                                                    _stable_conv_fp,
+                                                )
+                                                _verifier_verdict_cache = (None, _lt)
+                                                _verdict_is_fresh = True
                                         except Exception as _await_exc:
                                             logger.debug(
                                                 "async verdict await skipped: %s: %s",
@@ -13008,6 +13164,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 return await self._finalize_and_return(FinalizeState(
                     body=body,
                     created_time=created_time,
+                    current_plan_json=current_plan_json,
                     current_trajectory_id=current_trajectory_id,
                     execution_failure_count=execution_failure_count,
                     final_ai_content=final_ai_content,
@@ -13022,6 +13179,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     req_id=req_id,
                     thought_content=thought_content,
                     tools_run_this_turn=tools_run_this_turn,
+                    wakeup_prefix=wakeup_prefix,
                     was_complex_task=was_complex_task,
                     _stable_conv_fp=_stable_conv_fp,
                     _verdict_is_fresh=_verdict_is_fresh,
@@ -13374,11 +13532,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 from ..selfhood import SelfModel as _SelfModel
                 self_model = getattr(ctx, 'self_model', None)
                 if isinstance(self_model, _SelfModel) and getattr(self_model, 'enabled', False):
-                    self_model.record_outcome(
+                    # spawn_bg + to_thread: at the autobio log's byte cap
+                    # this is a full-file rewrite — inline it blocks the
+                    # event loop mid-turn (this hook runs synchronously
+                    # on the hot path).
+                    _glog.spawn_bg(asyncio.to_thread(
+                        self_model.record_outcome,
                         traj.id,
                         Outcome.FAILED.value,
                         failure_reason=verdict.reason or "user-correction",
-                    )
+                    ), name="selfhood-correction-backfill")
             except Exception as e:
                 logger.debug(
                     "selfhood verdict backfill skipped: %s: %s",
@@ -13964,6 +14127,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 "trajectory stash for correction lookup skipped: %s: %s",
                 type(e).__name__, e,
             )
+        # Streamed turn (generator final_content → final_response "" above):
+        # park the trajectory so the SSE drain can backfill the real text
+        # once the stream completes — the stash above rejected it (empty
+        # response), so without this the correction loop never sees
+        # streamed turns.
+        try:
+            if not isinstance(final_content, str):
+                self.context._streamed_traj_pending = (req_id, traj)
+        except Exception as e:
+            logger.debug(
+                "streamed trajectory parking skipped: %s: %s",
+                type(e).__name__, e,
+            )
 
         # Selfhood capture (proposal item #1 + #2): write a first-person
         # experiential record sharing the trajectory id. Distinct from
@@ -14037,8 +14213,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             and _sm is not None):
                         async def _hyp_executor(tool_name, action_str):
                             try:
+                                import shlex as _shlex
+                                _s = str(action_str or "").strip()
+                                # The generation prompt asks for "a minimal
+                                # Python script, shell command, or file read"
+                                # — running everything as shell turned Python
+                                # tests into `exit 127: command not found`
+                                # (whose "not found" then silently eliminated
+                                # the hypothesis). Honor the declared tool.
+                                if tool_name == "file_system":
+                                    _cmd = f"cat {_shlex.quote(_s)}"
+                                elif ("\n" in _s
+                                      or _s.startswith(("print(", "import ", "from "))):
+                                    _cmd = "python3 -c " + _shlex.quote(_s)
+                                else:
+                                    _cmd = _s
                                 _out, _code = await asyncio.to_thread(
-                                    _sm.execute, action_str, 30)
+                                    _sm.execute, _cmd, 30)
                                 return f"[exit {_code}]\n{_out}"
                             except Exception as _ex:
                                 return f"executor error: {_ex}"
@@ -14049,7 +14240,28 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 timeout=120.0,
                             )
                             # LLM adjudication over the real test evidence.
-                            await tester.evaluate_results(task_context, hypotheses)
+                            # Its verdict RESOLVES the consistent=None cases
+                            # test_hypotheses_parallel deliberately defers
+                            # (a test that SURFACES the expected error is
+                            # the one that confirms its hypothesis) — the
+                            # result was previously discarded, so survivors
+                            # were exactly the hypotheses the evidence did
+                            # NOT confirm.
+                            _eval = await tester.evaluate_results(
+                                task_context, hypotheses)
+                            try:
+                                _surv_idx = {
+                                    int(_i) for _i in
+                                    (_eval or {}).get("surviving_hypotheses", [])
+                                }
+                                if _surv_idx or (_eval or {}).get("conclusion"):
+                                    for _hi, _h in enumerate(hypotheses):
+                                        if _hi in _surv_idx:
+                                            _h.consistent = True
+                                        elif _h.consistent is None:
+                                            _h.consistent = False
+                            except Exception:
+                                pass
                             tested = True
                         except Exception as _ex:
                             logger.debug(f"Hypothesis grounding skipped: {_ex}")

@@ -788,6 +788,72 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-20 (later) — metacognitive-stack review: 2 criticals + ~15 majors found and fixed same-day
+
+Eight-slice parallel review of the whole metacog stack (~20k lines: metacog signals, reasoning
+search, dream/REM, failure learning, reflection+verifier, selfhood, distill/PRM, agent.py wiring),
+every finding adversarially re-verified against source before acceptance; then ten parallel fix
+batches with strict file ownership + a coordinator pass over agent.py/main.py. Full detail (with
+severity table) in `docs/audit_fixes.html` Round 10; new tests throughout. Highlights:
+
+- **CRITICAL — counterfactual replay was a total no-op since its 2026-07-17 ship**:
+  `persist_challenge` required exact `"SUCCESS"/"FAILURE"` but dream passes decorated strings
+  ("SUCCESS (in 2 attempts)") — zero challenges ever persisted (`$GHOST_HOME/system/counterfactual/`
+  didn't exist). `classify()` had the same exact-match bug (a fixed persist alone would have graded
+  every successful replay a REGRESSION and quarantined good lessons), and infra-failed replays
+  read as decisive failures. All three fixed (prefix-normalize; "inconclusive" branch: no
+  quarantine, bounded retry); quarantine attribution now prefers the sim-scoped
+  `dreamer.last_selfplay_hydrated_triggers` snapshot over the shared attribute a concurrent user
+  turn can re-stamp.
+- **CRITICAL — redaction bypass into the training corpus**: lowercase/colon secret forms
+  (`password: hunter2`, `db_password = hunter2`, `api_key: sk_live_…`) passed every redact.py rule
+  → unredacted secrets in `$GHOST_HOME/trajectories/` and GHOST_LLM_RECORD fixtures. New
+  case-insensitive assignment rule; escape-aware JSON rule reordered FIRST (integration caught the
+  new rule truncating `"a\"b_secret"` at the escaped quote). Selfhood's `redact_pii` had the inverse
+  bug (redacted "skateboarding", missed `api_key=…`) — both directions fixed.
+  **Follow-up DONE (same day): `scripts/scrub_secrets.py` (dry-run/--apply, per-file backups,
+  live-append-safe) scrubbed the corpus — 4 genuine leaked values in 2 trajectory files
+  (a `"password":` JSON value + a `SECRET = "…"` snippet); verified clean after. The dry-run also
+  exposed a CC-rule false positive — 13+ digit runs INSIDE 32-hex trajectory/experience ids
+  Luhn-passed and would have been corrupted — fixed in BOTH redactors with letter-excluding
+  boundaries (`(?<![0-9A-Za-z])`) + tests. Scrub backups (containing the originals) left at
+  `$GHOST_HOME/system/pre_scrub_backup_1784546621` — operator: delete after review.**
+- **Finalize-extraction regressions**: the plan-postcondition gate and the selfhood
+  reference-counter both read `locals().get(…)` from inside `_finalize_and_return` — dead since the
+  step-3 extraction, no log. Now FinalizeState fields (`current_plan_json`, `wakeup_prefix`),
+  test-pinned. Same idiom audited across agent.py — only these two sites were broken.
+- **Verifier fail-open**: non-dict judge reply → AttributeError → whole pass silently skipped;
+  truncated stage-2 fragment → fabricated UNCERTAIN@0.5 that SUPPRESSED the classic fallback;
+  `GHOST_VERIFY_STAGE_NO_THINK=0` defeated by an ungated `stop=["\n"]`. All fixed
+  (`_parse_json` guarantees dict; verdict key required; stop inside the guard).
+- **Self-play mutated production skill state**: dream's ReadOnlySkillMemory `__getattr__`
+  passthrough let the sim's bus bump real retrieval counters (prune-eligibility pollution) — now an
+  explicit whitelist like the vector wrapper's M1 fix. Related: `helpful_retrievals` double-credit
+  closed (judge stamps `last_credited_at`; both live `credit_recent_retrievals` calls now use the
+  discriminative query/trigger form) — this also un-corrupts the §3 distilled-lesson kill-criterion
+  audit.
+- **Frontier ABBA lock inversion** (event-loop deadlock risk) fixed + AST lock-order test.
+  **Async-critic timeout** now hands the running verdict to the late handler instead of abandoning
+  it AND double-spawning; late-verdict side effects moved to spawn_bg. **Streamed turns**: calib
+  stash tagged by req_id (cross-request mispair race); drain now backfills `final_response` into
+  the trajectory (user-correction promotion + abort-marker detection were dead for ALL streamed
+  turns). **Journal-mined self-play challenges** could never fire (phase-1 drains at ~2min idle,
+  phase-3 mines at >60min): phase-1 now tees mineable post-mortems into a bounded stash
+  (`system/selfplay/journal_stash.json`) that generation falls back to; dream's raw journal drain
+  removed. **PRM default checkpoint** now loads at boot (was orphaned on every restart).
+  **Uncertainty tracker** made real: footer before blanket-verify, resolutions persisted,
+  request-start reset. Plus ~35 minors (see docs Round 10 table).
+- **Test-isolation incident (fix immediately deployed)**: the dev shell exports GHOST_HOME, so
+  today's dream/self-play test runs wrote 112 synthetic challenges into the LIVE counterfactual
+  ledger and unrelated tests replayed from it. Ledger purged (backup in session scratchpad;
+  everything in it was test-minted — the live agent runs pre-fix code that cannot persist), and
+  tests/conftest.py gained an autouse `delenv("GHOST_HOME")` fixture so no test can resolve live
+  operator state again.
+- **NOT yet deployed**: the live agent still runs pre-fix code — plain-kill the launchd service to
+  deploy when ready. On first deploy expect: counterfactual ledger starts populating (real entries
+  this time), PRM loads any idle-trained checkpoint at boot, boot log may now print
+  `arbiter=off (module toggle)` (accurate — the bundle flag was misreporting).
+
 ### 2026-07-20 — overnight log-eval fixes: git-conflict-dialect mis-split + verifier mutated-file coverage + dream churn cap
 Night-log review (boot 07-19 20:54 → 07-20 06:50) found one serious incident and one
 systemic waste loop; both root-caused from the trajectory and fixed, full suite green

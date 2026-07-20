@@ -282,6 +282,47 @@ def test_split_patch_fenced_fallback():
     assert "+++ b" in patch
 
 
+def test_split_patch_mock_patch_inside_test_is_not_a_marker():
+    # `mock.patch` inside the reproducing test used to match `\bpatch\b`,
+    # truncating the test there and polluting the diff. Only a line-start
+    # `PATCH:` header may open the patch section.
+    test, patch = _split_patch_output(
+        "REPRODUCING TEST:\n"
+        "```python\n"
+        "from unittest import mock\n"
+        "def test_x():\n"
+        "    with mock.patch('ghost.tools.run') as m:\n"
+        "        assert m\n"
+        "```\n"
+        "PATCH:\n"
+        "```diff\n--- a/fs.py\n+++ b/fs.py\n@@\n-bad\n+good\n```"
+    )
+    assert "mock.patch" in test
+    assert "+good" in patch
+    assert "mock.patch" not in patch
+
+
+def test_split_patch_prose_mention_of_patch_is_not_a_marker():
+    test, patch = _split_patch_output(
+        "REPRODUCING TEST:\nThis test shows why the patch is needed.\n"
+        "```python\ndef test_y(): assert False\n```\n"
+        "PATCH:\n```diff\n--- a\n+++ b\n```"
+    )
+    assert "def test_y" in test
+    assert "+++ b" in patch
+    assert "def test_y" not in patch
+
+
+def test_split_patch_diff_fence_alone_marks_patch_section():
+    test, patch = _split_patch_output(
+        "REPRODUCING TEST:\n```python\ndef t(): pass\n```\n"
+        "```diff\n--- a\n+++ b\n```"
+    )
+    assert "def t()" in test
+    assert "+++ b" in patch
+    assert "def t()" not in patch
+
+
 # --------------------------------------------------------------------------
 # Prompt builders
 # --------------------------------------------------------------------------
@@ -433,6 +474,70 @@ async def test_postmortem_tool_degrades_without_queue():
     out = await tool_postmortem("pending", defect_queue=None)
     assert "not enabled" in out
     assert "--postmortem" in out
+
+
+async def test_engine_excludes_permafailed_analysis_signature(tmp_path):
+    # An unanalysable trajectory (junk reply) must not be re-selected on
+    # the next tick — severity-ordered selection has no other exit, so
+    # without the exclusion it costs one LLM call per tick forever.
+    calls = []
+
+    async def junk(_):
+        calls.append(1)
+        return "no parseable sections here"
+
+    eng = PostMortemEngine(junk, queue=DefectQueue(tmp_path), min_severity=0.3)
+    t = _read_loop_traj(n=8)
+    r1 = await eng.run(source=[t])
+    assert r1.selected == 1 and r1.analysed_errors == 1
+    r2 = await eng.run(source=[t])
+    assert r2.selected == 0 and r2.analysed_errors == 0
+    assert len(calls) == 1
+
+
+async def test_engine_excludes_signature_after_analyze_timeout(tmp_path):
+    async def slow(_):
+        await asyncio.sleep(10)
+        return "CATEGORY: BEHAVIOURAL\nROOT CAUSE: x"
+
+    eng = PostMortemEngine(
+        slow, queue=DefectQueue(tmp_path), per_call_timeout_s=0.05, min_severity=0.3
+    )
+    t = _read_loop_traj(n=8)
+    r1 = await eng.run(source=[t])
+    assert r1.analysed_errors == 1
+    r2 = await eng.run(source=[t])
+    assert r2.selected == 0
+
+
+async def test_engine_permafail_no_longer_starves_lower_severity(tmp_path):
+    # With max_runs=1, a high-severity permafail used to win selection
+    # every tick, so the milder oscillation never got analysed.
+    async def analyze(prompt):
+        if "read_file" in prompt:  # the severe read-loop permafails
+            return "garbage"
+        return "CATEGORY: BEHAVIOURAL\nTITLE: t\nROOT CAUSE: rc.\nLESSON: l."
+
+    eng = PostMortemEngine(
+        analyze, queue=DefectQueue(tmp_path), max_runs=1, min_severity=0.2
+    )
+    severe = _read_loop_traj(n=20)          # severity ~0.70
+    mild = _oscillation_traj(n_cycles=3)    # severity ~0.54
+    r1 = await eng.run(source=[severe, mild])
+    assert r1.selected == 1 and r1.analysed_errors == 1
+    r2 = await eng.run(source=[severe, mild])
+    assert r2.selected == 1 and r2.analysed_ok == 1  # the mild one runs now
+
+
+def test_failed_analysis_set_is_bounded_fifo(tmp_path):
+    from ghost_agent.reflection.postmortem import _FAILED_ANALYSIS_CAP
+
+    eng = PostMortemEngine(lambda p: "x", queue=DefectQueue(tmp_path))
+    for i in range(_FAILED_ANALYSIS_CAP + 10):
+        eng._note_failed_analysis(f"h{i}")
+    assert len(eng._failed_analysis_sigs) == _FAILED_ANALYSIS_CAP
+    assert "h0" not in eng._failed_analysis_sigs  # oldest evicted first
+    assert f"h{_FAILED_ANALYSIS_CAP + 9}" in eng._failed_analysis_sigs
 
 
 async def test_engine_skips_healthy_runs(tmp_path):

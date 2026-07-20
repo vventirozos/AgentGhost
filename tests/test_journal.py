@@ -44,6 +44,51 @@ def test_journal_pop_all(tmp_path):
     # Popping empty journal
     assert journal.pop_all() == []
 
+def test_journal_load_missing_file_returns_empty(tmp_path):
+    journal = MemoryJournal(tmp_path, max_capacity=5)
+    journal.file_path.unlink()
+    assert journal.load() == []
+
+def test_journal_load_reraises_transient_oserror(tmp_path):
+    # A transient read failure (EACCES/EIO) must NOT read as "empty
+    # journal": the next append() would atomically overwrite the intact
+    # on-disk queue with a single-entry list. Fail loud instead — the
+    # callers' append wrappers log a warning.
+    journal = MemoryJournal(tmp_path, max_capacity=5)
+    journal.append("type1", {"data": 1})
+    os.chmod(journal.file_path, 0o000)
+    try:
+        with pytest.raises(OSError):
+            journal.load()
+        # append() goes through load() and must propagate too, leaving
+        # the on-disk queue untouched.
+        with pytest.raises(OSError):
+            journal.append("type2", {"data": 2})
+    finally:
+        os.chmod(journal.file_path, 0o600)
+    loaded = journal.load()
+    assert len(loaded) == 1
+    assert loaded[0]["type"] == "type1"
+
+def test_journal_load_corrupt_json_sidecars_and_recovers(tmp_path):
+    journal = MemoryJournal(tmp_path, max_capacity=5)
+    journal.file_path.write_text('[{"type": "smart_memory", "da')
+    assert journal.load() == []
+    sidecars = list(tmp_path.glob("*.corrupt-*"))
+    assert len(sidecars) == 1
+    assert sidecars[0].read_text().startswith('[{"type"')
+
+def test_journal_load_undecodable_bytes_sidecars(tmp_path):
+    # Binary garbage is corruption (not disk sickness): preserved to a
+    # sidecar like bad JSON, not raised and not silently dropped.
+    journal = MemoryJournal(tmp_path, max_capacity=5)
+    journal.file_path.write_bytes(b"\xff\xfe\x00garbage\x80")
+    assert journal.load() == []
+    assert len(list(tmp_path.glob("*.corrupt-*"))) == 1
+    # Journal is usable again after quarantine.
+    journal.append("type1", {"data": 1})
+    assert len(journal.load()) == 1
+
 def test_journal_push_front(tmp_path):
     journal = MemoryJournal(tmp_path, max_capacity=3)
     journal.append("type3", {"data": 3})

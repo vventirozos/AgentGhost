@@ -60,6 +60,15 @@ _BASH_FAILURES = [
      "command not found: gsed inside the sandbox shell"),
 ]
 
+_PANDAS_FAILURES = [
+    ("pandas dataframe merge report wrong rows",
+     "joined the dataframe on the wrong key column"),
+    ("pandas csv export dropped columns",
+     "wrote the dataframe with the wrong column subset"),
+    ("pandas groupby summary miscounted",
+     "aggregated the dataframe before filtering nulls"),
+]
+
 _PATTERN_REPLY = json.dumps({
     "pattern": "SEARCH/REPLACE edits to sql files keep failing open",
     "anti_pattern": ("the replace parser writes stray markers into files "
@@ -78,9 +87,10 @@ def _ctx(tmp_path, responses):
     return ctx, sm, store, stub
 
 
-def _seed(sm, failures):
+def _seed(sm, failures, dimension=""):
     for trigger, anti in failures:
-        sm.learn_lesson(trigger, anti, "Fail closed and report the error.")
+        sm.learn_lesson(trigger, anti, "Fail closed and report the error.",
+                        dimension=dimension)
 
 
 def _distilled(sm):
@@ -210,10 +220,67 @@ class TestDistill:
         assert lessons[0]["frequency"] >= 2
 
     async def test_unparseable_reply_writes_nothing(self, tmp_path):
-        ctx, sm, _, _ = _ctx(tmp_path, ["not json at all"])
+        ctx, sm, _, stub = _ctx(tmp_path, ["not json at all", _PATTERN_REPLY])
         _seed(sm, _SQL_FAILURES)
         assert await distill_failure_clusters(ctx) == 0
         assert _distilled(sm) == []
+        # unparseable output is fingerprinted like an explicit no-pattern
+        # verdict: identical evidence must not re-pay the synthesis call
+        assert await distill_failure_clusters(ctx) == 0
+        assert len([c for c in stub.calls
+                    if c[0] == "DISTILL_PATTERN"]) == 1
+
+    async def test_no_pattern_verdict_fingerprints_until_evidence_changes(
+            self, tmp_path):
+        no_pat = json.dumps({"pattern": ""})
+        ctx, sm, _, stub = _ctx(tmp_path, [no_pat, _PATTERN_REPLY])
+        _seed(sm, _SQL_FAILURES)
+
+        assert await distill_failure_clusters(ctx) == 0
+        state = json.loads((tmp_path / "system" /
+                            "failure_distill_state.json").read_text())
+        assert state["output_processing/sql"]["no_pattern"] is True
+        # same evidence → skipped without an LLM call
+        assert await distill_failure_clusters(ctx) == 0
+        assert len([c for c in stub.calls
+                    if c[0] == "DISTILL_PATTERN"]) == 1
+        # new evidence changes the fingerprint → the cluster re-attempts
+        sm.learn_lesson("sql cte refactor edit failed",
+                        "SEARCH/REPLACE block failed to parse the sql cte",
+                        "Fail closed and report the error.")
+        assert await distill_failure_clusters(ctx) == 1
+        assert len(_distilled(sm)) == 1
+
+    async def test_learn_lesson_drop_not_fingerprinted(self, tmp_path):
+        ctx, sm, _, stub = _ctx(tmp_path, [_PATTERN_REPLY, _PATTERN_REPLY])
+        _seed(sm, _SQL_FAILURES)
+        # Simulate learn_lesson's silent drop (vector-dedup against the
+        # very case-lessons the pattern was distilled from).
+        sm.learn_lesson = lambda *a, **k: None
+
+        assert await distill_failure_clusters(ctx) == 0
+        state_file = tmp_path / "system" / "failure_distill_state.json"
+        assert (not state_file.exists()
+                or "output_processing/sql"
+                not in json.loads(state_file.read_text()))
+        # no fingerprint → the cluster is retried next cycle
+        assert await distill_failure_clusters(ctx) == 0
+        assert len([c for c in stub.calls
+                    if c[0] == "DISTILL_PATTERN"]) == 2
+
+    async def test_attempts_bound_caps_failing_pass(self, tmp_path):
+        # 3 eligible clusters, every synthesis returning the no-pattern
+        # verdict: with cap=1 the pass may attempt at most 2*cap clusters,
+        # so perpetually-failing clusters can't monopolize the cycle.
+        no_pat = json.dumps({"pattern": ""})
+        ctx, sm, _, stub = _ctx(tmp_path, [no_pat] * 3)
+        _seed(sm, _SQL_FAILURES, dimension="output_processing")
+        _seed(sm, _BASH_FAILURES, dimension="tool_interaction")
+        _seed(sm, _PANDAS_FAILURES, dimension="orchestration")
+
+        assert await distill_failure_clusters(ctx, max_lessons=1) == 0
+        assert len([c for c in stub.calls
+                    if c[0] == "DISTILL_PATTERN"]) == 2
 
     async def test_kill_switch(self, tmp_path, monkeypatch):
         monkeypatch.setenv("GHOST_FAILURE_DISTILL", "0")
@@ -224,6 +291,28 @@ class TestDistill:
 
     async def test_mock_context_returns_zero(self):
         assert await distill_failure_clusters(MagicMock()) == 0
+
+
+# ------------------------------------------------------------- state save
+
+class TestStateSave:
+    def test_save_state_round_trip_and_atomicity(self, tmp_path, monkeypatch):
+        from ghost_agent.core import failure_distill as fd
+        ctx = SimpleNamespace()
+        path = tmp_path / "system" / "failure_distill_state.json"
+
+        fd._save_state(ctx, {"a": {"fingerprint": "f1"}})
+        assert json.loads(path.read_text()) == {"a": {"fingerprint": "f1"}}
+        assert not path.with_suffix(".tmp").exists()  # tmp cleaned by rename
+
+        # A crash between tmp-write and rename must leave the prior state
+        # intact — a truncated file would make _load_state return {} and
+        # every cluster re-distill.
+        monkeypatch.setattr(fd.os, "replace",
+                            MagicMock(side_effect=OSError("boom")))
+        fd._save_state(ctx, {"a": {"fingerprint": "f2"}})
+        assert json.loads(path.read_text()) == {"a": {"fingerprint": "f1"}}
+        assert fd._load_state(ctx) == {"a": {"fingerprint": "f1"}}
 
 
 # ------------------------------------------------------------- adjudication

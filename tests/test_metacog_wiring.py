@@ -121,6 +121,29 @@ class TestMetacogBundleConstruction:
         await bundle.shutdown()
         await bundle.shutdown()  # second call must not raise
 
+    def test_bridge_counter_hook_wired_to_bundle_count(self, fake_context):
+        """Regression: _ctr_replan_attempts/_ctr_replan_succeeded had no
+        producer anywhere, so the shutdown summary always printed
+        replans 0/0 even when the bridge revised tasks."""
+        bundle = MetacogBundle.from_args(fake_context, _args(enable_metacog=True))
+        assert bundle.bridge.counter_hook == bundle.count
+
+    @pytest.mark.asyncio
+    async def test_replan_counters_move_end_to_end(self, fake_context):
+        bundle = MetacogBundle.from_args(fake_context, _args(enable_metacog=True))
+        bundle.set_active_task("t1")
+
+        class FakePlan:
+            def request_revision(self, task_id, reason):
+                return True
+
+        # Point the bridge at a live plan (the default context has none).
+        bundle.bridge.plan_getter = lambda: FakePlan()
+        from ghost_agent.core.triggers import loop_event
+        await bundle.bus.publish(loop_event("looped", severity="warning"))
+        assert bundle._ctr_replan_attempts == 1
+        assert bundle._ctr_replan_succeeded == 1
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Active-task tracking

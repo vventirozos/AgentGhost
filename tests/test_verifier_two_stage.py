@@ -178,6 +178,39 @@ async def test_stage2_unparseable_falls_back_to_classic():
     assert result.suspects is None
 
 
+async def test_stage1_bare_array_reply_falls_back_to_classic():
+    """A judge replying with a bare JSON array (non-dict top level) used
+    to escape _parse_json as-is, and `(stage1 or {}).get("suspects")`
+    raised AttributeError out of verify_claim — which agent.py's broad
+    debug-level except turned into a silently skipped pass. It must
+    instead read as an unusable stage 1 and fall back to classic."""
+    stub = _QueueStub([json.dumps(["34°C looks off", "humidity figure"]),
+                       CONFIRM_JSON])
+    v = Verifier(llm_client=stub)
+    result = await v.verify_claim("c", "e", "x")
+    assert len(stub.prompts) == 2
+    assert "Check, in order:" in stub.prompts[1]  # classic prompt
+    assert result.verdict == VerifyVerdict.CONFIRMED
+    assert result.suspects is None
+
+
+async def test_stage2_truncated_verdictless_fragment_falls_back():
+    """The measured live failure: stage 2 loops/truncates at the token
+    cap, so the only balanced `{...}` the fragment walk can parse is an
+    INNER object with no "verdict" key. That must read as "no usable
+    output" (two-stage returns None → classic fallback runs), not a
+    fabricated UNCERTAIN@0.5 that also suppresses the fallback."""
+    truncated = ('{"per_suspect":[{"suspect":1,"real":false},'
+                 '{"suspect":2,"real":true}],"verdict":"CONF')
+    stub = _QueueStub([SUSPECTS_JSON, truncated, REFUTE_JSON])
+    v = Verifier(llm_client=stub)
+    result = await v.verify_claim("c", "e", "x")
+    assert len(stub.prompts) == 3
+    assert "Check, in order:" in stub.prompts[2]  # classic prompt
+    assert result.verdict == VerifyVerdict.REFUTED
+    assert result.suspects is None
+
+
 async def test_no_client_returns_none():
     v = Verifier(llm_client=None)
     assert await v.verify_claim("c", "e", "x") is None
@@ -254,7 +287,11 @@ async def test_stage_no_think_kill_switch(monkeypatch):
         v = vmod.Verifier(llm_client=stub)
         await v.verify_claim("c", "e", "x")
         for p in stub.payloads:
-            assert p["stop"] == ["\n"]  # stop stays: it is harmless
+            # No stop token either: a thinking judge's reply opens with
+            # a think prelude, so stop-at-newline would cut it at the
+            # prelude's first line break — both stages parse empty and
+            # every verdict silently rides the classic fallback.
+            assert "stop" not in p
             assert "chat_template_kwargs" not in p
             assert not p["messages"][0]["content"].rstrip().endswith(
                 "/no_think")

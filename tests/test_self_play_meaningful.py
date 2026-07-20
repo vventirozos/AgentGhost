@@ -7,7 +7,8 @@ Covers the core invariants of:
   C. write gate opens on first-try wins with high structural novelty
   D. journal mining materialises shape-appropriate fixtures
   E. PRM scheduler helper is safe to call with missing collector / scorer
-  F. reflector accepts low-novelty self-play passes when opted in
+  F. reflector reflects FAILED trajectories only (the proposal-F
+     low-novelty-pass opt-in was removed 2026-07-20 as dead code)
   G. adversarial generator tracker pass-rate + bias suggestion
   H. per-template saturation independent of cluster-level saturation
 
@@ -250,11 +251,18 @@ class TestJournalMining:
 
 
 # ---------------------------------------------------------------------------
-# F. Reflector accepts low-novelty self-play passes (opt-in)
+# F. Reflector reflects FAILED trajectories only (proposal-F opt-in removed)
 # ---------------------------------------------------------------------------
 
 
-class TestReflectorAcceptsLowNoveltyPasses:
+class TestReflectorFailedOnly:
+    """The proposal-F ``accept_low_novelty_passes`` opt-in was removed
+    2026-07-20 as dead-by-construction: nothing in the live tree writes
+    ``extra["solution_novelty"]`` (it only flows to
+    frontier_tracker.record_run) and the live dream loop's isolated
+    context sets trajectory_collector=None, so no self_play trajectories
+    reach the collector. A pass is never reflectable."""
+
     def _make_traj(self, *, outcome: str, novelty=None, kind: str = "self_play"):
         # Build a minimal Trajectory-like duck for _is_reflectable.
         t = MagicMock()
@@ -263,41 +271,26 @@ class TestReflectorAcceptsLowNoveltyPasses:
         t.extra = {"solution_novelty": novelty} if novelty is not None else {}
         return t
 
-    def test_default_only_failed(self):
-        from ghost_agent.reflection.loop import Reflector
-        r = Reflector(critique_fn=lambda x: "diag", accept_low_novelty_passes=False)
-        passed_traj = self._make_traj(outcome="passed", novelty=0.05)
-        assert r._is_reflectable(passed_traj) is False
-
-    def test_opted_in_accepts_low_novelty_pass(self):
+    def test_passed_never_reflected_even_low_novelty_selfplay(self):
         from ghost_agent.reflection.loop import Reflector
         from ghost_agent.distill.schema import Outcome
-        r = Reflector(critique_fn=lambda x: "diag", accept_low_novelty_passes=True, novelty_threshold=0.2)
+        r = Reflector(critique_fn=lambda x: "diag")
         boring = self._make_traj(outcome=Outcome.PASSED.value, novelty=0.05)
-        assert r._is_reflectable(boring) is True
-
-    def test_opted_in_skips_novel_pass(self):
-        from ghost_agent.reflection.loop import Reflector
-        from ghost_agent.distill.schema import Outcome
-        r = Reflector(critique_fn=lambda x: "diag", accept_low_novelty_passes=True, novelty_threshold=0.2)
-        interesting = self._make_traj(outcome=Outcome.PASSED.value, novelty=0.9)
-        assert r._is_reflectable(interesting) is False
-
-    def test_opted_in_skips_non_selfplay(self):
-        """Even when novelty is low, a non-self-play pass must NOT be
-        promoted — the opt-in is scoped to self-play only."""
-        from ghost_agent.reflection.loop import Reflector
-        from ghost_agent.distill.schema import Outcome
-        r = Reflector(critique_fn=lambda x: "diag", accept_low_novelty_passes=True, novelty_threshold=0.2)
-        chat = self._make_traj(outcome=Outcome.PASSED.value, novelty=0.05, kind="chat")
-        assert r._is_reflectable(chat) is False
+        assert r._is_reflectable(boring) is False
 
     def test_failed_always_reflected(self):
         from ghost_agent.reflection.loop import Reflector
         from ghost_agent.distill.schema import Outcome
-        r = Reflector(critique_fn=lambda x: "diag", accept_low_novelty_passes=False)
+        r = Reflector(critique_fn=lambda x: "diag")
         failed = self._make_traj(outcome=Outcome.FAILED.value)
         assert r._is_reflectable(failed) is True
+
+    def test_removed_kwarg_rejected(self):
+        # Locks the clean removal in place — the main.py wiring that
+        # passed this kwarg is being removed alongside it.
+        from ghost_agent.reflection.loop import Reflector
+        with pytest.raises(TypeError):
+            Reflector(critique_fn=lambda x: "diag", accept_low_novelty_passes=True)
 
 
 # ---------------------------------------------------------------------------

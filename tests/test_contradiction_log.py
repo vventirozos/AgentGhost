@@ -100,6 +100,71 @@ class TestContradictionLog:
     def test_empty_query_returns_empty(self, contradiction_log):
         assert contradiction_log.explain_belief_change("") == ""
 
+    def test_record_accepts_string_old_facts(self, contradiction_log):
+        # core.project_safety.route_contradiction passes List[str] with
+        # deleted_ids=[] — this used to raise AttributeError on f.get()
+        # inside record(), silently killing the whole project-advancer
+        # belief-revision path.
+        contradiction_log.record(
+            new_fact="Project uses Postgres now",
+            old_facts=["Project uses SQLite", "DB layer is embedded"],
+            deleted_ids=[],
+            reason="conflict marker",
+        )
+
+        recent = contradiction_log.get_recent(limit=1)
+        assert len(recent) == 1
+        # String-sourced facts have no ids to match, so they are included
+        # in `superseded` unconditionally.
+        assert recent[0]["superseded"] == [
+            {"id": "", "text": "Project uses SQLite"},
+            {"id": "", "text": "DB layer is embedded"},
+        ]
+        assert recent[0]["deleted_ids"] == []
+
+    def test_record_mixed_dict_and_string_old_facts(self, contradiction_log):
+        contradiction_log.record(
+            new_fact="new",
+            old_facts=[
+                {"id": "kept", "text": "dict not deleted"},
+                {"id": "gone", "text": "dict deleted"},
+                "plain string fact",
+            ],
+            deleted_ids=["gone"],
+        )
+        superseded = contradiction_log.get_recent(limit=1)[0]["superseded"]
+        # Dicts keep the existing deleted_ids filter; strings are
+        # unconditional.
+        assert superseded == [
+            {"id": "gone", "text": "dict deleted"},
+            {"id": "", "text": "plain string fact"},
+        ]
+
+    def test_string_facts_searchable_via_explain(self, contradiction_log):
+        contradiction_log.record(
+            new_fact="Service runs on port 8081",
+            old_facts=["Service runs on port 8080"],
+            deleted_ids=[],
+        )
+        explanation = contradiction_log.explain_belief_change("port 8080")
+        assert "BELIEF REVISION HISTORY" in explanation
+
+    def test_record_never_raises_on_weird_types(self, contradiction_log):
+        # None entries are skipped; scalars are coerced; a bare string /
+        # None for old_facts and None deleted_ids must not raise.
+        contradiction_log.record(
+            new_fact="weird", old_facts=[None, 42], deleted_ids=None)
+        contradiction_log.record(
+            new_fact="bare", old_facts="single string", deleted_ids=[])
+        contradiction_log.record(
+            new_fact="nothing", old_facts=None, deleted_ids=[])
+
+        entries = contradiction_log.get_recent(limit=3)
+        assert len(entries) == 3
+        assert entries[2]["superseded"] == [{"id": "", "text": "42"}]
+        assert entries[1]["superseded"] == [{"id": "", "text": "single string"}]
+        assert entries[0]["superseded"] == []
+
     def test_persistence_across_instances(self, tmp_path):
         log1 = ContradictionLog(tmp_path)
         log1.record(

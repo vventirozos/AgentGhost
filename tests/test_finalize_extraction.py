@@ -29,6 +29,7 @@ def _fs(**over):
     fields = dict(
         body={"messages": [], "stream": False},
         created_time=1234567890,
+        current_plan_json={},
         current_trajectory_id="traj-1",
         execution_failure_count=0,
         final_ai_content="All done.",
@@ -43,6 +44,7 @@ def _fs(**over):
         req_id="ab12cd34",
         thought_content="",
         tools_run_this_turn=[],
+        wakeup_prefix="",
         was_complex_task=False,
         _stable_conv_fp="fp",
         _verdict_is_fresh=False,
@@ -104,3 +106,47 @@ async def test_tool_response_scrubber_still_fires():
         "Answer.\n<tool_response>raw dump</tool_response>\nMore."))
     out, _, _ = await agent._finalize_and_return(fs)
     assert "raw dump" not in out
+
+
+# ── revived finalize gates (2026-07-20) ─────────────────────────────────────
+# Both gates silently died in the step-3 extraction: they read handle_chat
+# locals via `locals().get(...)` from inside the extracted method, which can
+# never see them. They now ride FinalizeState — these tests pin that the
+# fields actually reach their consumers.
+
+@pytest.mark.asyncio
+async def test_plan_postcondition_gate_receives_the_plan():
+    agent = _make_agent()
+    plan = {
+        "id": "root", "description": "answer with a number",
+        "postconditions": ["the reply contains a number"],
+        "subtasks": [],
+    }
+    fs = _fs(current_plan_json=plan)
+    # The gate must at least ATTEMPT to load the plan — pin via the
+    # TaskTree loader getting called (MagicMock context keeps every
+    # downstream dependency inert, so a note may or may not append; the
+    # dead-variable regression made even the attempt impossible).
+    import ghost_agent.core.planning as planning_mod
+    called = {}
+    orig = planning_mod.TaskTree.load_from_json
+    planning_mod.TaskTree.load_from_json = (
+        lambda self, pj: called.setdefault("plan", pj) or orig(self, pj))
+    try:
+        await agent._finalize_and_return(fs)
+    finally:
+        planning_mod.TaskTree.load_from_json = orig
+    assert called.get("plan") == plan
+
+
+@pytest.mark.asyncio
+async def test_wakeup_prefix_reaches_reference_counter():
+    agent = _make_agent()
+    sm = MagicMock()
+    sm.enabled = True
+    agent.context.self_model = sm
+    fs = _fs(wakeup_prefix="=== WAKING UP ===\npast experience text")
+    await agent._finalize_and_return(fs)
+    assert sm.note_referenced_experiences.called
+    _, kwargs = sm.note_referenced_experiences.call_args
+    assert kwargs.get("prefix_text", "").startswith("=== WAKING UP ===")

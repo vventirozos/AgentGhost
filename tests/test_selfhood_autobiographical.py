@@ -164,6 +164,18 @@ def test_autobio_count_handles_missing_file(tmp_path: Path):
     assert mem.count() == 0
 
 
+def test_autobio_get_by_ids(tmp_path: Path):
+    mem = AutobiographicalMemory(tmp_path)
+    e1 = Experience(summary="first thing I did")
+    e2 = Experience(summary="second thing I did")
+    mem.append(e1)
+    mem.append(e2)
+    got = mem.get_by_ids([e2.id, "no-such-id"])
+    assert [e.id for e in got] == [e2.id]
+    assert mem.get_by_ids([]) == []
+    assert mem.get_by_ids(["missing"]) == []
+
+
 def test_summary_writer_never_raises_on_disk_error(tmp_path: Path):
     """The autobio writer's contract is: a failure must NEVER raise.
     Exercise the failure path by pointing at a path under a file (not

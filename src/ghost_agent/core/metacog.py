@@ -36,6 +36,24 @@ from typing import Any, Awaitable, Callable, Optional
 logger = logging.getLogger("GhostAgent")
 
 
+#: Prefixes of user-ROLE messages the turn loop itself injects mid-turn
+#: (steers, diagnostics, pivots, condensation summaries, re-wrapped tool
+#: responses — grep agent.py for the injection sites). They are not the
+#: human's request, so ``arbitrate_tool_calls`` must not arbitrate on
+#: them — on any turn with a failure steer, the newest user message is
+#: almost always one of these.
+SYNTHETIC_USER_PREFIXES: tuple = (
+    "SYSTEM ALERT",
+    "AUTO-DIAGNOSTIC",
+    "SYSTEM 3 PIVOT",
+    "### ACTIVE STRATEGY",
+    "[SYSTEM",
+    "<tool_response",
+    "<system_state_update",
+    "CRITICAL:",
+)
+
+
 @dataclass
 class MetacogBundle:
     """Container for the eight uplift modules + their config.
@@ -142,6 +160,10 @@ class MetacogBundle:
             bundle.bus,
             plan_getter=_plan_getter,
             current_task_getter=_task_getter,
+            # Feeds the shutdown-summary replans_tried/replans_ok
+            # counters — without this hook the bridge revised tasks but
+            # the summary always printed replans 0/0.
+            counter_hook=bundle.count,
         )
         bundle.bridge.attach()
 
@@ -304,8 +326,9 @@ class MetacogBundle:
              reading was below threshold. No prior reading → pass
              through (cold start; don't pay the cost on the first turn
              of a fresh session).
-          5. A user message must be present in ``messages`` to use as
-             the arbitration prompt.
+          5. A genuine user message must be present in ``messages`` to
+             use as the arbitration prompt — synthetic user-role steers
+             (see :data:`SYNTHETIC_USER_PREFIXES`) are skipped.
 
         Caller (agent.py tool dispatch loop) acts on the returned
         ``decision.action``:
@@ -335,15 +358,21 @@ class MetacogBundle:
                 return None  # cold start
             if not getattr(reading, "below_threshold", False):
                 return None
-        # Locate the most recent user message
+        # Locate the most recent GENUINE user message — the turn loop
+        # appends synthetic user-role steers mid-turn, and those would
+        # otherwise masquerade as the arbitration prompt.
         prompt = ""
         try:
             for m in reversed(messages):
                 role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "")
-                if role == "user":
-                    content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
-                    prompt = str(content or "")
-                    break
+                if role != "user":
+                    continue
+                content = m.get("content") if isinstance(m, dict) else getattr(m, "content", "")
+                text = str(content or "")
+                if text.lstrip().startswith(SYNTHETIC_USER_PREFIXES):
+                    continue
+                prompt = text
+                break
         except Exception:
             return None
         if not prompt:

@@ -710,6 +710,13 @@ class SkillMemory:
         canonical on-disk entry contains BOTH representations so older
         readers (pattern-matching on `task/mistake/solution`) keep
         working unchanged.
+
+        Returns a short status string on success — ``"written"`` for a new
+        playbook entry, ``"reinforced"`` for a dedup frequency bump — and
+        ``None`` on every drop path (quality gate, near-duplicate skip with
+        no JSON twin to bump, swallowed error), so callers can tell a real
+        write from a silent drop. Backward-compatible: pre-existing callers
+        ignore the return value.
         """
         try:
             effective_trigger = trigger or task or ""
@@ -732,7 +739,7 @@ class SkillMemory:
                 logger.debug(
                     "learn_lesson: dropped non-actionable %s lesson: %r",
                     source or "?", (effective_correct or effective_trigger)[:80])
-                return
+                return None
 
             # Harness-dimension attribution (2026-07-19). Chokepoint
             # placement covers every producer without touching them: when
@@ -828,7 +835,7 @@ class SkillMemory:
                                 f"Merged duplicate lesson: {effective_trigger[:30]}... (freq={existing['frequency']})",
                                 icon=Icons.MEM_REINFORCE,
                             )
-                            return
+                            return "reinforced"
                 else:
                     # Vector-dedup path. Previously this just returned, so a
                     # near-exact re-learn (which ALWAYS hits the vector store
@@ -836,6 +843,7 @@ class SkillMemory:
                     # frequency>=5, so lessons never graduated. Bump the
                     # matching playbook entry (and upgrade verified/confidence)
                     # just like the JSON-dedup branch does.
+                    bumped = False
                     with self._get_lock():
                         playbook = self._load_playbook()
                         key = _normalize_trigger(effective_trigger or "")
@@ -868,6 +876,7 @@ class SkillMemory:
                             existing["timestamp"] = _now_iso()
                             playbook[idx] = existing
                             self._save_playbook_unlocked(playbook)
+                            bumped = True
                             pretty_log(
                                 "SKILL REINFORCED",
                                 f"Vector-dedup: bumped lesson freq={existing['frequency']}: {effective_trigger[:30]}...",
@@ -880,7 +889,7 @@ class SkillMemory:
                                 f"no JSON twin to bump): {effective_trigger[:30]}...",
                                 icon=Icons.SKIP,
                             )
-                    return
+                    return "reinforced" if bumped else None
 
             new_lesson = build_lesson(
                 task=task,
@@ -938,8 +947,10 @@ class SkillMemory:
                 f"Lesson learned: {effective_trigger[:30]}...",
                 icon=Icons.SKILL_GRADUATE,
             )
+            return "written"
         except Exception as e:
             logger.error(f"Failed to save skill: {e}")
+            return None
 
     # ---- Retrieval + feedback -----------------------------------------
 
@@ -1099,6 +1110,11 @@ class SkillMemory:
         def _mut(lesson):
             lesson["helpful_retrievals"] = int(lesson.get("helpful_retrievals") or 0) + 1
             lesson["confidence"] = min(1.0, float(lesson.get("confidence") or 0.5) + 0.05)
+            # Stamp the credit: `credit_recent_retrievals` skips lessons whose
+            # last_credited_at >= last_retrieved_at, so without this stamp the
+            # post-mortem fallback re-credits every judge-credited lesson in
+            # the same turn (+2 helpful per clean turn, hit_rate → 2.0).
+            lesson["last_credited_at"] = _now_iso()
 
         return self._update_lesson_fields(_match, _mut)
 

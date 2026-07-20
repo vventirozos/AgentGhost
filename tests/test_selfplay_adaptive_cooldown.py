@@ -15,6 +15,16 @@ from ghost_agent.core.agent import GhostAgent, GhostContext
 from ghost_agent.memory.frontier import FrontierTracker
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ghost_home(monkeypatch):
+    """_biological_tick's counterfactual batch resolves its replay
+    ledger from $GHOST_HOME. On a dev box with GHOST_HOME exported and
+    a populated ledger, ticks here replayed REAL pending challenges
+    through the mocked dreamer (extra synthetic_self_play awaits) and
+    appended results to the operator's ledger. Keep the tests hermetic."""
+    monkeypatch.delenv("GHOST_HOME", raising=False)
+
+
 def _make_agent_with_tracker(tmp_path, idle_seconds=4000):
     ctx = MagicMock(spec=GhostContext)
     ctx.args = MagicMock()

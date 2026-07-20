@@ -32,7 +32,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Iterable, List, Optional, Sequence, Tuple
+from typing import Deque, Iterable, List, Optional, Sequence, Tuple, Union
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -120,9 +120,11 @@ class EntropyTracker:
 
         tracker = EntropyTracker(window=32)
         for chunk in stream:
-            top_lps = chunk["logprobs"]["content"][0]["top_logprobs"]
-            # top_lps is a list of {"token": str, "logprob": float} dicts
-            tracker.observe([d["logprob"] for d in top_lps])
+            top_lps = extract_top_logprobs(chunk)
+            if top_lps:
+                # flat list = one token; nested list = a delta that
+                # batched several tokens (both shapes accepted)
+                tracker.observe(top_lps)
         reading = tracker.reading()
 
     Thread-safety: callers driving one tracker should call it from one
@@ -136,9 +138,18 @@ class EntropyTracker:
         self._total_observed = 0
         self._running_sum = 0.0
 
-    def observe(self, top_logprobs: Sequence[float]) -> float:
-        """Add one token's top-K logprobs. Returns that token's
-        normalised entropy."""
+    def observe(self, top_logprobs: Sequence) -> float:
+        """Add one token's top-K logprobs — or a batch of them.
+
+        Accepts either a flat sequence of floats (one token) or a
+        sequence of such sequences (a streaming delta that batched
+        several tokens — the nested shape ``extract_top_logprobs``
+        returns for those chunks). Every token in a batch is fed into
+        the window individually. Returns the normalised entropy of the
+        observed token (mean over a batch)."""
+        if top_logprobs and isinstance(top_logprobs[0], (list, tuple)):
+            vals = [self.observe(tok) for tok in top_logprobs]
+            return sum(vals) / len(vals) if vals else 0.0
         h = compute_token_entropy(top_logprobs)
         self.window.append(h)
         self._total_observed += 1
@@ -181,8 +192,10 @@ class EntropyTracker:
 # Chunk parsing helper
 # ──────────────────────────────────────────────────────────────────────
 
-def extract_top_logprobs(chunk: dict) -> Optional[List[float]]:
-    """Pull the top-logprobs list out of one OpenAI-compatible streaming
+def extract_top_logprobs(
+    chunk: dict,
+) -> Union[List[float], List[List[float]], None]:
+    """Pull the top-logprobs out of one OpenAI-compatible streaming
     chunk. Returns ``None`` when the chunk doesn't carry logprobs at all.
 
     Standard shape::
@@ -190,10 +203,19 @@ def extract_top_logprobs(chunk: dict) -> Optional[List[float]]:
         chunk["choices"][0]["logprobs"]["content"][i]["top_logprobs"]
             -> [{"token": str, "logprob": float}, ...]
 
+    ``content`` holds ONE entry per token — servers that batch several
+    tokens into a single SSE delta send several entries, and all of them
+    must reach the entropy window (reading a single entry silently
+    dropped every other token of the delta). A single-token chunk yields
+    the flat ``List[float]`` shape (backward compatible); a multi-token
+    chunk yields ``List[List[float]]`` — ``EntropyTracker.observe``
+    accepts both.
+
     Some servers (llama.cpp) emit a flat ``logprobs`` field; that path
-    is recognised too. The function is intentionally lenient — any
-    schema deviation just returns ``None`` and the caller can decide
-    whether to treat it as "no calibration this chunk" or fail loud.
+    is recognised too, with the same one-vs-many convention. The
+    function is intentionally lenient — any schema deviation just
+    returns ``None`` and the caller can decide whether to treat it as
+    "no calibration this chunk" or fail loud.
     """
     if not isinstance(chunk, dict):
         return None
@@ -204,17 +226,32 @@ def extract_top_logprobs(chunk: dict) -> Optional[List[float]]:
         lp = choice.get("logprobs")
         if not lp:
             return None
-        # Standard: content[0].top_logprobs
+        # Standard: content[i].top_logprobs, one entry per token
         content = lp.get("content")
         if isinstance(content, list) and content:
-            top = content[-1].get("top_logprobs")
-            if isinstance(top, list):
-                return [float(d.get("logprob")) for d in top
-                        if isinstance(d, dict) and d.get("logprob") is not None]
-        # llama.cpp-flat: top_logprobs at the logprobs level
+            per_token: List[List[float]] = []
+            for entry in content:
+                if not isinstance(entry, dict):
+                    continue
+                top = entry.get("top_logprobs")
+                if not isinstance(top, list):
+                    continue
+                per_token.append([
+                    float(d.get("logprob")) for d in top
+                    if isinstance(d, dict) and d.get("logprob") is not None
+                ])
+            if per_token:
+                return per_token[0] if len(per_token) == 1 else per_token
+        # llama.cpp-flat: top_logprobs at the logprobs level, one row
+        # per token
         flat = lp.get("top_logprobs")
         if isinstance(flat, list) and flat and isinstance(flat[0], (list, tuple)):
-            return [float(x) for x in flat[0] if x is not None]
+            rows = [
+                [float(x) for x in row if x is not None]
+                for row in flat if isinstance(row, (list, tuple))
+            ]
+            if rows:
+                return rows[0] if len(rows) == 1 else rows
         return None
     except Exception:
         return None

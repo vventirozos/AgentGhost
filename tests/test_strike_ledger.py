@@ -5,8 +5,10 @@ used to track as five interacting locals. Behaviour must match the inlined
 version exactly."""
 
 from ghost_agent.core.strikes import (
+    READWRITE_HARD_STOP,
     StrikeLedger,
     action_result_fingerprint,
+    is_readwrite_loop_exempt,
     note_repeated_action,
     note_repeated_failure,
 )
@@ -102,6 +104,38 @@ def test_recurring_failure_refreezes_after_unfreeze():
     sig = led.note_failure("read", "'x' not found")
     assert sig[2] is True  # is_persistent
     assert led.decay_frozen
+
+
+def test_fingerprint_covers_full_string_not_just_head():
+    """Regression: the fingerprint hashed only the first 600 normalised
+    chars, so long outputs with a stable header (a polling loop whose
+    progress shows only in the tail) collided — a genuinely-progressing
+    loop got steered at 2 and hard-aborted at 3 "identical" results."""
+    header = "POLL STATUS: job queue report\n" + ("x" * 700)
+    a = header + "\nstep=one pending"
+    b = header + "\nstep=two running"
+    assert action_result_fingerprint(a) != action_result_fingerprint(b)
+
+
+def test_fingerprint_whitespace_normalisation_still_applies():
+    # Same content modulo whitespace/case must still collide (that IS
+    # the no-progress signal), including past the old 600-char slice.
+    long_body = ("word " * 200).strip()
+    assert action_result_fingerprint(f"{long_body}\n\nEND  marker") == \
+        action_result_fingerprint(f"{long_body} end MARKER")
+
+
+def test_fingerprint_empty_and_none_stable():
+    assert action_result_fingerprint("") == action_result_fingerprint(None)
+
+
+def test_readwrite_hard_stop_contract():
+    """The two-tier contract lives in ONE place: steer at the general
+    no-progress threshold (2), exempt read/write tools hard-stop at 5.
+    agent.py imports this constant instead of restating the number."""
+    assert READWRITE_HARD_STOP == 5
+    assert READWRITE_HARD_STOP > 2  # must sit above the steer tier
+    assert is_readwrite_loop_exempt("file_system")
 
 
 def test_note_action_trips_on_repeat():

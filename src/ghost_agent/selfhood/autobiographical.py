@@ -130,11 +130,25 @@ _PHONE_RE = re.compile(
     r"|\d{3}[ -]\d{4}"
     r")(?!\d)"
 )
+# `sk`/`pk` must be followed by a `-`/`_` separator (sk-live…, sk_test…)
+# — as a bare word-prefix they ate ordinary words ("skateboarding" →
+# "[REDACTED_KEY] yesterday").
 _API_KEY_RE = re.compile(
-    r"\b(?:sk|pk|ghp|github_pat|AKIA|AIza|xoxb|xoxp|api[_-]?key)[A-Za-z0-9_-]{8,}\b",
+    r"\b(?:(?:sk|pk)[-_]|ghp|github_pat|AKIA|AIza|xoxb|xoxp)[A-Za-z0-9_-]{8,}\b",
     re.IGNORECASE,
 )
-_CREDIT_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+# Assignment-shaped leaks (`api_key=abcd1234efgh`, `password: hunter2xyz`)
+# — the common real shape the prefix rule can't see because the separator
+# splits the token. The key name is kept so the diary line stays readable.
+_KV_SECRET_RE = re.compile(
+    r"\b(api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|token|"
+    r"password|passwd|secret)\s*[:=]\s*[\"']?[A-Za-z0-9_\-./+]{8,}[\"']?",
+    re.IGNORECASE,
+)
+# Letter-excluding boundaries: digit runs inside longer alphanumeric
+# tokens (32-hex experience/trajectory ids) are identifiers, not cards —
+# redacting them corrupts the ids the diary joins on.
+_CREDIT_CARD_RE = re.compile(r"(?<![0-9A-Za-z])(?:\d[ -]?){13,19}(?![0-9A-Za-z])")
 
 
 def _luhn_ok(digits: str) -> bool:
@@ -182,6 +196,7 @@ def redact_pii(text: str) -> str:
         return text
     out = _EMAIL_RE.sub("[REDACTED_EMAIL]", text)
     out = _API_KEY_RE.sub("[REDACTED_KEY]", out)
+    out = _KV_SECRET_RE.sub(lambda m: f"{m.group(1)}=[REDACTED_KEY]", out)
     out = _CREDIT_CARD_RE.sub(_redact_cc_if_luhn, out)
     out = _PHONE_RE.sub("[REDACTED_PHONE]", out)
     return out
@@ -497,6 +512,19 @@ class AutobiographicalMemory:
             except Exception:
                 continue
         return items
+
+    def get_by_ids(self, ids: Iterable[str]) -> List[Experience]:
+        """Fetch experiences by id, in log order; unknown ids are silently
+        skipped. Served from the cached search index so repeated calls
+        don't re-parse the log. Never raises."""
+        wanted = {i for i in (ids or ()) if i}
+        if not wanted:
+            return []
+        try:
+            experiences, _, _ = self._search_index()
+        except Exception:
+            return []
+        return [e for e in experiences if e.id in wanted]
 
     def search_my_past(self, query: str, limit: int = 5) -> List[Experience]:
         """Relevance-ranked search over my own past. Deliberately

@@ -343,10 +343,18 @@ class ReplanBridge:
         *,
         plan_getter: Optional[Callable[[], Any]] = None,
         current_task_getter: Optional[Callable[[], Optional[str]]] = None,
+        counter_hook: Optional[Callable[..., None]] = None,
     ):
         self.bus = bus
         self.plan_getter = plan_getter
         self.current_task_getter = current_task_getter
+        # Optional lifetime-counter hook, called with keyword flags that
+        # match ``MetacogBundle.count`` (``replan_attempt=True`` when a
+        # ``request_revision`` call is issued, ``replan_succeeded=True``
+        # when it returns ok) so the construction site can pass
+        # ``bundle.count`` directly. Default ``None`` = no accounting,
+        # behaviour identical to before the hook existed.
+        self.counter_hook = counter_hook
         self._attached = False
         self._revisions: List[Dict[str, Any]] = []
 
@@ -394,7 +402,10 @@ class ReplanBridge:
                 self._revisions.append(record)
                 return  # silent
             reason = f"{event.kind}/{event.severity}: {event.reason}"
+            self._count(replan_attempt=True)
             ok = fn(task_id, reason)
+            if ok:
+                self._count(replan_succeeded=True)
             record["action"] = "revised" if ok else "revision_rejected"
             self._revisions.append(record)
             self._emit(record["action"], event, task_id)
@@ -431,6 +442,16 @@ class ReplanBridge:
             )
         except Exception as exc:
             logger.debug("ReplanBridge log emit failed: %s", exc)
+
+    def _count(self, **counters: bool) -> None:
+        """Invoke the optional counter hook. Never raises — accounting
+        must not break a replan."""
+        if self.counter_hook is None:
+            return
+        try:
+            self.counter_hook(**counters)
+        except Exception as exc:
+            logger.debug("ReplanBridge counter hook failed: %s", exc)
 
     @staticmethod
     def _safe_call(fn):

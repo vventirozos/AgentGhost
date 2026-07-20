@@ -1,6 +1,7 @@
 """Tests for distill.self_consistency."""
 
 import asyncio
+import time
 
 import pytest
 
@@ -36,6 +37,13 @@ def _always_fails_runner():
 def _slow_runner(delay_s: float):
     async def r(_payload):
         await asyncio.sleep(delay_s)
+        return "too slow"
+    return r
+
+
+def _slow_sync_runner(delay_s: float):
+    def r(_payload):
+        time.sleep(delay_s)
         return "too slow"
     return r
 
@@ -112,6 +120,52 @@ async def test_timeout_is_captured_per_sample():
     samples = await sampler.sample("p", per_sample_timeout_s=0.05)
     assert samples[0].passed is False
     assert "timeout" in samples[0].trajectory.failure_reason
+
+
+async def test_sync_runner_happy_path():
+    """The SampleRunner contract accepts plain sync callables."""
+    def r(payload):
+        return {"output": f"sync-answer-at-{payload['temperature']}", "steps": 2}
+    sampler = SelfConsistencySampler(r, temperatures=[0.3])
+    samples = await sampler.sample("p")
+    assert samples[0].trajectory.final_response == "sync-answer-at-0.3"
+    assert samples[0].trajectory.n_steps == 2
+
+
+async def test_sync_runner_timeout_enforced():
+    """per_sample_timeout_s must apply to SYNC runners too. Before the
+    fix the sync call ran to completion on the event loop BEFORE
+    wait_for saw an awaitable, so the timeout silently never fired."""
+    sampler = SelfConsistencySampler(_slow_sync_runner(1.0),
+                                     temperatures=[0.1])
+    start = time.monotonic()
+    samples = await sampler.sample("p", per_sample_timeout_s=0.05)
+    elapsed = time.monotonic() - start
+    assert samples[0].passed is False
+    assert "timeout" in samples[0].trajectory.failure_reason
+    assert samples[0].trajectory.outcome == Outcome.FAILED.value
+    assert elapsed < 0.9  # returned at the timeout, not after the sleep
+
+
+async def test_sync_runner_error_captured_per_sample():
+    def r(_payload):
+        raise RuntimeError("sync boom")
+    sampler = SelfConsistencySampler(r, temperatures=[0.1, 0.5])
+    samples = await sampler.sample("p")
+    assert all(s.passed is False for s in samples)
+    assert all("RuntimeError" in s.trajectory.failure_reason for s in samples)
+
+
+async def test_sync_callable_returning_awaitable_still_works():
+    """A non-coroutine-function runner may still RETURN an awaitable
+    (partial over an async fn, async __call__) — it must be resolved."""
+    async def real(_payload):
+        return {"output": "wrapped"}
+    def r(payload):
+        return real(payload)
+    sampler = SelfConsistencySampler(r, temperatures=[0.1])
+    samples = await sampler.sample("p")
+    assert samples[0].trajectory.final_response == "wrapped"
 
 
 async def test_validator_raise_marks_failed():

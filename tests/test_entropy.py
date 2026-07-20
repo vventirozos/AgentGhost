@@ -162,3 +162,76 @@ class TestExtractTopLogprobs:
         # Random shape — should return None, not crash
         out = extract_top_logprobs({"choices": [{"logprobs": "broken"}]})
         assert out is None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Multi-token deltas — servers that batch several tokens per SSE chunk
+# (regression: only content[-1] was read, dropping every other token
+# of the delta from the entropy window)
+# ──────────────────────────────────────────────────────────────────────
+
+def _content_entry(*logprobs):
+    return {
+        "token": "t",
+        "logprob": logprobs[0],
+        "top_logprobs": [{"token": "t", "logprob": lp} for lp in logprobs],
+    }
+
+
+class TestMultiTokenDeltas:
+    def test_batched_delta_returns_all_tokens(self):
+        chunk = {
+            "choices": [{
+                "logprobs": {
+                    "content": [
+                        _content_entry(-0.1, -2.0),
+                        _content_entry(-0.5, -1.0),
+                        _content_entry(-0.9, -0.9),
+                    ],
+                },
+            }]
+        }
+        out = extract_top_logprobs(chunk)
+        assert out == [[-0.1, -2.0], [-0.5, -1.0], [-0.9, -0.9]]
+
+    def test_single_token_delta_stays_flat(self):
+        # Backward compatibility: the one-token shape is unchanged.
+        chunk = {
+            "choices": [{
+                "logprobs": {"content": [_content_entry(-0.1, -2.0)]},
+            }]
+        }
+        assert extract_top_logprobs(chunk) == [-0.1, -2.0]
+
+    def test_llama_cpp_flat_multi_row(self):
+        chunk = {
+            "choices": [{
+                "logprobs": {"top_logprobs": [[-0.1, -2.0], [-0.3, -1.5]]},
+            }]
+        }
+        assert extract_top_logprobs(chunk) == [[-0.1, -2.0], [-0.3, -1.5]]
+
+    def test_tracker_observes_every_token_of_a_batch(self):
+        tracker = EntropyTracker(window=10)
+        nested = extract_top_logprobs({
+            "choices": [{
+                "logprobs": {
+                    "content": [_content_entry(-1.6094, -1.6094)] * 3,
+                },
+            }]
+        })
+        tracker.observe(nested)
+        assert tracker.reading().n == 3
+        assert tracker._total_observed == 3
+
+    def test_tracker_batch_return_is_mean_normalised(self):
+        tracker = EntropyTracker(window=10, top_k=5)
+        # Two maximally-uncertain 5-way tokens → mean normalised = 1.0
+        v = tracker.observe([[-1.6094] * 5, [-1.6094] * 5])
+        assert v == pytest.approx(1.0, abs=1e-3)
+
+    def test_tracker_flat_input_unchanged(self):
+        tracker = EntropyTracker(window=10, top_k=5)
+        v = tracker.observe([-1.6094] * 5)
+        assert v == pytest.approx(1.0, abs=1e-3)
+        assert tracker.reading().n == 1

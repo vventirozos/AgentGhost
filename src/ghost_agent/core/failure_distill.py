@@ -121,8 +121,13 @@ def _save_state(context, state: Dict[str, Any]) -> None:
         return
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(state, ensure_ascii=False, indent=2),
-                        encoding="utf-8")
+        # Atomic (tmp + os.replace): a crash mid-write must not truncate
+        # the JSON — _load_state would silently return {} and every
+        # cluster would re-distill.
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        os.replace(tmp, path)
     except Exception as e:
         logger.debug("failure_distill state write failed: %s", e)
 
@@ -353,9 +358,16 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
             return 0
 
         state = _load_state(context)
+        state_dirty = False
         written = 0
+        attempts = 0
         for (dim, cluster), recs in eligible:
             if written >= cap:
+                break
+            # `cap` bounds successes only; without an attempts bound a run
+            # of failing clusters (route errors, learn_lesson drops) would
+            # monopolize the pass with up-to-60s synthesis calls each cycle.
+            if attempts >= 2 * cap:
                 break
             handles = sorted({r["handle"] for r in recs})
             fingerprint = hashlib.md5(
@@ -364,6 +376,7 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
             prior = state.get(state_key) or {}
             if prior.get("fingerprint") == fingerprint:
                 continue  # same evidence → same lesson; nothing new to say
+            attempts += 1
 
             cases = "\n".join(
                 f"{i}. {r['text'][:400]}"
@@ -402,18 +415,25 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                              state_key, e)
                 continue
             data = _parse_pattern_json(str(reply or ""))
-            if not data:
+            correct = str((data or {}).get("correct_pattern") or "").strip()
+            if not data or not correct:
+                # Explicit no-pattern verdict ({"pattern": ""}), unparseable
+                # output, or a verdict with no imperative rule: fingerprint
+                # with a marker so identical evidence stops re-paying the
+                # synthesis call every cycle; changed evidence re-attempts.
+                state[state_key] = {"fingerprint": fingerprint,
+                                    "ts": datetime.now().isoformat(),
+                                    "cases": len(recs),
+                                    "no_pattern": True}
+                state_dirty = True
                 continue
             pattern = str(data.get("pattern") or "").strip()
             anti = str(data.get("anti_pattern") or "").strip() or pattern
-            correct = str(data.get("correct_pattern") or "").strip()
-            if not correct:
-                continue
 
             trigger = (_existing_distilled_trigger(skill_memory, dim, cluster)
                        or f"{_TRIGGER_PREFIX}({dim}/{cluster}): {pattern[:80]}")
             try:
-                await asyncio.to_thread(
+                result = await asyncio.to_thread(
                     skill_memory.learn_lesson,
                     trigger, anti, correct,
                     getattr(context, "memory_system", None),
@@ -430,9 +450,19 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                 logger.debug("failure_distill write failed for %s: %s",
                              state_key, e)
                 continue
+            if not result:
+                # learn_lesson dropped it silently (typically vector-dedup
+                # against the very case-lessons the pattern was distilled
+                # from). Deliberately NOT fingerprinted — the cluster
+                # retries when its evidence changes instead of being
+                # frozen forever with nothing on disk.
+                logger.debug("failure_distill: learn_lesson dropped %s",
+                             state_key)
+                continue
             state[state_key] = {"fingerprint": fingerprint,
                                 "ts": datetime.now().isoformat(),
                                 "cases": len(recs)}
+            state_dirty = True
             written += 1
             pretty_log(
                 "Dream Distill",
@@ -441,7 +471,7 @@ async def distill_failure_clusters(context, *, min_cluster: int = _MIN_CLUSTER,
                 icon=Icons.BRAIN_SUM,
             )
 
-        if written:
+        if state_dirty:
             _save_state(context, state)
         return written
     except Exception as e:

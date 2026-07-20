@@ -192,12 +192,29 @@ def classify_chat_outcome(
             if op in ("navigate", "goto") and not _looks_like_tool_error(result):
                 seen.clear()  # observable progress — restart the window
                 continue
+            actions = [s for s in (args.get("actions") or []) if isinstance(s, dict)]
+            # The live tool's multi-step shape is op="interact" with the
+            # navigation INSIDE the actions list ({"action": "goto", …});
+            # a successful one is the same observable progress as a
+            # top-level navigate. Clear BEFORE tallying this call's own
+            # selectors so within-call thrash (goto + 4× the same click in
+            # one sequence) still counts. An aborted sequence never ran the
+            # steps after its goto, so it is not progress — and its banner
+            # doesn't trip _tool_call_failed's text sniff, hence the
+            # explicit SEQUENCE ABORTED check.
+            if (
+                op == "interact"
+                and any(str(s.get("action") or "").lower() in ("goto", "navigate") for s in actions)
+                and not _tool_call_failed(tc)
+                and "SEQUENCE ABORTED" not in result
+            ):
+                seen.clear()
             sels = []
             sel = args.get("selector")
             if isinstance(sel, str) and sel:
                 sels.append(sel)
-            for step in args.get("actions") or []:
-                if isinstance(step, dict) and isinstance(step.get("selector"), str) and step.get("selector"):
+            for step in actions:
+                if isinstance(step.get("selector"), str) and step.get("selector"):
                     sels.append(step["selector"])
             for sel in sels:
                 seen[sel] = seen.get(sel, 0) + 1

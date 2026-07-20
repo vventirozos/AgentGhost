@@ -163,3 +163,40 @@ revised plan:
     d, plan = parse_reflection_output(text)
     assert "lowercase worked" in d
     assert plan == ["yes"]
+
+
+def test_parse_word_plan_in_diagnosis_does_not_hijack_plan_section():
+    """`DIAGNOSIS: The plan failed because:` contains the bare word
+    "plan" — it must NOT open the plan section, or the diagnosis
+    bullets get captured as the "revised plan" and the blank-line
+    break stops before the real REVISED PLAN."""
+    text = ("DIAGNOSIS: The plan failed because:\n"
+            "- the file was missing\n"
+            "\n"
+            "REVISED PLAN:\n"
+            "1. Use browser\n"
+            "2. ...")
+    d, plan = parse_reflection_output(text)
+    assert "plan failed" in d.lower()
+    assert plan[0] == "Use browser"
+    assert "the file was missing" not in " ".join(plan)
+
+
+def test_parse_plan_header_with_inline_first_step():
+    """The header line may carry the first step after the colon."""
+    text = """DIAGNOSIS: x
+REVISED PLAN: 1. alpha
+2. beta
+"""
+    d, plan = parse_reflection_output(text)
+    assert plan == ["alpha", "beta"]
+
+
+def test_parse_midline_plan_prose_alone_is_not_a_section():
+    """Prose mentioning "plan" with no real header must not fabricate
+    a plan out of unrelated bullets."""
+    text = ("DIAGNOSIS: The plan failed because:\n"
+            "- the file was missing\n")
+    d, plan = parse_reflection_output(text)
+    assert "plan failed" in d.lower()
+    assert plan == []

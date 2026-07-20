@@ -137,9 +137,23 @@ class SelfConsistencySampler:
         output_text = ""
         metrics: Dict[str, Any] = {}
         failure_reason = ""
+
+        async def _invoke():
+            # Sync runners go through a worker thread so wait_for governs
+            # them too — calling them inline ran them to completion BEFORE
+            # wait_for ever saw an awaitable, so per_sample_timeout_s
+            # silently never applied. (A timed-out thread keeps running
+            # detached; the sample is still labeled FAILED on time.)
+            if inspect.iscoroutinefunction(self.runner):
+                return await self.runner(payload)
+            value = await asyncio.to_thread(self.runner, payload)
+            # A sync callable may still RETURN an awaitable (partial over
+            # an async fn, async __call__) — resolve it under the same
+            # wait_for budget.
+            return await _maybe_await(value)
+
         try:
-            result = self.runner(payload)
-            result = await asyncio.wait_for(_maybe_await(result), timeout=timeout_s)
+            result = await asyncio.wait_for(_invoke(), timeout=timeout_s)
             if isinstance(result, dict):
                 output_text = str(result.get("output") or "")
                 metrics = result

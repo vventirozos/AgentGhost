@@ -144,6 +144,14 @@ class UncertaintyTracker:
             return False
         target.resolved = True
         target.resolved_value = value
+        # Persist the resolution to the SAME durable log the flag went
+        # to. Without this record the readers (`recurring_unknowns` /
+        # `persisted_context`) counted RESOLVED unknowns as recurring
+        # blind-spots forever — the log only ever saw the flag events.
+        self._append_persist({
+            "ts": time.time(), "kind": "unknown_resolved",
+            "text": target.what, "value": value,
+        })
         return True
 
     def flag_assumption(self, claim: str, confidence: float = 0.5,
@@ -273,6 +281,12 @@ class UncertaintyTracker:
         """Unknowns flagged repeatedly across turns — the durable
         blind-spots. Returns ``[(text, count), ...]`` sorted count-desc.
 
+        Only UNRESOLVED unknowns count: a ``unknown_resolved`` record
+        clears every earlier flag of that text within the lookback
+        window, while a re-flag AFTER the resolution starts a fresh
+        count (it genuinely recurred). Logs written before resolution
+        records existed simply contain none and parse unchanged.
+
         Reads the persisted log; empty when persistence is off."""
         if self.persist_path is None or not self.persist_path.exists():
             return []
@@ -291,14 +305,16 @@ class UncertaintyTracker:
                 rec = json.loads(ln)
             except json.JSONDecodeError:
                 continue
-            if rec.get("kind") != "unknown":
-                continue
+            kind = rec.get("kind")
             text = str(rec.get("text") or "").strip()
             if not text:
                 continue
             key = text.lower()
-            counts[key] = counts.get(key, 0) + 1
-            display[key] = text
+            if kind == "unknown":
+                counts[key] = counts.get(key, 0) + 1
+                display[key] = text
+            elif kind == "unknown_resolved":
+                counts.pop(key, None)
         out = [(display[k], c) for k, c in counts.items() if c >= min_count]
         out.sort(key=lambda kv: kv[1], reverse=True)
         return out

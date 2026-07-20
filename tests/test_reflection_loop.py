@@ -175,6 +175,77 @@ async def test_already_reflected_set_updated_in_place():
     assert "tF" in already
 
 
+async def test_run_skips_candidate_claimed_by_concurrent_reflect_one():
+    """A concurrent reflect_one (user-correction path sharing the same
+    reflected-ids set) claims candidate B while run() awaits A's critique.
+    run() must re-check membership at claim time — vetting at collection
+    time is not enough — or B gets reflected twice (duplicate lessons)."""
+    already: set = set()
+    sink_results = []
+    gate = asyncio.Event()
+    a = _failed_trajectory(tid="A", user_request="task-A")
+    b = _failed_trajectory(tid="B", user_request="task-B")
+
+    async def critique(prompt):
+        if "task-A" in prompt:
+            await gate.wait()
+        return _VALID_RESPONSE
+
+    refl = Reflector(critique_fn=critique)
+    run_task = asyncio.create_task(refl.run(
+        failed_source=[a, b], sink=sink_results.append, already_reflected=already,
+    ))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert "A" in already  # run() claimed A and is parked in its critique
+
+    # The concurrent path reflects B during A's await window...
+    out_b = await refl.reflect_one(b, sink=sink_results.append, already_reflected=already)
+    assert out_b.ok
+    # ...and a concurrent attempt on the already-claimed A is refused.
+    out_a = await refl.reflect_one(a, already_reflected=already)
+    assert out_a.error == "already reflected"
+
+    gate.set()
+    report = await run_task
+    assert report.reflected_ok == 1        # A only — B was claimed elsewhere
+    assert report.skipped_duplicate == 1   # B skipped at claim time
+    reflected_from = [t.extra["reflected_from"] for t in sink_results]
+    assert sorted(reflected_from) == ["A", "B"]  # exactly once each
+    assert "B" in already  # run() never un-claimed the concurrent path's id
+
+
+async def test_run_error_path_discard_keeps_concurrent_claim():
+    """run()'s error-path discard must only un-claim ids THIS run claimed:
+    when reflect_one already reflected B, run() (whose critique errors)
+    must leave B claimed in the shared set."""
+    already: set = set()
+    gate = asyncio.Event()
+    a = _failed_trajectory(tid="A", user_request="task-A")
+    b = _failed_trajectory(tid="B", user_request="task-B")
+
+    async def critique(prompt):
+        if "task-A" in prompt:
+            await gate.wait()
+            raise RuntimeError("LLM fell over")
+        return _VALID_RESPONSE
+
+    refl = Reflector(critique_fn=critique)
+    run_task = asyncio.create_task(refl.run(
+        failed_source=[a, b], already_reflected=already,
+    ))
+    for _ in range(5):
+        await asyncio.sleep(0)
+    out_b = await refl.reflect_one(b, already_reflected=already)
+    assert out_b.ok
+
+    gate.set()
+    report = await run_task
+    assert report.reflected_errors == 1  # A's critique raised
+    assert "A" not in already            # A un-claimed for a later retry
+    assert "B" in already                # the concurrent claim survives
+
+
 async def test_run_report_summary_string_includes_counts():
     async def critique(_p):
         return _VALID_RESPONSE

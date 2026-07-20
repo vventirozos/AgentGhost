@@ -85,3 +85,34 @@ class TestDetectToolPatterns:
             assert len(p["description"]) > 0
             assert "pattern_name" in p
             assert p["pattern_name"].startswith("strategy:")
+
+    def test_own_pattern_lessons_do_not_inflate_counts(self, skill_memory_with_patterns):
+        """Regression (2026-07-20): previously the detector counted its
+        own previously-saved "[Pattern] ..." lessons as instances (their
+        task/description contain the tool keywords), so every REM cycle
+        the count self-reinforced by one. Pattern-writer output — the
+        "[Pattern]" task prefix and the source="dream_pattern" tag —
+        must be excluded."""
+        sm = skill_memory_with_patterns
+        baseline = detect_tool_patterns(sm)
+        base_freq = {p["pattern_name"]: p["frequency"] for p in baseline}
+
+        playbook = sm._load_playbook()
+        # Simulate two prior REM cycles having saved the detected pattern.
+        for i in range(2):
+            playbook.append({
+                "timestamp": f"2025-03-0{i+1}T00:00:00",
+                "task": "[Pattern] strategy:execute → file_system → recall",
+                "mistake": "none",
+                "solution": ("Recurring tool pattern (execute → file_system "
+                             "→ recall) seen in 4 lessons. Examples: ..."),
+                "source": "dream_pattern",
+                "frequency": 1,
+            })
+        sm.save_playbook(playbook)
+
+        again = detect_tool_patterns(sm)
+        again_freq = {p["pattern_name"]: p["frequency"] for p in again}
+        assert again_freq == base_freq, (
+            "pattern-writer output must not count as pattern instances"
+        )

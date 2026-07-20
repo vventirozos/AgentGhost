@@ -74,6 +74,54 @@ def test_json_field_case_insensitive():
     assert "Bearer abc" not in out
 
 
+def test_lowercase_secret_assignments_redacted():
+    """Empirically-reproduced leaks (2026-07-20): lowercase/mixed-case
+    sensitive names with `:` separators or spaced `=` bypassed every
+    assignment rule (CAPS-only, `name=value`-only, quoted-JSON-only)."""
+    for text, secret in [
+        ("password: hunter2", "hunter2"),
+        ("db_password = hunter2", "hunter2"),
+        ("api_key: sk_live_abcdef123456", "sk_live_abcdef123456"),
+        ("pwd: hunter2", "hunter2"),
+        ("auth: opaquetok123", "opaquetok123"),
+        ("x-auth-token: opaquetok123", "opaquetok123"),
+        ("client_secret: cs_abc123", "cs_abc123"),
+        ("aws_access_key = AKXYZ", "AKXYZ"),
+        ("private_key: notapemkey123", "notapemkey123"),
+        ("Password: hunter2", "hunter2"),
+    ]:
+        out = redact_text(text)
+        assert secret not in out, f"{text!r} leaked"
+        assert "<REDACTED>" in out
+
+
+def test_previously_passing_assignment_forms_still_redacted():
+    """The lowercase extension must not regress the forms that already
+    worked before it."""
+    for text, secret in [
+        ("password=hunter2", "hunter2"),
+        ("DB_PASSWORD: hunter2", "hunter2"),
+        ('"password": "hunter2"', "hunter2"),
+        ("client_secret=cs_abc123&grant_type=cc", "cs_abc123"),
+    ]:
+        out = redact_text(text)
+        assert secret not in out, f"{text!r} leaked"
+
+
+def test_lowercase_rule_does_not_redact_benign_prose():
+    """False positives stay bounded: only names ending in a sensitive
+    word fire — arbitrary `key: value` prose survives."""
+    for text in (
+        "key: value",
+        "primary key: id",
+        "monkey: banana",
+        "oauth: client_credentials",
+        "cache_key: user-42",
+        "wait_until: load",
+    ):
+        assert redact_text(text) == text, f"{text!r} was wrongly redacted"
+
+
 def test_onion_address_redacted():
     out = redact_text("Check http://facebookcorewwwi.onion/ then act.")
     assert "facebookcorewwwi.onion" not in out

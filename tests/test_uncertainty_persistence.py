@@ -5,6 +5,7 @@ prompt-injection context, the hedge-scanner, and the flag_uncertainty
 tool that populates the tracker.
 """
 
+import json
 from pathlib import Path
 
 from ghost_agent.core.uncertainty import UncertaintyTracker
@@ -91,6 +92,103 @@ def test_should_ask_user_gate():
     q = t.should_ask_user()
     assert q is not None
     assert "which production database to target" in q
+
+
+# --------------------------------------------------------------------------
+# Resolution persistence — a resolved unknown must stop counting as a
+# recurring blind-spot (the log used to record only flag events, so
+# resolve_unknown left the readers claiming "unresolved across multiple
+# past turns" forever).
+# --------------------------------------------------------------------------
+
+def test_resolve_appends_resolution_record(tmp_path: Path):
+    log = tmp_path / "u.jsonl"
+    t = UncertaintyTracker(persist_path=log)
+    u = t.flag_unknown("the deployment target", impact=4)
+    assert t.resolve_unknown(u, "prod-eu") is True
+    recs = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert recs[-1]["kind"] == "unknown_resolved"
+    assert recs[-1]["text"] == "the deployment target"
+    assert recs[-1]["value"] == "prod-eu"
+
+
+def test_resolved_unknown_excluded_from_recurring(tmp_path: Path):
+    log = tmp_path / "u.jsonl"
+    t = UncertaintyTracker(persist_path=log)
+    for _ in range(2):
+        t.flag_unknown("the deployment target", impact=4)
+        t.reset()
+    u = t.flag_unknown("the deployment target", impact=4)
+    t.resolve_unknown(u, "prod-eu")
+    assert t.recurring_unknowns(min_count=2) == []
+    assert t.persisted_context() == ""
+
+
+def test_reflag_after_resolution_counts_fresh(tmp_path: Path):
+    """A resolution clears PRIOR flags only — re-flagging afterwards is a
+    genuine recurrence and must start a fresh count."""
+    log = tmp_path / "u.jsonl"
+    t = UncertaintyTracker(persist_path=log)
+    for _ in range(3):
+        t.flag_unknown("the api schema", impact=4)
+        t.reset()
+    u = t.flag_unknown("the api schema", impact=4)
+    t.resolve_unknown(u, "v2 openapi doc")
+    t.reset()
+    for _ in range(2):
+        t.flag_unknown("the api schema", impact=4)
+        t.reset()
+    recurring = t.recurring_unknowns(min_count=2)
+    assert recurring == [("the api schema", 2)]
+
+
+def test_resolution_only_clears_matching_text(tmp_path: Path):
+    log = tmp_path / "u.jsonl"
+    t = UncertaintyTracker(persist_path=log)
+    for _ in range(2):
+        t.flag_unknown("the timezone", impact=3)
+        t.reset()
+    u = t.flag_unknown("the locale", impact=3)
+    t.resolve_unknown(u, "el_GR")
+    recurring = t.recurring_unknowns(min_count=2)
+    assert recurring == [("the timezone", 2)]
+
+
+def test_resolve_by_index_also_persists(tmp_path: Path):
+    log = tmp_path / "u.jsonl"
+    t = UncertaintyTracker(persist_path=log)
+    t.flag_unknown("the port number", impact=3)
+    assert t.resolve_unknown(0, "8080") is True
+    recs = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert recs[-1]["kind"] == "unknown_resolved"
+
+
+def test_failed_resolve_writes_nothing(tmp_path: Path):
+    log = tmp_path / "u.jsonl"
+    t = UncertaintyTracker(persist_path=log)
+    t.flag_unknown("something", impact=3)
+    assert t.resolve_unknown(99, "nope") is False
+    recs = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert all(r["kind"] != "unknown_resolved" for r in recs)
+
+
+def test_legacy_log_without_resolution_records_still_parses(tmp_path: Path):
+    """Backward compatibility: logs written before resolution records
+    existed contain only flag events (plus whatever junk survived a
+    crash) and must read exactly as before."""
+    log = tmp_path / "u.jsonl"
+    old_lines = [
+        json.dumps({"ts": 1.0, "kind": "unknown", "text": "the db backend",
+                    "impact": 4, "resolution": "ask user"}),
+        json.dumps({"ts": 2.0, "kind": "assumption", "text": "py3.11",
+                    "confidence": 0.5, "basis": ""}),
+        "not json at all",
+        json.dumps({"ts": 3.0, "kind": "unknown", "text": "the db backend",
+                    "impact": 4, "resolution": "ask user"}),
+    ]
+    log.write_text("\n".join(old_lines) + "\n")
+    t = UncertaintyTracker(persist_path=log)
+    assert t.recurring_unknowns(min_count=2) == [("the db backend", 2)]
 
 
 # --------------------------------------------------------------------------

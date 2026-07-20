@@ -78,6 +78,21 @@ def test_recent_accessor_respects_limit_newest_last(tmp_path):
     assert "warehouse_inventory" in recent[0]
 
 
+def test_recent_accessor_zero_limit_returns_empty(tmp_path):
+    # Regression: `recent[-max(0, 0):]` is `recent[0:]` — limit=0 used to
+    # return the ENTIRE window instead of nothing.
+    t = _tracker(tmp_path)
+    t.note_generated_challenge(FRAUD_A)
+    t.note_generated_challenge(INVENTORY)
+    assert t.recent_generated_challenges(limit=0) == []
+
+
+def test_recent_accessor_negative_limit_returns_empty(tmp_path):
+    t = _tracker(tmp_path)
+    t.note_generated_challenge(FRAUD_A)
+    assert t.recent_generated_challenges(limit=-3) == []
+
+
 def test_empty_and_blank_challenges_ignored(tmp_path):
     t = _tracker(tmp_path)
     t.note_generated_challenge("")

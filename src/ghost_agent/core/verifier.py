@@ -323,25 +323,6 @@ Respond ONLY with a JSON object:
   "issues": ["specific contradictions, if any"]
 }}"""
 
-_ADVERSARIAL_PROBE_PROMPT = """You are a devil's advocate. Given a PROBLEM and proposed SOLUTION, generate edge cases and counterexamples that could break it.
-
-PROBLEM:
-{problem}
-
-SOLUTION:
-{solution}
-
-Generate 3-5 specific, testable edge cases. For each, explain what could go wrong.
-
-Respond ONLY with a JSON object:
-{{
-  "edge_cases": [
-    {{"case": "description", "risk": "what could break"}},
-    ...
-  ]
-}}"""
-
-
 class Verifier:
     """Self-evaluation module that uses LLM introspection to check the agent's
     own work before presenting it to the user."""
@@ -385,12 +366,18 @@ class Verifier:
             # sampling made this judge MORE verbose (41 -> 786+ tokens,
             # truncating at the cap). A malformed answer here fails fast
             # (~3 tokens) and falls back to the classic prompt.
+            # The stop token travels WITH the no-think switch: with
+            # GHOST_VERIFY_STAGE_NO_THINK=0 a thinking judge's reply
+            # opens with a think prelude, so stop-at-newline would cut
+            # it at the prelude's first line break — both stages parse
+            # empty and every verdict silently rides the classic
+            # fallback (plus a wasted stage-1 call each time).
             if _STAGE_NO_THINK:
                 payload["messages"][0]["content"] = \
                     prompt + "\n\n/no_think"
                 payload["chat_template_kwargs"] = {
                     "enable_thinking": False}
-            payload["stop"] = ["\n"]
+                payload["stop"] = ["\n"]
 
         # Dedicated critic pool takes precedence when configured
         # (--critic-nodes). It keeps the verdict off the foreground
@@ -502,11 +489,22 @@ class Verifier:
         text = re.sub(r"<think>[\s\S]*$", "", text).strip()
         if not text:
             return {}
-        # Try direct parse
+        # Try direct parse. Callers do `.get(...)` on the result, so a
+        # bare array/string reply must never escape this function — it
+        # would raise AttributeError out of verify_claim, and the broad
+        # debug-level except in agent.py silently skips the whole pass.
         try:
-            return json.loads(text)
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return parsed
+            if (isinstance(parsed, list) and len(parsed) == 1
+                    and isinstance(parsed[0], dict)):
+                # Salvage a dict the model needlessly wrapped in [].
+                return parsed[0]
         except json.JSONDecodeError:
             pass
+        # Non-dict top-level values fall through to the fragment walk
+        # (its `{...}` candidates can only parse as dicts).
         # Walk every `{...}` block from the end — some models emit a
         # final JSON after prose; the last parseable one wins.
         for candidate in reversed(re.findall(r"\{[\s\S]*?\}", text) or []):
@@ -527,13 +525,20 @@ class Verifier:
         """Convert a parsed JSON dict into a VerifyResult.
 
         Returns ``None`` when the verifier LLM produced no usable output
-        (worker unavailable, JSON unparseable, upstream error). Callers
-        surface that as "skipped" rather than conflating it with a real
+        (worker unavailable, JSON unparseable, upstream error, or a
+        parsed dict with no "verdict" key at all). Callers surface that
+        as "skipped" rather than conflating it with a real
         low-confidence UNCERTAIN verdict — the two cases are logged
         identically as "UNCERTAIN (0%)" previously, which hid genuine
         failures of the verifier pipeline itself.
         """
         if not data:
+            return None
+        if "verdict" not in data:
+            # A truncated reply's only balanced `{...}` is typically an
+            # INNER fragment ({"suspect":2,"real":true,...}) — treating
+            # it as a verdict fabricated UNCERTAIN@0.5 and, on the
+            # two-stage path, suppressed the classic fallback.
             return None
         # A non-string verdict (null / list) or non-numeric confidence ("high",
         # null) would otherwise raise out of the verifier (callers don't wrap

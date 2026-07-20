@@ -10,6 +10,19 @@ from unittest.mock import MagicMock, AsyncMock
 from tests.helpers import make_context, make_agent, FakeBgTasks  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _isolate_ghost_home(monkeypatch):
+    """Tests must never resolve the operator's live GHOST_HOME.
+
+    The developer shell exports GHOST_HOME for the live agent, and modules
+    like core/counterfactual and core/journal_challenges persist under it —
+    a test run with the env inherited silently wrote 112 synthetic
+    challenges into the LIVE replay ledger (2026-07-20) and then replayed
+    from it in unrelated tests. Tests that need a home set one explicitly
+    (monkeypatch.setenv runs after this delenv)."""
+    monkeypatch.delenv("GHOST_HOME", raising=False)
+
+
 @pytest.fixture
 def mock_llm():
     client = MagicMock()

@@ -132,15 +132,11 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
         r"\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)S?)(\"?\s*[=:]\s*\"?)([^\s\"',]+)"
     ), r"\1\2<REDACTED>"),
 
-    # Lowercase form/query-string secrets (`client_secret=…`, `password=…`
-    # in curl bodies and URLs). OAuth token exchanges and login form posts
-    # are conventionally lowercase; the ALL-CAPS rule above and the JSON
-    # rule below both miss the `key=value` spelling.
-    ("form_secret_assignment", re.compile(
-        r"(?i)\b((?:[a-z0-9_\-]*(?:password|passwd|secret|token|api_key|apikey))=)([^\s&\"',]+)"
-    ), r"\1<REDACTED>"),
-
-    # JSON-style "api_key": "..." / "token": "..."
+    # JSON-style "api_key": "..." / "token": "...". MUST run before
+    # form_secret_assignment: on a double-quoted JSON pair the form
+    # rule's value charset stops at the first escaped quote
+    # (`"a\"b_secret"` → redacts only `a\`, leaks the tail), while this
+    # rule's escape-aware value body consumes the whole string.
     ("json_secret_field", re.compile(
         # Value body tolerates escaped quotes (`"a\"b_secret"`): the old
         # `[^"]+` stopped at the first inner quote, redacting only `a\` and
@@ -148,6 +144,23 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
         r'("(?:api[_-]?key|access[_-]?token|secret[_-]?key|auth[_-]?token|password|passwd|client[_-]?secret|refresh[_-]?token)"\s*:\s*")(?:\\.|[^"\\])+(")',
         re.IGNORECASE,
     ), r"\1<REDACTED>\2"),
+
+    # Lowercase / mixed-case secret assignments: form/query-string bodies
+    # (`client_secret=…`), YAML/config style (`password: hunter2`,
+    # `api_key: sk_live_…`) and spaced prose (`db_password = hunter2`).
+    # OAuth token exchanges and login form posts are conventionally
+    # lowercase; the ALL-CAPS rule above and the quoted-JSON rule above
+    # both miss these spellings. Only names ENDING in a word from the
+    # sensitive list fire — a bare `key: value` never matches. `pwd`/`auth`
+    # need a `_`/`-` boundary (or to stand alone) so prose like
+    # `oauth: client_credentials` isn't redacted. Separators stay on one
+    # line ([ \t], not \s) so a name at end-of-line can't eat the next line.
+    ("form_secret_assignment", re.compile(
+        r"(?i)\b((?:[a-z0-9_\-]*"
+        r"(?:password|passwd|secret|token|api_key|apikey|access_key|private_key)"
+        r"|(?:[a-z0-9_\-]+[_\-])?(?:pwd|auth))"
+        r"[\"']?[ \t]*[=:][ \t]*[\"']?)([^\s&\"',]+)"
+    ), r"\1<REDACTED>"),
 
     # .onion hostnames
     ("tor_onion", re.compile(r"\b[a-z2-7]{16,56}\.onion\b"), "<REDACTED_ONION>"),
@@ -184,7 +197,11 @@ _BUILTIN_RULES: List[_BuiltinRule] = [
     # redactor so the higher-stakes corpus is at least as strict as the diary).
     # Credit cards are Luhn-gated (see _redact_cc_if_luhn) so bigint ids and
     # other long numeric literals in stored SQL/code survive intact.
-    ("credit_card", re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)"), _redact_cc_if_luhn),
+    # Letter-excluding boundaries: a 13-19 digit run INSIDE a longer
+    # alphanumeric token (32-hex trajectory/request ids) is an identifier,
+    # not a card — Luhn alone passes ~10% of those and the redaction
+    # corrupts referential ids downstream.
+    ("credit_card", re.compile(r"(?<![0-9A-Za-z])(?:\d[ -]?){13,19}(?![0-9A-Za-z])"), _redact_cc_if_luhn),
     # A phone match must carry phone STRUCTURE — a leading `+`, a
     # parenthesised area code, or internal space/dash separators. The old
     # pattern's core (`\d{3}[ -]?\d{4}` with everything else optional)

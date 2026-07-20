@@ -480,16 +480,23 @@ class TestIsolatedContextNulling_C4:
 
 
 class TestRestoreMocksPurge_S4:
+    # 2026-07-20: the snapshot/restore helpers were hoisted from
+    # closures inside synthetic_self_play to module level (so they can
+    # snapshot recursively AND be exercised directly). The source
+    # invariants now target the module functions; the behavioural tests
+    # exercise the real helpers.
+
     def test_source_purges_non_snapshot_files(self):
         import inspect
-        from ghost_agent.core.dream import Dreamer
+        from ghost_agent.core import dream
 
-        src = inspect.getsource(Dreamer.synthetic_self_play)
-        # New straggler-purge logic skips protected names and deletes
+        src = inspect.getsource(dream._restore_mocks)
+        # Straggler-purge logic skips protected names and deletes
         # files not in snap_names.
         assert "snap_names" in src
         assert "p.unlink" in src
-        assert "acquired_skills" in src  # protected name
+        assert "_SELFPLAY_PROTECTED_NAMES" in src
+        assert "acquired_skills" in dream._SELFPLAY_PROTECTED_NAMES
 
     def test_pre_validator_restore_preserves_solution_py(self):
         """Regression for the 12:37 log: the pre-validator `_restore_mocks`
@@ -502,11 +509,13 @@ class TestRestoreMocksPurge_S4:
         validator call uses the default False.
         """
         import inspect
+        from ghost_agent.core import dream
         from ghost_agent.core.dream import Dreamer
 
-        src = inspect.getsource(Dreamer.synthetic_self_play)
         # Helper signature accepts the flag with a safe False default.
-        assert "purge_stragglers: bool = False" in src
+        assert "purge_stragglers: bool = False" in inspect.getsource(
+            dream._restore_mocks)
+        src = inspect.getsource(Dreamer.synthetic_self_play)
         # Between-attempts call passes True.
         # Pre-validator call (under "Restore mocks one more time") uses
         # the default — no `True` third positional argument — so
@@ -519,34 +528,83 @@ class TestRestoreMocksPurge_S4:
         )
 
     def test_restore_mocks_behavior_purge_vs_preserve(self, tmp_path):
-        """Functional check on the helper's two modes. We can't easily
-        reach the closure inside synthetic_self_play, so we replicate
-        its contract with a mini-helper built from the same source
-        invariants: purge=True deletes stragglers, purge=False keeps
-        them (which is what the pre-validator call depends on)."""
+        """Functional check on the REAL helper's two modes: purge=True
+        deletes stragglers, purge=False keeps them (which is what the
+        pre-validator call depends on)."""
+        from ghost_agent.core.dream import _restore_mocks, _snapshot_mocks
+
         # Seed the tmp sandbox with one mock file and one straggler.
         (tmp_path / "mock.csv").write_bytes(b"a,b\n1,2\n")
+        snapshot = _snapshot_mocks(tmp_path)
+        assert snapshot == {"mock.csv": b"a,b\n1,2\n"}
         (tmp_path / "solution.py").write_bytes(b"print('hi')\n")
-        snapshot = {"mock.csv": b"a,b\n1,2\n"}
-
-        PROTECTED = {".setup.py", ".validator.py", ".preflight.py", "acquired_skills"}
-
-        def _restore_mocks(path, snap, purge=False):
-            snap_names = set(snap.keys())
-            if purge:
-                for p in path.iterdir():
-                    if p.name in PROTECTED or p.name in snap_names:
-                        continue
-                    p.unlink()
-            for name, blob in snap.items():
-                (path / name).write_bytes(blob)
 
         # purge=False: straggler survives (pre-validator case).
-        _restore_mocks(tmp_path, snapshot, purge=False)
+        _restore_mocks(tmp_path, snapshot, purge_stragglers=False)
         assert (tmp_path / "solution.py").exists()
         assert (tmp_path / "mock.csv").exists()
 
         # purge=True: straggler wiped (between-attempts case).
-        _restore_mocks(tmp_path, snapshot, purge=True)
+        _restore_mocks(tmp_path, snapshot, purge_stragglers=True)
         assert not (tmp_path / "solution.py").exists()
         assert (tmp_path / "mock.csv").exists()
+
+    def test_snapshot_and_restore_cover_subdirectories(self, tmp_path):
+        """The 2026-07-20 fix: a setup script doing os.makedirs('data')
+        + data/x.csv passes the gates, so the snapshot must capture the
+        subtree and the purge pass must NOT rmtree `data/` (it used to,
+        so attempt 1 started with the fixture already deleted)."""
+        from ghost_agent.core.dream import _restore_mocks, _snapshot_mocks
+
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "x.csv").write_bytes(b"a,b\n1,2\n")
+        (tmp_path / "top.txt").write_bytes(b"t\n")
+        snap = _snapshot_mocks(tmp_path)
+        assert snap == {"data/x.csv": b"a,b\n1,2\n", "top.txt": b"t\n"}
+
+        # Solver mutates the fixture, writes stragglers at both levels.
+        (tmp_path / "data" / "x.csv").write_bytes(b"corrupted")
+        (tmp_path / "data" / "out.txt").write_bytes(b"artifact")
+        (tmp_path / "junk").mkdir()
+        (tmp_path / "junk" / "z.bin").write_bytes(b"z")
+
+        _restore_mocks(tmp_path, snap, purge_stragglers=True)
+        # Snapshot subtree survives the purge and is restored pristine.
+        assert (tmp_path / "data" / "x.csv").read_bytes() == b"a,b\n1,2\n"
+        assert (tmp_path / "top.txt").exists()
+        # Stragglers (nested file AND whole non-snapshot dir) are gone.
+        assert not (tmp_path / "data" / "out.txt").exists()
+        assert not (tmp_path / "junk").exists()
+
+    def test_restore_recreates_deleted_directories(self, tmp_path):
+        """A validator that rmtree'd the fixture directory at module
+        scope must not break the restore — directories are recreated."""
+        import shutil
+        from ghost_agent.core.dream import _restore_mocks, _snapshot_mocks
+
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "x.csv").write_bytes(b"1\n")
+        snap = _snapshot_mocks(tmp_path)
+        shutil.rmtree(tmp_path / "data")
+
+        _restore_mocks(tmp_path, snap, purge_stragglers=True)
+        assert (tmp_path / "data" / "x.csv").read_bytes() == b"1\n"
+
+    def test_snapshot_and_purge_respect_protected_names(self, tmp_path):
+        """Tool files and the acquired_skills/ subtree are neither
+        snapshotted nor purged."""
+        from ghost_agent.core.dream import _restore_mocks, _snapshot_mocks
+
+        (tmp_path / ".setup.py").write_text("pass")
+        (tmp_path / ".validator.py").write_text("pass")
+        (tmp_path / "acquired_skills").mkdir()
+        (tmp_path / "acquired_skills" / "skill.py").write_text("pass")
+        (tmp_path / "mock.json").write_bytes(b"{}")
+
+        snap = _snapshot_mocks(tmp_path)
+        assert snap == {"mock.json": b"{}"}
+
+        _restore_mocks(tmp_path, snap, purge_stragglers=True)
+        assert (tmp_path / ".setup.py").exists()
+        assert (tmp_path / ".validator.py").exists()
+        assert (tmp_path / "acquired_skills" / "skill.py").exists()

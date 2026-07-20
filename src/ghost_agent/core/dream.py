@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import asyncio
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 from .agent import extract_json_from_text
@@ -750,6 +751,14 @@ def detect_tool_patterns(skill_memory) -> list:
     for lesson in playbook:
         solution = (lesson.get("solution") or "").lower()
         task = (lesson.get("task") or "").lower()
+        # Exclude the pattern-writer's OWN output: "[Pattern] ..." lessons
+        # (saved by the dream loop with source="dream_pattern") name the
+        # very tool keywords scanned below, so counting them made each
+        # detected pattern re-detect itself one stronger every REM cycle.
+        trigger = (lesson.get("trigger") or "").lower()
+        if (task.startswith("[pattern]") or trigger.startswith("[pattern]")
+                or (lesson.get("source") or "") == "dream_pattern"):
+            continue
         combined = f"{task} {solution}"
         # Extract the SET of tools mentioned (unordered co-occurrence — the
         # key is sorted below, so this is NOT a sequence; for true ordered
@@ -1190,6 +1199,125 @@ def _patch_with_fallback(
     return out
 
 
+# ── Self-play sandbox snapshot / restore ─────────────────────────────
+# Paths `_restore_mocks` must NEVER delete even when they're not in the
+# snapshot: the tooling files the self-play pipeline itself wrote, plus
+# acquired_skills/. Matching is on the TOP-LEVEL path component, so the
+# whole acquired_skills/ subtree is protected.
+_SELFPLAY_PROTECTED_NAMES = frozenset({
+    ".setup.py", ".validator.py", ".preflight.py", "acquired_skills",
+})
+
+
+def _snapshot_mocks(sandbox_path: Path) -> dict:
+    """Recursively snapshot the mock files the setup script produced, as
+    ``{relative_posix_path: bytes}``.
+
+    Recursive since 2026-07-20: the old top-level-only walk missed files
+    a setup script wrote under a subdirectory (``os.makedirs('data')`` +
+    ``data/x.csv`` passes every gate), so the purge pass in restore
+    rmtree'd ``data/`` before attempt 1 — the challenge was then falsely
+    discarded as inconsistent, or the solver failed 3/3 unfairly on
+    replays."""
+    snap = {}
+    try:
+        for p in sandbox_path.rglob("*"):
+            try:
+                rel = p.relative_to(sandbox_path)
+                top = rel.parts[0]
+                if top in _SELFPLAY_PROTECTED_NAMES or top.startswith(".mount_sync_"):
+                    continue
+                if p.is_file() and not p.is_symlink():
+                    snap[rel.as_posix()] = p.read_bytes()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return snap
+
+
+def _restore_mocks(sandbox_path: Path, snap: dict, purge_stragglers: bool = False):
+    """Restore the pristine post-setup sandbox state.
+
+    When ``purge_stragglers`` is True (between-attempts cleanup and the
+    post-preflight restore), delete any file or directory not covered by
+    the snapshot (e.g., a stale `solution.py` from attempt N-1, or
+    output artifacts). This is the S4 fix for cross-attempt leakage.
+
+    When ``purge_stragglers`` is False (pre-validator restore), only
+    rewrite the snapshot entries. The solver just wrote `solution.py`
+    and the validator is about to subprocess-run it, so purging would
+    delete the very file the validator needs and produce a spurious
+    "No such file or directory" failure on every attempt.
+
+    Snapshot keys are RELATIVE posix paths; a snapshot entry's parent
+    directories are recreated on restore and protected from the purge.
+    """
+    if not snap and not sandbox_path.exists():
+        return
+    snap_names = set(snap.keys()) if snap else set()
+    # Every ancestor directory of a snapshot entry must survive a purge.
+    snap_dirs = set()
+    for rel in snap_names:
+        parts = rel.split("/")[:-1]
+        for i in range(1, len(parts) + 1):
+            snap_dirs.add("/".join(parts[:i]))
+    if purge_stragglers:
+        try:
+            # Deepest-first so files are unlinked before their (now
+            # empty) parent directories are considered.
+            entries = sorted(
+                sandbox_path.rglob("*"),
+                key=lambda q: len(q.parts), reverse=True,
+            )
+            for p in entries:
+                try:
+                    rel = p.relative_to(sandbox_path).as_posix()
+                    top = rel.split("/", 1)[0]
+                    if top in _SELFPLAY_PROTECTED_NAMES:
+                        continue
+                    if top.startswith(".mount_sync_"):
+                        continue
+                    if p.is_file() or p.is_symlink():
+                        if rel not in snap_names:
+                            p.unlink()
+                    elif p.is_dir():
+                        if rel not in snap_dirs:
+                            import shutil as _shutil
+                            _shutil.rmtree(p, ignore_errors=True)
+                except Exception as e:
+                    logger.warning(f"Failed to purge straggler {p}: {e}")
+        except Exception as e:
+            logger.debug(f"Straggler purge iteration failed: {e}")
+    # Always: rewrite snapshot entries (recreating their directories) so
+    # any in-place mutations the solver made to mock data are reverted.
+    for rel, blob in (snap or {}).items():
+        try:
+            target = sandbox_path / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(blob)
+        except Exception as e:
+            logger.warning(f"Failed to restore mock {rel}: {e}")
+
+
+def _preflight_restore(sandbox_path: Path, snap: dict):
+    """Cancel pre-flight / self-test side effects (M5): purge stragglers
+    the probes created, then rewrite the post-setup snapshot."""
+    _restore_mocks(sandbox_path, snap, purge_stragglers=True)
+
+
+def _redream_min_new_fragments() -> int:
+    """Guarded parse of GHOST_DREAM_MIN_NEW (default 3). A malformed
+    value (e.g. "abc") must fall back rather than raise at import —
+    this runs at module scope, so a ValueError here killed dream in
+    phase-2 (import swallowed to debug) and errored every phase-3 tick.
+    Same convention as failure_dimension.distill_max."""
+    try:
+        return max(1, int(os.getenv("GHOST_DREAM_MIN_NEW", "3") or 3))
+    except ValueError:
+        return 3
+
+
 class Dreamer:
     """
     Active Memory Consolidation System.
@@ -1201,7 +1329,7 @@ class Dreamer:
     # (2026-07-20): each idle self-play run minted one new digest ID and
     # re-triggered a full REM over an otherwise-identical window.
     # Env-overridable: GHOST_DREAM_MIN_NEW=1 restores the old behavior.
-    REDREAM_MIN_NEW_FRAGMENTS = max(1, int(os.getenv("GHOST_DREAM_MIN_NEW", "3") or 3))
+    REDREAM_MIN_NEW_FRAGMENTS = _redream_min_new_fragments()
 
     def __init__(self, agent_context):
         self.context = agent_context
@@ -1213,41 +1341,14 @@ class Dreamer:
 
         pretty_log("Dream Mode", "Entering REM cycle (Consolidating Memory & Extracting Heuristics)...", icon=Icons.DREAM)
 
-        # Drain the short-term journal into the consolidation pipeline so
-        # entries the agent appended during the day actually become long-
-        # term memories instead of sitting forever in memory_journal.json.
-        # Wrapped defensively: a journal failure must never break the dream.
-        try:
-            journal = getattr(self.context, "journal", None)
-            if journal is not None and hasattr(journal, "drain"):
-                drained = await asyncio.to_thread(journal.drain)
-                if drained:
-                    pretty_log(
-                        "Dream Journal Drain",
-                        f"Pulled {len(drained)} journal entries into consolidation.",
-                        icon=Icons.BRAIN_SUM,
-                    )
-                    for entry in drained:
-                        try:
-                            data = entry.get("data") if isinstance(entry, dict) else None
-                            if not isinstance(data, dict):
-                                continue
-                            text = (
-                                data.get("text")
-                                or data.get("content")
-                                or data.get("summary")
-                                or ""
-                            )
-                            if isinstance(text, str) and text.strip():
-                                await asyncio.to_thread(
-                                    self.memory.add,
-                                    text.strip(),
-                                    {"type": "auto", "timestamp": __import__("time").strftime("%Y-%m-%dT%H:%M:%SZ", __import__("time").gmtime())},
-                                )
-                        except Exception as ie:
-                            logger.debug(f"Dream: failed to ingest journal entry: {ie}")
-        except Exception as je:
-            logger.warning(f"Dream journal drain failed (non-fatal): {je}")
+        # NOTE (2026-07-20): dream no longer drains the short-term journal.
+        # The old drain wrote raw `smart_memory` text straight into the
+        # vector store as `type:"auto"` fragments — bypassing the smart-
+        # memory selectivity pipeline entirely — and silently DISCARDED any
+        # `post_mortem` items it popped. Phase-1 `process_journal_queue`
+        # (agent.py, ~2min idle, runs long before this phase-3 tick) is the
+        # proper consumer: it scores smart_memory items and executes
+        # post-mortems, with bounded requeue on transient failure.
 
         # --- EPISODIC CONSOLIDATION -------------------------------------
         # Episodes (trigger → action chain → outcome) are the trajectory-
@@ -1305,7 +1406,11 @@ class Dreamer:
             results = await asyncio.to_thread(
                 self.memory.collection.get,
                 where={"type": "auto"},
-                limit=300,
+                # Fetch exactly the window the prompt shows (mem_list[:150]
+                # below). The old limit=300 stamped ids 151-300 into the
+                # idempotency cache as "dreamed" without them ever entering
+                # the prompt — permanently consumed, never consolidated.
+                limit=150,
                 include=["documents", "metadatas", "embeddings"]
             )
         except Exception as e:
@@ -1367,11 +1472,26 @@ class Dreamer:
         # the meta-patterns of a 60-fragment window; require a minimum of
         # NEW-fragment evidence before re-dreaming.
         current_fragment_key = frozenset(ids)
-        last_fragment_key = getattr(self.context, "_last_dream_fragment_ids", None)
+        # NAMESPACE-AWARE since 2026-07-20: auto-memory ids and the
+        # traj:/selfplay: fallback digests are disjoint namespaces. A
+        # single shared set meant that whenever the seed source
+        # oscillated (pool refills → auto, pool thins → fallback), every
+        # id looked "fresh" against the other namespace's cache and
+        # unchanged material was fully re-dreamed. Compare and stamp
+        # per seed source instead.
+        seed_namespace = "traj_selfplay" if seeded_from_trajectories else "auto"
+        _frag_cache = getattr(self.context, "_last_dream_fragment_ids", None)
+        if isinstance(_frag_cache, frozenset):
+            # Legacy single-set shape (pre-namespace): treat it as this
+            # namespace's entry so an unchanged window still skips once.
+            _frag_cache = {seed_namespace: _frag_cache}
         # Defensive isinstance guard: on a MagicMock context, attribute
         # access returns a child mock rather than the `None` default, so
         # an == comparison would silently always be False. Only honour
-        # the cache when it's a real frozenset.
+        # the cache when it's a real dict of frozensets.
+        if not isinstance(_frag_cache, dict):
+            _frag_cache = {}
+        last_fragment_key = _frag_cache.get(seed_namespace)
         if isinstance(last_fragment_key, frozenset):
             fresh = len(current_fragment_key - last_fragment_key)
         else:
@@ -1440,7 +1560,19 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             content_text = data["choices"][0]["message"]["content"]
             
             result_json = extract_json_from_text(content_text)
-            
+
+            # extract_json_from_text returns {} on EVERY failure mode —
+            # indistinguishable from a considered-and-empty verdict. Only a
+            # reply that actually carries the schema keys counts as parsed;
+            # a garbage reply must NOT stamp the idempotency cache below or
+            # this fragment window is skipped as "no new input" until
+            # REDREAM_MIN_NEW_FRAGMENTS genuinely-new fragments arrive
+            # (same mark-only-after-successful-parse contract as
+            # _consolidate_episodes).
+            parsed_ok = isinstance(result_json, dict) and (
+                "consolidations" in result_json or "heuristics" in result_json
+            )
+
             # --- CONSOLIDATION METRICS ---
             # Measure entropy (information content) before and after
             # consolidation to avoid producing low-value meta-memories.
@@ -1586,7 +1718,10 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                             f"[Pattern] {p['pattern_name']}",
                             "none",
                             p["description"],
-                            memory_system=self.memory
+                            memory_system=self.memory,
+                            # Provenance tag — detect_tool_patterns skips
+                            # these so its counts can't self-reinforce.
+                            source="dream_pattern",
                         )
                         patterns_found += 1
             except Exception as pe:
@@ -1701,9 +1836,22 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 logger.debug("rrf refit skipped: %s", _rwx)
             # Record the fragment set we just processed so the next REM
             # cycle can short-circuit if no new auto-memories have arrived.
-            # Only stored on success — a transient LLM error must not
-            # poison the idempotency cache against a valid retry.
-            self.context._last_dream_fragment_ids = current_fragment_key
+            # Only stored on success — a transient LLM error OR an
+            # unparseable reply must not poison the idempotency cache
+            # against a valid retry. Stamped per seed namespace (see the
+            # guard above).
+            if parsed_ok:
+                _stamp_cache = getattr(self.context, "_last_dream_fragment_ids", None)
+                _stamp_cache = dict(_stamp_cache) if isinstance(_stamp_cache, dict) else {}
+                _stamp_cache[seed_namespace] = current_fragment_key
+                self.context._last_dream_fragment_ids = _stamp_cache
+            else:
+                pretty_log(
+                    "Dream Mode",
+                    "REM reply unparseable — fragment window left unstamped "
+                    "so the next cycle retries it.",
+                    level="WARNING", icon=Icons.WARN,
+                )
 
             msg = f"Dream Complete. Synthesized {applied_consolidations} new meta-memories and extracted {h_count} heuristics.{metrics_note}"
             pretty_log("Dream Mode", msg, icon=Icons.OK)
@@ -2242,8 +2390,19 @@ Return ONLY a JSON object with:
         if journal is None:
             return None
         try:
-            from .journal_challenges import pick_journal_challenge
+            from .journal_challenges import (
+                pick_journal_challenge, pick_stashed_challenge,
+            )
             mined = pick_journal_challenge(journal)
+            if mined is None and type(journal).__module__.startswith("ghost_agent"):
+                # Live journal empty/unmineable — the normal case:
+                # phase-1 process_journal_queue drains the queue ~2min
+                # into idle, hours before this phase-3 tick. Fall back
+                # to the persisted stash phase-1 copied aside before
+                # consuming. (The module check mirrors the MagicMock
+                # guards elsewhere in this file: a mock journal must not
+                # reach the operator's real stash file from a test.)
+                mined = pick_stashed_challenge()
         except Exception as e:
             logger.debug(f"Journal challenge mining failed: {e}")
             return None
@@ -2342,6 +2501,7 @@ Return ONLY a JSON object with:
         passed: bool,
         cluster_key: str,
         solution_novelty: Optional[float] = None,
+        is_background: bool = False,
     ) -> dict:
         """Outcome-routed lesson extractor.
 
@@ -2418,7 +2578,8 @@ Return ONLY a JSON object with:
         }
         try:
             data = await self.context.llm_client.chat_completion(
-                payload, use_worker=True, timeout=120.0, task_label="dream"
+                payload, use_worker=True, timeout=120.0, task_label="dream",
+                is_background=is_background,
             )
             raw = data["choices"][0]["message"].get("content", "")
             parsed = extract_json_from_text(raw) or {}
@@ -2570,6 +2731,12 @@ Return ONLY a JSON object with:
         # XML, setup failure, validator syntax error) don't leave a stale
         # delta from a prior run on the Dreamer instance.
         self.last_compression_delta = 0.0
+        # Counterfactual snapshot pre-clear (mirrors the caller's
+        # last_self_play_status pre-clear): None = "sim did not conclude",
+        # which tells the quarantine to fall back rather than trust a
+        # stale prior sim's trigger list. Stamped with the real list at
+        # sim conclusion, next to last_self_play_status.
+        self.last_selfplay_hydrated_triggers = None
 
         system_message = SYNTHETIC_CHALLENGE_PROMPT
 
@@ -2770,6 +2937,7 @@ Return ONLY a JSON object with:
         # still record the outcome against whichever cluster the
         # template's challenge_prompt classifies into.
         from .challenge_templates import try_template, pick_random_template
+        from . import challenge_templates as _ct_mod
         _cluster_key = seed.get("cluster_key")
         # Saturated clusters: the frontier tracker tells us which
         # clusters to avoid when rolling the random-template dice, so
@@ -2808,6 +2976,13 @@ Return ONLY a JSON object with:
         _resolved_tier = _resolve_tier(_cluster_key) if _cluster_key else None
         _tpl = try_template(_cluster_key, tier=_resolved_tier)
         _tpl_source = "cluster"
+        # Cluster of the template ACTUALLY used for generation (proposal H
+        # saturation stats). Stays "" for LLM-generated, journal-mined and
+        # injected challenges — deriving it from the seed instead charged
+        # the template even when the saturation re-check flipped the
+        # cluster to None and the LLM generated something novel, while
+        # cold-start random templates (no seed cluster) were never tracked.
+        _used_template_cluster = ""
         challenge_domains: list = []
         journal_source = False
         # Only the LLM-generation path below populates this; deterministic
@@ -2853,6 +3028,12 @@ Return ONLY a JSON object with:
                 exclude_clusters=_saturated, tier_resolver=_resolve_tier
             )
             _tpl_source = "cold_start_random"
+            if _tpl is not None:
+                # pick_random_template records its chosen cluster in the
+                # module-level dedup key — the only place the pick is
+                # exposed (the return is a bare 3-tuple).
+                _used_template_cluster = str(
+                    getattr(_ct_mod, "_LAST_TEMPLATE_KEY", "") or "")
         elif _tpl is None and not gen_ok and _saturated:
             # Saturation coin-flip: previously 50/50 between rotating to
             # a non-saturated template and falling through to LLM-gen.
@@ -2870,6 +3051,9 @@ Return ONLY a JSON object with:
                     exclude_clusters=_saturated, tier_resolver=_resolve_tier
                 )
                 _tpl_source = "saturation_template_rotation"
+                if _tpl is not None:
+                    _used_template_cluster = str(
+                        getattr(_ct_mod, "_LAST_TEMPLATE_KEY", "") or "")
                 pretty_log(
                     "Self-Play Frontier",
                     "Saturation coin-flip (20%) → picking a non-saturated template.",
@@ -2883,6 +3067,11 @@ Return ONLY a JSON object with:
                     icon=Icons.BRAIN_AIM,
                 )
         if _tpl is not None and not gen_ok:
+            if _tpl_source == "cluster":
+                # try_template rendered the seed cluster's template — the
+                # post-saturation-check _cluster_key is the cluster that
+                # was actually rendered.
+                _used_template_cluster = _cluster_key or ""
             challenge, setup_script, validation_script = _tpl
             # Templates don't go through the markdown extractor because
             # they're already pure Python, but the sanitizer pass is still
@@ -3025,7 +3214,11 @@ Return ONLY a JSON object with:
                     payload,
                     use_coding=has_coding_node,
                     use_worker=not has_coding_node,
-                    is_background=False,
+                    # Honour the caller's mode: idle-loop generation must
+                    # not bump foreground_tasks on the production client
+                    # (same C1 contract as the _BackgroundOnlyLLM wrapper
+                    # for solver turns below).
+                    is_background=is_background,
                 )
                 content_text = data["choices"][0]["message"]["content"]
 
@@ -3287,7 +3480,7 @@ Return ONLY a JSON object with:
                         ref_repair_payload,
                         use_coding=has_coding_node,
                         use_worker=not has_coding_node,
-                        is_background=False,
+                        is_background=is_background,
                     )
                     ref_repair_text = ref_repair_data["choices"][0]["message"]["content"]
                     ref_repair_text = re.sub(
@@ -3426,7 +3619,7 @@ Return ONLY a JSON object with:
                         repair_payload,
                         use_coding=has_coding_node,
                         use_worker=not has_coding_node,
-                        is_background=False,
+                        is_background=is_background,
                     )
                     repair_text = repair_data["choices"][0]["message"]["content"]
                     repair_text = re.sub(
@@ -3507,24 +3700,103 @@ Return ONLY a JSON object with:
             # suggestions whose write lands in /dev/null anyway.
             is_read_only = True
 
+            # Whitelist of read-only attributes that may legitimately pass
+            # through to the real playbook. Same M1 fix as
+            # ReadOnlyVectorMemory below: the previous `__getattr__`
+            # forwarded EVERYTHING, so the temp agent's fresh MemoryBus
+            # called record_retrievals_bulk on the PRODUCTION store —
+            # synthetic turns bumped real retrieval counters with no
+            # matching helpful-credit, pushing real lessons toward
+            # prune_low_utility eligibility.
+            _SAFE_PASSTHROUGH = frozenset({
+                "get_playbook_items", "get_recent_failures", "list_lessons",
+                "find_by_trigger", "file_path", "last_playbook_triggers",
+                "_load_playbook", "_get_lock", "_playbook_items_and_branch",
+                "_filter_quarantined",
+            })
+
             def __init__(self, real_sm):
                 self.real_sm = real_sm
+                # Triggers hydrated INSIDE this sim. The counterfactual
+                # quarantine snapshot (last_selfplay_hydrated_triggers) is
+                # built from this — NOT from the shared
+                # skill_memory.last_playbook_triggers attribute, which a
+                # concurrent user turn can re-stamp mid-replay.
+                self.hydrated_triggers = []
+
+            def _note_triggers(self, triggers):
+                if not isinstance(triggers, (list, tuple)):
+                    return
+                for trig in triggers:
+                    if trig and trig not in self.hydrated_triggers:
+                        self.hydrated_triggers.append(trig)
 
             def get_playbook_context(self, *args, **kwargs):
                 if self.real_sm:
-                    return self.real_sm.get_playbook_context(*args, **kwargs)
+                    # Reads must stay pure: the real method bumps retrieval
+                    # counters by default (keyword-only flag).
+                    kwargs["record_retrievals"] = False
+                    out = self.real_sm.get_playbook_context(*args, **kwargs)
+                    self._note_triggers(
+                        getattr(self.real_sm, "last_playbook_triggers", None))
+                    return out
                 return ""
 
+            # Explicitly block all mutation methods. record_retrievals_bulk
+            # still CAPTURES the triggers it was asked to credit — that is
+            # the MemoryBus's post-fusion "these lessons entered the
+            # prompt" signal, i.e. exactly what "hydrated in this sim"
+            # means for the bus path.
             def learn_lesson(self, *args, **kwargs):
                 pass
 
             def save_playbook(self, *args, **kwargs):
                 pass
 
+            def record_retrieval(self, *args, **kwargs):
+                pass
+
+            def record_retrievals_bulk(self, triggers=None, *args, **kwargs):
+                self._note_triggers(list(triggers) if triggers else [])
+                return 0
+
+            def record_helpful_retrieval(self, *args, **kwargs):
+                pass
+
+            def credit_recent_retrievals(self, *args, **kwargs):
+                return 0
+
+            def retract_lessons_from_trajectory(self, *args, **kwargs):
+                return 0
+
+            def prune_low_utility(self, *args, **kwargs):
+                return 0
+
+            def quarantine_lesson(self, *args, **kwargs):
+                return 0
+
+            def mark_verified(self, *args, **kwargs):
+                pass
+
+            def remove_by_trigger(self, *args, **kwargs):
+                return False
+
+            def _update_lesson_fields(self, *args, **kwargs):
+                return 0
+
+            def _save_playbook_unlocked(self, *args, **kwargs):
+                pass
+
             def __getattr__(self, name):
-                if self.real_sm:
+                # Only forward whitelisted read attributes; everything else
+                # raises so a future SkillMemory mutation method can't
+                # silently bypass this wrapper during self-play.
+                if name in type(self)._SAFE_PASSTHROUGH and self.real_sm is not None:
                     return getattr(self.real_sm, name)
-                raise AttributeError(name)
+                raise AttributeError(
+                    f"{type(self).__name__}: attribute {name!r} is not in the "
+                    "read-only passthrough whitelist"
+                )
 
         class SafeCollection:
             def __init__(self, real_collection):
@@ -3763,22 +4035,11 @@ Return ONLY a JSON object with:
                         pretty_log("Self-Play Error", f"Setup script failed: {s_out}", level="WARNING", icon=Icons.WARN)
                         return f"Synthetic challenge generation failed during setup script execution:\n{s_out}\n\nSYSTEM INSTRUCTION: This setup script was executed in a temporary, isolated sandbox that has now been destroyed. DO NOT try to fix `.setup.py` using the file_system tool. DO NOT call the `self_play` tool again. Inform the user that generation failed."
 
-                    # Snapshot the mock files the setup script produced, so
+                    # Snapshot the mock files the setup script produced
+                    # (recursively — see module-level _snapshot_mocks), so
                     # we can restore them before each retry attempt. Without
                     # this, attempt 1 can mutate the mock data and attempt 2
                     # validates against a corrupted input → false failure.
-                    def _snapshot_mocks(sandbox_path: Path) -> dict:
-                        snap = {}
-                        try:
-                            for p in sandbox_path.iterdir():
-                                if p.is_file() and p.name not in {".setup.py", ".validator.py"} and not p.name.startswith(".mount_sync_"):
-                                    try:
-                                        snap[p.name] = p.read_bytes()
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-                        return snap
                     setup_snapshot = await asyncio.to_thread(_snapshot_mocks, Path(temp_sandbox))
 
                 validator_path = Path(temp_sandbox) / ".validator.py"
@@ -3908,14 +4169,10 @@ Return ONLY a JSON object with:
                             await asyncio.to_thread(solution_path.write_text, probe_solution_src)
                             # Restore mocks before running the validator —
                             # the probe may have mutated them indirectly
-                            # through the instrumented exec above.
+                            # through the instrumented exec above. No purge:
+                            # the probe solution.py written above must
+                            # survive for the validator run.
                             if setup_snapshot:
-                                def _restore_mocks(sandbox_path, snap):
-                                    for name, blob in (snap or {}).items():
-                                        try:
-                                            (sandbox_path / name).write_bytes(blob)
-                                        except Exception:
-                                            pass
                                 await asyncio.to_thread(
                                     _restore_mocks, Path(temp_sandbox), setup_snapshot
                                 )
@@ -3974,34 +4231,9 @@ Return ONLY a JSON object with:
                 # write, deletes a mock) has already corrupted the
                 # sandbox by the time we get here. Restore the post-
                 # setup snapshot to cancel those side effects before the
-                # solver starts. Also purge any stragglers the pre-
-                # flight created that weren't in the snapshot.
-                def _preflight_restore(sandbox_path: Path, snap: dict):
-                    try:
-                        snap_names = set(snap.keys())
-                        for p in sandbox_path.iterdir():
-                            if p.name in {".setup.py", ".validator.py", ".preflight.py", "acquired_skills"}:
-                                continue
-                            if p.name.startswith(".mount_sync_"):
-                                continue
-                            if p.name in snap_names:
-                                continue
-                            try:
-                                if p.is_file() or p.is_symlink():
-                                    p.unlink()
-                                elif p.is_dir():
-                                    import shutil as _shutil
-                                    _shutil.rmtree(p, ignore_errors=True)
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    for name, blob in snap.items():
-                        try:
-                            (sandbox_path / name).write_bytes(blob)
-                        except Exception:
-                            pass
-
+                # solver starts (module-level _preflight_restore: purge
+                # stragglers the pre-flight created, then rewrite the
+                # snapshot).
                 if setup_snapshot:
                     await asyncio.to_thread(
                         _preflight_restore, Path(temp_sandbox), setup_snapshot
@@ -4171,65 +4403,10 @@ Return ONLY a JSON object with:
                     )}]
                 }
 
-                # Files that `_restore_mocks` must NEVER delete even if
-                # they're not in the snapshot: the tooling files the
-                # self-play pipeline itself wrote, plus acquired_skills/.
-                _PROTECTED_NAMES = {
-                    ".setup.py", ".validator.py", ".preflight.py",
-                    "acquired_skills",
-                }
-
-                def _restore_mocks(sandbox_path: Path, snap: dict, purge_stragglers: bool = False):
-                    """Restore the pristine post-setup sandbox state.
-
-                    When ``purge_stragglers`` is True (between-attempts
-                    cleanup), delete any file that wasn't part of the
-                    snapshot (e.g., a stale `solution.py` from attempt
-                    N-1, or output artifacts). This is the S4 fix for
-                    cross-attempt leakage.
-
-                    When ``purge_stragglers`` is False (pre-validator
-                    restore), only rewrite the snapshot entries. The
-                    solver just wrote `solution.py` and the validator
-                    is about to subprocess-run it, so purging would
-                    delete the very file the validator needs and
-                    produce a spurious "No such file or directory"
-                    failure on every attempt.
-                    """
-                    if not snap and not sandbox_path.exists():
-                        return
-                    snap_names = set(snap.keys()) if snap else set()
-                    if purge_stragglers:
-                        try:
-                            for p in sandbox_path.iterdir():
-                                if p.name in _PROTECTED_NAMES:
-                                    continue
-                                if p.name.startswith(".mount_sync_"):
-                                    continue
-                                if p.name in snap_names:
-                                    continue
-                                try:
-                                    if p.is_file() or p.is_symlink():
-                                        p.unlink()
-                                    elif p.is_dir():
-                                        import shutil as _shutil
-                                        _shutil.rmtree(p, ignore_errors=True)
-                                except Exception as e:
-                                    logger.warning(
-                                        f"Failed to purge straggler {p.name}: {e}"
-                                    )
-                        except Exception as e:
-                            logger.debug(f"Straggler purge iteration failed: {e}")
-                    # Always: rewrite snapshot entries so any in-place
-                    # mutations the solver made to mock data are reverted.
-                    if snap:
-                        for name, blob in snap.items():
-                            try:
-                                (sandbox_path / name).write_bytes(blob)
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to restore mock {name}: {e}"
-                                )
+                # Between-attempts / pre-validator restores use the
+                # module-level `_restore_mocks` (recursive snapshot keys,
+                # `_SELFPLAY_PROTECTED_NAMES` guard, `purge_stragglers`
+                # flag — see its docstring for the purge semantics).
 
                 full_simulation_transcript = ""
                 passed = False
@@ -4509,14 +4686,14 @@ Return ONLY a JSON object with:
                         solution_novelty = None
 
                 # Resolve the template key for per-template saturation
-                # tracking (proposal H). When the dreamer routed via a
-                # deterministic template the key is the cluster name
-                # of the template chosen; LLM-generated challenges
-                # report an empty template_key and skip per-template
-                # tracking.
-                template_key = ""
-                if seed.get("cluster_key") and not seed.get("frontier_fallback"):
-                    template_key = seed.get("cluster_key") or ""
+                # tracking (proposal H). The key is the cluster name of the
+                # template ACTUALLY chosen (captured on the generation path
+                # above) — not the seed's cluster, which diverges when the
+                # saturation re-check rotates away from it or when a
+                # cold-start random template runs with no seed at all.
+                # LLM-generated / journal-mined / injected challenges
+                # report "" and skip per-template tracking.
+                template_key = _used_template_cluster
 
                 frontier_result = {"compression_delta": 0.0, "is_new_cluster": True, "mastered": False}
                 if frontier_tracker is not None and validator_infra_crash:
@@ -4694,8 +4871,20 @@ Return ONLY a JSON object with:
                     # Infra crashes are excluded: a crash-prone generator
                     # fingerprint would read as "hard challenge"
                     # (passed=False) and get REINFORCED — the opposite of
-                    # what the tracker is for.
-                    if mem_dir is not None and not _tpl and not validator_infra_crash:
+                    # what the tracker is for. Journal-mined, injected
+                    # (counterfactual replay) and solver-aborted runs are
+                    # excluded too: none of those outcomes were produced by
+                    # the LLM generator this tracker biases, so feeding
+                    # them into suggest_bias() is noise wearing a
+                    # generator-feedback label.
+                    if (
+                        mem_dir is not None
+                        and not _tpl
+                        and not validator_infra_crash
+                        and not journal_source
+                        and not injected_challenge
+                        and not aborted_by_solver
+                    ):
                         adv_tracker = AdversarialGeneratorTracker(Path(mem_dir))
                         fp = fingerprint_prompt(seed.get("hint", "") or "")
                         await asyncio.to_thread(
@@ -4722,6 +4911,7 @@ Return ONLY a JSON object with:
                         passed=passed,
                         cluster_key=cluster_key,
                         solution_novelty=solution_novelty,
+                        is_background=is_background,
                     )
 
                     # Validate the lesson before writing:
@@ -4936,6 +5126,15 @@ Return ONLY a JSON object with:
                 # Replays themselves are NOT re-persisted — a replayed
                 # replay would compound the ledger forever.
                 self.last_self_play_status = str(status_str)
+                # Counterfactual quarantine contract: the playbook triggers
+                # hydrated INSIDE this sim (accumulated by the
+                # ReadOnlySkillMemory wrapper). An empty list means "the
+                # sim hydrated nothing — quarantine nothing"; only a
+                # missing/None snapshot lets the quarantine fall back to
+                # the shared skill_memory attribute.
+                self.last_selfplay_hydrated_triggers = list(
+                    getattr(isolated_context.skill_memory,
+                            "hydrated_triggers", []) or [])
                 if not injected_challenge:
                     try:
                         from .counterfactual import persist_challenge

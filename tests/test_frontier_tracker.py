@@ -362,3 +362,118 @@ class TestPartialClusterSchemaBackfill:
         for key in ("runs", "recent_outcomes", "recent_hashes", "mastered",
                     "total_first_try_wins", "unlocked_tier_index"):
             assert key in cluster, f"missing {key}"
+
+
+class TestLockOrdering:
+    """Regression guard for the 2026-07-20 ABBA deadlock.
+
+    `note_generated_challenge` used to acquire `self._lock` BEFORE
+    `self._crossproc_lock()` while `note_reflection_failure` and
+    `record_run` acquired them in the opposite order. flock on two
+    separate fds conflicts even within one process, so two threads could
+    each hold one lock while waiting on the other — freezing the event
+    loop permanently. Mandatory order (documented in `__init__`):
+    crossproc flock FIRST, then `_lock`.
+    """
+
+    @staticmethod
+    def _lock_kind(item):
+        """Classify a `with` item as 'cross' (self._crossproc_lock()),
+        'proc' (self._lock) or None. AST-based so it is robust to
+        formatting/whitespace changes."""
+        import ast
+        ctx = item.context_expr
+        if (
+            isinstance(ctx, ast.Call)
+            and isinstance(ctx.func, ast.Attribute)
+            and ctx.func.attr == "_crossproc_lock"
+        ):
+            return "cross"
+        if isinstance(ctx, ast.Attribute) and ctx.attr == "_lock":
+            return "proc"
+        return None
+
+    def _scan(self):
+        import ast
+        import inspect
+        import ghost_agent.memory.frontier as frontier_mod
+
+        tree = ast.parse(inspect.getsource(frontier_mod))
+        violations = []
+        correct_dual = 0
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.With):
+                continue
+            kinds = [k for k in map(self._lock_kind, node.items) if k]
+            if "proc" in kinds and "cross" in kinds:
+                if kinds.index("proc") < kinds.index("cross"):
+                    violations.append(node.lineno)
+                else:
+                    correct_dual += 1
+            elif "proc" in kinds:
+                # `_lock` held alone: any crossproc acquisition NESTED
+                # inside its body inverts the mandatory order too.
+                for inner in ast.walk(node):
+                    if inner is node or not isinstance(inner, ast.With):
+                        continue
+                    if "cross" in map(self._lock_kind, inner.items):
+                        violations.append(inner.lineno)
+            elif "cross" in kinds:
+                for inner in ast.walk(node):
+                    if inner is node or not isinstance(inner, ast.With):
+                        continue
+                    if "proc" in map(self._lock_kind, inner.items):
+                        correct_dual += 1
+        return violations, correct_dual
+
+    def test_no_method_takes_lock_before_crossproc_lock(self):
+        violations, correct_dual = self._scan()
+        assert violations == [], (
+            "lock-order inversion (self._lock before _crossproc_lock) at "
+            f"frontier.py line(s) {violations}; mandatory order is "
+            "crossproc flock first, then _lock (see __init__)"
+        )
+        # Sanity: the scanner must actually see the dual-lock sites
+        # (note_generated_challenge, note_reflection_failure, record_run)
+        # or the assertion above is vacuous.
+        assert correct_dual >= 3
+
+    def test_concurrent_dual_lock_writers_do_not_deadlock(self, tmp_path):
+        """Two-thread smoke test: hammer the two dual-lock write paths
+        that deadlocked each other under the old inverted ordering. With
+        a single mandatory order this can never deadlock, so the test is
+        deterministic-pass on correct code; a reintroduced inversion
+        shows up as a join timeout instead of a hung test run."""
+        import threading
+
+        tracker = FrontierTracker(tmp_path)
+        errors = []
+
+        def hammer(fn):
+            try:
+                for i in range(30):
+                    fn(i)
+            except Exception as e:  # pragma: no cover - diagnostic only
+                errors.append(e)
+
+        threads = [
+            threading.Thread(
+                target=hammer,
+                args=(lambda i: tracker.note_generated_challenge(f"challenge {i}"),),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=hammer,
+                args=(lambda i: tracker.note_reflection_failure("sql", diagnosis=str(i)),),
+                daemon=True,
+            ),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not any(t.is_alive() for t in threads), (
+            "dual-lock writer threads did not finish — probable "
+            "lock-order deadlock"
+        )
+        assert errors == []

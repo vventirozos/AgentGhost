@@ -44,12 +44,17 @@ class TestCallSiteWiring:
         idx = src.index("strikes.note_action(")
         assert "threshold=2" in src[idx:idx + 300]
 
-    def test_hard_abort_at_3(self):
+    def test_hard_abort_two_tier(self):
+        # 2026-07-20: the hard stop is two-tier — general tools abort at 3,
+        # read/write-exempt tools keep the documented >=5 backstop
+        # (READWRITE_HARD_STOP from strikes.py) so one post-steer re-read
+        # can't abort a pending write.
         src = self._src()
         idx = src.index("_noprogress_trip is not None and not force_stop")
-        window = src[idx:idx + 600]
-        assert "_acnt >= 3" in window
-        assert "_acnt >= 5" not in window
+        window = src[idx:idx + 1400]
+        assert "_acnt >= _hard_n" in window
+        assert "READWRITE_HARD_STOP" in window
+        assert "else 3" in window
 
     def test_steers_lead_with_evidence_gathering(self):
         src = self._src()

@@ -109,6 +109,12 @@ class FrontierTracker:
 
     def __init__(self, memory_dir: Path):
         self.file_path = Path(memory_dir) / "self_play_frontier.json"
+        # LOCK ORDER (mandatory): any method taking BOTH locks MUST acquire
+        # `_crossproc_lock()` (the fcntl flock) FIRST, then `_lock`. The
+        # reverse order deadlocks: thread A holds `_lock` waiting on the
+        # flock while thread B holds the flock waiting on `_lock` — flock
+        # on two separate fds conflicts even within one process.
+        # Enforced by tests/test_frontier_tracker.py::TestLockOrdering.
         self._lock = threading.RLock()
         # `_lock_path` is a sibling file used purely for cross-process
         # `fcntl.flock`. Keeping it separate from the data file means the
@@ -222,7 +228,10 @@ class FrontierTracker:
         head = (challenge or "").strip()[: self.RECENT_CHALLENGE_HEAD]
         if not head:
             return
-        with self._lock, self._crossproc_lock():
+        # Lock order: flock first, then _lock (see __init__) — the
+        # reversed order deadlocked against note_reflection_failure /
+        # record_run running on another thread.
+        with self._crossproc_lock(), self._lock:
             state = self._load()
             recent = state.setdefault("recent_challenges", [])
             recent.append(head)
@@ -231,10 +240,14 @@ class FrontierTracker:
 
     def recent_generated_challenges(self, limit: int = 5) -> list:
         """Most recent challenge heads (newest last), for use as negative
-        examples in the generation prompt."""
+        examples in the generation prompt. ``limit <= 0`` returns an empty
+        list (``recent[-0:]`` would have returned the WHOLE window)."""
+        limit = int(limit)
+        if limit <= 0:
+            return []
         with self._lock:
             recent = self._load().get("recent_challenges", []) or []
-        return list(recent[-max(0, int(limit)):])
+        return list(recent[-limit:])
 
     #: filename-looking literals — the single strongest repeat tell: the
     #: mode-collapsed generator reuses the same mock dataset name even

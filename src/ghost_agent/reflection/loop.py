@@ -136,8 +136,6 @@ class Reflector:
         max_failures: int = 3,
         model: str = "",
         session_id_prefix: str = "reflect",
-        accept_low_novelty_passes: bool = False,
-        novelty_threshold: float = 0.15,
         verify_fn: Optional[VerifyCallable] = None,
         verify_timeout_s: float = 60.0,
     ):
@@ -153,15 +151,6 @@ class Reflector:
         self.max_failures = int(max_failures)
         self.model = model
         self.session_id_prefix = session_id_prefix
-        # Proposal F (2026-05-17): when True, the reflector ALSO picks
-        # up self-play trajectories that PASSED but with novelty below
-        # `novelty_threshold`. These are the cycles where the agent
-        # re-emitted a structurally-identical solution to a prior win —
-        # technically a pass, but with no learning signal under the
-        # new score. Pre-2026-05 these trajectories never reached the
-        # reflector because the filter was strict on FAILED.
-        self.accept_low_novelty_passes = bool(accept_low_novelty_passes)
-        self.novelty_threshold = float(novelty_threshold)
 
     async def run(
         self,
@@ -204,11 +193,19 @@ class Reflector:
                 break
 
         for traj in candidates:
-            # Mark BEFORE awaiting (mirrors reflect_one at line ~204).
-            # During this await window a concurrent reflect_one(traj) —
-            # e.g. a user-correction scheduled via create_task — must see
-            # the id already claimed, or the same trajectory gets
-            # reflected twice (duplicate/contradictory SFT data).
+            # Candidates were vetted at collection time; a concurrent
+            # reflect_one — e.g. a user-correction scheduled via
+            # create_task, sharing this set — may have claimed and
+            # reflected this one while an earlier candidate's critique
+            # was awaited. Re-check RIGHT before claiming (check+add with
+            # no await between them is atomic on the event loop).
+            if traj.id in reflected_set:
+                report.skipped_duplicate += 1
+                continue
+            # Mark BEFORE awaiting (mirrors reflect_one at line ~270).
+            # During this await window a concurrent reflect_one(traj)
+            # must see the id already claimed, or the same trajectory
+            # gets reflected twice (duplicate/contradictory SFT data).
             reflected_set.add(traj.id)
             outcome = await self._reflect_one(traj)
             report.outcomes.append(outcome)
@@ -224,7 +221,10 @@ class Reflector:
                 # A transient failure (idle-LLM timeout, unparseable critique)
                 # must NOT permanently claim the trajectory — un-mark it so a
                 # later tick can retry. The id was held only to block a
-                # concurrent reflect_one from double-reflecting DURING the await.
+                # concurrent reflect_one from double-reflecting DURING the
+                # await. Safe: the membership check above guarantees this
+                # claim was made by THIS iteration, so the discard can never
+                # un-claim an id a concurrent path successfully reflected.
                 reflected_set.discard(traj.id)
 
         return report
@@ -287,38 +287,18 @@ class Reflector:
         return out
 
     def _is_reflectable(self, traj: Trajectory) -> bool:
-        """Decide whether a trajectory belongs in the reflection batch.
-
-        Always accept ``FAILED``. When ``accept_low_novelty_passes`` is
-        on, ALSO accept self-play trajectories that passed but whose
-        recorded novelty score is below the threshold — those cycles
-        produced no learning signal under the new score (proposal F).
-        Everything else is ignored.
+        """Decide whether a trajectory belongs in the reflection batch:
+        ``FAILED`` trajectories only. (The proposal-F low-novelty-pass
+        opt-in was removed 2026-07-20 as dead-by-construction: nothing
+        in the live tree writes ``extra["solution_novelty"]`` and the
+        dream loop's isolated context carries no trajectory collector,
+        so qualifying self-play passes could never reach this filter.)
         """
         # Never learn from the agent's own error-recovery turns — they
         # yield transient tooling trivia, not task knowledge.
         if _is_recovery_scaffold(traj):
             return False
-        if traj.outcome == Outcome.FAILED.value:
-            return True
-        if not self.accept_low_novelty_passes:
-            return False
-        # Self-play passes with very low novelty count as "boring wins"
-        # worth meta-critiquing. Read the novelty signal from the
-        # trajectory's `extra` dict where dream.py stashes it.
-        extra = getattr(traj, "extra", None) or {}
-        if not isinstance(extra, dict):
-            return False
-        if (extra.get("task_kind") or "").lower() != "self_play" and \
-                (getattr(traj, "task_kind", "") or "").lower() != "self_play":
-            return False
-        novelty = extra.get("solution_novelty")
-        if novelty is None:
-            return False
-        try:
-            return float(novelty) < self.novelty_threshold
-        except Exception:
-            return False
+        return traj.outcome == Outcome.FAILED.value
 
     async def _reflect_one(self, traj: Trajectory) -> ReflectionOutcome:
         out = ReflectionOutcome(source_trajectory_id=traj.id)

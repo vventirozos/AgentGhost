@@ -1,5 +1,6 @@
 """Tests for distill.collector TrajectoryCollector."""
 
+import datetime
 import json
 from pathlib import Path
 
@@ -105,6 +106,46 @@ def test_iter_skips_malformed_lines(tmp_path):
     res = list(c.iter_trajectories())
     assert len(res) == 2  # only the two good ones
     assert {t.user_request for t in res} == {"good", "still good"}
+
+
+def test_append_resyncs_after_crash_truncated_tail(tmp_path):
+    """A crash mid-append leaves a tail line with no trailing newline.
+    The next append must re-sync to a newline boundary — otherwise the
+    new record concatenates onto the truncated tail and every JSONL
+    reader drops BOTH lines."""
+    c = TrajectoryCollector(root=tmp_path, session_id="crash")
+    c.append(_sample(user_request="first"))
+    [f] = list(tmp_path.rglob("session-*.jsonl"))
+    with f.open("a") as fh:
+        fh.write('{"id": "trunc')  # no trailing \n — simulated crash
+    c.append(_sample(user_request="second"))
+
+    lines = f.read_text().splitlines()
+    assert len(lines) == 3  # first + truncated junk + second, each on its own line
+    json.loads(lines[2])    # the new record parses on its own
+    reqs = {t.user_request for t in c.iter_trajectories()}
+    assert reqs == {"first", "second"}
+
+
+def test_append_clean_tail_gets_no_spurious_blank_line(tmp_path):
+    c = TrajectoryCollector(root=tmp_path, session_id="clean")
+    c.append(_sample(user_request="a"))
+    c.append(_sample(user_request="b"))
+    [f] = list(tmp_path.rglob("session-*.jsonl"))
+    content = f.read_text()
+    assert "\n\n" not in content
+    assert len(content.splitlines()) == 2
+
+
+def test_append_to_empty_existing_file_adds_no_leading_newline(tmp_path):
+    c = TrajectoryCollector(root=tmp_path, session_id="empty")
+    path = c._file_for(datetime.datetime.utcnow())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()  # 0-byte file (crashed before the first write)
+    c.append(_sample(user_request="only"))
+    content = path.read_text()
+    assert not content.startswith("\n")
+    assert len(content.splitlines()) == 1
 
 
 def test_append_failure_is_non_fatal(tmp_path, monkeypatch):
