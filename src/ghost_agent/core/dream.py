@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import asyncio
 from typing import List, Dict, Any, Optional
@@ -1194,6 +1195,14 @@ class Dreamer:
     Active Memory Consolidation System.
     "Dreams" about recent memories to synthesize them into higher-order facts and extract heuristics.
     """
+
+    # Minimum NEW fragment IDs (vs. the previous cycle's set) before a
+    # re-dream is worth an LLM call. 1 was the overnight churn engine
+    # (2026-07-20): each idle self-play run minted one new digest ID and
+    # re-triggered a full REM over an otherwise-identical window.
+    # Env-overridable: GHOST_DREAM_MIN_NEW=1 restores the old behavior.
+    REDREAM_MIN_NEW_FRAGMENTS = max(1, int(os.getenv("GHOST_DREAM_MIN_NEW", "3") or 3))
+
     def __init__(self, agent_context):
         self.context = agent_context
         self.memory = agent_context.memory_system
@@ -1342,20 +1351,38 @@ class Dreamer:
                 pretty_log("Dream Mode", msg, icon=Icons.DREAM)
                 return msg
 
-        # Idempotency guard: if the auto-memory set hasn't changed since
-        # the last REM cycle, a re-run will at best produce the same
-        # output (often 0 consolidations / 0 heuristics) and at worst
-        # burn an LLM call on noise. Skip until new fragments arrive.
-        # The last set is cached on the agent context so the check
+        # Idempotency guard: if the auto-memory set has too little NEW
+        # material since the last REM cycle, a re-run will at best produce
+        # the same output (often 0 consolidations / 0 heuristics) and at
+        # worst burn an LLM call on noise. Skip until enough new fragments
+        # arrive. The last set is cached on the agent context so the check
         # survives the per-tick Dreamer re-instantiation.
+        #
+        # DELTA-AWARE since 2026-07-20: equality alone was the overnight
+        # churn engine — every idle self-play run minted ONE new
+        # `selfplay:<cluster>:<ts>` ID, which reopened the guard, and the
+        # cycle re-extracted near-identical heuristics from a 59/60-same
+        # fragment window all night (10+ re-saves of the same two lessons,
+        # 0 meta-memories synthesized). One changed fragment cannot change
+        # the meta-patterns of a 60-fragment window; require a minimum of
+        # NEW-fragment evidence before re-dreaming.
         current_fragment_key = frozenset(ids)
         last_fragment_key = getattr(self.context, "_last_dream_fragment_ids", None)
         # Defensive isinstance guard: on a MagicMock context, attribute
         # access returns a child mock rather than the `None` default, so
         # an == comparison would silently always be False. Only honour
         # the cache when it's a real frozenset.
-        if isinstance(last_fragment_key, frozenset) and last_fragment_key == current_fragment_key:
-            msg = f"Skipping REM — fragment set unchanged ({len(ids)} memories, no new input since last cycle)."
+        if isinstance(last_fragment_key, frozenset):
+            fresh = len(current_fragment_key - last_fragment_key)
+        else:
+            fresh = len(current_fragment_key)
+        if isinstance(last_fragment_key, frozenset) and fresh < self.REDREAM_MIN_NEW_FRAGMENTS:
+            if fresh:
+                msg = (f"Skipping REM — only {fresh} new fragment(s) since "
+                       f"last cycle (< {self.REDREAM_MIN_NEW_FRAGMENTS} "
+                       f"needed; {len(ids)} total).")
+            else:
+                msg = f"Skipping REM — fragment set unchanged ({len(ids)} memories, no new input since last cycle)."
             if episode_lessons:
                 msg += f" Episodic pass still learned {episode_lessons} strategy lessons."
             if distilled_lessons:

@@ -128,15 +128,39 @@ async def test_tool_replace_file_aider(sandbox_dir):
 
 @pytest.mark.asyncio
 async def test_tool_replace_file_aider_robust_parsing(sandbox_dir):
+    """REVERSED 2026-07-19: a separator glued to content (`…')====`) is no
+    longer parsed. That anywhere-match tolerance is exactly what corrupted
+    WebOS index.html — a `=====` inside a banner comment on the SEARCH
+    text's first line became the separator, SEARCH parsed as `//`, and the
+    file's first `//` (in a CSS url) was replaced with the whole blob under
+    a SUCCESS. The separator must now be a full line of 4+ equals; a
+    malformed envelope fails CLOSED with the corrective instruction and the
+    file untouched. Tolerances that remain: content on the opener line,
+    missing newline before the closer (see the next test)."""
+    test_file = sandbox_dir / "test.txt"
+    original = "def my_func():\n    print('hello')\n    return True"
+    test_file.write_text(original)
+
+    # Missing newline before ==== (separator glued to content) → rejected.
+    aider_content = "<<<< SEARCH\ndef my_func():\n    print('hello')====\ndef my_func():\n    print('world')>>>>"
+
+    res = await tool_replace_text("test.txt", aider_content, None, sandbox_dir)
+    assert "failed to parse" in res
+    assert test_file.read_text() == original
+
+
+async def test_tool_replace_file_loose_tolerances_still_parse(sandbox_dir):
+    # The tolerance that remains: a missing newline before the closer —
+    # with the separator on its own line as now required.
     test_file = sandbox_dir / "test.txt"
     test_file.write_text("def my_func():\n    print('hello')\n    return True")
-    
-    # Missing newlines before ==== and >>>>
-    aider_content = "<<<< SEARCH\ndef my_func():\n    print('hello')====\ndef my_func():\n    print('world')>>>>"
-    
+
+    aider_content = ("<<<< SEARCH\ndef my_func():\n"
+                     "    print('hello')\n====\ndef my_func():\n"
+                     "    print('world')>>>>")
+
     res = await tool_replace_text("test.txt", aider_content, None, sandbox_dir)
     assert "SUCCESS: Applied 1 SEARCH/REPLACE blocks" in res
-    
     content = test_file.read_text()
     assert "print('world')" in content
     assert "print('hello')" not in content

@@ -222,8 +222,11 @@ async def test_dream_skips_when_fragment_set_unchanged(mock_context):
 
 @pytest.mark.asyncio
 async def test_dream_runs_when_fragment_set_changes(mock_context):
-    """The idempotency guard must not block legitimate re-runs once a new
-    auto-memory has arrived."""
+    """The idempotency guard must not block legitimate re-runs once enough
+    new auto-memories have arrived. DELTA-AWARE since 2026-07-20: a single
+    new fragment is below REDREAM_MIN_NEW_FRAGMENTS (3) and now SKIPS (that
+    reopen-on-any-change behavior was the overnight heuristic-churn engine);
+    three fresh fragments re-dream."""
     dreamer = Dreamer(mock_context)
 
     mock_context.memory_system.collection.get.return_value = {
@@ -237,10 +240,19 @@ async def test_dream_runs_when_fragment_set_changes(mock_context):
     await dreamer.dream()
     assert mock_context.llm_client.chat_completion.await_count == 1
 
-    # A new fragment arrives — the id set differs, so the LLM must fire again.
+    # ONE new fragment — below the delta threshold → skip, naming the count.
     mock_context.memory_system.collection.get.return_value = {
         "ids": ["1", "2", "3", "NEW"],
         "documents": ["d1", "d2", "d3", "new"],
+    }
+    result = await dreamer.dream()
+    assert "only 1 new fragment" in result
+    assert mock_context.llm_client.chat_completion.await_count == 1
+
+    # THREE new fragments vs the last successful cycle → re-dream fires.
+    mock_context.memory_system.collection.get.return_value = {
+        "ids": ["1", "2", "3", "NEW", "NEW2", "NEW3"],
+        "documents": ["d1", "d2", "d3", "new", "new2", "new3"],
     }
     result = await dreamer.dream()
     assert "Dream Complete" in result

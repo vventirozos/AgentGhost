@@ -884,7 +884,11 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 "file in 'content' — do NOT retry 'replace' without the "
                 "exact existing text.")
 
-    has_aider_blocks = "<<<< SEARCH" in str(old_text)
+    # Marker-run detection is width-tolerant (`<{4,}`): the model sometimes
+    # emits the 7-char git-conflict dialect (`<<<<<<< SEARCH` / `=======` /
+    # `>>>>>>> REPLACE`, observed live 2026-07-19) and a plain substring test
+    # for "<<<< SEARCH" misses the no-space variant of either dialect.
+    has_aider_blocks = re.search(r"<{4,}[ \t]*SEARCH", str(old_text)) is not None
 
     # IDENTICAL-ARGS CORRUPTION GUARD (2026-07-05). Measured over 5 days of
     # trajectories: 50 of 99 replace calls arrived with content ==
@@ -1082,7 +1086,6 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             return f"Error: failed to read '{filename}' for replace: {oe}"
         
         if has_aider_blocks:
-            import re
             # Indentation-preserving parse FIRST: capture block bodies
             # starting on the line AFTER each marker, so the first line's
             # leading whitespace survives. The loose fallback's `\s*` used
@@ -1090,14 +1093,33 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             # indented blocks and (b) fed _reindent_replacement a new_text
             # whose first line was dedented, mis-computing its indent base
             # — the fuzzy/anchor rungs then inserted a broken first line.
+            # Both regexes accept marker runs of ANY width >= 4 (`<{4,}` /
+            # `={4,}` / `>{4,}`, optional REPLACE suffix) so the 7-char
+            # git-conflict dialect parses as intended, and both require the
+            # separator to be a FULL LINE of equals. The old loose fallback
+            # matched `====` ANYWHERE (`\s*====\s*`): a 7-char envelope fell
+            # past the strict 4-char regex into it, and the first `=====`
+            # inside a banner comment on the SEARCH text's first line
+            # ("// ===== Minesweeper App =====") became the separator —
+            # SEARCH parsed as `//`, the entire rest became the replacement,
+            # and the first `//` in the file (inside the CSS
+            # `@import url('https://...')`) was replaced with the whole
+            # marker-stripped blob, reported as SUCCESS (live corruption
+            # 2026-07-19, WebOS index.html).
             blocks = re.findall(
-                r'<<<<[ \t]*SEARCH[ \t]*\r?\n(.*?)\r?\n====[ \t]*\r?\n(.*?)\r?\n?>>>>',
+                r'<{4,}[ \t]*SEARCH[ \t]*\r?\n(.*?)\r?\n={4,}[ \t]*\r?\n(.*?)\r?\n?>{4,}[ \t]*(?:REPLACE)?',
                 str(old_text), re.DOTALL)
             if not blocks:
-                # Loose fallback: tolerates content on the marker lines and
-                # missing newlines, at the cost of stripping the blocks'
-                # leading/trailing whitespace.
-                blocks = re.findall(r'(?s)<<<<\s*SEARCH\s*(.*?)\s*====\s*(.*?)\s*>>>>', str(old_text))
+                # Loose fallback: tolerates content on the OPENER line and a
+                # missing newline before the closer, at the cost of stripping
+                # the blocks' leading/trailing whitespace. The separator stays
+                # line-anchored — that is the invariant that prevents content
+                # containing `====` runs from splitting the envelope.
+                blocks = [
+                    (s.strip(), r.strip()) for s, r in re.findall(
+                        r'(?s)<{4,}[ \t]*SEARCH(.*?)\n[ \t]*={4,}[ \t]*\r?\n(.*?)>{4,}[ \t]*(?:REPLACE)?',
+                        str(old_text))
+                ]
 
             if not blocks:
                 return "SYSTEM INSTRUCTION: Found SEARCH/REPLACE markers but failed to parse them. Ensure you use <<<< SEARCH, ====, and >>>> correctly."
@@ -1108,6 +1130,32 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             prev_content = file_content
 
             for search_str, replace_str in blocks:
+                # MIS-SPLIT SANITY (2026-07-19). A parse that yields a
+                # SEARCH text this small can only come from a mangled
+                # envelope (the live corruption parsed SEARCH as `//`) or
+                # an edit far too ambiguous to apply safely — a 1-2 char
+                # needle matches essentially anywhere in the file.
+                if len(search_str.strip()) < 3:
+                    errors.append(
+                        "Block REJECTED: its SEARCH text is "
+                        f"{len(search_str.strip())} char(s) — too short to "
+                        "locate safely (this usually means the envelope "
+                        "markers were malformed and the parse split in the "
+                        "wrong place). Re-emit the envelope with at least "
+                        "one full line of the file's CURRENT text in the "
+                        "SEARCH section.")
+                    continue
+                # A marker line INSIDE the parsed SEARCH section is the same
+                # mangled-envelope signature on the other side of the
+                # separator — never a legitimate edit.
+                if any(_MARKER_LINE_RE.match(ln.rstrip("\r"))
+                       for ln in search_str.splitlines()):
+                    errors.append(
+                        "Block REJECTED: its SEARCH section contains a "
+                        "SEARCH/REPLACE marker line — the envelope was "
+                        "malformed and the parse split in the wrong place. "
+                        "Emit ONE clean envelope per edit.")
+                    continue
                 # Same corruption signature as the two-argument form: a
                 # block that "replaces" text with itself is a no-op and
                 # means the old block was lost in transit.
@@ -1195,7 +1243,6 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         # match starts at the first token, so re-anchor the replacement's
         # indentation to the matched region before substituting (otherwise a
         # multi-line block's continuation lines land at the wrong column).
-        import re
         words = [re.escape(w) for w in str(old_text).split()]
         flexible_old = r'\s+'.join(words)
 
@@ -1922,11 +1969,17 @@ def _syntax_regression(prev_content: str, new_content: str, filename: str) -> st
     return ""
 
 
-# A line that IS a SEARCH/REPLACE marker: exactly `====` (the separator the
-# block parser recognizes — 5+ equals, e.g. an RST underline, is NOT a
-# separator and must not trip this), a `<<<< SEARCH` opener, or a `>>>>`
-# closer. Used to catch marker text leaking INTO file content.
-_MARKER_LINE_RE = re.compile(r"^(?:====|<<<<[ \t]*SEARCH.*|>>>>)[ \t]*$")
+# A line that IS a SEARCH/REPLACE marker: a full line of 4+ equals (the
+# parser's separator — width-tolerant since 2026-07-19, when the 7-char
+# git-conflict dialect `=======` leaked into a file UNDETECTED because this
+# regex only knew the exact-4 form), a `<<<< SEARCH`-style opener, or a
+# `>>>>`(` REPLACE`)-style closer. Used to catch marker text leaking INTO
+# file content. An RST/Markdown `====` underline CAN now match, but the
+# leak guard is count-aware — only lines ADDED relative to the previous
+# content flag, and the reject message steers to operation='write' for the
+# rare legitimate case.
+_MARKER_LINE_RE = re.compile(
+    r"^(?:={4,}|<{4,}[ \t]*(?:SEARCH.*)?|>{4,}[ \t]*(?:REPLACE.*)?)[ \t]*$")
 
 
 def _marker_leak(prev_content: str, new_content: str) -> str:

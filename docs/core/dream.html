@@ -205,6 +205,20 @@
   substrate: every chat trajectory now stamps <code>extra.hydrated_lessons</code>
   (the playbook triggers actually injected that turn). Tests:
   <code>tests/test_counterfactual.py</code>.</p>
+
+  <h3>Delta-aware idempotency guard (2026-07-20)</h3>
+  <p>The fragment-set guard skipped only on <em>exact equality</em>, which was the overnight
+  churn engine (log eval 07-19→20): each hourly idle self-play run minted ONE new
+  <code>selfplay:&lt;cluster&gt;:&lt;ts&gt;</code> digest ID, reopening the guard, and every REM
+  cycle re-extracted near-identical heuristics from a 59/60-identical fragment window — 10+
+  re-saves of the same two rules, 0 meta-memories synthesized, a worker LLM call burned per
+  cycle. The guard now requires <code>REDREAM_MIN_NEW_FRAGMENTS</code> (default 3, env
+  <code>GHOST_DREAM_MIN_NEW</code>) fresh IDs relative to the <em>last successful</em> cycle's
+  set before re-dreaming; below that it logs "only N new fragment(s)" and skips. The cached
+  set is only updated on a successful cycle, so un-dreamed fragments accumulate toward the
+  threshold rather than being consumed by skips. Companion fix on the write side: mistake-less
+  rules dedup at a wider vector distance (see <a href="../memory/skills.html">memory /
+  skills</a>). Tests: <code>tests/test_dream_selfplay_seeds.py</code>.</p>
 </main>
 </body>
 </html>

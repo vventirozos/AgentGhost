@@ -140,6 +140,11 @@ async def test_thin_pool_with_few_trajectories_seeds_from_selfplay(tmp_path):
 
 @pytest.mark.asyncio
 async def test_new_selfplay_outcome_reopens_idempotency_guard(tmp_path):
+    """DELTA-AWARE since 2026-07-20: a SINGLE new self-play outcome no
+    longer reopens the guard — that was the overnight churn engine (each
+    idle run minted one digest ID and re-triggered a full REM over a
+    59/60-identical window, re-saving the same heuristics all night). The
+    guard now needs >= REDREAM_MIN_NEW_FRAGMENTS (3) fresh IDs."""
     ft = _tracker_with_runs(tmp_path, n=3)
     dreamer, ctx = _dreamer(tmp_path, trajs=[_traj(1)], tracker=ft)
     await dreamer.dream(model_name="test-model")
@@ -151,11 +156,35 @@ async def test_new_selfplay_outcome_reopens_idempotency_guard(tmp_path):
     assert "unchanged" in str(out2)
     assert ctx.llm_client.chat_completion.await_count == 1
 
-    # a fresh self-play outcome lands (the overnight case) → REM runs again
+    # ONE fresh self-play outcome (the overnight case) → still a skip,
+    # but the message names the shortfall instead of claiming "unchanged".
     ft.record_run("python_general", "a brand new challenge", 1, True, 4)
     ctx.trajectory_collector.iter_trajectories.return_value = iter([_traj(1)])
     out3 = await dreamer.dream(model_name="test-model")
-    assert "unchanged" not in str(out3)
+    assert "only 1 new fragment" in str(out3)
+    assert ctx.llm_client.chat_completion.await_count == 1
+
+    # Two MORE outcomes (3 fresh total vs the last successful cycle —
+    # the un-dreamed one above still counts, nothing was consumed) → runs.
+    ft.record_run("python_general", "second new challenge", 1, True, 4)
+    ft.record_run("python_general", "third new challenge", 1, True, 4)
+    ctx.trajectory_collector.iter_trajectories.return_value = iter([_traj(1)])
+    out4 = await dreamer.dream(model_name="test-model")
+    assert "Skipping REM" not in str(out4)
+    assert ctx.llm_client.chat_completion.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_redream_min_new_env_override(tmp_path, monkeypatch):
+    # GHOST_DREAM_MIN_NEW=1 restores the old reopen-on-any-change behavior.
+    monkeypatch.setattr(Dreamer, "REDREAM_MIN_NEW_FRAGMENTS", 1)
+    ft = _tracker_with_runs(tmp_path, n=3)
+    dreamer, ctx = _dreamer(tmp_path, trajs=[_traj(1)], tracker=ft)
+    await dreamer.dream(model_name="test-model")
+    ft.record_run("python_general", "a brand new challenge", 1, True, 4)
+    ctx.trajectory_collector.iter_trajectories.return_value = iter([_traj(1)])
+    out = await dreamer.dream(model_name="test-model")
+    assert "Skipping REM" not in str(out)
     assert ctx.llm_client.chat_completion.await_count == 2
 
 

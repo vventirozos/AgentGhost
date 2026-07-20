@@ -110,11 +110,21 @@ async def test_cleanup_edit_removing_markers_is_allowed(sandbox):
     assert "====" not in target.read_text()
 
 
-def test_marker_leak_ignores_rst_style_underlines():
-    # A 5+ equals line (RST/Markdown underline) is NOT a parser separator
-    # and must not trip the guard.
-    assert _marker_leak("Title\n", "Title\n=====\n") == ""
+def test_marker_leak_matches_all_marker_widths():
+    # REVERSED 2026-07-19: the parser now accepts 4+ equals as a separator
+    # (the git-conflict dialect leaked a literal `=======` into index.html
+    # while this guard only knew the exact-4 form), so ALL 4+ runs count.
+    # RST underlines are handled by count-awareness: only ADDED lines flag.
+    assert _marker_leak("Title\n", "Title\n=====\n") != ""
     assert _marker_leak("a\n", "a\n====\n") != ""
+    assert _marker_leak("a\n", "a\n=======\n") != ""
+    # Pre-existing underline stays editable (count-aware, not banned).
+    assert _marker_leak("Title\n=====\nbody\n", "Title\n=====\nnew body\n") == ""
+    # 7-char openers/closers are marker lines too.
+    assert _marker_leak("a\n", "a\n<<<<<<< SEARCH\n") != ""
+    assert _marker_leak("a\n", "a\n>>>>>>> REPLACE\n") != ""
+    # An equals run embedded in a longer line is NOT a marker line.
+    assert _marker_leak("a\n", "a\n// ===== Section =====\n") == ""
 
 
 def test_marker_leak_count_aware():
@@ -268,3 +278,134 @@ def test_would_be_snippet_edge_cases():
     assert _would_be_snippet("a\nb", "boom (line 99, col 1)") == ""
     out = _would_be_snippet("l1\nl2\nl3\nl4\nl5", "x (line 1, col 1)")
     assert out.splitlines()[0].startswith(">    1 | l1")
+
+
+# ---------------------------------------------------------------------------
+# 6. Git-conflict dialect (7-char markers) — live corruption 2026-07-19
+# ---------------------------------------------------------------------------
+# The model emitted `<<<<<<< SEARCH / ======= / >>>>>>> REPLACE`. The strict
+# parser only knew the exact-4 dialect, so the payload fell into the loose
+# fallback whose separator regex matched `====` ANYWHERE — the `=====` inside
+# a banner comment on the SEARCH text's FIRST LINE became the separator,
+# SEARCH parsed as `//`, and the first `//` in the file (inside the CSS
+# `@import url('https://...')`) was replaced with the whole marker-stripped
+# blob. Reported SUCCESS; user found the corrupted page 14 minutes later.
+
+_WEBOS_LIKE = (
+    "<style>\n"
+    "@import url('https://fonts.example.com/css2?family=Inter');\n"
+    "body { color: red; }\n"
+    "</style>\n"
+    "<script>\n"
+    "// ===== Minesweeper App =====\n"
+    "registerApp('minesweeper', () => {\n"
+    "  const ROWS = 9;\n"
+    "  init();\n"
+    "});\n"
+    "// ===== Other App =====\n"
+    "registerApp('other', () => {});\n"
+    "</script>\n"
+)
+
+
+async def test_git_conflict_dialect_applies_correctly(sandbox):
+    # The exact live shape: 7-char markers + `=====` banner comments inside
+    # the SEARCH content. Must apply as ONE clean edit.
+    target = sandbox / "index.html"
+    target.write_text(_WEBOS_LIKE)
+    payload = (
+        "<<<<<<< SEARCH\n"
+        "// ===== Minesweeper App =====\n"
+        "registerApp('minesweeper', () => {\n"
+        "  const ROWS = 9;\n"
+        "  init();\n"
+        "});\n"
+        "=======\n"
+        "// ===== Minesweeper App (iframe-based) =====\n"
+        "registerApp('minesweeper', () => { iframe('minesweeper.html'); });\n"
+        ">>>>>>> REPLACE"
+    )
+    res = await tool_replace_text("index.html", payload, None, sandbox)
+    assert res.startswith("SUCCESS"), res
+    out = target.read_text()
+    # The @import URL is intact — the live corruption spliced the blob into
+    # the first `//` of `https://`.
+    assert "@import url('https://fonts.example.com" in out
+    assert "iframe('minesweeper.html')" in out
+    assert "const ROWS = 9;" not in out           # old block actually replaced
+    assert "=======" not in out                   # no separator leaked
+    assert "// ===== Other App =====" in out      # untouched sibling intact
+
+
+async def test_four_char_dialect_with_banner_comments_still_works(sandbox):
+    # Same banner-comment content through the canonical 4-char dialect.
+    target = sandbox / "index.html"
+    target.write_text(_WEBOS_LIKE)
+    payload = (
+        "<<<< SEARCH\n"
+        "// ===== Other App =====\n"
+        "registerApp('other', () => {});\n"
+        "====\n"
+        "// ===== Other App (v2) =====\n"
+        "registerApp('other', () => { v2(); });\n"
+        ">>>>"
+    )
+    res = await tool_replace_text("index.html", payload, None, sandbox)
+    assert res.startswith("SUCCESS"), res
+    out = target.read_text()
+    assert "v2();" in out
+    assert "@import url('https://" in out
+
+
+async def test_no_space_marker_variant_detected_and_parsed(sandbox):
+    # `<<<<<<<SEARCH` (no space) must still be DETECTED as an envelope —
+    # the old substring test `"<<<< SEARCH" in text` missed it and the
+    # payload would have been treated as literal two-arg search text.
+    target = sandbox / "app.js"
+    target.write_text("const a = 1;\n")
+    payload = "<<<<<<<SEARCH\nconst a = 1;\n=======\nconst a = 2;\n>>>>>>>REPLACE"
+    res = await tool_replace_text("app.js", payload, None, sandbox)
+    assert res.startswith("SUCCESS"), res
+    assert target.read_text() == "const a = 2;\n"
+
+
+async def test_tiny_search_parse_rejected(sandbox):
+    # A parsed SEARCH under 3 chars is a mis-split/ambiguity signature —
+    # reject, never string-replace a 2-char needle.
+    target = sandbox / "style.css"
+    original = "@import url('https://x.test/a.css');\nbody { color: red; }\n"
+    target.write_text(original)
+    payload = "<<<< SEARCH\n//\n====\nreplacement blob\n>>>>"
+    res = await tool_replace_text("style.css", payload, None, sandbox)
+    assert "too short" in res
+    assert target.read_text() == original
+
+
+async def test_marker_line_inside_search_section_rejected(sandbox):
+    # A marker line INSIDE the parsed SEARCH section = mangled envelope.
+    target = sandbox / "app.js"
+    original = "const a = 1;\n"
+    target.write_text(original)
+    payload = (
+        "<<<< SEARCH\n"
+        "const a = 1;\n"
+        "<<<< SEARCH\n"
+        "====\n"
+        "const a = 2;\n"
+        ">>>>"
+    )
+    res = await tool_replace_text("app.js", payload, None, sandbox)
+    assert "REJECTED" in res
+    assert target.read_text() == original
+
+
+async def test_seven_char_separator_leak_rejected_by_backstop(sandbox):
+    # Defense in depth: even via the two-argument form, a replacement that
+    # ADDS a `=======` line is caught by the widened _MARKER_LINE_RE.
+    target = sandbox / "notes.txt"
+    original = "alpha\nbeta\n"
+    target.write_text(original)
+    res = await tool_replace_text(
+        "notes.txt", "beta", "beta\n=======\ngamma", sandbox)
+    assert "REJECTED" in res and "marker" in res
+    assert target.read_text() == original

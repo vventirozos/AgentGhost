@@ -788,6 +788,57 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-20 — overnight log-eval fixes: git-conflict-dialect mis-split + verifier mutated-file coverage + dream churn cap
+Night-log review (boot 07-19 20:54 → 07-20 06:50) found one serious incident and one
+systemic waste loop; both root-caused from the trajectory and fixed, full suite green
+(8236 passed). WebOS games click-verified end-to-end (the request the loop-breaker cut
+short at 22:29) — two REAL game bugs found and fixed in the process.
+- **Marker-leak RECURRENCE root-caused** (request 97e42cea, 21:59): the model emitted a
+  *well-formed* envelope in the 7-char git-conflict dialect (`<<<<<<< SEARCH` /
+  `=======` / `>>>>>>> REPLACE`). The strict parser only knew exact-4, so the payload
+  fell into the loose fallback whose separator regex matched `====` ANYWHERE — the
+  `=====` inside the banner comment on the SEARCH text's first line became the
+  separator, SEARCH parsed as `//`, and the file's first `//` (inside the CSS
+  `@import url('https://…')`) was replaced with the whole marker-stripped blob,
+  reported SUCCESS. All 4 of the 07-14 guards were structurally blind to it (CSS
+  damage ≠ JS parse failure; exact-4 `_MARKER_LINE_RE` didn't know `=======`).
+  **Fixes (tools/file_system.py):** width-tolerant (`<{4,}`/`={4,}`/`>{4,}`, optional
+  `REPLACE`) + line-anchored-separator parsing in BOTH regexes; width-tolerant
+  `_MARKER_LINE_RE` (reverses the RST-underline carve-out — count-awareness covers
+  it); mis-split sanity (SEARCH < 3 chars or containing marker lines → reject);
+  regex-based envelope detection (no-space variants). Deliberate behavior change: a
+  separator glued to content (`…')====`) now fails CLOSED instead of parsing.
+  Tests: test_replace_marker_leak_guard.py (24), test_file_system_replace.py updated.
+- **Verifier mutated-file coverage (core/agent.py):** the corruption shipped behind
+  CONFIRMED (100%) because WEB-EXEC probed only the FIRST located entry page
+  (minesweeper.html, not the mutated index.html) and FILE-ARTIFACT only re-read
+  prose-claimed ("created …") files. Now `_execute_web_artifact` probes EVERY html
+  written/replaced this turn (cap 4; any located page failing to navigate →
+  inconclusive, never "clean") and FILE-ARTIFACT checks claimed ∪ mutated (new
+  `_files_mutated_this_turn` collector). Honest limit: CSS-only damage still loads
+  clean — the parser guards above are the primary defense. Tests:
+  test_verifier_web_exec.py, test_grounded_file_verify.py, test_verifier_auto_repair.py.
+- **Dream-churn cap:** overnight REM re-extracted the same two heuristics 10+ times
+  (0 meta-memories all night) — each idle self-play run minted ONE new digest ID,
+  reopening the equality-only idempotency guard over a 59/60-identical window, and
+  reworded re-saves (measured 0.07–0.17 apart on the live bge-small store) slipped
+  past the 0.15 dedup cutoff. **Fixes:** delta-aware guard (`REDREAM_MIN_NEW_FRAGMENTS`
+  = 3, env `GHOST_DREAM_MIN_NEW`; un-dreamed fragments accumulate — cache key updates
+  only on success) in core/dream.py; mistake-less rules dedup at < 0.25 (distinct
+  rules measured ≥ 0.29; env `GHOST_RULE_DEDUP_DIST`) in memory/skills.py. Tests:
+  test_dream_selfplay_seeds.py, test_dream_async.py, test_skill_dedup.py.
+- **WebOS games actually fixed + click-verified** (Playwright, 15/15): the overnight
+  "remove duplicate gameLoop() calls" edit removed ALL gameLoop call sites — the
+  platformer froze at menu (Enter changed state, nothing animated). Re-added the start
+  in the menu→playing branch with a cancelAnimationFrame guard (loop-continuation
+  condition covers the other states). Minesweeper's `getLevelConfig()` read the
+  globals `rows`/`cols` before init assigned them → NaN mines → ZERO mines placed →
+  first click flood-won instantly (self-heals on game 2, hence missed). Fixed to
+  `base.rows`/`base.cols`. Verified: icons open windows, grid reveals correctly,
+  Enter starts the game, levelComplete overlay draws, Enter advances level 0→1,
+  single ~60fps loop.
+- Docs: tools/file_system.html, core/verifier.html, core/dream.html, memory/skills.html.
+
 ### 2026-07-19 — harness-dimension failure attribution + failure-cluster distillation
 MemoHarness adaptation (arXiv:2607.14159): every failure record now names the harness
 layer it was attributed to, and recurring failure clusters distill into preventive

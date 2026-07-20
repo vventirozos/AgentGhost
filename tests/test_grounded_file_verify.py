@@ -84,3 +84,41 @@ class TestVerifyFileArtifacts:
     def test_no_claims_or_bad_dir_is_none(self):
         assert GhostAgent._verify_file_artifacts([], "/tmp") is None
         assert GhostAgent._verify_file_artifacts(["x.md"], "/nonexistent/xyz") is None
+
+
+class TestMutatedFileCollector:
+    """`_files_mutated_this_turn` (2026-07-19): the FILE-ARTIFACT check now
+    unions the answer's claimed deliverables with the files the turn ACTUALLY
+    wrote/replaced — an edited-but-unclaimed file (described as "updated",
+    not "created") previously skipped the ground-truth re-read entirely."""
+
+    def test_collects_writes_and_replaces_any_extension(self):
+        from ghost_agent.core.agent import _files_mutated_this_turn
+        tools = [
+            {"role": "tool", "name": "file_system",
+             "content": "SUCCESS: Wrote 11196 chars to 'projects/e4e2/minesweeper.html'."},
+            {"role": "tool", "name": "file_system",
+             "content": "SUCCESS: Applied 1 SEARCH/REPLACE blocks to 'projects/e4e2/index.html'."},
+            {"role": "tool", "name": "file_system",
+             "content": "SUCCESS: Wrote 90 chars to 'notes.md'."},
+        ]
+        assert _files_mutated_this_turn(tools) == [
+            "projects/e4e2/minesweeper.html",
+            "projects/e4e2/index.html",
+            "notes.md",
+        ]
+
+    def test_ignores_failures_synthetic_and_other_tools(self):
+        from ghost_agent.core.agent import _files_mutated_this_turn
+        tools = [
+            {"role": "tool", "name": "file_system", "_synthetic": True,
+             "content": "SUCCESS: Wrote 10 chars to 'fake.html'."},
+            {"role": "tool", "name": "browser",
+             "content": "SUCCESS: navigated to 'page.html'."},
+            {"role": "tool", "name": "file_system",
+             "content": "REJECTED: that replace would have written marker lines into 'x.html'."},
+            {"role": "tool", "name": "file_system",
+             "content": "Error: could not write 'broken.js'."},
+        ]
+        assert _files_mutated_this_turn(tools) == []
+        assert _files_mutated_this_turn(None) == []

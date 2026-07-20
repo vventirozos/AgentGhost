@@ -216,12 +216,24 @@ async def test_unverified_mutation_triggers_repair_without_verifier(agent):
 # on an untested write, still forces the "actually RUN it" repair
 # --------------------------------------------------------------------------
 
-async def test_web_confirmed_without_exec_is_capped_and_repaired(agent):
+async def test_web_confirmed_without_exec_is_capped_and_repaired(
+        agent, tmp_path, monkeypatch):
     """Live failure (2026-06-20): the turn wrote a web page, the WEB-EXEC
     probe logged 'skipped' (no browser tool here), and the verifier said
     CONFIRMED — pre-fix that shipped as a verified pass on a build that
     never ran. Post-fix the CONFIRMED is capped below 0.7 and the sync
-    in-loop gate treats the untested write as unverified → repair round."""
+    in-loop gate treats the untested write as unverified → repair round.
+
+    2026-07-20: the FILE-ARTIFACT check now also re-reads every MUTATED
+    file (not just prose-claimed ones), so the SUCCESS-claimed index.html
+    must actually exist on disk here — otherwise the (correct) missing-
+    mutated-file REFUTED path fires instead of the inconclusive cap this
+    test is about."""
+    (tmp_path / "index.html").write_text("<html></html>")
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox",
+        lambda ctx, stateful=False: (tmp_path, "/workspace"),
+    )
     agent.available_tools["file_system"] = AsyncMock(
         return_value="SUCCESS: Wrote 1000 chars to 'index.html'.")
     # Text verifier is confidently wrong BOTH times (finalisation + the

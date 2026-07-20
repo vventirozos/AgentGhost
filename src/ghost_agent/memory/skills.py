@@ -635,12 +635,22 @@ class SkillMemory:
             return []
         return data if isinstance(data, list) else []
 
-    def _find_duplicate_lesson(self, task: str, mistake: str, solution: str, memory_system=None) -> dict:
+    def _find_duplicate_lesson(self, task: str, mistake: str, solution: str,
+                               memory_system=None,
+                               vector_threshold: float = 0.15) -> dict:
         """Check if a semantically similar lesson already exists.
 
         Returns the matching lesson dict (with 'index' key) if found, else None.
         Uses vector search first (fast, semantic), then falls back to JSON
-        playbook exact-task matching if no vector store is available."""
+        playbook exact-task matching if no vector store is available.
+
+        ``vector_threshold`` — cosine-distance cutoff for the vector match.
+        The 0.15 default suits mistake-ful lessons; MISTAKE-LESS rules get a
+        wider cutoff from the caller (see learn_lesson), measured 2026-07-20
+        on the live bge-small store: rewordings of the SAME rule land at
+        0.07-0.17 (so 0.15 let the tail through — the overnight churn saved
+        10+ copies of two rules), while genuinely DIFFERENT rules never come
+        closer than 0.29."""
         lesson_text = f"SITUATION: {task}\nMISTAKE: {mistake}\nSOLUTION: {solution}"
 
         if memory_system and hasattr(memory_system, 'collection') and memory_system.collection:
@@ -652,7 +662,7 @@ class SkillMemory:
                 )
                 if results['distances'] and results['distances'][0]:
                     for i, dist in enumerate(results['distances'][0]):
-                        if dist < 0.15:
+                        if dist < vector_threshold:
                             return {
                                 "id": results['ids'][0][i],
                                 "text": results['documents'][0][i],
@@ -751,8 +761,23 @@ class SkillMemory:
 
             # Dedup uses legacy fields for compatibility with older
             # playbooks & vector entries written before the redesign.
+            # MISTAKE-LESS rules ("When X, do Y" heuristics from dream/
+            # reflection) dedup at a WIDER distance: their producers re-emit
+            # the same rule reworded every cycle, and rewordings measure up
+            # to 0.17 apart on the live embedder — past the 0.15 default —
+            # while distinct rules stay >= 0.29. GHOST_RULE_DEDUP_DIST
+            # overrides (set 0.15 to restore the old single-threshold
+            # behavior).
+            from .lesson_quality import _is_mistake_less as _ml
+            _thresh = 0.15
+            if _ml(effective_anti):
+                try:
+                    _thresh = float(os.getenv("GHOST_RULE_DEDUP_DIST", "0.25") or 0.25)
+                except (TypeError, ValueError):
+                    _thresh = 0.25
             duplicate = self._find_duplicate_lesson(
-                effective_trigger, effective_anti, effective_correct, memory_system
+                effective_trigger, effective_anti, effective_correct,
+                memory_system, vector_threshold=_thresh,
             )
             if duplicate:
                 if duplicate.get("source") == "json":

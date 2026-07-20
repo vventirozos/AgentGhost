@@ -334,3 +334,84 @@ async def test_no_web_writes_no_cap():
     )
     assert v_result.confidence == 0.95
     agent._execute_web_artifact.assert_not_awaited()
+
+
+# ── multi-page probing (2026-07-19 gap) ──────────────────────────────
+# The turn created minesweeper.html AND corrupted index.html via replace;
+# the probe picked the FIRST page only, so the mutated index.html was never
+# loaded and the corruption shipped behind "WEB-EXEC clean". Every located
+# html page written this turn must now load clean.
+
+def _multi_agent(tmp_path, results_by_url, monkeypatch, default="SUCCESS: navigated"):
+    """Agent whose browser mock answers per-URL from ``results_by_url``."""
+    agent = GhostAgent.__new__(GhostAgent)
+    agent.context = MagicMock()
+
+    async def _nav(**kwargs):
+        return results_by_url.get(kwargs.get("url"), default)
+
+    browser = AsyncMock(side_effect=_nav)
+    agent.available_tools = {"browser": browser}
+    monkeypatch.setattr(
+        "ghost_agent.tools.file_system.project_scoped_sandbox",
+        lambda ctx, stateful=False: (tmp_path, "/workspace"),
+    )
+    return agent, browser
+
+
+async def test_second_page_exception_refutes(tmp_path, monkeypatch):
+    (tmp_path / "minesweeper.html").write_text("<html></html>")
+    (tmp_path / "index.html").write_text("<html></html>")
+    diag = ("SUCCESS: navigated.\n⚠ UNCAUGHT JS EXCEPTIONS (1):\n"
+            "  • SyntaxError: Unexpected token '='")
+    agent, browser = _multi_agent(
+        tmp_path,
+        {"file:///workspace/index.html": diag},
+        monkeypatch,
+    )
+    page_rel, block = await agent._execute_web_artifact(
+        ["minesweeper.html", "index.html"])
+    assert page_rel == "index.html"          # the FAILING page is named
+    assert block.startswith("UNCAUGHT JS EXCEPTIONS")
+    assert browser.await_count == 2          # both pages actually probed
+
+
+async def test_all_pages_clean_names_every_page(tmp_path, monkeypatch):
+    (tmp_path / "a.html").write_text("<html></html>")
+    (tmp_path / "b.html").write_text("<html></html>")
+    agent, browser = _multi_agent(tmp_path, {}, monkeypatch)
+    page_rel, block = await agent._execute_web_artifact(["a.html", "b.html"])
+    assert block == ""
+    assert page_rel == "a.html, b.html"
+    assert browser.await_count == 2
+
+
+async def test_one_unloadable_page_is_inconclusive(tmp_path, monkeypatch):
+    # A mutated page that fails to NAVIGATE must make the whole probe
+    # inconclusive (None → confidence cap), never read as "clean".
+    (tmp_path / "a.html").write_text("<html></html>")
+    (tmp_path / "b.html").write_text("<html></html>")
+    agent, _ = _multi_agent(
+        tmp_path,
+        {"file:///workspace/b.html": "Error: net::ERR_FILE_NOT_FOUND"},
+        monkeypatch,
+    )
+    assert await agent._execute_web_artifact(["a.html", "b.html"]) is None
+
+
+async def test_page_probe_cap(tmp_path, monkeypatch):
+    for i in range(6):
+        (tmp_path / f"p{i}.html").write_text("<html></html>")
+    agent, browser = _multi_agent(tmp_path, {}, monkeypatch)
+    res = await agent._execute_web_artifact(
+        [f"p{i}.html" for i in range(6)])
+    assert res is not None and res[1] == ""
+    assert browser.await_count == GhostAgent._WEB_EXEC_MAX_PAGES
+
+
+async def test_duplicate_candidates_probed_once(tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text("<html></html>")
+    agent, browser = _multi_agent(tmp_path, {}, monkeypatch)
+    res = await agent._execute_web_artifact(["index.html", "index.html"])
+    assert res == ("index.html", "")
+    assert browser.await_count == 1

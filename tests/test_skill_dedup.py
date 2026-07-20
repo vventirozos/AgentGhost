@@ -148,3 +148,65 @@ class TestLearnLessonDedup:
         assert len(playbook) == 50
         # Most recent should be first
         assert playbook[0]["task"] == "Task 49"
+
+
+class TestMistakeLessWideThreshold:
+    """2026-07-20: mistake-less rules ("When X, do Y" dream/reflection
+    heuristics) dedup at 0.25 instead of 0.15 — measured on the live
+    embedder, rewordings of the SAME rule land at 0.07-0.17 while distinct
+    rules stay >= 0.29, so the 0.15 default let reworded re-saves through
+    all night (10+ copies of two rules)."""
+
+    def _mem_at_distance(self, dist):
+        mock_memory = MagicMock()
+        mock_memory.collection = MagicMock()
+        mock_memory.collection.query.return_value = {
+            "ids": [["id1"]],
+            "documents": [["SITUATION: When querying weather, name the "
+                           "location\nMISTAKE: none\nSOLUTION: name the "
+                           "location explicitly"]],
+            "distances": [[dist]],
+        }
+        return mock_memory
+
+    def test_mistakeless_rule_deduped_in_wide_band(self, skill_memory):
+        # dist 0.20: past the 0.15 default, inside the 0.25 rule cutoff.
+        mem = self._mem_at_distance(0.20)
+        skill_memory.learn_lesson(
+            "When querying weather, ensure the query names the exact "
+            "requested location to avoid ambiguity.",
+            "none",
+            "When querying weather, ensure the query names the exact "
+            "requested location to avoid ambiguity.",
+            memory_system=mem, source="dream",
+        )
+        playbook = json.loads(skill_memory.file_path.read_text())
+        assert playbook == []  # deduped — no new entry written
+
+    def test_mistakeful_lesson_keeps_tight_threshold(self, skill_memory):
+        # Same 0.20 distance, but a REAL mistake → 0.15 cutoff applies and
+        # the lesson is written as new.
+        mem = self._mem_at_distance(0.20)
+        skill_memory.learn_lesson(
+            "Parse the weather API response",
+            "read the wrong station's data",
+            "Always match the station id against the requested city "
+            "before reading values.",
+            memory_system=mem,
+        )
+        playbook = json.loads(skill_memory.file_path.read_text())
+        assert len(playbook) == 1
+
+    def test_env_override_restores_old_behavior(self, skill_memory, monkeypatch):
+        monkeypatch.setenv("GHOST_RULE_DEDUP_DIST", "0.15")
+        mem = self._mem_at_distance(0.20)
+        skill_memory.learn_lesson(
+            "When querying weather, ensure the query names the exact "
+            "requested location to avoid ambiguity.",
+            "none",
+            "When querying weather, ensure the query names the exact "
+            "requested location to avoid ambiguity.",
+            memory_system=mem, source="dream",
+        )
+        playbook = json.loads(skill_memory.file_path.read_text())
+        assert len(playbook) == 1  # old threshold → treated as new

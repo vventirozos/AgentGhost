@@ -417,6 +417,40 @@ def _web_artifacts_written(tools_run: Optional[list]) -> list:
     return out
 
 
+# Any quoted filename in a file_system SUCCESS message — the all-extension
+# sibling of _WEB_ARTIFACT_RE. Extension capped at 7 chars so quoted prose
+# fragments don't match.
+_MUTATED_FILE_RE = re.compile(r"'([^']+\.[A-Za-z0-9]{1,7})'")
+
+
+def _files_mutated_this_turn(tools_run: Optional[list]) -> list:
+    """Filenames of ALL files successfully written or replaced this turn.
+
+    Feeds the FILE-ARTIFACT ground-truth check alongside the answer-text
+    claims: `_claimed_deliverable_files` only sees files the prose says were
+    *created* ("wrote/saved/generated ..."), so a file the turn EDITED but
+    described as "updated"/"fixed" was never re-checked — the 2026-07-19
+    index.html marker-leak corruption shipped behind a CONFIRMED (100%)
+    precisely because the corrupted file was an unclaimed edit. Parses the
+    recorded tool SUCCESS messages (same sourcing as
+    `_web_artifacts_written`) because turn records carry only
+    (name, content), not the original call arguments."""
+    out: list = []
+    for t in tools_run or []:
+        if not isinstance(t, dict) or t.get("_synthetic"):
+            continue
+        if str(t.get("name", "")).lower().replace("-", "_") not in (
+                "file_system", "filesystem", "file"):
+            continue
+        content = str(t.get("content", ""))
+        if not content.startswith("SUCCESS"):
+            continue
+        for m in _MUTATED_FILE_RE.findall(content[:400]):
+            if m not in out:
+                out.append(m)
+    return out
+
+
 # ── Deliverable-file ground-truth check ──────────────────────────────
 # The #1 most-retrieved real lesson (ret=55) is the agent "prematurely
 # declared task completion ... without showing the actual content" — it
@@ -4860,15 +4894,25 @@ class GhostAgent:
                     continue
         return None
 
-    async def _execute_web_artifact(self, written: list):
-        """Headless-load the entry page for web files written this turn.
+    # Bound on pages probed per turn — keeps a many-file scaffold turn from
+    # turning the async verify pass into a browser marathon.
+    _WEB_EXEC_MAX_PAGES = 4
 
-        Returns ``(page_rel, error_block)`` — ``error_block`` is "" when the
-        page loaded with no uncaught JS exception — or ``None`` when the
-        check cannot run (no entry page on disk, no browser tool, or the
-        navigation itself failed; a failed probe must stay inconclusive,
-        never read as "clean"). JS-only edits load the conventional
-        ``index.html`` next to the edited file.
+    async def _execute_web_artifact(self, written: list):
+        """Headless-load EVERY html page written/edited this turn (cap
+        ``_WEB_EXEC_MAX_PAGES``), not just one entry page.
+
+        Returns ``(pages_rel, error_block)`` — ``pages_rel`` names the probed
+        page(s) (comma-joined when clean, the failing page on error) and
+        ``error_block`` is "" only when ALL located pages loaded with no
+        uncaught JS exception — or ``None`` when the check cannot run (no
+        page on disk, no browser tool, or ANY located page failed to
+        navigate; a partially-run probe must stay inconclusive, never read
+        as "clean"). Single-page probing was the 2026-07-19 gap: the turn
+        created minesweeper.html AND corrupted index.html via replace, the
+        probe picked the first page only, and the mutated index.html was
+        never loaded. JS-only edits load the conventional ``index.html``
+        next to the edited file.
         """
         browser = (getattr(self, "available_tools", None) or {}).get("browser")
         if browser is None:
@@ -4882,31 +4926,46 @@ class GhostAgent:
         candidates = [f for f in written if f.lower().endswith((".html", ".htm"))]
         if not candidates:
             candidates = [str(Path(f).parent / "index.html") for f in written]
-        host = self._locate_entry_page(candidates, sbx, root)
-        if host is None:
+        # Resolve each candidate independently so one located page can't
+        # shadow the rest; dedupe by resolved host path.
+        hosts: list = []
+        seen: set = set()
+        for c in candidates[: self._WEB_EXEC_MAX_PAGES]:
+            host = self._locate_entry_page([c], sbx, root)
+            if host is None:
+                continue
+            key = str(host.resolve())
+            if key in seen:
+                continue
+            seen.add(key)
+            hosts.append(host)
+        if not hosts:
             return None
-        try:
-            page_rel = host.resolve().relative_to(root.resolve()).as_posix()
-        except Exception:
-            page_rel = host.name
-        # ABSOLUTE container URL (triple-slash). A relative `file://index.html`
-        # is parsed as a HOST with an empty path and never loads — that was the
-        # WEB-EXEC reliability bug: the probe "skipped" on every build because
-        # the URL pointed nowhere, so a page that throws on load still got a
-        # text-only CONFIRMED.
-        url = "file://" + _to_container_path(sbx, host)
-        res = await browser(
-            operation="navigate",
-            url=url,
-            wait_until="domcontentloaded",
-        )
-        text = str(res)
-        if text.lstrip().startswith("Error") or "[BROWSER_ERR]" in text:
-            return None
-        marker = "UNCAUGHT JS EXCEPTIONS"
-        if marker not in text:
-            return page_rel, ""
-        return page_rel, text[text.index(marker):][:1200]
+        clean_pages: list = []
+        for host in hosts:
+            try:
+                page_rel = host.resolve().relative_to(root.resolve()).as_posix()
+            except Exception:
+                page_rel = host.name
+            # ABSOLUTE container URL (triple-slash). A relative
+            # `file://index.html` is parsed as a HOST with an empty path and
+            # never loads — that was the WEB-EXEC reliability bug: the probe
+            # "skipped" on every build because the URL pointed nowhere, so a
+            # page that throws on load still got a text-only CONFIRMED.
+            url = "file://" + _to_container_path(sbx, host)
+            res = await browser(
+                operation="navigate",
+                url=url,
+                wait_until="domcontentloaded",
+            )
+            text = str(res)
+            if text.lstrip().startswith("Error") or "[BROWSER_ERR]" in text:
+                return None
+            marker = "UNCAUGHT JS EXCEPTIONS"
+            if marker in text:
+                return page_rel, text[text.index(marker):][:1200]
+            clean_pages.append(page_rel)
+        return ", ".join(clean_pages), ""
 
     def _project_constraints_for(self, pid, limit: int = 5) -> List[str]:
         """Explicit user constraints stored on project ``pid``'s record
@@ -5193,10 +5252,21 @@ class GhostAgent:
         # attempt to actually produce the deliverable.
         try:
             _claimed = _claimed_deliverable_files(final_ai_content)
-            if _claimed:
+            # Union with the files the turn ACTUALLY mutated (writes AND
+            # replaces, any extension) — claim-prose selection alone let an
+            # edited-but-unclaimed file skip the ground-truth re-read
+            # (2026-07-19 index.html corruption). Cap matches the claimed
+            # list's own [:8].
+            _mutated = _files_mutated_this_turn(tools_run_this_turn)
+            _to_check = list(_claimed)
+            for _mf in _mutated:
+                if _mf not in _to_check:
+                    _to_check.append(_mf)
+            _to_check = _to_check[:8]
+            if _to_check:
                 from ..tools.file_system import project_scoped_sandbox
                 _host_dir = project_scoped_sandbox(self.context)[0]
-                _fa = self._verify_file_artifacts(_claimed, _host_dir)
+                _fa = self._verify_file_artifacts(_to_check, _host_dir)
                 if _fa is not None:
                     v_result = _fa
                     pretty_log(
@@ -5207,8 +5277,10 @@ class GhostAgent:
                 else:
                     pretty_log(
                         "Verifier",
-                        f"FILE-ARTIFACT clean: {len(_claimed)} claimed "
-                        f"deliverable(s) present + non-empty",
+                        f"FILE-ARTIFACT clean: {len(_to_check)} file(s) "
+                        f"({len(_claimed)} claimed + "
+                        f"{len(_to_check) - len(_claimed)} mutated) present "
+                        f"+ non-empty",
                         icon=Icons.BRAIN_THINK,
                     )
         except Exception as _fa_exc:
