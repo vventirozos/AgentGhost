@@ -43,6 +43,55 @@ def test_extract_libraries_from_text_mentions():
     assert "chromadb" in libs
 
 
+def test_common_english_words_do_not_mint_library_edges():
+    # Regression: plain-substring matching linked unrelated projects whose
+    # goals merely said "user requests" / "training datasets".
+    libs = extract_libraries("triage user requests and curate training datasets")
+    assert "requests" not in libs
+    assert "datasets" not in libs
+
+
+def test_ambiguous_surfaces_match_in_code_context():
+    assert "requests" in extract_libraries("fetch each page with import requests")
+    assert "requests" in extract_libraries("pin requests==2.31 in the venv")
+    assert "requests" in extract_libraries("use the requests library for http")
+    assert "requests" in extract_libraries("call requests.get(url) per page")
+    assert "datasets" in extract_libraries("pip install datasets for the corpus loader")
+    assert "datasets" in extract_libraries("from datasets import load_dataset")
+
+
+def test_ambiguous_surfaces_still_extracted_from_requirements():
+    libs = extract_libraries("", "requests==2.31\ndatasets>=2.0\n")
+    assert {"requests", "datasets"} <= libs
+
+
+def test_library_mentions_require_word_boundaries():
+    # "torchlight" must not read as the torch library.
+    assert "torch" not in extract_libraries("a torchlight procession at dusk")
+    assert "torch" in extract_libraries("train the model with torch")
+
+
+def test_user_requests_goal_does_not_link_requests_library(tmp_path):
+    gm = GraphMemory(tmp_path)
+    link_project_concepts(gm, {
+        "id": "helpdesk",
+        "title": "Helpdesk triage",
+        "goal": "route user requests to the right team using training datasets",
+        "metadata": {}, "workspace_dir": "",
+    })
+    assert "library:requests" not in gm.nx_graph
+    assert "library:datasets" not in gm.nx_graph
+    # An actual import-style mention still creates the edge.
+    link_project_concepts(gm, {
+        "id": "scraper",
+        "title": "Scraper",
+        "goal": "crawl docs pages with import requests and beautifulsoup4",
+        "metadata": {}, "workspace_dir": "",
+    })
+    assert "library:requests" in gm.nx_graph
+    assert "project:scraper" in set(gm.nx_graph.predecessors("library:requests"))
+
+
 def test_extract_techniques_word_boundary_short_tokens():
     # 'gru' / 'lstm' map to the recurrent-net technique...
     assert "recurrent-net" in extract_techniques("a GRU-based sequence model")

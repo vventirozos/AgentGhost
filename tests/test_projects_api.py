@@ -150,8 +150,17 @@ def test_resume_logs_event(client):
     assert evs
 
 
-def test_advance_noop_when_no_tasks(client):
+def _fake_tools_map(monkeypatch, tools):
+    """Point the route's lazy `get_available_tools` import at a canned map."""
+    import ghost_agent.tools.registry as registry
+    monkeypatch.setattr(registry, "get_available_tools", lambda _ctx: tools)
+
+
+def test_advance_noop_when_no_tasks(client, monkeypatch):
     tc, *_ = client
+    async def _search(**kwargs):
+        return "results"
+    _fake_tools_map(monkeypatch, {"web_search": _search})
     pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
     r = tc.post(f"/api/projects/{pid}/advance")
     assert r.status_code == 200
@@ -160,16 +169,81 @@ def test_advance_noop_when_no_tasks(client):
     assert data["classification"] == "idle"
 
 
-def test_advance_runs_task(client):
+def test_advance_runs_task_with_runner(client, monkeypatch):
     tc, store, _ = client
+    calls = []
+    async def _search(**kwargs):
+        calls.append(kwargs)
+        return ("Foo is a placeholder term used in programming examples. "
+                "It commonly pairs with bar and baz in tutorials.")
+    _fake_tools_map(monkeypatch, {"web_search": _search})
     pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
-    tc.post(f"/api/projects/{pid}/tasks",
-            json={"description": "Research foo"})
+    tid = tc.post(f"/api/projects/{pid}/tasks",
+                  json={"description": "Research foo"}).json()["id"]
     r = tc.post(f"/api/projects/{pid}/advance")
     assert r.status_code == 200
-    # Tool runner is None in this wiring (no registry), so the step
-    # just classifies + marks done with "(no tool runner)"
     assert r.json()["classification"] == "research"
+    # The runner actually executed — no "(no tool runner)" theatrical DONE.
+    assert calls
+    task = store.get_task(tid)
+    assert task["status"] == "DONE"
+    assert "(no tool runner)" not in (task.get("result_summary") or "")
+
+
+def test_advance_refuses_without_tool_runner(client, monkeypatch):
+    """No buildable runner → refuse (503), never the classify-only path
+    that marks a research leaf DONE having done nothing."""
+    tc, store, _ = client
+    _fake_tools_map(monkeypatch, {})
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    tid = tc.post(f"/api/projects/{pid}/tasks",
+                  json={"description": "Research foo"}).json()["id"]
+    r = tc.post(f"/api/projects/{pid}/advance")
+    assert r.status_code == 503
+    assert store.get_task(tid)["status"] != "DONE"
+
+
+def test_advance_refuses_when_registry_raises(client, monkeypatch):
+    tc, store, _ = client
+    import ghost_agent.tools.registry as registry
+    def _boom(_ctx):
+        raise RuntimeError("no registry here")
+    monkeypatch.setattr(registry, "get_available_tools", _boom)
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    r = tc.post(f"/api/projects/{pid}/advance")
+    assert r.status_code == 503
+
+
+def test_advance_passes_runner_and_pins_events(client, monkeypatch):
+    """The route hands advance_once a working tool_runner + executors and
+    runs it under pinned_event_project(pid)."""
+    tc, _, _ = client
+    async def _search(**kwargs):
+        return "hit"
+    _fake_tools_map(monkeypatch, {"web_search": _search})
+
+    captured = {}
+    async def _fake_advance(context, project_id, tool_runner=None, **kw):
+        from ghost_agent.workspace.model import _EVENT_PROJECT_OVERRIDE
+        captured["project_id"] = project_id
+        captured["tool_runner"] = tool_runner
+        captured["kw"] = kw
+        captured["event_pin"] = _EVENT_PROJECT_OVERRIDE.get()
+        if tool_runner is not None:
+            captured["runner_output"] = await tool_runner("web_search", {})
+        return SimpleNamespace(ok=True, task_id="t1", classification="research",
+                               summary="ok", artifact_id=None)
+    import ghost_agent.api.projects_routes as pr
+    monkeypatch.setattr(pr, "advance_once", _fake_advance)
+
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    r = tc.post(f"/api/projects/{pid.upper()}/advance")
+    assert r.status_code == 200
+    assert captured["project_id"] == pid          # canonicalized path pid
+    assert captured["tool_runner"] is not None
+    assert captured["runner_output"] == "hit"
+    assert captured["event_pin"] == pid           # events stamp THIS project
+    assert captured["kw"].get("coding_executor") is not None
 
 
 def test_events_endpoint(client):
@@ -267,3 +341,77 @@ def test_delete_task_cross_project_404(client):
                   json={"description": "x"}).json()["id"]
     r = tc.delete(f"/api/projects/{pid2}/tasks/{tid}")
     assert r.status_code == 404
+
+
+# ------------------------------------------------- _set_current + canon pid
+
+def test_switch_goes_through_set_current(client):
+    """Switch must write the scratchpad sentinels (via tools.projects.
+    _set_current), not just the context attribute — otherwise the next
+    chat turn's reconcile silently undoes the switch."""
+    from ghost_agent.tools.projects import (
+        _CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL,
+    )
+    tc, _, ctx = client
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    r = tc.post(f"/api/projects/{pid}/switch")
+    assert r.status_code == 200
+    assert ctx.current_project_id == pid
+    assert ctx.scratchpad.get(_CURRENT_SENTINEL) == pid
+    # Bound (possibly to "" = unbound-by-any-conversation) — the key exists.
+    assert ctx.scratchpad.get(_CURRENT_CONV_SENTINEL) is not None
+
+
+def test_resume_goes_through_set_current(client):
+    from ghost_agent.tools.projects import _CURRENT_SENTINEL
+    tc, _, ctx = client
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    r = tc.post(f"/api/projects/{pid}/resume")
+    assert r.status_code == 200
+    assert ctx.current_project_id == pid
+    assert ctx.scratchpad.get(_CURRENT_SENTINEL) == pid
+
+
+def test_delete_of_current_clears_sentinel(client):
+    """Deleting the bound project must clear the sentinel too — a stale
+    sentinel naming the deleted id made reconcile reactivate it and the
+    sandbox recreate projects/<deleted-id>/."""
+    from ghost_agent.tools.projects import _CURRENT_SENTINEL
+    tc, store, ctx = client
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    tc.post(f"/api/projects/{pid}/switch")
+    assert ctx.scratchpad.get(_CURRENT_SENTINEL) == pid
+    r = tc.delete(f"/api/projects/{pid}", params={"hard": "true"})
+    assert r.status_code == 204
+    assert store.get_project(pid) is None
+    assert ctx.current_project_id is None
+    assert ctx.scratchpad.get(_CURRENT_SENTINEL) is None
+
+
+def test_case_mangled_pid_resolves(client):
+    """Store ids are canonical (strip+lowercase); a case-mangled path pid
+    must resolve on every route instead of 404ing on ownership checks."""
+    tc, _, ctx = client
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    mangled = pid.upper()
+    assert tc.get(f"/api/projects/{mangled}").status_code == 200
+    tid = tc.post(f"/api/projects/{mangled}/tasks",
+                  json={"description": "x"}).json()["id"]
+    r = tc.patch(f"/api/projects/{mangled}/tasks/{tid}",
+                 json={"status": "DONE"})
+    assert r.status_code == 200
+    r = tc.delete(f"/api/projects/{mangled}/tasks/{tid}")
+    assert r.status_code == 204
+    # switch stores the CANONICAL id, never the raw path casing (a raw-cased
+    # current_project_id diverges the workspace path on a case-sensitive FS).
+    r = tc.post(f"/api/projects/{mangled}/switch")
+    assert r.status_code == 200
+    assert ctx.current_project_id == pid
+
+
+def test_case_mangled_pid_delete(client):
+    tc, store, _ = client
+    pid = tc.post("/api/projects", json={"title": "A"}).json()["id"]
+    r = tc.delete(f"/api/projects/{pid.upper()}", params={"hard": "true"})
+    assert r.status_code == 204
+    assert store.get_project(pid) is None

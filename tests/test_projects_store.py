@@ -7,6 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../s
 import json
 import sqlite3
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -123,11 +124,34 @@ def test_update_project_returns_false_when_missing(store):
     assert store.update_project("missing", goal="x") is False
 
 
-def test_update_project_merges_metadata_as_replacement(store):
+def test_update_project_merges_metadata_shallow(store):
+    # MERGE semantics (2026-07-20): the blob carries system state
+    # (design_ledger, config, budgets) — a whole-dict replace wiped it.
     pid = store.create_project("X", metadata={"a": 1})
     store.update_project(pid, metadata={"b": 2})
-    # Replacement semantics (not merge) — keeps the store simple
-    assert store.get_project(pid)["metadata"] == {"b": 2}
+    assert store.get_project(pid)["metadata"] == {"a": 1, "b": 2}
+
+
+def test_update_project_metadata_budget_raise_preserves_system_state(store):
+    # The documented budget-raise (metadata={"steps_cap": 100}) must not
+    # destroy the ledger/config/counter siblings that live in the same blob.
+    pid = store.create_project("X")
+    store.append_ledger(pid, "src/app.py: entrypoint")
+    store.set_config_value(pid, "PORT", "8080")
+    store.update_project(pid, metadata={"steps_used": 40, "defect_reopens": 2})
+    store.update_project(pid, metadata={"steps_cap": 100})
+    meta = store.get_project(pid)["metadata"]
+    assert meta["steps_cap"] == 100
+    assert meta["steps_used"] == 40
+    assert meta["defect_reopens"] == 2
+    assert meta["design_ledger"] == "src/app.py: entrypoint"
+    assert meta["config"] == {"PORT": "8080"}
+
+
+def test_update_project_metadata_replace_opt_in(store):
+    pid = store.create_project("X", metadata={"a": 1, "b": 2})
+    store.update_project(pid, metadata={"c": 3}, metadata_replace=True)
+    assert store.get_project(pid)["metadata"] == {"c": 3}
 
 
 def test_soft_delete_marks_archived(store):
@@ -399,3 +423,154 @@ def test_schema_uses_foreign_keys(store):
     # Hard-delete project → tasks should cascade
     store.delete_project(pid, hard=True)
     assert store.get_task(tid) is None
+
+
+# --------------------------------------------------------------- 2026-07-20 fixes
+
+def _set_project_status_raw(store, pid, status):
+    """Simulate a concurrent writer flipping status outside the API."""
+    with store._lock, store._connect() as conn:
+        conn.execute("UPDATE projects SET status = ? WHERE id = ?", (status, pid))
+        conn.commit()
+
+
+def test_reaper_resets_stale_in_progress(store):
+    pid = store.create_project("P")
+    stale = store.add_task(pid, "stale", status="IN_PROGRESS")
+    fresh = store.add_task(pid, "fresh", status="IN_PROGRESS")
+    open_task = store.add_task(pid, "open")
+    with store._lock, store._connect() as conn:
+        conn.execute("UPDATE tasks SET updated_at = ? WHERE id = ?",
+                     (time.time() - 3600, stale))
+        conn.commit()
+    count = store.reset_orphaned_in_progress(older_than_seconds=600)
+    assert count == 1
+    assert store.get_task(stale)["status"] == "READY"
+    assert store.get_task(fresh)["status"] == "IN_PROGRESS"
+    assert store.get_task(open_task)["status"] == "PENDING"
+    evs = store.list_events(pid, event_type="task_reset_orphaned")
+    assert len(evs) == 1
+    assert evs[0]["task_id"] == stale
+    assert evs[0]["payload"]["to"] == "READY"
+
+
+def test_reaper_safe_on_empty_store(store):
+    # Boot-time call with nothing in flight must be a clean no-op.
+    assert store.reset_orphaned_in_progress() == 0
+
+
+def test_rollup_noops_when_archive_interleaves(store, monkeypatch):
+    # A manual ARCHIVE landing between the rollup's read and its write must
+    # not be stomped back to DONE (which would fire the destructive cleanup
+    # on an archived project).
+    pid = store.create_project("P")
+    tid = store.add_task(pid, "t")
+    fired = []
+    store.on_project_done = fired.append
+
+    orig_list_tasks = store.list_tasks
+
+    def racy_list_tasks(project_id, status_filter=None):
+        rows = orig_list_tasks(project_id, status_filter)
+        _set_project_status_raw(store, pid, "ARCHIVED")
+        return rows
+
+    monkeypatch.setattr(store, "list_tasks", racy_list_tasks)
+    store.update_task(tid, status="DONE")  # triggers the rollup
+    assert store.get_project(pid)["status"] == ProjectStatus.ARCHIVED.value
+    assert fired == []
+    assert not store.list_events(pid, event_type="project_auto_rollup")
+
+
+def test_add_task_reopens_failed_project(store):
+    pid = store.create_project("P")
+    tid = store.add_task(pid, "t")
+    store.update_task(tid, status="FAILED")
+    assert store.get_project(pid)["status"] == ProjectStatus.FAILED.value
+    store.add_task(pid, "retry the build")
+    assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value
+    evs = store.list_events(pid, event_type="project_reopened")
+    assert evs and evs[0]["payload"]["from_status"] == "FAILED"
+
+
+def test_add_task_reopens_paused_project(store):
+    pid = store.create_project("P")
+    store.add_task(pid, "t")
+    store.update_project(pid, status="PAUSED")
+    store.add_task(pid, "new work")
+    assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value
+
+
+def test_add_task_never_reopens_archived_or_needs_user(store):
+    a = store.create_project("A")
+    store.add_task(a, "t")
+    store.update_project(a, status="ARCHIVED")
+    store.add_task(a, "more")
+    assert store.get_project(a)["status"] == ProjectStatus.ARCHIVED.value
+
+    n = store.create_project("N")
+    tid = store.add_task(n, "ask user")
+    store.update_task(tid, status="NEEDS_USER")
+    assert store.get_project(n)["status"] == ProjectStatus.NEEDS_USER.value
+    store.add_task(n, "more")
+    assert store.get_project(n)["status"] == ProjectStatus.NEEDS_USER.value
+
+
+def test_update_task_reopen_reactivates_failed_project(store):
+    pid = store.create_project("P")
+    tid = store.add_task(pid, "t")
+    store.update_task(tid, status="FAILED")
+    assert store.get_project(pid)["status"] == ProjectStatus.FAILED.value
+    # Reviving the failed task must give the project a path back to ACTIVE.
+    store.update_task(tid, status="PENDING")
+    assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value
+
+
+def test_delete_task_of_last_open_triggers_rollup(store):
+    pid = store.create_project("P")
+    t1 = store.add_task(pid, "done work")
+    t2 = store.add_task(pid, "abandoned")
+    store.update_task(t1, status="DONE")
+    assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value
+    store.delete_task(t2)
+    assert store.get_project(pid)["status"] == ProjectStatus.DONE.value
+
+
+def test_delete_task_leaving_no_tasks_does_not_complete_project(store):
+    pid = store.create_project("P")
+    tid = store.add_task(pid, "only")
+    store.delete_task(tid)
+    assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value
+
+
+def test_register_file_artifact_normalizes_absolute_sandbox_path(store):
+    pid = store.create_project("P")
+    tid = store.add_task(pid, "t")
+    aid = store.register_file_artifact(tid, f"/workspace/projects/{pid}/out/x.png")
+    assert aid is not None
+    arts = store.list_artifacts(project_id=pid)
+    assert [a["payload"] for a in arts if a["kind"] == "file"] == ["out/x.png"]
+    # The bare relative form dedupes against the absolute registration.
+    assert store.register_file_artifact(tid, "out/x.png") == aid
+    assert store.register_file_artifact(tid, f"projects/{pid}/out/x.png") == aid
+    assert store.register_file_artifact(tid, "workspace/projects/" + pid + "/out/x.png") == aid
+    assert len(store.list_deliverables(pid)) == 1
+
+
+def test_register_file_artifact_rejects_traversal(store):
+    pid = store.create_project("P")
+    tid = store.add_task(pid, "t")
+    assert store.register_file_artifact(tid, "../../etc/passwd") is None
+    assert store.register_file_artifact(tid, f"projects/{pid}/../other/x") is None
+    assert store.list_deliverables(pid) == []
+
+
+def test_list_events_clamps_negative_and_huge_limits(store):
+    pid = store.create_project("P")
+    for i in range(5):
+        store.log_event(pid, None, "note", {"i": i})
+    # Negative limit is "no limit" to SQLite — must not dump the whole log.
+    assert len(store.list_events(pid, limit=-1, event_type="note")) == 1
+    assert len(store.list_events(pid, limit=0, event_type="note")) == 1
+    assert len(store.list_events(pid, limit=10**9, event_type="note")) == 5
+    assert store.EVENTS_MAX_LIMIT >= 50

@@ -129,6 +129,17 @@ _CONFLICT_MARKERS = [
 ]
 
 
+def _marker_re(marker: str):
+    # Word-bounded so a marker never fires from inside a larger word —
+    # "unsafe" must not read as "safe", "nothing" as "no".
+    return re.compile(rf"(?<![a-z0-9]){re.escape(marker)}(?![a-z0-9])")
+
+
+_COMPILED_MARKERS = [
+    (a, b, _marker_re(a), _marker_re(b)) for a, b in _CONFLICT_MARKERS
+]
+
+
 def detect_contradiction(new_summary: str, prior_summary: str) -> Optional[str]:
     """Lightweight textual check: does a new result contradict a prior
     result on the same underlying claim?
@@ -141,10 +152,17 @@ def detect_contradiction(new_summary: str, prior_summary: str) -> Optional[str]:
         return None
     ns = str(new_summary).lower()
     ps = str(prior_summary).lower()
-    for a, b in _CONFLICT_MARKERS:
-        if a in ns and b in ps:
+    for a, b, a_re, b_re in _COMPILED_MARKERS:
+        # The negated/longer marker claims its text first: "supported"
+        # only counts where it is NOT part of "not supported", so two
+        # summaries that both negate are agreement, not contradiction.
+        new_b = bool(b_re.search(ns))
+        prior_b = bool(b_re.search(ps))
+        new_a = bool(a_re.search(b_re.sub(" ", ns)))
+        prior_a = bool(a_re.search(b_re.sub(" ", ps)))
+        if new_a and prior_b:
             return f"new says '{a}', prior says '{b}'"
-        if b in ns and a in ps:
+        if new_b and prior_a:
             return f"new says '{b}', prior says '{a}'"
     return None
 

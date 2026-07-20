@@ -117,6 +117,31 @@ async def test_build_fails_on_write_rejection():
     assert len(runner.execs()) == 0  # never reached verify
 
 
+def test_system_instruction_refusal_is_a_write_error():
+    # file_system refuses some writes with a `SYSTEM INSTRUCTION:` head (e.g.
+    # the empty-content refusal); missing it closed tasks DONE with the file
+    # never written (2026-07-20 review).
+    from ghost_agent.core.coding_executor import _looks_like_write_error
+    assert _looks_like_write_error(
+        "SYSTEM INSTRUCTION: The 'content' parameter is MANDATORY for write "
+        "operations. You must provide the full text to write.")
+    assert _looks_like_write_error("SYSTEM ERROR: path escapes sandbox")
+    assert _looks_like_write_error("Error: disk full")
+    # genuine successes still pass
+    assert not _looks_like_write_error(
+        "SUCCESS: Wrote 42 chars to 'a.py'. Script-side path: 'a.py'.")
+
+
+@pytest.mark.asyncio
+async def test_build_fails_on_system_instruction_write_refusal():
+    runner = FakeRunner(
+        write_out="SYSTEM INSTRUCTION: The 'content' parameter is MANDATORY "
+                  "for write operations. You must provide the full text to write.")
+    res = await build_coding_task(_ctx(FakeLLM(SPEC_OK)), "build x", tool_runner=runner)
+    assert not res.ok                      # NOT closed DONE with nothing written
+    assert "write rejected" in res.summary
+
+
 @pytest.mark.asyncio
 async def test_oversized_content_fails_loudly_not_silently_truncated():
     # A full file larger than the cap must FAIL (so the retry can split it),
@@ -430,7 +455,10 @@ async def test_advance_once_uses_coding_executor_and_registers_files(store):
     pid = store.create_project("Builder", kind="CODING")
     plan = ProjectPlan(store, pid)
     tid = plan.add_task("build the parser module")
-    runner = FakeRunner(verify_out="OK")
+    # Through advance_once the verify gate is fail-CLOSED: only an explicit
+    # `EXIT CODE: 0` passes (bare prose like "OK" is inconclusive).
+    runner = FakeRunner(
+        verify_out="--- COMMAND RESULT ---\nEXIT CODE: 0\nSTDOUT/STDERR:\nOK")
 
     res = await advance_once(
         SimpleNamespace(project_store=store, llm_client=None),

@@ -69,19 +69,29 @@ _SPEC_HTML = json.dumps({
 
 
 class SeqRunner:
-    """file_system returns the next canned output per call; execute returns OK."""
-    def __init__(self, outs):
+    """file_system returns the next canned output per call; execute returns OK.
+    Reads are answered out-of-band (``read_out``) so the canned write/replace
+    sequence stays aligned now that the executor live-reads before appends and
+    between retry attempts (2026-07-20 snapshot-clobber fixes)."""
+    def __init__(self, outs, read_out=None):
         self.outs = list(outs)
         self.calls = []
+        self.read_out = read_out
 
     async def __call__(self, name, args):
         self.calls.append((name, args))
         if name == "file_system":
+            if args.get("operation") == "read":
+                if self.read_out is not None:
+                    return self.read_out
+                return (f"Error: '{args.get('path')}' does not exist in the "
+                        f"current project's sandbox.")
             return self.outs.pop(0) if self.outs else "SUCCESS: File written."
         return "OK"
 
     def writes(self):
-        return [a for (n, a) in self.calls if n == "file_system"]
+        return [a for (n, a) in self.calls
+                if n == "file_system" and a.get("operation") != "read"]
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +127,10 @@ async def test_full_write_with_syntax_fail_is_apply_failure():
 
 @pytest.mark.asyncio
 async def test_append_with_syntax_fail_is_apply_failure():
-    runner = SeqRunner([_TAINT])
+    # the append live-reads the current file, then the write comes back tainted
+    runner = SeqRunner(
+        [_TAINT],
+        read_out="--- index.html CONTENTS ---\n<html><body></body></html>")
     existing = {"index.html": "<html><body></body></html>"}
     path, reason = await _apply_file(
         runner, {"path": "index.html", "append": "<script>let x=1;</script>"},

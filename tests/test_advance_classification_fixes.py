@@ -98,7 +98,8 @@ async def test_general_project_still_honors_llm_label(store):
 
     res = await advance_once(
         SimpleNamespace(project_store=store, llm_client=None), pid,
-        tool_runner=None, llm_classifier=classifier, coding_executor=exec_)
+        tool_runner=_dummy_runner, llm_classifier=classifier,
+        coding_executor=exec_)
 
     assert res.classification == "research"
     assert "called" not in seen                # coding executor NOT run
@@ -176,6 +177,34 @@ def test_gather_large_file_is_not_emptied(store):
     files = _gather_project_files(store, pid)
     assert files.get("index.html")                 # non-empty → guard sees it
     assert len(files["index.html"]) > 20_000        # the real (large) content
+
+
+def test_gather_project_files_skips_binary_media(store):
+    # PNG/WAV read with errors="replace" are pure noise to the executor, yet
+    # they consumed the file cap and char budget — crowding real sources out
+    # of existing_files and blinding the non-regression guard to them.
+    pid = store.create_project("P", kind="CODING")
+    base = store.sandbox_root / "projects" / pid
+    base.mkdir(parents=True, exist_ok=True)
+    (base / "index.html").write_text("<html><body>app</body></html>")
+    (base / "sprite.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 256)
+    (base / "theme.wav").write_bytes(b"RIFF" + b"\x00" * 128)
+    files = _gather_project_files(store, pid)
+    assert "index.html" in files
+    assert not any(k.endswith((".png", ".wav")) for k in files)
+
+
+def test_gather_binary_files_do_not_consume_the_cap(store):
+    # A dozen media files sort ahead of the real source and used to fill the
+    # 12-file cap before it was ever reached.
+    pid = store.create_project("P", kind="CODING")
+    base = store.sandbox_root / "projects" / pid
+    base.mkdir(parents=True, exist_ok=True)
+    for i in range(15):
+        (base / f"frame_{i:02d}.png").write_bytes(b"\x89PNG" + b"\x00" * 64)
+    (base / "z_app.js").write_text("console.log('app')")
+    files = _gather_project_files(store, pid)
+    assert files == {"z_app.js": "console.log('app')"}
 
 
 @pytest.mark.asyncio

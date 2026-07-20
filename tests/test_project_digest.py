@@ -68,6 +68,47 @@ def test_watermark_gates_repeats(store):
     assert third.advanced == 1
 
 
+def test_needs_user_project_rolled_same_tick_still_surfaces(store):
+    # Regression: the advancer's tick rolls the project to NEEDS_USER in
+    # the same batch that logs the needs-user event; the ACTIVE-only scan
+    # hid exactly that batch, so the user was never told input is needed.
+    pid = store.create_project("Waiting Proj")
+    tid = store.add_task(pid, "approve the schema change")
+    store.log_event(pid, tid, "autoadvance_needs_user",
+                    {"description": "approve the schema change"})
+    store.update_task(tid, status="NEEDS_USER")  # rolls project → NEEDS_USER
+    assert store.get_project(pid)["status"] == "NEEDS_USER"
+    res = summarize_since(store, 0)
+    assert len(res.needs_user) == 1
+    assert res.needs_user[0] == ("Waiting Proj", "approve the schema change")
+    assert "need your input" in render_digest(res)
+
+
+def test_done_project_terminal_batch_still_counted(store):
+    # The steps that finished a project must not vanish from the digest
+    # just because the project is no longer ACTIVE when the digest runs.
+    pid = store.create_project("Ship It")
+    tid = store.add_task(pid, "final step")
+    store.log_event(pid, tid, "autoadvance_step", {})
+    store.update_task(tid, status="DONE")  # rolls project → DONE
+    assert store.get_project(pid)["status"] == "DONE"
+    res = summarize_since(store, 0)
+    assert res.advanced == 1
+    assert ("Ship It", "DONE") in res.finished
+    out = render_digest(res)
+    assert "Ship It" in out and "DONE" in out
+
+
+def test_failed_project_rollup_surfaces(store):
+    pid = store.create_project("Doomed")
+    tid = store.add_task(pid, "impossible step")
+    store.update_task(tid, status="FAILED")  # rolls project → FAILED
+    assert store.get_project(pid)["status"] == "FAILED"
+    res = summarize_since(store, 0)
+    assert ("Doomed", "FAILED") in res.finished
+    assert res.has_content is True
+
+
 def test_new_event_id_advances_past_irrelevant_events(store):
     pid = store.create_project("P")
     store.log_event(pid, None, "noise_a", {})

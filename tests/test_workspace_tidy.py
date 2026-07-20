@@ -101,16 +101,77 @@ def test_tidy_keeps_registered_and_referenced_media(store, pid):
     assert s["kept_referenced"] == ["sprites.png"]
 
 
-def test_tidy_removes_debris_regardless_of_age(store, pid):
+def test_tidy_removes_old_debris(store, pid):
     ws = _ws(store, pid)
     cache = ws / "__pycache__"
     cache.mkdir()
     (cache / "m.pyc").write_bytes(b"c")
-    (ws / ".browser_runner.py").write_text("x")  # fresh, still debris
+    (ws / ".browser_runner.py").write_text("x")
+    _age(cache / "m.pyc", 30)
+    _age(ws / ".browser_runner.py", 30)
     s = tidy_project_workspace(store, pid)
     assert "__pycache__/m.pyc" in s["deleted"]
     assert ".browser_runner.py" in s["deleted"]
     assert "__pycache__" in s["dirs_removed"]
+
+
+def test_tidy_age_gate_applies_to_debris_too(store, pid):
+    """H8 regression (2026-07-20): the age gate covered only media, so a
+    recurring tidy on an ACTIVE project deleted brand-new debris-shaped
+    files out from under in-flight work. Fresh debris must survive the
+    default tidy exactly like fresh screenshots do."""
+    ws = _ws(store, pid)
+    cache = ws / "__pycache__"
+    cache.mkdir()
+    (cache / "m.pyc").write_bytes(b"c")
+    (ws / ".hidden_scratch").write_text("in-flight tool state")
+    s = tidy_project_workspace(store, pid)
+    assert s["deleted"] == []
+    assert (cache / "m.pyc").exists()
+    assert (ws / ".hidden_scratch").exists()
+
+
+def test_tidy_never_touches_git_tree_or_config_dotfiles(store, pid):
+    """H8 regression (2026-07-20): tidy deleted `.git/` contents and
+    dot-config files (`.eslintrc.json`, `.env.local`) on ACTIVE projects.
+    The `.git/` subtree is excluded outright — even past the age gate,
+    even at min_age_hours=0 — and keep-dotfile VARIANTS are not debris."""
+    ws = _ws(store, pid)
+    git = ws / ".git"
+    (git / "objects" / "ab").mkdir(parents=True)
+    (git / "refs" / "tags").mkdir(parents=True)
+    (git / "config").write_text("[core]")
+    (git / "objects" / "ab" / "cdef").write_bytes(b"blob")
+    (ws / ".eslintrc.json").write_text("{}")
+    (ws / ".env.local").write_text("KEY=1")
+    for rel in (".git/config", ".git/objects/ab/cdef"):
+        _age(ws / rel, 999)
+
+    s = tidy_project_workspace(store, pid, min_age_hours=0.0)
+
+    assert s["deleted"] == []
+    assert (git / "config").exists()
+    assert (git / "objects" / "ab" / "cdef").exists()
+    assert (git / "refs" / "tags").is_dir()  # empty git dir never pruned
+    assert (ws / ".eslintrc.json").exists()
+    assert (ws / ".env.local").exists()
+
+
+def test_tidy_path_escape_id_deletes_nothing(store):
+    """C1 regression (2026-07-20): a `..`-bearing project_id resolved the
+    walk root OUTSIDE the sandbox (reproduced with `../..` → sandbox
+    parent). Defense-in-depth behind the tool boundary: tidy must refuse
+    to walk and delete nothing."""
+    parent = store.sandbox_root.parent
+    decoy = parent / "decoy_scratch.tmp"  # debris-shaped, would be swept
+    decoy.write_text("outside the sandbox")
+    _age(decoy, 999)
+
+    s = tidy_project_workspace(store, "../..", min_age_hours=0.0)
+
+    assert s["status"] == "skipped: path escape"
+    assert s["deleted"] == []
+    assert decoy.exists()
 
 
 def test_tidy_never_deletes_source_even_when_unregistered_and_old(store, pid):

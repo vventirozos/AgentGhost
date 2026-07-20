@@ -168,7 +168,7 @@ async def test_no_remap_without_project_scope(tmp_path):
     result = await tool_execute(command="python3 /workspace/nope.py",
                                 sandbox_dir=tmp_path, sandbox_manager=mgr)
     assert mgr.execute.call_count == 1
-    assert "EXIT CODE: 1" in result
+    assert "EXIT CODE: 2" in result  # the REAL exit code, no longer flattened to 1
 
 
 # --- 3. grep exit 1 + no output = no matches, not a failure ------------------
@@ -216,7 +216,7 @@ async def test_grep_exit2_real_error_still_errors(tmp_path):
     mgr = _mock_mgr(returns=("grep: nope.py: No such file or directory", 2))
     result = await tool_execute(command='grep -n "x" nope.py',
                                 sandbox_dir=tmp_path, sandbox_manager=mgr)
-    assert "EXIT CODE: 1" in result  # _format_error shape
+    assert "EXIT CODE: 2" in result  # _format_error shape, real code threaded
 
 
 async def test_grep_piped_to_non_grep_not_carved_out(tmp_path):

@@ -106,6 +106,26 @@ _HYPOTHESIS_GROUNDING_ENABLED = True
 #    feature, tracked separately.
 _METACOG_ARBITER_ENABLED = False
 
+# Tools that are stateful or side-effecting but are NOT in the sandbox-
+# mutation `is_mutating` list — batch dedup must never collapse two
+# byte-identical calls of these to one execution (2026-07-20): `browser`
+# op=interact is a stateful click, and manage_projects/notify_operator/
+# delegate have real side effects. Dropping a real call causes state drift;
+# executing a redundant read is merely wasteful, so err toward not collapsing.
+_BATCH_COLLAPSE_UNSAFE = frozenset({
+    "browser", "manage_projects", "notify_operator", "delegate",
+    "delegate_to_swarm", "manage_services", "manage_skills", "create_skill",
+})
+
+# Headroom reserved for the per-turn injection that `_compose_injection`
+# adds to the shipped payload AFTER history pruning — tool schemas (~7-8k
+# tok), hydrated playbook/memory, continuity + workspace blocks, the
+# project briefing, and the scratchpad. Pruning history to the full
+# `max_context` and THEN adding this overshoots the model window → HTTP 400
+# → destructive emergency recovery (2026-07-20). Prune and steer against
+# `max_context - this` so the assembled payload stays within budget.
+_INJECTION_RESERVE_TOKENS = 24000
+
 # NON-THINKING MODE — model skips the `<think>` block entirely. Used
 # for tasks where reasoning doesn't help and would just burn tokens:
 # structured-XML emission (self-play challenge generation), one-shot
@@ -1544,6 +1564,17 @@ def _repair_one_native_tool_call(tc: dict, available_names):
         # can't attribute to the parser — leave it untouched.
         if not recovered and not sibling:
             continue
+        # Guard (2026-07-20 H6): a large, multi-line value is a CONTENT body,
+        # not a short leaked argument. This agent routinely writes files whose
+        # content SHOWS tool-call XML (docs/tests about its own tool format),
+        # which matches the leaked-framing signature and silently truncated
+        # the file at the first `</parameter>` example, reporting SUCCESS. A
+        # genuine merged leak recovers a known SECOND tool call; sibling
+        # params alone (which a documentation example also yields) are not
+        # strong enough to truncate a body-sized value. Only truncate a large
+        # value when a real second call was recovered.
+        if not recovered and (len(v) > 400 or "\n" in v[:m.start()]):
+            continue
         recovered_tcs = [_mk(name, a) for name, a in recovered]
         if m.start() > 0:
             # A clean prefix survives before the framing: truncate the primary's
@@ -2530,7 +2561,15 @@ class GhostAgent:
                     scrubbed_truncated.append({**msg, "content": new_content})
                 else:
                     scrubbed_truncated.append(msg)
-            return system_msgs + scrubbed_truncated
+            # Per-message tail cap (2026-07-20 H4): the other two
+            # over-budget returns wrap their output in `_cap_oversized_tail`,
+            # but this few-messages branch returned the last 3 messages
+            # VERBATIM — so a turn with a handful of huge tool results still
+            # ships oversize → upstream HTTP 400 → destructive emergency
+            # recovery (the exact xrick shape the 07-18 tail-cap claimed to
+            # close; it wrapped only 2 of 3 returns). Cap this branch too.
+            return self._cap_oversized_tail(
+                system_msgs + scrubbed_truncated, max_tokens)
 
         # Keep recent context (last 3 turns = 6 messages + goal)
         original_goal = non_system_msgs[0]
@@ -6962,8 +7001,15 @@ class GhostAgent:
                     last_was_failure = True
                     continue
 
-                is_mutating = fname in ["execute", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
-                              (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename"]) or \
+                # Keep the file_system op list + image_generation in sync with
+                # `is_sandbox_mutation` above (2026-07-20): `unzip`/`git_clone`
+                # write to the sandbox but were absent here, so the
+                # world-changed reset never fired after a clone (the post-clone
+                # verification read could then hit the no-progress breaker) and
+                # byte-identical clone/unzip/image_generation calls were
+                # dedup-collapse eligible.
+                is_mutating = fname in ["execute", "image_generation", "manage_tasks", "update_profile", "learn_skill", "vision_analysis"] or \
+                              (fname == "file_system" and t_args.get("operation") in ["write", "replace", "download", "delete", "move", "rename", "unzip", "git_clone"]) or \
                               (fname == "knowledge_base" and t_args.get("action") in ["ingest_document", "forget", "reset_all", "insert_fact"]) or \
                               (fname == "manage_composed_skills" and t_args.get("action") in ["define", "approve", "delete"])
 
@@ -7275,7 +7321,18 @@ class GhostAgent:
                         # duration lands in tool_durations[idx] (parallel to
                         # results/metadata) — feeds the metacog runtime-budget
                         # anomaly window.
-                        _dup_src_idx = None if is_mutating else batch_seen_reads.get(a_hash)
+                        # Batch dedup collapses byte-identical calls in one
+                        # batch to a single execution. `is_mutating` alone is
+                        # NOT a sufficient safety gate (2026-07-20): stateful
+                        # tools like `browser` (op=interact click), and
+                        # side-effecting ones like `manage_projects`,
+                        # `notify_operator`, `delegate` aren't in that list, so
+                        # two identical clicks collapsed to one and the model
+                        # believed both happened (state drift). Dropping a real
+                        # call is far worse than a redundant read, so exclude
+                        # anything stateful/side-effecting from collapse too.
+                        _collapse_unsafe = is_mutating or fname in _BATCH_COLLAPSE_UNSAFE
+                        _dup_src_idx = None if _collapse_unsafe else batch_seen_reads.get(a_hash)
                         if _dup_src_idx is not None:
                             # Duplicate read-only call in the SAME batch —
                             # register a placeholder task; the result is
@@ -7289,9 +7346,9 @@ class GhostAgent:
                             _coro = self.available_tools[fname](**t_args)
                             tool_tasks.append(_timed_tool_coro(_coro, tool_durations, len(tool_tasks)))
                             tool_durations.append(None)
-                            if not is_mutating:
+                            if not _collapse_unsafe:
                                 batch_seen_reads[a_hash] = len(tool_tasks) - 1
-                        tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or "")))
+                        tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or "")))
                         # The DURABLE idempotency hash is recorded at
                         # the RESULT-processing site, and only when
                         # the call actually SUCCEEDED. Recording it
@@ -7377,6 +7434,14 @@ class GhostAgent:
                 turn_has_failure = False
                 last_error_res = ""
                 last_error_preview = "Unknown Error"
+                # The tool name of the FAILING call (2026-07-20). `fname` is
+                # rebound per result, so after the loop it names the LAST
+                # tool in the batch — keying the strike signature / fallback
+                # hint / failure-dimension off it mis-attributed a failing
+                # `execute` to a trailing successful `recall`, so the
+                # same-failure repeat counter fragmented and the ≥3 breaker
+                # fired late or never. Captured at the failure site instead.
+                failed_fname = ""
 
                 # Per-call outcomes for this turn. A multi-id command
                 # ("delete A and B") is N separate tool calls; tracking
@@ -7396,7 +7461,7 @@ class GhostAgent:
                 # earlier failure can't latch the pivot prompt.
                 consecutive_parse_errors = 0
                 for i, result in enumerate(results):
-                    fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op = tool_call_metadata[i]
+                    fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op, ptarget_raw = tool_call_metadata[i]
                     str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
 
                     # Record this call's outcome uniformly (before the
@@ -7679,8 +7744,14 @@ class GhostAgent:
                             self.context, "current_project_id", None):
                         try:
                             if fname == "file_system" and is_mutating and ptarget:
+                                # Record the ORIGINAL-CASE path (2026-07-20):
+                                # `ptarget` is lower-cased for the loop-breaker's
+                                # case-insensitive "same target" match, but the
+                                # work_log feeds a briefing the model later runs
+                                # `cat <path>` against — a lower-cased README.md
+                                # ENOENTs on the case-sensitive container FS.
                                 getattr(self.context, "_project_work_files",
-                                        set()).add(str(ptarget))
+                                        set()).add(str(ptarget_raw or ptarget))
                             if (fname in ("execute", "browser",
                                           "vision_analysis")
                                     or (fname == "file_system" and is_mutating)):
@@ -7860,6 +7931,7 @@ class GhostAgent:
                         if exit_code_val != 0:
                             turn_has_failure = True
                             last_error_res = str_res
+                            failed_fname = fname
                             if "STDOUT/STDERR:" in str_res:
                                 last_error_preview = str_res.split("STDOUT/STDERR:")[1].strip().replace("\n", " ")
                             elif "SYSTEM ERROR:" in str_res:
@@ -7925,6 +7997,7 @@ class GhostAgent:
                     elif str_res.startswith("Error:") or str_res.startswith("ERROR") or str_res.startswith("SYSTEM ERROR") or str_res.startswith("Critical Tool Error"):
                         turn_has_failure = True
                         last_error_res = str_res
+                        failed_fname = fname
                         last_error_preview = str_res.replace("Error:", "").strip()
                         pretty_log("Tool Warning", f"{fname} -> {last_error_preview[:100]}", icon=Icons.WARN)
 
@@ -8049,6 +8122,10 @@ class GhostAgent:
                     # Any failure (transient or structural) breaks the
                     # consecutive-clean-success streak that unfreezes decay.
                     strikes.reset_clean_streak()
+                    # Attribute to the FAILING tool, not the batch's last
+                    # tool (`fname` is rebound per result). Falls back to
+                    # `fname` only if no capture site fired.
+                    _fail_fname = failed_fname or fname
                     # Classify the failure to route to the right budget
                     from ..tools.tool_failure import classify_tool_failure, FailureClass, format_failure_context, summarize_multi_op_outcomes
                     failure_class, failure_match = classify_tool_failure(last_error_res or last_error_preview)
@@ -8057,7 +8134,7 @@ class GhostAgent:
                     _ftexts = getattr(self.context, "_turn_failure_texts", None)
                     if isinstance(_ftexts, list) and len(_ftexts) < 6:
                         _ftexts.append(
-                            f"{fname} [{failure_class.value}]: "
+                            f"{_fail_fname} [{failure_class.value}]: "
                             f"{(last_error_res or last_error_preview)[:300]}")
                     # Partial-failure summary (empty unless this turn
                     # mixed successes and failures across >=2 calls).
@@ -8078,13 +8155,13 @@ class GhostAgent:
                         # live tool result is authoritative over any stale
                         # context/system-state hint that says otherwise.
                         _sig, _cnt, _persist, _first_warn = strikes.note_failure(
-                            fname, last_error_preview
+                            _fail_fname, last_error_preview
                         )
                         if _first_warn:
                             pretty_log(
                                 "Loop Breaker",
                                 f"Same failure ×{_cnt} "
-                                f"({fname}) — freezing strike decay & redirecting.",
+                                f"({_fail_fname}) — freezing strike decay & redirecting.",
                                 level="WARNING", icon=Icons.STOP,
                             )
                             messages.append({"role": "user", "content": (
@@ -8107,8 +8184,8 @@ class GhostAgent:
                     # Check for tool fallback suggestions
                     from ..tools.fallback_chains import get_fallback_hint
                     fallback_hint = ""
-                    if fname:
-                        hint = get_fallback_hint(fname, last_error_res or last_error_preview)
+                    if _fail_fname:
+                        hint = get_fallback_hint(_fail_fname, last_error_res or last_error_preview)
                         if hint:
                             fallback_hint = f"\n\n{hint}"
 
@@ -8361,6 +8438,84 @@ class GhostAgent:
         except Exception as exc:
             logger.debug(f"defect-task recording skipped: {exc}")
             return False
+
+    async def _write_project_work_log_safe(
+            self, *, last_user_content, final_ai_content,
+            execution_failure_count, verifier_backfill=None):
+        """Write ONE bounded project work_log event for a turn that did
+        real work (mutated files / ran work tools) while a project was
+        bound, then clear the per-turn accumulators. Records request head,
+        files, tool counts, verifier/failure-aware outcome, harness
+        dimension, and the answer head — the store's only record of an
+        interactive turn's work (agent.py used to write nothing itself).
+
+        Shared by `_finalize_and_return` (non-streamed) and the stream
+        drain (2026-07-20 H1: streamed forced-final turns bypass finalize,
+        so this MUST also run there or streamed project turns leave no
+        work_log — re-opening the "agent forgets project work" gap).
+        Non-fatal.
+        """
+        try:
+            _wl_pid = getattr(self.context, "current_project_id", None)
+            _wl_store = getattr(self.context, "project_store", None)
+            _wl_files = getattr(self.context, "_project_work_files", None) or set()
+            _wl_tools = getattr(self.context, "_project_work_tools", None) or {}
+            if _wl_pid and _wl_store is not None and (_wl_files or _wl_tools):
+                if verifier_backfill is not None:
+                    _wl_outcome = f"verifier:{verifier_backfill[0]}"
+                elif execution_failure_count > 0:
+                    _wl_outcome = "had_failures"
+                else:
+                    _wl_outcome = "completed"
+                # Harness-dimension attribution (2026-07-19): classify the
+                # turn's captured failure heads so the work_log names the
+                # layer that failed (a prior for debugging and the group
+                # key for dream-side distillation — not a verdict).
+                _wl_dim = ""
+                if _wl_outcome != "completed":
+                    try:
+                        from .failure_dimension import (
+                            classify_failure_dimension, failure_dim_enabled)
+                        if failure_dim_enabled():
+                            _parts = list(getattr(
+                                self.context, "_turn_failure_texts",
+                                None) or [])[-3:]
+                            if (verifier_backfill is not None
+                                    and verifier_backfill[0] == "failed"):
+                                _parts.insert(
+                                    0, f"verifier: {verifier_backfill[1]}")
+                            if _parts:
+                                _wl_dim, _wl_dim_sig = \
+                                    classify_failure_dimension("\n".join(_parts))
+                                if _wl_dim == "unknown":
+                                    _wl_dim = ""
+                                else:
+                                    logger.debug(
+                                        "work_log dimension=%s (signal: %r)",
+                                        _wl_dim, str(_wl_dim_sig)[:60])
+                    except Exception:
+                        _wl_dim = ""
+                await asyncio.to_thread(
+                    _wl_store.add_work_log, _wl_pid,
+                    request=last_user_content or "",
+                    files=list(_wl_files),
+                    tools=dict(_wl_tools),
+                    commands=list(getattr(self.context,
+                                          "_project_work_cmds", None) or []),
+                    outcome=_wl_outcome,
+                    note=final_ai_content or "",
+                    failure_dimension=_wl_dim,
+                )
+                # Consumed — a queued follow-up in the same process must
+                # not re-attribute this request's work.
+                try:
+                    self.context._project_work_files = set()
+                    self.context._project_work_tools = {}
+                    self.context._turn_failure_texts = []
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"project work-log write skipped: {type(e).__name__}: {e}")
 
     async def _finalize_and_return(self, fs: "FinalizeState"):
         """The post-turn-loop finalization chain — output scrubbers,
@@ -9345,9 +9500,27 @@ class GhostAgent:
                     # Sandbox writes accumulate ACROSS the session (the AND
                     # rule needs ≥3 total, and a chat rarely writes 3 files in
                     # one turn). Persist a running counter in the scratchpad.
+                    # Count only successful MUTATIONS, not reads/lists/errors
+                    # (2026-07-20): the old count of every file_system result
+                    # let a chat that merely READ 3 files fire the "promote to
+                    # a project" nudge the ≥3-writes retune exists to prevent.
+                    # A write's result is a "SUCCESS: <verb>…" line; a read
+                    # returns raw file content, an error an "Error:"/"SYSTEM"
+                    # prefix — neither matches.
+                    _WRITE_VERBS = ("wrote", "applied", "replace", "renamed",
+                                    "moved", "deleted", "downloaded",
+                                    "unzipped", "cloned", "created",
+                                    "auto-promoted", "inserted", "appended")
+                    def _is_fs_write(_t):
+                        if not (isinstance(_t, dict) and _t.get("name") == "file_system"):
+                            return False
+                        _c = str(_t.get("content") or "").lstrip()
+                        if not _c.upper().startswith("SUCCESS"):
+                            return False
+                        _low = _c[:80].lower()
+                        return any(v in _low for v in _WRITE_VERBS)
                     _writes_this_turn = sum(
-                        1 for t in (tools_run_this_turn or [])
-                        if isinstance(t, dict) and t.get("name") == "file_system"
+                        1 for t in (tools_run_this_turn or []) if _is_fs_write(t)
                     )
                     _writes = _writes_this_turn
                     try:
@@ -9401,76 +9574,17 @@ class GhostAgent:
         except Exception:
             pass
 
-        # Turn→project write-back (2026-07-18). While a project was
-        # bound, any request that did real work (mutated files or ran
-        # work tools) leaves ONE bounded work_log event on the project —
-        # request head, files touched, tool counts, outcome (verifier-
-        # aware), and the head of the final answer. This is the record
-        # the store previously never got for interactive turns: agent.py
-        # wrote nothing itself, so all post-completion debugging was
-        # invisible to future turns (2026-07-17 session: 7 requests of
-        # game debugging, zero store events after 21:41). Non-fatal.
-        try:
-            _wl_pid = getattr(self.context, "current_project_id", None)
-            _wl_store = getattr(self.context, "project_store", None)
-            _wl_files = getattr(self.context, "_project_work_files", None) or set()
-            _wl_tools = getattr(self.context, "_project_work_tools", None) or {}
-            if _wl_pid and _wl_store is not None and (_wl_files or _wl_tools):
-                if verifier_backfill is not None:
-                    _wl_outcome = f"verifier:{verifier_backfill[0]}"
-                elif execution_failure_count > 0:
-                    _wl_outcome = "had_failures"
-                else:
-                    _wl_outcome = "completed"
-                # Harness-dimension attribution (2026-07-19): classify the
-                # turn's captured failure heads so the work_log names the
-                # layer that failed (a prior for debugging and the group
-                # key for dream-side distillation — not a verdict).
-                _wl_dim = ""
-                if _wl_outcome != "completed":
-                    try:
-                        from .failure_dimension import (
-                            classify_failure_dimension, failure_dim_enabled)
-                        if failure_dim_enabled():
-                            _parts = list(getattr(
-                                self.context, "_turn_failure_texts",
-                                None) or [])[-3:]
-                            if (verifier_backfill is not None
-                                    and verifier_backfill[0] == "failed"):
-                                _parts.insert(
-                                    0, f"verifier: {verifier_backfill[1]}")
-                            if _parts:
-                                _wl_dim, _wl_dim_sig = \
-                                    classify_failure_dimension("\n".join(_parts))
-                                if _wl_dim == "unknown":
-                                    _wl_dim = ""
-                                else:
-                                    logger.debug(
-                                        "work_log dimension=%s (signal: %r)",
-                                        _wl_dim, str(_wl_dim_sig)[:60])
-                    except Exception:
-                        _wl_dim = ""
-                await asyncio.to_thread(
-                    _wl_store.add_work_log, _wl_pid,
-                    request=last_user_content or "",
-                    files=list(_wl_files),
-                    tools=dict(_wl_tools),
-                    commands=list(getattr(self.context,
-                                          "_project_work_cmds", None) or []),
-                    outcome=_wl_outcome,
-                    note=final_ai_content or "",
-                    failure_dimension=_wl_dim,
-                )
-                # Consumed — a queued follow-up in the same process must
-                # not re-attribute this request's work.
-                try:
-                    self.context._project_work_files = set()
-                    self.context._project_work_tools = {}
-                    self.context._turn_failure_texts = []
-                except Exception:
-                    pass
-        except Exception as e:
-            logger.debug(f"project work-log write skipped: {type(e).__name__}: {e}")
+        # Turn→project write-back (2026-07-18). Extracted to a shared
+        # helper 2026-07-20 (H1): streamed forced-final turns return the
+        # SSE generator BEFORE this finalize chain runs, so the work_log
+        # write has to happen from the stream drain too — both call the
+        # same helper so the logic can't drift.
+        await self._write_project_work_log_safe(
+            last_user_content=last_user_content,
+            final_ai_content=final_ai_content,
+            execution_failure_count=execution_failure_count,
+            verifier_backfill=verifier_backfill,
+        )
 
         # Stage-1 self-improvement: append the turn's trajectory
         # to the distill log. No-op when the collector isn't
@@ -10611,6 +10725,18 @@ class GhostAgent:
                             pass
 
                     scratch_data = self.context.scratchpad.list_all() if getattr(self.context, 'scratchpad', None) else "None."
+                    # Bound the scratchpad at the SOURCE (2026-07-20). The
+                    # per-turn `dynamic_state` injection below embeds this raw
+                    # and uncapped (the planner path caps its own copy, but the
+                    # DYNAMIC SYSTEM STATE block did not), and it's invisible to
+                    # every governor token estimate — a large stashed blob (or
+                    # swarm workers writing multi-KB outputs to scrapbook keys,
+                    # which the system prompt instructs) then rode in every turn
+                    # of every request, widening the overflow band and surviving
+                    # restarts via the SQLite-persisted scratchpad.
+                    _SCRATCH_INJECT_CAP = 6000
+                    if isinstance(scratch_data, str) and len(scratch_data) > _SCRATCH_INJECT_CAP:
+                        scratch_data = scratch_data[:_SCRATCH_INJECT_CAP] + "\n...[SCRATCHPAD TRUNCATED — recall a specific key for the full value]"
                     if has_coding_intent:
                         # Per-request sandbox state cache. The previous
                         # process-global cache (`context.cached_sandbox_state`)
@@ -10794,15 +10920,34 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     except Exception as _cmx:
                         logger.debug("progressive compression skipped: %s", _cmx)
 
-                    # Proactive Context Pruning before request
+                    # Proactive Context Pruning before request. Prune against
+                    # a HISTORY budget that reserves room for the per-turn
+                    # injection added after this (2026-07-20): pruning to the
+                    # full max_context and then composing schemas/briefing/
+                    # hydration/scratchpad on top overshot the window into a
+                    # 400. `_history_budget` closes that band; the steer
+                    # threshold below uses the same figure so the graduated
+                    # governor fires before the destructive recovery does.
+                    _ctx_cap = int(getattr(self.context.args, "max_context", 0) or 0)
+                    # Reserve headroom for the per-turn injection, but only ramp
+                    # it in ABOVE 32k — a real production window (240k) reserves
+                    # the full ~24k, while a small/mock context (the injection
+                    # is negligible there anyway) keeps its full budget so the
+                    # reserve never lowers a tiny threshold and perturbs
+                    # compaction timing.
+                    _injection_reserve = min(
+                        _INJECTION_RESERVE_TOKENS, max(0, _ctx_cap - 32000))
+                    _history_budget = (
+                        max(1000, _ctx_cap - _injection_reserve)
+                        if _ctx_cap else self.context.args.max_context)
                     _pre_prune_tokens = _estimate_messages_tokens(messages)
-                    messages = await self._prune_context(messages, max_tokens=self.context.args.max_context, model=model)
+                    messages = await self._prune_context(messages, max_tokens=_history_budget, model=model)
                     # Context-pressure governor (2026-07-18). A prune that
                     # actually fired means detail was just summarized away —
                     # without a steer the model keeps bulk-reading, re-reads
                     # what compaction destroyed, and spirals (xrick session:
                     # 60 file reads, 2 compactions, 25+ min, dead turn).
-                    if _pre_prune_tokens > int(getattr(self.context.args, "max_context", 0) or 0):
+                    if _ctx_cap and _pre_prune_tokens > _history_budget:
                         context_pressure_steers += 1
                         if context_pressure_steers == 1:
                             messages.append({"role": "user", "content": (
@@ -11829,49 +11974,50 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             self._judge_hydration_safe(
                                 full_content, turn_id=str(req_id or ""))
 
-                            # Streamed-turn trajectory backfill: the record
-                            # written at finalize carried final_response=""
-                            # (the text lived in the SSE frames), which made
-                            # the correction-lookup stash reject it — the
-                            # user-correction promotion loop and the
-                            # abort-marker heuristics were dead for every
-                            # streamed turn. Now that the full text exists,
-                            # backfill the in-memory trajectory, re-run the
-                            # shape heuristics, land any promotion via the
-                            # corrections sidecar, and stash for the next
-                            # turn's correction hook.
+                            # Streamed-turn trajectory + work_log (2026-07-20 H1).
+                            # A streamed forced-final turn RETURNS the SSE
+                            # generator before `_finalize_and_return` ever runs,
+                            # so `_record_turn_trajectory` and the project
+                            # work_log — both sole-called from finalize — never
+                            # fired for streamed turns: no corpus record (dead
+                            # user-correction loop + abort detection) and no
+                            # project work_log (the "forgets project work" gap).
+                            # Web UI always streams AND one-task-per-turn forces
+                            # this ending on task-closing turns, so this is the
+                            # COMMON case, not an edge. Record here directly with
+                            # the real `full_content` (the earlier finalize-time
+                            # backfill was inert — it keyed off a trajectory
+                            # finalize never wrote). The verifier runs LATE below
+                            # and backfills the outcome by `current_trajectory_id`,
+                            # so pass verifier=None here.
                             try:
-                                _spend = getattr(
-                                    self.context, "_streamed_traj_pending", None)
-                                if (_spend and _spend[0] == req_id
-                                        and isinstance(full_content, str)
+                                if (isinstance(full_content, str)
                                         and full_content.strip()):
-                                    _straj = _spend[1]
-                                    _straj.final_response = full_content[:16000]
-                                    try:
-                                        from ..distill.outcome_heuristics import (
-                                            apply_chat_outcome_heuristics)
-                                        from ..distill.schema import Outcome as _SOut
-                                        if (_straj.outcome == _SOut.UNKNOWN.value
-                                                and apply_chat_outcome_heuristics(_straj)):
-                                            _scol = getattr(
-                                                self.context,
-                                                "trajectory_collector", None)
-                                            if _scol is not None:
-                                                _glog.spawn_bg(asyncio.to_thread(
-                                                    _scol.update_outcome,
-                                                    _straj.id, _straj.outcome,
-                                                    reason=_straj.failure_reason,
-                                                    source="stream_backfill",
-                                                ), name="stream-outcome-backfill")
-                                    except Exception:
-                                        pass
-                                    self._stash_trajectory_for_correction_lookup(_straj)
-                                    self.context._streamed_traj_pending = None
+                                    self._record_turn_trajectory(
+                                        messages=messages,
+                                        final_content=full_content,
+                                        req_id=req_id,
+                                        model=model,
+                                        trajectory_id=current_trajectory_id,
+                                        user_request=last_user_content,
+                                        verifier=None,
+                                        execution_failed=(
+                                            execution_failure_count > 0
+                                            and bool(last_was_failure)),
+                                    )
                             except Exception as _sbf_exc:
                                 logger.debug(
-                                    "streamed trajectory backfill skipped: %s",
+                                    "streamed trajectory record skipped: %s",
                                     _sbf_exc)
+                            # Project work_log — same helper finalize uses. No
+                            # synchronous verdict on the stream path (verifier is
+                            # late), so the outcome is execution-based here.
+                            await self._write_project_work_log_safe(
+                                last_user_content=last_user_content,
+                                final_ai_content=full_content,
+                                execution_failure_count=execution_failure_count,
+                                verifier_backfill=None,
+                            )
 
                             # --- VERIFIER GATE (STREAM), 2026-07-18 ---
                             # The gated verdict was historically invoked only
@@ -14125,19 +14271,6 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as e:
             logger.debug(
                 "trajectory stash for correction lookup skipped: %s: %s",
-                type(e).__name__, e,
-            )
-        # Streamed turn (generator final_content → final_response "" above):
-        # park the trajectory so the SSE drain can backfill the real text
-        # once the stream completes — the stash above rejected it (empty
-        # response), so without this the correction loop never sees
-        # streamed turns.
-        try:
-            if not isinstance(final_content, str):
-                self.context._streamed_traj_pending = (req_id, traj)
-        except Exception as e:
-            logger.debug(
-                "streamed trajectory parking skipped: %s: %s",
                 type(e).__name__, e,
             )
 

@@ -74,15 +74,37 @@ def _project_dir(store, project_id: str) -> Optional[Path]:
     return Path(root) / "projects" / pid
 
 
+def _escapes_projects_root(store, project_id: str, root: Path) -> bool:
+    """Defense-in-depth containment check (2026-07-20 review, C1): the tool
+    boundary validates project ids, but a ``..``-bearing id that slips
+    through makes ``_project_dir`` resolve OUTSIDE the sandbox, and the walks
+    below would then delete the parent tree. True ⇒ do not walk. Any doubt
+    (including an unexpected exception) reads as an escape — this must never
+    raise into the completion path."""
+    try:
+        pid = str(project_id or "").strip()
+        if "/" in pid or "\\" in pid or ".." in Path(pid).parts:
+            return True
+        projects_root = (Path(store.sandbox_root) / "projects").resolve()
+        # strictly inside: the projects root itself is never a project dir
+        return root == projects_root or not root.is_relative_to(projects_root)
+    except Exception:
+        return True
+
+
 def _normalize_rel(payload: str, project_id: str) -> Optional[str]:
     """Reduce an artifact ``file`` payload to a clean project-relative POSIX
     path, or ``None`` if it cannot be trusted.
 
     Payloads are stored relative to the project dir (e.g. ``research/x.md``),
     but a few producers prepend the redundant ``projects/<id>/`` prefix the
-    model sees in directory listings. Strip that, drop a leading ``./``, and
-    reject any ``..`` traversal so a malformed payload can never widen the
-    keep-set to a path outside the project dir.
+    model sees in directory listings, and some pass the absolute sandbox path
+    (``/workspace/projects/<id>/x.png``). Both must collapse to the same
+    project-relative key the sweep's walk produces, or the registered file
+    reads as unprotected and gets deleted (2026-07-20 review, H9). The shared
+    contract (``register_file_artifact`` stores the same form): project-
+    relative POSIX, no leading ``/``, no ``workspace/`` segment, no
+    ``projects/<id>/`` prefix, ``..`` rejected.
     """
     if not payload:
         return None
@@ -90,6 +112,8 @@ def _normalize_rel(payload: str, project_id: str) -> Optional[str]:
     while rel.startswith("./"):
         rel = rel[2:]
     rel = rel.lstrip("/")
+    if rel.lower().startswith("workspace/"):
+        rel = rel[len("workspace/"):]
     pref = f"projects/{project_id}/"
     if rel.lower().startswith(pref.lower()):
         rel = rel[len(pref):]
@@ -127,6 +151,26 @@ _KEEP_DOTFILES = frozenset({
 })
 
 
+def _is_kept_dotfile(name: str) -> bool:
+    """True for well-known config/deliverable dotfiles, INCLUDING their
+    format variants — real projects spell them ``.eslintrc.json``,
+    ``.babelrc.js``, ``.env.local`` — which the exact-match set missed, so
+    they were classified debris and deleted (2026-07-20 review, H8)."""
+    return name in _KEEP_DOTFILES or any(
+        name.startswith(k + ".") for k in _KEEP_DOTFILES)
+
+
+def _in_git_tree(rel: str) -> bool:
+    """True for ``.git`` itself or anything under a ``.git/`` directory
+    (including a worktree/submodule ``.git`` pointer file). Version-control
+    state is never cleanup's to delete — tidying an in-flight clone corrupts
+    the whole repo (2026-07-20 review, H8) — so both the recurring tidy and
+    the DONE sweep skip this subtree outright. ``.git`` stays in
+    ``_SCRATCH_DIRS`` so the recovery passes don't register its internals
+    as deliverables; this guard is what keeps the files on disk."""
+    return ".git" in rel.lower().split("/")
+
+
 def _is_debris(rel: str) -> bool:
     """True for a project-relative path that is categorically transient —
     bytecode caches, browser scaffolding, editor swap/backup files, dotfiles.
@@ -141,7 +185,7 @@ def _is_debris(rel: str) -> bool:
     # Dotfiles are debris EXCEPT well-known config/deliverable dotfiles — a web
     # build's `.htaccess`, a `.env`, or a `.gitignore` are real deliverables and
     # were being deleted by the no-registration recovery path.
-    if name.startswith(".") and name not in _KEEP_DOTFILES:
+    if name.startswith(".") and not _is_kept_dotfile(name):
         return True
     if name.startswith(_SCRATCH_PREFIXES):
         return True
@@ -311,10 +355,11 @@ def sweep_project_workspace(store, project_id: str, *,
     directories left empty.
 
     Returns a summary dict — ``{project_id, status, deleted, kept,
-    dirs_removed, freed_bytes}`` (plus ``recovered`` when a recovery pass
-    kept unregistered files) — and never raises. ``status`` is ``"ok"``
-    on a real sweep, or ``"skipped: <reason>"`` when there is nothing safe
-    to do (no sandbox root, missing dir, unreadable keep-set). With
+    dirs_removed, freed_bytes, kept_referenced}`` (plus ``recovered`` when a
+    recovery pass kept unregistered files) — and never raises. ``status`` is
+    ``"ok"`` on a real sweep, or ``"skipped: <reason>"`` when there is
+    nothing safe to do (no sandbox root, escaped/missing dir, unreadable
+    keep-set). With
     ``dry_run=True`` it reports what it *would* delete without touching disk.
     """
     summary: Dict[str, Any] = {
@@ -330,6 +375,9 @@ def sweep_project_workspace(store, project_id: str, *,
         root = proj_dir.resolve()
     except OSError:
         summary["status"] = "skipped: unresolvable dir"
+        return summary
+    if _escapes_projects_root(store, project_id, root):
+        summary["status"] = "skipped: path escape"
         return summary
     if not root.is_dir():
         summary["status"] = "skipped: no project dir"
@@ -363,6 +411,30 @@ def sweep_project_workspace(store, project_id: str, *,
     kept: List[str] = []
     freed = 0
 
+    # Pass 0 — referenced-media protection (2026-07-20): an unregistered
+    # media file that a kept source file points at (sprite sheet, texture,
+    # favicon) is an asset of the build, not a stray screenshot — deleting
+    # it breaks the deliverable the sweep just protected. Same scan the
+    # recurring tidy runs; symlinks stay deletable (a symlink is scratch).
+    media_candidates: List[str] = []
+    for dirpath, _dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+        base = Path(dirpath)
+        for fname in filenames:
+            fpath = base / fname
+            try:
+                if fpath.is_symlink():
+                    continue
+                rel = fpath.relative_to(root).as_posix()
+            except (OSError, ValueError):
+                continue
+            if rel in keep or _is_debris(rel):
+                continue
+            name = rel.split("/")[-1].lower()
+            dot = name.rfind(".")
+            if dot > 0 and name[dot:] in _MEDIA_SUFFIXES:
+                media_candidates.append(rel)
+    referenced = _referenced_media(root, media_candidates)
+
     # Pass 1 — delete unregistered files. topdown so we never descend into a
     # dir we're about to drop; followlinks=False so a symlink can't lead the
     # walk out of the project tree.
@@ -374,7 +446,9 @@ def sweep_project_workspace(store, project_id: str, *,
                 rel = fpath.relative_to(root).as_posix()
             except ValueError:
                 continue  # defensive: outside the tree, never touch it
-            if rel in keep:
+            if _in_git_tree(rel):
+                continue  # version-control state survives even the DONE sweep
+            if rel in keep or rel in referenced:
                 kept.append(rel)
                 continue
             try:
@@ -403,18 +477,25 @@ def sweep_project_workspace(store, project_id: str, *,
             if d == root:
                 continue
             try:
+                drel = d.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if _in_git_tree(drel):
+                continue  # git keeps legitimately-empty dirs (refs/tags, …)
+            try:
                 next(d.iterdir())
             except StopIteration:
                 try:
                     d.rmdir()
-                    dirs_removed.append(d.relative_to(root).as_posix())
+                    dirs_removed.append(drel)
                 except OSError:
                     pass
             except OSError:
                 pass
 
     summary.update(deleted=deleted, kept=kept,
-                   dirs_removed=dirs_removed, freed_bytes=freed)
+                   dirs_removed=dirs_removed, freed_bytes=freed,
+                   kept_referenced=sorted(referenced))
     if deleted or dirs_removed:
         verb = "would remove" if dry_run else "removed"
         pretty_log(
@@ -439,7 +520,9 @@ def sweep_project_workspace(store, project_id: str, *,
 #
 # It is deliberately MUCH narrower than the DONE sweep. It deletes only:
 #   * categorical debris (`_is_debris` — caches, browser scaffolding,
-#     swap/backup files), and
+#     swap/backup files) older than the age gate — the tidy runs on ACTIVE
+#     projects, so even debris-shaped files get their grace period (a fresh
+#     `.hidden_scratch` may be an in-flight tool's state), and
 #   * unregistered MEDIA files (screenshot-shaped: .png/.jpg/…)
 #     that are (a) older than the age gate, (b) not in the keep-set,
 #     (c) not referenced by any of the project's source files — a sprite
@@ -447,7 +530,8 @@ def sweep_project_workspace(store, project_id: str, *,
 # Source/document files are NEVER deleted here regardless of
 # registration — on a non-terminal project, today's unregistered helper
 # script may be tomorrow's deliverable; the DONE sweep is the place where
-# unregistered scratch scripts get judged.
+# unregistered scratch scripts get judged. The `.git/` subtree is never
+# touched at all (`_in_git_tree`).
 
 #: media suffixes the tidy treats as screenshot-shaped scratch candidates.
 _MEDIA_SUFFIXES = {
@@ -502,9 +586,10 @@ def tidy_project_workspace(store, project_id: str, *,
                            dry_run: bool = False) -> Dict[str, Any]:
     """Recurring, status-agnostic debris tidy for one project workspace.
 
-    Deletes categorical debris plus unregistered, unreferenced,
-    older-than-``min_age_hours`` media files (see module note above);
-    never touches source/document files or anything in the keep-set.
+    Deletes categorical debris and unregistered, unreferenced media files —
+    both only when older than ``min_age_hours`` (see module note above);
+    never touches source/document files, the ``.git/`` subtree, or anything
+    in the keep-set.
     Logs one ``workspace_tidy`` project event when something was removed.
     Returns the same summary shape as ``sweep_project_workspace``;
     never raises."""
@@ -522,6 +607,9 @@ def tidy_project_workspace(store, project_id: str, *,
         root = proj_dir.resolve()
     except OSError:
         summary["status"] = "skipped: unresolvable dir"
+        return summary
+    if _escapes_projects_root(store, project_id, root):
+        summary["status"] = "skipped: path escape"
         return summary
     if not root.is_dir():
         summary["status"] = "skipped: no project dir"
@@ -548,8 +636,17 @@ def tidy_project_workspace(store, project_id: str, *,
                 continue
             if rel in keep:
                 continue
+            if _in_git_tree(rel):
+                continue  # version-control state is never the tidy's to delete
             if _is_debris(rel):
-                debris.append(rel)
+                # Same grace period media gets: an ACTIVE project's fresh
+                # debris (a tool's live dotfile state, a log being written)
+                # must not vanish under the build; symlinks stay deletable.
+                try:
+                    if fpath.is_symlink() or fpath.stat().st_mtime <= age_cutoff:
+                        debris.append(rel)
+                except OSError:
+                    pass
                 continue
             if _is_source_like(rel):
                 continue  # never the tidy's business
@@ -592,11 +689,17 @@ def tidy_project_workspace(store, project_id: str, *,
             if d == root:
                 continue
             try:
+                drel = d.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            if _in_git_tree(drel):
+                continue  # git keeps legitimately-empty dirs (refs/tags, …)
+            try:
                 next(d.iterdir())
             except StopIteration:
                 try:
                     d.rmdir()
-                    dirs_removed.append(d.relative_to(root).as_posix())
+                    dirs_removed.append(drel)
                 except OSError:
                     pass
             except OSError:

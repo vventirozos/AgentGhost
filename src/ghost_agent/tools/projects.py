@@ -441,6 +441,21 @@ def _message_references_project(context, project_id: str) -> bool:
     return False
 
 
+def _park_current_project(context, cur: str, why: str):
+    """Deactivate the process-global active project for THIS request,
+    snapshotting its scratchpad so the owning conversation can resume it."""
+    _snapshot_scratchpad(context, cur)
+    context.current_project_id = None
+    _wm = getattr(context, "workspace_model", None)
+    if _wm is not None:
+        try:
+            _wm.current_project_id = ""
+        except Exception:
+            pass
+    _hydrate_scratchpad(context, None)
+    pretty_log("Project Scope", why, icon=Icons.BRAIN_PLAN)
+
+
 def reconcile_conversation(context, conv_key: str):
     """Scope the active project to the conversation that activated it.
 
@@ -469,6 +484,22 @@ def reconcile_conversation(context, conv_key: str):
         return
     cur = getattr(context, "current_project_id", None)
     if not bound_pid or not isinstance(bound_pid, str):
+        # No valid binding — never set, cleared, or LRU-evicted (the
+        # scratchpad keeps ~50 entries / 24h). Returning here used to fail
+        # OPEN: the process-global `current_project_id` from the PREVIOUS
+        # conversation stayed active for this request, so its file writes
+        # landed in that project's workspace. Fail CLOSED instead: park the
+        # stale project unless this very message names it (same escape
+        # hatch as the fingerprint-mismatch path below).
+        if cur and not _message_references_project(context, cur):
+            _park_current_project(
+                context, cur,
+                f"Project '{cur}' has no conversation binding — "
+                "deactivated for this request")
+        elif cur:
+            # Explicitly referenced → keep it active and re-bind it to this
+            # conversation so sentinel-based scoping fallbacks resolve it.
+            _set_current(context, cur)
         return
     owns = bool(conv_key) and bound_conv == conv_key
     # Escape hatch: even on a fingerprint mismatch, an explicit user reference
@@ -510,19 +541,10 @@ def reconcile_conversation(context, conv_key: str):
         return
     if cur:
         # Another conversation's project is live — park it for this request.
-        _snapshot_scratchpad(context, cur)
-        context.current_project_id = None
-        _wm = getattr(context, "workspace_model", None)
-        if _wm is not None:
-            try:
-                _wm.current_project_id = ""
-            except Exception:
-                pass
-        _hydrate_scratchpad(context, None)
-        pretty_log("Project Scope",
-                   f"Project '{cur}' belongs to another conversation — "
-                   "deactivated for this request",
-                   icon=Icons.BRAIN_PLAN)
+        _park_current_project(
+            context, cur,
+            f"Project '{cur}' belongs to another conversation — "
+            "deactivated for this request")
 
 
 def _workspace_note(project_id: str) -> str:
@@ -1060,6 +1082,11 @@ async def tool_manage_projects(
         project_id = _canon_pid(project_id)
     if task_id:
         task_id = _canon_pid(task_id)
+    # parent_id too: the store canonicalises it on write, but the sibling-
+    # duplicate guard in task_add compares it RAW against stored (canonical)
+    # parent ids — a case-mangled parent id slipped past the guard.
+    if parent_id:
+        parent_id = _canon_pid(parent_id)
 
     store = _resolve_store(context)
     if store is None:
@@ -1093,6 +1120,14 @@ async def tool_manage_projects(
                 metadata = None
         else:
             metadata = None
+    if metadata is not None and not isinstance(metadata, dict):
+        # A non-dict here (e.g. metadata='["x"]' parsing to a LIST) would be
+        # PERSISTED verbatim and poison every later `dict(metadata)` /
+        # `metadata.get(...)` reader — reject at the boundary instead.
+        return _err(
+            f"metadata must be a JSON object, got {type(metadata).__name__} "
+            '— e.g. metadata={"key": "value"}'
+        )
 
     # `result` is the canonical name for a task's completion summary, but the
     # model very naturally reaches for `result_summary` / `summary` — and when
@@ -1127,7 +1162,7 @@ async def tool_manage_projects(
     # short-circuits on a valid project_id and ignores the title.
     # NB: "update" is NOT here — its `title` arg is a RENAME value, not a
     # lookup key, so auto-filling `current` for a rename is correct.
-    _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch"}
+    _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch", "resume"}
     if project_id is None and act not in {"create", "list", "promote_from_context"}:
         if not (title and act in _TITLE_RESOLVABLE):
             project_id = getattr(context, "current_project_id", None)
@@ -1429,11 +1464,13 @@ async def tool_manage_projects(
             })
 
         if act == "get":
-            if not project_id:
+            if not project_id and not title:
                 return _no_active_project(store)
             # Resolve a title/slug to the real id (e.g. `get petai`) via the
-            # shared resolver so a title isn't a hard "not found".
-            rid, rerr = _resolve_project_ref(store, project_id)
+            # shared resolver so a title isn't a hard "not found". The
+            # explicit `title` param is honoured too — the suppression above
+            # already keeps `current` from shadowing it.
+            rid, rerr = _resolve_project_ref(store, project_id, title)
             if rerr:
                 return _err(rerr)                # ambiguous title
             if not rid:
@@ -1443,19 +1480,19 @@ async def tool_manage_projects(
                 # answer sat in vector memory at 0.76 relevance. Attach any
                 # memory hits so the model can answer without a second,
                 # unprompted tool hop.
-                return await _not_found_with_recall(context, project_id)
+                return await _not_found_with_recall(context, project_id or title)
             return _ok(store.get_project(rid))
 
         if act == "switch":
-            if not project_id:
-                return _err("project_id is required for action=switch")
+            if not project_id and not title:
+                return _err("project_id (or title) is required for action=switch")
             # Resolve a title/slug to the real id so `switch petai` works
             # instead of erroring + striking on a recoverable title/id mixup.
-            rid, rerr = _resolve_project_ref(store, project_id)
+            rid, rerr = _resolve_project_ref(store, project_id, title)
             if rerr:
                 return _err(rerr)                # ambiguous title
             if not rid:
-                return _err(f"project not found: {project_id}")
+                return _err(f"project not found: {project_id or title!r}")
             _set_current(context, rid)
             return _ok({"switched_to": rid,
                         "workspace": f"projects/{rid}",
@@ -1553,8 +1590,16 @@ async def tool_manage_projects(
                                 "permanently."})
 
         if act == "resume":
-            if not project_id:
-                return _err("project_id is required for action=resume")
+            if not project_id and not title:
+                return _err("project_id (or title) is required for action=resume")
+            # Same title/slug resolution as get/switch — "resume petai" is
+            # the natural way users refer back to an old project.
+            rid, rerr = _resolve_project_ref(store, project_id, title)
+            if rerr:
+                return _err(rerr)                # ambiguous title
+            if not rid:
+                return _err(f"project not found: {project_id or title!r}")
+            project_id = rid
             proj = store.get_project(project_id)
             if not proj:
                 return _err(f"project not found: {project_id}")
@@ -1678,6 +1723,7 @@ async def tool_manage_projects(
                 pass
             updated: List[Dict[str, Any]] = []
             missing: List[str] = []
+            result_only: List[str] = []
             gated: List[str] = []
             gated_constraints: List[str] = []
             active_constraints: List[str] = []
@@ -1764,7 +1810,13 @@ async def tool_manage_projects(
                             logger.debug("constraint judgment gate skipped",
                                          exc_info=True)
                             constraint_audit = (True, "")
-                    if constraint_audit is not None and not constraint_audit[0]:
+                    # Refuse only tasks that HAD files to audit. The one-
+                    # audit-per-call cache above must not leak the first
+                    # task's verdict onto a fileless SIBLING in the same
+                    # batch — no files → skip the judgment gate, per the
+                    # contract documented on _files_for_task.
+                    if (_task_files and constraint_audit is not None
+                            and not constraint_audit[0]):
                         judged_violations.append(tid)
                         continue
                 # Register deliverables BEFORE flipping the task to DONE.
@@ -1795,6 +1847,16 @@ async def tool_manage_projects(
                     plan.update_status(tid, st_enum, result=result,
                                        failure_reason=failure_reason)
                 extras: Dict[str, Any] = {}
+                # `result` without `status`: persist it as the task's
+                # result_summary. update_status is guarded on st_enum, so
+                # this call used to write NOTHING while still returning
+                # {"updated": [...], "count": 1} — a success-shaped no-op
+                # that the gate-recovery instruction steered the model
+                # into repeating forever. The stored summary also clears
+                # the evidence gates on the next status=DONE call.
+                if st_enum is None and (result or "").strip():
+                    extras["result_summary"] = str(result).strip()
+                    result_only.append(tid)
                 # Per-task description rewrites only make sense in the
                 # single-id case — broadcasting one description across
                 # many tasks is almost certainly a mistake.
@@ -1829,6 +1891,15 @@ async def tool_manage_projects(
                                        "count": len(updated)}
             if missing:
                 payload["missing"] = missing
+            if result_only:
+                payload["result_recorded_status_unchanged"] = result_only
+                payload["agent_instruction_result_only"] = (
+                    f"Recorded `result` as evidence on {len(result_only)} "
+                    "task(s), but you passed no `status`, so the task "
+                    "status is UNCHANGED — a result alone does not close a "
+                    "task. To mark it complete, re-call task_update with "
+                    "BOTH status=done AND the task id(s)."
+                )
             if judged_violations:
                 payload["constraint_violations"] = judged_violations
                 payload["agent_instruction_violation"] = (
@@ -1837,9 +1908,10 @@ async def tool_manage_projects(
                     "user's stated constraints. "
                     + (constraint_audit[1] if constraint_audit else "")
                     + " Fix the deliverable so it actually honors the "
-                    "constraint, then re-call task_update. Only if the USER "
-                    "has explicitly approved this exception, re-call with a "
-                    "`result` beginning with 'CONSTRAINT-OVERRIDE:' and "
+                    "constraint, then re-call task_update with status=done "
+                    "and a `result`. Only if the USER has explicitly "
+                    "approved this exception, re-call with status=done and "
+                    "a `result` beginning with 'CONSTRAINT-OVERRIDE:' and "
                     "their reason."
                 )
             if gated_constraints:
@@ -1849,9 +1921,11 @@ async def tool_manage_projects(
                     f"Held {len(gated_constraints)} task(s) at non-DONE: the "
                     f"user attached EXPLICIT CONSTRAINTS and you provided no "
                     f"result evidence. Re-read the deliverable, confirm each "
-                    f"constraint holds, then re-call task_update with a "
-                    f"`result` that states — per constraint — HOW the work "
-                    f"honors it. Constraints: "
+                    f"constraint holds, then re-call task_update with "
+                    f"status=done AND a `result` that states — per constraint "
+                    f"— HOW the work honors it (a result without status=done "
+                    f"records evidence but does NOT close the task). "
+                    f"Constraints: "
                     + " | ".join(active_constraints)
                     + ". If the deliverable violates one (e.g. it contains a "
                     f"coded stand-in for something the user said YOU must do "
@@ -1867,12 +1941,15 @@ async def tool_manage_projects(
                     f"page, canvas, chart): VERIFY it first — browser "
                     f"operation='screenshot' (click_center=true for a game), "
                     f"check the RENDER_CHECK / PRE_INTERACTION lines — then "
-                    f"re-call task_update with a `result` describing what you saw.\n"
+                    f"re-call task_update with status=done AND a `result` "
+                    f"describing what you saw.\n"
                     f"  • If the task is NOT visual (a text / research / markdown "
                     f"/ analysis task — this gate can misfire on wording): just "
-                    f"re-call task_update with a one-line `result` describing what "
-                    f"you produced. That counts as evidence and clears the gate "
-                    f"immediately. (Pass it as `result=...`.)\n"
+                    f"re-call task_update with status=done and a one-line `result` "
+                    f"describing what you produced. That counts as evidence and "
+                    f"clears the gate immediately. (Pass BOTH `status=done` and "
+                    f"`result=...` — a result without status does not close the "
+                    f"task.)\n"
                     f"  • Also pass `deliverables=[...]` with the files the user "
                     f"should keep — everything else in the project workspace is "
                     f"deleted when the project finishes."
@@ -2067,8 +2144,21 @@ async def tool_manage_projects(
             # is for "clean up the project" mid-flight or post-DONE.
             if not project_id:
                 return _err("no active project (pass project_id or switch first)")
+            # Destructive → validate the model-supplied id against the store
+            # like delete/archive do. cleanup used to pass the raw string
+            # straight to tidy_project_workspace, so a traversal id like
+            # "../.." resolved to the sandbox PARENT and the tidy walked
+            # (and deleted from) directories outside the project sandbox.
+            rid, rerr = _resolve_project_ref(store, project_id)
+            if rerr:
+                return _err(rerr)                # ambiguous title
+            if not rid:
+                return _err(
+                    f"project not found: {project_id!r} — nothing was "
+                    f"cleaned. Use action=list to see the real ids."
+                )
             from ..core.workspace_cleanup import tidy_project_workspace
-            ts = tidy_project_workspace(store, project_id, min_age_hours=0.0)
+            ts = tidy_project_workspace(store, rid, min_age_hours=0.0)
             return _ok({
                 "status": ts.get("status"),
                 "deleted": ts.get("deleted"),

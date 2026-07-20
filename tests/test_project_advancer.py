@@ -230,13 +230,24 @@ async def test_advance_tool_failure_marks_task_failed(context, store):
     assert "network down" in t["failure_reason"]
 
 
-async def test_advance_without_tool_runner_marks_done_with_no_output(context, store):
+async def test_advance_without_tool_runner_does_not_mark_done(context, store):
+    # H10: a task that REQUIRES tool execution must NOT close DONE with
+    # result_summary="(no tool runner)" (theatrical completion, observed via
+    # the runner-less HTTP /advance route). The claim is released instead.
     pid = store.create_project("P")
     tid = store.add_task(pid, "Research foo")
     r = await advance_once(context, pid, tool_runner=None)
     assert r.ok is True
-    assert store.get_task(tid)["status"] == "DONE"
-    assert store.get_task(tid)["result_summary"] == "(no tool runner)"
+    assert r.classification == "blocked"
+    t = store.get_task(tid)
+    assert t["status"] == "PENDING"            # claim released, not DONE
+    assert "(no tool runner)" not in (t.get("result_summary") or "")
+    # no step charged for a tick that executed nothing …
+    assert (store.get_project(pid)["metadata"] or {}).get("steps_used", 0) == 0
+    # … but the round-robin stamp still rotates the project.
+    assert store.get_project(pid)["metadata"].get("last_autoadvance_ts")
+    evs = store.list_events(pid, event_type="autoadvance_skipped")
+    assert evs and evs[0]["payload"]["reason"] == "no tool runner"
 
 
 async def test_advance_uses_llm_classifier_when_provided(context, store):

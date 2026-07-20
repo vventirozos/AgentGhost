@@ -54,6 +54,13 @@ class TestSelfReferentialDetection:
         "Analyze the data I uploaded and chart the revenue trend",
         "Summarize the papers I saved to the knowledge base",
         "Build the dashboard I described in the spec",
+        # Ordinary first-person QUESTIONS about external things. The bare
+        # "do i|how i|can i" alternates (pre-2026-07-20) swallowed these
+        # into self-analysis; the clause must now also carry a cognition
+        # object (noun or verb) to count as self-reference.
+        "Research how do I connect the sensor API to the dashboard",
+        "What I need for the deployment checklist, itemized",
+        "Can I use the free tier of the maps API for this app? Find out",
     ])
     def test_genuine_research_not_hijacked(self, desc):
         # The narrow regex must NOT swallow real web research — "how attention

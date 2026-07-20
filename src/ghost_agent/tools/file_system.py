@@ -345,9 +345,22 @@ def _get_safe_path(sandbox_dir: Path, filename: str, *, allow_root: bool = True)
         # the active project's dir so they all agree. (Trade-off: a literal
         # ``projects/`` SUBDIR inside a project workspace is not addressable
         # this way — acceptable; the model should not nest one.)
-        _m = re.match(r"(?i)projects/[^/]+/", clean_name)
+        # EXCEPTION: a slug whose ``projects/<slug>`` dir actually EXISTS
+        # under the outer root is an EXPLICIT reference to another project —
+        # collapsing it silently read/wrote the ACTIVE project's file instead.
+        # Those re-anchor to the outer root so the path resolves to THAT
+        # project's dir; only a slug with no backing dir (the title-guess
+        # case) is healed into the active project.
+        _m = re.match(r"(?i)projects/([^/]+)/", clean_name)
         if _m:
-            clean_name = clean_name[_m.end():]
+            _slug = _m.group(1)
+            _foreign = (_outer_root / "projects" / _slug
+                        if _outer_root is not None and _slug not in (".", "..")
+                        else None)
+            if _foreign is not None and _foreign.is_dir():
+                anchor = _outer_root
+            else:
+                clean_name = clean_name[_m.end():]
 
     # 1c. Existence-aware ROOT re-anchor for ``/workspace/...`` paths under
     # project scoping. Such a path is ambiguous: it may be the model's usual
@@ -953,7 +966,13 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                 # which matters for clean file writes.
                 if "```" in str(old_text):
                     from ..utils.sanitizer import extract_code_from_markdown
-                    clean_content = extract_code_from_markdown(str(old_text))
+                    # filename= arms the extractor's "whole input already
+                    # parses in the target language → keep it whole" guard
+                    # (same as tool_write_file) — without it a complete
+                    # module whose docstring embeds a ```python example was
+                    # overwritten by just the inner snippet, SUCCESS.
+                    clean_content = extract_code_from_markdown(
+                        str(old_text), filename=filename)
                 else:
                     clean_content = str(old_text)
                 await asyncio.to_thread(path.write_text, clean_content, encoding="utf-8")
@@ -989,10 +1008,13 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
         # column. Same guard the replace→write auto-promote path already
         # uses. When fences are absent, preserve old_text/new_text
         # byte-for-byte (indentation included).
+        # filename= arms the "whole input already parses → keep it whole"
+        # guard so a block that is itself valid code containing a fenced
+        # docstring example is not collapsed to the inner snippet.
         if "```" in str(old_text):
-            old_text = extract_code_from_markdown(str(old_text))
+            old_text = extract_code_from_markdown(str(old_text), filename=filename)
         if new_text is not None and "```" in str(new_text):
-            new_text = extract_code_from_markdown(str(new_text))
+            new_text = extract_code_from_markdown(str(new_text), filename=filename)
             
     try:
         path = _get_safe_path(sandbox_dir, filename)
@@ -1032,7 +1054,14 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             try:
                 import tempfile
                 def _streaming_replace():
+                    # Stage the result in a sibling tmp file WITHOUT
+                    # committing — the guard chain below decides whether it
+                    # ever replaces the original. Also collects the changed
+                    # lines (before/after) so the marker-leak check can run
+                    # without materialising the whole file.
                     replaced = 0
+                    changed_old = []
+                    changed_new = []
                     tmp_path = None
                     try:
                         # surrogateescape on BOTH read and write so untouched
@@ -1046,25 +1075,83 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
                                 tmp_path = Path(f_out.name)
                                 for line in f_in:
                                     if old_text in line:
-                                        line = line.replace(old_text, new_text)
+                                        new_line = line.replace(old_text, new_text)
+                                        changed_old.append(line)
+                                        changed_new.append(new_line)
+                                        line = new_line
                                         replaced += 1
                                     f_out.write(line)
-                        if replaced > 0:
-                            import os
-                            os.replace(tmp_path, path)
-                            tmp_path = None  # consumed by the rename
-                        return replaced
-                    finally:
-                        # Drop the temp file if it wasn't consumed by the
-                        # rename (no matches, or an exception mid-stream) —
-                        # otherwise failed/no-op replaces leak .tmp orphans.
+                        if replaced == 0:
+                            tmp_path.unlink(missing_ok=True)
+                            tmp_path = None
+                        return replaced, tmp_path, changed_old, changed_new
+                    except BaseException:
                         if tmp_path is not None:
                             try:
                                 tmp_path.unlink(missing_ok=True)
                             except Exception:
                                 pass
-                replaced = await asyncio.to_thread(_streaming_replace)
-                if replaced > 0:
+                        raise
+                replaced, _tmp, _chg_old, _chg_new = await asyncio.to_thread(_streaming_replace)
+                if replaced > 0 and _tmp is not None:
+                    _committed = False
+                    try:
+                        # Same guard chain as _write_replace_guarded — this
+                        # path used to bypass it entirely, so merged-args
+                        # corruption (literal '<<<< SEARCH'/'====' markers in
+                        # replace_with) was written verbatim with SUCCESS.
+                        # The marker check runs on the changed-line delta
+                        # only: unchanged lines cancel in the count-aware
+                        # guard, so the delta equals the whole-file delta.
+                        leak = _marker_leak("".join(_chg_old), "".join(_chg_new))
+                        if leak:
+                            pretty_log(
+                                "Replace Rejected",
+                                f"{filename}: streaming edit would write "
+                                f"SEARCH/REPLACE marker line(s) into the file "
+                                f"({leak}) — file left unchanged",
+                                icon=Icons.WARN, level="WARNING")
+                            return (
+                                f"REJECTED: that replace would have written "
+                                f"SEARCH/REPLACE marker line(s) ({leak}) into "
+                                f"'{filename}' as literal file content — "
+                                f"'{filename}' is unchanged on disk. Emit ONE "
+                                f"complete envelope per edit, or use "
+                                f"operation='write' if the file legitimately "
+                                f"needs such a line.")
+                        _g_ext = str(filename).split(".")[-1].lower()
+                        if _g_ext in ("py", "json", "js", "mjs", "cjs", "html", "htm"):
+                            # Syntax-checkable type: load both versions once
+                            # for the regression check (bounded by the 50 MB
+                            # replace cap, same as the non-streaming path).
+                            _prev_c = await asyncio.to_thread(
+                                path.read_text, encoding="utf-8", errors="surrogateescape")
+                            _new_c = await asyncio.to_thread(
+                                _tmp.read_text, encoding="utf-8", errors="surrogateescape")
+                            regression = _syntax_regression(_prev_c, _new_c, filename)
+                            if not regression:
+                                regression = await _syntax_regression_js_html(
+                                    _prev_c, _new_c, filename)
+                            if regression:
+                                pretty_log(
+                                    "Replace Rejected",
+                                    f"{filename}: streaming edit would break "
+                                    f"syntax ({regression}) — file left unchanged",
+                                    icon=Icons.WARN, level="WARNING")
+                                return (
+                                    f"REJECTED: that replace would introduce a "
+                                    f"syntax error and was NOT applied — "
+                                    f"'{filename}' is unchanged on disk: "
+                                    f"{regression}. Re-read the file and emit a "
+                                    f"corrected surgical edit.")
+                        await asyncio.to_thread(os.replace, _tmp, path)
+                        _committed = True
+                    finally:
+                        if not _committed:
+                            try:
+                                _tmp.unlink(missing_ok=True)
+                            except Exception:
+                                pass
                     return f"SUCCESS: Streaming replace applied to '{filename}' ({replaced} line(s) modified)."
                 # Fall through to heuristic match below
             except Exception as e:
@@ -1106,15 +1193,38 @@ async def tool_replace_text(filename: str, old_text: str, new_text: str, sandbox
             # `@import url('https://...')`) was replaced with the whole
             # marker-stripped blob, reported as SUCCESS (live corruption
             # 2026-07-19, WebOS index.html).
+            # The closer is line-anchored like the separator (a `>{4,}` run
+            # mid-line — e.g. a `// >>>> end of patch` comment in the
+            # replacement — used to terminate the envelope early, silently
+            # truncating the replacement). The replacement capture is an
+            # optional `(payload\n)?` group so a deletion envelope
+            # (`====` directly followed by `>>>>`) still parses: the
+            # separator's own trailing newline doubles as the closer's
+            # anchor and findall yields '' for the non-participating group.
             blocks = re.findall(
-                r'<{4,}[ \t]*SEARCH[ \t]*\r?\n(.*?)\r?\n={4,}[ \t]*\r?\n(.*?)\r?\n?>{4,}[ \t]*(?:REPLACE)?',
+                r'<{4,}[ \t]*SEARCH[ \t]*\r?\n(.*?)\r?\n={4,}[ \t]*\r?\n(?:(.*?)\r?\n)?[ \t]*>{4,}[ \t]*(?:REPLACE)?',
                 str(old_text), re.DOTALL)
             if not blocks:
-                # Loose fallback: tolerates content on the OPENER line and a
-                # missing newline before the closer, at the cost of stripping
-                # the blocks' leading/trailing whitespace. The separator stays
-                # line-anchored — that is the invariant that prevents content
-                # containing `====` runs from splitting the envelope.
+                # Loose fallback: tolerates content on the OPENER line, at
+                # the cost of stripping the blocks' leading/trailing
+                # whitespace. The separator AND closer stay line-anchored —
+                # that is the invariant that prevents content containing
+                # `====`/`>>>>` runs from splitting the envelope.
+                blocks = [
+                    (s.strip(), r.strip()) for s, r in re.findall(
+                        r'(?s)<{4,}[ \t]*SEARCH(.*?)\n[ \t]*={4,}[ \t]*\r?\n(?:(.*?)\n)?[ \t]*>{4,}[ \t]*(?:REPLACE)?',
+                        str(old_text))
+                ]
+            if not blocks:
+                # Last-resort rung: a closer GLUED to content (`…')>>>>`,
+                # no newline before it). Only reached when neither anchored
+                # parse found a single block — i.e. the envelope has NO
+                # line-anchored closer at all — so a mid-payload `>{4,}`
+                # run can never truncate a well-formed envelope (it used
+                # to: `// >>>> end of patch` in the replacement ended the
+                # match early and the truncated result was written with
+                # SUCCESS). The per-block marker/tiny-search guards below
+                # still screen whatever this rung yields.
                 blocks = [
                     (s.strip(), r.strip()) for s, r in re.findall(
                         r'(?s)<{4,}[ \t]*SEARCH(.*?)\n[ \t]*={4,}[ \t]*\r?\n(.*?)>{4,}[ \t]*(?:REPLACE)?',
@@ -1978,8 +2088,20 @@ def _syntax_regression(prev_content: str, new_content: str, filename: str) -> st
 # leak guard is count-aware — only lines ADDED relative to the previous
 # content flag, and the reject message steers to operation='write' for the
 # rare legitimate case.
+# Leading [ \t]* tolerance matches the loose parser (which accepts indented
+# separators) — without it an indented `    ====` sailed past the write
+# backstop. Git-conflict marker lines (`<<<<<<< HEAD` / `>>>>>>> <ref>`)
+# also count as markers: a SEARCH text carrying them (a conflict-resolution
+# edit) is otherwise mis-split by the envelope parse — the conflict's own
+# `=======` line hijacks the separator while its <<<<<<</>>>>>>> lines were
+# invisible here (suffix != SEARCH/REPLACE), so the mangled block applied.
 _MARKER_LINE_RE = re.compile(
-    r"^(?:={4,}|<{4,}[ \t]*(?:SEARCH.*)?|>{4,}[ \t]*(?:REPLACE.*)?)[ \t]*$")
+    r"^[ \t]*(?:={4,}"
+    r"|<{4,}[ \t]*(?:SEARCH.*)?"
+    r"|>{4,}[ \t]*(?:REPLACE.*)?"
+    r"|<{4,}[ \t]+\S.*"
+    r"|>{4,}[ \t]+\S.*"
+    r")[ \t]*$")
 
 
 def _marker_leak(prev_content: str, new_content: str) -> str:
@@ -2166,10 +2288,45 @@ async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
         # SELF-HEALING: Auto-create parent directories
         path.parent.mkdir(parents=True, exist_ok=True)
         # Always UTF-8: without an explicit encoding, write_text uses the
-        # process locale (comma-decimal Greek Macs, LANG unset), which both
-        # mojibakes non-ASCII content and — on UnicodeEncodeError — leaves
-        # the file truncated (open('w') truncates before the failing encode).
-        await asyncio.to_thread(path.write_text, content, encoding="utf-8")
+        # process locale (comma-decimal Greek Macs, LANG unset), which
+        # mojibakes non-ASCII content. Encode BEFORE touching the target:
+        # write_text opens with truncate, so a strict-encode failure (a lone
+        # surrogate like "\ud800" surviving json.loads) used to wipe the
+        # file to 0 bytes AND surface as a bare UnicodeEncodeError string
+        # with no 'Error:' prefix — recorded as written by callers keying
+        # on that prefix.
+        try:
+            _payload = content.encode("utf-8")
+        except UnicodeEncodeError as ue:
+            return (f"Error: content for '{filename}' contains characters that "
+                    f"cannot be encoded as UTF-8 (lone surrogate "
+                    f"{content[ue.start:ue.end]!r} at offset {ue.start}). "
+                    f"'{filename}' was NOT modified. Remove or re-escape those "
+                    f"characters and retry.")
+
+        def _atomic_write():
+            # tmp-then-rename so a failure mid-write never leaves the target
+            # truncated or half-written.
+            import tempfile
+            fd, _tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(_payload)
+                # mkstemp creates 0600; keep the target's existing mode (or
+                # a normal 0644) so container-side readers aren't locked out.
+                try:
+                    _mode = path.stat().st_mode & 0o7777
+                except OSError:
+                    _mode = 0o644
+                os.chmod(_tmp, _mode)
+                os.replace(_tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(_tmp)
+                except OSError:
+                    pass
+                raise
+        await asyncio.to_thread(_atomic_write)
         # Report the resolved sandbox-relative path so scripts running
         # in the container (cwd=/workspace) know exactly where to find
         # it — e.g. if the model wrote "sandbox/foo.txt" and we honored
@@ -2549,7 +2706,8 @@ async def tool_file_search(pattern: str, sandbox_dir: Path, filename: str = None
 
         pretty_log("File Search", f"'{pattern}' in {filename or 'workspace'}", icon=Icons.TOOL_FILE_S)
 
-        cmd = f"rg --line-number --no-heading --color=never --max-columns=300 {escaped_pattern} {escaped_path}"
+        # -e: a pattern starting with '-' must not parse as an rg flag.
+        cmd = f"rg --line-number --no-heading --color=never --max-columns=300 -e {escaped_pattern} {escaped_path}"
         output, exit_code = await asyncio.to_thread(sandbox_manager.execute, cmd, timeout=20)
 
         # rg exits 1 to mean "no matches" — a successful query with an empty
@@ -2725,6 +2883,25 @@ async def tool_rename_file(old_name: str, new_name: str, sandbox_dir: Path):
         old_path = _get_safe_path(sandbox_dir, old_name, allow_root=False)
         new_path = _get_safe_path(sandbox_dir, new_name, allow_root=False)
         if not old_path.exists(): return f"Error: '{old_name}' not found."
+        if new_path.exists():
+            # Refuse a silent clobber (mirrors tool_copy_file). shutil.move
+            # also treats an existing-dir destination as "move INTO it" —
+            # make that explicit instead of guessing. A case-only rename on
+            # a case-insensitive FS (old and new are the SAME file) is
+            # still allowed through.
+            try:
+                _same = new_path.samefile(old_path)
+            except OSError:
+                _same = False
+            if new_path.is_dir() and not _same:
+                return (f"Error: destination '{new_name}' is an existing "
+                        f"directory. To move INTO it, pass the full "
+                        f"destination path, e.g. "
+                        f"'{str(new_name).rstrip('/')}/{old_path.name}'.")
+            if not _same:
+                return (f"Error: destination '{new_name}' already exists. "
+                        f"Delete or rename it first if you intended to "
+                        f"overwrite.")
         new_path.parent.mkdir(parents=True, exist_ok=True)
         await asyncio.to_thread(shutil.move, str(old_path), str(new_path))
         return f"SUCCESS: Renamed/Moved '{old_name}' to '{new_name}'."

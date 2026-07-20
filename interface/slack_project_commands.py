@@ -278,12 +278,45 @@ async def advance_async(ctx: SlackContext, agent_context) -> SlackResponse:
     ``advance_once`` so the advancer can call through the live tool
     registry. ``ctx.current_project_id`` must already be set.
     """
-    from ghost_agent.core.project_advancer import advance_once
+    from ghost_agent.core.project_advancer import (
+        advance_once, pinned_project_context,
+        default_llm_classifier, default_code_generator,
+    )
 
     pid = ctx.current_project_id
     if not pid:
         return SlackResponse(text=":warning: no active project.")
-    result = await advance_once(agent_context, pid)
+    # Build the SAME project-pinned tool runner the API route and the
+    # manage_projects autoadvance action use. Without one, advance_once
+    # runs the degraded classify-only path that returns "blocked" for any
+    # research/coding leaf (2026-07-20 H10) — a Slack `advance` would never
+    # actually do the work. Refuse loudly if the registry can't be built.
+    tools_map = None
+    try:
+        from ghost_agent.tools.registry import get_available_tools
+        tools_map = get_available_tools(pinned_project_context(agent_context, pid))
+    except Exception:
+        tools_map = None
+    if not tools_map:
+        return SlackResponse(
+            text=":warning: tool runner unavailable — cannot advance right now.")
+
+    async def _run(name, args):
+        handler = tools_map.get(name)
+        if not handler:
+            return f"ERROR: tool {name} unavailable"
+        return await handler(**args)
+
+    from ghost_agent.core.coding_executor import build_coding_task
+    from ghost_agent.workspace import pinned_event_project
+    with pinned_event_project(pid):
+        result = await advance_once(
+            agent_context, pid,
+            tool_runner=_run,
+            llm_classifier=default_llm_classifier(agent_context),
+            code_generator=default_code_generator(agent_context),
+            coding_executor=build_coding_task,
+        )
     emoji = {
         "research": ":mag:", "coding": ":keyboard:",
         "needs_user": ":raising_hand:", "idle": ":zzz:",

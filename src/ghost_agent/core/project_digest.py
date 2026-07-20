@@ -27,7 +27,15 @@ logger = logging.getLogger("GhostAgent")
 # Event types written by core.project_advancer.advance_once.
 _ADVANCE_EVENTS = ("autoadvance_step",)
 _NEEDS_USER_EVENTS = ("autoadvance_needs_user", "human_gate_triggered")
-_RELEVANT = frozenset(_ADVANCE_EVENTS + _NEEDS_USER_EVENTS)
+# Written by ProjectStore._maybe_rollup_project_status when task updates
+# settle the whole project's status.
+_ROLLUP_EVENTS = ("project_auto_rollup",)
+_RELEVANT = frozenset(_ADVANCE_EVENTS + _NEEDS_USER_EVENTS + _ROLLUP_EVENTS)
+
+# DONE/FAILED project lists grow without bound, and only the most recently
+# updated few can hold events newer than the watermark — cap the terminal
+# scan (``list_projects`` orders by ``updated_at DESC``).
+_RECENT_TERMINAL_LIMIT = 10
 
 
 @dataclass
@@ -35,25 +43,35 @@ class DigestResult:
     advanced: int = 0
     projects_touched: int = 0
     needs_user: List[Tuple[str, str]] = field(default_factory=list)  # (project_title, task_desc)
+    finished: List[Tuple[str, str]] = field(default_factory=list)  # (project_title, new_status)
     new_event_id: int = 0
 
     @property
     def has_content(self) -> bool:
-        return self.advanced > 0 or bool(self.needs_user)
+        return self.advanced > 0 or bool(self.needs_user) or bool(self.finished)
 
 
 def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -> DigestResult:
-    """Scan ACTIVE projects' events newer than ``last_event_id`` and tally
-    autonomous progress. ``new_event_id`` advances past every event scanned
-    (so the next call doesn't re-show them), even types we don't surface."""
+    """Scan projects' events newer than ``last_event_id`` and tally
+    autonomous progress. The scan covers NEEDS_USER and recent DONE/FAILED
+    projects alongside ACTIVE ones: the advancer's tick rolls the project's
+    status in the same batch that logs its digest-worthy events, so an
+    ACTIVE-only scan hid exactly the batch where the user's input became
+    needed. ``new_event_id`` advances past every event scanned (so the next
+    call doesn't re-show them), even types we don't surface."""
     res = DigestResult(new_event_id=int(last_event_id))
-    try:
-        actives = store.list_projects("ACTIVE")
-    except Exception as e:
-        logger.debug("digest list_projects failed: %s", e)
-        return res
+    candidates: List[dict] = []
+    for status, cap in (("ACTIVE", None), ("NEEDS_USER", None),
+                        ("DONE", _RECENT_TERMINAL_LIMIT),
+                        ("FAILED", _RECENT_TERMINAL_LIMIT)):
+        try:
+            projs = store.list_projects(status) or []
+        except Exception as e:
+            logger.debug("digest list_projects(%s) failed: %s", status, e)
+            continue
+        candidates.extend(projs if cap is None else projs[:cap])
     touched = set()
-    for p in actives or []:
+    for p in candidates:
         pid = p.get("id")
         title = str(p.get("title") or pid or "project")[:40]
         try:
@@ -71,10 +89,20 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
             etype = ev.get("type")
             if etype not in _RELEVANT:
                 continue
-            touched.add(pid)
             if etype in _ADVANCE_EVENTS:
+                touched.add(pid)
                 res.advanced += 1
+            elif etype in _ROLLUP_EVENTS:
+                # Only terminal rollups are digest-worthy; a NEEDS_USER
+                # rollup already surfaces via its needs-user event.
+                new_status = str(
+                    (ev.get("payload") or {}).get("new_status") or ""
+                ).upper()
+                if new_status in ("DONE", "FAILED"):
+                    touched.add(pid)
+                    res.finished.append((title, new_status))
             else:  # needs-user
+                touched.add(pid)
                 payload = ev.get("payload") or {}
                 desc = str(payload.get("description") or "")
                 if not desc and ev.get("task_id"):
@@ -97,6 +125,10 @@ def render_digest(res: DigestResult, *, max_needs_user: int = 3) -> str:
         f"**While you were away** — I advanced {res.advanced} task(s) "
         f"on {res.projects_touched} project(s) on my own."
     ]
+    if res.finished:
+        lines.append(f"{len(res.finished)} project(s) reached a final status:")
+        for title, status in res.finished[:max_needs_user]:
+            lines.append(f"  - [{title}] → {status}")
     if res.needs_user:
         lines.append(f"{len(res.needs_user)} now need your input:")
         for title, desc in res.needs_user[:max_needs_user]:

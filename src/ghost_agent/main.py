@@ -408,6 +408,21 @@ async def lifespan(app):
         context.project_store.on_project_done = (
             lambda pid, _store=context.project_store: sweep_project_workspace(_store, pid)
         )
+        # Boot reaper (2026-07-20 H3): the advancer claims a leaf by writing
+        # it IN_PROGRESS before a multi-minute build/LLM step. A deploy (plain
+        # SIGTERM — the standard workflow) or crash mid-tick leaves the task
+        # stuck IN_PROGRESS forever — rollup treats it as open so the project
+        # never completes and every later tick idles. Reset stale claims to
+        # READY at boot, before the watchdog/advancer starts.
+        try:
+            _reaped = context.project_store.reset_orphaned_in_progress()
+            if _reaped:
+                pretty_log("Project Store",
+                           f"reset {_reaped} orphaned IN_PROGRESS task(s) "
+                           "left by a prior crash/deploy",
+                           icon=Icons.RETRY)
+        except Exception as _reap_exc:
+            logger.debug("orphan reaper skipped: %s", _reap_exc)
         pretty_log("Project Store", "Long-term project store initialized",
                    icon=Icons.BRAIN_PLAN)
     except Exception as e:

@@ -82,6 +82,14 @@ _LIBRARY_ALIASES: Dict[str, str] = {
     "dspy": "dspy",
 }
 
+# Library surfaces that are also everyday English ("user requests",
+# "training datasets"): a bare prose mention is no evidence the project
+# uses the library, so these only count in explicit code/dependency
+# context ("import requests", "pip install datasets", "requests==2.31",
+# "the requests library"). requirements.txt pins are parsed exactly and
+# bypass this gate.
+_AMBIGUOUS_LIBRARY_SURFACES = {"requests", "datasets"}
+
 # ── Technique lexicon ──────────────────────────────────────────────────
 # Canonical technique node name → surface patterns. Short / ambiguous
 # tokens (rnn, gru, cnn, gan, rl, gnn) are matched on word boundaries to
@@ -134,6 +142,23 @@ def _matches(needle: str, haystack: str) -> bool:
     return needle in haystack
 
 
+def _library_mentioned(surface: str, haystack: str) -> bool:
+    """True when a library surface form appears as a whole word ("user
+    requested" must not hit "requests") — and, for the everyday-English
+    surfaces, only in code/dependency context."""
+    s = re.escape(surface)
+    if surface in _AMBIGUOUS_LIBRARY_SURFACES:
+        return re.search(
+            rf"(?:\b(?:import|from|install)\s+{s}(?![a-z0-9])"
+            rf"|(?<![a-z0-9]){s}\s*[=<>~!]="
+            rf"|(?<![a-z0-9]){s}\.[a-z_]+\("
+            rf"|(?<![a-z0-9]){s}\s+(?:library|package|module)\b"
+            rf"|\b(?:library|package|module)\s+{s}(?![a-z0-9]))",
+            haystack,
+        ) is not None
+    return re.search(rf"(?<![a-z0-9]){s}(?![a-z0-9])", haystack) is not None
+
+
 def canonical_library(name: str) -> Optional[str]:
     """Canonical node name for a library surface form, or None if unknown."""
     key = (name or "").strip().lower()
@@ -155,7 +180,7 @@ def extract_libraries(text: str, requirements_text: str = "") -> Set[str]:
             if canon:
                 libs.add(canon)
     for surface, canon in _LIBRARY_ALIASES.items():
-        if _matches(surface, haystack):
+        if _library_mentioned(surface, haystack):
             libs.add(canon)
     return libs
 

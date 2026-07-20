@@ -21,6 +21,7 @@ Endpoints:
   DELETE /api/projects/{pid}/tasks/{tid}
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -30,8 +31,15 @@ from pydantic import BaseModel, Field
 
 from .routes import verify_api_key, get_agent
 from ..core.planning import ProjectPlan, TaskStatus
-from ..core.project_advancer import advance_once
+from ..core.project_advancer import (
+    advance_once,
+    default_code_generator,
+    default_llm_classifier,
+    pinned_project_context,
+)
 from ..core.prompts import build_project_briefing
+from ..memory.projects import _canon_id
+from ..workspace import pinned_event_project
 
 logger = logging.getLogger("GhostAgent")
 
@@ -111,6 +119,11 @@ async def create_project(body: ProjectCreate, request: Request):
 
 @projects_router.get("/{pid}")
 async def get_project(pid: str, request: Request):
+    # Canonicalize once at entry (store ids are strip+lowercase): the store
+    # canonicalizes its own lookups, but raw path pids were compared against
+    # canonical ids and stored into `current_project_id`, so a case-mangled
+    # pid 404'd on ownership checks and diverged the workspace path.
+    pid = _canon_id(pid)
     proj = _store(request).get_project(pid)
     if not proj:
         raise HTTPException(404, "project not found")
@@ -120,11 +133,14 @@ async def get_project(pid: str, request: Request):
 @projects_router.patch("/{pid}")
 async def update_project(pid: str, body: ProjectUpdate, request: Request):
     store = _store(request)
+    pid = _canon_id(pid)
     fields = {k: v for k, v in body.model_dump().items() if v is not None}
     if not fields:
         raise HTTPException(400, "no fields to update")
     try:
-        ok = store.update_project(pid, **fields)
+        # Off-loop: a status=DONE transition fires the workspace cleanup
+        # sweep (sync filesystem walk) inline from the store hook.
+        ok = await asyncio.to_thread(store.update_project, pid, **fields)
     except ValueError as e:
         raise HTTPException(400, str(e))
     if not ok:
@@ -135,12 +151,20 @@ async def update_project(pid: str, body: ProjectUpdate, request: Request):
 @projects_router.delete("/{pid}", status_code=204)
 async def delete_project(pid: str, request: Request, hard: bool = False):
     store = _store(request)
-    ok = store.delete_project(pid, hard=hard)
+    pid = _canon_id(pid)
+    # Off-loop: a hard delete rmtree's the project workspace (sync
+    # filesystem work that must not block the process-wide event loop).
+    ok = await asyncio.to_thread(store.delete_project, pid, hard=hard)
     if not ok:
         raise HTTPException(404, "project not found")
     ctx = _context(request)
     if getattr(ctx, "current_project_id", None) == pid:
-        ctx.current_project_id = None
+        # Route through the tool-side setter: a raw attribute write left
+        # the conversation sentinel + workspace_model pointer naming the
+        # deleted id, so reconcile reactivated the deleted project and the
+        # sandbox recreated projects/<deleted-id>/.
+        from ..tools.projects import _set_current
+        _set_current(ctx, None)
     # 204 No Content MUST have an empty body (RFC 9110). JSONResponse(204,
     # content=None) serialized a 4-byte `null`, which strict HTTP/2 clients
     # and proxies reject.
@@ -150,10 +174,16 @@ async def delete_project(pid: str, request: Request, hard: bool = False):
 @projects_router.post("/{pid}/switch")
 async def switch_project(pid: str, request: Request):
     store = _store(request)
+    pid = _canon_id(pid)
     proj = store.get_project(pid)
     if not proj:
         raise HTTPException(404, "project not found")
-    _context(request).current_project_id = pid
+    # Route through the tool-side setter: a raw attribute write skipped the
+    # conversation sentinel + workspace_model pointer + scratchpad
+    # snapshot/hydrate, so the next chat turn's reconcile silently undid
+    # the switch (or, with no binding, the activation leaked globally).
+    from ..tools.projects import _set_current
+    _set_current(_context(request), pid)
     return {"switched_to": pid,
             "briefing": build_project_briefing(store, pid)}
 
@@ -161,10 +191,12 @@ async def switch_project(pid: str, request: Request):
 @projects_router.post("/{pid}/resume")
 async def resume_project(pid: str, request: Request):
     store = _store(request)
+    pid = _canon_id(pid)
     proj = store.get_project(pid)
     if not proj:
         raise HTTPException(404, "project not found")
-    _context(request).current_project_id = pid
+    from ..tools.projects import _set_current
+    _set_current(_context(request), pid)
     store.log_event(pid, None, "project_resumed", {})
     return {"project": proj,
             "briefing": build_project_briefing(store, pid)}
@@ -174,9 +206,43 @@ async def resume_project(pid: str, request: Request):
 async def advance_project(pid: str, request: Request):
     ctx = _context(request)
     store = _store(request)
+    pid = _canon_id(pid)
     if not store.get_project(pid):
         raise HTTPException(404, "project not found")
-    result = await advance_once(ctx, pid)
+    # Build the SAME project-pinned tool runner the manage_projects
+    # autoadvance action uses. advance_once without one runs the degraded
+    # classify-only path, which marks a research leaf DONE having done
+    # nothing — theatrical completion on a network-reachable authed route —
+    # so when a runner can't be built we refuse rather than fail open.
+    tools_map = None
+    try:
+        from ..tools.registry import get_available_tools
+        tools_map = get_available_tools(pinned_project_context(ctx, pid))
+    except Exception:
+        tools_map = None
+    if not tools_map:
+        raise HTTPException(
+            503, "tool runner unavailable — refusing to advance on the "
+                 "degraded classify-only path")
+
+    async def _run(name: str, args: Dict[str, Any]) -> str:
+        handler = tools_map.get(name)
+        if not handler:
+            return f"ERROR: tool {name} unavailable"
+        return await handler(**args)
+
+    from ..core.coding_executor import build_coding_task
+    # Pin the event stamp to the project being advanced (as the idle tick
+    # and tool path both do) — otherwise workspace events stamp whatever
+    # project the chat side currently has active.
+    with pinned_event_project(pid):
+        result = await advance_once(
+            ctx, pid,
+            tool_runner=_run,
+            llm_classifier=default_llm_classifier(ctx),
+            code_generator=default_code_generator(ctx),
+            coding_executor=build_coding_task,
+        )
     return {
         "ok": result.ok,
         "task_id": result.task_id,
@@ -190,6 +256,7 @@ async def advance_project(pid: str, request: Request):
 async def list_events(pid: str, request: Request,
                       limit: int = 50, type: Optional[str] = None):
     store = _store(request)
+    pid = _canon_id(pid)
     if not store.get_project(pid):
         raise HTTPException(404, "project not found")
     # Clamp: a negative limit means "no limit" in SQLite (unbounded response)
@@ -203,6 +270,7 @@ async def list_events(pid: str, request: Request,
 @projects_router.get("/{pid}/tasks")
 async def list_tasks(pid: str, request: Request, status: Optional[str] = None):
     store = _store(request)
+    pid = _canon_id(pid)
     if not store.get_project(pid):
         raise HTTPException(404, "project not found")
     return {"tasks": store.list_tasks(pid, status_filter=status)}
@@ -211,6 +279,7 @@ async def list_tasks(pid: str, request: Request, status: Optional[str] = None):
 @projects_router.post("/{pid}/tasks", status_code=201)
 async def add_task(pid: str, body: TaskCreate, request: Request):
     store = _store(request)
+    pid = _canon_id(pid)
     if not store.get_project(pid):
         raise HTTPException(404, "project not found")
     try:
@@ -228,6 +297,7 @@ async def add_task(pid: str, body: TaskCreate, request: Request):
 @projects_router.patch("/{pid}/tasks/{tid}")
 async def update_task(pid: str, tid: str, body: TaskUpdate, request: Request):
     store = _store(request)
+    pid = _canon_id(pid)
     existing = store.get_task(tid)
     if not existing or existing["project_id"] != pid:
         raise HTTPException(404, "task not found in this project")
@@ -241,7 +311,10 @@ async def update_task(pid: str, tid: str, body: TaskUpdate, request: Request):
         except KeyError:
             raise HTTPException(400, f"bad status: {fields['status']}")
         plan = ProjectPlan(store, pid)
-        plan.update_status(
+        # Off-loop: the DONE cascade can complete the project and fire the
+        # workspace cleanup sweep (sync filesystem walk) from the store hook.
+        await asyncio.to_thread(
+            plan.update_status,
             tid, st,
             result=fields.get("result_summary", "") or "",
             failure_reason=fields.get("failure_reason", "") or "",
@@ -262,6 +335,7 @@ async def update_task(pid: str, tid: str, body: TaskUpdate, request: Request):
 @projects_router.delete("/{pid}/tasks/{tid}", status_code=204)
 async def delete_task(pid: str, tid: str, request: Request):
     store = _store(request)
+    pid = _canon_id(pid)
     existing = store.get_task(tid)
     if not existing or existing["project_id"] != pid:
         raise HTTPException(404, "task not found in this project")

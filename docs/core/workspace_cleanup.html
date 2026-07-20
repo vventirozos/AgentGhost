@@ -65,7 +65,7 @@
   <table>
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>sweep_project_workspace(store, project_id, *, dry_run=False) -&gt; dict</code></td><td>Delete every file under the project workspace not registered as a <code>file</code> artifact, then prune the directories left empty. Returns <code>{project_id, status, deleted, kept, dirs_removed, freed_bytes}</code>. Never raises. <code>dry_run=True</code> reports what it would delete without touching disk.</td></tr>
+      <tr><td><code>sweep_project_workspace(store, project_id, *, dry_run=False) -&gt; dict</code></td><td>Delete every file under the project workspace not registered as a <code>file</code> artifact, then prune the directories left empty. Returns <code>{project_id, status, deleted, kept, dirs_removed, freed_bytes, kept_referenced}</code>. Never raises. <code>dry_run=True</code> reports what it would delete without touching disk.</td></tr>
     </tbody>
   </table>
 
@@ -144,6 +144,19 @@
   the user asked now). Note the tidy walks only <code>projects/&lt;id&gt;/</code>
   trees: stray directories at the sandbox ROOT (repo clones, ad-hoc analysis dirs)
   are the free-chat workspace and deliberately stay untouched.</p>
+
+  <h2>Containment + never-debris guards (2026-07-20)</h2>
+  <ul>
+    <li><b>Path-escape containment (sweep AND tidy).</b> Both walks now assert the resolved root is strictly inside <code>&lt;sandbox&gt;/projects/</code> before touching anything (<code>_escapes_projects_root</code>): a project id bearing <code>/</code>, <code>\</code> or <code>..</code> — which made <code>_project_dir</code> resolve OUTSIDE the sandbox, so the walk would have deleted the parent tree — deletes nothing and returns <code>status="skipped: path escape"</code>. Defense in depth: the tool boundary validates ids too, and any doubt (including an unexpected exception in the check) reads as an escape.</li>
+    <li><b><code>.git/</code> is never cleanup's to delete.</b> <code>_in_git_tree</code> makes both the recurring tidy and the DONE sweep skip the whole subtree — files and legitimately-empty dirs (<code>refs/tags</code>, …) alike — because tidying an in-flight clone corrupts the repo. <code>.git</code> stays in <code>_SCRATCH_DIRS</code> only so the recovery passes don't register its internals as deliverables; the guard is what keeps the files on disk.</li>
+    <li><b>Config-dotfile variants are not debris.</b> The kept-dotfile set now matches format variants too (<code>_is_kept_dotfile</code>: <code>.eslintrc.json</code>, <code>.babelrc.js</code>, <code>.env.local</code>) — real projects spell them that way, and the exact-match set classified them debris and deleted them.</li>
+    <li><b>The tidy's age gate covers ALL debris.</b> Categorical debris used to be deleted at any age; on an ACTIVE project a fresh debris-shaped file may be an in-flight tool's live state (a dotfile being written, a log mid-append), so debris now gets the same <code>min_age_hours</code> grace period media always had. The explicit <code>manage_projects action=cleanup</code> still runs with no age gate — the user asked now.</li>
+    <li><b><code>_normalize_rel</code> strips <code>workspace/</code>.</b> Artifact payloads are reduced to the exact project-relative key the walk produces — now including a leading <code>/workspace/</code>&thinsp;/&thinsp;<code>workspace/</code> segment, and <code>register_file_artifact</code> stores the same normalized form (see <a href="../memory/projects.html">memory.projects</a>). An absolute <code>/workspace/projects/&lt;id&gt;/x.png</code> deliverable previously matched no walked rel and was deleted by the very sweep it was registered to survive.</li>
+    <li><b>The DONE sweep protects referenced media too.</b> The tidy's <code>_referenced_media</code> scan now also runs in the sweep: an unregistered media file that a kept source file points at (sprite sheet, texture, favicon) is an asset of the build, not a stray screenshot — deleting it broke the deliverable the sweep had just protected. The summary gains a <code>kept_referenced</code> list; symlinks stay deletable.</li>
+  </ul>
+  <p>Covered by <code>tests/test_workspace_cleanup.py</code> (path-escape id, git-tree,
+  referenced-media, <code>_normalize_rel</code>) and <code>tests/test_workspace_tidy.py</code>
+  (age-gate-on-debris, config-dotfile variants, path-escape id).</p>
 
   <h2>Tests</h2>
   <p><code>tests/test_workspace_cleanup.py</code> — keep/delete split, nested

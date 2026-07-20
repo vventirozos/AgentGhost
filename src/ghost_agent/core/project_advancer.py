@@ -37,6 +37,22 @@ from ..utils.logging import Icons, pretty_log
 logger = logging.getLogger("GhostAgent")
 
 
+# Binary/media artifacts the coding executor can neither read nor EXTEND.
+# Read with errors="replace" they decode to replacement-char noise, yet they
+# used to count against the file cap and char budget below — a project with a
+# dozen PNGs/WAVs crowded every real source out of ``existing_files`` and
+# blinded the non-regression guard to them.
+_BINARY_EXTS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".tif", ".tiff",
+    ".wav", ".mp3", ".ogg", ".flac", ".m4a", ".mp4", ".webm", ".avi", ".mov",
+    ".mkv", ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+    ".pdf", ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".pyc", ".pyo", ".so", ".dylib", ".dll", ".exe", ".o", ".a", ".wasm",
+    ".db", ".sqlite", ".sqlite3", ".pkl", ".npy", ".npz", ".pt", ".pth",
+    ".onnx", ".gguf", ".bin",
+})
+
+
 def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000,
                           per_file_chars: int = 200_000,
                           max_files: int = 12) -> Dict[str, str]:
@@ -75,6 +91,8 @@ def _gather_project_files(store, project_id: str, *, budget_chars: int = 400_000
                 # fed to the build separately as read-only context via
                 # `_gather_research_briefs`.
                 if "research" in parts[:-1] or parts[-1].startswith("."):
+                    continue
+                if Path(fn).suffix.lower() in _BINARY_EXTS:
                     continue
                 p = Path(dirpath) / fn
                 try:
@@ -357,6 +375,42 @@ def _increment_budget(store, project_id: str) -> None:
         store.update_project(project_id, metadata=new_meta)
 
 
+def _stamp_autoadvanced(store, project_id: str) -> None:
+    """Stamp ``last_autoadvance_ts`` WITHOUT charging a step.
+
+    ``_increment_budget`` stamps it for ticks that advanced a task, but the
+    blocked (budget-exhausted / secondary-rails) and idle (no ready leaf)
+    exits used to return unstamped — so a permanently-blocked project stayed
+    the ``min(last_autoadvance_ts)`` round-robin pick forever and starved
+    every other ACTIVE project of idle ticks. Every tick that RAN for a
+    project must rotate it to the back of the queue. Never raises."""
+    try:
+        with _get_project_lock(project_id):
+            budget = _get_budget(store, project_id)
+            new_meta = dict(budget["meta"])
+            new_meta["last_autoadvance_ts"] = time.time()
+            store.update_project(project_id, metadata=new_meta)
+    except Exception:
+        logger.debug("last_autoadvance_ts stamp skipped", exc_info=True)
+
+
+def _log_budget_exhausted(store, project_id: str,
+                          payload: Dict[str, Any]) -> None:
+    """Append a ``budget_exhausted`` event only when the newest one differs.
+
+    With the round-robin stamp above, an exhausted project is re-picked on
+    every rotation; one identical event per pick would flood its event log
+    (and the digest built from it) with pure repetition."""
+    try:
+        last = store.list_events(project_id, limit=1,
+                                 event_type="budget_exhausted")
+        if last and (last[0].get("payload") or {}) == payload:
+            return
+    except Exception:
+        logger.debug("budget_exhausted dedup check skipped", exc_info=True)
+    store.log_event(project_id, None, "budget_exhausted", payload)
+
+
 def _metacog_set_task(context, task_id) -> None:
     """Best-effort: stash the executing task id on the metacog bundle so the
     ReplanBridge can attribute a triggered replan. No-op when metacog is off
@@ -415,11 +469,14 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
                        failure_reason=f"code_executor: {cres.summary}")
     _metacog_set_task(context, None)
     _increment_budget(store, project_id)
-    # A failed build cost real time too — stamp it so the retrospective's
-    # cost total reflects effort spent, not just effort that succeeded.
+    # A failed build cost real time too — often MORE than a success (a
+    # multi-minute build that dies at verify). Feed the runtime rail
+    # (check_budget) and stamp the task's cost so both the safety cap and the
+    # retrospective reflect effort spent, not just effort that succeeded.
+    _tick_secs = max(0.0, time.time() - tick_started_at)
+    record_runtime(store, project_id, seconds=_tick_secs, tool_calls=1)
     try:
-        store.update_task(nxt.id,
-                          actual_cost=max(0.0, time.time() - tick_started_at))
+        store.update_task(nxt.id, actual_cost=_tick_secs)
     except Exception:
         logger.debug("actual_cost stamp skipped", exc_info=True)
     store.log_event(project_id, nxt.id, "autoadvance_failed",
@@ -438,6 +495,13 @@ _COGNITION = (r"(memory|attention|architecture|weights|training|reasoning|"
               r"decisions?|decision-making|behaviou?r|context|guardrails|"
               r"predictions?|biases|limits?)")
 
+# Cognition OBJECTS a first-person clause can anchor on: the nouns above plus
+# the cognitive VERBS introspective task descriptions use ("Do I genuinely
+# decide…", "whether I truly 'choose' responses").
+_FP_COGNITION = (r"(?:" + _COGNITION + r"|decid\w+|choos\w+|chose|predict\w*|"
+                 r"reason\w*|think\w*|believe\w*|perceiv\w*|sampl\w+|"
+                 r"hallucinat\w+)")
+
 _SELF_REF_RE = re.compile(
     # Second person — the operator asking the agent about itself.
     r"\b(your own|yourself|your " + _COGNITION + r"|your context window|"
@@ -448,10 +512,13 @@ _SELF_REF_RE = re.compile(
     r"|\bthe pronoun ['\"]?i['\"]?\b"
     # FIRST person — the agent's own task descriptions are written this way
     # ("Evaluate whether I truly 'choose' responses or merely predict them"),
-    # and the second-person patterns above miss them entirely. Anchored on an
-    # introspective QUESTION form or a possessive over a cognition noun, so
-    # "Analyze the data I uploaded" / "the report I need" do NOT match.
-    r"|\b(whether i|do i|am i|can i|what i|how i)\b"
+    # and the second-person patterns above miss them entirely. The question
+    # form alone is NOT enough: bare "do i|how i|can i" misrouted ordinary
+    # first-person research ("how do I connect the sensor API") into
+    # self-analysis, so the clause must also contain a cognition object
+    # (noun or verb) before the sentence ends.
+    r"|\b(?:whether|do|am|can|what|how)\s+i\b(?=[^.?!\n]*\b" + _FP_COGNITION
+    + r"\b)"
     r"|\bmy own\b|\bmy " + _COGNITION + r"\b",
     re.IGNORECASE,
 )
@@ -566,17 +633,18 @@ async def advance_once(
 
     budget = _get_budget(store, project_id)
     if budget["used"] >= budget["cap"]:
-        store.log_event(project_id, None, "budget_exhausted",
-                        {"used": budget["used"], "cap": budget["cap"]})
+        _log_budget_exhausted(store, project_id,
+                              {"used": budget["used"], "cap": budget["cap"]})
+        _stamp_autoadvanced(store, project_id)
         return AdvanceResult(True, None, "blocked",
                              f"budget exhausted: {budget['used']}/{budget['cap']}")
 
     # Secondary rails: runtime + tool-call caps (optional per project).
-    from .project_safety import check_budget
+    from .project_safety import check_budget, record_runtime
     secondary = check_budget(proj.get("metadata") or {})
     if not secondary.allowed:
-        store.log_event(project_id, None, "budget_exhausted",
-                        dict(secondary.remaining))
+        _log_budget_exhausted(store, project_id, dict(secondary.remaining))
+        _stamp_autoadvanced(store, project_id)
         return AdvanceResult(True, None, "blocked", secondary.reason)
 
     _tick_started_at = time.time()
@@ -597,10 +665,15 @@ async def advance_once(
     with _get_project_lock(project_id):
         plan = ProjectPlan(store, project_id)
         nxt = plan.next_ready_leaf()
-        if not nxt:
-            _metacog_set_task(context, None)  # nothing executing → clear
-            return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
-        plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
+        if nxt:
+            plan.update_status(nxt.id, TaskStatus.IN_PROGRESS)
+    if not nxt:
+        _metacog_set_task(context, None)  # nothing executing → clear
+        # Stamped OUTSIDE the claim lock (it re-acquires the project lock):
+        # an idle project must still rotate to the back of the round-robin
+        # queue or it starves the other ACTIVE projects (see _stamp_…).
+        _stamp_autoadvanced(store, project_id)
+        return AdvanceResult(True, None, "idle", "no READY/PENDING leaf")
 
     # Tell the metacog ReplanBridge which task is now executing, so a
     # trigger (host-resource pressure, etc.) can attribute a replan to THIS
@@ -711,7 +784,13 @@ async def advance_once(
         cres = None
         try:
             cres = await coding_executor(
-                context, nxt.description, tool_runner=tool_runner, ledger=ledger,
+                context, nxt.description,
+                # Fail-CLOSED shell gates: the executor's verify/smoke
+                # classification would otherwise read a success-shaped
+                # non-execution (grep no-match, egress-guard prose, missing
+                # exit code) as a pass and mark the task DONE on nothing.
+                tool_runner=_verify_fail_closed_runner(tool_runner),
+                ledger=ledger,
                 existing_files=_gather_project_files(store, project_id),
                 research_context=_gather_research_briefs(store, project_id),
                 single_file=_single_file,
@@ -785,6 +864,12 @@ async def advance_once(
                 failure_reason=f"tool {tool_name} raised: {e}",
             )
             _increment_budget(store, project_id)
+            # Failed ticks burn wall-clock too — the runtime rail
+            # (check_budget) must see them or a project can loop failures
+            # far past its runtime cap.
+            record_runtime(store, project_id,
+                           seconds=max(0.0, time.time() - _tick_started_at),
+                           tool_calls=1)
             return AdvanceResult(True, nxt.id, classification,
                                  f"tool error: {e}")
         try:
@@ -814,11 +899,31 @@ async def advance_once(
             store.log_event(project_id, nxt.id, "autoadvance_failed",
                             {"tool": tool_name, "reason": reason[:200]})
             _increment_budget(store, project_id)
+            record_runtime(store, project_id,
+                           seconds=max(0.0, time.time() - _tick_started_at),
+                           tool_calls=1)
             return AdvanceResult(True, nxt.id, classification,
                                  f"{tool_name} produced no usable result",
                                  artifact_id)
 
-    result_summary = _short_summary(output) if output else "(no tool runner)"
+    if not output:
+        # No tool runner and nothing generated in-process (self-analysis did
+        # not fire): this task REQUIRES tool execution nobody can perform
+        # this tick. Marking it DONE with "(no tool runner)" was theatrical
+        # completion (observed via the runner-less HTTP /advance route).
+        # Release the claim so a properly wired tick can take it, and report
+        # the tick as blocked without charging a step.
+        plan.update_status(nxt.id, TaskStatus.PENDING)
+        _metacog_set_task(context, None)
+        _stamp_autoadvanced(store, project_id)
+        store.log_event(project_id, nxt.id, "autoadvance_skipped",
+                        {"reason": "no tool runner",
+                         "classification": classification})
+        return AdvanceResult(True, nxt.id, "blocked",
+                             "task requires tool execution but no "
+                             "tool_runner was provided")
+
+    result_summary = _short_summary(output)
 
     # Human-gate postconditions force NEEDS_USER regardless of output.
     # The store row is the authoritative source for the postcondition
@@ -890,10 +995,9 @@ async def advance_once(
                        result=result_summary, actual_tool=tool_name)
     _metacog_set_task(context, None)  # node finished → don't replan a done task
     _increment_budget(store, project_id)
-    from .project_safety import record_runtime as _record
     _tool_tick_secs = max(0.0, time.time() - _tick_started_at)
-    _record(store, project_id, seconds=_tool_tick_secs,
-            tool_calls=1 if tool_runner is not None else 0)
+    record_runtime(store, project_id, seconds=_tool_tick_secs,
+                   tool_calls=1 if tool_runner is not None else 0)
     # Stamp the task's real wall-clock cost (see _finalize_coding).
     try:
         store.update_task(nxt.id, actual_cost=_tool_tick_secs)
@@ -1207,6 +1311,76 @@ def _looks_like_failure(output: str) -> bool:
         or first.startswith("traceback")
         or first == "error"
     )
+
+
+def classify_verify_result(output) -> str:
+    """Classify a VERIFY command's ``execute`` output: ``"pass"`` / ``"fail"``
+    / ``"inconclusive"``.
+
+    FAIL-CLOSED — deliberately NOT `_looks_like_failure`'s interactive
+    semantics: a verify PASSES only on an explicit ``EXIT CODE: 0`` that is
+    neither execute.py's grep-no-match rewrite nor a guard message. Three
+    success-shaped outputs used to read as a pass and let `_run_verify` mark
+    a task DONE on nothing (theatrical completion):
+
+      * grep-family no-match — execute.py rewrites grep exit 1 to a friendly
+        ``EXIT CODE: 0 … NOT FOUND`` (right for the interactive strike loop),
+        but for a verify like ``grep -q marker file`` it means the required
+        marker is ABSENT;
+      * the sandbox egress guard, whose prose (``SANDBOX EGRESS BLOCKED …``)
+        describes a command it did NOT execute;
+      * any output carrying no ``EXIT CODE:`` at all (guard/spill-log prose).
+
+    All three are "inconclusive": the verify neither passed nor demonstrably
+    failed, and the task must NOT be marked DONE on them.
+    """
+    s = str(output or "").strip()
+    if not s:
+        return "inconclusive"
+    if s.startswith("SANDBOX EGRESS BLOCKED"):
+        return "inconclusive"  # command NOT executed — nothing was verified
+    m = re.search(r"EXIT CODE:\s*(\d+)", s)
+    if m is None:
+        return "inconclusive"  # no exit code at all — not proof of anything
+    if m.group(1) != "0":
+        return "fail"
+    if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
+        return "fail"
+    if "(no matches" in s and "NOT FOUND" in s:
+        return "inconclusive"  # grep-no-match rewrite: required text absent
+    return "pass"
+
+
+def _verify_fail_closed_runner(tool_runner: ToolRunner) -> ToolRunner:
+    """Wrap the tool runner handed to the coding executor so its shell gates
+    (the spec's ``verify`` command, the smoke gate) fail CLOSED.
+
+    The executor's `_run_verify` classifies gate output with THIS module's
+    `_looks_like_failure`, whose interactive semantics pass the three
+    non-executions listed in :func:`classify_verify_result`. Rewriting an
+    inconclusive ``execute`` result into an explicit error here — the one
+    seam every coding tick crosses — keeps this module the owner of the
+    verify contract without reaching into the executor: the task is retried
+    with the real reason and ends FAILED, never DONE, on a verify that
+    proved nothing. The original output is preserved below the marker so
+    retry feedback (and the smoke gate's own ``SMOKE_RESULT`` scan) still
+    see it."""
+    async def _run(tool_name: str, tool_args: Dict[str, Any]) -> str:
+        out = await tool_runner(tool_name, tool_args)
+        if (tool_name == "execute"
+                and classify_verify_result(out) == "inconclusive"):
+            # `_looks_like_failure` trusts an `EXIT CODE:` found ANYWHERE in
+            # the result — the quoted original (e.g. the grep-no-match
+            # rewrite's `EXIT CODE: 0`) must not smuggle one past the ERROR
+            # prefix, so neutralize the banner in the preserved text.
+            body = str(out or "").replace("EXIT CODE:", "EXIT-CODE:")
+            return ("ERROR: verify inconclusive — the command produced no "
+                    "explicit exit-code-0 success (no exit code at all, "
+                    "a grep/rg no-match, or a guard-blocked command that "
+                    "never ran). This is not evidence the deliverable "
+                    "works.\nOriginal output:\n" + body)
+        return out
+    return _run
 
 
 def _short_summary(output: str, max_len: int = 200) -> str:

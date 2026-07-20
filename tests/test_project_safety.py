@@ -162,6 +162,43 @@ def test_detect_contradiction_handles_empty():
     assert detect_contradiction("anything", "") is None
 
 
+def test_detect_contradiction_agreeing_negatives_not_flagged():
+    # Regression: 'supported' matched inside its own negation 'not
+    # supported', so two AGREEING summaries were flagged as contradictory.
+    assert detect_contradiction("streaming is not supported on this backend",
+                                "we found streaming is not supported") is None
+    assert detect_contradiction("that cast is unsafe",
+                                "the cast is unsafe here too") is None
+    assert detect_contradiction("driver is incompatible with kernel 6.8",
+                                "confirmed the driver is incompatible") is None
+
+
+def test_detect_contradiction_agreeing_positives_not_flagged():
+    assert detect_contradiction("the migration is safe",
+                                "the migration looks safe") is None
+    assert detect_contradiction("SSE is supported by the proxy",
+                                "SSE is supported end to end") is None
+
+
+def test_detect_contradiction_genuine_negation_flip_flagged():
+    # A real flip on the substring-containing pairs must still fire,
+    # in both directions.
+    assert detect_contradiction("the api is supported on linux",
+                                "the api is not supported on linux") is not None
+    assert detect_contradiction("the api is not supported on linux",
+                                "the api is supported on linux") is not None
+    assert detect_contradiction("the migration is safe",
+                                "the migration is unsafe") is not None
+    assert detect_contradiction("driver is incompatible with 6.8",
+                                "driver is compatible with 6.8") is not None
+
+
+def test_detect_contradiction_markers_are_word_bounded():
+    # 'eyes'/'nothing' must not read as the yes/no markers.
+    assert detect_contradiction("closed my eyes during the demo",
+                                "nothing notable happened") is None
+
+
 def test_route_contradiction_without_log_returns_false():
     assert route_contradiction(None, "new", ["old"]) is False
 

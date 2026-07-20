@@ -21,6 +21,12 @@ from .file_system import _get_safe_path
 # genuine errors (bad regex, unreadable file) with exit 2 + stderr output.
 _EXIT1_MEANS_NO_MATCH = {"grep", "egrep", "fgrep", "zgrep", "rg", "pgrep"}
 
+# Execution budget for sandboxed runs (seconds). The sandbox layer wraps
+# every run in `timeout -k 5s <budget>s`, so hitting the budget surfaces
+# as exit 124 (or 137/143 when the -k SIGKILL / a SIGTERM landed).
+_EXEC_TIMEOUT_S = 600
+_TIMEOUT_KILL_CODES = (124, 137, 143)
+
 # SANDBOX EGRESS GUARD (agent's own ports). The sandbox container has its
 # own loopback, so 127.0.0.1:8000 in there is NOT the agent's API and
 # 127.0.0.1:8088 is NOT the upstream LLM. Every observed probe of these
@@ -44,6 +50,31 @@ _AGENT_PORT_PROBE_RE = re.compile(
 _HEREDOC_BODY_RE = re.compile(
     r"<<-?\s*(['\"]?)(\w+)\1.*?(?:\n\2(?=\s|$)|\Z)", re.DOTALL)
 
+# BUT a heredoc fed to an interpreter is EXECUTED code, not data:
+# `python3 <<'EOF' … urlopen(…) … EOF` runs the body exactly like a
+# script, so stripping it as "data" was a clean bypass of the egress
+# block. The opener line (everything on the physical line carrying `<<`,
+# including a trailing `| python3`) names the consumer — strip only when
+# no interpreter appears there.
+_HEREDOC_INTERP_RE = re.compile(
+    r"(?:^|[|&;(`\s])(?:python[0-9.]*|node(?:js)?|sh|bash|zsh|dash|ksh|"
+    r"ruby|perl)\b")
+
+
+def _strip_data_heredocs(command: str) -> str:
+    """Replace heredoc bodies that are pure data (file writes) with a
+    placeholder; keep bodies an interpreter will execute so the probe
+    scan sees them."""
+    def _sub(m):
+        line_start = command.rfind("\n", 0, m.start()) + 1
+        line_end = command.find("\n", m.start())
+        if line_end == -1:
+            line_end = len(command)
+        if _HEREDOC_INTERP_RE.search(command[line_start:line_end]):
+            return m.group(0)
+        return "<<HEREDOC-BODY>>"
+    return _HEREDOC_BODY_RE.sub(_sub, command)
+
 # A probe needs a network client. Plain text manipulation that mentions the
 # URL (echo > file, sed on a config) proves nothing and is allowed.
 _NET_CLIENT_RE = re.compile(
@@ -55,11 +86,11 @@ _NET_CLIENT_RE = re.compile(
 
 def _command_probes_agent_port(command: str) -> bool:
     """True iff a SHELL command actually probes the agent's ports: the
-    loopback URL must appear OUTSIDE heredoc bodies AND a network-client
-    token must be present. Inline ``content`` (code handed to an
-    interpreter) is judged by the caller with the strict any-match rule —
-    executed code that mentions the URL is always suspect."""
-    stripped = _HEREDOC_BODY_RE.sub("<<HEREDOC-BODY>>", str(command))
+    loopback URL must appear OUTSIDE data heredoc bodies AND a
+    network-client token must be present. Inline ``content`` (code handed
+    to an interpreter) is judged by the caller with the strict any-match
+    rule — executed code that mentions the URL is always suspect."""
+    stripped = _strip_data_heredocs(str(command))
     if not _AGENT_PORT_PROBE_RE.search(stripped):
         return False
     return bool(_NET_CLIENT_RE.search(stripped))
@@ -174,9 +205,26 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
 
     # --- 🛡️ HIJACK LAYER: CODE SANITIZATION ---
     
-    # Helper for consistent error reporting
-    def _format_error(msg, hint=None):
-        out = f"--- EXECUTION RESULT ---\nEXIT CODE: 1\nSTDOUT/STDERR:\n{msg}"
+    # Helper for consistent error reporting. Emits the REAL exit code —
+    # hardcoding 1 made a 124 timeout kill indistinguishable from a
+    # program failure, so the model re-ran identical >=10-min commands.
+    # The annotation rides AFTER the digits: downstream parsers match
+    # `EXIT CODE:\s*(\d+)` and must keep working.
+    def _format_error(msg, hint=None, exit_code=1):
+        _code_note = ""
+        if exit_code in _TIMEOUT_KILL_CODES:
+            _code_note = f" (timed out / killed after {_EXEC_TIMEOUT_S}s)"
+            _t_hint = (
+                f"Exit {exit_code} means the process was KILLED — most "
+                f"likely it exceeded the {_EXEC_TIMEOUT_S}s execution "
+                f"budget (137 can also be the kernel OOM killer). This is "
+                f"NOT a bug in the code, and re-running the identical "
+                f"command will die the same way. Shrink the workload "
+                f"(fewer iterations / a data subset), checkpoint "
+                f"intermediate results, or split the run into stages.")
+            hint = f"{_t_hint}\n\n{hint}" if hint else _t_hint
+        out = (f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}{_code_note}"
+               f"\nSTDOUT/STDERR:\n{msg}")
         if hint:
             out += f"\n\n--- 💡 DIAGNOSTIC HINT ---\n{hint}\n------------------------"
         return out
@@ -482,7 +530,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # script path (the bash branch previously had NO tool-level trim, so a
         # noisy direct command dumped its whole 256 KB into context).
         output, exit_code = await asyncio.to_thread(
-            sandbox_manager.execute, cmd_str, timeout=600,
+            sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
             spill_large_output=True, **_workdir_kw)
         # Root fallback for project-scoped commands. When a project is active
         # the command runs from /workspace/projects/<id>, but the model may
@@ -525,7 +573,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     level="WARNING", icon=Icons.SHIELD,
                 )
                 _fh_out, _fh_code = await asyncio.to_thread(
-                    sandbox_manager.execute, cmd_str, timeout=600,
+                    sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, workdir=_proj_wd)
                 if _fh_code == 0 or not _looks_like_file_not_found(_fh_out):
                     output, exit_code = _fh_out, _fh_code
@@ -567,7 +615,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                 # the exact flood the primary call's spill mode prevents.
                 _re_out, _re_code = await asyncio.to_thread(
                     sandbox_manager.execute,
-                    f"bash -c {shlex.quote(_remapped)}", timeout=600,
+                    f"bash -c {shlex.quote(_remapped)}", timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True, **_workdir_kw)
                 if _re_code == 0 or not _looks_like_file_not_found(_re_out):
                     output, exit_code = _re_out, _re_code
@@ -589,18 +637,26 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
             else:
                 # Root-cwd retry (relative paths, file at the sandbox root).
                 _re_out, _re_code = await asyncio.to_thread(
-                    sandbox_manager.execute, cmd_str, timeout=600,
+                    sandbox_manager.execute, cmd_str, timeout=_EXEC_TIMEOUT_S,
                     spill_large_output=True)
-                output, exit_code = _re_out, _re_code
-                if exit_code == 0:
+                # Same adoption guard as the two heals above: a scoped
+                # script that RAN and then died on a missing data file
+                # matches the file-not-found signature too, and adopting
+                # unconditionally replaced its real traceback with the
+                # root run's bogus "can't open file '<script>'".
+                if _re_code == 0 or not _looks_like_file_not_found(_re_out):
+                    output, exit_code = _re_out, _re_code
                     # Say WHERE it ran — silently succeeding from the root
                     # taught the model nothing, so its next command used the
                     # scoped-relative path again and failed again.
                     output = (output or "") + (
                         "\n[SYSTEM NOTE: the target was not in the active "
                         "project's workspace; this ran from the sandbox ROOT "
-                        "(/workspace). Reference it as /workspace/<path>, or "
-                        "move it into the project.]")
+                        "(/workspace)"
+                        + ("" if exit_code == 0 else
+                           " and failed there for reasons UNRELATED to the path")
+                        + ". Reference it as /workspace/<path>, or "
+                          "move it into the project.]")
         _dt = _time.time() - _t0
 
         # Match-style commands (grep family, pgrep) exit 1 to mean "no
@@ -673,7 +729,8 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
 
         if exit_code != 0:
             return _format_error(
-                output or f"Process failed (Exit {exit_code}) with no output."
+                output or f"Process failed (Exit {exit_code}) with no output.",
+                exit_code=exit_code,
             ) + _host_proc_note
 
         return (f"--- COMMAND RESULT ---\nEXIT CODE: {exit_code}\n"
@@ -1076,24 +1133,35 @@ if has_error:
             
             tb_match = re.findall(r'File "([^"]+)", line (\d+),', output)
             if tb_match:
-                # Prioritize matches from the actual script or workspace, ignore deep library traces
-                script_matches = [m for m in tb_match if filename in m[0] or rel_path in m[0] or "/workspace/" in m[0] or m[0].startswith("./")]
-                
-                if script_matches:
-                    _, last_error_line = script_matches[-1]
-                else:
-                    _, last_error_line = tb_match[-1]
-                    
+                # Only frames from the EXECUTED file may index
+                # `clean_content` — the last workspace frame can belong to
+                # an imported module, and slicing the executed file at THAT
+                # line number showed the wrong file's region (or nothing).
+                _exec_names = {Path(rel_path).name, Path(str(filename)).name}
+                exec_matches = [m for m in tb_match
+                                if Path(m[0]).name in _exec_names]
                 try:
-                    line_num = int(last_error_line)
-                    if stateful and ext == "py" and (rel_path in output or filename in output):
-                         line_num = max(1, line_num - wrapper_line_offset)
-                    
-                    lines = clean_content.splitlines()
-                    start_l = max(0, line_num - 3)
-                    end_l = min(len(lines), line_num + 2)
-                    snippet = "\n".join([f"{i+1}: {l}" for i, l in enumerate(lines) if start_l <= i < end_l])
-                    diagnostic_info = f"Error detected at Line {line_num}:\n{snippet}\n\nSUGGESTION: Review the snippet above line {line_num}."
+                    if exec_matches:
+                        line_num = int(exec_matches[-1][1])
+                        if stateful and ext == "py":
+                            line_num = max(1, line_num - wrapper_line_offset)
+
+                        lines = clean_content.splitlines()
+                        start_l = max(0, line_num - 3)
+                        end_l = min(len(lines), line_num + 2)
+                        snippet = "\n".join([f"{i+1}: {l}" for i, l in enumerate(lines) if start_l <= i < end_l])
+                        diagnostic_info = f"Error detected at Line {line_num} of '{rel_path}':\n{snippet}\n\nSUGGESTION: Review the snippet above line {line_num}."
+                    else:
+                        # The failing frame is in another file (an imported
+                        # module or runner) — label it honestly instead of
+                        # slicing the executed file at a foreign line number.
+                        script_matches = [m for m in tb_match if "/workspace/" in m[0] or m[0].startswith("./")]
+                        err_file, err_line = (script_matches or tb_match)[-1]
+                        diagnostic_info = (
+                            f"Error detected at Line {err_line} of '{err_file}' "
+                            f"(NOT in '{rel_path}' itself — a file it imports/"
+                            f"calls). Read that file around line {err_line} for "
+                            f"the failing code.")
                 except (ValueError, TypeError) as de:
                     # Diagnostic snippet is best-effort; don't let a parse
                     # error here mask the actual execution failure.
@@ -1127,7 +1195,8 @@ if has_error:
                 pass
 
         if exit_code != 0:
-             return _format_error(output, hint=diagnostic_info) + _probe_note
+             return _format_error(output, hint=diagnostic_info,
+                                  exit_code=exit_code) + _probe_note
 
         return (f"--- EXECUTION RESULT ---\nEXIT CODE: {exit_code}\n"
                 f"STDOUT/STDERR:\n{output}{_probe_note}")

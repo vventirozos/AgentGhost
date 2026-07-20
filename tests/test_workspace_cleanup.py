@@ -348,6 +348,100 @@ def test_sweep_does_not_follow_symlink_out_of_tree(store, tmp_path):
     assert target.read_text() == "must survive"
 
 
+def test_sweep_path_escape_id_deletes_nothing(store):
+    """C1 regression (2026-07-20): `manage_projects action=cleanup
+    project_id="../.."` skipped id resolution, and `_project_dir` then
+    resolved to the sandbox PARENT (reproduced) — the walk deleted
+    dotfiles/logs outside the sandbox. Defense-in-depth behind the tool
+    boundary: the sweep must verify its resolved root is strictly inside
+    `<sandbox>/projects/` and refuse without raising."""
+    parent = store.sandbox_root.parent
+    decoy = parent / "decoy_outside.log"  # debris-shaped, would be swept
+    decoy.write_text("outside the sandbox")
+
+    res = sweep_project_workspace(store, "../..")
+
+    assert res["status"] == "skipped: path escape"
+    assert res["deleted"] == []
+    assert decoy.exists()
+
+
+def test_sweep_rejects_separator_bearing_id(store):
+    """Even an id that resolves INSIDE projects/ is rejected when it
+    smuggles path components — ids are opaque tokens, not paths."""
+    pid = store.create_project("P")
+    _proj_dir(store, pid)
+    res = sweep_project_workspace(store, f"x/../{pid}")
+    assert res["status"] == "skipped: path escape"
+    assert res["deleted"] == []
+
+
+def test_sweep_absolute_path_deliverable_is_protected(store):
+    """H9 regression (2026-07-20): a deliverable registered under its
+    absolute sandbox path (`/workspace/projects/<id>/demo.png`) normalized
+    to `workspace/projects/<id>/demo.png`, matched no walked rel, and the
+    DONE sweep deleted the registered file. Both payload forms must
+    protect the same file."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "demo.png", "the registered render")
+    _write(pdir, "stray_shot.png", "scratch")
+    # store the raw absolute-sandbox form, bypassing write-side normalization
+    store.add_artifact(tid, "file", f"/workspace/projects/{pid}/demo.png")
+
+    res = sweep_project_workspace(store, pid)
+
+    assert (pdir / "demo.png").exists()
+    assert not (pdir / "stray_shot.png").exists()
+    assert "demo.png" in res["kept"]
+
+
+def test_sweep_keeps_media_referenced_by_kept_source(store):
+    """MED regression (2026-07-20): the referenced-media protection was
+    wired only into the recurring tidy — the DONE sweep still deleted a
+    `sprites.png` that the kept `index.html` points at, breaking the
+    deliverable at the moment of completion."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "index.html", '<img src="sprites.png">')
+    _write(pdir, "sprites.png", "asset the build points at")
+    _write(pdir, "shot.png", "stray screenshot")
+    store.register_file_artifact(tid, "index.html")
+
+    res = sweep_project_workspace(store, pid)
+
+    assert (pdir / "sprites.png").exists()
+    assert not (pdir / "shot.png").exists()
+    assert res["kept_referenced"] == ["sprites.png"]
+    assert "sprites.png" in res["kept"]
+    assert res["deleted"] == ["shot.png"]
+
+
+def test_sweep_never_deletes_git_tree(store):
+    """H8 (2026-07-20): `.git` sits in `_SCRATCH_DIRS` so recovery never
+    registers its internals, but the sweep must not DELETE version-control
+    state either — a DONE project's repo history is part of the work."""
+    pid = store.create_project("P")
+    pdir = _proj_dir(store, pid)
+    tid = ProjectPlan(store, pid).add_task("t")
+    _write(pdir, "main.py", "keep")
+    _write(pdir, ".git/config", "[core]")
+    _write(pdir, ".git/objects/ab/cdef", "blob")
+    (pdir / ".git" / "refs" / "tags").mkdir(parents=True)
+    _write(pdir, "__pycache__/m.pyc", "bytecode")
+    store.register_file_artifact(tid, "main.py")
+
+    res = sweep_project_workspace(store, pid)
+
+    assert (pdir / ".git" / "config").exists()
+    assert (pdir / ".git" / "objects" / "ab" / "cdef").exists()
+    assert (pdir / ".git" / "refs" / "tags").is_dir()  # empty, never pruned
+    assert not (pdir / "__pycache__").exists()         # real debris still swept
+    assert not any(r.startswith(".git/") for r in res["deleted"])
+
+
 # ----------------------------------------------------------------- normalize
 
 @pytest.mark.parametrize("payload,expected", [
@@ -360,6 +454,15 @@ def test_sweep_does_not_follow_symlink_out_of_tree(store, tmp_path):
     ("sub/../../escape", None),
     ("", None),
     (".env", ".env"),                               # leading dot file preserved
+    # H9 (2026-07-20): absolute sandbox paths must collapse to the same
+    # project-relative key as the bare rel, or the registered deliverable
+    # matches no walked path and gets swept. Shared contract with
+    # `register_file_artifact`: project-relative POSIX, no leading `/`,
+    # no `workspace/` segment, no `projects/<id>/` prefix, `..` rejected.
+    ("/workspace/projects/abc123/demo.png", "demo.png"),
+    ("workspace/projects/abc123/demo.png", "demo.png"),
+    ("workspace/demo.png", "demo.png"),
+    ("/workspace/projects/abc123/sub/x.md", "sub/x.md"),
 ])
 def test_normalize_rel(payload, expected):
     assert _normalize_rel(payload, "abc123") == expected

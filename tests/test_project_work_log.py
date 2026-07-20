@@ -238,15 +238,31 @@ def test_defect_hook_never_raises_without_store():
 
 # ------------------------------------------------- wiring pins (source)
 
-def test_finalize_chain_writes_work_log():
+def test_work_log_helper_writes_and_consumes():
+    # 2026-07-20 H1: the work_log write was extracted from
+    # `_finalize_and_return` into a shared helper so the stream drain (which
+    # bypasses finalize) can run it too — both call sites use one helper so
+    # the logic can't drift.
     import inspect
     import ghost_agent.core.agent as agent_mod
-    src = inspect.getsource(agent_mod.GhostAgent._finalize_and_return)
+    src = inspect.getsource(agent_mod.GhostAgent._write_project_work_log_safe)
     assert "add_work_log" in src
     # verifier-aware outcome + consumed accumulators
-    assert "verifier_backfill" in src[src.index("add_work_log") - 2000:
-                                      src.index("add_work_log")]
+    assert "verifier_backfill" in src[:src.index("add_work_log")]
     assert "_project_work_files" in src
+
+
+def test_both_paths_call_work_log_helper():
+    # The whole point of the H1 fix: streamed forced-final turns RETURN the
+    # SSE generator before `_finalize_and_return`, so the work_log write must
+    # also fire from the stream drain (inside handle_chat) or streamed
+    # project turns leave no work_log.
+    import inspect
+    import ghost_agent.core.agent as agent_mod
+    fin = inspect.getsource(agent_mod.GhostAgent._finalize_and_return)
+    hc = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    assert "_write_project_work_log_safe" in fin
+    assert "_write_project_work_log_safe" in hc
 
 
 def test_dispatch_accumulates_project_work():
@@ -287,10 +303,10 @@ def test_work_log_failure_dimension_defaults_empty_and_bounded(store, pid):
     assert len(p["failure_dimension"]) == 24
 
 
-def test_finalize_chain_classifies_failure_dimension():
+def test_work_log_helper_classifies_failure_dimension():
     import inspect
     import ghost_agent.core.agent as agent_mod
-    src = inspect.getsource(agent_mod.GhostAgent._finalize_and_return)
+    src = inspect.getsource(agent_mod.GhostAgent._write_project_work_log_safe)
     assert "failure_dimension=_wl_dim" in src
     assert "_turn_failure_texts" in src
     # only failed turns pay for classification

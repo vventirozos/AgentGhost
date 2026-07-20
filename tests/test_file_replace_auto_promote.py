@@ -243,6 +243,83 @@ class TestReplaceAutoPromote:
         assert "bonjour" in target.read_text()
         assert "hello" not in target.read_text()
 
+    async def test_auto_promote_keeps_module_with_fenced_docstring_whole(self, tmp_path):
+        """C2 regression (2026-07-20): the auto-promote path called
+        extract_code_from_markdown WITHOUT filename=, skipping the
+        "whole input already parses -> keep it whole" guard — a complete
+        module whose docstring embeds a ```python example was overwritten
+        by just the inner snippet, and SUCCESS was reported."""
+        target = tmp_path / "solution.py"
+        target.write_text("# old stub\n")
+
+        module = (
+            "import os\n"
+            "\n"
+            "def helper():\n"
+            '    """Return the cwd.\n'
+            "\n"
+            "    Example:\n"
+            "\n"
+            "    ```python\n"
+            "    x = 1\n"
+            "    ```\n"
+            '    """\n'
+            "    return os.getcwd()\n"
+            "\n"
+            "if __name__ == '__main__':\n"
+            "    helper()\n"
+        )
+
+        result = await tool_replace_text(
+            filename="solution.py",
+            old_text=module,
+            new_text=None,
+            sandbox_dir=tmp_path,
+        )
+        assert "SUCCESS" in result and "auto-promoted" in result
+        written = target.read_text()
+        assert written == module.strip()
+        assert "def helper" in written
+        assert "```python" in written          # fence survives inside the docstring
+        assert written.strip() != "x = 1"      # the old bug: only the snippet
+
+    async def test_two_arg_replacement_with_fenced_docstring_kept_whole(self, tmp_path):
+        """Same missing-filename hole on the two-arg replace fence strip:
+        a replacement block that is itself valid Python containing a fenced
+        docstring example was collapsed to the inner snippet before
+        matching — wrong content written, SUCCESS reported."""
+        target = tmp_path / "mod.py"
+        target.write_text(
+            "import os\n"
+            "\n"
+            "def f():\n"
+            "    return 1\n"
+        )
+
+        new_func = (
+            "def f():\n"
+            '    """Doc.\n'
+            "\n"
+            "    ```python\n"
+            "    example()\n"
+            "    ```\n"
+            '    """\n'
+            "    return 2\n"
+        )
+        result = await tool_replace_text(
+            filename="mod.py",
+            old_text="def f():\n    return 1",
+            new_text=new_func,
+            sandbox_dir=tmp_path,
+        )
+        assert "SUCCESS" in result
+        written = target.read_text()
+        assert "return 2" in written
+        assert "```python" in written          # fenced example intact
+        assert "import os" in written
+        # The old bug: new_text collapsed to just `example()`.
+        assert "def f():" in written
+
     async def test_aider_blocks_still_work(self, tmp_path):
         """Aider SEARCH/REPLACE blocks inside `content` (with
         replace_with=None) must continue to work as before."""

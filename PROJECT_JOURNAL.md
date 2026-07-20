@@ -434,6 +434,148 @@ graph inverted index (the forgetting pass + node-cache landed).
 Severity in parens. Many are latent (no prod caller), multi-process (single-tenant today), or
 model-behavior edges.
 
+- **[2026-07-20 three-stack review — project-autonomy + turn-loop + code-correction] ALL FIXED
+  2026-07-20 (later 3)** — see §6's "three-stack review FIXES" entry. 10 parallel fix agents (strict
+  one-file-per-owner) + coordinator on agent.py/main.py/slack; full suite green. Findings below kept
+  for the record; `⊕` = independently corroborated by ≥2 agents. The `TurnState`/`FinalizeState`
+  decomposition seam audited CLEAR (no `locals()` recurrence; MUTATED_FIELDS repack symmetry confirmed
+  by two agents). **Headline: the streamed-finalize bypass (H1) had invalidated the Round-10
+  streamed-trajectory fix — now correctly closed by mirroring the work_log + trajectory writes into
+  the stream drain via a shared `_write_project_work_log_safe` helper.**
+
+  CRITICAL:
+  - **[fs/destructive] `manage_projects action=cleanup project_id="../.."` escapes the sandbox** —
+    `cleanup` is the one destructive action skipping `_resolve_project_ref`; `_canon_id` only
+    strip/lowercases, so `../..` survives into `workspace_cleanup._project_dir` →
+    `Path(root)/"projects"/"../.."` resolves to the sandbox PARENT (reproduced), and
+    `tidy_project_workspace(min_age_hours=0)` `os.walk`s it deleting dotfiles/`.git`/logs with no
+    containment re-check. Fix: validate the id against the store (or reject `..`/separators) before
+    tidy, and add a `root.is_relative_to(<sandbox>/projects)` assertion in tidy/sweep.
+    `tools/projects.py:2071`, `core/workspace_cleanup.py:60-100,325`.
+  - **[fs/correction] replace→write auto-promote overwrites a file with an inner snippet, SUCCESS** —
+    `extract_code_from_markdown(str(old_text))` called WITHOUT `filename=`, skipping the
+    "whole input already parses → keep it whole" guard; a module with a fenced docstring example is
+    replaced by just the snippet, syntax-check passes, status SUCCESS. `tool_write_file:2160` passes
+    `filename=` correctly. Fix: forward `filename=filename`. `tools/file_system.py:955`.
+
+  HIGH:
+  - **[project/streaming] ⊕⊕⊕ streamed forced-final turns bypass the entire finalize tail** — they
+    `return` the SSE generator at `agent.py:12019` before `_finalize_and_return` (13164), so
+    `add_work_log` (only caller finalize:9454) and `_record_turn_trajectory` (only caller
+    finalize:9480) NEVER run. Web UI always streams AND one-task-per-turn `force_final_response`
+    guarantees this ending on any task-closing turn → no work_log (re-opens the 07-18 "forgets
+    project work" gap) and NO trajectory recorded. **The Round-10 streamed-trajectory backfill is
+    inert** (parking setter 14137 gated on non-str `final_content` its only caller never passes;
+    backfills a trajectory never created). Fix: mirror work_log + trajectory-record + correction-stash
+    into the stream drain (11324-12010), not the backfill; add a streamed-turn integration test
+    asserting both are written. `agent.py:9404/12019/14136`.
+  - **[project/store] ⊕⊕ `update_project(metadata=…)` is a blind whole-dict replace** — wipes
+    `design_ledger`/`config`/`steps_used/cap`/`defect_reopens`/research index/runtime counters. The
+    documented budget-raise (`action=update metadata={"steps_cap":100}`, steered by the batch blurb)
+    destroys project state; the advancer's non-atomic RMW also clobbers cross-process
+    (`_atomic_metadata_update`) writers. Fix: route metadata mutations through a merge/atomic path.
+    `memory/projects.py:329`, `tools/projects.py:1490`.
+  - **[project/advancer] ⊕⊕ IN_PROGRESS leaf orphaned on deploy-by-kill** — claim committed before
+    ~6 awaits, `next_ready_leaf` eligibility `{PENDING,READY}` only, handlers catch `Exception` not
+    `CancelledError`, no boot reaper. Plain SIGTERM mid-tick wedges the task forever (project stuck
+    ACTIVE, "all complete"). Fix: boot-time reaper resetting stale IN_PROGRESS→READY, or add
+    IN_PROGRESS to eligibility with an age guard. `project_advancer.py:597`, `planning.py:789`.
+  - **[turn-loop/context] `_prune_context` third un-capped return** — the `len(non_system_msgs)<=5`
+    branch returns the tail verbatim (no `_cap_oversized_tail`); a few huge tool results still ship
+    oversize → xrick HTTP-400 → destructive recovery. The 07-18 fix wrapped only 2 of 3 returns.
+    `agent.py:2518-2533`.
+  - **[verify/fail-open] grep-exit-1 → `EXIT CODE: 0` defeats autoadvance verify** —
+    `execute.py:654` rewrites grep-family no-match to exit 0; advancer `_looks_like_failure` reads a
+    pass, so `grep -q "marker" file` marks DONE when the marker is ABSENT (theatrical completion).
+    Correct for the interactive strike loop, fail-open for verify — the verify path needs the raw
+    exit code. `execute.py:624`, `project_advancer.py:1190`.
+  - **[parser/native] leaked-framing repair truncates legitimate content, SUCCESS** —
+    `_value_has_leaked_framing` fires on any `file_system` write whose `content` holds a two-param
+    tool-call example (`</parameter>`…`<parameter …>` — produced when writing docs/tests about the
+    tool format); repair truncates content at the first `</parameter>` and writes the fragment.
+    Native-ON default; content in `arguments` is never tag-checked. Fix: length/known-tool guard, or
+    skip repair when the primary tool name is valid and args parse. `agent.py:1553`.
+  - **[fs/correction] streaming-replace (>1 MB) bypasses the guard chain** — no marker-leak check,
+    no syntax rollback; merged-args markers (`<<<< SEARCH`/`====`) written verbatim, SUCCESS. Fix:
+    route the streaming path through `_write_replace_guarded`. `file_system.py:1031-1071`.
+  - **[cleanup/destructive] recurring tidy deletes `.git/`+dot-configs on ACTIVE projects, no age
+    gate** — the `TIDY_MIN_AGE_HOURS` gate applies only to the media branch; `_is_debris('repo/.git/
+    config')`/`.eslintrc.json`→True unconditionally. Idle watchdog corrupts in-flight clones. Fix:
+    apply the age gate (and a registered/referenced check) to debris too. `workspace_cleanup.py:114`.
+  - **[cleanup/destructive] registered absolute-path deliverable unprotected → DONE sweep deletes
+    it** — `deliverables=["/workspace/projects/<id>/x.png"]` normalizes to `workspace/projects/<id>/
+    x.png`, matching no walked rel. Fix: handle the `workspace/` prefix in `_normalize_rel` +
+    `register_file_artifact`. `workspace_cleanup.py:77`, `memory/projects.register_file_artifact`.
+  - **[project/api] `POST /api/projects/{pid}/advance` = theatrical completion** — no tool_runner
+    passed; research leaf closes DONE `result_summary="(no tool runner)"`, budget charged, events
+    stamped to the wrong project. Fix: build the default runner (as the docstring promises) or refuse
+    non-idle advance. `api/projects_routes.py:179`, `project_advancer.py:821`.
+
+  MEDIUM (project autonomy): `task_update` with `result` but no `status` is a success-shaped no-op
+  (`count:1`, writes nothing) and the gate-recovery text tells the model to make exactly that call →
+  gate-clear loop (`projects.py:1794`); bulk `task_update` constraint audit blocks fileless SIBLING
+  tasks (`1767`); `reconcile_conversation` fails open on a missing/LRU-evicted sentinel (50-entry/24h)
+  → stale project active cross-conversation (`444-527`); API `switch`/`resume`/`delete` set
+  `current_project_id` directly, bypassing `_set_current` → sentinel desync / reactivates a deleted
+  id (`projects_routes.py:142-167`); ⊕ dead ReplanBridge (revises a throwaway tree, nothing persists,
+  counts "revised") (`planning.py:475`, `metacog.py:141`); ⊕ idle round-robin starvation —
+  blocked/idle ticks never re-stamp `last_autoadvance_ts` (`project_advancer.py:356`, `agent.py:3703`);
+  HUMAN_GATE not enforced on the interactive close → FAILED not NEEDS_USER (`planning.py:115`,
+  `project_safety.py:104`); now-live plan gate per-char garbage on string `postconditions` + crash on
+  `status:null` (`planning.py:146`); `_maybe_rollup_project_status` non-transactional, no `AND
+  status=?` guard → can stomp a concurrent ARCHIVE→DONE + fire cleanup (`memory/projects.py:677`);
+  reactivation dead-end for FAILED/PAUSED/NEEDS_USER (no schema-legal ACTIVE) (`memory/projects.py:548`);
+  `delete_task` never rolls up (`725`); metadata array-string poisons `dict(metadata)` readers
+  (`projects.py:1087`); `parent_id` + `resume`/`get`/`switch` title args not canonicalized/honored
+  (`1436/1558/1601`); `record_runtime` only on success → runtime rail blind to failed builds
+  (`project_advancer.py:414`); digest scans only ACTIVE → hides the same-tick NEEDS_USER/DONE rollup
+  (`project_digest.py:51`); sync `shutil.rmtree`/sweep on the event loop in async routes
+  (`projects_routes.py:136`).
+
+  MEDIUM (turn-loop): post-batch failure bookkeeping attributes to the LAST tool in the batch, not
+  the failing one (strike sig / fallback hint / failure-dimension all mis-keyed → ≥3-repeat breaker
+  fires late/never) (`agent.py:8054`); `is_mutating` drifted from `is_sandbox_mutation` —
+  `unzip`/`git_clone` non-mutating so world-changed reset never fires post-clone + batch-dedup can
+  collapse them (`6965`); batch dedup collapses identical `browser`/`manage_projects` calls (two
+  clicks execute once) (`7278`); per-turn injection (~10-20k tok: schemas+hydration+briefing)
+  uncounted at the prune/steer threshold → overflow band with no steer (`10799`); first-read budget
+  exemption bypasses the occupancy-shrunk cap by one whole-file read (`file_system.py:814`); raw
+  uncapped scratchpad injected every turn, invisible to every governor estimate (`agent.py:11022`);
+  `_apply_file` writes from a truncated/absent snapshot → clobber, and same-path double-append
+  discards the first (`coding_executor.py:513`); retry re-renders a stale pre-edit excerpt → burns
+  all 4 attempts, half-applied file on disk (`coding_executor.py:640`); `_format_error` hardcodes
+  `EXIT CODE: 1` (erases timeout 124) (`execute.py:179`); egress-guard / spill-log return
+  success-shaped prose the verify classifier passes / point at an unreadable path
+  (`execute.py:158`, `docker.py:724`).
+
+  MEDIUM (code-correction): REPLACE closer not line-anchored (a `>>>>` in the payload truncates it)
+  (`file_system.py:1110`); git-conflict content in SEARCH text hijacks the `=======` separator
+  (`1109`); lone-surrogate content truncates the target to 0 bytes + the ValueError returns with no
+  `Error:` prefix so `coding_executor` records it written (`2172`); indented markers evade the leak
+  guard (`1981`); `projects/<slug>/` prefix strip collapses an explicit FOREIGN-project path into the
+  active one (`348`); `tool_rename_file` silently clobbers an existing destination (`2729`);
+  `_apply_edits` after/before-insert uses 2-arg `.replace` (all occurrences) (`coding_executor.py:466`).
+
+  LOW (sample; full list in agent transcripts): promotion nudge counts reads as "sandbox writes"
+  (`agent.py:9348`); work-log paths lower-cased → ENOENT on case-sensitive FS (`7682`); `_SELF_REF_RE`
+  misroutes "how do I…" research to introspection (`project_advancer.py:454`); binary media crowds
+  the 12-file executor snapshot (`67`); substring library-match mints false cross-project edges
+  (`project_concepts.py:129`); `detect_contradiction` flags agreeing summaries (`project_safety.py:121`);
+  dangling alternative id consumed + blocks parent with valid alternatives queued (`planning.py:280`);
+  id-less native tool-call dup collision (KNOWN §4B, `id=""` default confirms reachable)
+  (`agent.py:12240/13994`); `unescape_xml_values` double-decodes native args (`6731`);
+  truncated-tool-call partial body dispatched w/o recovery steer (`6076`); `GHOST_TOOL_GRAMMAR=1`
+  without `--no-native-tools` attaches contradictory constraints (`11248`); `rg` pattern passed
+  positionally (a `-`-leading pattern parses as a flag) (`file_system.py:2552`); root-cwd retry
+  adopts result unconditionally, replacing a real traceback (`execute.py:589`); heredoc-into-interp
+  egress-guard bypass (`execute.py:44`).
+
+  FIX-ORDER RECOMMENDATION: (1) H1 streamed-finalize bypass — biggest blast radius, corrects the
+  inert Round-10 fix; (2) C1 + H8/H9 cleanup containment/age-gate/deliverable-normalization (one
+  focused `workspace_cleanup.py` pass); (3) C2/H6/H7 file_system write-corruption trio; (4) H5+H10
+  verify fail-open + H3 IN_PROGRESS reaper; (5) H2 metadata whole-dict replace; (6) H4 prune return,
+  then the medium tier.
+
 - **[2026-07-14 post-July-hunt cohort review] open residuals** (the CONFIRMED-and-fixed items are
   in §6's 2026-07-14b entry). Still open:
   - **[concurrency] streaming final-generation tail escapes the semaphore + turn registry** —
@@ -787,6 +929,75 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-20 (later 3) — three-stack review FIXES: 2 crit + ~12 high + ~20 med, all fixed in the recommended order
+
+Ten parallel fix agents (strict one-file-per-owner) + coordinator on `core/agent.py`, `main.py`, and
+`interface/slack_project_commands.py`. Every §4B "2026-07-20 three-stack review" finding addressed;
+each fix batch shipped its own regression tests. Full suite green. By the recommended fix order:
+
+1. **H1 streamed-finalize bypass (headline + self-correction).** Streamed forced-final turns `return`
+   the SSE generator before `_finalize_and_return`, so `add_work_log` + `_record_turn_trajectory`
+   (both sole-called from finalize) never ran — and yesterday's Round-10 streamed-trajectory backfill
+   was INERT (keyed off a trajectory finalize never wrote). Fix: extracted the work_log write into a
+   shared `_write_project_work_log_safe` helper called from BOTH finalize and the stream drain, and
+   the drain now calls `_record_turn_trajectory` directly with the real `full_content` (records +
+   outcome-heuristics + correction-stash in one; the late verifier backfills the outcome by
+   trajectory id). Removed the dead `_streamed_traj_pending` machinery. Tests:
+   test_project_work_log.py (helper pins + both-paths-call-it), test_turn_loop_review_fixes_20260720.py.
+2. **C1 cleanup sandbox escape + H8/H9 cleanup gaps** (workspace_cleanup.py + tools/projects.py +
+   memory/projects.py): `_escapes_projects_root` containment assertion in sweep/tidy, `cleanup` routed
+   through `_resolve_project_ref` at the tool boundary, `.git`/dot-config never debris + age-gate on
+   all tidy debris, and `_normalize_rel`/`register_file_artifact` aligned so absolute
+   `/workspace/projects/<id>/x` deliverables are protected.
+3. **C2/H6/H7 write-corruption trio**: auto-promote + fence strips pass `filename=` (sanitizer guard
+   armed); native leaked-framing repair won't truncate a body-sized value on sibling-only evidence
+   (agent.py:1553); streaming-replace (>1 MB) routes through the marker-leak + syntax-regression guard.
+4. **H5 verify fail-open + H10 no-runner + H3 reaper**: advancer got a fail-closed verify classifier
+   (grep-no-match / egress-prose / no-exit-code → inconclusive, never DONE) and refuses to DONE a
+   runner-less tool leaf; the API route and Slack `advance_async` now build a real project-pinned
+   runner (or refuse) instead of the classify-only path; `ProjectStore.reset_orphaned_in_progress`
+   wired at boot in main.py resets stale IN_PROGRESS claims left by a deploy/crash.
+5. **H2 metadata whole-dict replace**: `update_project` metadata is now MERGE-by-default inside one
+   BEGIN IMMEDIATE txn (explicit `metadata_replace=True` for a true replace) — the documented
+   budget-raise no longer wipes ledger/config/counters.
+6. **H4 prune third return + the medium tier**: the `<=5`-message branch now caps via
+   `_cap_oversized_tail`; pruning reserves per-turn injection headroom (`_history_budget =
+   max_context - min(24k, max(0, max_context-32k))` — the reserve ramps in only above a 32k window so
+   it never lowers a small/mock test budget's threshold, which had perturbed compaction timing and
+   flipped the `execution_failure_count==4` System-3 pivot under the loaded-tokenizer full-suite
+   ordering); scratchpad injection capped at source; batch dedup no
+   longer collapses stateful tools (`_BATCH_COLLAPSE_UNSAFE`); `is_mutating` aligned with
+   `is_sandbox_mutation` (unzip/git_clone/image_generation); post-batch failure bookkeeping attributes
+   to the FAILING tool not the batch's last; ReplanBridge now PERSISTS via `ProjectPlan.request_revision`;
+   plan-gate coerces string/null fields; HUMAN_GATE → NEEDS_USER; contradiction/digest/concepts,
+   execute exit-codes + heredoc guard, coding_executor append/retry/insert, and the API/route
+   canonicalization + off-loop blocking — all fixed.
+
+Deferred to docs owner: HTML docs for the new contracts (metadata merge, `metadata_replace`,
+`human_approved`, `ProjectPlan.request_revision`, verify-classifier, advance 503, the
+`projects/<other-id>/` explicit-foreign-path behavior change). NOT yet deployed — plain-kill to deploy.
+
+### 2026-07-20 (later 2) — three-stack review (project-autonomy + turn-loop + code-correction): LOGGED, not fixed
+
+Ten parallel review agents over the next-stalest stacks (last dedicated sweep 07-03/04; heavy churn
+since). Every finding re-verified against source by the coordinator, criticals reproduced; deduped
+against §4B/§4C. Result: **2 critical, ~12 high, ~20 medium — all logged in §4B's 2026-07-20 cohort
+block, NONE fixed yet** (user asked to log for later pickup). The `TurnState`/`FinalizeState` seam
+audited CLEAR (no `locals()` recurrence).
+
+**Headline + self-correction:** the biggest finding (H1, corroborated by 3 agents) is that streamed
+forced-final turns `return` the SSE generator at `agent.py:12019` BEFORE `_finalize_and_return`
+(13164), so `add_work_log` and `_record_turn_trajectory` (each sole-called from finalize) never run
+on streamed turns — web UI always streams and one-task-per-turn guarantees the streamed ending on
+task-closing turns. **This makes the Round-10 "streamed turns backfill final_response" fix (below,
+claimed HIGH-fixed) INERT** — the parking setter is gated on a non-str `final_content` its only
+caller never passes, backfilling a trajectory that streamed turns never create. Correct fix = move
+the work_log + trajectory-record + correction-stash into the stream drain, plus a streamed-turn
+integration test (its absence let the inert fix pass green). Other criticals: `manage_projects
+cleanup project_id="../.."` sandbox escape into destructive delete (reproduced); replace→write
+auto-promote overwriting a file with an inner code snippet (missing `filename=` guard). Full list +
+fix-order in §4B.
 
 ### 2026-07-20 (later) — metacognitive-stack review: 2 criticals + ~15 majors found and fixed same-day
 

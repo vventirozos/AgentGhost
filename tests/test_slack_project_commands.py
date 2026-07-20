@@ -210,14 +210,39 @@ def test_advance_sync_is_stub(ctx):
     assert "async" in r.text.lower()
 
 
-async def test_advance_async_runs_tick(ctx):
+async def test_advance_async_runs_tick(ctx, monkeypatch):
+    # advance_async now builds a project-pinned tool runner (2026-07-20 H10)
+    # instead of running the degraded classify-only path that fake-completes
+    # a research leaf. Stub the registry so a research task actually runs.
     pid = ctx.store.create_project("X")
     ctx.current_project_id = pid
     ctx.store.add_task(pid, "Research foo")
+
+    async def _fake_web_search(**kwargs):
+        return "--- COMMAND RESULT ---\nEXIT CODE: 0\nfound: foo is a bar"
+
+    monkeypatch.setattr(
+        "ghost_agent.tools.registry.get_available_tools",
+        lambda _c: {"web_search": _fake_web_search},
+    )
     agent_ctx = SimpleNamespace(project_store=ctx.store)
     r = await advance_async(ctx, agent_ctx)
     assert r.text  # non-empty message
     assert "research" in r.text.lower() or "idle" in r.text.lower()
+
+
+async def test_advance_async_refuses_without_runner(ctx, monkeypatch):
+    # No tool registry → refuse loudly rather than theatrically complete.
+    pid = ctx.store.create_project("X")
+    ctx.current_project_id = pid
+    ctx.store.add_task(pid, "Research foo")
+    monkeypatch.setattr(
+        "ghost_agent.tools.registry.get_available_tools",
+        lambda _c: {},
+    )
+    agent_ctx = SimpleNamespace(project_store=ctx.store)
+    r = await advance_async(ctx, agent_ctx)
+    assert "unavailable" in r.text.lower()
 
 
 async def test_advance_async_without_project(ctx):

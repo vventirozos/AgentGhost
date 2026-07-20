@@ -250,16 +250,23 @@ def context(tmp_path):
 
 
 @pytest.fixture
-def no_subtools(monkeypatch):
-    """Force tool_runner=None inside the autoadvance handler so research tasks
+def stub_subtools(monkeypatch):
+    """Swap the registry for a stub web_search handler so research tasks
     complete cleanly without invoking real sub-tools (which need a full
-    context). Isolates the wiring (tool → advance_many → loop → store)."""
+    context). Isolates the wiring (tool → advance_many → loop → store).
+    A None registry is no longer usable here: a runner-less tick now refuses
+    to close a task (H10 theatrical-completion fix) and reports blocked."""
     import ghost_agent.tools.registry as reg
-    monkeypatch.setattr(reg, "get_available_tools", lambda ctx: None)
+
+    async def _web_search(query="", **_kw):
+        return f"stub results for {query}"
+
+    monkeypatch.setattr(reg, "get_available_tools",
+                        lambda ctx: {"web_search": _web_search})
 
 
 @pytest.mark.asyncio
-async def test_tool_autoadvance_all_completes_research_project(context, no_subtools):
+async def test_tool_autoadvance_all_completes_research_project(context, stub_subtools):
     store = context.project_store
     await tool_manage_projects(context, action="create", title="Lit Review")
     pid = context.current_project_id
@@ -267,8 +274,8 @@ async def test_tool_autoadvance_all_completes_research_project(context, no_subto
                                subtasks=["research topic A", "research topic B"])
     out = json.loads(await tool_manage_projects(
         context, action="autoadvance", count="all"))
-    # both research tasks advance (no tool runner → marked DONE) and the loop
-    # reports completion
+    # both research tasks advance (stub search output → marked DONE) and the
+    # loop reports completion
     assert out["requested"] == "all"
     assert out["count"] == 2
     assert out["stop_reason"] == "project_done"
@@ -276,7 +283,7 @@ async def test_tool_autoadvance_all_completes_research_project(context, no_subto
 
 
 @pytest.mark.asyncio
-async def test_tool_autoadvance_count_one_default(context, no_subtools):
+async def test_tool_autoadvance_count_one_default(context, stub_subtools):
     store = context.project_store
     await tool_manage_projects(context, action="create", title="P")
     pid = context.current_project_id

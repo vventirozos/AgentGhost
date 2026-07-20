@@ -81,11 +81,14 @@ def _op_ok(out: str) -> bool:
 
 def _looks_like_write_error(out: str) -> bool:
     """Conservative write-failure check (writes rarely fail; don't abort a good
-    build on a chatty success message)."""
+    build on a chatty success message). ``SYSTEM INSTRUCTION:`` heads are
+    file_system REFUSALS (e.g. the empty-content write refusal) — missing them
+    closed tasks DONE with the file never written (2026-07-20 review)."""
     head = (out or "").strip()[:80].lower()
     return (
         not out
         or head.startswith("system error")
+        or head.startswith("system instruction")
         or head.startswith("error:")
         or "security error" in head
     )
@@ -116,6 +119,59 @@ def _syntax_fail_reason(path: str, out: str) -> Optional[str]:
     return (f"{path} is on disk but does NOT parse — {diag} "
             f"Fix the syntax error with `edits` (do not rewrite the whole "
             f"file); the task cannot complete while the file is broken.")
+
+
+def _looks_like_missing_file(out: str) -> bool:
+    """True when a file_system read says the target does not exist (as opposed
+    to failing for some other reason — too large, budget-refused, IO error)."""
+    head = " ".join((out or "").split()).lower()[:200]
+    return head.startswith("error") and (
+        "does not exist" in head or "not found" in head)
+
+
+async def _read_live_file(tool_runner: ToolRunner,
+                          path: str) -> Tuple[Optional[str], Optional[str]]:
+    """Read ``path``'s CURRENT on-disk content through file_system. Returns
+    ``(content, None)`` on success, ``("", "missing")`` when the file does not
+    exist yet, and ``(None, reason)`` when the live content cannot be
+    determined (too large / budget-refused / errored). Callers must NOT
+    substitute the prompt snapshot in that last case: the snapshot is
+    truncated by the gatherer's per-file/budget caps, and writing old+new
+    reconstructed from it AMPUTATES the on-disk tail (2026-07-20 review)."""
+    try:
+        out = await tool_runner("file_system", {"operation": "read", "path": path})
+    except Exception as e:
+        return None, f"read errored: {e}"
+    text = str(out or "")
+    marker = f"--- {path} CONTENTS ---\n"
+    idx = text.find(marker)
+    if idx != -1:
+        return text[idx + len(marker):], None
+    if _looks_like_missing_file(text):
+        return "", "missing"
+    return None, _short(text, 140)
+
+
+async def _refresh_existing(tool_runner: ToolRunner, existing: Dict[str, str],
+                            fresh: set, paths: List[str]) -> None:
+    """Re-read ``paths`` from disk into the ``existing`` snapshot between retry
+    attempts. A failed attempt can leave PARTIAL edits on disk (``_apply_edits``
+    stops at the first bad edit, after earlier ones applied) — without this the
+    retry prompt re-rendered the PRE-edit excerpt, the model re-emitted an edit
+    whose anchor was already gone, and every attempt burned on "anchor not
+    found" (2026-07-20 review). Best-effort: an unreadable file keeps its stale
+    entry (it is only prompt material), but is dropped from ``fresh`` so the
+    append path re-reads instead of trusting it."""
+    for path in paths:
+        live, err = await _read_live_file(tool_runner, path)
+        if live is not None and err is None:
+            existing[path] = live
+            fresh.add(path)
+        elif err == "missing":
+            existing.pop(path, None)
+            fresh.discard(path)
+        else:
+            fresh.discard(path)
 
 
 # Distinctive structural identifiers (HTML ids, function/def/class/const names,
@@ -449,10 +505,15 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     return spec, was_empty
 
 
-async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list) -> Optional[str]:
+async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list,
+                       touched: Optional[set] = None) -> Optional[str]:
     """Apply find/replace (or after/insert) edits to an existing file. Returns
-    a failure reason, or None if at least one edit applied cleanly."""
+    a failure reason, or None if at least one edit applied cleanly. ``touched``
+    collects paths a mutating op was issued for, so the retry loop knows what
+    to re-read from disk (a failed batch can leave EARLIER edits applied)."""
     applied = 0
+    touched = touched if touched is not None else set()
+    cur: Optional[str] = None   # live content; None = unknown / stale
     for ed in edits[:20]:
         if not isinstance(ed, dict):
             continue
@@ -460,26 +521,66 @@ async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list) -> Optio
         after = ed.get("after")
         before = ed.get("before")
         ins = ed.get("insert")
+        anchor: Optional[str] = None
+        insert_after = False
         if isinstance(find, str) and find and isinstance(rep, str):
             args = {"operation": "replace", "path": path,
                     "content": find, "replace_with": rep}
         elif isinstance(after, str) and after and isinstance(ins, str):
+            anchor, insert_after = after, True
             args = {"operation": "replace", "path": path,
                     "content": after, "replace_with": after + "\n" + ins}
         elif isinstance(before, str) and before and isinstance(ins, str):
             # Insert BEFORE an anchor (e.g. "</body>") — the common HTML case.
+            anchor, insert_after = before, False
             args = {"operation": "replace", "path": path,
                     "content": before, "replace_with": ins + "\n" + before}
         else:
             continue
+        if anchor is not None:
+            # file_system's exact-match replace substitutes EVERY occurrence,
+            # so an insert anchored on a tag that appears 3x landed 3 copies
+            # of the fragment (2026-07-20 review). When the anchor is
+            # ambiguous, splice ONE fragment at the FIRST occurrence and
+            # write the result ourselves; a unique (or non-byte-matching)
+            # anchor keeps the replace path — its fuzzy matching and syntax
+            # rollback are worth more than the splice.
+            if cur is None:
+                cur, _rerr = await _read_live_file(tool_runner, path)
+            if isinstance(cur, str) and cur.count(anchor) > 1:
+                i = cur.index(anchor)
+                pos = i + len(anchor) if insert_after else i
+                frag = ("\n" + ins) if insert_after else (ins + "\n")
+                new = cur[:pos] + frag + cur[pos:]
+                if len(new) > MAX_CONTENT_CHARS:
+                    return (f"{path} would exceed {MAX_CONTENT_CHARS} chars "
+                            f"({len(new)}) — split this feature into a "
+                            f"separate file")
+                try:
+                    out = await tool_runner("file_system", {
+                        "operation": "write", "path": path, "content": new})
+                except Exception as e:
+                    touched.add(path)   # state unknown — refresh next attempt
+                    return f"edit on {path} errored: {e}"
+                if _looks_like_write_error(out):
+                    return f"edit on {path} was rejected: {_short(out)}"
+                touched.add(path)
+                cur = new
+                applied += 1
+                last_out = out
+                continue
         try:
             out = await tool_runner("file_system", args)
         except Exception as e:
+            touched.add(path)   # state unknown — refresh next attempt
             return f"edit on {path} errored: {e}"
         if not _op_ok(out):
+            # a no-match replace provably did not mutate — no refresh needed
             return f"edit on {path} did not apply (anchor not found): {_short(out)}"
+        touched.add(path)
         applied += 1
         last_out = out
+        cur = None   # the replace mutated the file in a way we didn't model
     if applied == 0:
         return f"no usable edits for {path}"
     # The LAST edit's result reflects the file's final on-disk state — the
@@ -494,15 +595,28 @@ async def _apply_edits(tool_runner: ToolRunner, path: str, edits: list) -> Optio
 
 
 async def _apply_file(tool_runner: ToolRunner, fspec: dict,
-                      existing_files: Dict[str, str]) -> Tuple[Optional[str], Optional[str]]:
+                      existing_files: Dict[str, str],
+                      fresh: Optional[set] = None,
+                      touched: Optional[set] = None) -> Tuple[Optional[str], Optional[str]]:
     """Apply one file entry. Returns ``(written_path|None, fail_reason|None)``.
-    A blank entry returns (None, None) — skipped, not a failure."""
+    A blank entry returns (None, None) — skipped, not a failure.
+
+    ``existing_files`` is the PROMPT snapshot — possibly truncated by the
+    gatherer's per-file/budget caps, or missing the path entirely (file-count
+    cap) — never a source of truth for what is on disk. ``fresh`` marks paths
+    whose snapshot entry IS authoritative (just written or re-read from disk
+    this task); the append path trusts those and live-reads everything else.
+    ``touched`` collects paths whose ON-DISK state (possibly) changed, so a
+    failed attempt's retry re-reads exactly those."""
     if not isinstance(fspec, dict):
         return (None, None)
     path = (fspec.get("path") or "").strip()
     if not path:
         return (None, None)
-    old = (existing_files or {}).get(path)
+    snap = existing_files if isinstance(existing_files, dict) else {}
+    fresh = fresh if fresh is not None else set()
+    touched = touched if touched is not None else set()
+    old = snap.get(path)
 
     # APPEND — the easiest, safest incremental primitive: the model emits ONLY
     # the new snippet and the executor places it (for HTML, just before the
@@ -512,7 +626,25 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
     # failed; smart append sidesteps both.)
     append = fspec.get("append")
     if isinstance(append, str) and append.strip():
-        base = old if isinstance(old, str) else ""
+        # Base the append on the LIVE file, not the snapshot: writing
+        # old+snippet from a truncated snapshot AMPUTATED the on-disk tail,
+        # and from an absent one (>file-cap projects) REPLACED the whole
+        # file with just the snippet (2026-07-20 review). The invariant: an
+        # append must never shorten or replace the existing file.
+        if path in fresh and isinstance(old, str):
+            base = old
+        else:
+            live, lerr = await _read_live_file(tool_runner, path)
+            if lerr == "missing":
+                base = ""
+            elif live is None:
+                return (None, f"append to {path} refused: the current on-disk "
+                              f"content could not be read ({lerr}) — appending "
+                              f"from a possibly-truncated snapshot could delete "
+                              f"the file's tail. Put this feature in a separate "
+                              f"NEW file instead")
+            else:
+                base = live
         new = _smart_append(base, append.strip(), path)
         if len(new) > MAX_CONTENT_CHARS:
             # Never truncate (it would cut off closing tags and break the
@@ -523,18 +655,31 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
             out = await tool_runner(
                 "file_system", {"operation": "write", "path": path, "content": new})
         except Exception as e:
+            touched.add(path)   # state unknown — refresh next attempt
             return (None, f"append failed for {path}: {e}")
         if _looks_like_write_error(out):
             return (None, f"append rejected for {path}: {_short(out)}")
+        touched.add(path)
         sfail = _syntax_fail_reason(path, out)
         if sfail:
             return (None, sfail)
+        # Record the just-written content so a SECOND append to the same path
+        # in this spec builds on it instead of the pre-write state — two
+        # appends computed from the same stale base made the second write
+        # discard the first (2026-07-20 review).
+        snap[path] = new
+        fresh.add(path)
         return (path, None)
 
     edits = fspec.get("edits")
-    if isinstance(edits, list) and edits and path in (existing_files or {}):
-        reason = await _apply_edits(tool_runner, path, edits)
-        return (None, reason) if reason else (path, None)
+    if isinstance(edits, list) and edits and path in snap:
+        reason = await _apply_edits(tool_runner, path, edits, touched=touched)
+        if reason:
+            return (None, reason)
+        # Edits mutate the file in ways we didn't model in-memory — drop any
+        # fresh claim so a later append re-reads instead of trusting it.
+        fresh.discard(path)
+        return (path, None)
 
     content = fspec.get("content")
     if content is None:
@@ -567,12 +712,16 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
         out = await tool_runner(
             "file_system", {"operation": "write", "path": path, "content": content})
     except Exception as e:
+        touched.add(path)   # state unknown — refresh next attempt
         return (None, f"write failed for {path}: {e}")
     if _looks_like_write_error(out):
         return (None, f"write rejected for {path}: {_short(out)}")
+    touched.add(path)
     sfail = _syntax_fail_reason(path, out)
     if sfail:
         return (None, sfail)
+    snap[path] = content
+    fresh.add(path)
     return (path, None)
 
 
@@ -637,13 +786,26 @@ async def build_coding_task(
     if llm is None or tool_runner is None:
         return CodingResult(False, "coding executor unavailable (no llm/tool_runner)")
     model = getattr(getattr(context, "args", None), "model", "default")
-    existing = existing_files or {}
+    # Work on a COPY: attempts update the snapshot in place (just-written
+    # content, between-attempt disk refresh) and the caller's dict must not
+    # be mutated under it.
+    existing = dict(existing_files or {})
+    fresh: set = set()          # paths whose `existing` entry mirrors disk
+    prev_touched: List[str] = []
 
     last = "build failed"
     feedback = ""
     last_written: List[str] = []
     empty_responses = 0
     for _attempt in range(max(1, max_attempts)):
+        if prev_touched:
+            # The previous attempt touched files and failed — possibly with
+            # PARTIAL edits already on disk. Re-read them so this attempt's
+            # prompt and guards see the CURRENT state; re-rendering the stale
+            # pre-edit excerpt made the model re-emit already-applied edits
+            # that burned every retry on "anchor not found" (2026-07-20).
+            await _refresh_existing(tool_runner, existing, fresh, prev_touched)
+            prev_touched = []
         try:
             spec, was_empty = await _generate_build_spec(
                 llm, model, description, ledger,
@@ -699,15 +861,17 @@ async def build_coding_task(
             feedback = msg
             continue
 
+        touched: set = set()
         written: List[str] = []
         fail: Optional[str] = None
         for f in files[:max_files]:
-            path, reason = await _apply_file(tool_runner, f, existing)
+            path, reason = await _apply_file(tool_runner, f, existing, fresh, touched)
             if reason:
                 fail = reason
                 break
             if path:
                 written.append(path)
+        prev_touched = sorted(touched)
         last_written = written
         if fail:
             last = fail

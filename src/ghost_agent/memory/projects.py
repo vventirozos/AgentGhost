@@ -310,50 +310,90 @@ class ProjectStore:
             ).fetchone()
             return self._row_to_project(row) if row else None
 
-    def update_project(self, project_id: str, **fields) -> bool:
+    def update_project(self, project_id: str, metadata_replace: bool = False,
+                       **fields) -> bool:
+        """Update project fields. ``metadata`` is MERGED (shallow) into the
+        existing metadata by default — the blob carries system state
+        (design_ledger, config, steps_used/cap, research index, runtime
+        counters) that a whole-dict replace silently destroyed, e.g. the
+        documented budget-raise ``metadata={"steps_cap": 100}``. Pass
+        ``metadata_replace=True`` for a deliberate full replacement."""
         project_id = _canon_id(project_id)
         if not fields:
             return False
-        # Capture the prior status so a manual transition *into* DONE can
-        # fire the cleanup hook exactly once (and not on a DONE→DONE no-op).
-        prev_status = None
-        if "status" in fields:
-            existing = self.get_project(project_id)
-            prev_status = (existing or {}).get("status")
         allowed = {"title", "kind", "goal", "status", "workspace_dir", "metadata"}
-        sets = []
-        values: List[Any] = []
-        for key, val in fields.items():
+        for key in fields:
             if key not in allowed:
                 raise ValueError(f"unknown project field: {key}")
-            if key == "metadata":
-                sets.append("metadata_json = ?")
-                values.append(json.dumps(val or {}))
-            elif key == "status":
-                sets.append("status = ?")
-                values.append(ProjectStatus(val.upper()).value)
-            elif key == "kind":
-                sets.append("kind = ?")
-                values.append(ProjectKind(val.upper()).value)
-            else:
-                sets.append(f"{key} = ?")
-                values.append(val)
-        sets.append("updated_at = ?")
-        values.append(_now())
-        values.append(project_id)
+        # Normalise enums up front so a bad value raises before the txn opens.
+        status_norm = (ProjectStatus(fields["status"].upper()).value
+                       if "status" in fields else None)
+        kind_norm = (ProjectKind(fields["kind"].upper()).value
+                     if "kind" in fields else None)
+        # Single BEGIN IMMEDIATE txn: the prior-status read, the metadata
+        # read+merge, and the UPDATE are atomic across processes (mirrors
+        # _atomic_metadata_update), so a concurrent writer can't interleave
+        # between our read and write — no metadata clobber, and the DONE
+        # hook below can't double-fire from two racing status updates.
+        prev_status = None
         with self._lock, self._connect() as conn:
-            cur = conn.execute(
-                f"UPDATE projects SET {', '.join(sets)} WHERE id = ?", values
-            )
-            conn.commit()
-            updated = cur.rowcount > 0
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    "SELECT status, metadata_json FROM projects WHERE id = ?",
+                    (project_id,),
+                ).fetchone()
+                if row is None:
+                    conn.execute("ROLLBACK")
+                    return False
+                prev_status = row["status"]
+                sets = []
+                values: List[Any] = []
+                for key, val in fields.items():
+                    if key == "metadata":
+                        if metadata_replace:
+                            merged: Dict[str, Any] = dict(val or {})
+                        else:
+                            try:
+                                merged = json.loads(row["metadata_json"] or "{}")
+                            except Exception:
+                                merged = {}
+                            if not isinstance(merged, dict):
+                                merged = {}
+                            merged.update(val or {})
+                        sets.append("metadata_json = ?")
+                        values.append(json.dumps(merged))
+                    elif key == "status":
+                        sets.append("status = ?")
+                        values.append(status_norm)
+                    elif key == "kind":
+                        sets.append("kind = ?")
+                        values.append(kind_norm)
+                    else:
+                        sets.append(f"{key} = ?")
+                        values.append(val)
+                sets.append("updated_at = ?")
+                values.append(_now())
+                values.append(project_id)
+                values.append(prev_status)
+                cur = conn.execute(
+                    f"UPDATE projects SET {', '.join(sets)} "
+                    "WHERE id = ? AND status = ?", values
+                )
+                conn.execute("COMMIT")
+                updated = cur.rowcount > 0
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
         if updated:
             self.log_event(project_id, None, "project_updated", {"fields": list(fields.keys())})
-            if "status" in fields:
-                new_norm = ProjectStatus(fields["status"].upper()).value
-                if (new_norm == ProjectStatus.DONE.value
-                        and (prev_status or "").upper() != ProjectStatus.DONE.value):
-                    self._fire_project_done(project_id)
+            if (status_norm == ProjectStatus.DONE.value
+                    and (prev_status or "").upper() != ProjectStatus.DONE.value):
+                self._fire_project_done(project_id)
         return updated
 
     def delete_project(self, project_id: str, hard: bool = False) -> bool:
@@ -541,18 +581,31 @@ class ProjectStore:
             # autoadvance returned 0). Adding work to a finished project
             # un-finishes it — that is the only coherent semantic.
             #
-            # Only DONE reopens. ARCHIVED is a deliberate end-state (the
-            # cleanup sweep has already run); silently resurrecting it would
-            # be a surprise, and the caller can un-archive explicitly.
-            reopened = False
+            # DONE reopens; so do FAILED and PAUSED (2026-07-20) — a project
+            # in either state holding revived work had NO path back to
+            # ACTIVE (the tool status enum omits ACTIVE, advance_once
+            # refuses non-ACTIVE), so new tasks sat unreachable forever.
+            # NEEDS_USER stays put (parked on human input by design) and
+            # ARCHIVED is a deliberate end-state (the cleanup sweep has
+            # already run); silently resurrecting either would be a
+            # surprise — the caller can un-archive / answer explicitly.
+            # The read and guarded UPDATE share the INSERT's write txn, so
+            # a concurrent status change can't interleave.
+            reopened_from = None
             if str(status).upper() != "DONE":
-                cur = conn.execute(
-                    "UPDATE projects SET updated_at = ?, status = 'ACTIVE' "
-                    "WHERE id = ? AND status = 'DONE'",
-                    (now, project_id),
-                )
-                reopened = cur.rowcount > 0
-            if not reopened:
+                prow = conn.execute(
+                    "SELECT status FROM projects WHERE id = ?", (project_id,)
+                ).fetchone()
+                prev = ((prow["status"] if prow else "") or "").upper()
+                if prev in ("DONE", "FAILED", "PAUSED"):
+                    cur = conn.execute(
+                        "UPDATE projects SET updated_at = ?, status = 'ACTIVE' "
+                        "WHERE id = ? AND status = ?",
+                        (now, project_id, prev),
+                    )
+                    if cur.rowcount > 0:
+                        reopened_from = prev
+            if not reopened_from:
                 conn.execute(
                     "UPDATE projects SET updated_at = ? WHERE id = ?",
                     (now, project_id),
@@ -560,9 +613,10 @@ class ProjectStore:
             conn.commit()
         self.log_event(project_id, task_id, "task_added",
                        {"description": description, "parent_id": parent_id})
-        if reopened:
+        if reopened_from:
             self.log_event(project_id, task_id, "project_reopened",
-                           {"reason": "new task added to a DONE project"})
+                           {"reason": f"new task added to a {reopened_from} project",
+                            "from_status": reopened_from})
         return task_id
 
     def get_task(self, task_id: str) -> Optional[Dict[str, Any]]:
@@ -643,11 +697,38 @@ class ProjectStore:
                     "UPDATE projects SET updated_at = ? WHERE id = ?",
                     (now, row["project_id"]),
                 )
+            # Re-opening a task to an open state on a FAILED/PAUSED project
+            # reactivates it (2026-07-20) — otherwise the revived work was
+            # unreachable (advance_once refuses non-ACTIVE, the tool status
+            # enum omits ACTIVE). NEEDS_USER and ARCHIVED are never
+            # auto-undone. Same txn as the task UPDATE, guarded on the
+            # observed status, so a concurrent transition makes it a no-op.
+            reopened_from = None
+            if (row and cur.rowcount > 0 and "status" in fields
+                    and str(fields["status"]).upper()
+                    in ("PENDING", "READY", "IN_PROGRESS")):
+                prow = conn.execute(
+                    "SELECT status FROM projects WHERE id = ?",
+                    (row["project_id"],),
+                ).fetchone()
+                prev = ((prow["status"] if prow else "") or "").upper()
+                if prev in ("FAILED", "PAUSED"):
+                    rcur = conn.execute(
+                        "UPDATE projects SET status = 'ACTIVE', updated_at = ? "
+                        "WHERE id = ? AND status = ?",
+                        (now, row["project_id"], prev),
+                    )
+                    if rcur.rowcount > 0:
+                        reopened_from = prev
             conn.commit()
             updated = cur.rowcount > 0
         if updated and row:
             self.log_event(row["project_id"], task_id, "task_updated",
                            {"fields": list(fields.keys())})
+            if reopened_from:
+                self.log_event(row["project_id"], task_id, "project_reopened",
+                               {"reason": f"task re-opened on a {reopened_from} project",
+                                "from_status": reopened_from})
             # Auto-roll-up: when a task status changes, the project as a
             # whole may have finished. If every task is in a terminal
             # state, transition the project. (DONE if all DONE; FAILED
@@ -705,12 +786,20 @@ class ProjectStore:
 
         if new_status == current:
             return
+        # Guard on the status observed at read time (mirrors add_task's
+        # reopen): the lock was released between get_project/list_tasks and
+        # this write, so a concurrent transition (e.g. a manual ARCHIVE)
+        # would otherwise be stomped back to DONE — and then fire the
+        # destructive cleanup on an archived project. Interleave → no-op.
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "UPDATE projects SET status = ?, updated_at = ? WHERE id = ?",
-                (new_status, _now(), project_id),
+            cur = conn.execute(
+                "UPDATE projects SET status = ?, updated_at = ? "
+                "WHERE id = ? AND status = ?",
+                (new_status, _now(), project_id, current),
             )
             conn.commit()
+            if cur.rowcount == 0:
+                return
         self.log_event(
             project_id, None, "project_auto_rollup",
             {"new_status": new_status,
@@ -721,6 +810,52 @@ class ProjectStore:
         # project forward to DONE later), so their workspace must survive.
         if new_status == ProjectStatus.DONE.value:
             self._fire_project_done(project_id)
+
+    def reset_orphaned_in_progress(self, older_than_seconds: float = 900.0) -> int:
+        """Reset stale IN_PROGRESS tasks back to READY. Returns the count.
+
+        The advancer commits a leaf's IN_PROGRESS claim before several
+        awaits; a crash or deploy-kill (plain SIGTERM) between claim and
+        completion wedges the task forever — ``next_ready_leaf`` only
+        considers PENDING/READY, so the project sits ACTIVE reporting
+        "all complete". Called at boot (before the advancer starts) and
+        safe to call any time: only tasks whose ``updated_at`` is older
+        than ``older_than_seconds`` are touched, and each reset is guarded
+        on the row still being IN_PROGRESS, so genuinely in-flight work in
+        a live process is never yanked. Logs one ``task_reset_orphaned``
+        project event per reset.
+        """
+        cutoff = _now() - max(0.0, float(older_than_seconds))
+        reset: List[sqlite3.Row] = []
+        with self._lock, self._connect() as conn:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = conn.execute(
+                    "SELECT id, project_id FROM tasks "
+                    "WHERE status = 'IN_PROGRESS' AND updated_at < ?",
+                    (cutoff,),
+                ).fetchall()
+                if rows:
+                    now = _now()
+                    conn.executemany(
+                        "UPDATE tasks SET status = 'READY', updated_at = ? "
+                        "WHERE id = ? AND status = 'IN_PROGRESS'",
+                        [(now, r["id"]) for r in rows],
+                    )
+                    reset = list(rows)
+                conn.execute("COMMIT")
+            except Exception:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                raise
+        for r in reset:
+            self.log_event(r["project_id"], r["id"], "task_reset_orphaned",
+                           {"from": "IN_PROGRESS", "to": "READY",
+                            "older_than_seconds": float(older_than_seconds)})
+        return len(reset)
 
     def delete_task(self, task_id: str) -> bool:
         """Delete a task and its descendants (via FK cascade on parent_id=NULL
@@ -760,6 +895,10 @@ class ProjectStore:
             conn.commit()
         self.log_event(project_id, task_id, "task_deleted",
                        {"cascaded": len(to_delete) - 1})
+        # Deleting the last open task can settle the project (all remaining
+        # tasks DONE) — without this, an otherwise-finished project stayed
+        # ACTIVE forever because nothing ever re-evaluated the aggregate.
+        self._maybe_rollup_project_status(project_id)
         return True
 
     def _row_to_task(self, row: sqlite3.Row) -> Dict[str, Any]:
@@ -815,20 +954,35 @@ class ProjectStore:
         returns the existing artifact id instead of creating a duplicate, so
         callers can register on every DONE without accumulating rows.
 
-        Returns the artifact id, or ``None`` when the path is blank or the
-        task is unknown.
+        Paths are stored in the same normalized project-relative POSIX form
+        the cleanup's ``_normalize_rel`` reduces walked files to — a leading
+        ``/workspace/`` / ``workspace/`` segment, then ``projects/<id>/``,
+        then ``/`` and ``./`` are stripped; ``..`` traversal is rejected.
+        Before this (2026-07-20) an absolute ``/workspace/projects/<id>/x``
+        payload was stored verbatim, matched no walked rel, and the DONE
+        sweep deleted the registered deliverable.
+
+        Returns the artifact id, or ``None`` when the path is blank,
+        rejected, or the task is unknown.
         """
         task_id = _canon_id(task_id)
-        rel = (rel_path or "").strip().replace("\\", "/")
-        while rel.startswith("./"):
-            rel = rel[2:]
-        rel = rel.strip()
-        if not rel:
-            return None
         task = self.get_task(task_id)
         if not task:
             return None
         project_id = task["project_id"]
+        rel = (rel_path or "").strip().replace("\\", "/")
+        while rel.startswith("./"):
+            rel = rel[2:]
+        rel = rel.lstrip("/")
+        if rel.lower().startswith("workspace/"):
+            rel = rel[len("workspace/"):].lstrip("/")
+        pref = f"projects/{project_id}/"
+        if rel.lower().startswith(pref.lower()):
+            rel = rel[len(pref):]
+        parts = [p for p in rel.split("/") if p not in ("", ".")]
+        if not parts or any(p == ".." for p in parts):
+            return None
+        rel = "/".join(parts)
         for art in self.list_artifacts(project_id=project_id):
             if (art.get("kind") == "file"
                     and (art.get("payload") or "").strip() == rel):
@@ -1154,9 +1308,19 @@ class ProjectStore:
         """Newest-first work-log events, for the briefing and status views."""
         return self.list_events(project_id, limit=limit, event_type="work_log")
 
+    #: hard ceiling for list_events — a negative LIMIT is "no limit" to
+    #: SQLite, so an unclamped caller (the tool passes limit through
+    #: verbatim) could dump the entire event log.
+    EVENTS_MAX_LIMIT = 500
+
     def list_events(self, project_id: str, limit: int = 50,
                     event_type: Optional[str] = None) -> List[Dict[str, Any]]:
         project_id = _canon_id(project_id)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, self.EVENTS_MAX_LIMIT))
         with self._lock, self._connect() as conn:
             if event_type:
                 rows = conn.execute(

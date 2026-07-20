@@ -53,14 +53,14 @@
     <thead><tr><th>Method</th><th>Effect</th></tr></thead>
     <tbody>
       <tr><td><code>add_task(description, parent_id, status, dependency_type, alternatives, postconditions)</code></td><td>Insert task, return id (line 60).</td></tr>
-      <tr><td><code>update_status(task_id, status, result, failure_reason, actual_tool)</code></td><td>Mark transition; trigger postcondition check + parent propagation (line 89).</td></tr>
+      <tr><td><code>update_status(task_id, status, result, failure_reason, actual_tool, human_approved=False)</code></td><td>Mark transition; trigger postcondition check + parent propagation. A DONE close on a <code>HUMAN_GATE:</code>-gated task parks at NEEDS_USER unless <code>human_approved=True</code> or the task was already parked (2026-07-20, see below).</td></tr>
       <tr><td><code>_check_postconditions(node)</code></td><td>≥60 % token-overlap heuristic between result_summary and each postcondition; optional custom checker callback (line 120).</td></tr>
       <tr><td><code>_check_parent_completion(parent_id)</code></td><td>ALL/ANY/BEST aggregation propagated upward (line 165).</td></tr>
       <tr><td><code>_check_parent_failure(parent_id)</code></td><td>Spawns alternatives, propagates BLOCKED/FAILED (line 216).</td></tr>
       <tr><td><code>get_active_node()</code></td><td>Next leaf in IN_PROGRESS or READY (line 267).</td></tr>
       <tr><td><code>render()</code></td><td>ASCII tree with emoji status icons (line 292).</td></tr>
       <tr><td><code>request_revision(task_id, failure_reason)</code></td><td>Increment revision_count, reset to PENDING if &lt;3 (line 394).</td></tr>
-      <tr><td><code>load_from_json(json_data)</code></td><td>Stateful merge (no clear) so concurrent edits survive.</td></tr>
+      <tr><td><code>load_from_json(json_data)</code></td><td>Stateful merge (no clear) so concurrent edits survive; coerces malformed planner fields (2026-07-20, see below).</td></tr>
     </tbody>
   </table>
 
@@ -107,13 +107,23 @@
   </div>
 
   <h2>Postcondition matching</h2>
-  <p>Token overlap ≥ 60 % case-insensitive, with stop words filtered (<code>{the, and, for, not, are, has}</code>). A postcondition prefixed with <code>HUMAN_GATE:</code> is special-cased by <a href="project_safety.html">project_safety</a> to flip the task to NEEDS_USER regardless of tool output.</p>
+  <p>Token overlap ≥ 60 % case-insensitive, with stop words filtered (<code>{the, and, for, not, are, has}</code>). A postcondition prefixed with <code>HUMAN_GATE:</code> is special-cased by <a href="project_safety.html">project_safety</a> to flip the task to NEEDS_USER regardless of tool output — and since 2026-07-20 it is excluded from the token-overlap check entirely (a gate can never be satisfied, or failed, by result-text similarity; see <em>Plan-gate hardening</em> below).</p>
 
   <h2>ProjectPlan</h2>
   <p>Same shape as <code>TaskTree</code> but persisted via <a href="../memory/projects.html">memory.projects</a>'s SQLite store. <code>ProjectPlan.update_status()</code> wraps <code>TaskTree.update_status()</code> with a write-through to the database.</p>
   <p><strong>Durable fallback edges.</strong> The write-through diff tracks <code>parent_id</code>, <code>alternatives</code> and <code>depends_on</code> in addition to the status fields. The failure cascade (<code>_check_parent_failure</code>) consumes an alternative by popping it off the parent and re-parenting it onto the failed parent — mutations that are silent on status. A status-only diff never persisted them, so on the next hydrate the alternative was no longer linked and the fallback edge was lost. Tracking those keys makes the alternatives/fallback path durable across sessions.</p>
   <p><strong>Prerequisite-gated scheduling.</strong> <code>next_ready_leaf()</code> skips any leaf whose <code>depends_on</code> prerequisites are not all DONE (unknown/stale dep ids are treated as satisfied so a bad reference can't deadlock the plan). <code>decompose(task_id, subtasks, sequential=True)</code> chains each subtask to the previous via <code>depends_on</code>, so the autoadvancer runs them strictly in order; <code>sequential=False</code> (default) leaves every subtask independently eligible, the historical behaviour.</p>
   <p>Covered by <code>tests/test_project_mgmt_fixes.py</code>.</p>
+
+  <h2>Plan-gate hardening (2026-07-20)</h2>
+  <p>Three-stack review fixes — the plan gate is live now, so malformed planner output has to be survivable, human gates have to be enforceable, and a triggered replan has to actually write.</p>
+  <ul>
+    <li><b><code>load_from_json</code> coerces malformed planner fields.</b> Everything it reads is LLM JSON: a bare-string <code>postconditions</code>/<code>alternatives</code>/<code>depends_on</code> is wrapped into a one-item list via <code>_coerce_str_list</code> (previously <code>_check_postconditions</code> iterated the string and graded it per-character), a null/non-string <code>status</code> or <code>dependency_type</code> falls back to PENDING/ALL instead of crashing on <code>.upper()</code> (which aborted the whole planning step), and null/blank list entries are dropped. <code>_check_postconditions</code> coerces again at read time — belt to <code>load_from_json</code>'s braces, for nodes built outside it.</li>
+    <li><b><code>HUMAN_GATE:</code> forces NEEDS_USER, never FAILED — and is never textually scored.</b> Closing a gated task as DONE parks it at NEEDS_USER instead of grading the gate against result text, which either cascaded a spurious FAILED up the tree (the result never echoes the gate) or, conversely, let echoed text "satisfy" a human approval. <code>TaskTree.update_status</code> / <code>ProjectPlan.update_status</code> gained <code>human_approved: bool = False</code>: an explicit <code>human_approved=True</code>, or a close on a task already parked NEEDS_USER (the user has been asked and the close path is now being taken), is the approval and proceeds to the normal postcondition gate. <code>HUMAN_GATE:</code> postconditions are skipped by the token-overlap check entirely.</li>
+    <li><b><code>ProjectPlan.request_revision(task_id, failure_reason) -&gt; bool</code> PERSISTS.</b> The metacog ReplanBridge prefers <code>plan.request_revision</code> and only falls back to <code>plan.tree.request_revision</code> — but its plan_getter builds a fresh <code>ProjectPlan</code> per event, so triggered replans mutated a THROWAWAY hydration that was never written back, while the <code>replans_tried/replans_ok</code> counters still reported "revised". The new override cascades through the tree, then writes every node the revision touched (the task itself plus a possible parent BLOCKED→IN_PROGRESS unblock) through the store — the trigger → ReplanBridge → replan pipeline is now durable.</li>
+    <li><b>Dangling alternatives are skipped, not blocking.</b> The alternatives queue can hold ids the planner referenced but never created; <code>_check_parent_failure</code> now consumes dangling ids (with a warning) until a valid one resolves — blocking on the FIRST dangling id stranded valid alternatives still queued behind it.</li>
+  </ul>
+  <div class="note"><strong>Tests:</strong> <code>tests/test_planning_gate_fixes.py</code>.</div>
 
   <h2>Concurrency</h2>
   <p>Synchronous tree mutation. Persistence happens via the <code>ProjectStore</code> RLock; in-memory <code>TaskTree</code> is per-request only.</p>

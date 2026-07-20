@@ -129,7 +129,7 @@
   <ul>
     <li><code>create_project(title, kind, goal, metadata, workspace_dir) -&gt; str</code></li>
     <li><code>list_projects(status_filter)</code> / <code>get_project(id)</code></li>
-    <li><code>update_project(id, **fields)</code></li>
+    <li><code>update_project(id, metadata_replace=False, **fields)</code> — <code>metadata</code> is shallow-<em>merged</em> by default (2026-07-20; see below).</li>
     <li><code>delete_project(id, hard=False)</code> — soft = ARCHIVED, hard = cascade delete.</li>
     <li><code>ensure_workspace(project_id)</code> — create / return workspace path.</li>
   </ul>
@@ -138,7 +138,8 @@
     <li><code>add_task(...) -&gt; str</code></li>
     <li><code>get_task(id)</code> / <code>list_tasks(project_id, status_filter)</code></li>
     <li><code>update_task(id, **fields)</code></li>
-    <li><code>delete_task(id)</code> — cascade delete descendants.</li>
+    <li><code>delete_task(id)</code> — cascade delete descendants; re-evaluates the project rollup (2026-07-20).</li>
+    <li><code>reset_orphaned_in_progress(older_than_seconds=900.0) -&gt; int</code> — boot reaper for stale IN_PROGRESS claims (2026-07-20; see below).</li>
   </ul>
   <h3>Artifacts &amp; events</h3>
   <ul>
@@ -166,6 +167,18 @@
     <li><b><code>deleted_projects</code> table</b> — a tombstone (<code>id, title, kind, goal, created_at, deleted_at</code>) written inside <code>delete_project(hard=True)</code> BEFORE the row is removed, because the FK cascade otherwise erases every trace that the project existed. <code>find_deleted_similar(title, within_secs=86400)</code> matches a new title against recent tombstones (stopword-insensitive token Jaccard ≥ 0.5) so <code>create</code> can detect the delete-then-recreate correction pattern. Soft delete (archive) writes no tombstone.</li>
   </ul>
   <p>Covered by <code>tests/test_project_constraints.py</code> and <code>tests/test_correction_detection.py</code>.</p>
+
+  <h2>Three-stack review hardening (2026-07-20)</h2>
+  <ul>
+    <li><b><code>update_project(metadata=…)</code> now MERGES.</b> The metadata blob carries system state (design ledger, config slot, <code>steps_used/steps_cap</code>, research index, runtime counters), so the old whole-dict replace made even the documented budget-raise <code>metadata={"steps_cap": 100}</code> silently destroy all of it. The supplied dict is now shallow-merged into the existing metadata — and the prior-status read, the merge, and the UPDATE run inside a single <code>BEGIN IMMEDIATE</code> transaction (same shape as <em>Atomic metadata read-modify-write</em> above), with the UPDATE guarded on the observed status (<code>AND status = ?</code>) so a racing writer can't interleave and the DONE hook can't double-fire. Pass <code>metadata_replace=True</code> for a deliberate full replacement.</li>
+    <li><b><code>reset_orphaned_in_progress(older_than_seconds=900.0) -&gt; int</code> — boot reaper.</b> The advancer commits a leaf's IN_PROGRESS claim before several awaits; a crash or deploy-kill (plain SIGTERM) between claim and completion wedged the task forever — <code>next_ready_leaf</code> only considers PENDING/READY, so the project sat ACTIVE reporting "all complete". Called at startup from <code>main.py</code> (before the advancer runs) and safe any time: only tasks whose <code>updated_at</code> is older than the threshold are reset to READY, each reset guarded on the row still being IN_PROGRESS (genuinely in-flight work in a live process is never yanked), one <code>task_reset_orphaned</code> event per reset.</li>
+    <li><b>Rollup UPDATE is status-guarded.</b> <code>_maybe_rollup_project_status</code> releases the lock between reading the tasks and writing the project, so a concurrent manual ARCHIVE could be stomped back to DONE — and then fire the destructive cleanup sweep on an archived project. The UPDATE now carries <code>AND status = ?</code> (the status observed at read time); an interleaved transition makes it a no-op.</li>
+    <li><b>Auto-reopen now covers FAILED/PAUSED.</b> <code>add_task</code> (any non-DONE insert) and <code>update_task</code> (status back to PENDING/READY/IN_PROGRESS) reactivate a DONE/FAILED/PAUSED project to ACTIVE — previously only DONE reopened, and FAILED/PAUSED had <em>no path back</em> (the tool status enum omits ACTIVE, <code>advance_once</code> refuses non-ACTIVE), so revived work sat unreachable forever. NEEDS_USER (parked on human input by design) and ARCHIVED (deliberate end-state; the cleanup sweep already ran) are never auto-undone. The guarded UPDATE shares the write txn; a <code>project_reopened</code> event records the transition.</li>
+    <li><b><code>delete_task</code> triggers rollup.</b> Deleting the last open task can settle the project (all remaining tasks DONE); previously nothing re-evaluated the aggregate, so an otherwise-finished project stayed ACTIVE forever.</li>
+    <li><b><code>register_file_artifact</code> normalizes absolute paths.</b> Payloads are reduced to the same project-relative POSIX key the cleanup sweep's walk produces (leading <code>/workspace/</code>&thinsp;/&thinsp;<code>workspace/</code> segment, <code>projects/&lt;id&gt;/</code> prefix, <code>/</code> and <code>./</code> stripped; <code>..</code> rejected). An absolute <code>/workspace/projects/&lt;id&gt;/x.png</code> payload was previously stored verbatim, matched no walked rel, and the DONE sweep deleted the very deliverable it registered to protect.</li>
+    <li><b><code>list_events</code> clamps its limit</b> to 1…<code>EVENTS_MAX_LIMIT</code> (500) — a negative limit means "no limit" in SQLite (unbounded response) and a huge one floods memory.</li>
+  </ul>
+  <p>Covered by <code>tests/test_projects_store.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

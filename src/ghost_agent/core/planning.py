@@ -28,6 +28,46 @@ class DependencyType(str, Enum):
     BEST = "BEST"  # All children run; parent picks the best result
 
 
+def _coerce_str_list(val: Any) -> List[str]:
+    """Defensively coerce a planner-supplied field into a list of strings.
+
+    Planner output is LLM JSON: fields documented as lists routinely
+    arrive as null or as a bare string, and iterating a raw string walks
+    it char-by-char — with the plan gate live that emitted one
+    "unsatisfied postcondition" PER CHARACTER into the user reply.
+    None → []; str → single-element list; list/tuple → items
+    stringified with blanks dropped.
+    """
+    if val is None:
+        return []
+    if isinstance(val, str):
+        val = val.strip()
+        return [val] if val else []
+    if isinstance(val, (list, tuple)):
+        out: List[str] = []
+        for item in val:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return out
+    s = str(val).strip()
+    return [s] if s else []
+
+
+def _human_gate_reason(postconditions: Any) -> Optional[str]:
+    """First HUMAN_GATE reason on a postcondition list, or None.
+
+    Delegates to ``project_safety.enforce_human_gate`` (the documented
+    contract) reshaped to a bare list so TaskTree stays store-free.
+    """
+    from .project_safety import enforce_human_gate
+    return enforce_human_gate(
+        {"postconditions": _coerce_str_list(postconditions)}
+    )
+
+
 @dataclass
 class TaskNode:
     id: str
@@ -102,9 +142,11 @@ class TaskTree:
         return node_id
 
     def update_status(self, task_id: str, status: TaskStatus, result: str = "",
-                      failure_reason: str = "", actual_tool: str = ""):
+                      failure_reason: str = "", actual_tool: str = "",
+                      human_approved: bool = False):
         if task_id in self.nodes:
             node = self.nodes[task_id]
+            prior_status = node.status
             node.status = status
             if result:
                 node.result_summary = result
@@ -113,6 +155,24 @@ class TaskTree:
             if actual_tool:
                 node.actual_tool_used = actual_tool
             if status == TaskStatus.DONE:
+                # HUMAN_GATE contract (project_safety.enforce_human_gate):
+                # a gated task is closed by a human, never by result-text
+                # similarity. Park the first close attempt at NEEDS_USER
+                # instead of textually grading the gate to FAILED (which
+                # cascaded a spurious failure up the tree and made an
+                # approved gated task almost impossible to close). A close
+                # on a task already parked NEEDS_USER (the user has been
+                # asked and the close path is now being taken) or already
+                # DONE, or an explicit human_approved=True, is the
+                # approval and proceeds to the normal postcondition gate.
+                gate_reason = _human_gate_reason(node.postconditions)
+                if (gate_reason is not None and not human_approved
+                        and prior_status not in (TaskStatus.NEEDS_USER,
+                                                 TaskStatus.DONE)):
+                    node.status = TaskStatus.NEEDS_USER
+                    if not node.result_summary:
+                        node.result_summary = f"human gate: {gate_reason}"
+                    return
                 # Postcondition gate: if the task declared postconditions,
                 # evaluate them against the result summary. Any unsatisfied
                 # postcondition flips the task back to FAILED so the
@@ -148,10 +208,17 @@ class TaskTree:
         checker = getattr(self, "postcondition_checker", None)
         result_summary = (node.result_summary or "").lower()
         unsat: List[str] = []
-        for pc in node.postconditions:
-            if not pc or not str(pc).strip():
+        # Coerce here too (belt to load_from_json's braces): a node built
+        # outside load_from_json can still carry a bare-string
+        # postconditions field, and iterating it raw grades per-char.
+        for pc_str in _coerce_str_list(node.postconditions):
+            if _human_gate_reason([pc_str]) is not None:
+                # Never textually scored: human gates are enforced as a
+                # status transition (→ NEEDS_USER) in update_status, per
+                # project_safety.enforce_human_gate. Grading them here
+                # either failed a gated task (result never echoes the
+                # gate) or let echoed text satisfy a human approval.
                 continue
-            pc_str = str(pc).strip()
             if checker is not None:
                 try:
                     if checker(pc_str, node):
@@ -276,40 +343,53 @@ class TaskTree:
         if parent.dependency_type == DependencyType.ALL:
             # Any child failure blocks the parent (strict)
             if any(s in failed_statuses for s in child_statuses):
-                # Try alternatives before blocking
-                if parent.alternatives:
-                    alt_id = parent.alternatives.pop(0)
-                    if alt_id in self.nodes:
-                        self.nodes[alt_id].status = TaskStatus.READY
-                        # Unlink the failed child(ren) the alternative
-                        # supersedes. Leaving them in the rollup makes an
-                        # ALL parent unsatisfiable: `all(s == DONE)` can
-                        # never hold with a FAILED child still counted, so
-                        # the parent would hang forever even after the
-                        # alternative succeeds. The nodes stay in
-                        # self.nodes for history; they just stop counting.
-                        _unlinked = [
-                            cid for cid in parent.children
-                            if cid in self.nodes
-                            and self.nodes[cid].status in failed_statuses
-                        ]
-                        parent.children = [
-                            cid for cid in parent.children if cid not in _unlinked
-                        ]
-                        # Also clear the unlinked child's parent_id. The store
-                        # persists ONLY parent_id and rebuilds `children` from it
-                        # on reload, so a failed child left pointing at the parent
-                        # re-links after any restart → the ALL parent becomes
-                        # unsatisfiable again (FAILED child back in the rollup),
-                        # defeating alternative recovery across sessions.
-                        for _cid in _unlinked:
-                            self.nodes[_cid].parent_id = None
-                        # Integrate the alternative into the parent's children
-                        # so completion/failure cascading sees it.
-                        if alt_id not in parent.children:
-                            parent.children.append(alt_id)
-                            self.nodes[alt_id].parent_id = parent_id
-                        return  # Don't block — alternative is being tried
+                # Try alternatives before blocking. The queue can hold
+                # dangling ids (planner referenced a node that was never
+                # created); consume those until one resolves — blocking on
+                # the FIRST dangling id stranded valid alternatives still
+                # queued behind it.
+                alt_id = None
+                while parent.alternatives:
+                    _cand = parent.alternatives.pop(0)
+                    if _cand in self.nodes:
+                        alt_id = _cand
+                        break
+                    import logging as _logging
+                    _logging.getLogger("GhostAgent").warning(
+                        "TaskTree: dropping dangling alternative %r on parent %r",
+                        _cand, parent.id,
+                    )
+                if alt_id is not None:
+                    self.nodes[alt_id].status = TaskStatus.READY
+                    # Unlink the failed child(ren) the alternative
+                    # supersedes. Leaving them in the rollup makes an
+                    # ALL parent unsatisfiable: `all(s == DONE)` can
+                    # never hold with a FAILED child still counted, so
+                    # the parent would hang forever even after the
+                    # alternative succeeds. The nodes stay in
+                    # self.nodes for history; they just stop counting.
+                    _unlinked = [
+                        cid for cid in parent.children
+                        if cid in self.nodes
+                        and self.nodes[cid].status in failed_statuses
+                    ]
+                    parent.children = [
+                        cid for cid in parent.children if cid not in _unlinked
+                    ]
+                    # Also clear the unlinked child's parent_id. The store
+                    # persists ONLY parent_id and rebuilds `children` from it
+                    # on reload, so a failed child left pointing at the parent
+                    # re-links after any restart → the ALL parent becomes
+                    # unsatisfiable again (FAILED child back in the rollup),
+                    # defeating alternative recovery across sessions.
+                    for _cid in _unlinked:
+                        self.nodes[_cid].parent_id = None
+                    # Integrate the alternative into the parent's children
+                    # so completion/failure cascading sees it.
+                    if alt_id not in parent.children:
+                        parent.children.append(alt_id)
+                        self.nodes[alt_id].parent_id = parent_id
+                    return  # Don't block — alternative is being tried
                 parent.status = TaskStatus.BLOCKED
                 self._check_parent_failure(parent.parent_id, visited)
 
@@ -399,25 +479,40 @@ class TaskTree:
             if visited is None: visited = set()
             if not isinstance(node_data, dict): return
             
-            node_id = node_data.get("id", str(uuid.uuid4())[:4])
+            # Everything below is planner (LLM) JSON — coerce each field
+            # defensively before the now-live plan gate reads it: a null
+            # status crashed `.upper()` (aborting the whole planning
+            # step) and a bare-string postconditions field was iterated
+            # per-char by _check_postconditions.
+            node_id = node_data.get("id")
+            if node_id is None or (isinstance(node_id, str) and not node_id.strip()):
+                node_id = str(uuid.uuid4())[:4]
+            elif not isinstance(node_id, str):
+                node_id = str(node_id)
             if node_id in visited: return
             visited.add(node_id)
-            desc = node_data.get("description", "Unknown Task")
-            status_str = node_data.get("status", "PENDING").upper()
+            desc = node_data.get("description") or "Unknown Task"
+            if not isinstance(desc, str):
+                desc = str(desc)
+            status_raw = node_data.get("status", "PENDING")
+            status_str = (status_raw.strip().upper()
+                          if isinstance(status_raw, str) else "PENDING")
             try:
                 status = TaskStatus[status_str]
             except KeyError:
                 status = TaskStatus.PENDING
-                
+
             # Parse extended fields
-            dep_type_str = node_data.get("dependency_type", "ALL").upper()
+            dep_raw = node_data.get("dependency_type", "ALL")
+            dep_type_str = (dep_raw.strip().upper()
+                            if isinstance(dep_raw, str) else "ALL")
             try:
                 dep_type = DependencyType[dep_type_str]
             except KeyError:
                 dep_type = DependencyType.ALL
-            alternatives = node_data.get("alternatives", [])
-            postconditions = node_data.get("postconditions", [])
-            depends_on = node_data.get("depends_on", [])
+            alternatives = _coerce_str_list(node_data.get("alternatives"))
+            postconditions = _coerce_str_list(node_data.get("postconditions"))
+            depends_on = _coerce_str_list(node_data.get("depends_on"))
 
             if node_id in self.nodes:
                 # Update existing node
@@ -654,10 +749,12 @@ class ProjectPlan:
                 revision_count=int(row["revision_count"] or 0),
                 actual_tool_used=row["actual_tool_used"],
                 dependency_type=dep,
-                alternatives=list(row.get("alternatives") or []),
-                postconditions=list(row.get("postconditions") or []),
-                constraints=list(row.get("constraints") or []),
-                depends_on=list(row.get("depends_on") or []),
+                # _coerce_str_list, not list(): a string smuggled into a
+                # row's JSON column would explode into per-char entries.
+                alternatives=_coerce_str_list(row.get("alternatives")),
+                postconditions=_coerce_str_list(row.get("postconditions")),
+                constraints=_coerce_str_list(row.get("constraints")),
+                depends_on=_coerce_str_list(row.get("depends_on")),
                 estimated_cost=float(row["estimated_cost"] or 0.0),
                 actual_cost=float(row["actual_cost"] or 0.0),
             )
@@ -708,7 +805,7 @@ class ProjectPlan:
 
     def update_status(self, task_id: str, status: TaskStatus,
                       result: str = "", failure_reason: str = "",
-                      actual_tool: str = ""):
+                      actual_tool: str = "", human_approved: bool = False):
         """Cascade through the in-memory tree, then persist every node
         whose state changed as a side effect.
 
@@ -728,7 +825,8 @@ class ProjectPlan:
         before = {tid: _snapshot(n) for tid, n in self.tree.nodes.items()}
         self.tree.update_status(task_id, status, result=result,
                                 failure_reason=failure_reason,
-                                actual_tool=actual_tool)
+                                actual_tool=actual_tool,
+                                human_approved=human_approved)
         for tid, node in self.tree.nodes.items():
             prev = before.get(tid)
             current = _snapshot(node)
@@ -769,6 +867,36 @@ class ProjectPlan:
             ids.append(new_id)
             prev_id = new_id
         return ids
+
+    def request_revision(self, task_id: str, failure_reason: str) -> bool:
+        """Persistent counterpart of ``TaskTree.request_revision``.
+
+        The metacog ``ReplanBridge`` prefers ``plan.request_revision``
+        and only falls back to ``plan.tree.request_revision``. Before
+        this override existed, the fallback fired on a THROWAWAY
+        hydration (the bridge's plan_getter builds a fresh ProjectPlan
+        per event), so triggered replans mutated an in-memory tree that
+        was never written back — while the replans_tried/replans_ok
+        counters still reported "revised". Cascade through the tree,
+        then persist every node the revision touched (the task itself
+        plus a possible parent BLOCKED→IN_PROGRESS unblock).
+        """
+        def _snapshot(n: "TaskNode"):
+            return (n.status, n.failure_reason, n.revision_count)
+
+        before = {tid: _snapshot(n) for tid, n in self.tree.nodes.items()}
+        ok = self.tree.request_revision(task_id, failure_reason)
+        if not ok:
+            return False
+        for tid, node in self.tree.nodes.items():
+            if before.get(tid) != _snapshot(node):
+                self.store.update_task(
+                    tid,
+                    status=node.status.value,
+                    failure_reason=node.failure_reason,
+                    revision_count=node.revision_count,
+                )
+        return True
 
     # ------------------------------------------------------------------ query
 
