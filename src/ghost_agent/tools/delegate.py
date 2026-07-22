@@ -54,6 +54,21 @@ async def tool_delegate(task=None, tasks=None, tools=None, wait: bool = False,
     if context is None:
         return "Error: delegation is unavailable (no agent context)."
 
+    # Deadlock guard: a sub-agent's LLM calls are forced is_background=True
+    # (core/subagent.py), and a background call targeting the main node parks
+    # on _wait_for_foreground_clear() for as long as a user request is active
+    # (core/llm.py). But wait=True blocks THIS request inside reg.wait() while
+    # it still holds foreground_requests up — so the sub-agent parks on the
+    # very request that is awaiting it. Result: 600s of dead air, then a
+    # timed-out FAILED job. foreground_requests>0 means exactly "an interactive
+    # turn is in flight" (it is 0 in idle/autoadvance contexts, where wait is
+    # safe), so downgrade to fire-and-forget there: the jobs run once this turn
+    # ends and the model collects them next turn.
+    _fg = getattr(getattr(context, "llm_client", None), "foreground_requests", 0)
+    _wait_downgraded = bool(wait) and _fg > 0
+    if _wait_downgraded:
+        wait = False
+
     task_list = []
     if isinstance(tasks, list) and tasks:
         for t in tasks:
@@ -106,8 +121,16 @@ async def tool_delegate(task=None, tasks=None, tools=None, wait: bool = False,
                icon=Icons.NODE_WORKER)
 
     if not wait:
-        lines = [f"Delegated {len(jobs)} task(s) to tool-using sub-agents "
-                 f"(running in the background):"]
+        if _wait_downgraded:
+            lines = [f"Delegated {len(jobs)} task(s) to tool-using sub-agents. "
+                     f"NOTE: wait=true is unavailable while serving an "
+                     f"interactive turn — a sub-agent shares your single "
+                     f"inference slot, so blocking on it here would deadlock "
+                     f"(it can't run until this turn ends). Running them in the "
+                     f"background instead:"]
+        else:
+            lines = [f"Delegated {len(jobs)} task(s) to tool-using sub-agents "
+                     f"(running in the background):"]
         lines += [f"- {j.id}: {j.label[:70]}" for j in jobs]
         lines.append("")
         lines.append("They keep working while you do other things. Check with "
@@ -164,14 +187,27 @@ async def tool_jobs(action: str = None, job_id=None, context=None, **kwargs):
 
     if action == "collect":
         if not job_id:
-            # Collect ALL unread finished jobs — the common case.
-            done = [j for j in reg.list(status=STATUS_DONE) if j.result]
+            # Collect ALL unread finished jobs — the common case. Returned
+            # jobs are read-marked so a repeated collect-all does NOT re-dump
+            # the same (up to 50 × 8000-char) results into context; an
+            # explicit by-id collect can always re-fetch one.
+            done = [j for j in reg.list(status=STATUS_DONE)
+                    if j.result and not j.collected]
             if not done:
+                seen = [j for j in reg.list(status=STATUS_DONE)
+                        if j.result and j.collected]
+                if seen:
+                    return (f"No NEW results — all {len(seen)} finished "
+                            f"job(s) were already collected. Re-read one "
+                            f"with jobs(action='collect', job_id='...') "
+                            f"(e.g. {seen[-1].id}); jobs(action='status') "
+                            f"shows what's still running.")
                 return ("No finished jobs with results to collect "
                         "(jobs(action='status') shows what's running).")
             out = [f"Collected {len(done)} finished job(s):"]
             for j in done:
                 out.append(f"\n--- {j.id}: {j.label[:70]} ---\n{j.result}")
+            reg.mark_collected([j.id for j in done])
             return "\n".join(out)
         job = reg.get(job_id)
         if job is None:
@@ -182,6 +218,9 @@ async def tool_jobs(action: str = None, job_id=None, context=None, **kwargs):
             return (f"Job {job.id} is still RUNNING ({job.duration_s:.0f}s so "
                     f"far): {job.label[:80]}. Check back later.")
         if job.status == STATUS_DONE:
+            # Explicit by-id fetch ALWAYS returns the result (intentional
+            # re-fetch, even if already collected) — it only read-marks.
+            reg.mark_collected([job.id])
             return f"--- {job.id}: {job.label[:70]} ---\n{job.result or '(no output)'}"
         return (f"Job {job.id} {job.status.upper()}: "
                 f"{job.error or 'no error detail'}")

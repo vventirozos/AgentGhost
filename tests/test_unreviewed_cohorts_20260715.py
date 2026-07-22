@@ -174,11 +174,31 @@ class TestRRFWeightFit:
         out = fit_intent_weights(obs)
         assert out["factual"]["graph"] == 2.0  # unchanged: below the floor
 
-    def test_all_failures_drives_toward_min(self):
-        from ghost_agent.core.rrf_weights import fit_intent_weights, WEIGHT_MIN
+    def test_all_failures_keeps_the_prior(self):
+        # 2026-07-22: a degenerate all-failure (or all-success) sample carries
+        # NO cross-tier contrast, so there is nothing to learn — the fit now
+        # REFUSES it and keeps the hand-set prior. The old behaviour (collapse
+        # a 2.0-prior cell to WEIGHT_MIN, a 20x inversion) WAS the bug: it is
+        # exactly the live factual/graph n=24 used=0 cell that had crushed the
+        # whole intent matrix into noise. The new contract is "degrade toward
+        # the prior, never invert".
+        from ghost_agent.core.rrf_weights import (
+            fit_intent_weights, DEFAULT_INTENT_WEIGHTS)
         obs = [("factual", "graph", False)] * 25
         out = fit_intent_weights(obs)
-        assert out["factual"]["graph"] == pytest.approx(WEIGHT_MIN, abs=0.05)
+        assert out["factual"]["graph"] == pytest.approx(
+            DEFAULT_INTENT_WEIGHTS["factual"]["graph"])
+
+    def test_weak_signal_stays_near_prior_never_inverts(self):
+        # The live collapse cell: n=24, zero used. Must stay near its 2.0 prior
+        # (mildly damped), never invert below vector's 1.0.
+        from ghost_agent.core.rrf_weights import fit_intent_weights
+        obs = ([("factual", "graph", False)] * 24
+               + [("factual", "vector", True)] * 10
+               + [("factual", "vector", False)] * 40)  # gives cross-tier contrast
+        out = fit_intent_weights(obs)
+        assert out["factual"]["graph"] > out["factual"]["vector"], "must not invert"
+        assert 1.0 <= out["factual"]["graph"] <= 3.0
 
     def test_load_merges_partial_over_defaults(self, tmp_path):
         from ghost_agent.core.rrf_weights import (

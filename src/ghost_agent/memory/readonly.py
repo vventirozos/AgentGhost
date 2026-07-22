@@ -78,6 +78,15 @@ class ReadOnlyVectorMemory(_ReadOnlyProxy):
         "bump_retrievals", "bump_helpful", "forget_episode",
         "delete_document_by_name", "correct_fragment", "delete_fragment",
         "delete_by_query", "delete_skill_twins",
+        # 2026-07-22: `_update_library_index` writes the operator's real
+        # library_index.json. `ingest_document` was already blocked (returns
+        # None), but tools/memory.py's `tool_gain_knowledge` only checks for a
+        # tuple result, so it fell through and called this DIRECTLY — a
+        # self-play ingest permanently registered a synthetic filename with
+        # ZERO stored chunks, after which ingest_document's dedup refused every
+        # future REAL ingest of that name ("Skipped: already ingested") while
+        # query_document returned nothing. Silent, permanent, hand-fixable only.
+        "_update_library_index",
         # legacy guessed names kept harmless in case an external caller used them
         "add_memory", "delete_memory", "forget",
     })
@@ -93,6 +102,18 @@ class ReadOnlyVectorMemory(_ReadOnlyProxy):
             return ""
         kw["record_retrievals"] = False
         return real.search(*a, **kw)
+
+    def search_advanced(self, *a, **kw):
+        """Same contract as ``search``: results pass through, but the
+        retrieval-stat bump is forced OFF. Without this the façade leaked a
+        writer — `search_advanced` unconditionally called
+        `_bump_retrieval_stats`, so a delegated sub-agent (which is granted
+        `recall`) mutated operator memory metadata on every single recall."""
+        real = self.__dict__.get("_real")
+        if real is None:
+            return []
+        kw["record_retrievals"] = False
+        return real.search_advanced(*a, **kw)
 
 
 class ReadOnlySkillMemory(_ReadOnlyProxy):

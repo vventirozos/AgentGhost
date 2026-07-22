@@ -91,6 +91,34 @@ class TestRebuildGuard:
             rebuilt = agent._rebuild_available_tools()
         assert set(rebuilt) == set(full)  # a normal agent keeps the full set
 
+    def test_rebuild_drops_disabled_for_dream(self):
+        """Dream/self-play contains by SETTING disabled_tools (+ popping
+        available_tools), NOT by _subagent_allowed_tools. A dispatch-miss
+        rebuild must re-drop the disabled set, or the network-egress tools
+        self-play disables (web_search/deep_research) heal back in (2026-07-22)."""
+        from ghost_agent.core.agent import GhostAgent
+        agent = GhostAgent.__new__(GhostAgent)
+        agent.context = SimpleNamespace()  # no _subagent_allowed_tools (like dream)
+        agent.disabled_tools = {"web_search", "deep_research", "delegate_to_swarm"}
+        full = {"recall": 1, "web_search": 2, "deep_research": 3,
+                "execute": 4, "delegate_to_swarm": 5}
+        with patch("ghost_agent.core.agent.get_available_tools", return_value=full):
+            rebuilt = agent._rebuild_available_tools()
+        assert set(rebuilt) == {"recall", "execute"}  # disabled tools NOT healed back
+        for banned in ("web_search", "deep_research", "delegate_to_swarm"):
+            assert banned not in rebuilt
+
+    def test_rebuild_drops_disabled_and_honors_allowlist_together(self):
+        """When both guards are present the intersection wins."""
+        from ghost_agent.core.agent import GhostAgent
+        agent = GhostAgent.__new__(GhostAgent)
+        agent.context = SimpleNamespace(_subagent_allowed_tools=frozenset({"recall", "web_search"}))
+        agent.disabled_tools = {"web_search"}  # disabled overrides the allowlist
+        full = {"recall": 1, "web_search": 2, "execute": 3}
+        with patch("ghost_agent.core.agent.get_available_tools", return_value=full):
+            rebuilt = agent._rebuild_available_tools()
+        assert set(rebuilt) == {"recall"}  # allowlist ∩ (not disabled)
+
 
 class TestRunSubagentRestriction:
     async def test_disabled_and_available_enforce_allowlist(self, tmp_path):

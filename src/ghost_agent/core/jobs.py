@@ -46,6 +46,12 @@ class Job:
     result: str = ""
     error: str = ""
     meta: Dict[str, Any] = field(default_factory=dict)
+    # Read-marking: True once a no-id ``jobs(action='collect')`` has returned
+    # this job's result. Collect-all skips collected jobs (so repeated
+    # collect-alls don't re-dump up to MAX_RETAINED × MAX_RESULT_CHARS of
+    # already-seen output into the model's context); an explicit by-id
+    # collect ignores the flag — re-fetching by id is intentional.
+    collected: bool = False
     task: Optional[asyncio.Task] = None   # not serialised
     # Optional callable(raw_task_result) -> str|None. When set, its return
     # (if not None) becomes the recorded result instead of str(task.result()).
@@ -62,6 +68,7 @@ class Job:
             "id": self.id, "kind": self.kind, "label": self.label,
             "status": self.status, "duration_s": round(self.duration_s, 1),
             "result": self.result, "error": self.error, "meta": dict(self.meta),
+            "collected": self.collected,
         }
 
 
@@ -167,6 +174,16 @@ class JobRegistry:
         if kind:
             jobs = [j for j in jobs if j.kind == kind]
         return jobs
+
+    def mark_collected(self, job_ids: List[str]) -> None:
+        """Read-mark finished jobs after a collect-all has returned their
+        results. Running jobs are never marked (their result hasn't landed
+        yet, so it hasn't been read). Unknown ids are skipped."""
+        with self._lock:
+            for jid in job_ids or []:
+                job = self._jobs.get(str(jid))
+                if job is not None and job.status != STATUS_RUNNING:
+                    job.collected = True
 
     def cancel(self, job_id: str) -> bool:
         job = self.get(job_id)

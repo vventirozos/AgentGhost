@@ -2261,6 +2261,19 @@ class GhostAgent:
         _allow = getattr(self.context, "_subagent_allowed_tools", None)
         if _allow is not None:
             rebuilt = {k: v for k, v in rebuilt.items() if k in _allow}
+        # Also re-drop the disabled set (2026-07-22). Dream's self-play temp
+        # agent contains by SETTING `disabled_tools` + popping them from
+        # `available_tools` — it never sets `_subagent_allowed_tools` — so
+        # without this a dispatch-miss rebuild healed the popped tools back
+        # into the dict. Since dispatch requires `fname in available_tools`
+        # (and canonicalisation only ever returns a name already in it), a
+        # tool absent here can never fire — closing the hole where an aliased
+        # variant ("websearch"→"web_search") reached the network-egress tools
+        # self-play disables. Covers the sub-agent path too (it sets
+        # disabled_tools as well), as defence-in-depth beside the allowlist.
+        _disabled = getattr(self, "disabled_tools", None)
+        if _disabled:
+            rebuilt = {k: v for k, v in rebuilt.items() if k not in _disabled}
         self.available_tools = rebuilt
         return self.available_tools
 
@@ -2733,7 +2746,11 @@ class GhostAgent:
         "postgres": "postgres_admin",
         "delegatetoswarm": "delegate_to_swarm",
         "delegate-to-swarm": "delegate_to_swarm",
-        "delegate": "delegate_to_swarm",
+        # NOTE: no bare "delegate" alias — that is the real sub-agent tool
+        # (tools/delegate.py, added 2026-07-11). The alias table is consulted
+        # BEFORE the exact norm_to_real match, so aliasing "delegate" here
+        # would hijack every case/paren variant of the real tool ("Delegate",
+        # "delegate()") to delegate_to_swarm — wrong tool, wrong schema, strike.
         "selfplay": "self_play",
         "self-play": "self_play",
         "selfplayloop": "self_play_loop",
@@ -3812,7 +3829,11 @@ class GhostAgent:
                                     "python3 -c). Output ONLY the command — no "
                                     "explanation, no markdown fences.\n\nTASK: "
                                     + str(description)[:500])}],
-                                "temperature": 0.2, "max_tokens": 1024, "stream": False,
+                                # 4096 for parity with default_code_generator
+                                # (project_advancer.py): 1024 truncated real
+                                # `python3 -c` inline programs mid-script
+                                # ("unterminated quote"). Same prompt, same cap.
+                                "temperature": 0.2, "max_tokens": 4096, "stream": False,
                             }, is_background=True)
                             out = ((_r or {}).get("choices", [{}])[0]
                                    .get("message", {}).get("content", "") or "").strip()
@@ -4165,7 +4186,13 @@ class GhostAgent:
                 # extractor) keeps the model from padding with prose.
                 payload = {"model": model_name, "messages": [{"role": "user", "content": final_prompt}], "stream": False, "temperature": 0.1, "max_tokens": 3072, "response_format": {"type": "json_object"}}
                 try:
-                    data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="memory extract")
+                    # Bounded timeout (was the 1200s worker default): a
+                    # wedged-but-connected Nova — a known class during a
+                    # llama-server restart — otherwise pins this journal-drain
+                    # item for up to 20 min AND holds a _bg_queue_sem slot the
+                    # whole time. A ReadTimeout is upstream-transient, so it
+                    # requeues below instead of dropping the consolidation.
+                    data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=90.0, task_label="memory extract")
                 except Exception as _ue:
                     # The in-client retries (worker failover + one 2s retry
                     # on 5xx) are exhausted and NOTHING has been stored yet,
@@ -4324,6 +4351,10 @@ class GhostAgent:
             except Exception as e: logger.error(f"Smart memory task failed: {e}")
 
     async def _execute_post_mortem(self, last_user_content: str, tools_run: list, final_ai_content: str, model: str):
+        # Function-scope import so BOTH the transient raise below and the
+        # re-raise clause guarding the broad handler can name the type.
+        from ..memory.journal import (
+            RetryableConsolidationError as _RetryableConsolidation)
         try:
             history_summary = f"User: {last_user_content}\n"
             for t_msg in tools_run[-5:]:
@@ -4342,7 +4373,19 @@ class GhostAgent:
             learn_prompt = f"### TASK POST-MORTEM\nReview this interaction. The agent either struggled and succeeded, OR failed completely. Identify the core technical error, hallucination, or bad strategy. Extract a concrete rule to fix or avoid this in the future.\n\nHISTORY:\n{history_summary}\n\nFINAL AI: {final_ai_content[:500]}\n\nReturn ONLY a JSON object with 'task', 'mistake', and 'solution' (what to do instead next time/the anti-pattern to avoid). If no unique technical lesson is found, return null."
 
             payload = {"model": model, "messages": [{"role": "system", "content": "You are a Meta-Cognitive Analyst. Output JSON."}, {"role": "user", "content": learn_prompt}], "temperature": 0.1, "max_tokens": 1024}
-            l_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, task_label="postmortem")
+            try:
+                # Bounded timeout (was 1200s worker default) + transient-aware:
+                # the 2026-07-09 requeue fix covered run_smart_memory_task but
+                # NOT this sibling, so a post_mortem item that hit a worker
+                # timeout/5xx was popped and dropped permanently. Nothing is
+                # stored before this call, so it is safe to re-run — signal the
+                # drain (process_journal_queue) to re-queue via the same path.
+                l_data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=90.0, task_label="postmortem")
+            except Exception as _ue:
+                from ..memory.journal import is_upstream_transient as _iut
+                if _iut(_ue):
+                    raise _RetryableConsolidation(f"{type(_ue).__name__}: {_ue}") from _ue
+                raise
             l_content = str(l_data["choices"][0]["message"].get("content") or "")
             if l_content and "null" not in l_content.lower():
                 l_json = extract_json_from_text(l_content)
@@ -4354,6 +4397,14 @@ class GhostAgent:
                             memory_system=self.context.memory_system
                         )
                     pretty_log("Auto-Learning", "New lesson captured automatically", icon=Icons.IDEA)
+        except _RetryableConsolidation:
+            # MUST escape the broad handler below: the drain loop
+            # (process_journal_queue) re-queues on this type, and the item was
+            # already pop_all'd, so swallowing it here drops the lesson
+            # permanently. This clause is why the 2026-07-22 requeue attempt was
+            # inert — the raise was caught by `except Exception` and logged as a
+            # generic "Post-mortem failed" (2026-07-22 later 3).
+            raise
         except Exception as e:
             logger.error(f"Post-mortem failed: {e}")
 
@@ -10349,6 +10400,17 @@ class GhostAgent:
                                             else getattr(self.context,
                                                          "llm_client", None)),
                                 context_budget=4000,
+                                # Classify INTENT on the raw user message, not
+                                # the expanded `search_query` (2026-07-22). A
+                                # short anaphoric follow-up gets rewritten to
+                                # "Context: <200 chars of the PREVIOUS reply> |
+                                # User intent: <query>", and classifying that
+                                # whole string let the assistant's own prose
+                                # drive the tier weighting instead of the user's
+                                # actual question.
+                                raw_user_text=(last_user_content
+                                               if 'last_user_content' in locals()
+                                               else ""),
                                 # Stamp the stash so only THIS turn's judge
                                 # consumes it, and keep the active session's
                                 # own stored history out of the PAST
@@ -11068,6 +11130,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # schema-skip kicks in even when the planner only
                     # signals via next_action_id (the dynamic_state line
                     # that sets force_final_response runs AFTER us).
+                    # Hoisted here (was computed just before _compose_injection)
+                    # because the KV-pin decision now also governs how the
+                    # final-generation turn is assembled: under pin, the
+                    # tool_header_block must stay byte-stable across turns, so
+                    # the "answer directly" directive rides the VOLATILE block
+                    # instead of flipping the pinned front (2026-07-22).
+                    _pin_stable = os.getenv("GHOST_PIN_TOOL_SCHEMAS", "0").strip().lower() not in ("0", "false", "no")
                     _early_required_tool = locals().get("required_tool", "all")
                     _early_next_action_id = locals().get("next_action_id", "")
                     _is_final_generation_for_schema = (
@@ -11083,11 +11152,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         getattr(self.context.args, "native_tools", False)
                     )
 
-                    if _is_final_generation_for_schema:
-                        # Slim header: drop the entire tool block. The
-                        # model is being asked to answer the user, not
-                        # to call a tool. Keep the think-budget guidance
-                        # so reasoning depth stays controlled.
+                    _final_gen_directive = ""  # non-empty only on a PINNED final-gen turn
+                    if _is_final_generation_for_schema and not _pin_stable:
+                        # Slim header (UNPINNED path only): drop the entire tool
+                        # block. The model is being asked to answer the user, not
+                        # to call a tool. Keep the think-budget guidance so
+                        # reasoning depth stays controlled. Under pin this flip
+                        # would bust the KV-cache from byte 1 on the turn that
+                        # carries the full accumulated history (a whole-history
+                        # re-prefill), so the pinned path keeps the normal header
+                        # below and routes this directive through the volatile
+                        # block (built at _stable_injection).
                         tool_header_block = (
                             f"# Final-generation turn\n\n"
                             f"You are answering the user directly this turn. "
@@ -11129,6 +11204,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             .replace('{think_budget_guidance}', render_think_budget_guidance(think_budget))
                             .replace("\r", "")
                         )
+                    if _is_final_generation_for_schema and _pin_stable:
+                        # Pinned final-gen: the header above stayed the normal
+                        # (byte-stable) one so the KV prefix still matches prior
+                        # turns; emit the "answer directly" directive through the
+                        # VOLATILE block instead. Native/legacy `tools` are still
+                        # suppressed downstream (is_final_generation), so the model
+                        # cannot call a native tool, and this directive forbids a
+                        # text <tool_call>.
+                        _final_gen_directive = (
+                            f"# Final-generation turn\n\n"
+                            f"You are answering the user directly this turn. "
+                            f"DO NOT emit any <tool_call> blocks. Reply in "
+                            f"plain prose only.\n\n"
+                            f"ADAPT YOUR THINKING DEPTH TO THE TASK:\n"
+                            f"{render_think_budget_guidance(think_budget)}\n"
+                        ).replace("\r", "")
                     # --- INTENT-DRIVEN SKILL RECALL ---
                     # ARCHITECTURAL OPTIMISATION #4: the playbook lookup is
                     # cached per (skill_query) inside `request_state`, so a
@@ -11288,15 +11379,34 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # across turns to maximise upstream KV-cache hits.
                     _continuity_tail = f"\n\n{continuity_text}" if continuity_text else ""
                     # Cache-aware ordering: STABLE blocks first (tool schemas,
-                    # persona, playbook, hydrated memory, per-request continuity
-                    # — all byte-identical across the turns of one request),
-                    # VOLATILE `dynamic_state` LAST (timestamp / sandbox state /
-                    # plan focus change every turn). The upstream prefix KV-cache
-                    # holds up to the first differing byte, so pushing the only
-                    # per-turn-varying block to the end maximises the cached
-                    # region — turns 2+ re-prefill just dynamic_state + the user
-                    # instruction instead of the whole (large) injection.
-                    _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{_continuity_tail}"
+                    # persona, hydrated memory, per-request continuity — all
+                    # byte-identical across the turns of one request), VOLATILE
+                    # `dynamic_state` LAST (timestamp / sandbox state / plan focus
+                    # change every turn). The upstream prefix KV-cache holds up to
+                    # the first differing byte, so pushing the only per-turn-
+                    # varying blocks to the end maximises the cached region.
+                    #
+                    # Under pin (2026-07-22), two per-turn-varying pieces are
+                    # moved OUT of the "stable" block into the volatile front so
+                    # the pinned prefix is genuinely byte-identical across turns:
+                    #   (a) fetched_playbook — its skill_query is rebuilt from the
+                    #       planner's per-turn required_tool + thought_content, so
+                    #       it changed every planned turn and busted the prefix
+                    #       from its position; it is per-turn-relevant, so it
+                    #       BELONGS in the volatile block.
+                    #   (b) the final-gen directive — see above.
+                    # Unpinned mode keeps the exact original composition (cache is
+                    # not a concern there, and the existing layout tests pin it).
+                    if _pin_stable:
+                        _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_context}{_continuity_tail}"
+                        _volatile_prefix = ""
+                        if _final_gen_directive:
+                            _volatile_prefix += _final_gen_directive + "\n"
+                        if fetched_playbook:
+                            _volatile_prefix += fetched_playbook
+                        dynamic_state = _volatile_prefix + dynamic_state
+                    else:
+                        _stable_injection = f"{tool_header_block}\n\n{active_persona}{fetched_playbook}{fetched_context}{_continuity_tail}"
                     # Measurement hook: a stable hash across a request's turns
                     # means the prefix is cacheable; a changing hash points at a
                     # remaining buster. Cheap (one sha1 of already-built text).
@@ -11322,7 +11432,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # assembly for every non-prod launch and trips 8 integration
                     # tests that pin the unpinned message layout, so durability
                     # lives in the launcher (the real prod path), not here.
-                    _pin_stable = os.getenv("GHOST_PIN_TOOL_SCHEMAS", "0").strip().lower() not in ("0", "false", "no")
+                    # (`_pin_stable` is computed once, higher up, because the
+                    # final-gen assembly above depends on it.)
                     req_messages = self._compose_injection(
                         req_messages, _stable_injection, dynamic_state, _pin_stable,
                     )
@@ -11590,6 +11701,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     chunk_str = chunk.decode("utf-8")
                                     if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
                                         chunk_data = json.loads(chunk_str[6:])
+                                        # Upstream abort frame (no "choices"): the
+                                        # final answer was cut off mid-stream. The
+                                        # frame passes through to the client and
+                                        # the finalize verifier gate REFUTES the
+                                        # partial, but log it so a truncated
+                                        # user-facing answer isn't a silent gap.
+                                        if "error" in chunk_data and "choices" not in chunk_data:
+                                            pretty_log(
+                                                "Stream Aborted",
+                                                "Upstream aborted the FINAL answer "
+                                                f"mid-stream: {str(chunk_data.get('error'))[:200]}",
+                                                level="WARNING", icon=Icons.WARN,
+                                            )
                                         if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
                                             delta = chunk_data["choices"][0].get("delta", {})
                                             if "content" in delta and delta["content"] is not None:
@@ -12176,6 +12300,16 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # "length" means the upstream hit its token cap and
                         # the answer is truncated — handled after the loop.
                         stream_finish_reason = None
+                        # True if the stream aborted mid-flight — the upstream
+                        # emitted a `data: {"error": ...}` frame (idle stall,
+                        # mid-stream break, connect failure) instead of a clean
+                        # finish. Without catching it the partial `full_content`
+                        # was finalized as if complete and fed to the verifier /
+                        # memory as the final answer (a truncated reply shipped
+                        # with no signal). Folded into the truncation handling
+                        # below so it triggers the same continuation attempt.
+                        stream_errored = False
+                        stream_error_msg = ""
 
                         # Thinking metrics: surfaced as a single summary line
                         # after the stream completes. We no longer print empty
@@ -12267,6 +12401,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 chunk_str = chunk.decode("utf-8")
                                 if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
                                     chunk_data = json.loads(chunk_str[6:])
+                                    # Upstream abort frame (idle stall / mid-stream
+                                    # break / connect failure) — has an "error"
+                                    # key, no "choices". Previously fell through
+                                    # this `if "choices"` and was silently dropped,
+                                    # so a half-generated reply finalized as if it
+                                    # were complete. Record it so the truncation
+                                    # path treats the turn as cut off.
+                                    if "error" in chunk_data and "choices" not in chunk_data:
+                                        stream_errored = True
+                                        stream_error_msg = str(chunk_data.get("error"))[:200]
+                                        pretty_log(
+                                            "Stream Aborted",
+                                            f"Upstream aborted the stream mid-answer: "
+                                            f"{stream_error_msg} — treating the partial "
+                                            f"reply as truncated.",
+                                            level="WARNING", icon=Icons.WARN,
+                                        )
                                     if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
                                         delta = chunk_data["choices"][0].get("delta", {})
                                         _fr = chunk_data["choices"][0].get("finish_reason")
@@ -12429,7 +12580,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # handled by the parse/retry path, not user-facing
                         # prose) or when the model emitted no visible content.
                         _truncated_text_turn = (
-                            stream_finish_reason == "length"
+                            (stream_finish_reason == "length" or stream_errored)
                             and bool(full_content.strip())
                             and not msg.get("tool_calls")
                             and "<tool_call" not in full_content.lower()
@@ -12443,15 +12594,17 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _continue_tries += 1
                             pretty_log(
                                 "Truncated Output",
-                                "Upstream stopped at token cap mid-answer; "
-                                f"continuing ({_continue_tries}/{MAX_TRUNCATION_CONTINUATIONS}).",
+                                (("Stream aborted mid-answer" if stream_errored
+                                  else "Upstream stopped at token cap mid-answer")
+                                 + "; continuing "
+                                 f"({_continue_tries}/{MAX_TRUNCATION_CONTINUATIONS})."),
                                 level="WARNING", icon=Icons.WARN,
                             )
                             cont_messages = list(req_messages) + [
                                 {"role": "assistant", "content": full_content},
                                 {"role": "user", "content": (
-                                    "Your previous reply was cut off by a length "
-                                    "limit. Continue it from exactly where it "
+                                    "Your previous reply was cut off before it "
+                                    "finished. Continue it from exactly where it "
                                     "stopped — do NOT repeat anything you already "
                                     "wrote, do NOT restate the question, just emit "
                                     "the next characters and finish the answer."

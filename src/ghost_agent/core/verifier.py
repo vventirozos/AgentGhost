@@ -12,6 +12,7 @@ Two capabilities:
 
 import asyncio
 import base64
+import inspect
 import json
 import logging
 import mimetypes
@@ -64,6 +65,24 @@ try:
         os.getenv("GHOST_VERIFY_WORKER_TIMEOUT", "45") or 45)
 except ValueError:
     _VERIFY_WORKER_TIMEOUT_S = 45.0
+
+# Hard wall-clock for the LAST-RESORT direct verdict call on the MAIN
+# model (the final fallback in `_call_llm`, reached when the critic pool
+# and the worker route are both absent or unusable). Without an explicit
+# timeout that call rode the shared httpx client's 1200s default — a
+# thinking-enabled 2048-token verdict could pin the single foreground
+# inference slot for MINUTES in direct contention with a live user
+# stream, and the verifier is reachable from BACKGROUND flows too
+# (dream/self-play verify shares context.verifier). 90s is deliberately
+# roomier than the worker's 45s budget because the main model may spend
+# tokens thinking before the JSON, but it is BOUNDED: a stalled call now
+# fails into "verdict skipped" (None) instead of starving the user.
+# Override with GHOST_VERIFY_FALLBACK_TIMEOUT (seconds).
+try:
+    _VERIFY_FALLBACK_TIMEOUT_S = float(
+        os.getenv("GHOST_VERIFY_FALLBACK_TIMEOUT", "90") or 90)
+except ValueError:
+    _VERIFY_FALLBACK_TIMEOUT_S = 90.0
 
 # Hard cap per image fed to the visual verifier. The vision node rasterises
 # and base64-encodes every image into the prompt; an oversized screenshot
@@ -323,6 +342,64 @@ Respond ONLY with a JSON object:
   "issues": ["specific contradictions, if any"]
 }}"""
 
+def _bounded_fallback_kwargs(llm_client: Any) -> Dict[str, Any]:
+    """Kwargs for the last-resort direct verdict call on the MAIN model.
+
+    Two guards, both applied only when the client's ``chat_completion``
+    actually accepts the keyword (the verifier is duck-typed over stubs
+    and wrappers whose signatures may be positional-only — passing an
+    unknown kwarg there would TypeError into the fallback's broad except
+    and silently skip the verdict):
+
+    - ``timeout=_VERIFY_FALLBACK_TIMEOUT_S``: the call must be bounded.
+      With no explicit timeout it inherited the shared httpx client's
+      1200s default, so an exhausted worker path landed an unbounded
+      thinking generation on the single main inference slot.
+    - ``is_background=True`` — but ONLY when no user request is live
+      (``foreground_requests <= 0``). In that state the verify was
+      invoked from a background flow (dream/self-play/idle project
+      advance) or a late async verdict, and must queue as background
+      instead of inflating ``foreground_tasks`` and making other
+      background work misread a live user. When a user request IS live
+      we must NOT mark background: the verifier runs from INSIDE the
+      user turn (the in-loop auto-repair verdict), and an is_background
+      call would park on ``_wait_for_foreground_clear`` waiting for
+      THIS request to finish — the same self-stall documented on the
+      critic path in ``_call_llm``. A foreground-ambiguous case (user
+      live, verify possibly background) therefore stays foreground and
+      relies on the bounded timeout.
+    """
+    fn = getattr(llm_client, "chat_completion", None)
+    if fn is None:
+        return {}
+    try:
+        params = inspect.signature(fn).parameters
+        has_var_kw = any(p.kind is inspect.Parameter.VAR_KEYWORD
+                         for p in params.values())
+    except (TypeError, ValueError):
+        # Signature not introspectable — don't risk a TypeError that
+        # would eat the verdict; behave exactly as before the guards.
+        return {}
+
+    def _accepts(name: str) -> bool:
+        return has_var_kw or name in params
+
+    kwargs: Dict[str, Any] = {}
+    if _accepts("timeout"):
+        kwargs["timeout"] = _VERIFY_FALLBACK_TIMEOUT_S
+    if _accepts("is_background"):
+        fg = getattr(llm_client, "foreground_requests", None)
+        try:
+            if fg is not None and int(fg) <= 0:
+                kwargs["is_background"] = True
+        except (TypeError, ValueError):
+            # Non-numeric counter (mock / exotic wrapper) — assume a
+            # user request may be live; stay foreground, never
+            # self-park.
+            pass
+    return kwargs
+
+
 class Verifier:
     """Self-evaluation module that uses LLM introspection to check the agent's
     own work before presenting it to the user."""
@@ -462,9 +539,21 @@ class Verifier:
                 # Empty/unparseable worker response → fall through to
                 # direct call rather than giving up.
 
-        # Fallback to direct call
+        # Last-resort fallback: a direct call on the MAIN model. Bounded
+        # and background-aware via _bounded_fallback_kwargs — previously
+        # this was a foreground-marked call with NO timeout (1200s httpx
+        # default), reachable from background flows, pinning the single
+        # main inference slot against a live user stream. The payload
+        # itself is deliberately UNTOUCHED here: the two-stage
+        # (json_only) payloads already carry the /no_think + stop +
+        # tight-cap discipline from the top of this method, while the
+        # classic-prompt payload keeps its thinking-sized 2048 budget —
+        # the main model is a thinking model and a starved budget came
+        # back all-prelude/no-JSON (see the docstring above); the
+        # timeout, not the token budget, is the containment.
         try:
-            result = await self.llm_client.chat_completion(payload)
+            result = await self.llm_client.chat_completion(
+                payload, **_bounded_fallback_kwargs(self.llm_client))
             text = (
                 result.get("choices", [{}])[0]
                 .get("message", {})

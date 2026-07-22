@@ -1,9 +1,53 @@
 import asyncio
 import logging
+import os
 import uuid
 from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
+
+# Overall ceiling (seconds) for the blocking `await_results=True` wait.
+# Each worker alone can legally take ~906s (3 attempts x 300s HTTP timeout
+# + 1s/2s backoff), so an unbounded gather could stall the live turn ~15
+# minutes on a single hung node. 240s is deliberately UNDER the 300s
+# single-attempt HTTP timeout: it is long enough for a slow-but-alive node
+# to answer its first attempt, and long enough to absorb both quick-failure
+# retries (fast connection errors + 1s/2s backoff) — but a node that has
+# not produced bytes in 4 minutes is hung for interactive purposes, and the
+# turn should get its partial results back instead of waiting out the full
+# retry budget. Workers hitting the deadline are NOT cancelled; they keep
+# running in the background exactly like a fire-and-forget dispatch.
+SWARM_AWAIT_DEADLINE_S = 240.0
+
+
+def _await_deadline_s() -> float:
+    """Resolve the await_results deadline, env-overridable for ops/tests
+    (GHOST_SWARM_AWAIT_DEADLINE); garbage or unset falls back to the
+    module default. Clamped to >=0.1s so a typo can't make it non-blocking."""
+    raw = os.getenv("GHOST_SWARM_AWAIT_DEADLINE", "")
+    try:
+        val = float(raw) if raw else SWARM_AWAIT_DEADLINE_S
+    except ValueError:
+        val = SWARM_AWAIT_DEADLINE_S
+    return max(0.1, val)
+
+
+# Sentinel for tasks still in flight when the await_results deadline expires.
+_STILL_RUNNING = object()
+
+
+class SwarmWorkerError(RuntimeError):
+    """Raised by ``_swarm_worker`` when a task ultimately fails.
+
+    Raising (instead of the old ``return False``) is what makes the failure
+    observable at the job level: ``JobRegistry._on_done`` maps
+    ``task.exception()`` to STATUS_FAILED with the error text, whereas a
+    plain ``False`` return was str()'d into a success-shaped ``[done]`` job
+    with no error. The SCRAPBOOK "SYSTEM ALERT" is still written BEFORE
+    raising, so the model-facing surface is unchanged, and the job's
+    ``result_resolver`` (which reads the scratchpad) is only consulted on
+    the success path — no double-handling of failures.
+    """
 
 # Keep strong references to background tasks to prevent aggressive garbage collection
 _swarm_tasks = set()
@@ -19,11 +63,23 @@ def _register_task(task_id: str, task: asyncio.Task):
 
     def _cleanup(_t, _id=task_id):
         _swarm_task_registry.pop(_id, None)
+        # Retrieve the failure exception (if any) so fire-and-forget worker
+        # failures — which RAISE SwarmWorkerError so the job registry lands
+        # STATUS_FAILED — don't emit "Task exception was never retrieved"
+        # noise when no registry is attached (context=None). The worker
+        # already logged and wrote the SCRAPBOOK alert before raising.
+        if not _t.cancelled():
+            _t.exception()
 
     task.add_done_callback(_cleanup)
 
 async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_client, fallback_model_name: str, scratchpad, worker_persona: str = None, target_model: str = None, preselected_node=None):
-    """Background worker that executes on the fast edge node with retry logic."""
+    """Background worker that executes on the fast edge node with retry logic.
+
+    Returns True on success; raises :class:`SwarmWorkerError` on failure
+    (after writing a SYSTEM ALERT to the scratchpad) so the job registry
+    lands the job as FAILED instead of a success-shaped [done].
+    """
     MAX_RETRIES = 2
 
     sys_prompt = worker_persona if worker_persona else "You are a specialized Swarm Worker node. Execute the user's instruction on the provided data and return ONLY the results. Be concise."
@@ -55,7 +111,10 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
             node = llm_client.get_swarm_node(target_model)
         if not node:
             scratchpad.set(output_key, "SYSTEM ALERT: Swarm execution failed. No cluster nodes available.")
-            return False
+            # Raise (don't return False) so the job registry lands the job
+            # as FAILED with this error instead of a success-shaped [done].
+            raise SwarmWorkerError(
+                f"swarm task '{output_key}' failed: no cluster nodes available")
 
         client = node["client"]
         model_name = node["model"]
@@ -96,8 +155,16 @@ async def _swarm_worker(instruction: str, input_data: str, output_key: str, llm_
             else:
                 pretty_log("Swarm Task Failed", f"All {MAX_RETRIES + 1} attempts failed: {e}", level="WARNING", icon=Icons.WARN)
 
+    # The model-facing detail goes to the SCRAPBOOK first (unchanged), then
+    # we RAISE so the failure is observable at the job level: the registry's
+    # done-callback maps the exception to STATUS_FAILED + error text, so
+    # `jobs(action='status')` shows [failed] instead of a clean [done]. The
+    # job's result_resolver only runs on the DONE path, so the scratchpad
+    # alert is not double-reported.
     scratchpad.set(output_key, f"SYSTEM ALERT: Swarm execution failed after {MAX_RETRIES + 1} attempts ({last_error}). The edge node is offline. You must process this data yourself synchronously.")
-    return False
+    raise SwarmWorkerError(
+        f"swarm task '{output_key}' failed after {MAX_RETRIES + 1} attempts: "
+        f"{type(last_error).__name__}: {last_error}")
 
 async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks: list = None, instruction: str = None, input_data: str = None, output_key: str = None, worker_persona: str = None, await_results: bool = False, context=None, **kwargs):
     """Dispatch tasks to the background swarm.
@@ -109,9 +176,14 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
     poll status from a later turn.
 
     Set ``await_results=True`` to block until every dispatched task
-    completes; the aggregated per-task results (success or exception) are
-    appended to the return string. This is useful when the agent has no
-    other useful work to do until the swarm responds.
+    completes OR an overall deadline expires (``SWARM_AWAIT_DEADLINE_S``,
+    default 240s, env-overridable via ``GHOST_SWARM_AWAIT_DEADLINE``); the
+    aggregated per-task results (success or exception) are appended to the
+    return string. On deadline the PARTIAL results that did complete are
+    returned and the unfinished workers keep running in the background
+    (they are NOT cancelled — their results still land in the SCRAPBOOK
+    and they stay pollable via the job registry). This is useful when the
+    agent has no other useful work to do until the swarm responds.
     """
     if not scratchpad:
         return "Error: Scratchpad memory is not initialized."
@@ -211,10 +283,11 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
                     "swarm", t_instruction or t_output_key,
                     output_key=t_output_key, swarm_id=task_id,
                 )
-                # The worker returns a bool; the real output (or the failure
-                # ALERT) is in the scratchpad under output_key. Resolve the
-                # job result from there so `jobs(action='collect')` returns
-                # the content instead of "True"/"False".
+                # The worker returns True on success (and raises on failure,
+                # landing the job FAILED via the registry's done-callback);
+                # the real output is in the scratchpad under output_key.
+                # Resolve the job result from there so `jobs(action=
+                # 'collect')` returns the content instead of "True".
                 _job.result_resolver = (
                     lambda _res, _sp=scratchpad, _k=t_output_key: _sp.get(_k))
                 _jreg.attach(_job.id, task)
@@ -245,24 +318,74 @@ async def tool_delegate_to_swarm(llm_client, model_name: str, scratchpad, tasks:
         )
 
     # If the caller asked us to block, gather and report aggregated results.
-    # _swarm_worker returns True on success, False on failure (it never
-    # raises and writes a SCRAPBOOK alert on failure), so a False result is a
-    # real per-task FAILURE — not the "OK" it used to be reported as.
+    # _swarm_worker returns True on success and RAISES SwarmWorkerError on
+    # failure (after writing a SCRAPBOOK alert), so failures arrive here as
+    # exceptions in the gathered list — return_exceptions=True keeps one bad
+    # task from sinking the batch. The whole wait is bounded by an overall
+    # deadline (see SWARM_AWAIT_DEADLINE_S): each worker alone can legally
+    # run ~906s (3 attempts x 300s HTTP timeout + backoff), and awaiting
+    # that unbounded stalled the live turn ~15 minutes on one hung node.
+    # asyncio.shield() means hitting the deadline does NOT cancel the
+    # workers — they keep running in the background exactly like a
+    # fire-and-forget dispatch (job registry + SCRAPBOOK writes intact) and
+    # we return the partial results that DID complete.
     if await_results and dispatched_tasks:
-        gathered = await asyncio.gather(*dispatched_tasks, return_exceptions=True)
+        deadline = _await_deadline_s()
+        still_running: list[str] = []
+        gather_fut = asyncio.gather(*dispatched_tasks, return_exceptions=True)
+        try:
+            gathered = await asyncio.wait_for(
+                asyncio.shield(gather_fut), timeout=deadline)
+        except asyncio.TimeoutError:
+            # Deadline hit: harvest per-task state directly off the tasks.
+            # Done tasks yield their result/exception (exception() also
+            # marks it retrieved); pending ones get the STILL_RUNNING
+            # sentinel and are left alone. The abandoned gather_fut never
+            # stores an exception (return_exceptions=True), so dropping it
+            # is safe.
+            gathered = []
+            for tid, t in zip(dispatched_keys, dispatched_tasks):
+                if not t.done():
+                    gathered.append(_STILL_RUNNING)
+                    still_running.append(tid)
+                elif t.cancelled():
+                    gathered.append(asyncio.CancelledError("cancelled"))
+                elif t.exception() is not None:
+                    gathered.append(t.exception())
+                else:
+                    gathered.append(t.result())
         result_lines = []
         n_ok = 0
         for tid, res in zip(dispatched_keys, gathered):
-            if isinstance(res, BaseException):
-                result_lines.append(f"  {tid}: ERROR {type(res).__name__}: {res}")
-            elif res is False:
+            if res is _STILL_RUNNING:
+                result_lines.append(
+                    f"  {tid}: STILL RUNNING in the background — its result "
+                    f"will land in the SCRAPBOOK when it finishes; poll with "
+                    f"jobs(action='status').")
+            elif isinstance(res, SwarmWorkerError) or res is False:
+                # `res is False` kept as a defensive legacy shape — the
+                # worker now raises instead of returning False.
                 result_lines.append(f"  {tid}: FAILED (a SYSTEM ALERT was written to its SCRAPBOOK key — process it yourself)")
+            elif isinstance(res, BaseException):
+                result_lines.append(f"  {tid}: ERROR {type(res).__name__}: {res}")
             else:
                 n_ok += 1
                 result_lines.append(f"  {tid}: OK")
-        n_fail = dispatched - n_ok
+        n_running = len(still_running)
+        n_fail = dispatched - n_ok - n_running
         body = "\n".join(result_lines) if result_lines else "(no results)"
-        if n_fail == 0 and skipped == 0:
+        if n_running:
+            prefix = (
+                f"PARTIAL: overall await deadline ({deadline:g}s) reached — "
+                f"{n_ok}/{len(tasks)} task(s) completed"
+                + (f", {n_fail} FAILED" if n_fail else "")
+                + (f", {skipped} skipped ({', '.join(invalid)})" if skipped else "")
+                + f"; {n_running} still running in the background "
+                f"({', '.join(still_running)}). They were NOT cancelled — "
+                f"do not re-dispatch them; check the SCRAPBOOK or "
+                f"jobs(action='status') later."
+            )
+        elif n_fail == 0 and skipped == 0:
             prefix = f"SUCCESS: {n_ok}/{len(tasks)} task(s) completed (await_results=True)."
         else:
             prefix = (

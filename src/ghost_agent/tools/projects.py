@@ -204,75 +204,250 @@ _CURRENT_SENTINEL = "__current_project__"
 # workspace).
 _CURRENT_CONV_SENTINEL = "__current_project_conv__"
 
+# Marker key written by tools/swarm.py at dispatch: `_swarm_task_id::<output_key>`
+# → task id. Its existence means a detached worker still owns `<output_key>`
+# and will write to it minutes later, in whatever conversation/project happens
+# to be live at that moment. Both keys therefore belong to the JOB, not to the
+# project that was active when it was dispatched — see
+# `_background_job_keys`.
+_SWARM_TASK_PREFIX = "_swarm_task_id::"
 
-def _iter_scratchpad_items(scratchpad) -> List[tuple]:
-    """Best-effort snapshot of the scratchpad's current key/value pairs.
 
-    Returns an empty list when the scratchpad is missing or doesn't
-    expose its internal ``_data`` mapping — callers must tolerate that
-    (e.g. MagicMock-based test contexts).
+def _scratchpad_keys(scratchpad) -> List[str]:
+    """Best-effort list of the scratchpad's live keys.
+
+    Prefers the public `keys()` accessor and falls back to the internal
+    `_data` mapping; returns [] for anything that supports neither (e.g.
+    MagicMock-based test contexts).
+    """
+    if scratchpad is None:
+        return []
+    getter = getattr(scratchpad, "keys", None)
+    if callable(getter):
+        try:
+            keys = list(getter())
+            if all(isinstance(k, str) for k in keys):
+                return keys
+        except Exception:
+            pass
+    data = getattr(scratchpad, "_data", None)
+    try:
+        return [k for k in list(data.keys()) if isinstance(k, str)]
+    except Exception:
+        return []
+
+
+def _background_job_keys(context, scratchpad) -> set:
+    """Scratchpad keys owned by background jobs — NEVER ours to delete.
+
+    A swarm task dispatched from conversation A writes its result long after
+    the dispatching turn ended. Until 2026-07-22 the project layer deleted
+    every non-sentinel key at any FOREIGN conversation's request start, so
+    conversation B saying "hi" durably destroyed A's in-flight results: the
+    worker then re-created the key in whatever scope was live, and
+    `jobs(action='collect')`'s resolver (a bare `scratchpad.get(output_key)`)
+    returned None — an empty job result with no error. The live prod DB was
+    down to its 2 sentinel rows.
+
+    Two independent sources, unioned (either alone is enough):
+      * the `_swarm_task_id::<output_key>` markers in the scratchpad itself;
+      * `meta["output_key"]` of every job the registry still retains
+        (running, or finished but not yet collected).
+    """
+    protected: set = set()
+    for k in _scratchpad_keys(scratchpad):
+        if k.startswith(_SWARM_TASK_PREFIX):
+            protected.add(k)
+            target = k[len(_SWARM_TASK_PREFIX):]
+            if target:
+                protected.add(target)
+    # Only consult a registry that already exists — never create one here.
+    registry = getattr(context, "job_registry", None)
+    lister = getattr(registry, "list", None)
+    if callable(lister):
+        try:
+            for job in lister():
+                if getattr(job, "collected", False):
+                    continue
+                out = (getattr(job, "meta", None) or {}).get("output_key")
+                if isinstance(out, str) and out:
+                    protected.add(out)
+                    protected.add(f"{_SWARM_TASK_PREFIX}{out}")
+        except Exception:
+            pass
+    return protected
+
+
+def _protected_scratchpad_keys(context, scratchpad) -> set:
+    """Every key a project switch must leave alone: the activation sentinels,
+    the `proj::`-namespaced convention keys, and background-job keys."""
+    protected = {_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL}
+    protected.update(
+        k for k in _scratchpad_keys(scratchpad)
+        if k.startswith(_PROJECT_KEY_PREFIX)
+    )
+    protected.update(_background_job_keys(context, scratchpad))
+    return protected
+
+
+def _sp_set(scratchpad, key: str, value, namespace=None):
+    """`scratchpad.set` with an explicit scope, tolerating scratchpads that
+    predate the namespace argument (mocks, alternative implementations)."""
+    try:
+        return scratchpad.set(key, value, namespace=namespace)
+    except TypeError:
+        return scratchpad.set(key, value)
+
+
+def _set_scratchpad_scope(scratchpad, project_id: Optional[str]):
+    """Point the scratchpad's default write scope at the active project (or
+    the global scope in free chat), so keys written this turn are tagged with
+    the project that owns them and can later be cleared on their own."""
+    if scratchpad is None:
+        return
+    try:
+        scratchpad.active_namespace = project_id or None
+    except Exception:
+        pass
+
+
+def _iter_scratchpad_items(scratchpad, project_id: Optional[str] = None,
+                           protected: Optional[set] = None) -> List[tuple]:
+    """Best-effort snapshot of the scratchpad keys owned by ``project_id``.
+
+    Scope-aware scratchpads report their own membership; older/mock ones fall
+    back to the historical "everything that isn't a sentinel or `proj::`"
+    rule. Background-job keys are excluded either way — they are process-wide,
+    so snapshotting them would file another conversation's swarm result into
+    THIS project's event log (and re-hydrate a stale copy later).
     """
     if scratchpad is None:
         return []
     data = getattr(scratchpad, "_data", None)
     if data is None:
         return []
+    spared = protected or set()
+    scoped = None
+    lister = getattr(scratchpad, "keys_in_namespace", None)
+    if project_id and callable(lister):
+        try:
+            candidates = list(lister(project_id))
+            if all(isinstance(k, str) for k in candidates):
+                scoped = candidates
+        except Exception:
+            scoped = None
     try:
+        if scoped is not None:
+            return [(k, data[k]) for k in scoped
+                    if k in data and k not in spared
+                    and not k.startswith(_PROJECT_KEY_PREFIX)
+                    and k not in (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL)]
         return [
             (k, v) for k, v in data.items()
             if not str(k).startswith(_PROJECT_KEY_PREFIX)
             and k not in (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL)
+            and k not in spared
         ]
     except Exception:
         return []
 
 
-def _snapshot_scratchpad(context, project_id: Optional[str]):
-    """Capture in-flight scratchpad keys into the project's event log."""
+def _snapshot_scratchpad(context, project_id: Optional[str]) -> bool:
+    """Capture in-flight scratchpad keys into the project's event log.
+
+    Returns False only when there WAS project state to save and saving it
+    failed — callers use that to avoid clearing keys they can no longer
+    restore.
+    """
     if not project_id:
-        return
+        return True
+    sp = getattr(context, "scratchpad", None)
+    items = _iter_scratchpad_items(
+        sp, project_id, _protected_scratchpad_keys(context, sp))
+    if not items:
+        return True
     store = _resolve_store(context)
     if store is None:
-        return
-    items = _iter_scratchpad_items(getattr(context, "scratchpad", None))
-    if not items:
-        return
+        return False
     try:
         store.log_event(project_id, None, "scratchpad_snapshot",
                         {"keys": dict(items)})
+        return True
     except Exception:
         logger.debug("scratchpad snapshot failed", exc_info=True)
+        return False
+
+
+def _clear_other_project_scopes(context, sp, project_id: Optional[str]):
+    """Drop the scratchpad keys owned by OTHER projects, and nothing else.
+
+    Previously this deleted every key that wasn't `proj::`-prefixed or a
+    sentinel — including keys belonging to no project at all. Because
+    `_park_current_project` runs it at REQUEST START for any conversation
+    that doesn't own the bound project, one unrelated chat message wiped the
+    whole scratchpad (verified in prod). Now each entry carries the scope
+    that wrote it, so we clear scope-by-scope and spare:
+
+      * the incoming project's own scope (about to be re-hydrated),
+      * the global/free-chat scope (owned by nobody — includes results
+        written by detached workers),
+      * sentinels, `proj::` keys and in-flight background-job keys
+        (`_protected_scratchpad_keys`), even when a stale scope tag says
+        otherwise.
+    """
+    protected = _protected_scratchpad_keys(context, sp)
+    target = project_id or None
+    namespaces = getattr(sp, "namespaces", None)
+    clear_ns = getattr(sp, "clear_namespace", None)
+    if callable(namespaces) and callable(clear_ns):
+        try:
+            names = [n for n in list(namespaces()) if n and n != target]
+        except Exception:
+            names = None
+        if names is not None:
+            for ns in names:
+                try:
+                    clear_ns(ns, protect=protected)
+                except Exception:
+                    pass
+            return
+    # Scratchpad without scope support: keep the historical behaviour but
+    # never touch a protected key — an unowned background-job result must
+    # survive here too (that is the data-loss bug).
+    data = getattr(sp, "_data", None)
+    if data is None:
+        return
+    try:
+        victims = [
+            k for k in list(data.keys())
+            if not str(k).startswith(_PROJECT_KEY_PREFIX)
+            and k not in (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL)
+            and k not in protected
+        ]
+    except Exception:
+        return
+    for k in victims:
+        try:
+            sp.delete(k)
+        except Exception:
+            pass
 
 
 def _hydrate_scratchpad(context, project_id: Optional[str]):
     """Restore the most recent scratchpad_snapshot for a project into
     the live scratchpad.
 
-    We clear non-namespaced keys first so a switch doesn't leak state
-    from the previous project, then restore the target's saved keys.
-    Sentinel keys (`__current_project__`, project-namespaced `proj::…`)
-    are preserved.
+    We clear the OTHER projects' scoped keys first so a switch doesn't leak
+    state from the previous project, then restore the target's saved keys
+    into the target's scope. Sentinel keys (`__current_project__`,
+    project-namespaced `proj::…`) and background-job keys are preserved.
     """
     sp = getattr(context, "scratchpad", None)
     if sp is None:
         return
-    data = getattr(sp, "_data", None)
-    if data is None:
-        return
-    try:
-        # Clear free-chat keys (not namespaced, not sentinels)
-        victims = [
-            k for k in list(data.keys())
-            if not str(k).startswith(_PROJECT_KEY_PREFIX)
-            and k not in (_CURRENT_SENTINEL, _CURRENT_CONV_SENTINEL)
-        ]
-        for k in victims:
-            try:
-                sp.delete(k)
-            except Exception:
-                pass
-    except Exception:
-        pass
+    _clear_other_project_scopes(context, sp, project_id)
+    # From here on, this turn's writes belong to the incoming project.
+    _set_scratchpad_scope(sp, project_id)
     if not project_id:
         return
     store = _resolve_store(context)
@@ -286,9 +461,15 @@ def _hydrate_scratchpad(context, project_id: Optional[str]):
     if not events:
         return
     keys = (events[0].get("payload") or {}).get("keys") or {}
+    # A legacy snapshot (taken before job keys were excluded) can carry a
+    # stale copy of a background-job key — restoring it would overwrite the
+    # live result the worker wrote in the meantime.
+    live_jobs = _background_job_keys(context, sp)
     for k, v in keys.items():
+        if k in live_jobs:
+            continue
         try:
-            sp.set(k, v)
+            _sp_set(sp, k, v, namespace=project_id)
         except Exception:
             pass
 
@@ -321,15 +502,23 @@ def _set_current(context, project_id: Optional[str]):
                 sp.delete(_CURRENT_SENTINEL)
                 sp.delete(_CURRENT_CONV_SENTINEL)
             else:
-                sp.set(_CURRENT_SENTINEL, project_id)
+                # namespace=None: the sentinels belong to no project scope,
+                # so a later scope clear can never take them with it (an
+                # evicted sentinel is what `reconcile_conversation`'s
+                # fail-closed branch treats as "no binding").
+                _sp_set(sp, _CURRENT_SENTINEL, project_id, namespace=None)
                 # Bind the activation to the conversation that asked for it
                 # (set per-request by `reconcile_conversation`). Empty/None
                 # means "unbound" — reconcile treats that as not owned by
                 # ANY conversation, so a stale activation can never leak.
-                sp.set(_CURRENT_CONV_SENTINEL,
-                       getattr(context, "conversation_key", None) or "")
+                _sp_set(sp, _CURRENT_CONV_SENTINEL,
+                        getattr(context, "conversation_key", None) or "",
+                        namespace=None)
         except Exception:
             pass
+        # Keep the default write scope in step even when the project is
+        # unchanged (idempotent switch takes neither branch below).
+        _set_scratchpad_scope(sp, project_id)
     if project_id and project_id != prev:
         _hydrate_scratchpad(context, project_id)
     elif project_id is None:
@@ -444,7 +633,7 @@ def _message_references_project(context, project_id: str) -> bool:
 def _park_current_project(context, cur: str, why: str):
     """Deactivate the process-global active project for THIS request,
     snapshotting its scratchpad so the owning conversation can resume it."""
-    _snapshot_scratchpad(context, cur)
+    saved = _snapshot_scratchpad(context, cur)
     context.current_project_id = None
     _wm = getattr(context, "workspace_model", None)
     if _wm is not None:
@@ -452,11 +641,39 @@ def _park_current_project(context, cur: str, why: str):
             _wm.current_project_id = ""
         except Exception:
             pass
-    _hydrate_scratchpad(context, None)
+    if saved:
+        _hydrate_scratchpad(context, None)
+    else:
+        # The snapshot that makes this reversible did not land. Clearing the
+        # project's keys now would destroy state nothing can restore, and
+        # this runs at REQUEST START for conversations that merely happen to
+        # share the process — leaking is recoverable, deleting is not. Leave
+        # the entries tagged with `cur` (the next successful switch clears
+        # them) and only reset the write scope.
+        _set_scratchpad_scope(getattr(context, "scratchpad", None), None)
+        logger.warning(
+            f"Project '{cur}' parked WITHOUT a scratchpad snapshot — its keys "
+            f"are kept in memory rather than dropped (nothing could restore them)")
     pretty_log("Project Scope", why, icon=Icons.BRAIN_PLAN)
 
 
 def reconcile_conversation(context, conv_key: str):
+    """Scope the active project to the conversation that activated it.
+
+    Thin wrapper around :func:`_reconcile_conversation` that leaves the
+    scratchpad's default write scope matching whatever project this request
+    ended up with — every branch below returns from a different place, and a
+    stale scope would tag this turn's keys with the PREVIOUS request's
+    project (so the next switch clears the wrong set).
+    """
+    try:
+        _reconcile_conversation(context, conv_key)
+    finally:
+        _set_scratchpad_scope(getattr(context, "scratchpad", None),
+                              getattr(context, "current_project_id", None))
+
+
+def _reconcile_conversation(context, conv_key: str):
     """Scope the active project to the conversation that activated it.
 
     Called once at request start, BEFORE any sandbox listing or file op.
@@ -520,7 +737,9 @@ def reconcile_conversation(context, conv_key: str):
             # instead of projects/<id>/ (observed live: a report PDF and stray
             # project directories created at the sandbox root).
             try:
-                sp.set(_CURRENT_CONV_SENTINEL, conv_key or "")
+                # namespace=None — sentinels are scope-free (see _set_current).
+                _sp_set(sp, _CURRENT_CONV_SENTINEL, conv_key or "",
+                        namespace=None)
             except Exception:
                 pass
         if cur != bound_pid:

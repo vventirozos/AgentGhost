@@ -174,7 +174,10 @@ class TestOffloadWiring:
 
     def test_smart_memory_already_offloaded(self):
         src = (_SRC / "core" / "agent.py").read_text()
-        block = src.split("async def run_smart_memory_task", 1)[1][:2500]
+        # Window widened 2500→3200 (2026-07-22): the extract call gained a
+        # bounded `timeout=90.0` + an explanatory comment, pushing the
+        # `use_worker=True` kwarg further into the function body.
+        block = src.split("async def run_smart_memory_task", 1)[1][:3200]
         assert "use_worker=True" in block
 
     def test_constraint_gate_screens_on_worker(self):

@@ -142,6 +142,31 @@ class MemoryBus:
         "always", "steps", "procedure", "workflow",
     }
 
+    # Marker the agent's legacy anaphora expansion splices in front of a short
+    # follow-up: ``Context: <prev assistant reply> | User intent: <question>``.
+    # Classifying that whole string let ~200 chars of the ASSISTANT's prose
+    # (dense in classifier keywords) pick the tier weights instead of the
+    # user's 3-word question — a follow-up "and the docs?" came out
+    # `procedural` purely from the previous reply (found 2026-07-22). The
+    # explicit ``raw_user_text`` argument is the real fix; this marker is the
+    # fallback for call sites that don't pass it yet.
+    _EXPANSION_MARKER = "| User intent:"
+
+    @classmethod
+    def _intent_source_text(cls, query: str, raw_user_text: str = "") -> str:
+        """The text intent should be classified on: the caller's raw user
+        message when given, else the tail of a legacy expanded query, else
+        the query itself (today's behaviour)."""
+        if raw_user_text and str(raw_user_text).strip():
+            return str(raw_user_text)
+        q = str(query or "")
+        idx = q.rfind(cls._EXPANSION_MARKER)
+        if idx >= 0:
+            tail = q[idx + len(cls._EXPANSION_MARKER):].strip()
+            if tail:
+                return tail
+        return q
+
     @classmethod
     def _classify_query_intent(cls, query: str) -> str:
         """Cheap keyword classifier for query intent. Returns 'factual',
@@ -159,21 +184,38 @@ class MemoryBus:
 
     # ============================================================ HYDRATION
 
+    # Fused-score denominator for the hydration path. 60 is the web-scale RRF
+    # default, sized for lists of hundreds; over the 5-15 item lists this bus
+    # fuses it flattens intra-tier spread to ~19% (1/61 vs 1/75) while the
+    # cross-tier weight spread runs up to 20x — so fused order collapsed to
+    # `tier_weight x consensus` and the vector store's own distance ranking was
+    # discarded. k=10 restores a ~2.3x spread across a 15-item list, which is
+    # the right order of magnitude against the weights (found 2026-07-22).
+    # `_reciprocal_rank_fusion` keeps k=60 as ITS default for back-compat with
+    # direct classmethod callers.
+    _RRF_K = 10
+
     async def hydrate_context(self, query: str, *,
                               max_chars: int = 6000,
-                              rrf_k: int = 60,
+                              rrf_k: int = 0,
                               context_budget: int = 0,
                               llm_client: Any = None,
                               turn_id: str = "",
+                              raw_user_text: str = "",
                               exclude_session_id: str = "") -> str:
         """Concurrently query Vector / Graph / Skill / Episodic memories and
         fuse the results with Reciprocal Rank Fusion. Returns a Markdown block
         (or an empty string when nothing is available).
 
-        When ``context_budget`` > 0, the hydration budget scales adaptively:
-        simple queries stay at 6000 chars, complex queries expand up to the
-        budget cap (max 12000 chars). This prevents complex research tasks
-        from being starved of memory context.
+        When ``context_budget`` > 0 it is the BASE budget and is honoured
+        as-is for a simple query; a medium query gets 2x it (capped 9000) and
+        a complex one 3x (capped 12000), so the documented scaling is actually
+        reachable from the production caller's 4000.
+
+        ``raw_user_text`` is the user's own message, before any anaphora
+        expansion the caller spliced into ``query``. Intent is classified on
+        it when supplied (see ``_intent_source_text``); omitting it keeps the
+        legacy behaviour of classifying whatever ``query`` holds.
 
         RAG-Fusion: When ``llm_client`` is provided, decomposes the query into
         sub-queries for broader retrieval coverage before fusing.
@@ -181,19 +223,20 @@ class MemoryBus:
         if not query or not str(query).strip():
             return ""
 
-        # Adaptive budget: scale UP for complex queries — but never BELOW the
-        # 6000 default. Flooring at the default is what makes this adaptive:
-        # the sole prod caller passes context_budget=4000, so `min(4000, 12000)`
-        # gave complex queries 4000 chars while simple ones kept 6000 — the
-        # exact inversion the docstring says it prevents ("complex research
-        # tasks starved"). max(context_budget, 6000) fixes the direction.
+        # Adaptive budget: the caller's budget is the BASE and scales UP with
+        # query complexity. The old form was `min(max(context_budget, 6000),
+        # cap)`, which with the sole prod caller's context_budget=4000
+        # evaluated to 6000 in ALL THREE branches — the adaptive path was dead
+        # code, the docstring's 12000 unreachable, and the operator's
+        # deliberate 4000 silently overridden (found 2026-07-22).
         if context_budget > 0:
             query_words = len(query.split())
             if query_words > 30:
-                max_chars = min(max(context_budget, 6000), 12000)
+                max_chars = min(context_budget * 3, 12000)
             elif query_words > 15:
-                max_chars = min(max(context_budget, 6000), 9000)
-            # else: keep default 6000
+                max_chars = min(context_budget * 2, 9000)
+            else:
+                max_chars = context_budget
 
         # RAG-Fusion: decompose into sub-queries for broader coverage
         sub_queries = await self._decompose_query(query, llm_client)
@@ -218,13 +261,16 @@ class MemoryBus:
                         for tier_list in tier_lists
                         if tier_list]
 
-        intent = self._classify_query_intent(query)
+        intent = self._classify_query_intent(
+            self._intent_source_text(query, raw_user_text))
         fused = self._reciprocal_rank_fusion(
             ranked_lists,
-            k=rrf_k, intent=intent,
+            k=(rrf_k if rrf_k > 0 else self._RRF_K), intent=intent,
             weight_overrides=self._intent_weights,
+            normalize_consensus=True,
         )
         out, survivors = self._format_markdown_with_survivors(fused, max_chars=max_chars)
+        self._log_hydration(ranked_lists, survivors, intent, max_chars)
         # Reinforcement credit AFTER fusion: only memories/lessons that
         # actually entered the prompt earn spaced-repetition / retrieval
         # credit. The fetchers deliberately skip their internal bumps
@@ -248,6 +294,48 @@ class MemoryBus:
             if survivors else None
         )
         return out
+
+    # Short tags for the per-hydration instrumentation line, in fetch order.
+    _TIER_TAGS = (("vector", "v"), ("graph", "g"), ("skill", "s"),
+                  ("episodic", "e"), ("session", "sess"))
+
+    def _log_hydration(self, ranked_lists: List[List[Dict[str, Any]]],
+                       survivors: List[Dict[str, Any]], intent: str,
+                       max_chars: int) -> None:
+        """One line per hydration: candidates and survivors per tier.
+
+        There was NO signal when a tier went permanently empty — the two
+        quiet-return paths and an unwired (``None``) store all returned ``[]``
+        indistinguishably, and the live log carried zero fetch-failure lines,
+        which is equally consistent with "all healthy" and "a tier has been
+        dead for weeks". A dead tier now reads as ``x=0`` and an unwired one
+        as ``x=-``. INFO so it lands in the file log without touching the
+        WARNING+ console/pretty stream."""
+        try:
+            stores = {"vector": self.vector, "graph": self.graph,
+                      "skill": self.skill, "episodic": self.episodic,
+                      "session": self.sessions}
+            cands: Dict[str, set] = {}
+            for tier_list in ranked_lists:
+                for it in tier_list or ():
+                    src = it.get("source") if isinstance(it, dict) else None
+                    if src:
+                        cands.setdefault(src, set()).add(it.get("text", ""))
+            surv: Dict[str, int] = {}
+            for it in survivors or ():
+                src = it.get("source") or "?"
+                surv[src] = surv.get(src, 0) + 1
+            got = " ".join(
+                f"{tag}=" + ("-" if stores.get(name) is None
+                             else str(len(cands.get(name) or ())))
+                for name, tag in self._TIER_TAGS)
+            kept = " ".join(f"{tag}{surv.get(name, 0)}"
+                            for name, tag in self._TIER_TAGS)
+            logger.info(
+                "Hydration tiers: %s -> %d survivors (%s) intent=%s budget=%d",
+                got, len(survivors or ()), kept, intent, max_chars)
+        except Exception as e:  # instrumentation must never break hydration
+            logger.debug(f"hydration instrumentation failed: {e}")
 
     async def judge_hydration_usefulness(self, reply: str, llm_client: Any,
                                          model_name: str = "default",
@@ -349,11 +437,18 @@ class MemoryBus:
                         logger.debug(f"skill record_helpful_retrieval failed: {e}")
 
         if self.usefulness_ledger_path is not None:
+            # `turn` groups the batch: every line written here shares ONE
+            # judge verdict. Without it the refit can only compute a per-ITEM
+            # used-rate, which measures tier VERBOSITY (a tier injecting 4.55
+            # items/turn is arithmetically capped near 1.65/4.55 while a
+            # 0.92-item tier can reach 1.0) — see rrf_weights._per_turn_lift.
+            turn_key = str(state.get("turn_id") or "") or f"ts-{state.get('ts', 0)}"
             lines = "".join(
                 json.dumps({
                     "intent": intent,
                     "source": s.get("source", "vector"),
                     "success": (i in used_idx),
+                    "turn": turn_key,
                     "ts": get_utc_timestamp(),
                 }) + "\n"
                 for i, s in enumerate(survivors)
@@ -419,6 +514,31 @@ class MemoryBus:
                 deduped.append(item)
         return deduped
 
+    # Shortest usable sub-query. Below this a "sub-query" is a fragment
+    # ("ok", "the") that matches everything and ranks nothing.
+    _MIN_SUB_QUERY_CHARS = 3
+
+    @classmethod
+    def _extend_sub_queries(cls, sub_queries: List[str], candidates: Any,
+                            limit: int = 3) -> None:
+        """Append usable, non-duplicate sub-queries in place."""
+        seen = {str(q).strip().lower() for q in sub_queries}
+        added = 0
+        for cand in (candidates or []):
+            if added >= limit:
+                break
+            if not isinstance(cand, str):
+                continue
+            cand = cand.strip()
+            if len(cand) < cls._MIN_SUB_QUERY_CHARS:
+                continue
+            key = cand.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            sub_queries.append(cand)
+            added += 1
+
     async def _decompose_query(self, query: str,
                                llm_client: Any = None) -> List[str]:
         """Decompose a query into sub-queries for broader retrieval.
@@ -474,7 +594,12 @@ class MemoryBus:
                         if match:
                             parsed = json.loads(match.group())
                             if isinstance(parsed, list):
-                                sub_queries.extend(str(s) for s in parsed[:3])
+                                # Validate: the model returns empty strings,
+                                # nulls, nested objects and — worst — echoes of
+                                # the original, which used to go straight into
+                                # retrieval. A duplicated sub-query silently
+                                # DOUBLES every fused score of the tier it hits.
+                                self._extend_sub_queries(sub_queries, parsed)
                                 return sub_queries[:4]  # Original + up to 3 decomposed
                 except Exception as exc:
                     logger.debug("Query decomposition failed: %s", exc)
@@ -498,6 +623,23 @@ class MemoryBus:
 
     # ------------------------------------------------------------- fetchers
 
+    @staticmethod
+    def _accepts_relevance_floor(fn: Any) -> bool:
+        """True when ``fn`` can take ``min_relevance_dist`` (explicitly or via
+        ``**kwargs``). Unintrospectable callables (builtins, C extensions,
+        mocks) are assumed to accept it — the gate is the safe default, and a
+        genuine arity error then surfaces as an error instead of silently
+        disabling the gate."""
+        import inspect
+        try:
+            params = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            return True
+        if "min_relevance_dist" in params:
+            return True
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD
+                   for p in params.values())
+
     async def _fetch_vector(self, query: str) -> List[Dict[str, Any]]:
         if not self.vector:
             return []
@@ -510,14 +652,21 @@ class MemoryBus:
         if callable(search_items):
             try:
                 # Proactive-injection gate: a query with no strong vector match
-                # injects nothing (see _VECTOR_MATCH_FLOOR). to_thread forwards
-                # the kwarg; a stub search_items without the param raises
-                # TypeError → retry positionally.
-                try:
+                # injects nothing (see _VECTOR_MATCH_FLOOR). Legacy stubs whose
+                # search_items lacks the parameter are detected BY SIGNATURE and
+                # called positionally. The old bare `except TypeError` also
+                # swallowed any TypeError raised INSIDE a real search_items and
+                # retried without the gate — silently injecting the weakly-
+                # related tail with no log at all (found 2026-07-22).
+                if self._accepts_relevance_floor(search_items):
                     items = await asyncio.to_thread(
                         search_items, query,
                         min_relevance_dist=self._VECTOR_MATCH_FLOOR)
-                except TypeError:
+                else:
+                    logger.warning(
+                        "MemoryBus vector off-topic gate DROPPED: "
+                        "%s.search_items takes no min_relevance_dist",
+                        type(self.vector).__name__)
                     items = await asyncio.to_thread(search_items, query)
                 return [
                     {"source": "vector", "text": it.get("text", ""), "mem_id": it.get("id")}
@@ -694,6 +843,7 @@ class MemoryBus:
                                 k: int = 60,
                                 intent: str = "contextual",
                                 weight_overrides: Optional[Dict[str, Dict[str, float]]] = None,
+                                normalize_consensus: bool = False,
                                 ) -> List[Tuple[Dict[str, Any], float]]:
         """Weighted RRF: score(d) = sum_r weight_r / (k + rank_r(d)).
 
@@ -703,27 +853,69 @@ class MemoryBus:
         learned matrix from :mod:`core.rrf_weights`) supersedes the
         hand-tuned ``_INTENT_WEIGHTS`` when supplied; ``None`` falls back
         to the defaults, so direct classmethod callers are unaffected.
+
+        ``normalize_consensus`` divides each source's accumulated scores by
+        that source's REDUNDANCY across the sub-query lists (emissions ÷
+        distinct items). RAG-Fusion's cross-sub-query consensus bonus is
+        only meaningful for a tier that CAN return different items per
+        sub-query: graph is keyword-seeded, so its variants return
+        near-identical edges and every edge banked ~4x the reciprocal rank,
+        while vector — by design — returns different items per sub-query and
+        banked 1x. Simulated on live shapes, top-8 for `contextual` came out
+        6 graph + 3 skill with the first vector item at fused position 9,
+        and _PER_SOURCE_CAP then handed graph six slots at the head of the
+        budget (found 2026-07-22). Dividing by redundancy makes each tier's
+        maximum attainable score w/(k+1) regardless of how stable it is,
+        while leaving INTRA-tier ordering (and therefore the genuine
+        consensus reward) untouched. Off by default: direct classmethod
+        callers keep the exact legacy arithmetic; ``hydrate_context``
+        turns it on.
         """
         wmap = weight_overrides or cls._INTENT_WEIGHTS
         weights = wmap.get(intent, wmap.get("contextual", cls._INTENT_WEIGHTS["contextual"]))
-        # Map source names to their weights. Sources: vector, graph, skill
-        # Positional fallback for a source-less ranked list. hydrate_context
-        # passes FIVE lists (vector, graph, skill, episodic, session) — keep
-        # this order in sync or a source-less item gets the wrong weight.
-        _source_order = ["vector", "graph", "skill", "episodic", "session"]
 
         scores: Dict[Tuple[str, str], float] = {}
         index: Dict[Tuple[str, str], Dict[str, Any]] = {}
-        for ranker_idx, ranker in enumerate(ranked_lists):
+        emissions: Dict[str, int] = {}
+        distinct: Dict[str, set] = {}
+        for ranker in ranked_lists:
             if not ranker:
                 continue
-            # Infer source from first item, fallback to positional mapping
-            source_name = ranker[0].get("source", _source_order[ranker_idx] if ranker_idx < len(_source_order) else "vector")
+            # `source` is REQUIRED. The old positional fallback keyed off the
+            # ranked-list index, which stopped being meaningful once
+            # hydrate_context began passing one list per (sub-query, tier) —
+            # and it was self-inconsistent anyway: it read `.get("source")`
+            # for the weight but `item["source"]` for the key, so a
+            # source-less item raised KeyError out of hydrate_context and
+            # cost the whole turn its context (found 2026-07-22).
+            head = ranker[0] if isinstance(ranker[0], dict) else {}
+            source_name = head.get("source")
+            if not source_name:
+                logger.debug("RRF: dropping ranked list with no source")
+                continue
             w = weights.get(source_name, 1.0)
             for rank, item in enumerate(ranker):
-                key = (item["source"], item["text"])
+                if not isinstance(item, dict):
+                    continue
+                src = item.get("source")
+                if not src:
+                    continue
+                key = (src, item.get("text", ""))
                 scores[key] = scores.get(key, 0.0) + w / (k + rank + 1)
                 index[key] = item
+                emissions[src] = emissions.get(src, 0) + 1
+                distinct.setdefault(src, set()).add(key)
+
+        if normalize_consensus:
+            redundancy = {
+                src: (emissions.get(src, 0) / len(keys)) if keys else 1.0
+                for src, keys in distinct.items()
+            }
+            for key in scores:
+                factor = redundancy.get(key[0], 1.0)
+                if factor > 1.0:
+                    scores[key] /= factor
+
         ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
         return [(index[key], score) for key, score in ordered]
 
@@ -756,6 +948,11 @@ class MemoryBus:
     # single tier (e.g. a heavy graph ego-dump) from monopolising the budget
     # when its fused scores happen to cluster at the top.
     _PER_SOURCE_CAP = 6
+
+    # Below this many chars left, no item (let alone a header + item) is worth
+    # emitting — the emission loop stops scanning rather than skipping items
+    # one by one to the end of a long fused list.
+    _MIN_EMITTABLE_CHARS = 8
 
     @staticmethod
     def _format_markdown(fused: List[Tuple[Dict[str, Any], float]],
@@ -817,13 +1014,12 @@ class MemoryBus:
             if header is not None and src not in emitted_headers:
                 header_cost = len(header) + 1
             remaining = max_chars - used
-            if remaining <= 0:
-                break
+            if remaining <= MemoryBus._MIN_EMITTABLE_CHARS:
+                break  # nothing meaningful can fit any more
             cost = len(text) + 1 + header_cost
             if cost > remaining:
                 # Nothing emitted yet — truncate the single highest-ranked
-                # item in place rather than returning empty context;
-                # otherwise stop, since lower-ranked items can't fit either.
+                # item in place rather than returning empty context.
                 if used == 0:
                     if header is not None and src not in emitted_headers:
                         lines.append(header)
@@ -833,7 +1029,17 @@ class MemoryBus:
                     lines.append(text[:max(0, remaining)].rstrip() + " [...]")
                     survivors.append(item)
                     used = max_chars
-                break
+                    break
+                # Otherwise SKIP this item and keep filling. Items are ordered
+                # by fused score, NOT by length, so the old `break` (comment:
+                # "lower-ranked items can't fit either") was simply false:
+                # reproduced 2026-07-22, a 900-char vector item at rank 3
+                # discarded a 23-char SKILL LESSON and a 6-char graph edge
+                # that both fit trivially in the remaining 277 chars, and the
+                # entire SKILL PLAYBOOK and TOPOLOGICAL KNOWLEDGE GRAPH
+                # sections vanished from the prompt — headers included,
+                # silently, because they are emitted lazily on first sight.
+                continue
             if header is not None and src not in emitted_headers:
                 lines.append(header)
                 emitted_headers.add(src)

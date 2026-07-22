@@ -30,6 +30,15 @@
     <li>Atomic temp + <code>os.replace</code>; <code>threading.RLock</code>.</li>
   </ul>
 
+  <h2>Load hardening (2026-07-22)</h2>
+  <p><code>_load()</code> distinguishes three outcomes rather than the old <code>except Exception: pass</code> that silently started from the initial threshold and let the very next <code>record()</code> atomically overwrite the intact file — the whole learned window gone, at no log level:</p>
+  <ul>
+    <li><strong>absent</strong> → keep the seeded initial threshold (normal cold start);</li>
+    <li><strong>corrupt</strong> (bad JSON / wrong type / non-list window / undecodable bytes) → move the raw bytes to a timestamped <code>adaptive_threshold.corrupt-*.json</code> sidecar, <code>WARNING</code>, restart from the initial threshold;</li>
+    <li><strong>present-but-unreadable</strong> (<code>OSError</code> — EIO / EACCES) → run on the initial threshold but set <code>_degraded</code> (logged at <code>ERROR</code>); while set, <code>_save()</code> REFUSES to write over the on-disk state.</li>
+  </ul>
+  <p>Tests: <code>tests/test_memory_store_durability.py</code>.</p>
+
   <h2>State</h2>
   <pre><code>{ "threshold": float, "window": [(score, was_useful), ...] }   # window cap = 100</code></pre>
   <p><code>WINDOW_SIZE = 100</code> · <code>MIN_OBSERVATIONS = 20</code> before recalculation kicks in.</p>
@@ -47,6 +56,9 @@
 
   <h2>Recalculation rule</h2>
   <p>The threshold is set to <strong>90 % of the minimum useful score</strong>, but never below the median of useless scores. Floor 0.3, ceiling 0.95.</p>
+
+  <h2>Known limitation — the learned threshold is dead weight under <code>--smart-memory 0.9</code></h2>
+  <p>The 2026-07-22 durability pass did <strong>not</strong> change the retention numbers — this is a documented caveat, not a change. Under the live flag the learned value is effectively inert: the consumer takes <code>max(cli_selectivity, learned)</code>, so with <code>--smart-memory 0.9</code> the effective bar is already &gt;= 0.9; the learned value can never exceed 0.9 (the upward candidate is <code>min(useful_scores) * 0.9 &lt;= 0.9</code>) and its update rule can only ratchet DOWN toward the 0.3 floor when the window starves — so it can neither raise nor lower the bar. Compounding it, <code>was_useful</code> is self-referential as wired in <code>core.agent</code>: the signal fed back is "the score cleared the bar", not "the memory was later retrieved and helped", so the loop measures its own gate rather than utility. The class becomes load-bearing again only for a selectivity below ~0.9. Changing the arithmetic alters what the agent remembers, so it is a retention decision that was deliberately kept out of a persistence fix.</p>
 
   <h2>Concurrency</h2>
   <p><code>threading.RLock</code> guards both reads and writes. Writes are atomic via temp file.</p>

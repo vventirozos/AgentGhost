@@ -186,6 +186,22 @@
 
   <p>End-to-end walkthrough: see <a href="../algorithms/dream_cycle.html">algorithms / dream cycle</a>.</p>
 
+  <h2>Background worker calls degrade off-main <span class="tag">2026-07-22</span></h2>
+  <p>All 8 of dream/self-play's background <code>chat_completion</code> calls
+  (REM consolidation, episode consolidation, graph-merge confirmation, lesson
+  graduation + extraction, challenge generation, reference-solution and
+  validator repair) now pass <code>off_main_only=True</code> so a
+  <a href="llm.html">worker</a> hiccup mid-cycle degrades — skip and retry next
+  cycle, via each site's pre-existing <code>except</code> — instead of dogpiling
+  the single main slot the operator is chatting on. User-triggered self-play
+  (<code>tool_self_play(is_background=False)</code>) is exempt via
+  <code>off_main_only=is_background</code>: there the user IS waiting on the
+  self-play, so a main fallback is correct. The isolated solver agent's own
+  turns (<code>_BackgroundOnlyLLM</code>) genuinely target the main 35B (that is
+  what's being trained) and are left as-is. The untimed high-<code>max_tokens</code>
+  calls (challenge-gen at 16384, the repairs at 4096) also gained
+  <code>timeout=180.0</code>. Test: <code>test_dream_offmain_contention.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
   <h2>Counterfactual replay — regression-of-learning, phase 1 (2026-07-17)</h2>
   <p><code>core/counterfactual.py</code>. Every concluded self-play sim now persists its

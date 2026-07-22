@@ -7,12 +7,38 @@ new users need aggressive retention.
 The "was_useful" signal: a memory was retrieved and included in a response
 the user didn't correct (positive), or the user corrected a response that
 used a stored memory (negative).
+
+KNOWN LIMITATION — the learned threshold is currently inert in prod
+--------------------------------------------------------------------
+Read this before "fixing" a threshold that never seems to move:
+
+1. ``was_useful`` is SELF-REFERENTIAL as wired in ``core.agent``: the
+   signal fed back is "the score cleared the bar", not "the memory was
+   later retrieved and helped". The loop therefore measures its own gate,
+   not utility.
+2. The update rule can effectively only ratchet DOWN. The upward
+   candidate is ``min(useful_scores) * 0.9``, and a score is at most 1.0,
+   so the candidate is at most 0.9 — while ``MAX_STEP_UP`` caps each rise
+   at 0.02. The floor branch (``threshold * 0.98``) has no such cap.
+3. The consumer takes ``max(cli_selectivity, learned)``. Under the live
+   flag ``--smart-memory 0.9`` the effective bar is therefore >= 0.9 and
+   the learned value — which cannot exceed 0.9 and decays toward
+   ``FLOOR`` (0.3) whenever the window starves — is DEAD WEIGHT: it can
+   never raise the bar and can never lower it either.
+
+Consequence: with ``--smart-memory 0.9`` this class is bookkeeping only.
+It becomes load-bearing again only for a selectivity below ~0.9. The
+2026-07-22 durability pass deliberately did NOT change the numbers here:
+altering the retention rule changes what the agent remembers, which is an
+operator-visible behaviour change and needs to be decided, not smuggled
+in with a persistence fix. See ``_recalculate`` for the mechanics.
 """
 
 import json
 import logging
 import os
 import threading
+import time
 from collections import deque
 from pathlib import Path
 
@@ -50,20 +76,81 @@ class AdaptiveThreshold:
         self._initial = initial
         self.threshold = initial
         self.window: deque = deque(maxlen=self.WINDOW_SIZE)
+        # Set when the state file is PRESENT but could not be read. While
+        # set, _save() refuses to write — see _load().
+        self._degraded = False
         self._load()
 
+    def _quarantine_corrupt(self, why: str) -> None:
+        """Corrupt state: preserve the raw file as a timestamped sidecar
+        BEFORE the next _save() overwrites it, then start from the
+        defaults. Same policy as journal.py / profile.py."""
+        try:
+            sidecar = self.file_path.with_suffix(f".corrupt-{int(time.time())}.json")
+            os.replace(self.file_path, sidecar)
+            logger.warning(
+                "adaptive_threshold.json was corrupt (%s); preserved to %s and "
+                "restarted from the initial threshold.", why, sidecar.name,
+            )
+        except Exception:
+            logger.warning(
+                "adaptive_threshold.json was corrupt (%s) and could not be "
+                "preserved; restarting from the initial threshold.", why,
+            )
+
     def _load(self):
-        if not self.file_path.exists():
+        # A missing file is the normal cold start — nothing to preserve.
+        try:
+            content = self.file_path.read_text()
+        except FileNotFoundError:
+            return
+        except UnicodeDecodeError:
+            self._quarantine_corrupt("undecodable bytes")
+            return
+        except OSError as exc:
+            # PRESENT but unreadable (EIO / EACCES / ENFILE …). The old
+            # `except Exception: pass` silently started from the initial
+            # threshold and the very next record() atomically OVERWROTE
+            # the intact file — the whole learned window gone, at no log
+            # level at all. Refuse to write instead: fail closed, loudly.
+            self._degraded = True
+            logger.error(
+                "adaptive_threshold.json is present but unreadable (%s: %s). "
+                "Running on the initial threshold and REFUSING to overwrite "
+                "the on-disk state until it can be read.",
+                type(exc).__name__, exc,
+            )
+            return
+        if not content.strip():
             return
         try:
-            data = json.loads(self.file_path.read_text())
-            self.threshold = float(data.get("threshold", self._initial))
-            for obs in data.get("window", []):
+            data = json.loads(content)
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"state is a {type(data).__name__}, expected object")
+            threshold = float(data.get("threshold", self._initial))
+            window = data.get("window", [])
+            if not isinstance(window, list):
+                raise ValueError("window is not a list")
+        except Exception as exc:
+            self._quarantine_corrupt(f"{type(exc).__name__}: {exc}")
+            return
+        self.threshold = threshold
+        for obs in window:
+            try:
                 self.window.append(tuple(obs))
-        except Exception:
-            pass
+            except TypeError:
+                continue
 
     def _save(self):
+        if self._degraded:
+            # See _load(): the on-disk state exists but could not be read,
+            # so writing would destroy it.
+            logger.warning(
+                "Adaptive threshold save skipped: on-disk state is unreadable "
+                "and must not be overwritten."
+            )
+            return
         try:
             data = {
                 "threshold": self.threshold,
@@ -73,7 +160,7 @@ class AdaptiveThreshold:
             tmp.write_text(json.dumps(data, indent=2))
             os.replace(tmp, self.file_path)
         except Exception as e:
-            logger.debug(f"Adaptive threshold save failed: {e}")
+            logger.warning(f"Adaptive threshold save failed: {e}")
 
     def record(self, score: float, was_useful: bool):
         """Record an observation: a memory with this score was (not) useful."""
@@ -97,6 +184,14 @@ class AdaptiveThreshold:
         Strategy: set threshold to 90% of the minimum score among useful
         memories. This keeps the bar slightly below the weakest useful signal
         to avoid filtering out borderline-but-valuable facts.
+
+        NOTE (see the module docstring): ``min_useful * 0.9 <= 0.9`` for any
+        score in [0, 1], so this rule cannot push the threshold above 0.9,
+        while the no-useful-observations branch decays it toward FLOOR
+        without limit. Combined with the consumer's
+        ``max(cli_selectivity, learned)`` that makes the learned value inert
+        at the live ``--smart-memory 0.9``. Changing that is a retention
+        decision, not a bug fix, so the arithmetic is left as-is here.
         """
         if len(self.window) < self.MIN_OBSERVATIONS:
             return

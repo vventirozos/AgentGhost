@@ -170,7 +170,9 @@ async def run_subagent(context, *, job_id: str, task: str,
 
     Raises ``asyncio.TimeoutError`` on the bound (the job registry lands
     that as a FAILED job) — a delegate that can't finish must not hang the
-    registry forever.
+    registry forever. Raises ``RuntimeError`` if the tool-surface
+    restriction cannot be applied (same FAILED-job landing) — a containment
+    boundary must fail CLOSED, never run the delegate with the full surface.
     """
     from .agent import GhostAgent
 
@@ -190,6 +192,16 @@ async def run_subagent(context, *, job_id: str, task: str,
     #      `_subagent_allowed_tools` (set on `iso` in build_subagent_context)
     #      so a miss can't heal the dict back to the full registry.
     # Any one of these alone is bypassable; together they contain the agent.
+    #
+    # FAIL CLOSED (2026-07-22): if any of this throws (registry import,
+    # unexpected defs shape), the agent would otherwise proceed with the
+    # FULL schema + FULL dispatch dict — the exact surface the gates exist
+    # to deny. A deny-all fallback is not constructible here either:
+    # `disabled_tools` is a DENYLIST, so hiding everything requires
+    # enumerating every advertised name — and the failure mode being
+    # defended against is precisely "the registry could not be enumerated".
+    # The only guaranteed-safe state is to not run at all: raise, and the
+    # job registry lands a FAILED job (same contract as the timeout bound).
     allow = set(allowed_tools)
     try:
         from ..tools.registry import TOOL_DEFINITIONS
@@ -199,7 +211,15 @@ async def run_subagent(context, *, job_id: str, task: str,
             k: v for k, v in agent.available_tools.items() if k in allow
         }
     except Exception as e:  # noqa: BLE001
-        logger.debug("subagent tool restriction failed: %s", e)
+        logger.error(
+            "subagent %s: tool containment could not be applied (%s: %s) — "
+            "aborting the job rather than running with the full tool surface",
+            job_id, type(e).__name__, e,
+        )
+        raise RuntimeError(
+            f"sub-agent tool containment failed ({type(e).__name__}: {e}); "
+            "refusing to run the delegate with an unrestricted tool surface"
+        ) from e
 
     prompt = (
         f"{task}\n\n"

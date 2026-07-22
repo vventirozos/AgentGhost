@@ -179,6 +179,45 @@
   by the code are never touched. The same tidy also runs automatically from the idle
   loop (phase 2.7d, 6-hourly, 24&nbsp;h age gate) — this action is for "clean up the
   project" asked directly. Covered by <code>tests/test_workspace_tidy.py</code>.</p>
+  <p><strong>Reference validated at the boundary (2026-07-20).</strong> <code>cleanup</code>
+  is destructive, but it was the one destructive action that skipped
+  <code>_resolve_project_ref</code>: the model-supplied <code>project_id</code> went raw
+  into <code>tidy_project_workspace</code>, so a traversal id like <code>"../.."</code>
+  resolved to the sandbox <em>parent</em> and the tidy walked (and deleted from)
+  directories outside the project sandbox. The reference is now resolved against the
+  store like <code>delete</code>/<code>archive</code>: an unknown ref fails loudly
+  ("nothing was cleaned"), an ambiguous title lists the candidate ids, and only a real
+  project id reaches the tidy. The sweep itself additionally asserts containment under
+  <code>projects/</code> (see <a href="../core/workspace_cleanup.html">core.workspace_cleanup</a>).
+  Covered by <code>tests/test_projects_tool_review_fixes.py</code>.</p>
+
+  <h2><code>update</code> metadata merges — a partial update can't wipe project state (2026-07-20)</h2>
+  <p><code>action=update</code> resolves <code>project_id</code> through
+  <code>_resolve_project_ref</code> (a title or stale id doesn't silently match zero rows),
+  then applies any of <code>title</code> / <code>goal</code> / <code>status</code> /
+  <code>kind</code> / <code>metadata</code>. For <code>metadata</code>:</p>
+  <ul>
+    <li><strong>Boundary coercion.</strong> A stringified JSON object (the model often
+    quotes object params) is parsed; anything that is not a JSON object — e.g.
+    <code>metadata='["x"]'</code> parsing to a list — is rejected with an error instead of
+    being persisted verbatim, where it used to poison every later
+    <code>dict(metadata)</code>/<code>metadata.get(...)</code> reader.</li>
+    <li><strong>Merge, not replace.</strong> The dict is passed to
+    <a href="../memory/projects.html"><code>ProjectStore.update_project</code></a>, which
+    shallow-<em>merges</em> it into the existing metadata inside a single
+    <code>BEGIN IMMEDIATE</code> transaction. The metadata blob carries system state
+    (design ledger, config slot, <code>steps_used/steps_cap</code>, research index, runtime
+    counters), so the old whole-dict replace made even the documented budget-raise
+    <code>action=update metadata={"steps_cap": 100}</code> silently destroy all of it —
+    that call now touches only <code>steps_cap</code>.</li>
+    <li><strong>No replace from the tool surface.</strong> The tool deliberately does not
+    expose the store's <code>metadata_replace</code> flag: merge is the only behavior
+    reachable from the LLM; a true whole-dict replacement is a deliberate store-API call
+    (<code>update_project(id, metadata=…, metadata_replace=True)</code>).</li>
+  </ul>
+  <p>Covered by <code>tests/test_projects_store.py</code> (merge / budget-raise /
+  opt-in replace) and <code>tests/test_projects_tool_review_fixes.py</code>
+  (non-dict rejection).</p>
 
   <h2>Defect reports reopen DONE projects (2026-07-18)</h2>
   <p>A bug-report-shaped request (the same <code>_is_bug_report_intent</code> gate

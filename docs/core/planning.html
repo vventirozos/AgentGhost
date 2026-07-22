@@ -59,7 +59,7 @@
       <tr><td><code>_check_parent_failure(parent_id)</code></td><td>Spawns alternatives, propagates BLOCKED/FAILED (line 216).</td></tr>
       <tr><td><code>get_active_node()</code></td><td>Next leaf in IN_PROGRESS or READY (line 267).</td></tr>
       <tr><td><code>render()</code></td><td>ASCII tree with emoji status icons (line 292).</td></tr>
-      <tr><td><code>request_revision(task_id, failure_reason)</code></td><td>Increment revision_count, reset to PENDING if &lt;3 (line 394).</td></tr>
+      <tr><td><code>request_revision(task_id, failure_reason)</code></td><td>Increment revision_count, reset to PENDING if &lt;3 (line 394); also unblocks a parent BLOCKED by this task. <code>ProjectPlan</code> overrides this with a persistent counterpart (2026-07-20, see <em>Plan-gate hardening</em> below).</td></tr>
       <tr><td><code>load_from_json(json_data)</code></td><td>Stateful merge (no clear) so concurrent edits survive; coerces malformed planner fields (2026-07-20, see below).</td></tr>
     </tbody>
   </table>

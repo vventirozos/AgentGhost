@@ -28,8 +28,10 @@ Design constraints:
   does not admit the ``<function=name>`` equals-variant; variants exist
   downstream for lenient PARSING, not for generation.
 * String parameter values admit ANY text that does not contain the
-  literal ``</parameter>`` close (prefix-exclusion chain) — file writes
-  with HTML/code inside keep working.
+  literal ``</parameter>`` close (prefix-exclusion chain, plus a
+  trailing-partial-prefix tail so a value may END in e.g. a bare ``<``
+  and the real close tag still parses) — file writes with HTML/code
+  inside keep working.
 * Required-ness and non-duplication of parameters are NOT enforced —
   GBNF can't express unordered required subsets without a combinatorial
   blow-up, and the tool layer already validates and teaches on missing
@@ -62,21 +64,59 @@ _NAME_SAFE_RE = re.compile(r"[^a-zA-Z0-9-]")
 
 def _rule_name(prefix: str, name: str) -> str:
     """GBNF rule names allow [a-zA-Z0-9-]; tool/arg names carry
-    underscores. Collisions after mapping are impossible in practice
-    (registry names are unique case-sensitively in [a-z0-9_])."""
+    underscores. The ``_`` → ``-`` mapping CAN collide across distinct
+    (tool, param) pairs (``web_search``+``query`` and ``web``+
+    ``search_query`` both map to ``p-web-search-query``), so this base
+    name is only ever emitted through ``build_tool_grammar``'s per-build
+    allocator, which suffixes ``-x2``, ``-x3``, … until the name is
+    unique within the grammar."""
     return f"{prefix}-{_NAME_SAFE_RE.sub('-', str(name))}"
 
 
 def _gbnf_string_literal(text: str) -> str:
-    return '"' + str(text).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """A GBNF double-quoted literal for ``text``. Escapes backslash and
+    quote, AND newlines/control characters — a raw newline inside a
+    literal splits the rule across lines and a raw control char is
+    rejected by llama-server's grammar parser at request time, so a
+    hostile enum value or parameter name used to build 'successfully'
+    here and 400 later. llama.cpp's parser accepts \\n \\r \\t and
+    \\xHH escapes inside literals."""
+    out = []
+    for ch in str(text):
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\x{ord(ch):02X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 # "Any text not containing '</parameter>'" — the standard prefix-
 # exclusion chain. Each step consumes the matched prefix plus one
 # diverging character; the real close tag is consumed by the param rule
 # instead. Shared by every string-typed parameter.
+#
+# ``sv-tail`` (2026-07-22 fix): the chain alone cannot ACCEPT a value
+# that ENDS in a proper prefix of the close tag — ``"<" sv0`` demands a
+# continuation character, so for a value ending in a bare ``<`` the only
+# live parse absorbed the real ``</parameter>`` into the value text and
+# generation could never legally terminate (runaway until max_tokens).
+# ``sv-tail`` lets a value end in any proper prefix of the sentinel; the
+# parse where the value stops there and the param rule's literal close
+# tag matches next keeps termination reachable. Values still cannot
+# CONTAIN the full close tag: mid-value ``<`` continues through the
+# chain, and the tail only ever matches at the very end of ``sval``.
 _SVAL_RULES = r"""
-sval ::= svc*
+sval ::= svc* sv-tail?
 svc ::= [^<] | "<" sv0
 sv0 ::= [^/] | "/" sv1
 sv1 ::= [^p] | "p" sv2
@@ -88,6 +128,7 @@ sv6 ::= [^e] | "e" sv7
 sv7 ::= [^t] | "t" sv8
 sv8 ::= [^e] | "e" sv9
 sv9 ::= [^r] | "r" [^>]
+sv-tail ::= "<" | "</" | "</p" | "</pa" | "</par" | "</para" | "</param" | "</parame" | "</paramet" | "</paramete" | "</parameter"
 """.strip()
 
 _SCALAR_RULES = """
@@ -130,28 +171,50 @@ def build_tool_grammar(frozen_funcs: tuple) -> str:
     …)``). Descriptions and required-sets are ignored by design."""
     fn_rules, param_rules, value_rules = [], [], []
     fn_alts = []
+
+    # Rule names go through this allocator so distinct (tool, param)
+    # pairs NEVER share a rule name: the `_` → `-` mapping collides
+    # (web_search+query vs web+search_query → p-web-search-query), and
+    # a duplicated tool name in the schema would otherwise emit two
+    # identical rule definitions — both shapes built "successfully" and
+    # then 400'd at llama-server request time. Iteration order over the
+    # frozen tuple is deterministic, so suffixes are stable per build.
+    used_names: set = set()
+
+    def _alloc(prefix: str, raw: str) -> str:
+        base = _rule_name(prefix, raw)
+        rule, n = base, 1
+        while rule in used_names:
+            n += 1
+            rule = f"{base}-x{n}"
+        used_names.add(rule)
+        return rule
+
     for name, _desc, prop_items, _required in frozen_funcs:
         if not name:
             continue  # schema-less/garbage entry — nothing to constrain to
-        fn_rule = _rule_name("fn", name)
+        fn_rule = _alloc("fn", name)
         fn_alts.append(fn_rule)
         p_alts = []
         for p_name, p_type, _p_desc, p_enum in prop_items:
-            p_rule = _rule_name("p", f"{name}-{p_name}")
-            v_rule = _rule_name("v", f"{name}-{p_name}")
+            p_rule = _alloc("p", f"{name}-{p_name}")
+            v_rule = _alloc("v", f"{name}-{p_name}")
             custom = _value_rule_for(p_type, p_enum, v_rule)
             if custom is None:
+                used_names.discard(v_rule)  # unused — release the name
                 v_rule = "sval"
             else:
                 value_rules.append(custom)
+            p_open = _gbnf_string_literal(f'<parameter name="{p_name}">')
             param_rules.append(
-                f'{p_rule} ::= "<parameter name=\\"{p_name}\\">" '
+                f'{p_rule} ::= {p_open} '
                 f"{v_rule} \"</parameter>\" ws"
             )
             p_alts.append(p_rule)
         params = f"({' | '.join(p_alts)})*" if p_alts else ""
+        fn_open = _gbnf_string_literal(f'<function name="{name}">')
         fn_rules.append(
-            f'{fn_rule} ::= "<function name=\\"{name}\\">" ws '
+            f'{fn_rule} ::= {fn_open} ws '
             f"{params + ' ' if params else ''}\"</function>\""
         )
     if not fn_alts:

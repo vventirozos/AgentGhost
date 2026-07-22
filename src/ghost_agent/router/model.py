@@ -359,8 +359,18 @@ class ComplexityClassifier:
             tol=float(hp.get("tol", 1e-5)),
             random_state=int(hp.get("random_state", 0)),
         )
-        clf.weights_ = np.array(raw["weights"], dtype=float)
-        clf.bias_ = float(raw["bias"])
+        try:
+            clf.weights_ = np.array(raw["weights"], dtype=float)
+            clf.bias_ = float(raw["bias"])
+        except (KeyError, TypeError, ValueError) as e:
+            # Normalise malformed-payload failures (missing keys, wrong
+            # types, ragged arrays) into ValueError so the boot loader has
+            # ONE clean, catchable failure mode: fall back to the
+            # escalate-all dispatcher and retrain over the bad file.
+            raise ValueError(
+                f"router checkpoint at {p} is malformed ({e}) — refusing to "
+                "load; it will be retrained."
+            ) from e
         names = tuple(raw.get("feature_names") or FEATURE_NAMES)
         clf.feature_names_ = names
         # Validate the persisted feature schema against the CURRENT one. Only
@@ -379,7 +389,16 @@ class ComplexityClassifier:
                 "misaligned model; it will be retrained."
             )
         if raw.get("report"):
-            clf.report_ = TrainingReport(**raw["report"])
+            try:
+                clf.report_ = TrainingReport(**raw["report"])
+            except TypeError as e:
+                # Field drift in the diagnostics-only report (older/newer
+                # TrainingReport shape) — same clean ValueError contract
+                # as above so the boot loader falls back and retrains.
+                raise ValueError(
+                    f"router checkpoint at {p} has an incompatible training "
+                    f"report ({e}) — refusing to load; it will be retrained."
+                ) from e
         # Reject a persisted NaN/inf checkpoint (e.g. one written by a
         # pre-guard training run that diverged). Loading it would silently
         # poison routing; the boot loader catches this and falls back to

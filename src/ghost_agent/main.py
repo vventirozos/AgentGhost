@@ -1193,10 +1193,12 @@ async def lifespan(app):
             _patch_fn = None
             if getattr(args, "postmortem_propose_patch", False):
                 async def _patch_fn(prompt: str) -> str:  # noqa: F811
-                    """Coding-model call for a code_defect: returns a
-                    reproducing test + unified diff. Routed through the
-                    coding pool when one is configured (chat_completion
-                    honours the model field); the result is stored as a
+                    """Coding call for a code_defect: returns a
+                    reproducing test + unified diff. Rides the DEFAULT
+                    (main) route at background priority — chat_completion
+                    only targets the coding pool when use_coding=True,
+                    which this closure does not pass (the model field
+                    alone never reroutes). The result is stored as a
                     proposal only — it is never applied."""
                     payload = {
                         "model": args.model,
@@ -1265,12 +1267,33 @@ async def lifespan(app):
 
         clf = None
         if router_ckpt_path.exists():
-            clf = ComplexityClassifier.load(router_ckpt_path)
-            pretty_log(
-                "Complexity Router",
-                f"Loaded classifier from {router_ckpt_path}",
-                icon=Icons.BRAIN_PLAN,
-            )
+            # Load in its OWN try/except: a corrupt or schema-incompatible
+            # checkpoint must not take down the whole router wiring. The
+            # outer except used to swallow this and null BOTH the
+            # dispatcher AND _router_checkpoint_path — which killed the
+            # bootstrap-train below plus every idle/self-play retrain, so
+            # one bad file meant a dead router on every boot until the
+            # file was manually deleted (model.py's load deliberately
+            # raises on schema drift EXPECTING this fallback to exist).
+            # Instead: fall back to clf=None (escalate-all dispatcher)
+            # with the checkpoint path intact, and let the bootstrap-train
+            # below OVERWRITE the bad checkpoint from the trajectory log.
+            try:
+                clf = ComplexityClassifier.load(router_ckpt_path)
+                pretty_log(
+                    "Complexity Router",
+                    f"Loaded classifier from {router_ckpt_path}",
+                    icon=Icons.BRAIN_PLAN,
+                )
+            except Exception as load_err:  # noqa: BLE001 — boot must survive any checkpoint state
+                clf = None
+                pretty_log(
+                    "Complexity Router",
+                    f"Checkpoint at {router_ckpt_path} failed to load ({load_err}); "
+                    "falling back to escalate-all dispatcher and retraining from trajectories",
+                    level="WARNING",
+                    icon=Icons.WARN,
+                )
         elif args.router_model:
             # Explicit --router-model pointed at a missing file: surface it.
             pretty_log(
@@ -1280,7 +1303,9 @@ async def lifespan(app):
                 icon=Icons.WARN,
             )
 
-        # Bootstrap-train at startup when no checkpoint exists yet. The router
+        # Bootstrap-train at startup when no USABLE checkpoint exists —
+        # missing file or a checkpoint that failed to load above (the
+        # save_path overwrite is what self-heals a corrupt one). The router
         # otherwise only ever gets a model from an IDLE retrain (needs a long-
         # lived idle process); a busy server or benchmark never idles and would
         # stay escalate-all forever. One-time train from the existing trajectory
@@ -1366,7 +1391,12 @@ async def lifespan(app):
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
-            res = await context.llm_client.chat_completion(payload)
+            # BACKGROUND priority: narrative consolidation runs from the
+            # biological idle watchdog (phase 2.8), never on the user's
+            # synchronous path. Foreground-marked it bumped foreground_tasks
+            # (skewing every "is a user live?" check) and contended for the
+            # main slot with a live turn.
+            res = await context.llm_client.chat_completion(payload, is_background=True)
             content = (
                 (res or {})
                 .get("choices", [{}])[0]
@@ -1435,7 +1465,10 @@ async def lifespan(app):
                 "stream": False,
                 "chat_template_kwargs": {"enable_thinking": False},
             }
-            res = await context.llm_client.chat_completion(payload)
+            # BACKGROUND priority — same rationale as the selfhood
+            # narrative closure above: idle-phase call, never on the
+            # user's synchronous path.
+            res = await context.llm_client.chat_completion(payload, is_background=True)
             content = (
                 (res or {})
                 .get("choices", [{}])[0]

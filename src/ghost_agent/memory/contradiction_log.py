@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -24,22 +25,97 @@ class ContradictionLog:
     def __init__(self, memory_dir: Path):
         self.file_path = memory_dir / "contradiction_log.json"
         self._lock = threading.RLock()
+        # Set when the log file is PRESENT but unreadable — see _load().
+        self._degraded = False
         if not self.file_path.exists():
             self._save([])
+        else:
+            # Probe once at construction so an unreadable / corrupt log is
+            # detected (and quarantined) at boot rather than on the first
+            # record() — clear() writes without reading, so a lazy check
+            # left one path that could still overwrite a corrupt file
+            # without preserving it.
+            self._load()
 
     def _save(self, entries: list):
+        if self._degraded:
+            # The file exists and could not be read: record() would
+            # otherwise write a ONE-entry list over the whole history.
+            logger.warning(
+                "Contradiction log write skipped: %s is unreadable and must "
+                "not be overwritten.", self.file_path.name,
+            )
+            return
         tmp = self.file_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(entries, indent=2))
         os.replace(tmp, self.file_path)
 
-    def _load(self) -> list:
+    def _quarantine_corrupt(self, why: str) -> list:
+        """Corrupt log: preserve the raw file as a timestamped sidecar
+        BEFORE the next _save() overwrites it, then start clean. Same
+        policy as journal.py / profile.py."""
         try:
-            data = json.loads(self.file_path.read_text())
-            # Wrong-type (dict/scalar) would break record()/get_recent which
-            # expect a list — treat as empty.
-            return data if isinstance(data, list) else []
+            sidecar = self.file_path.with_suffix(f".corrupt-{int(time.time())}.json")
+            os.replace(self.file_path, sidecar)
+            logger.warning(
+                "contradiction_log.json was corrupt (%s); preserved to %s and "
+                "started a fresh log.", why, sidecar.name,
+            )
         except Exception:
+            logger.warning(
+                "contradiction_log.json was corrupt (%s) and could not be "
+                "preserved; starting a fresh log.", why,
+            )
+        return []
+
+    def _load(self) -> list:
+        """Read the log.
+
+        Three distinct outcomes — the old ``except Exception: return []``
+        collapsed them into one and made an unreadable file behave exactly
+        like an absent one, so the next record() atomically overwrote 200
+        entries of belief-revision history with a single entry, silently:
+
+        * absent        → [] (normal cold start);
+        * corrupt       → sidecar the bytes, then [] (safe to overwrite:
+                          the original is preserved);
+        * unreadable    → [] **and fail closed** (``_degraded``), so no
+                          write can destroy the intact file. Cleared
+                          automatically as soon as a read succeeds.
+        """
+        try:
+            content = self.file_path.read_text()
+        except FileNotFoundError:
+            self._degraded = False
             return []
+        except UnicodeDecodeError:
+            self._degraded = False
+            return self._quarantine_corrupt("undecodable bytes")
+        except OSError as exc:
+            if not self._degraded:
+                logger.error(
+                    "contradiction_log.json is present but unreadable (%s: %s). "
+                    "Belief-revision history is unavailable and writes are "
+                    "BLOCKED so the file is not overwritten.",
+                    type(exc).__name__, exc,
+                )
+            self._degraded = True
+            return []
+        if not content.strip():
+            self._degraded = False
+            return []
+        try:
+            data = json.loads(content)
+            # Wrong-type (dict/scalar) would break record()/get_recent which
+            # expect a list — treat as corrupt.
+            if not isinstance(data, list):
+                raise ValueError(
+                    f"log is a {type(data).__name__}, expected list")
+        except Exception as exc:
+            self._degraded = False
+            return self._quarantine_corrupt(f"{type(exc).__name__}: {exc}")
+        self._degraded = False
+        return data
 
     def record(self, new_fact: str, old_facts: list, deleted_ids: list, reason: str = ""):
         """Record a belief revision event.

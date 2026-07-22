@@ -5,6 +5,56 @@ from pathlib import Path
 from typing import Any, Dict
 from ..utils.logging import pretty_log, Icons
 
+# Keys whose value is inherently SINGLE-valued, so a second write is a
+# CORRECTION and must REPLACE rather than merge.
+#
+# The merge branch below exists for facts that genuinely coexist
+# ("python" AND "rust" are both interests). Applying it to a singular
+# noun turned every correction into an accumulation:
+# ``update("relationships","wife","Anna")`` then ``(…,"wife","Maria")``
+# produced ``- wife: Anna, Maria`` — injected into the system prompt every
+# turn, for ever, with nothing anywhere able to reconcile it. Note that
+# `wife`/`husband`/`son`/`daughter`/`car` are keys the canonicalisation
+# table in update() explicitly CREATES, so they were guaranteed to hit
+# the merge branch.
+#
+# Rule of thumb for extending this: SINGULAR key ⇒ singleton. Genuinely
+# multi-valued facts belong under a PLURAL key (`pets`, `children`,
+# `languages`, `topics`), which keeps merge semantics untouched.
+_SINGLETON_KEYS = {
+    # identity
+    "name", "role", "email", "timezone", "age",
+    "birthday", "pronouns", "title", "location",
+    # relationships (singular — the canonicalisation table creates these)
+    "wife", "husband", "spouse", "partner",
+    "mother", "father", "mom", "dad",
+    "son", "daughter", "child",
+    # possessions / residence (singular)
+    "car", "vehicle", "home", "house", "address", "phone",
+    # work
+    "employer", "company", "job", "occupation", "nationality",
+}
+
+# Upper bound on how many values a MERGING (multi-valued) key may hold.
+# Nothing capped these before: every merged key grew without limit and is
+# rendered inline by get_context_string() into every system prompt, so an
+# unbounded key is a slow context-pressure leak. Oldest values are dropped
+# first (the newest statement is the most likely to be current).
+_MAX_VALUES_PER_KEY = 8
+
+# `notes.info` is the DEFAULT sink for a malformed profile_update: the
+# callers (core.agent's smart-memory path and core.bus) do
+# ``profile_up.get("category", "notes"), profile_up.get("key", "info")``,
+# so ANY dict the model emits without those keys lands here — with the
+# whole extracted fact as the value. It is not a singleton, so it appended
+# for ever with no cap, no TTL and no dedup beyond exact-string match.
+# Keep it as a tiny ring of short values: it is a junk drawer, not memory
+# (real facts also go to the vector store on that same path).
+_SINK_KEYS = {("notes", "info")}
+_SINK_MAX_VALUES = 3
+_SINK_MAX_VALUE_CHARS = 200
+
+
 class ProfileMemory:
     def __init__(self, path: Path):
         self.file_path = path / "user_profile.json"
@@ -54,6 +104,25 @@ class ProfileMemory:
             temp_path.write_text(json.dumps(data, indent=2))
             os.replace(temp_path, self.file_path)
 
+    @staticmethod
+    def _bounded(values: list, cap: int, cat: str, key: str) -> list:
+        """Trim a merged value list to ``cap``, dropping the OLDEST first.
+
+        Returns a scalar-free list; a one-element result is still a list so
+        the caller's list/scalar handling elsewhere (prune_value collapses
+        singletons) stays the single place that decides that."""
+        if cap <= 0 or len(values) <= cap:
+            return values
+        dropped = len(values) - cap
+        trimmed = values[-cap:]
+        pretty_log(
+            "Profile Capped",
+            f"{cat}.{key} hit the {cap}-value cap; dropped {dropped} oldest "
+            f"value(s) to keep the system prompt bounded",
+            icon=Icons.USER_ID, level="WARNING",
+        )
+        return trimmed
+
     def update(self, category: str, key: str, value: Any):
         with self._lock:
             data = self.load()
@@ -93,11 +162,7 @@ class ProfileMemory:
             # like `name: ["User", "Vasilis"]` (the seeded default kept
             # alongside the user-supplied name). For these keys we
             # always REPLACE; for everything else the merge behavior
-            # below applies.
-            _SINGLETON_KEYS = {
-                "name", "role", "email", "timezone", "age",
-                "birthday", "pronouns", "title", "location",
-            }
+            # below applies. (Module-level table — see _SINGLETON_KEYS.)
             if target_key in _SINGLETON_KEYS:
                 data[cat][target_key] = v
                 self.save(data)
@@ -111,12 +176,23 @@ class ProfileMemory:
             # car and a bike). Overwriting silently dropped prior facts. We
             # now keep both values as a deduped, order-preserved list. If
             # the new value matches what's already stored, no-op.
+            #
+            # BOUNDED since 2026-07-22: the accumulation is capped (oldest
+            # first out) so a merging key can no longer grow without limit
+            # into every system prompt. `notes.info` — the sink a malformed
+            # profile_update defaults into — gets a much tighter ring.
+            is_sink = (cat, target_key) in _SINK_KEYS
+            cap = _SINK_MAX_VALUES if is_sink else _MAX_VALUES_PER_KEY
+            if is_sink and len(v) > _SINK_MAX_VALUE_CHARS:
+                v = v[:_SINK_MAX_VALUE_CHARS].rstrip() + "…"
+
             existing = data[cat].get(target_key)
             if existing is None or existing == "":
                 data[cat][target_key] = v
             elif isinstance(existing, list):
                 if v not in [str(x).strip() for x in existing]:
-                    data[cat][target_key] = existing + [v]
+                    data[cat][target_key] = self._bounded(existing + [v], cap,
+                                                          cat, target_key)
                 # else: duplicate — no-op
             else:
                 # Scalar existing value
@@ -133,7 +209,8 @@ class ProfileMemory:
                         if item not in seen:
                             seen.add(item)
                             deduped.append(item)
-                    data[cat][target_key] = deduped
+                    data[cat][target_key] = self._bounded(deduped, cap,
+                                                          cat, target_key)
             self.save(data)
 
             if (cat, target_key) != (original_cat, original_key):

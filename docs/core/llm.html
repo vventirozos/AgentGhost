@@ -94,6 +94,16 @@
     </svg>
     <p class="caption">Figure 3 — <code>NodeCircuitBreaker</code> state diagram.</p>
   </div>
+  <p><strong>Caller-fault exclusion <span class="tag">2026-07-22</span>.</strong>
+  A node failure only counts toward the breaker when it is actually the
+  <em>node's</em> fault. <code>_is_node_fault(exc)</code> returns <code>False</code>
+  for an HTTP&nbsp;4xx (a bad or oversized payload, an unknown model) — a
+  deterministic <em>caller</em> bug that would repeat identically on any node,
+  so counting it would trip the breaker on a perfectly healthy node (e.g. a
+  verify payload exceeding Nova's <code>n_ctx</code>) and force every routed
+  call onto the single main slot for 60&nbsp;s. Timeouts, connection errors and
+  5xx stay node faults. Applied at all five pool branches
+  (worker/critic/coding/swarm/vision).</p>
 
   <h2>HTTP client</h2>
   <p>One <code>httpx.AsyncClient</code> per node with:</p>
@@ -152,9 +162,35 @@
   <ul>
     <li><strong>Inline self-stall (fixed):</strong> three calls awaited <em>inline by the user's own turn</em> carried <code>is_background=True</code> and parked in <code>_wait_for_foreground_clear</code> against their <em>own</em> still-active request — a deterministic stall up to the 600s ceiling that read as &ldquo;agent went silent&rdquo; on long-output turns. Fixed to foreground: the <a href="agent.html">Context Shield</a> summarizer (fires on any oversized non-exempt tool result), the <code>_prune_context</code> history condenser, and the <code>--perfect-it</code> inline optimization (its shared helper takes <code>foreground=</code>; the deferred internal-learning path keeps background priority).</li>
     <li><strong>Foreground learning work (fixed):</strong> the reflection closures (<code>_critique_fn</code>, <code>_verify_plan_fn</code>) and post-mortem closures (<code>_analyze_fn</code>, <code>_patch_fn</code>) in <code>main.py</code> ran at foreground priority — contending with the user's next turn for the 35B slot and inflating <code>foreground_tasks</code> so the &ldquo;is a user live?&rdquo; checks misread an idle reflection as an active user. Now <code>is_background=True</code>; if a user turn is running, the Reflector's per-call timeout simply defers the trajectory to the idle backstop.</li>
-    <li><strong>Off-main skip (new):</strong> a background call that will be served by an existing off-main pool (<code>use_worker</code>/<code>use_critic</code>/<code>use_vision</code>/<code>use_swarm</code> with a non-empty pool) skips the wait entirely — it never touches the main slot, so parking it was pure latency. If every pool node fails, <code>_do_chat_completion</code> may still fall back to main: a rare, already-bounded edge, same as proceeding after the 600s ceiling.</li>
+    <li><strong>Off-main skip (new):</strong> a background call that will be served by an existing off-main pool (<code>use_worker</code>/<code>use_critic</code>/<code>use_vision</code>/<code>use_swarm</code>/<code>use_coding</code> with a non-empty pool) skips the wait entirely — it never touches the main slot, so parking it was pure latency. The <code>use_coding</code> pool was added to this predicate <span class="tag">2026-07-22</span> (it had been the one off-main pool still misclassified as main-targeted). If every pool node fails, <code>_do_chat_completion</code> may still fall back to main: a rare, already-bounded edge, same as proceeding after the 600s ceiling.</li>
   </ul>
   <p>Observability: a background caller parked <b>120s</b> behind an active request now logs one <code>BG Queue Wait</code> line, so the operator's stream shows the park instead of a silent multi-minute gap. Covered by the priority-routing section of <code>tests/test_foreground_yield.py</code>.</p>
+
+  <h2>Consumer degradation — <code>off_main_only</code> reaches the callers <span class="tag">2026-07-22</span></h2>
+  <p>The off-main skip above still let a <em>failed</em> off-main call fall back
+  to the main 35B (a worker hiccup mid-idle-loop dogpiled the single slot the
+  user was waiting on). <code>off_main_only=True</code> makes that fallback raise
+  <code>OffMainNodeUnavailable</code> instead, so the caller degrades — skips the
+  cycle, uses a cheap local fallback — rather than stealing the foreground slot.
+  Historically only <code>route()</code> and keepalive passed it; the 2026-07-22
+  LLM-stack review threaded it through the remaining background consumers:
+  <a href="dream.html">dream / self-play</a>'s 8 worker calls (mirroring their
+  <code>is_background</code>), the <a href="verifier.html">verifier</a>'s
+  last-resort fallback (bounded + <code>is_background</code> when no user request
+  is live), <a href="project_research.html">project research</a>'s idle
+  summariser, and the selfhood/workspace critique closures in <code>main.py</code>.
+  Several untimed background calls (smart-memory extract, post-mortem, dream
+  challenge-gen) also gained bounded timeouts so a wedged-but-connected node
+  can't pin the journal drain for the 1200s httpx default.</p>
+  <p><strong>Retry classification <span class="tag">2026-07-22</span>.</strong>
+  The main-path retry-<code>except</code> now also catches
+  <code>httpx.ConnectTimeout</code> and <code>httpx.PoolTimeout</code> — these mean
+  the request was never put on the wire (connection / pool-slot acquisition
+  failed before send), so a retry is idempotent and worth it right after a
+  llama-server restart. <code>ReadTimeout</code> is deliberately still <em>not</em>
+  retried: the request may already be executing upstream, so a retry could
+  double-run a non-idempotent generation. Covered by
+  <code>tests/test_llm_contention_fixes.py</code>.</p>
 
   <h2>Empty / non-JSON upstream body — crash-proof decode (2026-06-23)</h2>
   <p>On the non-streaming path <code>_do_chat_completion</code> returned <code>resp.json()</code> directly. A <strong>200 with an empty body</strong> therefore crashed as <code>json.JSONDecodeError: Expecting value: line&nbsp;1 column&nbsp;1 (char&nbsp;0)</code>, which the generic handler logged as &ldquo;Upstream&nbsp;Fatal&rdquo; and re-raised. Observed live right after a context overflow: while the agent's emergency-prune retry was in flight the upstream returned 0&nbsp;bytes, turning a <em>recoverable</em> state into a hard failure with an opaque message.</p>
@@ -165,7 +201,16 @@
   <p>Two background routines keep worker/critic nodes hot so the short
   <code>route()</code> timeout never eats a cold path: <code>warm_up_workers()</code>
   fires 3 tiny thinking-off generations per node at boot (covers model-load /
-  first-request latency), and <code>keepalive_workers(interval_s)</code>
+  first-request latency) — <strong>concurrently and <code>off_main_only=True</code>
+  <span class="tag">2026-07-22</span></strong>: the old serial loop awaited each
+  warmup in turn so they all re-grabbed the one slot that freed first (the other
+  <code>-np</code> slots stayed cold, defeating the intent), and it omitted
+  <code>off_main_only</code> (the sibling keepalive had it), so a node that was
+  <em>down</em> at boot made each of the 3 pings fall back to the main 35B —
+  burning the single main slot and able to evict the freshly-warmed main prefix
+  cache. Now the 3 fire via <code>asyncio.gather</code> to occupy distinct slots,
+  a dead node degrades instead of touching main, and the "pre-warmed" line only
+  logs when a slot actually warmed. And <code>keepalive_workers(interval_s)</code>
   (spawn_bg'd from main.py, default 45&nbsp;s via
   <code>GHOST_WORKER_KEEPALIVE_S</code>, ≤0 disables) pings each node forever —
   covering Tailscale/WireGuard idle cool-down <em>mid-session</em>, which boot

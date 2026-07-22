@@ -64,7 +64,27 @@ class TestVectorReadOnly:
     def test_absent_store_degrades(self):
         ro = ReadOnlyVectorMemory(None)
         assert ro.add("x") is None        # mutator no-op works without a store
-        assert ro.search_advanced is None  # read attr degrades to None
+        # `search_advanced` is now an explicit proxy (2026-07-22) that forces
+        # record_retrievals=False — it used to fall through __getattr__ and so
+        # leaked the retrieval-stat WRITE. Without a store it degrades to [].
+        assert ro.search_advanced("q") == []
+
+    def test_search_advanced_never_records_retrievals(self):
+        """A read that reinforces retrieval stats is still a WRITE to operator
+        memory — a delegated sub-agent (granted `recall`) must not do it."""
+        real = MagicMock()
+        real.search_advanced.return_value = [{"id": "1"}]
+        ro = ReadOnlyVectorMemory(real)
+        assert ro.search_advanced("q", limit=3) == [{"id": "1"}]
+        assert real.search_advanced.call_args.kwargs["record_retrievals"] is False
+
+    def test_library_index_writer_is_blocked(self):
+        """`_update_library_index` writes the operator's real library_index.json;
+        tool_gain_knowledge reached it directly past the blocked ingest_document."""
+        real = MagicMock()
+        ro = ReadOnlyVectorMemory(real)
+        assert ro._update_library_index("synthetic.txt", "add") is None
+        real._update_library_index.assert_not_called()
 
 
 class TestSkillReadOnly:

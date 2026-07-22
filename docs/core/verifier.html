@@ -179,6 +179,22 @@ python scripts/verify_bench.py --base-url http://127.0.0.1:8080 \
   </ul>
   <p>Tests: the 2026-07-19/20 sections of <code>tests/test_verifier_web_exec.py</code> (multi-page refute, all-clean naming, unloadable-page inconclusive, probe cap, dedup) and <code>tests/test_grounded_file_verify.py::TestMutatedFileCollector</code>.</p>
 
+  <h2>Bounded last-resort fallback <span class="tag">2026-07-22</span></h2>
+  <p>When the worker/critic route is exhausted, <code>_call_llm</code>'s last
+  resort runs the verdict on the main 35B. That call was foreground-marked and
+  <em>timeout-less</em> (the 1200s httpx default), and it is reachable from
+  background flows (dream/self-play verify shares <code>context.verifier</code>),
+  so a worker hiccup at finalize could pin the single main slot for up to 20
+  minutes while the user's already-finished answer waited on the gate. It now
+  passes a bounded <code>timeout</code> (<code>_VERIFY_FALLBACK_TIMEOUT_S</code>,
+  default 90s, <code>GHOST_VERIFY_FALLBACK_TIMEOUT</code>) and
+  <code>is_background=True</code> <em>only when no user request is live</em>
+  (<code>foreground_requests &lt;= 0</code>) — marking it background inside a live
+  turn would park it behind its own request (the documented critic-path
+  self-stall). Passed via a signature-introspecting helper so a duck-typed
+  client can never <code>TypeError</code> away a verdict. Verdict parsing is
+  unchanged. Test: <code>test_verifier_offmain.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

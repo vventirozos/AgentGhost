@@ -195,6 +195,21 @@
   <h2 id="truncated-answer-continuation">Truncated-answer auto-continuation</h2>
   <p>The streaming consume loop records the last non-null <code>finish_reason</code> seen on the upstream stream. When a <em>text</em> turn (no <code>&lt;tool_call&gt;</code> / <code>&lt;function&gt;</code> in flight) ends with <code>finish_reason == "length"</code>, the answer was cut off at the model's token cap — shipping it would hand the user a mid-sentence reply, which the <a href="verifier.html">Verifier</a> correctly REFUTES (truncated output, and any explicit question left unanswered).</p>
   <p>Instead of surfacing the fragment, <code>handle_chat</code> transparently continues the generation: it replays the request with the partial answer as a prior <code>assistant</code> turn plus a "your reply was cut off — continue from exactly where it stopped, don't repeat anything" instruction, and appends the result to <code>full_content</code>. This repeats until the upstream returns a non-<code>length</code> finish or <code>MAX_TRUNCATION_CONTINUATIONS</code> (3) round-trips are spent — the bound prevents a model that mis-reports <code>length</code> on every reply from looping forever. The continuation payload drops <code>tools</code>/<code>tool_choice</code> so it can only produce prose, and strips any <code>&lt;think&gt;</code> prelude the continuation emits before appending. Turns that produced a tool call are unaffected — those go through the parse/retry path, not this user-facing-prose path.</p>
+  <p><strong>Mid-stream aborts fold into the same path <span class="tag">2026-07-22</span>.</strong>
+  When the upstream stream aborts mid-answer (an idle stall, a mid-stream break, a
+  connect failure), <a href="llm.html"><code>_do_stream_chat_completion</code></a>
+  emits a <code>data: {"error": …}</code> frame (no <code>"choices"</code>) then
+  <code>[DONE]</code>. The turn-loop drain previously parsed only frames
+  <em>containing</em> <code>"choices"</code>, so it silently dropped the error
+  frame and finalized the half-generated <code>full_content</code> as if it were
+  a complete answer — feeding a truncated reply to the <a href="verifier.html">verifier</a>
+  and memory with no signal it was cut off. The drain now detects the error frame
+  (sets <code>stream_errored</code>, logs a <code>Stream Aborted</code> warning) and
+  folds it into <code>_truncated_text_turn</code> alongside
+  <code>finish_reason == "length"</code>, so an aborted stream triggers the same
+  continuation attempt rather than shipping a silent partial. The streamed
+  final-answer path logs the abort too (its verifier gate already REFUTEs the
+  partial). Covered by <code>tests/test_agent_stream_bg_fixes.py</code>.</p>
 
   <h2>Turn flow</h2>
   <div class="diagram">
@@ -274,6 +289,27 @@
 
   <h3>Byte-stable advertised tool set (2026-07-07, #7)</h3>
   <p>The acquired-skill semantic router filters the ADVERTISED tool set by query. Feeding it the per-turn query — which becomes the planner's <em>thought</em> mid-request — byte-changed the tool header block every turn, invalidating the upstream prompt-prefix KV cache and forcing a full re-prefill each turn. <code>_RequestState.stable_tool_query()</code> now pins the routing query to the request's FIRST substantive query, so the advertised set (and thus the tool header) stays byte-identical across the request's turns while topic relevance is preserved (the first user message sets the request's topic). This is the prerequisite that lets the <code>GHOST_PIN_TOOL_SCHEMAS</code> KV pin (IMPROVEMENTS.md #6) actually hold — with an unstable tool set the pin had nothing constant to anchor. Covered by <code>tests/test_stable_tool_query.py</code>.</p>
+  <p><strong>Two remaining prefix busters closed under pin <span class="tag">2026-07-22</span>.</strong>
+  The "stable" injection (<code>_stable_injection</code>, pinned to the first user
+  message by <code>_compose_injection</code>) still held two per-turn-varying
+  pieces that busted the KV prefix even with the pin on: <strong>(1)</strong> the
+  skill playbook — despite the stable tool query above, the <em>playbook</em>
+  lookup keys off <code>f"Tool: {required_tool} - Context: {thought_content}"</code>,
+  both of which the planner rewrites every turn, so a shifted retrieval changed
+  the pinned block from the playbook's position; and <strong>(2)</strong> the
+  final-generation turn flipped <code>tool_header_block</code> to the slim
+  "answer directly" header — at the very front of the pinned block, on exactly
+  the turn carrying the full accumulated history, forcing a whole-history
+  re-prefill. Under pin, both now ride the VOLATILE block instead: the playbook
+  is prepended to <code>dynamic_state</code> (it is genuinely per-turn-relevant,
+  so it belongs there), and the final-gen turn keeps the byte-stable header while
+  the "answer directly, no <code>&lt;tool_call&gt;</code>" directive moves to
+  <code>dynamic_state</code> (native/legacy <code>tools</code> are suppressed
+  downstream regardless, so the model still cannot call a tool). The UNPINNED
+  path is byte-for-byte unchanged (the slim header + inline playbook), so the
+  existing layout tests are untouched. Verify live via the <code>Prefill Cache
+  h=</code> line — the hash is now stable across a planned request's turns
+  including its final answer. Covered by <code>tests/test_kv_pin_stable_prefix.py</code>.</p>
 
   <h2>Self-play control hooks</h2>
   <p><code>handle_chat</code> carries two small but load-bearing hooks that coordinate with the self-play subsystem:</p>

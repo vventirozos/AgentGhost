@@ -182,6 +182,22 @@ def compute_tor_proxy(url: str, tor_proxy: Optional[str]) -> Optional[str]:
     return tor_proxy.replace("socks5://", "socks5h://")
 
 
+def _is_node_fault(exc) -> bool:
+    """True if ``exc`` indicates the NODE itself is unhealthy (→ count it
+    toward the circuit breaker), False for a caller-fault that would repeat
+    identically on any node — an HTTP 4xx (bad/oversized payload, unknown
+    model). Counting 4xx as node failures trips the breaker on a perfectly
+    HEALTHY node for a deterministic caller bug (e.g. a verify payload
+    exceeding Nova's n_ctx), taking the node out of rotation for 60s and
+    forcing every routed call onto the main slot. Timeouts / connection
+    errors / 5xx stay node faults."""
+    resp = getattr(exc, "response", None)
+    code = getattr(resp, "status_code", None)
+    if isinstance(code, int) and 400 <= code < 500:
+        return False
+    return True
+
+
 class NodeCircuitBreaker:
     """Circuit breaker for LLM nodes.
 
@@ -537,34 +553,44 @@ class LLMClient:
                                   ("critic_clients", "critic")):
             clients = getattr(self, pool_attr, None) or []
             for node in clients:
-                # One warmup per slot: with -np N the first call only hydrates
-                # one slot; fire a few so the pool is broadly hot. Bounded so a
-                # dead node can't stall startup.
-                for _ in range(3):
-                    try:
-                        payload = {
-                            "model": node.get("model", "default"),
-                            "messages": [{"role": "user", "content": "ok"}],
-                            "max_tokens": 1, "temperature": 0.0,
-                            "stream": False,
-                            "chat_template_kwargs": {"enable_thinking": False},
-                        }
-                        await self.chat_completion(
-                            payload, use_worker=(label == "worker"),
-                            use_critic=(label == "critic"),
-                            is_background=True, timeout=30.0,
-                            task_label="warmup",
-                        )
-                    except Exception as e:  # noqa: BLE001 — warmup is best-effort
-                        logger.debug("warm_up %s %s failed: %s",
-                                     label, node.get("url"), e)
-                        break  # node unreachable — don't hammer it
-                if clients:
+                payload = {
+                    "model": node.get("model", "default"),
+                    "messages": [{"role": "user", "content": "ok"}],
+                    "max_tokens": 1, "temperature": 0.0,
+                    "stream": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                }
+                # Fire the -np per-slot warmups CONCURRENTLY. Awaiting them in
+                # series (the old loop) just re-grabs the one slot that freed
+                # first, leaving the other slots cold — the opposite of the
+                # stated "all -np slots get hot" intent. `off_main_only=True` is
+                # essential: without it a DOWN node makes each warmup fall back
+                # to the main 35B (3 pings × a dead node burned 3 main-slot
+                # generations AND could evict the freshly-warmed main prefix
+                # cache — the sibling keepalive_workers already passes it).
+                results = await asyncio.gather(
+                    *[self.chat_completion(
+                        dict(payload), use_worker=(label == "worker"),
+                        use_critic=(label == "critic"),
+                        is_background=True, timeout=30.0,
+                        off_main_only=True, task_label="warmup")
+                      for _ in range(3)],
+                    return_exceptions=True)
+                ok = sum(1 for r in results if not isinstance(r, BaseException))
+                if ok:
                     pretty_log(
                         "Node Warmup",
-                        f"{label} node {node.get('model')} pre-warmed",
+                        f"{label} node {node.get('model')} pre-warmed "
+                        f"({ok}/{len(results)} slots)",
                         icon=Icons.NODE_WORKER,
                     )
+                else:
+                    # Every warmup failed — log at debug (a dead node at boot is
+                    # expected during a co-restart), do NOT claim "pre-warmed".
+                    logger.debug("warm_up %s %s: all warmups failed (%s)",
+                                 label, node.get("url"),
+                                 next((r for r in results
+                                       if isinstance(r, BaseException)), "?"))
 
     async def keepalive_workers(self, interval_s: float = 45.0) -> None:
         """Long-lived loop that keeps each worker/critic node's network path
@@ -903,7 +929,8 @@ class LLMClient:
                             self.circuit_breaker.record_success(node["url"])
                             return resp.json()
                         except Exception as e:
-                            self.circuit_breaker.record_failure(node["url"])
+                            if _is_node_fault(e):
+                                self.circuit_breaker.record_failure(node["url"])
                             pretty_log("Vision Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                             target_model = None
                             node = self.get_vision_node(target_model)
@@ -962,7 +989,8 @@ class LLMClient:
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()
                     except Exception as e:
-                        self.circuit_breaker.record_failure(node["url"])
+                        if _is_node_fault(e):
+                            self.circuit_breaker.record_failure(node["url"])
                         if _quiet:
                             logger.debug("keepalive worker %s failed: %s",
                                          node.get("model"), type(e).__name__)
@@ -1029,7 +1057,8 @@ class LLMClient:
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()
                     except Exception as e:
-                        self.circuit_breaker.record_failure(node["url"])
+                        if _is_node_fault(e):
+                            self.circuit_breaker.record_failure(node["url"])
                         pretty_log("Critic Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_critic_node(target_model)
@@ -1079,7 +1108,8 @@ class LLMClient:
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()
                     except Exception as e:
-                        self.circuit_breaker.record_failure(node["url"])
+                        if _is_node_fault(e):
+                            self.circuit_breaker.record_failure(node["url"])
                         pretty_log("Coding Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_coding_node(target_model)
@@ -1132,7 +1162,8 @@ class LLMClient:
                         self.circuit_breaker.record_success(node["url"])
                         return resp.json()
                     except Exception as e:
-                        self.circuit_breaker.record_failure(node["url"])
+                        if _is_node_fault(e):
+                            self.circuit_breaker.record_failure(node["url"])
                         pretty_log("Swarm Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_swarm_node(target_model)
@@ -1164,6 +1195,16 @@ class LLMClient:
             #   upstream fatal      ReadTimeout('')        (6s later — the 35B)
             # i.e. one slow worker call turned into a HARD upstream error. Let
             # the main client use its own (1200s) default instead.
+            timeout = None
+        elif timeout is not None and (
+                use_worker or use_critic or use_coding or use_swarm):
+            # A pool was REQUESTED but none is configured, so the pool branch
+            # was skipped entirely (fell_back_from_node stayed False) and we
+            # are about to run on the MAIN model carrying a timeout that was
+            # sized for a small, fast off-main node. Same hazard as the
+            # fell_back_from_node reset above — a 6s route budget on the 35B is
+            # a guaranteed ReadTimeout — so drop it and let the main client use
+            # its own default. (use_vision has no such path: it raises above.)
             timeout = None
 
         for attempt in range(2):
@@ -1213,7 +1254,14 @@ class LLMClient:
                         f"This typically follows a context overflow or an upstream "
                         f"restart; the request did not complete."
                     ) from je
-            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError, httpx.ConnectError) as e:
+            except (httpx.RemoteProtocolError, httpx.ReadError, httpx.WriteError,
+                    httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                # ConnectTimeout / PoolTimeout mean the request was NEVER put on
+                # the wire (connection or pool-slot acquisition failed before
+                # send), so retrying is idempotent and worth it right after a
+                # llama-server restart. ReadTimeout is deliberately NOT here —
+                # the request may already be executing upstream, so a retry
+                # could double-run a non-idempotent generation.
                 if attempt < 1:
                     wait_time = 2
                     pretty_log("Upstream Retry", f"[{attempt+1}/2] {type(e).__name__}. Retrying in {wait_time}s...", icon=Icons.RETRY)
@@ -1296,6 +1344,7 @@ class LLMClient:
                 or (use_critic and getattr(self, "critic_clients", None))
                 or (use_vision and getattr(self, "vision_clients", None))
                 or (use_swarm and getattr(self, "swarm_clients", None))
+                or (use_coding and getattr(self, "coding_clients", None))
             )
             if targets_main_node:
                 await self._wait_for_foreground_clear()

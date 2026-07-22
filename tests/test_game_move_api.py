@@ -223,11 +223,20 @@ class TestCorrectFragmentUnit:
             def __init__(self):
                 self.rows = {}
 
-            def get(self, ids=None, include=None):
+            def get(self, ids=None, include=None, where=None):
                 if ids is not None:
                     hit = [(i,) + self.rows[i] for i in ids if i in self.rows]
                 else:
                     hit = [(i,) + v for i, v in self.rows.items()]
+                # 2026-07-22: correct_fragment/delete_fragment now push the
+                # `type != document` filter INTO the query instead of
+                # materialising the whole (7k-chunk) collection and filtering in
+                # Python. Honour it here so the double keeps testing the real
+                # filtering behaviour.
+                if where:
+                    ne = (where.get("type") or {}).get("$ne")
+                    if ne is not None:
+                        hit = [h for h in hit if (h[2] or {}).get("type") != ne]
                 return {"ids": [h[0] for h in hit],
                         "documents": [h[1] for h in hit],
                         "metadatas": [h[2] for h in hit]}

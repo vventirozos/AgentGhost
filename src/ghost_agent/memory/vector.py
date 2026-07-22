@@ -391,14 +391,44 @@ class VectorMemory:
 
         except Exception as e:
             if "already exists" in str(e) or "Embedding function conflict" in str(e):
-                # An embedding-provider mismatch on an existing collection is
+                # An embedding-provider mismatch on an EMPTY collection is
                 # RECOVERABLE: drop + recreate it with the current embedding
                 # function. The previous `sys.exit(1)` here contradicted the
                 # "Resetting collection" log right above it and hard-killed the
                 # whole process on a fixable mismatch.
-                pretty_log("Memory Conflict", "Embedding provider mismatch. Resetting collection for new provider...", level="WARNING", icon=Icons.WARN)
+                #
+                # BUT this branch is reached BEFORE the embedder-fingerprint
+                # guard above can run (that guard lives after the raising
+                # `get_or_create_collection` call in the same try), so on a
+                # POPULATED store the old code silently deleted every fragment
+                # — the entire memory — on a chromadb upgrade or an
+                # embedding-function class change, both of which produce a
+                # message matching these substrings. Same stance as the guard:
+                # a stalled agent beats a silently-wiped one. Count first;
+                # only auto-reset when there is nothing to lose (2026-07-22).
+                collection_name = "agent_memory"
+                _existing = 0
                 try:
-                    collection_name = "agent_memory"
+                    _probe = self.client.get_collection(name=collection_name)
+                    _existing = int(_probe.count())
+                except Exception:
+                    # Can't open/count it (may genuinely not exist) → treat as
+                    # empty and take the recoverable path below.
+                    _existing = 0
+                if _existing > 0:
+                    logger.error(
+                        "FATAL: embedding-function conflict on a POPULATED "
+                        "collection (%d fragments). Refusing to reset — that "
+                        "would destroy the entire memory store. Underlying "
+                        "error: %s\nFix: re-embed with\n"
+                        "    PYTHONPATH=src python scripts/reembed_memory.py\n"
+                        "(or restore the previous embedding provider / "
+                        "GHOST_EMBED_MODEL). Back up %s first.",
+                        _existing, e, self.chroma_dir,
+                    )
+                    sys.exit(1)
+                pretty_log("Memory Conflict", "Embedding provider mismatch on an EMPTY collection. Resetting for new provider...", level="WARNING", icon=Icons.WARN)
+                try:
                     try:
                         self.client.delete_collection(name=collection_name)
                     except Exception:
@@ -480,12 +510,26 @@ class VectorMemory:
         except Exception as e:
             logger.debug(f"Retrieval stats bump failed (non-critical): {e}")
 
-    def search_advanced(self, query: str, limit: int = 5):
+    def search_advanced(self, query: str, limit: int = 5,
+                        where: Optional[dict] = None,
+                        record_retrievals: bool = True):
+        """Raw semantic search.
+
+        ``where`` scopes the query (e.g. ``{"type": "episode"}``) so a caller
+        that only wants one memory type doesn't drag — and then credit — rows
+        it will immediately discard. ``record_retrievals=False`` suppresses the
+        retrieval-stat bump entirely; the read-only façade forces it off,
+        because a read that reinforces retrieval stats is still a WRITE to
+        operator memory (2026-07-22: the episodic tier routed through here and
+        was bumping ~5-8 document/identity rows per hydration that were never
+        shown to the model, poisoning the very fields that drive prune-survival
+        ranking and time decay).
+        """
         with self._get_lock():
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=limit
-            )
+            _kw = {"query_texts": [query], "n_results": limit}
+            if where:
+                _kw["where"] = where
+            results = self.collection.query(**_kw)
 
         parsed_results = []
         retrieved_ids = []
@@ -499,7 +543,7 @@ class VectorMemory:
                 })
                 retrieved_ids.append(results['ids'][0][i])
 
-        if retrieved_ids:
+        if retrieved_ids and record_retrievals:
             self._bump_retrieval_stats(retrieved_ids)
 
         return parsed_results
@@ -554,12 +598,27 @@ class VectorMemory:
     def add(self, text: str, meta: dict = None):
         if len(text) < 5: return
         mem_id = hashlib.md5(text.encode("utf-8")).hexdigest()
+        metadata = meta or {"timestamp": get_utc_timestamp(), "type": "auto"}
         with self._get_lock():
             existing = self.collection.get(ids=[mem_id])
             if existing and existing['ids']:
+                # Same text (id is md5 of the text) → don't re-add, but DO
+                # refresh the metadata (2026-07-22). The old blanket early
+                # return meant a vector twin's metadata could never be updated:
+                # skills.py writes twins via add() keyed on the lesson's
+                # embedding text, so re-learning an identical lesson left the
+                # twin carrying the OLD `source_trajectory_id`/`verified`/
+                # `dimension`. `retract_lessons_from_trajectory` then deletes by
+                # `source_trajectory_id` and simply doesn't match — the JSON
+                # lesson is removed while the twin survives, so a DISCREDITED
+                # lesson stays retrievable via the playbook's vector path.
+                # (ingest_document already used upsert for exactly this reason.)
+                try:
+                    self.collection.update(ids=[mem_id], metadatas=[metadata])
+                except Exception as e:
+                    logger.debug(f"Twin metadata refresh failed (non-critical): {e}")
                 return
 
-            metadata = meta or {"timestamp": get_utc_timestamp(), "type": "auto"}
             self.collection.add(documents=[text], metadatas=[metadata], ids=[mem_id])
             # Amortised cap enforcement: only probe the count once every
             # _PRUNE_CHECK_EVERY adds (a COUNT(*) per write would be wasteful),
@@ -626,14 +685,24 @@ class VectorMemory:
     def smart_update(self, text: str, type_label: str = "auto"):
         try:
             with self._get_lock():
-                # Only consider plain memory entries as dedup candidates —
-                # without the filter the nearest neighbor can be an ingested
-                # document chunk, skill twin, or episode, and dist<0.50 would
-                # permanently delete it (cf. delete_by_query's $ne guard).
+                # Dedup candidates must be the SAME type as the incoming entry
+                # (2026-07-22). The old denylist (`$nin` document/skill/episode)
+                # was NOT the complement of `_PRUNABLE_TYPES`, so everything else
+                # — `identity`, `synthesis`, `document_summary`,
+                # `acquired_skill` — was a legal deletion victim. Concretely: the
+                # only caller is update_profile → smart_update(…, "identity"),
+                # and a dream `synthesis` ("MASTER SUMMARY") is prose with no
+                # copula, so `_subject_key` returns None, `keys_conflict` is
+                # False, the guard falls back to distance-only, and an incoming
+                # profile fact within 0.50 DELETED the synthesis outright. It
+                # could likewise delete a user-saved `manual` memory.
+                # Same-type-only makes replacement predictable (an identity fact
+                # replaces an identity fact) and removes the entire cross-type
+                # deletion class; distinct types simply coexist.
                 results = self.collection.query(
                     query_texts=[text],
                     n_results=1,
-                    where={"type": {"$nin": ["document", "skill", "episode"]}},
+                    where={"type": type_label},
                 )
                 if results['ids'] and results['ids'][0]:
                     dist = results['distances'][0][0]
@@ -870,9 +939,30 @@ class VectorMemory:
                     # limit, but a 30-wide pool gives the BM25 cross-encoder
                     # enough material to surface keyword matches the pure
                     # semantic top-10 misses.
+                    #
+                    # EXCLUDE the ingested-document corpus (2026-07-22). This is
+                    # AMBIENT hydration; document QA has its own scoped path
+                    # (`search_document`, used by knowledge_base(action="query")),
+                    # so doc chunks have nothing to add here — and they were
+                    # actively destroying it. Two compounding effects, measured
+                    # on the live store (7,130 of 7,366 fragments = 96.8% are doc
+                    # chunks after the 2026-07-13 manual ingest):
+                    #   1. Documents get a 1.25 distance threshold (2x everything
+                    #      else) AND p_score=-5 (-1.5 after _TIER_WEIGHT), so a
+                    #      BARELY-related chunk at dist 1.0 scores -0.5 while a
+                    #      STRONG auto memory at dist 0.30 scores +0.60 — and
+                    #      lower wins. Documents outranked real memories by ~1.1
+                    #      points no matter how relevant the memory was.
+                    #   2. With 96.8% of the collection being doc chunks, the
+                    #      30-candidate pool was essentially all documents, so
+                    #      top_k=12 kept only documents — which the bus then
+                    #      rejected wholesale at its _VECTOR_MATCH_FLOOR (0.42,
+                    #      vs doc distances of 0.8-1.2). Net effect: the vector
+                    #      tier returned [] and ambient memory went DARK.
                     results = self.collection.query(
                         query_texts=search_queries,
                         n_results=30,
+                        where={"type": {"$ne": "document"}},
                     )
 
                 candidates = []
@@ -1159,7 +1249,14 @@ class VectorMemory:
                     # Substring scan. The store is small (hundreds of
                     # fragments), a full get is cheap and deterministic —
                     # unlike a semantic query, which can land on a neighbor.
+                    # Push the type filter INTO the query (2026-07-22). The
+                    # `!= "document"` test used to run in Python after fetching
+                    # the whole collection — which now materialises 7,130
+                    # ingested-document chunks (~75 MB) into RAM on every
+                    # substring correction. Identical semantics, a fraction of
+                    # the cost.
                     all_rows = self.collection.get(
+                        where={"type": {"$ne": "document"}},
                         include=["documents", "metadatas"])
                     needle = match.lower()
                     hits = [
@@ -1168,7 +1265,6 @@ class VectorMemory:
                             all_rows.get("documents") or [],
                             all_rows.get("metadatas") or [])
                         if needle in (d or "").lower()
-                        and (m or {}).get("type") != "document"
                     ]
                     if not hits:
                         return False, "no stored fragment matches"
@@ -1256,7 +1352,9 @@ class VectorMemory:
                 if got and got.get("ids"):
                     old_doc = (got.get("documents") or [""])[0]
                 else:
+                    # Type filter pushed into the query — see correct_fragment.
                     all_rows = self.collection.get(
+                        where={"type": {"$ne": "document"}},
                         include=["documents", "metadatas"])
                     needle = match.lower()
                     hits = [
@@ -1265,7 +1363,6 @@ class VectorMemory:
                             all_rows.get("documents") or [],
                             all_rows.get("metadatas") or [])
                         if needle in (d or "").lower()
-                        and (m or {}).get("type") != "document"
                     ]
                     if not hits:
                         return False, "no stored fragment matches"

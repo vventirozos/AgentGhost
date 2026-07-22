@@ -310,8 +310,45 @@ def _message_text(resp: Dict[str, Any]) -> str:
     return out
 
 
+def _idle_invocation(context) -> bool:
+    """True when NO interactive user request is in flight — i.e. this
+    research run started from an idle/background context (idle autoadvance
+    tick, dream pass, HTTP/Slack project routes) rather than inline on a
+    user's own turn (``manage_projects action=research/advance``).
+
+    Mirrors the deadlock guard in ``tools/delegate.py``:
+    ``LLMClient.foreground_requests`` is held > 0 for the WHOLE life of a
+    user request (``api/routes.py:_mark_foreground``) and is 0 in
+    idle/autoadvance contexts — so it discriminates exactly the two
+    invocation paths this module is shared by. The answer decides whether
+    the summariser's LLM calls are marked ``is_background`` (park politely
+    behind a live user turn) or stay foreground (they ARE the user's turn;
+    marking those background would park them behind their OWN request —
+    the 600s self-stall delegate.py documents).
+
+    Fail-safe: a missing or non-int counter (minimal test stubs, exotic
+    clients) means we cannot rule out being inline on a user request, so
+    we report NOT idle and keep the plain-foreground status quo — a
+    contended slot beats a 10-minute self-stall.
+    """
+    fr = getattr(getattr(context, "llm_client", None),
+                 "foreground_requests", None)
+    return isinstance(fr, int) and not isinstance(fr, bool) and fr <= 0
+
+
+def _resolve_background(context, background: Optional[bool]) -> bool:
+    """Resolve an entry point's ``background`` argument: an explicit bool
+    wins; ``None`` auto-detects from the invocation context (captured ONCE
+    at run start, so an idle run keeps parking politely even when a user
+    turn arrives mid-run)."""
+    if background is None:
+        return _idle_invocation(context)
+    return bool(background)
+
+
 async def _llm_complete(context, prompt: str, *, max_tokens: int,
-                        temperature: float = 0.3, timeout: float = 120) -> str:
+                        temperature: float = 0.3, timeout: float = 120,
+                        is_background: bool = False) -> str:
     """One no-think utility completion. Returns '' on any failure.
 
     The upstream is a reasoning model (``--deep-reason``); a utility call
@@ -320,9 +357,20 @@ async def _llm_complete(context, prompt: str, *, max_tokens: int,
     900 reasoning tokens, content=""). We disable thinking the way
     ``core/dream.py`` does for its utility calls — the ``/no_think``
     soft-switch + ``enable_thinking=False`` hard-switch + a system nudge —
-    give the budget headroom, and strip any stray ``<think>`` block. Plain
-    foreground call (no <code>use_worker</code>: no worker node is
-    configured here, so it would fall through to this same model anyway).
+    give the budget headroom, and strip any stray ``<think>`` block.
+
+    Deliberately a MAIN-model call (no ``use_worker``/``use_critic``): a
+    worker node (Nova) is live these days, but rerouting would change which
+    model writes the research brief — the summary quality is the point, so
+    it stays on the main model. Contention with a live user turn is handled
+    by ``is_background`` instead: idle/autoadvance runs pass True (the call
+    then parks on ``_wait_for_foreground_clear`` behind an active user
+    request instead of bumping ``foreground_tasks`` and stealing the single
+    35B slot); runs inline on the user's own turn pass False (background
+    would park them behind their own request — see ``_idle_invocation``).
+    Since this is a plain main call, ``off_main_only`` does not apply and
+    the park never raises — any failure still degrades to '' → the
+    heuristic summary.
     """
     llm = getattr(context, "llm_client", None)
     if llm is None:
@@ -339,7 +387,7 @@ async def _llm_complete(context, prompt: str, *, max_tokens: int,
             "max_tokens": max_tokens,
             "stream": False,
             "chat_template_kwargs": {"enable_thinking": False},
-        }, timeout=timeout)
+        }, timeout=timeout, is_background=is_background)
         return _message_text(r)
     except Exception as e:
         logger.debug("research LLM call failed: %s", e)
@@ -348,7 +396,8 @@ async def _llm_complete(context, prompt: str, *, max_tokens: int,
 
 async def _summarize(context, topic: str, proj: Dict[str, Any],
                      search_output: str,
-                     llm_summarizer: Optional[Callable[..., Awaitable[str]]]) -> str:
+                     llm_summarizer: Optional[Callable[..., Awaitable[str]]],
+                     *, background: bool = False) -> str:
     if llm_summarizer is not None:
         try:
             out = (await llm_summarizer(topic, search_output) or "").strip()
@@ -369,7 +418,8 @@ async def _summarize(context, topic: str, proj: Dict[str, Any],
             f"SEARCH RESULTS:\n{search_output[:6000]}"
         )
         out = await _llm_complete(context, prompt, max_tokens=1500,
-                                  temperature=0.3, timeout=120)
+                                  temperature=0.3, timeout=120,
+                                  is_background=background)
         if out:
             return out
     return _fallback_summary(topic, search_output)
@@ -380,14 +430,19 @@ async def _summarize(context, topic: str, proj: Dict[str, Any],
 async def _persist(context, project_id: str, topic: str, search_output: str, *,
                    task_id: Optional[str] = None,
                    llm_summarizer: Optional[Callable[..., Awaitable[str]]] = None,
+                   background: Optional[bool] = None,
                    ) -> ResearchResult:
     """Summarise an already-fetched search output and write the brief.
 
     Shared by :func:`research_topic` (which fetches first) and
     :func:`persist_research_from_output` (which reuses the advancer's
     output). Never raises — returns a ResearchResult with ``ok=False`` on a
-    hard failure.
+    hard failure. ``background=None`` auto-detects the invocation context
+    (see :func:`_idle_invocation`): idle/autoadvance runs mark their LLM
+    calls ``is_background`` so they yield the main slot to a live user
+    turn; runs inline on a user's own turn stay foreground.
     """
+    background = _resolve_background(context, background)
     store = getattr(context, "project_store", None)
     if store is None:
         return ResearchResult(False, topic, error="no project_store")
@@ -402,7 +457,8 @@ async def _persist(context, project_id: str, topic: str, search_output: str, *,
     if rdir is None:
         return ResearchResult(False, topic, error="no workspace for project")
 
-    summary_md = await _summarize(context, topic, proj, search_output, llm_summarizer)
+    summary_md = await _summarize(context, topic, proj, search_output,
+                                  llm_summarizer, background=background)
     sources = _extract_sources(search_output)[:12]
     slug = _slugify(topic)
     ts = time.time()
@@ -454,11 +510,20 @@ async def _persist(context, project_id: str, topic: str, search_output: str, *,
 async def persist_research_from_output(context, project_id: str, topic: str,
                                        search_output: str, *,
                                        task_id: Optional[str] = None,
-                                       llm_summarizer=None) -> ResearchResult:
+                                       llm_summarizer=None,
+                                       background: Optional[bool] = None,
+                                       ) -> ResearchResult:
     """Public wrapper: persist a brief from a search output already in hand
-    (used by the autoadvancer's research path so it doesn't search twice)."""
+    (used by the autoadvancer's research path so it doesn't search twice).
+
+    ``background=None`` (the default the advancer uses) auto-detects: an
+    idle autoadvance tick summarises with ``is_background=True``; the same
+    ``advance_once`` reached via ``manage_projects action=advance`` inside
+    a live user turn stays foreground (see :func:`_idle_invocation`).
+    """
     return await _persist(context, project_id, topic, search_output,
-                          task_id=task_id, llm_summarizer=llm_summarizer)
+                          task_id=task_id, llm_summarizer=llm_summarizer,
+                          background=background)
 
 
 # ------------------------------------------------------------------ search + persist
@@ -467,16 +532,21 @@ async def research_topic(context, project_id: str, topic: str, *,
                          tool_runner: Optional[ToolRunner] = None,
                          llm_summarizer=None,
                          queries: Optional[List[str]] = None,
-                         task_id: Optional[str] = None) -> ResearchResult:
+                         task_id: Optional[str] = None,
+                         background: Optional[bool] = None) -> ResearchResult:
     """Research ONE topic: run web search(es), summarise, persist the brief.
 
     ``queries`` overrides the search terms (defaults to the topic itself).
     Falls back to the tool registry for search when ``tool_runner`` is
     omitted; with no runner available it still writes a (sourceless) brief
-    so the topic is recorded.
+    so the topic is recorded. ``background=None`` auto-detects the
+    invocation context ONCE, up front — before the searches — so a run
+    that started idle keeps parking its LLM calls behind a user turn that
+    arrives mid-run (see :func:`_idle_invocation`).
     """
     if not topic or not topic.strip():
         return ResearchResult(False, topic, error="empty topic")
+    background = _resolve_background(context, background)
     topic = topic.strip()
     runner = _resolve_runner(context, tool_runner)
     chunks: List[str] = []
@@ -490,16 +560,20 @@ async def research_topic(context, project_id: str, topic: str, *,
             if out and isinstance(out, str):
                 chunks.append(out)
     return await _persist(context, project_id, topic, "\n\n".join(chunks),
-                          task_id=task_id, llm_summarizer=llm_summarizer)
+                          task_id=task_id, llm_summarizer=llm_summarizer,
+                          background=background)
 
 
 # ------------------------------------------------------------------ topic discovery
 
 async def propose_topics(context, project_id: str, n: int = MAX_TOPICS_DEFAULT,
-                         llm_proposer=None) -> List[str]:
+                         llm_proposer=None, *,
+                         background: Optional[bool] = None) -> List[str]:
     """Derive up to ``n`` distinct research topics from the project goal +
     open tasks. LLM-driven when a client is present; otherwise falls back to
-    the open task descriptions, then the goal."""
+    the open task descriptions, then the goal. ``background=None``
+    auto-detects the invocation context (see :func:`_idle_invocation`)."""
+    background = _resolve_background(context, background)
     store = getattr(context, "project_store", None)
     if store is None:
         return []
@@ -530,7 +604,8 @@ async def propose_topics(context, project_id: str, n: int = MAX_TOPICS_DEFAULT,
             "topic per line — no numbering, no commentary, no blank lines."
         )
         out = await _llm_complete(context, prompt, max_tokens=400,
-                                  temperature=0.4, timeout=90)
+                                  temperature=0.4, timeout=90,
+                                  is_background=background)
         topics = _clean_topic_lines(out, n)
         if topics:
             return topics
@@ -554,14 +629,23 @@ async def research_project(context, project_id: str, *,
                            topics: Optional[List[str]] = None,
                            max_topics: int = MAX_TOPICS_DEFAULT,
                            tool_runner: Optional[ToolRunner] = None,
-                           llm_summarizer=None) -> List[ResearchResult]:
+                           llm_summarizer=None,
+                           background: Optional[bool] = None,
+                           ) -> List[ResearchResult]:
     """Research several topics. When ``topics`` is empty, auto-derive them
-    from the project goal/tasks via :func:`propose_topics`."""
+    from the project goal/tasks via :func:`propose_topics`.
+
+    ``background`` is resolved ONCE for the whole multi-topic run (see
+    :func:`_idle_invocation`), so an idle run stays background for every
+    topic even when a user turn arrives between topics."""
+    background = _resolve_background(context, background)
     if not topics:
-        topics = await propose_topics(context, project_id, max_topics)
+        topics = await propose_topics(context, project_id, max_topics,
+                                      background=background)
     results: List[ResearchResult] = []
     for t in (topics or [])[:max_topics]:
         results.append(await research_topic(
             context, project_id, t,
-            tool_runner=tool_runner, llm_summarizer=llm_summarizer))
+            tool_runner=tool_runner, llm_summarizer=llm_summarizer,
+            background=background))
     return results

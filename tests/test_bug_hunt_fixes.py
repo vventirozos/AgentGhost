@@ -157,10 +157,18 @@ def test_smart_update_query_excludes_protected_types():
 
     vm.smart_update("user is studying asyncio")
 
+    # 2026-07-22: the denylist became a SAME-TYPE scope, which is strictly
+    # stronger. The old `$nin` list was not the complement of _PRUNABLE_TYPES,
+    # so `identity`/`synthesis`/`document_summary`/`acquired_skill` — and even a
+    # user-saved `manual` — were legal deletion victims of an auto extraction.
+    # Scoping the dedup query to the incoming type removes the entire cross-type
+    # deletion class: protected types simply can't be candidates.
     where = vm.collection.query.call_args.kwargs["where"]
-    excluded = where["type"]["$nin"]
-    for protected in ("document", "skill", "episode"):
-        assert protected in excluded
+    assert where == {"type": "auto"}
+
+    vm.collection.query.reset_mock()
+    vm.smart_update("User location is Athens", "identity")
+    assert vm.collection.query.call_args.kwargs["where"] == {"type": "identity"}
 
 
 # ---------------------------------------------------------------------------

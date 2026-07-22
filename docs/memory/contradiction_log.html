@@ -29,6 +29,15 @@
     <li>Atomic temp + <code>os.replace</code>; <code>threading.RLock</code>.</li>
   </ul>
 
+  <h2>Load hardening (2026-07-22)</h2>
+  <p><code>_load()</code> distinguishes three outcomes rather than the old <code>except Exception: return []</code> that made an unreadable file behave exactly like an absent one — so the next <code>record()</code> atomically overwrote 200 entries of belief-revision history with a single entry, silently:</p>
+  <ul>
+    <li><strong>absent</strong> → <code>[]</code> (normal cold start);</li>
+    <li><strong>corrupt</strong> (bad JSON / wrong type / undecodable bytes) → move the raw bytes to a timestamped <code>contradiction_log.corrupt-*.json</code> sidecar, <code>WARNING</code>, start clean;</li>
+    <li><strong>present-but-unreadable</strong> (<code>OSError</code> — EIO / EACCES) → return <code>[]</code> for reads but set <code>_degraded</code> (logged at <code>ERROR</code>); while set, <code>_save()</code> REFUSES to write. The flag clears automatically as soon as a read succeeds.</li>
+  </ul>
+  <p><code>__init__</code> now probes via <code>_load()</code> at construction — not lazily on the first <code>record()</code> — specifically because <code>clear()</code> writes without reading: a lazy check left one path that could overwrite a corrupt / unreadable file without preserving it. Tests: <code>tests/test_memory_store_durability.py</code>.</p>
+
   <h2>Entry shape</h2>
   <pre><code>{
   "timestamp":   "ISO",
@@ -42,11 +51,11 @@
   <table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>__init__(memory_dir)</code></td><td>Open log file.</td></tr>
+      <tr><td><code>__init__(memory_dir)</code></td><td>Open log file; probe via <code>_load()</code> so an unreadable / corrupt log is detected (and quarantined) at boot.</td></tr>
       <tr><td><code>record(new_fact, old_facts, deleted_ids, reason="")</code></td><td>Append revision.</td></tr>
       <tr><td><code>get_recent(limit=10)</code></td><td>Most recent entries.</td></tr>
       <tr><td><code>explain_belief_change(query)</code></td><td>Search recent entries by substring.</td></tr>
-      <tr><td><code>clear()</code></td><td>Wipe.</td></tr>
+      <tr><td><code>clear()</code></td><td>Wipe (refused while <code>_degraded</code>, so it can't overwrite an unreadable file).</td></tr>
     </tbody>
   </table>
 

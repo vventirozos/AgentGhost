@@ -202,6 +202,30 @@ async def api_health(request: Request):
         except Exception:  # noqa: BLE001 — health must never raise
             nodes[_p] = []
 
+    # Circuit-breaker view of those nodes (2026-07-22). `nodes` above lists
+    # what is CONFIGURED; the breaker tracks what is actually ANSWERING.
+    # Without this, a tripped/dead node is indistinguishable from a healthy
+    # one on the very endpoint used to verify node offload. Shape:
+    # url → {state: closed|open|half_open, failures: int, open_since: float|None}.
+    # Includes every URL the breaker has tracked (a configured node with no
+    # traffic yet simply has no entry). getattr-guarded so a mock/partial
+    # llm_client can never 500 the health endpoint.
+    node_health = {}
+    try:
+        _get_status = getattr(getattr(llm, "circuit_breaker", None), "get_status", None)
+        _status = _get_status() if callable(_get_status) else {}
+        if isinstance(_status, dict):
+            node_health = {
+                str(_u): {
+                    "state": _s.get("state"),
+                    "failures": _s.get("failures"),
+                    "open_since": _s.get("open_since"),
+                }
+                for _u, _s in _status.items() if isinstance(_s, dict)
+            }
+    except Exception:  # noqa: BLE001 — health must never raise
+        node_health = {}
+
     return JSONResponse({
         "status": "ok",
         "rss_mb": rss_mb,
@@ -214,6 +238,7 @@ async def api_health(request: Request):
         "memory_system_loaded": getattr(context, "memory_system", None) is not None,
         "scheduler_jobs": sched_jobs,
         "nodes": nodes,
+        "node_health": node_health,
         "config": getattr(app.state, "resolved_config", {}),
     })
 

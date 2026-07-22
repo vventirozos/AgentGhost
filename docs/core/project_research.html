@@ -93,6 +93,21 @@
   <p>Every path degrades and never raises into the caller: missing LLM → heuristic summary (the top result titles); missing search runner → sourceless brief; missing workspace → a clean <code>ok=False</code> result. The autoadvance hook is wrapped so a research failure can't break a tick.</p>
   <p>The summariser and topic-proposer issue a <strong>no-think</strong> utility completion (<code>_llm_complete</code>): a plain foreground <code>chat_completion</code> with thinking disabled — the <code>/no_think</code> soft-switch + <code>chat_template_kwargs:{enable_thinking:false}</code> hard-switch + a system nudge, mirroring <a href="dream.html">core.dream</a>. This matters because the upstream runs as a reasoning model under <code>--deep-reason</code>: a utility call with thinking left ON burns the entire token budget inside <code>&lt;think&gt;</code> and returns an <em>empty</em> <code>content</code> (verified live: <code>finish_reason=length</code>, all completion tokens spent on <code>reasoning_content</code>), which silently dropped the summary to the title-list fallback. Responses are still defensively cleaned — <code>_strip_think</code> removes any stray <code>&lt;think&gt;</code> block and <code>_message_text</code> salvages <code>reasoning_content</code> if <code>content</code> is empty. The index <code>summary_preview</code> skips Markdown headings so it reads as a real sentence. Covered by <code>tests/test_project_research.py</code> and <code>tests/test_project_advancer.py</code>.</p>
 
+  <h2>Idle summariser yields to the user <span class="tag">2026-07-22</span></h2>
+  <p><code>_llm_complete</code> (the research-brief summariser) was
+  foreground-marked, but it is reached from the idle autoadvance loop
+  (<code>advance_once</code> → <code>persist_research_from_output</code>) — so an
+  idle research summary contended on the main slot with a live user turn and
+  inflated <code>foreground_tasks</code>. It is now background-aware: the public
+  funnels take <code>background=None</code> (auto-detect) and resolve it once at
+  run start from <code>llm_client.foreground_requests</code> — <code>&gt; 0</code>
+  means an interactive turn is in flight (stay foreground, no self-stall),
+  <code>0</code> means idle/autoadvance (mark <code>is_background=True</code> so
+  it parks politely). A user-invoked <code>manage_projects action="research"</code>
+  therefore stays foreground; the idle backstop degrades. The call stays on the
+  main model (no <code>use_worker</code>), so <code>is_background</code> alone is
+  the fix. Test: <code>test_project_research_offmain.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

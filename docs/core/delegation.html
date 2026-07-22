@@ -90,6 +90,22 @@
     <li>The LLM client is forced to <strong>background mode</strong>, so a
     delegated job can never starve a live user turn of the single upstream slot.</li>
   </ul>
+  <p class="warn"><strong>wait=True deadlock downgrade (2026-07-22 LLM-stack
+  review).</strong> Because a sub-agent's LLM calls are forced background, they
+  park on <code>_wait_for_foreground_clear</code> for as long as a user request
+  is active. <code>delegate(wait=True)</code> blocks the parent request inside
+  <code>reg.wait</code> while that request still holds
+  <code>foreground_requests</code> up — so the sub-agent parks on the very
+  request awaiting it: a circular wait that produced ~600s of dead air, then a
+  timed-out <code>FAILED</code> job. <code>tool_delegate</code> now treats
+  <code>foreground_requests &gt; 0</code> (which is true precisely on an
+  interactive turn, and false in an idle/autoadvance context) as the deadlock
+  condition and <strong>downgrades <code>wait=True</code> to fire-and-forget</strong>
+  there: it spawns the jobs, returns immediately with the job ids and an
+  explanatory note, and the model collects them on a later turn (by which point
+  the foreground request has ended and the sub-agents can actually run). In an
+  idle/background context <code>wait=True</code> is honoured unchanged. Tests:
+  <code>test_delegate_swarm_review_fixes.py</code>.</p>
   <p class="warn"><strong>Containment hardening (2026-07-14 bug hunt).</strong>
   Two escapes made the isolation above nominal-only and are now closed:
   <strong>(1) tool surface</strong> — the old code filtered only the dispatch
@@ -109,6 +125,32 @@
   default-allow-reads / explicit-deny-writes proxy pinned to the real method
   names, with a test that fails if a store grows an unblocked writer. Tests:
   <code>test_subagent_containment.py</code>, <code>test_readonly_memory.py</code>.</p>
+  <p class="warn"><strong>Rebuild re-drops the disabled set <span class="tag">2026-07-22</span>.</strong>
+  <code>_rebuild_available_tools</code> (which heals the dispatch dict back from
+  the registry after a hallucinated-name miss) re-narrowed only via
+  <code>_subagent_allowed_tools</code>. But dream's self-play temp agent contains
+  differently — it SETS <code>disabled_tools</code> and pops them from
+  <code>available_tools</code>, and never sets the allowlist — so a dispatch miss
+  healed the popped tools back in, and an aliased variant
+  (<code>"websearch"</code>→<code>"web_search"</code>) could then reach the
+  network-egress tools self-play disables. The rebuild now also drops
+  <code>self.disabled_tools</code>; since dispatch requires
+  <code>fname in available_tools</code> and canonicalisation only returns names
+  already in it, a disabled tool can never fire post-rebuild. Also hardens the
+  sub-agent path (it sets <code>disabled_tools</code> too). Test:
+  <code>test_subagent_containment.py::TestRebuild</code>.</p>
+  <p class="warn"><strong>Containment now fails CLOSED <span class="tag">2026-07-22</span>.</strong>
+  The three-gate restriction block sat in one broad <code>try/except</code> that
+  only <code>logger.debug</code>'d on failure — so if the registry import or the
+  defs shape ever threw, the sub-agent ran with the <em>full</em> schema and
+  dispatch dict: a containment boundary that failed OPEN. It now
+  <code>logger.error</code>s and raises, landing a <code>FAILED</code> job via
+  the same path as the timeout bound (<code>JobRegistry._on_done</code> converts
+  the task exception to <code>STATUS_FAILED</code>). Deny-all was rejected because
+  gate 1 (<code>disabled_tools</code>) is a <em>denylist</em> that requires
+  enumerating the registry — impossible precisely when the registry can't be
+  read — so aborting is the only guaranteed-safe state. Test:
+  <code>test_subagent_failclosed.py</code>.</p>
   <p><strong>Rails.</strong> <code>FORBIDDEN_TOOLS</code> is absolute — a
   sub-agent can never delegate (no recursive fan-out), schedule
   (<code>manage_tasks</code>), run daemons (<code>manage_services</code>), mutate
@@ -132,6 +174,17 @@
   Tasks are spawned via <code>spawn_bg</code> — the codebase's one
   fire-and-forget primitive (strong ref + contextvar propagation + exception
   logging), never a bare <code>create_task</code>.</p>
+  <p class="warn"><strong>Collect read-marking <span class="tag">2026-07-22</span>.</strong>
+  <code>jobs(action='collect')</code> with no <code>job_id</code> (the "collect all"
+  case) previously re-dumped <em>every</em> retained finished job — up to 50 ×
+  8000 chars ≈ 400&nbsp;KB — back into context on every call, and the status text
+  steered the model to keep doing exactly that (a real context-pressure hazard).
+  <code>Job</code> gained a <code>collected</code> flag: a no-id collect now returns
+  only un-collected finished jobs and marks them collected via
+  <code>JobRegistry.mark_collected</code>; a repeat says "no NEW results" with a
+  by-id re-fetch hint. An explicit <code>collect(job_id=…)</code> still returns
+  that job's result <em>unconditionally</em> (explicit re-fetch is never hidden).
+  Test: <code>test_jobs_collect_readmark.py</code>.</p>
   <p class="warn"><strong>Swarm result surfacing (2026-07-14 bug hunt).</strong>
   A swarm worker returns a <em>bool</em> while its real output lands in the
   scratchpad, so <code>jobs(action='collect')</code> on a swarm job returned

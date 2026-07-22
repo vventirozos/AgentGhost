@@ -30,7 +30,7 @@
   <p class="subtitle">FIFO work queue consumed by the dream consolidator.</p>
 
   <h2>Storage</h2>
-  <p>JSON at <code>path/memory_journal.json</code>; atomic temp + <code>os.replace</code>; <code>threading.RLock</code>.</p>
+  <p>JSON at <code>path/memory_journal.json</code>; atomic temp + <code>fsync</code> + <code>os.replace</code> (the fsync before the rename closes a torn-/zero-length-file window on power loss); <code>threading.RLock</code>. A sibling <code>path/memory_journal.inflight.json</code> stages a taken batch for crash recovery — see the TAKE / ACK lifecycle below.</p>
 
   <h2>Schema</h2>
   <pre><code>[
@@ -38,14 +38,36 @@
   ...
 ]</code></pre>
 
+  <h2>Crash-safe TAKE / ACK lifecycle (2026-07-22)</h2>
+  <p><code>pop_all()</code> / <code>drain()</code> used to empty the on-disk queue in one atomic write and hand the items to the dream drain, which then spends up to ~90 s of LLM time <em>per item</em>. A deploy <code>kill</code> landing mid-drain raises <code>asyncio.CancelledError</code> — a <code>BaseException</code> the drain's <code>except Exception</code> never catches, with no <code>finally</code> — so up to <code>max_capacity</code> (50) buffered facts / lessons were destroyed silently: the file was already <code>[]</code>, so nothing on restart could tell that anything had been lost.</p>
+  <p>The take now happens in two on-disk steps. <code>pop_all()</code> / <code>drain()</code> copy the batch to <code>memory_journal.inflight.json</code> <strong>before</strong> clearing the queue, then return the items exactly as before — signature and semantics unchanged, so the un-editable drain in <code>core.agent</code> keeps working verbatim. <code>recover_inflight()</code> folds an orphaned staging batch back to the <strong>front</strong> of the queue and runs automatically on construction and on the first <code>load()</code> of the process, so recovery needs no cooperation from any caller. Because the current drain cannot ack, the staging file is also <em>rotated</em> on the next take (a fresh take implies the previous, serially-awaited drain returned).</p>
+  <p>Net effect: crash / cancel mid-drain → items come back on next boot (<strong>at-least-once</strong>; an item whose consolidation had already been written may be re-consolidated once — the memory layer dedups facts, and re-doing a consolidation is cheap next to losing 50); normal operation → the staging file is rotated away, no replay, no growth. A crash in the ~1&nbsp;ms window between staging and clearing leaves an item in both files; <code>recover_inflight()</code> de-dups against the queue contents, so that window cannot double-deliver either.</p>
+  <p>New <code>ack()</code> / <code>commit()</code> (alias) / <code>inflight()</code> exist for future callers that want explicit at-most-once confirmation: <code>ack()</code> clears the whole staging batch, <code>ack(items)</code> clears only those entries (partial ack for an item-by-item drain), and <code>inflight()</code> returns the un-acked batch for diagnostics.</p>
+
+  <h2>Upstream-transient classification widened (2026-07-22)</h2>
+  <p><code>is_upstream_transient(exc)</code> now decides in a fixed order, so a permanently-broken item can't retry until <code>JOURNAL_MAX_RETRIES</code> burns out on every drain:</p>
+  <ol>
+    <li><strong>Structurally-definitive types short-circuit to <code>False</code> first</strong>, before any text matching — <code>ValueError</code> (which <code>json.JSONDecodeError</code> subclasses), <code>TypeError</code>, <code>KeyError</code>, <code>AttributeError</code>, <code>IndexError</code>, <code>NotImplementedError</code> — so a decoder error whose message happens to contain "timeout" can't sneak through.</li>
+    <li><strong>httpx</strong> types keep their authoritative meaning (5xx → transient, everything else incl. 4xx → definitive, no fall-through to the heuristics).</li>
+    <li><strong>Builtin transport failures</strong> — <code>TimeoutError</code> (which <code>asyncio.TimeoutError</code> aliases on 3.11+) and <code>ConnectionError</code>.</li>
+    <li><strong>Only then a message allow-list</strong>, for the plain <code>RuntimeError</code> / <code>Exception</code> that <code>core.llm</code> re-raises after exhausting its OWN retries ("Max retries exceeded", "the request did not complete", empty/non-JSON, and a 5xx rendered into a string) — while a 4xx-in-a-string stays definitive.</li>
+  </ol>
+  <p>Those two llm.py <code>RuntimeError</code>s were previously classified definitive, so the consolidation was dropped instead of retried.</p>
+
+  <h2>Capacity-overflow logging (2026-07-22)</h2>
+  <p><code>append()</code> past <code>max_capacity</code> (50) now logs a <code>WARNING</code> naming how many <em>oldest</em> items it dropped — previously silent, even though the drain logs a warning for dropping a single item, and ~25 back-to-back turns can overflow the cap before the drain's idle window ever opens. <code>push_front()</code>'s pathological branch (more re-queued items than the whole queue can hold) no longer slices off exactly the requeued retries: the drain passes <code>requeue + items[i:]</code> with the transient-failure retries at the HEAD, and the old <code>items[-cap:]</code> destroyed precisely those. Retry-stamped items (a <code>retries</code> count set by the drain) now win the capacity fight, with the remaining room going to the most-recent of the rest. Tests: <code>tests/test_memory_store_durability.py</code>.</p>
+
   <h2>API</h2>
   <table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>__init__(path, max_capacity=50)</code></td><td>Bind path, set FIFO cap.</td></tr>
       <tr><td><code>append(item_type, data)</code></td><td>Enqueue. Tail-evict on overflow.</td></tr>
-      <tr><td><code>pop_all() / drain()</code></td><td>Atomically read + clear (used by dream).</td></tr>
-      <tr><td><code>push_front(items)</code></td><td>Re-queue items at head if dream couldn't process them; preserves order, drops new appends if needed.</td></tr>
+      <tr><td><code>pop_all() / drain()</code></td><td>Stage the batch to <code>memory_journal.inflight.json</code>, then atomically read + clear the queue (used by dream). Crash-recoverable — see the TAKE / ACK lifecycle above.</td></tr>
+      <tr><td><code>push_front(items)</code></td><td>Re-queue items at head if dream couldn't process them; preserves order. On overflow drops the newest appends — and its pathological branch now keeps retry-stamped items preferentially (it used to slice off exactly those retries).</td></tr>
+      <tr><td><code>recover_inflight() -&gt; int</code></td><td>Fold an orphaned staging batch back to the FRONT of the queue (de-duped against the queue). Automatic on construction + first <code>load()</code>; idempotent.</td></tr>
+      <tr><td><code>ack(items=None)</code> / <code>commit</code></td><td>Confirm a taken batch is durably consumed so it won't replay: whole batch, or only <code>items</code> (partial ack). <code>commit</code> is an alias.</td></tr>
+      <tr><td><code>inflight() -&gt; list</code></td><td>Items handed out but not yet acked (diagnostics).</td></tr>
       <tr><td><code>RetryableConsolidationError</code> / <code>is_upstream_transient(exc)</code> / <code>JOURNAL_MAX_RETRIES</code></td><td>The bounded re-queue contract for the drain loop (2026-07-09). A journal item is removed by <code>pop_all()</code> <em>before</em> processing, so a task failure after that used to be a permanent, invisible loss: an upstream 503 during the smart-memory consolidation was retried at the HTTP layer (worker failover + one 2s 5xx retry in the client) but on final failure the item was swallowed by a bare <code>logger.error</code> — and a main-node <em>timeout</em> got no HTTP-layer retry at all. Now <code>run_smart_memory_task</code> classifies upstream-transient failures (5xx / timeout / connection, via <code>is_upstream_transient</code>) and raises <code>RetryableConsolidationError</code> <em>before any memory write</em>; <code>process_journal_queue</code> catches it, re-queues the item with an incremented <code>retries</code> counter (visible <code>WARNING</code> + 🔄), and drops it — with a visible <code>WARNING</code> + 🔶 — only past <code>JOURNAL_MAX_RETRIES</code> (2). Definitive failures (4xx, parse errors) keep the old log-and-drop path since a re-run would fail identically. Tests: <code>tests/test_smart_memory_requeue.py</code>.</td></tr>
       <tr><td><code>load()</code></td><td>Read current journal without clearing.</td></tr>
     </tbody>

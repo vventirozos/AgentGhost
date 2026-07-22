@@ -2,12 +2,28 @@ import sqlite3
 import threading
 import difflib
 import logging
+import re
+from functools import lru_cache
 from pathlib import Path
 from typing import List, Dict, Iterable, Optional, Tuple
 
 import networkx as nx
 
 logger = logging.getLogger("GhostAgent")
+
+
+@lru_cache(maxsize=512)
+def _entity_pattern(target: str) -> "re.Pattern":
+    """Whole-word/whole-phrase matcher for an entity name.
+
+    ``target`` must match as a complete token (or token sequence) inside the
+    node name — optionally pluralised — never as a bare substring:
+    ``lois`` matches ``lois lane`` and ``lois's dog``, ``game`` matches
+    ``games`` and ``chess game``, but ``tin`` does NOT match ``testing`` and
+    ``game`` does NOT match ``gamedev``. ``[^\\W_]`` is "unicode alphanumeric,
+    underscore excluded", so ``chess_game`` still matches ``game``.
+    """
+    return re.compile(r"(?<![^\W_])" + re.escape(target) + r"s?(?![^\W_])")
 
 
 class GraphMemory:
@@ -18,6 +34,25 @@ class GraphMemory:
     `get_neighborhood`. Both stores are kept in sync by `add_triplets`,
     `delete_by_target`, `wipe_all`, and `execute_graph_compression`.
     """
+
+    #: Predicates that are SINGLE-VALUED: a new object supersedes the old one,
+    #: which gets a `valid_until` stamp instead of accumulating a contradiction.
+    #: Every entry here MUST be one-to-one *for any subject* — a multi-valued
+    #: predicate in this set silently expires real knowledge on every new
+    #: extraction. `OWNS`/`IS` used to live here and destroyed 19 of the
+    #: operator's ownership facts (you own many things; X IS many things);
+    #: likewise `HAS_PET`, `HAS_TASK`, `HAS_FEATURE`, `HAS_NAME` (written with
+    #: the generic subject `project`) and `HAS_STATE`/`HAS_FEN` (position logs)
+    #: are deliberately absent. Comparison is case-insensitive (uppercased).
+    _FUNCTIONAL_PREDICATES = {
+        # Biographical
+        "WORKS_AT", "LIVES_IN", "DRIVES", "MARRIED_TO",
+        "BORN_IN", "STUDIES_AT", "LOCATED_IN", "EMPLOYED_BY",
+        "HAS_AGE", "HAS_LOCATION",
+        # Operational — written by the agent itself, single-valued by
+        # construction (a process has one status/one pid at a time).
+        "HAS_STATUS", "STATUS", "HAS_PID",
+    }
 
     def __init__(self, memory_dir: Path):
         self.db_path = memory_dir / "knowledge_graph.db"
@@ -141,15 +176,12 @@ class GraphMemory:
                         # Temporal conflict resolution: if the same subject+predicate
                         # exists with a DIFFERENT object, expire the old edge instead
                         # of accumulating contradictions. Only applies to "functional"
-                        # predicates (one-to-one) like WORKS_AT, LIVES_IN, DRIVES.
-                        # Multi-valued predicates like LIKES, KNOWS, HAS are excluded.
-                        _FUNCTIONAL_PREDICATES = {
-                            "WORKS_AT", "LIVES_IN", "DRIVES", "MARRIED_TO",
-                            "IS", "BORN_IN", "STUDIES_AT", "LOCATED_IN",
-                            "EMPLOYED_BY", "OWNS",
-                        }
+                        # predicates (one-to-one) like WORKS_AT, LIVES_IN, DRIVES —
+                        # see `_FUNCTIONAL_PREDICATES`. Multi-valued predicates
+                        # (LIKES, KNOWS, HAS_*, OWNS, IS) are excluded: expiring
+                        # those is silent data loss, not an update.
                         conflicting = []
-                        if pn in _FUNCTIONAL_PREDICATES:
+                        if pn in self._FUNCTIONAL_PREDICATES:
                             conflicting = conn.execute(
                                 '''SELECT object FROM triplets
                                    WHERE subject = ? AND predicate = ? AND object != ?
@@ -163,6 +195,13 @@ class GraphMemory:
                                    AND valid_until IS NULL''',
                                 (now, sn, pn, on)
                             )
+                            # Expiry is destructive-by-retrieval (expired edges
+                            # vanish from every read path), so it is NEVER silent.
+                            for (old_obj,) in conflicting:
+                                logger.warning(
+                                    "graph expiry: %s %s '%s' superseded by '%s'",
+                                    sn, pn, old_obj, on,
+                                )
                             # Remove expired edges from the in-memory graph
                             for (old_obj,) in conflicting:
                                 self._remove_edge(sn, pn, old_obj)
@@ -188,47 +227,114 @@ class GraphMemory:
                 conn.commit()
         return added
 
+    @staticmethod
+    def _entity_matches(node: str, target: str) -> bool:
+        """True when ``node`` names the entity ``target`` (already normalised).
+
+        Whole-token match, NOT substring: `forget("tin")` must not reach
+        `testing`/`printing`, and `forget("game")` must not reach `gamedev`.
+        Multi-word names still match on any complete token run, so `lois`
+        reaches `lois lane` and `mortimer` reaches `mortimer the iguana`.
+        """
+        n = (node or "").strip().lower()
+        if not n or not target:
+            return False
+        if n == target:
+            return True
+        return _entity_pattern(target).search(n) is not None
+
+    #: Blast-radius guard for `delete_by_target`. Whole-token matching alone
+    #: does not bound a forget: `game` is a legitimate token of 108 rows (8%)
+    #: of the live graph. A forget at or above this many rows is therefore
+    #: downgraded to a temporal expiry — it disappears from every read path
+    #: (mirror, neighborhood, recent triplets) exactly like a delete, but
+    #: stays recoverable via `get_expired_triplets`. Small, surgical forgets
+    #: keep the original hard-delete semantics.
+    _FORGET_SOFT_EXPIRE_MIN_ROWS = 50
+
     def delete_by_target(self, target: str) -> int:
         if not target or len(target.strip()) < 3:
             return 0
         t_norm = target.lower().strip()
         like = f"%{t_norm}%"
+        import time as _time
+        now = _time.time()
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
-                # Collect matched rows first so we can mirror the deletion.
-                doomed = conn.execute(
-                    '''SELECT subject, predicate, object FROM triplets
+                # LIKE is only a cheap prefilter — the authoritative test is
+                # `_entity_matches`, which requires a whole-token hit. The old
+                # code deleted on the raw LIKE, so `forget("tin")` hard-deleted
+                # 83 unrelated rows of the production graph with no undo.
+                candidates = conn.execute(
+                    '''SELECT rowid, subject, predicate, object FROM triplets
                        WHERE subject LIKE ? OR object LIKE ?''',
                     (like, like)
                 ).fetchall()
-                cursor = conn.execute(
-                    '''DELETE FROM triplets
-                       WHERE subject LIKE ? OR object LIKE ?''',
-                    (like, like)
-                )
-                deleted = cursor.rowcount
+                doomed = [
+                    row for row in candidates
+                    if self._entity_matches(row[1], t_norm)
+                    or self._entity_matches(row[3], t_norm)
+                ]
+                if not doomed:
+                    return 0
+                live_rows = conn.execute(
+                    'SELECT COUNT(*) FROM triplets WHERE valid_until IS NULL'
+                ).fetchone()[0] or 0
+                if len(doomed) >= self._FORGET_SOFT_EXPIRE_MIN_ROWS:
+                    logger.warning(
+                        "graph forget '%s': %d/%d live rows matched — EXPIRING "
+                        "instead of deleting (recoverable via get_expired_triplets)",
+                        t_norm, len(doomed), live_rows,
+                    )
+                    conn.executemany(
+                        'UPDATE triplets SET valid_until = ? WHERE rowid = ?',
+                        [(now, row[0]) for row in doomed],
+                    )
+                else:
+                    conn.executemany(
+                        'DELETE FROM triplets WHERE rowid = ?',
+                        [(row[0],) for row in doomed],
+                    )
+                deleted = len(doomed)
                 conn.commit()
-            for s, p, o in doomed:
+            for _, s, p, o in doomed:
                 self._remove_edge(s, p, o)
         return deleted
 
     #: Generic hub nodes that link to nearly everything; expanding a
     #: `forget` to these would wipe unrelated knowledge, so they are never
-    #: returned as connected entities.
+    #: returned as connected entities. Pronouns are not enough — the live
+    #: graph's real hubs are operational nouns (`assistant` deg 54, `project`
+    #: 49, `system` 43, `done` 14). Also used as a guard in
+    #: `_map_words_to_seeds` so a longer query word cannot re-seed a hub.
     _ENTITY_EXPANSION_STOPLIST = {
         "user", "me", "i", "you", "it", "this", "that", "they", "them",
         "he", "she", "we", "thing", "things",
+        "assistant", "agent", "ghost", "system", "project", "projects",
+        "task", "tasks", "todo", "done", "bug", "bugs", "issue", "issues",
+        "file", "files", "code", "error", "errors", "service", "services",
+        "status", "test", "tests", "data", "session", "model", "tool",
+        "tools", "memory", "goal", "goals", "feature", "features",
     }
 
+    #: Dynamic companion to the stoplist: any neighbour with a degree above
+    #: this is a hub by measurement, whatever its name, and is never followed
+    #: by the forget expansion (forgetting a chess bot must not reach `webos`).
+    _EXPANSION_MAX_DEGREE = 8
+
     def get_connected_entities(self, target: str, limit: int = 8) -> List[str]:
-        """Return distinct entity names directly (1 hop) connected to any node
-        whose name contains ``target``.
+        """Return distinct entity names directly (1 hop) connected to
+        ``target``.
 
         Lets ``forget`` expand an entity wipe to its tightly-coupled
         neighbours: forgetting ``mortimer`` surfaces ``iguana`` (from a
         ``mortimer IS_A iguana`` edge) so the alias tombstone goes too.
-        Generic hub nodes (``user``, pronouns) are filtered out so the
-        expansion can't snowball into unrelated memory.
+
+        Every returned name is fed back into ``delete_by_target`` by the
+        caller, so this is the amplifier of any forget: it is bounded on
+        three axes — the anchor must match a WHOLE token of the node name
+        (not a substring), only CURRENT edges are followed, and hub
+        neighbours (by stoplist or by measured degree) are never returned.
         """
         if not target or len(target.strip()) < 3:
             return []
@@ -238,25 +344,37 @@ class GraphMemory:
             with sqlite3.connect(self.db_path) as conn:
                 rows = conn.execute(
                     '''SELECT subject, object FROM triplets
-                       WHERE subject LIKE ? OR object LIKE ?''',
+                       WHERE (subject LIKE ? OR object LIKE ?)
+                       AND valid_until IS NULL''',
                     (like, like)
                 ).fetchall()
-        out: List[str] = []
-        seen = set()
-        for s, o in rows:
-            for node in (s, o):
-                n = (node or "").lower().strip()
-                # Skip the target's own variants, hub nodes, and tiny tokens.
-                if not n or len(n) < 3 or t in n or n in t:
+            out: List[str] = []
+            seen = set()
+            for s, o in rows:
+                # Only follow an edge the target genuinely anchors, and only
+                # to the OTHER endpoint.
+                if self._entity_matches(s, t):
+                    neighbours = (o,)
+                elif self._entity_matches(o, t):
+                    neighbours = (s,)
+                else:
                     continue
-                if n in self._ENTITY_EXPANSION_STOPLIST:
-                    continue
-                if n not in seen:
-                    seen.add(n)
-                    out.append(n)
-                    if len(out) >= limit:
-                        return out
-        return out
+                for node in neighbours:
+                    n = (node or "").lower().strip()
+                    # Skip the target's own variants, hub nodes, and tiny tokens.
+                    if not n or len(n) < 3 or t in n or n in t:
+                        continue
+                    if n in self._ENTITY_EXPANSION_STOPLIST:
+                        continue
+                    if n in self.nx_graph and \
+                            self.nx_graph.degree(n) > self._EXPANSION_MAX_DEGREE:
+                        continue
+                    if n not in seen:
+                        seen.add(n)
+                        out.append(n)
+                        if len(out) >= limit:
+                            return out
+            return out
 
     def wipe_all(self):
         with self._lock:
@@ -411,6 +529,15 @@ class GraphMemory:
                             for subj, pred, obj, w, vfrom, vuntil in src_rows:
                                 n_subj = new_node if subj == old_node else subj
                                 n_obj = new_node if obj == old_node else obj
+                                if n_subj == n_obj and subj != obj:
+                                    # The edge ran BETWEEN the two merged nodes
+                                    # ("new-york SAME_AS new york"). Rewriting it
+                                    # mints a self-loop that duplicates the merged
+                                    # node's whole neighbourhood in every
+                                    # spreading-activation chain. Drop it — a
+                                    # genuine old->old self-loop (subj == obj)
+                                    # still migrates to new->new below.
+                                    continue
                                 self._merge_triplet_row(
                                     cursor, n_subj, pred, n_obj,
                                     int(w or 1), vfrom, vuntil)
@@ -420,6 +547,12 @@ class GraphMemory:
                             cursor.execute(
                                 "DELETE FROM triplets WHERE subject = ? OR object = ?",
                                 (old_node, old_node))
+                            # A subject-side merge unions two different objects of
+                            # the same functional predicate ("bob WORKS_AT google"
+                            # + "bobby WORKS_AT meta"), minting two mutually
+                            # exclusive CURRENT facts. add_triplets' conflict
+                            # resolution never runs here, so re-apply it.
+                            self._reconcile_functional_conflicts(cursor, new_node)
                             ops += 1
                         except Exception as e:
                             logger.debug(f"Graph compression merge failed: {type(e).__name__}: {e}")
@@ -427,6 +560,41 @@ class GraphMemory:
             # Rebuild mirror after a structural rewrite — simpler than diffing.
             self.initialize_graph()
         return ops
+
+    def _reconcile_functional_conflicts(self, cursor, subject: str) -> int:
+        """Re-apply single-valued-predicate expiry for one subject.
+
+        `add_triplets` resolves functional conflicts at write time, but node
+        compression rewrites rows straight into SQLite and can leave two
+        CURRENT objects under the same functional predicate. Newest wins
+        (latest ``valid_from``, then ``timestamp``, then insertion order);
+        the losers get a ``valid_until`` stamp. Returns the number expired."""
+        import time as _time
+        now = _time.time()
+        expired = 0
+        rows = cursor.execute(
+            '''SELECT rowid, predicate, object, COALESCE(valid_from, 0), timestamp
+               FROM triplets WHERE subject = ? AND valid_until IS NULL''',
+            (subject,)).fetchall()
+        by_pred: Dict[str, List] = {}
+        for rid, pred, obj, vfrom, ts in rows:
+            pred_u = str(pred or "").upper()
+            if pred_u in self._FUNCTIONAL_PREDICATES:
+                by_pred.setdefault(pred_u, []).append((vfrom, ts or "", rid, pred, obj))
+        for pred_u, items in by_pred.items():
+            if len(items) < 2:
+                continue
+            items.sort(reverse=True)  # newest valid_from / timestamp / rowid first
+            winner = items[0]
+            for vfrom, ts, rid, pred, obj in items[1:]:
+                cursor.execute(
+                    'UPDATE triplets SET valid_until = ? WHERE rowid = ?', (now, rid))
+                expired += 1
+                logger.warning(
+                    "graph expiry (merge): %s %s '%s' superseded by '%s'",
+                    subject, pred, obj, winner[4],
+                )
+        return expired
 
     @staticmethod
     def _merge_triplet_row(cursor, subject: str, predicate: str, obj: str,
@@ -485,6 +653,30 @@ class GraphMemory:
 
     # -------------------------------------------------------- spreading act'n
 
+    #: Minimum length / minimum length-ratio for a node name that is a
+    #: FRAGMENT of the query word ('ai' from 'aiohttp', 'user' from
+    #: 'username'). That direction re-seeds generic ego hubs from unrelated
+    #: words and blows the ego graph into every turn's context — the exact
+    #: hydration that `bus._STOPWORDS` exists to prevent. The opposite
+    #: direction (word inside a longer node: 'germ' -> 'germany') narrows
+    #: instead of widening and stays unrestricted.
+    _SEED_FRAGMENT_MIN_LEN = 4
+    _SEED_FRAGMENT_MIN_RATIO = 0.75
+
+    def _seed_containment_ok(self, node: str, word: str) -> bool:
+        """Guard for the substring tier of `_map_words_to_seeds`."""
+        if node == word:
+            return True
+        # Never reach a hub node except by an exact query word.
+        if node in self._ENTITY_EXPANSION_STOPLIST:
+            return False
+        if node in word:  # node is a fragment of the word — the risky direction
+            if len(node) < self._SEED_FRAGMENT_MIN_LEN:
+                return False
+            if len(node) < self._SEED_FRAGMENT_MIN_RATIO * len(word):
+                return False
+        return True
+
     def _map_words_to_seeds(self, words: Iterable[str]) -> List[str]:
         """Map free-form query words to exact node names in the graph.
 
@@ -504,12 +696,18 @@ class GraphMemory:
             if wl in self.nx_graph:
                 matches = [wl]
             else:
-                substr = [n for n in all_nodes if wl in n or n in wl]
+                substr = [n for n in all_nodes
+                          if (wl in n or n in wl) and self._seed_containment_ok(n, wl)]
                 if substr:
                     # Prefer the closest length match for stable ordering
                     matches = sorted(substr, key=lambda n: (abs(len(n) - len(wl)), n))[:3]
                 else:
-                    matches = difflib.get_close_matches(wl, all_nodes, n=3, cutoff=0.7)
+                    # Same hub protection on the fuzzy tier: 'systemd' is a
+                    # 0.92 difflib match for the 'system' hub.
+                    matches = [
+                        m for m in difflib.get_close_matches(wl, all_nodes, n=3, cutoff=0.7)
+                        if m not in self._ENTITY_EXPANSION_STOPLIST
+                    ]
             for m in matches:
                 if m not in seen:
                     seen.add(m)

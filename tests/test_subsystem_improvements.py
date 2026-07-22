@@ -227,10 +227,15 @@ class TestSwarmRetry:
             "url": "http://test:8080"
         })
 
-        await _swarm_worker(
-            "do something", "input data", "result_key",
-            mock_llm, "fallback-model", scratchpad
-        )
+        # 2026-07-22: a swarm worker now RAISES SwarmWorkerError on failure
+        # (so the job registry lands it FAILED, not a success-shaped [done])
+        # AFTER writing the SYSTEM ALERT to the scratchpad.
+        from ghost_agent.tools.swarm import SwarmWorkerError
+        with pytest.raises(SwarmWorkerError):
+            await _swarm_worker(
+                "do something", "input data", "result_key",
+                mock_llm, "fallback-model", scratchpad
+            )
 
         result = scratchpad.get("result_key")
         assert "failed after" in result.lower()

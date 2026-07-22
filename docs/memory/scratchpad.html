@@ -32,7 +32,7 @@
   <h2>Storage</h2>
   <ul>
     <li>OrderedDict in process memory (LRU).</li>
-    <li>Optional SQLite at <code>persist_path/scratchpad.db</code> with table <code>scratchpad(key PK, value JSON, created_at REAL, accessed_at REAL)</code>.</li>
+    <li>Optional SQLite at <code>persist_path/scratchpad.db</code> with table <code>scratchpad(key PK, value JSON, created_at REAL, accessed_at REAL, namespace TEXT)</code>. The <code>namespace</code> column (2026-07-22) is added to pre-scope DBs in place via <code>ALTER TABLE</code> at construction, so the per-entry scope tags survive restarts.</li>
     <li><strong>Prod is persistent since 2026-07-14</strong>: <code>main()</code> builds the context scratchpad with <code>persist_path=$GHOST_HOME/system/memory/scratchpad.db</code>, so working state (incl. the <code>__current_project__</code> resume sentinel) survives the plain-<code>kill</code> deploy path. <code>--no-memory</code> keeps it purely in-memory; self-play isolation contexts (<code>core/dream.py</code>) still build ephemeral <code>Scratchpad()</code>s.</li>
     <li>A corrupt/unreadable DB at construction degrades to in-memory with a warning instead of raising (an unguarded raise at boot would respawn-loop the launchd supervisor).</li>
     <li>Every SQLite connection is wrapped in <code>contextlib.closing</code> — <code>with sqlite3.connect(...)</code> alone only scopes the transaction, never closes the handle.</li>
@@ -42,10 +42,11 @@
   <table>
     <thead><tr><th>Method</th><th>Purpose</th></tr></thead>
     <tbody>
-      <tr><td><code>__init__(max_entries=50, persist_path=None, ttl=86400)</code></td><td>LRU + TTL config.</td></tr>
-      <tr><td><code>set(key, value) -&gt; str</code></td><td>Store; LRU evict if over capacity.</td></tr>
+      <tr><td><code>__init__(max_entries=50, persist_path=None, ttl=86400, max_echo_chars=500)</code></td><td>LRU + TTL config; <code>max_echo_chars</code> bounds the <code>set()</code> ack only.</td></tr>
+      <tr><td><code>set(key, value, namespace=_UNSET) -&gt; str</code></td><td>Store; LRU evict if over capacity. Tags the entry with <code>namespace</code> (or inherits <code>active_namespace</code>); <code>namespace=None</code> pins it to the global scope. The returned ack is echo-bounded — the STORED value is never truncated.</td></tr>
       <tr><td><code>get(key) -&gt; Optional[Any]</code></td><td>Retrieve; TTL check; refresh <code>accessed_at</code> (sliding-window TTL).</td></tr>
-      <tr><td><code>list_all() / count() / delete(key) / clear()</code></td><td>Standard helpers.</td></tr>
+      <tr><td><code>list_all(namespace=_UNSET) / count() / delete(key) / clear()</code></td><td>Standard helpers; <code>list_all</code> can render one scope.</td></tr>
+      <tr><td><code>clear_namespace(ns, protect=None) / keys_in_namespace(ns) / namespaces() / namespace_of(key) / keys()</code></td><td>Scope operations (2026-07-22). <code>clear_namespace</code> deletes exactly ONE scope, sparing <code>protect</code>ed keys.</td></tr>
     </tbody>
   </table>
 
@@ -57,6 +58,18 @@
   </ul>
 
   <p><code>threading.RLock</code> guards in-memory dict + SQLite.</p>
+
+  <h2>Namespace scopes &amp; durability (2026-07-22)</h2>
+  <p>Covered by <code>tests/test_scratchpad_scope_fixes.py</code>.</p>
+
+  <h3>Per-entry namespace scope</h3>
+  <p>One process-wide scratchpad is shared by every conversation, project and background job, and it used to be a single flat namespace. So <code>tools/projects.py::_hydrate_scratchpad</code>'s "clear the previous project's keys" meant "delete every key that isn't a <code>proj::</code> key or a sentinel" — and it runs at REQUEST START for any conversation that doesn't own the bound project, so one unrelated chat message wiped in-flight swarm results owned by another conversation. Verified in prod: the live DB had been reduced to its 2 sentinel rows (the detached worker then re-created the key in whatever scope was live, and <code>jobs(action='collect')</code>'s bare <code>get(output_key)</code> returned <code>None</code> — an empty result with no error).</p>
+  <p>Each entry now carries a NAMESPACE tag in a <code>_scopes</code> dict parallel to <code>_data</code> (<code>None</code> == global/free-chat). <code>set()</code> tags writes with <code>active_namespace</code> unless a <code>namespace=</code> is passed. The tag is metadata, NOT folded into the key, so every cross-subsystem bare-key lookup still resolves (swarm <code>output_key</code>, the job registry's resolver, <code>recall</code>, the <code>proj::</code>/sentinel conventions). New <code>clear_namespace(ns, protect=...)</code> deletes exactly ONE scope, so a project switch (<code>_clear_other_project_scopes</code>) now clears only OTHER projects' scopes and spares: the incoming project's scope, the global scope, sentinels, <code>proj::</code> keys, and in-flight background-job keys — a job's <code>output_key</code> and its <code>_swarm_task_id::</code> marker are NEVER dropped (the worker writes them minutes later, in whatever scope is live). Per-project isolation is preserved.</p>
+  <p>A park whose reversibility snapshot FAILED (<code>_snapshot_scratchpad</code> returned False) does NOT clear the outgoing project's keys: leaking is recoverable, deleting is not, and this runs at request start for conversations that merely share the process. The keys are left tagged with the old project (the next successful switch clears them) and only the write scope is reset, with a <code>warning</code>.</p>
+
+  <h3>Persistence-failure visibility &amp; bounded echo</h3>
+  <p><code>_persist_entry</code> now logs at <code>warning</code> (was <code>debug</code>) when the DB write fails while <code>set()</code> keeps serving the value from memory — a locked or full DB was silently making swarm results memory-only, a loss that surfaced only after the next restart. The operator watches the live stream, so this must be visible the moment it starts.</p>
+  <p>Separately, the string <code>set()</code> echoes back is bounded by <code>max_echo_chars</code> (default 500): the ack is handed straight to the model, so echoing a multi-KB swarm result doubled it into context for nothing (the model just wrote it). The STORED value is never truncated — only the acknowledgement is capped.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

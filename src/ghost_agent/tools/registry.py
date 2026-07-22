@@ -558,6 +558,19 @@ def _intent_filter(tools: list, query: str | None, *, drop_unconfigured: set | N
 
 def get_active_tool_definitions(context, query: str = None):
     active_tools = list(TOOL_DEFINITIONS)
+
+    # Don't advertise delegate_to_swarm when no swarm cluster is configured
+    # (no --swarm-nodes). Otherwise the model is shown the tool AND steered
+    # into it, every call returns "Error: The Swarm Cluster is not configured"
+    # (swarm.py), and that Error-prefixed result burns a strike — observed
+    # live. Mirrors the image_generation gating below (schema advertised only
+    # when image_gen_clients exist). The dispatch entry stays registered so a
+    # hallucinated call still gets the helpful "process synchronously" steer.
+    if not (context and getattr(context.llm_client, 'swarm_clients', None)):
+        active_tools = [
+            t for t in active_tools
+            if t.get("function", {}).get("name") != "delegate_to_swarm"
+        ]
     
     # Native vision allows us to always include vision_analysis for Qwen 3.5
     if True:

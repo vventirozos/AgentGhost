@@ -35,6 +35,16 @@
 
   <h2>Persistence</h2>
   <p>Single JSON under the memory directory with atomic-rename writes. The format is keyed by <code>"domain|tool"</code> so a future schema change can be detected at load time.</p>
+  <p><strong>Load hardening (2026-07-22).</strong> <code>_load()</code> now distinguishes three outcomes instead of collapsing them into "empty" — the old <code>except Exception: return</code> treated an unreadable file exactly like an absent one, so the very next <code>record()</code> atomically overwrote a hundred-observation profile with a single-tool file (total history loss, no sidecar, only a debug line):</p>
+  <ul>
+    <li><strong>absent</strong> → start empty (normal cold start);</li>
+    <li><strong>corrupt</strong> (bad JSON / wrong type / undecodable bytes) → move the raw bytes to a timestamped <code>competence_profile.corrupt-*.json</code> sidecar, <code>WARNING</code>, start clean;</li>
+    <li><strong>present-but-unreadable</strong> (<code>OSError</code> — EIO / EACCES …) → keep in-memory neutral priors but set <code>_degraded</code> (logged at <code>ERROR</code>); while set, <code>_save()</code> REFUSES to write, so a transient read failure can't wipe the intact file.</li>
+  </ul>
+
+  <h2>Sample counting &amp; optional debounce (2026-07-22)</h2>
+  <p><code>_Cell</code> now carries an integer <code>samples</code> count rather than deriving <code>n</code> from the Beta mass. Deriving it — <code>int((alpha-1)+(beta-1))</code> — truncates: ten records at <code>weight=0.05</code> add 0.5 of mass and floor to <code>n=0</code>, so a low-weight cell stayed invisible to the <code>n&nbsp;&gt;=&nbsp;1</code> gate in <code>estimate()</code> and reported <code>n=0</code> in the prompt for ever. The derived value survives only as the fallback for a legacy file that predates the field.</p>
+  <p><code>CompetenceProfile(memory_dir, flush_interval=0.0)</code> gained an opt-in write debounce: with <code>flush_interval&nbsp;&gt;&nbsp;0</code>, <code>record()</code> marks the profile dirty and flushes at most once per that many seconds (plus every <code>_FLUSH_EVERY = 10</code> records, on <code>reset()</code>, and on an explicit <code>flush()</code>). The DEFAULT stays <code>0.0</code> = write-through, because the durability contract is "an outcome recorded is an outcome persisted" and the deploy procedure is a plain <code>kill</code> (no atexit / signal handler) — a debounce would silently drop the tail. Tests: <code>tests/test_memory_store_durability.py</code>.</p>
 
   <h2>API summary</h2>
   <table>
@@ -45,6 +55,7 @@
       <tr><td><code>observations(domain, tool=None) -&gt; int</code></td><td>Sample count for cell or roll-up.</td></tr>
       <tr><td><code>by_domain() -&gt; {domain: (mean, n)}</code></td><td>Per-domain roll-up for observability.</td></tr>
       <tr><td><code>get_context_string() -&gt; str</code></td><td>Prompt-renderable summary for planner context.</td></tr>
+      <tr><td><code>flush()</code></td><td>Persist any debounced records (no-op when write-through / already clean).</td></tr>
     </tbody>
   </table>
 </main>

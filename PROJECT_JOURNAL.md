@@ -434,6 +434,114 @@ graph inverted index (the forgetting pass + node-cache landed).
 Severity in parens. Many are latent (no prod caller), multi-process (single-tenant today), or
 model-behavior edges.
 
+- **[2026-07-22 LLM-stack review — llm.py / router / recording+grammar / delegation / consumers]
+  (6 agents). MOSTLY FIXED 2026-07-22 (see §6 "LLM-stack review FIXES" — contention theme, mid-stream
+  fail-open, circuit-breaker 4xx, retry classification, router boot landmine, jobs-collect, swarm
+  deadline/status, subagent fail-closed, recording, grammar, health, code-gen parity).** Then
+  **KV-pin stable-block instability + dream temp-agent containment heal-open FIXED 2026-07-22 (later 2)**
+  (§6). Still OPEN (low-value / needs live infra): streaming recording hook + 3 improvements (serializer
+  unify, verifier shared prefix, fallback-hint merge). Original catalogue kept below for the record.
+  `⊕` = corroborated by ≥2 agents.
+
+  DOMINANT THEME — background/foreground contention on the single main slot (⊕⊕⊕⊕, the biggest
+  win if done as one focused pass):
+  - **⊕ `targets_main_node` computed from pool *presence*, not routing *outcome*** — `llm.py:1294`
+    decides whether to `_wait_for_foreground_clear` from whether a pool is CONFIGURED, but when that
+    pool fails a call falls back to main anyway, skipping the foreground-clear → a worker hiccup lands
+    unbounded generations on the main slot in direct contention with a live user stream. Same predicate
+    also omits `use_coding` (`llm.py:1294-1299`; latent — no live caller passes `use_coding+is_background`).
+  - **⊕⊕ consumers omit `off_main_only=True`** so worker-pool failures dogpile main instead of
+    degrading: dream/self-play (`dream.py:1559,2300,3213,3479,3618`, `max_tokens` up to 16384, no
+    timeout), verifier last-resort fallback (foreground + timeout-less main call, `verifier.py:465-476`),
+    `warm_up_workers` (`llm.py:552-557` — a dead worker/critic at boot burns 3× main-slot warmups AND
+    can evict the just-warmed main prefix cache; sibling `keepalive_workers` passes it at `:617`),
+    project_research/selfhood/workspace critique closures foreground-marked (`project_research.py:331`,
+    `main.py:1369,1438`).
+  - **⊕⊕ shared `_bg_queue_sem(3)` acquisition is unbounded** (`llm.py:1302`) — critical-path
+    `route()` calls (query-expansion, decompose, verify) park behind multi-minute background holders
+    (a self-play solver stream holds a permit for its whole generation, `llm.py:1486`); `route()`'s
+    12s/45s "fail fast" only bounds the HTTP call, not the semaphore wait.
+  - MED — smart-memory extract (`agent.py:4168`) and dream challenge-gen carry NO timeout → ride the
+    1200s worker default; a wedged-but-connected Nova pins the journal drain ~20 min/item.
+  - MED — circuit breaker counts caller-fault (HTTP 4xx, oversized ctx) and contention ReadTimeouts as
+    node failures (`llm.py:964-973`) → 3 contended timeouts open the breaker on a healthy Nova.
+  - Suggested fix order: give off-main `route()` its own small sem (or skip `_bg_queue_sem` when
+    off-main); add `off_main_only=True` at every dream/verify/critique/warmup consumer; recompute
+    `targets_main_node` from the actual chosen route; add per-call timeouts to the untimed background
+    calls. One `llm.py` + consumers pass.
+
+  HIGH (data integrity):
+  - **⊕ mid-stream stall/break is FAIL-OPEN** (`llm.py:1423-1450` vs `agent.py:11591,12268`) — an
+    aborted stream yields a `data: {"error":…}` frame + `[DONE]` and returns normally; both turn-loop
+    consumers parse only frames containing `"choices"`, so the error frame is silently dropped, the
+    truncated `full_content` is persisted as the final answer and fed to verifier/memory (truncation
+    detection checks only `finish_reason=="length"`; an aborted stream is `None`). Fix: consumers check
+    `chunk_data.get("error")` and mark the turn truncated.
+  - **GHOST_PIN_TOOL_SCHEMAS stable block not byte-stable across turns** (`agent.py:11086-11141`,
+    pin ON in prod) — (a) the per-turn skill-playbook query is rebuilt from planner output each
+    iteration → a shifted retrieval changes the pinned first user message; (b) the final-gen turn flips
+    `tool_header_block` to the slim variant, invalidating the KV cache from message 1 on exactly the
+    turn carrying full history → whole-history re-prefill. Verify live via the `Prefill Cache h=` line
+    (should be stable within one request; a changing `h=` is the tell).
+
+  ROUTER (built-but-unwired — zero live consumers today, so low operational priority, BUT one boot
+  landmine to fix before the planned schema bump):
+  - **HIGH — boot-load landmine** (`main.py:1267` inside the broad try whose except nulls the
+    dispatcher) — a failed `ComplexityClassifier.load` kills the router AND every retrain path
+    (bootstrap at `:1289` never reached); the planned schema bump makes the existing on-disk checkpoint
+    raise on every boot → router dead until `checkpoint.json` is manually deleted. Fix: wrap load in
+    its own try, fall back to `clf=None` so bootstrap retrains + overwrites. **Do this before any
+    schema bump.**
+  - The live checkpoint is semantically INVERTED (technical/coding→"easy") from label corruption:
+    `n_steps` counts conversation-history assistant messages (`agent.py:14177`), and chess-protocol
+    turns flood the "easy" class (`labels.py:84`). Harmless while consumer-less; a schema-bump+retrain
+    reproduces the inversion unless labels are fixed first. The 3 logged serve-only feature items
+    (`§4B router serve-only`, still unfixed) are dwarfed by this. A/B decision-stamp promised at
+    `dispatch.py:46` is never persisted. A hot-swap sanity gate (refuse a model with negative
+    jargon/coding weights, `agent.py:3588`) would auto-catch the inversion.
+
+  DELEGATION (cluster FIXED 2026-07-22 for the top 3; residuals OPEN):
+  - MED — `jobs(action='collect')` without `job_id` re-returns every retained finished job every time
+    (no read-marking; up to 50×8000 chars into a pressure-sensitive context) (`delegate.py:166`).
+  - MED — dream's temp agent tool-containment heals open on a dispatch miss (`_rebuild_available_tools`
+    re-narrows only via `_subagent_allowed_tools`, which dream never sets; `disabled_tools` checked
+    before canonicalisation) → an aliased variant can reach `web_search`/`deep_research` self-play
+    disables (`agent.py:2253,6874,7165`). Sub-agent path is safe; dream is the hole.
+  - MED — `delegate_to_swarm(await_results=True)` has no overall deadline (`swarm.py:252`, each worker
+    ~906s). LOW — failed swarm work lands status `[done]` (`swarm.py:99`); sub-agent tool restriction
+    is fail-OPEN (broad try/except, `subagent.py:193`); qwen_bridge cross-loop hazard real but
+    UNREACHABLE (`GhostQwenAgent` has zero instantiation sites — best closed by deleting the variant +
+    its 3 test files). IMPROVEMENT — two `get_fallback_hint` fns give contradictory hints for one
+    failure (`fallback_chains.py:44` + `tool_failure.py:234`); merge into one.
+
+  RECORDING/GRAMMAR (dev features — `GHOST_LLM_RECORD` off, `GHOST_TOOL_GRAMMAR` opt-in — so low
+  operational priority):
+  - HIGH — the streaming path has NO recording hook and ALL main-model turns stream, so
+    `GHOST_LLM_RECORD=1` never captures the calls it exists for (`llm.py:1370-1499`, records only
+    non-streamed `chat_completion`/`route`). HIGH — per-process ordinal restarts at 1 while the day
+    file appends across restarts; `ReplayLLMClient` stable-sorts by ordinal → interleaves sessions
+    (`llm_recording.py:73,98,148`). MED — `route()` fallbacks unrecorded (breaks replay 1:1); grammar
+    `sval` prefix-exclusion can't accept a value ending in a `</parameter>` prefix → runaway
+    generation; name+param join collision `p-web-search-query` (`tool_grammar.py:63,78,148`). LOW —
+    replay loader dies on a torn last line; GHOST_HOME frozen at first record. IMPROVEMENT — recording
+    has no size guard (base64 vision payloads balloon the JSONL to GB); feed grammar output to a real
+    GBNF parser in tests.
+
+  LLM REQUEST-SIDE (lower severity):
+  - MED — verifier auto-repair on a project-wrap-up builds a self-contradictory payload (full XML tool
+    schema + "RUN it now" while native tools suppressed and the turn forced-final → repair can't comply,
+    burns a `_MAX_VERIFIER_REPAIRS` slot) (`agent.py:11073-11197,13166`). MED — `_execute_post_mortem`
+    swallows the transient-requeue exception → a post_mortem item on a worker timeout is popped and
+    permanently dropped (the 2026-07-09 requeue fix covered only `run_smart_memory_task`)
+    (`agent.py:4357`). MED — `_aa_code_gen` idle twin still `max_tokens=1024` where
+    `default_code_generator` was raised to 4096 for the inline-`-c` truncation bug (`agent.py:3815`).
+    IMPROVEMENTS — retry classification inverted (`ConnectTimeout` not retried though it's the only
+    guaranteed-nothing-sent failure, `llm.py:1216`); `warm_up_workers` fires the 3 warmups sequentially
+    (same slot reused, other `-np` slots stay cold — `asyncio.gather` them, `llm.py:543`); unify the 5
+    hand-rolled node-payload serializers + kill the `errors='ignore'` footgun (`llm.py:896,955`);
+    surface `NodeCircuitBreaker.get_status()` in `/api/health .nodes`; share a common leading block
+    between verifier stage-1/stage-2 prompts so llama.cpp prefix-cache hits (`verifier.py:202`).
+
 - **[2026-07-20 three-stack review — project-autonomy + turn-loop + code-correction] ALL FIXED
   2026-07-20 (later 3)** — see §6's "three-stack review FIXES" entry. 10 parallel fix agents (strict
   one-file-per-owner) + coordinator on agent.py/main.py/slack; full suite green. Findings below kept
@@ -930,6 +1038,218 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-22 (later 3) — MEMORY-SUBSTRATE review + FIXES: the highest-damage cohort yet (multiple CRITs with LIVE data loss)
+
+**DEPLOYED + DATA-REPAIRED + LIVE-VERIFIED 2026-07-22.** Clean suite 8901 passed / 0 failed (the 2
+`test_thinking_loop_guards::TestAtomicPrint` "failures" are a shell `FORCE_COLOR=3` artifact — pass
+with it cleared; logging.py untouched). Operator restarted; 20 wrongly-expired graph OWNS/IS rows
+restored via `repair_owns.py --apply` (backup `knowledge_graph.db.pre_owns_repair_1784724404.bak`);
+collapsed `weights.json` removed (bus → healthy priors, dream refit regenerates). LIVE VERIFICATION:
+asked the running agent "what vehicles do I own?" (no tools) → answered "BMW 118i, Ducati Streetfighter
+V4s, Sym scooter" — all three were expired by the bug and now surface correctly. **DOCS DONE** (4
+parallel agents; all 11 memory HTML docs — vector/readonly/graph/episodes/scratchpad/bus/journal/
+profile/competence/contradiction_log/adaptive_threshold — updated + verified vs source + tag-balanced;
+graph.html's flagged-stale functional-predicate section corrected). Backups retained: graph pre-repair
+DB + collapsed weights, both in the job scratch dir.
+
+
+First dedicated hunt of the retrieval/consolidation substrate (vector/graph/episodes/bus/rrf/journal +
+small stores) — the cognitive core every turn depends on, never swept this cycle. Chosen precisely
+because memory bugs are SILENT (a retrieval or consolidation corruption doesn't throw, it quietly
+poisons future turns), so log-watching can't surface them. 5 parallel review agents (each validating
+against the LIVE production stores read-only) → 5 parallel one-file-per-owner fix agents + coordinator
+(owned vector.py/readonly.py/agent.py). This cohort found the most severe issues of any subsystem so
+far, several with damage that had ALREADY happened on live data.
+
+**Data loss confirmed on the live stores (verified by the coordinator):**
+- **CRIT — graph `OWNS`/`IS` wrongly in `_FUNCTIONAL_PREDICATES`** (both multi-valued): every new
+  `user OWNS X` extraction expired ALL previous ones. 19 of the 21 expired rows in the whole graph
+  were this bug — the agent had "forgotten" the operator owns a BMW 118i, a Ducati Streetfighter V4S,
+  **evolmonkey (his own company)**, webos, piggybag, nova, chess coach. Fix (graph agent): removed
+  OWNS/IS; added the genuinely-functional operational predicates (HAS_STATUS/STATUS/HAS_PID) that were
+  MISSING and accumulating contradictions (`chess-v4 HAS_STATUS dead` AND `running` both current);
+  instrumented every expiry with a WARNING. **DATA REPAIR: 20 wrongly-expired rows restored via
+  scripts repair (backup-first, dry-run verified), operator-authorized.**
+- **CRIT — scratchpad wiped to 2 sentinel rows**: any non-owning conversation's request start deleted
+  every key incl. in-flight swarm results (`_hydrate_scratchpad` had no scope primitive). Fix
+  (scratchpad agent): a per-entry namespace tag + `clear_namespace` so parking clears only the foreign
+  project's scope and NEVER a background-job's output_key.
+- **CRIT — RRF intent-weight matrix collapsed into noise**: `fit_intent_weights` calibrated "rate 0.5
+  → base weight" but the real judged-used rate is ~0.14, so every well-sampled cell was crushed to
+  WEIGHT_MIN — live `factual/graph` fitted 2.0 → 0.1 (a 6.6× INVERSION), intent routing silently
+  inert. Fix (bus/RRF agent): relative-multiplicative fit `weight = prior*clamp(lift^(GAMMA*shrink))`
+  calibrated on the OWN base rate, evidence-shrinkage toward the prior, hard `MAX_DEVIATION=2.0` band
+  (can re-order mildly, never invert); turn-share normalisation for the items-per-turn confound.
+  Coordinator-verified the arithmetic (collapsed cell → 1.84, near its 2.0 prior). **weights.json
+  regenerates on the next dream refit (anchors on defaults); deleting it heals immediately.**
+
+**Silent degradation the coordinator verified + fixed directly (vector.py/readonly.py):**
+- **HIGH — ambient hydration was DARK since the 2026-07-13 manual ingest.** 96.8% of the store is
+  ingested-document chunks; documents get a 1.25 threshold (2×) + p_score=-5 and lower combined_score
+  wins, so a barely-related doc (dist 1.0 → -0.5) beat a strong auto memory (dist 0.30 → +0.60).
+  MEASURED on a live-store copy: the 30-candidate ambient pool was **30/30 document chunks** (0
+  episodes/identity/skills). Fix: `_search_selection` excludes `type=document` (doc QA has its own
+  scoped `search_document`); after the fix the same query yields 18 episodes + 6 identity + 6 skills.
+- **CRIT (latent) — an embedding-function conflict silently DELETED the whole store.** The
+  `delete_collection`+recreate recovery sits in an `except` matching "already exists"/"Embedding
+  function conflict" and is reached BEFORE the fingerprint guard (which is after the raising
+  `get_or_create_collection` in the same try). A chromadb upgrade or EF-class change would have wiped
+  all 7,368 fragments. Fix: count first, refuse to reset a populated collection (sys.exit + re-embed
+  instruction), keep the auto-reset only for an empty collection.
+- HIGH — `search_advanced` unconditionally bumped retrieval stats on every raw hit (the episodic tier
+  credited ~5-8 rows/hydration never shown to the model, poisoning prune-survival + decay). Fix: added
+  `record_retrievals=False` + a `where=` scope; the read-only façade forces it off. HIGH — the
+  read-only façade leaked `_update_library_index` (a self-play ingest permanently poisoned the
+  operator's library index) and `search_advanced` (a delegated sub-agent mutated operator memory on
+  every recall) — both now blocked/proxied. MED — `smart_update` denylist wasn't the complement of
+  `_PRUNABLE_TYPES`, so an auto-extraction could delete a user `manual` memory or a dream synthesis;
+  now same-type-only. MED — `add()` id-exists early return never refreshed twin metadata, so
+  `retract_lessons_from_trajectory` silently missed and a discredited lesson stayed retrievable; now
+  refreshes. Fragment-correction full scans (materialised 7k doc chunks/call) pushed into the query.
+
+**Also fixed (episodes/consolidation agents):** action truncation kept the HEAD and dropped the
+resolution (now head+tail, warns); `search_recoveries` was structurally dead (0/145 live — no writer
+sets `lesson`; now derives the recovery signal from the live schema); float-epoch episode timestamps →
+ISO; three small stores (competence/contradiction/adaptive_threshold) treated a corrupt/unreadable
+file as EMPTY and overwrote it (total silent wipe) — now sidecar-on-corrupt + refuse-write-on-degraded
+like journal/profile; journal `pop_all` gained crash-safe in-flight staging + recovery (a deploy-kill
+mid-drain lost up to 50 items); `is_upstream_transient` widened for the plain RuntimeError llm.py
+raises; profile singular relationship/possession keys REPLACE not accumulate; notes.info bounded.
+**COORDINATOR SELF-CATCH: my own 2026-07-22 post-mortem requeue fix was INERT** —
+`_RetryableConsolidation` wasn't imported in `_execute_post_mortem`'s scope (raised NameError) and even
+fixed would have been swallowed by the function's own `except Exception`; now function-scope import +
+a re-raise clause guarding the broad handler, runtime-verified to propagate.
+
+Cross-file wiring the coordinator added to activate the bus fixes: agent.py passes
+`raw_user_text=last_user_content` to `hydrate_context` (classify intent on the user's message, not the
+expanded query); dream.py forwards the `turn` id to `fit_intent_weights` (activates turn-share
+normalisation). Two stale pins updated for intentional contract changes (RRF all-failure now keeps the
+prior not WEIGHT_MIN; graph temporal test IS→LIVES_IN). Tests: 10 new/updated files across the cohort.
+STILL DEFERRED (logged, not shipped): episodes `_scoped_episode_hits` could use the new
+`search_advanced(where=)` instead of the `.collection` handle (cleaner, coupling); a boot reconcile of
+episode rows missing a vector twin; competence per-tool write debounce.
+
+### 2026-07-22 (later 2) — the final two LLM-stack items: KV-pin stable-block + dream containment heal-open
+
+The two items deferred from the "proceed with all" pass (below), both in `core/agent.py`, done
+carefully with the risk they warranted. Full suite green (**8715 passed / 13 skipped**). NOT yet
+deployed at time of writing.
+
+1. **KV-pin stable-block instability (HIGH perf).** Under `GHOST_PIN_TOOL_SCHEMAS=1` (prod), the
+   "stable" injection pinned to the first user message held two per-turn-varying pieces that busted the
+   KV prefix: (a) the skill playbook (its lookup keys off the planner's per-turn `required_tool` +
+   `thought_content`, so a shifted retrieval changed the pinned block), and (b) the final-gen turn
+   flipped `tool_header_block` to the slim header at the very front — on the turn carrying full history,
+   forcing a whole-history re-prefill. Fix, gated on `_pin_stable` so the UNPINNED path is byte-for-byte
+   unchanged (the layout tests are all pin-OFF and stay green): under pin, `_stable_injection` excludes
+   `fetched_playbook` (prepended to the volatile `dynamic_state` — it's genuinely per-turn-relevant) and
+   keeps the byte-stable header on final-gen turns, routing the "answer directly, no `<tool_call>`"
+   directive to `dynamic_state` (native/legacy `tools` are suppressed downstream regardless). `_pin_stable`
+   is hoisted above the header assembly. Proof chain: `test_compose_injection.py::test_pinned_first_message_
+   identical_across_turns` already proves identical stable string → byte-identical pinned message;
+   `test_kv_pin_stable_prefix.py` (new, 4) proves the stable string no longer holds the per-turn playbook/
+   directive under pin and the unpinned composition is untouched. Verify live via the `Prefill Cache h=`
+   line (now stable across a planned request's turns including the final answer).
+2. **Dream temp-agent containment heals open (MED).** `_rebuild_available_tools` (heals the dispatch
+   dict after a hallucinated-name miss) re-narrowed only via `_subagent_allowed_tools`, which dream's
+   self-play temp agent never sets — it contains by SETTING `disabled_tools` + popping `available_tools`.
+   So a dispatch miss healed the popped tools back, and an aliased variant (`"websearch"`→`"web_search"`)
+   could reach the network-egress tools self-play disables. Fix: the rebuild now also drops
+   `self.disabled_tools`; since dispatch requires `fname in available_tools` and canonicalisation only
+   returns names already in it, a disabled tool can't fire post-rebuild. Hardens the sub-agent path too.
+   Tests: `test_subagent_containment.py::TestRebuild` (+2: dream case, allowlist∩disabled). Docs:
+   `agent.html` (context-compaction §), `delegation.html` (containment §).
+
+### 2026-07-22 (later) — LLM-stack review FIXES: contention theme + data-integrity + ~20 items across 13 files
+
+"Proceed with all" pass over the 2026-07-22 LLM-stack review catalogue (§4B). Coordinator owned the
+two shared hot files (`core/llm.py`, `core/agent.py`); 10 parallel one-file-per-owner agents fixed the
+disjoint files. Full suite green (**8713 passed / 13 skipped**; 2 pre-existing source-pin/behavior
+tests updated for the intentional swarm-raise + memory-timeout changes). NOT yet deployed at time of
+writing — plain-kill to deploy.
+
+**The dominant theme — main-slot contention — is now closed at the consumers.** `off_main_only=True`
+threaded through every background LLM consumer so a worker hiccup degrades instead of dogpiling the
+single main slot: dream/self-play (8 calls, `off_main_only=is_background` to exempt user-triggered
+self-play), verifier last-resort fallback (bounded + `is_background` only when no user request live),
+project-research idle summariser (background auto-detected from `foreground_requests`), main.py
+selfhood/workspace critique closures. Plus `warm_up_workers` (concurrent `gather` + `off_main_only` so
+a dead boot node can't burn/evict the main prefix), `targets_main_node` gained the coding pool, and
+bounded timeouts on the untimed background calls (smart-memory extract 90s, post-mortem 90s, dream
+challenge-gen/repairs 180s) so a wedged-but-connected node can't pin the journal drain 20 min.
+
+**Data integrity:** the mid-stream fail-open (H, `core/agent.py`) — an upstream abort frame
+(`data:{"error"}`, no `choices`) was silently dropped and the truncated reply finalized as complete
+and fed to the verifier/memory. Now detected (`stream_errored`) and folded into `_truncated_text_turn`
+so it triggers the continuation path; streamed-final path logs the abort. Circuit breaker no longer
+counts HTTP 4xx (caller fault) as node faults (`_is_node_fault`, all 5 pool branches). Retry adds
+`ConnectTimeout`/`PoolTimeout` (never-sent → idempotent); `ReadTimeout` still excluded. Post-mortem
+transient failures now re-queue (the 2026-07-09 requeue fix had covered only smart-memory).
+
+**Also fixed:** router boot landmine (a failed checkpoint load no longer kills the router + all
+retrains — load wrapped in its own try, `_router_checkpoint_path` preserved so bootstrap overwrites the
+bad file; `router/model.py` load raises clean ValueErrors — **do this before any router schema bump**);
+`jobs(collect)` read-marking (was re-dumping ~400KB every call); swarm `await_results` deadline (240s,
+partial return, workers not cancelled) + failed swarm work raises → FAILED job (was success-shaped
+`[done]`); subagent containment fail-CLOSED (was fail-open on a registry-import throw); `delegate_to_swarm`
+already gated (earlier today); `llm_recording` cross-restart session-id + torn-line tolerance + image
+elision; `tool_grammar` sval trailing-partial-prefix + collision-free rule names + literal escaping;
+`_aa_code_gen` max_tokens 1024→4096; `/api/health` now surfaces `node_health` (breaker state).
+
+Tests: `test_llm_contention_fixes.py`, `test_agent_stream_bg_fixes.py`, `test_dream_offmain_contention.py`,
+`test_verifier_offmain.py`, `test_router_boot_resilience.py`, `test_project_research_offmain.py`,
+`test_jobs_collect_readmark.py`, `test_swarm_tool.py` (appended), `test_subagent_failclosed.py`,
+`test_llm_recording.py` (appended), `test_tool_grammar.py` (appended), `test_health_node_status.py`.
+Docs: llm/agent/dream/verifier/project_research/delegation/api-routes HTML updated.
+
+**The two originally-deferred items — FIXED 2026-07-22 (later 2), see the "final two LLM-stack items"
+entry below.** KV-pin stable-block instability + dream temp-agent containment heal-open both landed
+with tests (`test_kv_pin_stable_prefix.py`, `test_subagent_containment.py::TestRebuild`), suite green.
+
+**STILL DEFERRED (low-value / needs live infra):**
+- **Streaming recording hook (dev feature).** `GHOST_LLM_RECORD` still misses streamed (all main-model)
+  turns; adds buffering to the hot path. Low value (recording off in prod).
+- **IMPROVEMENTS left:** node-payload serializer unify (`llm.py`, 80-line refactor, low value);
+  verifier stage-1/2 shared prefix-cache block (needs live `verify_bench`); fallback-hint merge
+  (`fallback_chains.py`+`tool_failure.py`, touches agent.py call sites).
+
+### 2026-07-22 — LLM/routing/delegation-stack review (6 agents) + delegation/swarm cluster FIXES
+
+First dedicated sweep of the inference layer every subsystem rides through — `core/llm.py`
+(request-construction + failover), the `router/` package, `llm_recording.py`/`tool_grammar.py`, the
+delegation stack (subagent/delegate/swarm/fallback_chains/qwen_bridge), and the consumer side
+(verifier/dream/journal/advancer). Chosen because §5B/§5C and the 2026-07-20 reviews all covered
+project/turn-loop/correction, never this layer — and the live post-deploy logs pointed here
+(`delegate_to_swarm -> not configured` burning a strike, native tool_call repair, a verifier LATE
+REFUTED). Six parallel review agents; every finding required file:line grounding + a concrete failure
+scenario. Full catalogue logged in §4B "2026-07-22 LLM-stack review". **The dominant theme** (4+
+agents converging): background/foreground contention on the single main slot — `targets_main_node`
+computed from pool *presence* not routing *outcome*, and consumers omitting `off_main_only=True`, so a
+worker hiccup dogpiles the foreground slot. **This session FIXED the delegation/swarm cluster** (most
+corroborated + live-log confirmed + self-contained); the contention theme, the streaming fail-open,
+and the router items are logged for follow-up.
+
+Fixes shipped (each verified against source before editing; tests
+`test_delegate_swarm_review_fixes.py`, 6 green):
+1. **CRIT — `delegate(wait=True)` deadlock** (corroborated by 2 agents, independent traces). A
+   sub-agent's LLM calls are forced `is_background=True` and park on `_wait_for_foreground_clear`
+   while a user request is active; `wait=True` blocks the parent inside `reg.wait` while it still
+   holds `foreground_requests` up → circular wait → ~600s dead air then a timed-out FAILED job (the
+   same self-stall shape the compaction/context-shield fixes named, via a new entry point). Fix:
+   `tool_delegate` downgrades `wait=True`→fire-and-forget when `foreground_requests > 0` (true iff an
+   interactive turn is in flight; false in idle/autoadvance where wait is safe), returns the job ids +
+   an explanatory note, model collects next turn. `tools/delegate.py`.
+2. **HIGH — `delegate_to_swarm` advertised while unconfigured** (matches the live strike-burn). Gated
+   out of `get_active_tool_definitions` when `llm_client.swarm_clients` is empty (mirrors
+   `image_generation`); dispatch entry kept so a hallucinated call still gets the "process
+   synchronously" steer. `tools/registry.py`.
+3. **HIGH — stale `"delegate" → "delegate_to_swarm"` alias** hijacked case/paren variants of the real
+   `delegate` tool (alias table consulted before the exact `norm_to_real` match). Removed the alias;
+   the swarm-specific aliases stay. `core/agent.py`.
+
+Docs: `docs/tools/swarm.html` (schema gating), `docs/core/delegation.html` (wait=True downgrade).
+NOT yet deployed as of this entry — plain-kill to deploy.
+
 ### 2026-07-20 (later 3) — three-stack review FIXES: 2 crit + ~12 high + ~20 med, all fixed in the recommended order
 
 Ten parallel fix agents (strict one-file-per-owner) + coordinator on `core/agent.py`, `main.py`, and
@@ -976,7 +1296,16 @@ each fix batch shipped its own regression tests. Full suite green. By the recomm
 
 Deferred to docs owner: HTML docs for the new contracts (metadata merge, `metadata_replace`,
 `human_approved`, `ProjectPlan.request_revision`, verify-classifier, advance 503, the
-`projects/<other-id>/` explicit-foreign-path behavior change). NOT yet deployed — plain-kill to deploy.
+`projects/<other-id>/` explicit-foreign-path behavior change). **Docs DONE 2026-07-22** (3 parallel
+doc agents; several sections turned out to already exist from the fix session — the genuinely missing
+pieces were project_safety.html's human-gate/NEEDS_USER contract, the advancer boot-reaper bullet,
+the Slack `advance_async` runner parity, the REST-visible metadata-merge bullet, and the tool-surface
+notes in tools/projects.html; every pre-existing claim was re-verified against source. Notable
+contract nuances now documented: `metadata_replace` is store-API-only — neither `manage_projects`
+nor REST expose it, so merge is the only model/REST-reachable behavior; the boot reaper resets
+orphans to READY while the in-tick no-runner release resets to PENDING; ReplanBridge lives in
+core/triggers.py:327, metacog.py only wires it.) **DEPLOYED 2026-07-22** — suite green pre-deploy
+(8586 passed / 12 skipped), plain-kill, respawned healthy in ~10s (health OK, all 3 nodes attached).
 
 ### 2026-07-20 (later 2) — three-stack review (project-autonomy + turn-loop + code-correction): LOGGED, not fixed
 

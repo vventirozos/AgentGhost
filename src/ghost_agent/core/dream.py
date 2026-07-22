@@ -1556,7 +1556,10 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 "temperature": 0.0,
                 "max_tokens": 4096,
             }
-            data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, timeout=180.0, task_label="self-play")
+            # off_main_only: a worker-pool failure must DEGRADE (outer
+            # except returns "Dream error") instead of falling back onto
+            # the single main inference slot mid-user-turn.
+            data = await self.context.llm_client.chat_completion(payload, use_worker=True, is_background=True, off_main_only=True, timeout=180.0, task_label="self-play")
             content_text = data["choices"][0]["message"]["content"]
             
             result_json = extract_json_from_text(content_text)
@@ -1898,7 +1901,15 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             for line in lines[-max_ledger_lines:]:
                 try:
                     d = json.loads(line)
-                    obs.append((str(d["intent"]), str(d["source"]), bool(d["success"])))
+                    # Forward the `turn` id (2026-07-22) so fit_intent_weights
+                    # can use the TURN-NORMALISED estimator — crediting each
+                    # tier's share of a turn's judged-used set rather than a raw
+                    # per-item rate that just measures tier verbosity. A
+                    # legacy line without a turn id degrades to the pooled
+                    # estimator (fit_intent_weights handles both shapes).
+                    obs.append((str(d["intent"]), str(d["source"]),
+                                bool(d["success"]),
+                                str(d["turn"]) if d.get("turn") else None))
                 except Exception:
                     continue
             if len(obs) < min_observations:
@@ -2013,7 +2024,8 @@ Return ONLY valid JSON:
         }
         try:
             data = await self.context.llm_client.chat_completion(
-                payload, use_worker=True, is_background=True, timeout=180.0,
+                payload, use_worker=True, is_background=True,
+                off_main_only=True, timeout=180.0,
                 task_label="dream",
             )
             result = extract_json_from_text(data["choices"][0]["message"]["content"])
@@ -2109,7 +2121,8 @@ Return ONLY valid JSON:
             }
             try:
                 data = await llm.chat_completion(
-                    payload, use_worker=True, is_background=True, timeout=60.0,
+                    payload, use_worker=True, is_background=True,
+                    off_main_only=True, timeout=60.0,
                     task_label="dream",
                 )
                 result = extract_json_from_text(data["choices"][0]["message"]["content"]) or {}
@@ -2298,7 +2311,11 @@ Return ONLY a JSON object with:
                     "response_format": {"type": "json_object"}
                 }
                 data = await self.context.llm_client.chat_completion(
-                    payload, use_worker=True, is_background=True, task_label="dream"
+                    payload, use_worker=True, is_background=True,
+                    # Degrade on worker-pool failure (per-lesson except below
+                    # retries next cycle) rather than dogpiling the main slot;
+                    # timeout bounds a wedged-but-connected node.
+                    off_main_only=True, timeout=180.0, task_label="dream"
                 )
                 result = extract_json_from_text(data["choices"][0]["message"]["content"])
 
@@ -2580,6 +2597,12 @@ Return ONLY a JSON object with:
             data = await self.context.llm_client.chat_completion(
                 payload, use_worker=True, timeout=120.0, task_label="dream",
                 is_background=is_background,
+                # Background cycles must never fall back onto the main
+                # slot when the worker pool fails — degrade (except below
+                # keeps the templated-fallback path). User-triggered runs
+                # (is_background=False) keep the fallback: the user is
+                # actively waiting and the foreground IS this task.
+                off_main_only=is_background,
             )
             raw = data["choices"][0]["message"].get("content", "")
             parsed = extract_json_from_text(raw) or {}
@@ -3219,6 +3242,17 @@ Return ONLY a JSON object with:
                     # (same C1 contract as the _BackgroundOnlyLLM wrapper
                     # for solver turns below).
                     is_background=is_background,
+                    # Background generation must not dogpile the main slot
+                    # when the coding/worker pool fails — the except below
+                    # burns this gen_attempt and retries. Foreground
+                    # (user-triggered) runs keep the main fallback.
+                    off_main_only=is_background,
+                    # Bound a wedged-but-connected node: max_tokens=16384
+                    # with no timeout could pin this call indefinitely.
+                    # Expected wall time is ~45s (temp 0.3 + /no_think +
+                    # stop tag); 180s matches the file's worker-call
+                    # convention with generous headroom.
+                    timeout=180.0,
                 )
                 content_text = data["choices"][0]["message"]["content"]
 
@@ -3481,6 +3515,11 @@ Return ONLY a JSON object with:
                         use_coding=has_coding_node,
                         use_worker=not has_coding_node,
                         is_background=is_background,
+                        # Same contract as the generation call above:
+                        # background repair degrades on pool failure
+                        # (except below treats it as "no usable repair").
+                        off_main_only=is_background,
+                        timeout=180.0,
                     )
                     ref_repair_text = ref_repair_data["choices"][0]["message"]["content"]
                     ref_repair_text = re.sub(
@@ -3620,6 +3659,11 @@ Return ONLY a JSON object with:
                         use_coding=has_coding_node,
                         use_worker=not has_coding_node,
                         is_background=is_background,
+                        # Same contract as the generation call above:
+                        # background repair degrades on pool failure
+                        # (except below falls back to full regeneration).
+                        off_main_only=is_background,
+                        timeout=180.0,
                     )
                     repair_text = repair_data["choices"][0]["message"]["content"]
                     repair_text = re.sub(

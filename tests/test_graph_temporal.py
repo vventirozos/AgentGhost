@@ -80,8 +80,12 @@ class TestGraphTemporalReasoning:
         assert all(e["subject"] == "alice" for e in expired_alice)
 
     def test_initialize_graph_excludes_expired(self, graph):
-        graph.add_triplets([{"subject": "x", "predicate": "IS", "object": "old"}])
-        graph.add_triplets([{"subject": "x", "predicate": "IS", "object": "new"}])
+        # Uses LIVES_IN (a genuinely single-valued predicate). Was IS, but IS is
+        # multi-valued ("webos IS a project" AND "IS done") and was removed from
+        # the functional set 2026-07-22 — wrongly treating IS/OWNS as functional
+        # had silently expired real facts (e.g. the operator's OWNS history).
+        graph.add_triplets([{"subject": "x", "predicate": "LIVES_IN", "object": "old"}])
+        graph.add_triplets([{"subject": "x", "predicate": "LIVES_IN", "object": "new"}])
 
         graph.initialize_graph(include_expired=False)
         nodes = list(graph.nx_graph.nodes())

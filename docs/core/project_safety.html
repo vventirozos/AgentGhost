@@ -29,7 +29,7 @@
     <thead><tr><th>Function</th><th>Purpose</th></tr></thead>
     <tbody>
       <tr><td><code>check_budget(proj_metadata) -&gt; BudgetDecision</code></td><td>Multi-dimensional budget check — steps · runtime_seconds · tool_calls (line 39).</td></tr>
-      <tr><td><code>enforce_human_gate(task) -&gt; Optional[str]</code></td><td>Returns the first <code>HUMAN_GATE:</code>-prefixed postcondition, or None (line 114).</td></tr>
+      <tr><td><code>enforce_human_gate(task) -&gt; Optional[str]</code></td><td>Returns the reason from the first <code>HUMAN_GATE:</code>-prefixed postcondition, or None (line 114). Non-None → the task must go NEEDS_USER, not DONE (see below).</td></tr>
       <tr><td><code>detect_contradiction(new_summary, prior_summary) -&gt; Optional[str]</code></td><td>Textual conflict detection (true↔false, yes↔no, …) (line 142).</td></tr>
       <tr><td><code>route_contradiction(contradiction_log, new_fact, prior_facts, reason)</code></td><td>Append a revision event to the contradiction log (line 162).</td></tr>
       <tr><td><code>should_suggest_promotion(...)</code></td><td>Decide whether the in-flight chat warrants becoming a tracked project (line 203).</td></tr>
@@ -48,7 +48,8 @@
   <p><code>MIN_TURNS_FOR_SUGGESTION = 8</code>; <code>MIN_PLAN_NODES_FOR_SUGGESTION = 3</code>. Promotion is suggested only when both clear and the conversation isn't already in a project.</p>
 
   <h2>Human gate</h2>
-  <p>Any postcondition prefixed with <code>HUMAN_GATE:</code> forces NEEDS_USER regardless of tool output. Used for irreversible actions (delete production data, send-to-customer, etc.).</p>
+  <p>Any postcondition prefixed with <code>HUMAN_GATE:</code> forces NEEDS_USER regardless of tool output. Used for irreversible actions (delete production data, send-to-customer, etc.). <code>enforce_human_gate(task)</code> returns the gate reason (the text after the prefix, or <em>"human approval required"</em> when empty); callers check it BEFORE marking DONE — a non-None result means the task transitions to NEEDS_USER instead.</p>
+  <p><strong>Interactive close path enforced too (2026-07-20).</strong> The advancer already routed gated tasks to NEEDS_USER, but closing a gated task DONE <em>interactively</em> used to grade the gate text against the result summary and cascade a spurious FAILED up the tree (the result never echoes the gate). <code>TaskTree.update_status</code> / <code>ProjectPlan.update_status</code> (<a href="planning.html">core.planning</a>) now call <code>enforce_human_gate</code> on every DONE close and park the task at NEEDS_USER instead. Approval is a signal, never text similarity: an explicit <code>human_approved=True</code>, or a close on a task already parked NEEDS_USER (the user has been asked and the close is now being taken) or already DONE, proceeds to the normal postcondition gate. <code>HUMAN_GATE:</code> postconditions are excluded from the token-overlap check entirely — a gate can be neither satisfied nor failed by result text. Covered by <code>tests/test_planning_gate_fixes.py</code>.</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

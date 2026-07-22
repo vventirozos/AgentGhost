@@ -40,6 +40,24 @@
   <h2>Registry</h2>
   <p><code>_swarm_task_registry</code> tracks <code>asyncio.Task</code> objects by id and auto-cleans via a done callback.</p>
 
+  <h2>Advertised only when configured <span class="tag">2026-07-22</span></h2>
+  <p><code>delegate_to_swarm</code> is dropped from the advertised tool schema
+  (<code>registry.get_active_tool_definitions</code>) whenever no swarm cluster
+  is configured (<code>llm_client.swarm_clients</code> empty — the live default,
+  no <code>--swarm-nodes</code>). Previously the tool was always advertised
+  <em>and</em> the system prompt steered the model into it, so every call
+  returned <code>Error: The Swarm Cluster is not configured</code> and that
+  <code>Error:</code>-prefixed result burned a strike. This mirrors the
+  <code>image_generation</code> gating (advertised only when
+  <code>image_gen_clients</code> exist). The dispatch entry stays registered, so
+  a <em>hallucinated</em> call still receives the helpful "process this
+  synchronously" steer rather than an unknown-tool error.</p>
+  <p>Note the <code>delegate_to_swarm</code> tool (stateless single-completion
+  workers) is distinct from the <a href="../core/delegation.html">delegate</a>
+  tool (tool-using sub-agents). The bare <code>"delegate"</code> canonicalisation
+  alias was removed so a case/paren variant of the real
+  <code>delegate</code> tool is no longer hijacked here.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>
