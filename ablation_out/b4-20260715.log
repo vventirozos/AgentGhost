@@ -1,5 +1,0 @@
-[18:34:16] === B4 repeat 1/3 ===
-[18:34:28]   ready: treatment on http://127.0.0.1:8046 (pid 7614)
-[19:38:22]   ready: treatment_uniform on http://127.0.0.1:8046 (pid 10992)
-[20:37:20]   !! arm busy past 900s grace (finished 28/29) — holding up to the ceiling
-[20:51:31]   arm quiet again (finished 29/29)

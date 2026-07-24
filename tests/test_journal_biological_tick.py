@@ -45,6 +45,9 @@ def _make_ctx_with_journal(*, idle_secs: float, has_items: bool = True):
     journal.load = MagicMock(
         return_value=[{"type": "smart_memory", "data": {}}] if has_items else []
     )
+    # 'Is there work?' now goes through pending_count() (hot + overflow spill),
+    # not len(load()), so overflow-only work still triggers the drain.
+    journal.pending_count = MagicMock(return_value=1 if has_items else 0)
     ctx.journal = journal
 
     # Phase 2 will see no candidates, so it short-circuits cleanly.

@@ -8,6 +8,18 @@ import os
 # can verify the very same flags we ship.
 from . import _env  # noqa: F401  (import applies the env-var assignments)
 
+# Earn-your-keep ENV prunes must land BEFORE core.agent is imported below —
+# its module-level toggle constants (e.g. GHOST_HYPOTHESIS_GROUNDING) read
+# their env at import time. Pure stdlib, fully defensive (no-op + never raises
+# when the override file is absent — the common case), so it can't perturb a
+# normal boot. Arg-kind prunes are applied after parse_args() in main().
+from .core import prune_overrides as _prune_overrides  # noqa: E402
+_pruned_at_boot = _prune_overrides.load_pruned(os.environ.get("GHOST_HOME"))
+_env_prunes_applied = _prune_overrides.apply_env_prunes(_pruned_at_boot)
+if _env_prunes_applied:
+    print(f" - Earn-your-keep: env-pruned subsystem(s) DISABLED: "
+          f"{', '.join(_env_prunes_applied)}", flush=True)
+
 print(" - Importing standard libraries...", flush=True)
 import argparse
 import asyncio
@@ -143,6 +155,8 @@ def parse_args():
     # implicitly disables reflection (it has nothing to read).
     parser.add_argument("--no-trajectories", action="store_true", help="Disable the distill/trajectory JSONL log. Also disables idle-time self-critique on failed turns, since it depends on the log.")
     parser.add_argument("--no-reflection", action="store_true", help="Disable idle-time self-critique on failed turns even if trajectory logging is on.")
+    parser.add_argument("--no-dream", action="store_true", help="Disable the idle-time Deep REM Dream phase (biological-watchdog phase 2: memory consolidation / heuristic harvest). Leaves reflection and self-play intact. The dream-off arm for the Track-B earn-keep idle-loop LOO (scripts/earn_keep.py --track B). Off by default = production dreams normally.")
+    parser.add_argument("--no-self-play", action="store_true", help="Disable the idle-time Synthetic Self-Play phase (biological-watchdog phase 3: fresh self-play + counterfactual replay, >60 min idle). Leaves reflection and dream intact. The self-play-off arm for the Track-B earn-keep idle-loop LOO. NOTE: distinct from --frontier-selfplay, which only toggles cluster SELECTION, not whether self-play fires. Off by default = production self-plays normally.")
     parser.add_argument("--postmortem", action="store_true", default=False, help="Biological-watchdog phase 2.5c: run whole-transcript post-mortems on the worst recent FAILED runs and file durable, classified DEFECT REPORTS (behavioural / configuration / code_defect) to $GHOST_HOME/postmortem/defects.jsonl. Behavioural findings also route into SkillMemory (same channel as reflection). Code-defect findings get an LLM-proposed reproducing test + unified diff attached — stored for review, NEVER auto-applied. Read the queue with the `postmortem` tool. Opt-in, off by default. Requires the trajectory log (no effect under --no-trajectories).")
     parser.add_argument("--postmortem-cooldown", type=int, default=10800, help="Seconds between idle-time post-mortem passes (phase 2.5c). Default 3 hours. Only active under --postmortem.")
     parser.add_argument("--postmortem-min-severity", type=float, default=0.4, help="Minimum structural-severity (0..1) a failed run must score before it earns a post-mortem LLM call. Lower = more runs analysed. Default 0.4.")
@@ -214,6 +228,7 @@ def parse_args():
     parser.add_argument("--metacog-cpu-high", type=float, default=85.0, help="CPU usage %% above which a HostSignal fires (default 85). Sustained crossings escalate severity to warning.")
     parser.add_argument("--metacog-mem-high", type=float, default=85.0, help="RAM usage %% above which a HostSignal fires (default 85). Raise to 95-99 on hosts where the LLM server pins memory as steady state.")
     parser.add_argument("--metacog-mem-floor-mb", type=float, default=800.0, help="Hard floor for free RAM in MB (default 800). Crossing emits a critical-severity signal regardless of mem-high.")
+    parser.add_argument("--metacog-mem-warn-free-mb", type=float, default=1024.0, help="The RAM WARNING requires BOTH mem-high%% AND free RAM below this (default 1024 = 1 GB). On a large-RAM box a high percentage with GBs free is not real pressure and spammed a warning every heartbeat; gating on genuinely-low free memory (~97%% on a 36 GB box) fires only under real pressure. The critical floor (--metacog-mem-floor-mb) stays the harder OOM line below this.")
     parser.add_argument("--metacog-disk-high", type=float, default=90.0, help="Disk usage %% above which a HostSignal fires (default 90).")
     parser.add_argument("--metacog-host-heartbeat-s", type=float, default=300.0, help="Re-emit a steady-state host signal every N seconds even when (metric, severity) hasn't changed. Default 300 (5 min). Prevents 1Hz log spam while keeping a periodic 'still degraded' trail.")
     args = parser.parse_args()
@@ -1883,6 +1898,16 @@ async def lifespan(app):
 
 def main():
     args = parse_args()
+    # Earn-your-keep ARG prunes: flip off any subsystem the measurement harness
+    # auto-pruned on a sustained "doesn't earn its keep" verdict. Reversible —
+    # the operator deletes the entry in $GHOST_HOME/system/earn_keep/pruned.json
+    # to restore it. Loud so a pruned config is never a silent surprise.
+    _arg_prunes_applied = _prune_overrides.apply_arg_prunes(args, _pruned_at_boot)
+    if _arg_prunes_applied:
+        for _name in _arg_prunes_applied:
+            _ev = (_pruned_at_boot.get(_name, {}) or {}).get("evidence", {})
+            print(f"⚖️  Earn-your-keep: subsystem '{_name}' DISABLED by auto-prune "
+                  f"(evidence: {_ev}) — revert via pruned.json", flush=True)
     base_dir = Path(os.getenv("GHOST_HOME", Path.home() / "ghost_llamacpp"))
     sandbox_dir = base_dir / "sandbox"
     memory_dir = base_dir / "system" / "memory"

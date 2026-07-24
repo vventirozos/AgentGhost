@@ -23,6 +23,11 @@ def _make_agent(idle_seconds: int = 0,
     ctx.args.max_context = 4000
     ctx.args.smart_memory = 0.0
     ctx.args.use_planning = False
+    # idle-loop ablation toggles default OFF (production dreams / self-plays).
+    # Must be real bools, not the auto-vivified MagicMock children, so the
+    # phase gates (`is not True`) see them as disabled=False.
+    ctx.args.no_dream = False
+    ctx.args.no_self_play = False
 
     ctx.llm_client = MagicMock()
     ctx.llm_client.foreground_tasks = foreground_tasks
@@ -54,6 +59,9 @@ def _make_agent(idle_seconds: int = 0,
         # The watchdog now routes through the guarded journal.load() (so a
         # corrupt journal sidecars instead of silently skipping consolidation).
         ctx.journal.load.return_value = _items
+        # Phase-1 'has work?' uses pending_count() (hot + overflow), not
+        # len(load()), so overflow-only work isn't mistaken for empty.
+        ctx.journal.pending_count.return_value = journal_items
     else:
         ctx.journal = None
 
@@ -135,6 +143,21 @@ async def test_tick_phase2_triggers_rem_dream():
     MockDreamer.assert_called_once_with(agent.context)
     mock_dreamer.dream.assert_awaited_once()
     mock_dreamer.dream.assert_awaited_with(model_name="test-model")
+
+
+@pytest.mark.asyncio
+async def test_tick_phase2_skips_when_no_dream():
+    """--no-dream ablates JUST the REM dream loop: even fully eligible (idle,
+    ≥3 auto memories, random gate open), Dreamer.dream must not fire. The
+    Track-B earn-keep dream-off arm depends on this."""
+    agent = _make_agent(idle_seconds=900, memory_ids=4)
+    agent.context.args.no_dream = True
+    mock_dreamer = MagicMock()
+    mock_dreamer.dream = AsyncMock()
+    with patch("ghost_agent.core.dream.Dreamer", return_value=mock_dreamer), \
+         patch("ghost_agent.core.agent.random.random", return_value=0.1):
+        await agent._biological_tick()
+    mock_dreamer.dream.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -251,6 +274,37 @@ async def test_tick_phase3_triggers_self_play():
         model_name="test-model", is_background=True
     )
     mock_dreamer.dream.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tick_phase3_skips_when_no_self_play():
+    """--no-self-play ablates JUST the self-play loop: even deeply idle with
+    the random gate open, synthetic_self_play must not fire. The Track-B
+    earn-keep self-play-off arm depends on this."""
+    agent = _make_agent(idle_seconds=4000)
+    agent.context.args.no_self_play = True
+    mock_dreamer = MagicMock()
+    mock_dreamer.synthetic_self_play = AsyncMock()
+    with patch("ghost_agent.core.dream.Dreamer", return_value=mock_dreamer), \
+         patch("ghost_agent.core.agent.random.random", return_value=0.05):
+        await agent._biological_tick()
+    mock_dreamer.synthetic_self_play.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_tick_phase2_only_no_dream_leaves_self_play(monkeypatch):
+    """Isolation guarantee: --no-dream must NOT disable self-play (and vice
+    versa). A deeply-idle agent with only dream ablated still self-plays."""
+    agent = _make_agent(idle_seconds=4000)
+    agent.context.args.no_dream = True
+    agent.context.args.no_self_play = False
+    mock_dreamer = MagicMock()
+    mock_dreamer.dream = AsyncMock()
+    mock_dreamer.synthetic_self_play = AsyncMock()
+    with patch("ghost_agent.core.dream.Dreamer", return_value=mock_dreamer), \
+         patch("ghost_agent.core.agent.random.random", return_value=0.05):
+        await agent._biological_tick()
+    mock_dreamer.synthetic_self_play.assert_awaited_once()
 
 
 @pytest.mark.asyncio

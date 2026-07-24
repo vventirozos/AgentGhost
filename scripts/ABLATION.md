@@ -65,6 +65,39 @@ Files:
 
 ---
 
+## Scoring — the `ANSWER:` line (and why "last number" was a trap)
+
+The hard suite (`scripts/ablation_hard_tasks.py`) validates from the chat TEXT.
+Every prompt is auto-suffixed with a directive to end on a canonical line:
+
+    ANSWER: <bare value>
+
+and the validators (`answer_int`, `answer_num`) read the **last `ANSWER:` line**,
+not the last number in the reply. If the marker is missing they fall back to a
+lenient "is the correct value present as a standalone token" check — so a
+forgotten marker is not penalised, but trailing prose can never hijack the score.
+
+**Why this matters — a real bug that corrupted a headline.** The old
+`final_number_is` rule scored the *last numeric token* in the reply. A correct,
+verified answer that shows its work ("the father is 36 … in 12 years 48 = 2×24 ✓")
+ends on **24** and was marked WRONG. Because the verifier / deep-reason arms emit
+more verification prose than `thin`, that rule docked them for *being verbose*,
+manufacturing a ~3pp `full`-vs-`thin` gap that was pure formatting. The earn-keep
+audit (2026-07-23) traced the entire "the full stack underperforms stripped"
+finding to this: split by validator, the 12 lenient tasks were `full` 98% vs
+`thin` 99% (a tie, and at a useless ceiling), while the 4 `final_number_is` tasks
+were 39% vs 50% — the whole gap lived in the scoring artifact. **The verifier was
+exonerated** (it CONFIRMED 100%; it never refuted a correct answer). Lesson: an
+ablation's validator is part of its measurement — a validator that correlates
+with an arm's *style* (verbosity) rather than its *correctness* will invent
+differences that aren't there. Score the declared answer, not the last digit.
+
+The trap tasks (`bat_ball`, `algae_quarter`, `avg_speed`, …) exist to add
+failure-frontier headroom where reasoning/verification *can* pay off; their
+parameters are shifted off the textbook values so a recalled trick doesn't win.
+
+---
+
 ## Two tracks (this is the part people get wrong)
 
 The single-shot suite only exercises **in-session** layers. Run cleanly (fresh
@@ -273,3 +306,114 @@ Pre-registered verdicts (journal §4D items 5-7): idle-loop outcome value =
 stratified p<0.05 with healthy mediation; frontier KEEP iff self-play yield ≥
 uniform in ≥2/3 repeats AND weak-cluster probe delta ≥ 0, else flip default to
 uniform (PRM stays either way); dream gate satisfied-but-silent = new bug.
+
+## Earn-your-keep — the STANDING self-measuring / self-pruning harness (2026-07-22)
+
+> **⛔ CLOSED as INCONCLUSIVE-for-this-model (operator decision 2026-07-23).** The synthetic-ablation
+> route below is **dormant** — do not run more batteries expecting a prune verdict. The premise (auto-graded
+> deterministic tasks discriminate whether a subsystem helps) fails on this uncontended 35B: both the Track-A
+> puzzle battery and the Track-B4 grounded battery ceiling, so the auto-prune rule never fires. **Nothing was
+> pruned; prod config is unchanged.** The code stays as reference/dormant infra; it would only be revived if
+> the *instrument* changes (observational mediation on live trajectories, or a deliberately degraded model).
+> See `PROJECT_JOURNAL.md` §6 "2026-07-23 (later 3)". The mechanics below are retained for that possibility.
+
+`scripts/earn_keep.py` turns the one-shot ablations above into a standing
+capability: every cognitive subsystem must prove it earns its keep or get
+auto-pruned. It's a thin orchestration layer over the paired driver — no new
+measurement machinery.
+
+**What it does.** `run` boots the **leave-one-out** config matrix
+(`ablation_paired.CONFIG_FLAGS`: `full` + one `full_no_<x>` per subsystem +
+`thin`) and fires the hard battery at every arm back-to-back (paired → shared
+upstream load cancels). The marginal contribution of subsystem X = the paired
+`full` vs `full_no_x` delta. Every run's raw per-(arm, repeat, task) pass/fail
+is APPENDED to a durable ledger (`ablation_out/earn_keep/results.jsonl`), so the
+picture TRENDS across on-demand runs. `report` aggregates the ledger into a
+ranked keep/prune table (Δ-help, 90% bootstrap CI, latency cost, pair/run
+counts, verdict).
+
+> **Ledger hygiene.** `report` pools EVERY run in `results.jsonl`, so the ledger
+> may only contain runs of the *same* battery + scoring contract. When the tasks
+> or validators change, archive the old ledger before re-running, e.g.
+> `mv results.jsonl results.pre-<change>.jsonl` — pooling incompatible runs
+> re-corrupts the report. (Done once already: `results.pre-answerline.jsonl`
+> holds the 3 runs scored under the biased last-number rule; see the scoring
+> section above.)
+
+    # prod stopped (paired needs 2+ throwaway agents + the 35B):
+    PYTHONPATH=src GHOST_HOME=<live-home> python scripts/earn_keep.py run --track A --repeats 3
+    PYTHONPATH=src GHOST_HOME=<live-home> python scripts/earn_keep.py run --resume       # after a crash/kill
+    PYTHONPATH=src GHOST_HOME=<live-home> python scripts/earn_keep.py report              # trend so far
+    PYTHONPATH=src GHOST_HOME=<live-home> python scripts/earn_keep.py report --apply --dry-run
+
+**Single script, resumable, monitorable.** `run` is the one entrypoint. Each run
+gets a directory `ablation_out/earn_keep/run-<id>/` with three artifacts:
+
+  * `progress.log` — the whole-process narrative (booting, per-group / per-cell
+    PASS/fail, checkpoints, completion), teed to stdout AND the file, and it also
+    absorbs the boot/teardown chatter — so `tail -f progress.log` mirrors exactly
+    what the operator sees.
+  * `<arm>.log` — each throwaway agent's own stdout/stderr (`full.log`, `thin.log`,
+    `full_no_deepreason.log`, …) for drilling into one arm's behaviour.
+  * `checkpoint.jsonl` + `manifest.json` — the resume substrate.
+
+**Idle loops are quiesced for Track A** (`--bio-time-scale 0.001`, applied
+uniformly to every arm). Track A measures per-turn cognition, which fires on the
+task turns — but the ~9 arms share one llama slot (`-np 1`), and each arm's own
+biological idle loops (dream / REM / self-play / reflection / autoadvance) would
+otherwise fire between measured tasks and contend on the single GPU. That load
+is per-arm *asymmetric*, which the paired design does NOT cancel, so it would
+poison the latency/outcome signal and crawl the run. Quiescing pushes every
+idle-window bound out to ~days so no idle phase fires; uniform across arms → no
+bias. (Track B, which *measures* the idle loops, does the opposite.)
+
+The run prints the exact `tail -f` commands for both at startup. Progress is
+checkpointed at **(repeat, task)-GROUP** granularity — all arms for a task fire
+back-to-back (so the paired-within-seconds property survives a resume) and a
+group is written atomically, so a kill mid-group redoes only that one group.
+`run --resume` (or `--run-id <id>`) picks up the latest incomplete run, skips
+done groups, and continues; the run's data is folded into the durable
+`results.jsonl` ledger ONLY when all groups complete (no partial run pollutes the
+trend). Starting a fresh run while one is incomplete is refused (use `--resume`
+or `--force-new`).
+
+**Auto-prune (pre-registered rule — do not move post-hoc).** A subsystem is
+auto-pruned only when, across **≥3 runs** totalling **≥60 matched pairs**, its
+Δ vs `full` is **≤ 0** AND the 90% CI upper bound is **< +2 pp** AND it carries a
+compute cost (`costs=True` in the catalog — a free-but-useless subsystem is
+harmless to keep). **Protected set — measured but NEVER auto-pruned:** `memory`
+(Track-B-proven, 98% vs 0%) and `verifier` (correctness guard).
+
+**How a prune reaches prod (reversible).** The harness writes
+`$GHOST_HOME/system/earn_keep/pruned.json`. At boot `main.py` reads it via
+`core.prune_overrides` and flips the subsystem off — env-kind toggles (e.g.
+`GHOST_HYPOTHESIS_GROUNDING`) BEFORE `core.agent` is imported, arg-kind toggles
+after `parse_args()` — logging each loudly (`⚖️ Earn-your-keep …`). **Revert** by
+deleting the entry (or the file); the subsystem returns on the next restart. The
+catalog `core.prune_overrides.SUBSYSTEMS` is the single source of truth for the
+subsystem↔arm↔toggle mapping.
+
+**Phase 2 (needs an operator evening):** wire the Track-B idle-loop LOO
+(dream/self-play/reflection arms, via the trackb4 protocol + a calibrated
+battery) into `run --track B`, feeding the same ledger/report. That adjudicates
+the idle loops — the one genuinely open question. Tests:
+`tests/test_earn_keep.py` (attribution math, the verdict rule's every branch,
+prune I/O + prod-apply + protected refusal — all pure, no live boot).
+
+*Phase 2 progress (2026-07-23).* The idle-loop **disable toggles** now exist and
+are catalogued as Track-B, costed arms:
+
+| loop | toggle | arm | notes |
+|---|---|---|---|
+| reflection | `--no-reflection` | `full_no_reflection` | pre-existing |
+| dream (REM, phase 2) | `--no-dream` | `full_no_dream` | gate at `agent.py` phase 2 |
+| self-play (phase 3) | `--no-self-play` | `full_no_selfplay` | ablates fresh self-play **and** counterfactual replay; **≠** `--no-frontier-selfplay` (that only changes cluster *selection*) |
+
+Each disables *only* its own loop (isolation tested in `tests/test_biological_watchdog.py`).
+**Still to do before running the LOO:** (1) calibrate the probe battery —
+`ablation_trackb4.py --pilot` (the Track-A ceiling lesson applies: an
+un-calibrated battery measures nothing); (2) confirm the collective
+`treatment` vs `control` effect is non-null before spending arms on per-loop
+attribution; (3) wire `run --track B` to boot these arms through the trackb4
+seed→idle→probe protocol and fold probe outcomes into the ledger with
+`track="B"`.

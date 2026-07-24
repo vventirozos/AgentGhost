@@ -323,10 +323,48 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 
 ## 4. WHAT REMAINS TO DO
 
-Everything below is open. Start here. Grouped: (A) improvement-review partials/blocked,
-(B) static-hunt deferred findings, (C) functional-hunt deferred findings, (D) the B4
-outcome-battery design (the harder task battery #4/#27b are blocked on — designed
-2026-07-09, awaiting implementation).
+> **╔═ 2026-07 BUG-HUNT CYCLE CLOSED (2026-07-22) ═╗**
+> The dedicated adversarial-hunt cycle is complete. Cohorts swept, fixed, tested, and DEPLOYED this
+> cycle: **project-autonomy + turn-loop + code-correction** (07-20 three-stack), **metacognitive stack**
+> (07-20), **LLM / routing / delegation / recording / grammar / consumers** (07-22), **memory
+> substrate** — vector/graph/episodes/bus/journal (07-22 "later 3"), and **sandbox/execution + infra**
+> (07-22 "later 4"). Every finding from those reviews is either FIXED+deployed or explicitly parked
+> below. The detailed §4A–§4D catalogues below are kept as the historical record; their per-item
+> "FIXED"/"RESOLVED" markers are current.
+>
+> **What genuinely remains is NOT pending hunt-work — it is two buckets, both by decision:**
+>
+> **(1) Blocked on operator action** (cannot be done headless):
+> - **Earn-your-keep / synthetic-ablation route — CLOSED as INCONCLUSIVE-for-this-model (operator decision
+>   2026-07-23; §6 "later 3").** DO NOT resurface as pending work. The self-measuring→self-pruning premise
+>   assumed auto-graded deterministic tasks could discriminate whether a subsystem helps. They can't on this
+>   uncontended 35B: Track A puzzles ceilinged and Track B4 grounded tasks ceilinged (32/35 at 3/3; the 3
+>   "survivors" were pure timeout flakes) — the statistical auto-prune rule will never fire on this instrument.
+>   **Verdict: ZERO subsystems pruned; prod config unchanged (everything stays on).** What we DID establish:
+>   the per-turn stack in aggregate ≈ stripped on all measurable tasks (neutral, not harmful), and the verifier
+>   is exonerated (confirms 100%, never false-refutes). The harness code (`scripts/earn_keep.py`, the LOO
+>   matrix, `prune_overrides`, the `--no-dream`/`--no-self-play` gates) stays in the tree as dormant infra —
+>   not deleted, revivable only if the *instrument* changes (observational mediation on live trajectories, or
+>   a deliberately degraded model). Not a headless-runnable item any more.
+> - **GAIA full run** — harness done, pilot 8/8; blocked on `huggingface-cli login` for the gated set.
+>
+> **(2) Parked by decision** (reviewed, deliberately not fixed):
+> - **Node-deployed items — SKIPPED per operator 2026-07-22 ("not in use"):** voice-server no-auth CRIT
+>   (Orin), uConsole client (SSE token-loss / camera leak), Slack thread-boundary. Reviewed with fix
+>   recipes in §4B; per-device deploys.
+> - **Linux-only** (prod is macOS/bridge, no prod impact): sandbox `HOST=0.0.0.0` host-mode exposure
+>   (accessor in place), exec-user provisioning, egress-guard loopback bypass.
+> - **Low-value improvements + one deferred refactor:** llm.py node-payload serializer unify, verifier
+>   stage shared-prefix cache, fallback-hint merge, streaming recording hook (dev feature), and the
+>   agent.py step-4 streamer-closure refactor (§4A #5 — the seam is established; cosmetic, high-effort).
+> - **Latent §4B/§4C residuals** — no prod caller / multi-process-only / model-behavior edges, kept for
+>   reference (e.g. remove-while-exec self-heal, Yandex-over-Tor, huge-reasoning no-file-spec).
+>
+> Next cycle, if reopened, the stalest un-hunted surfaces are the web-facing `interface/server.py` + CLI
+> and the mid-July tool cohorts. **╚════════════════════════════════════════════╝**
+
+The detailed catalogue follows. Grouped: (A) improvement-review partials/blocked, (B) static-hunt
+deferred findings, (C) functional-hunt deferred findings, (D) the B4 outcome-battery design.
 
 ### 4A. Improvement-review items not fully closed (from the 6-agent review)
 
@@ -825,11 +863,16 @@ model-behavior edges.
   checked before DIAGNOSTIC, so `ValueError: invalid argument…` / `FileNotFoundError: 'tool.py' not
   found` get marked FATAL instead of self-correctable. Also: dead retry helpers
   (`get_retry_delay`/`should_retry`/`MAX_RETRIES`, off-by-one) — wire-or-delete.
-- **sandbox/docker.py** (med/rare + high-on-Linux) — remove-while-exec race (in-flight command dies,
-  self-heals; do NOT auto-retry — commands aren't idempotent); no client-side deadline on probes/exec
-  (a wedged daemon hangs a worker); **Linux exec-user vs root-provisioned env** (Playwright/Chromium
-  in /root mode 700, sudo refuses unknown uids — masked on macOS which execs as root; forces a full
-  re-provision to fix — do when a Linux deployment matters).
+- **sandbox/docker.py + services.py + execute.py** — client-side exec deadline, infra-error marking,
+  resume-stopped-container, adopted-published-ports, spill-counter, heal-retry safety, port-reclaim
+  ownership + container-generation stamp + atomic restart **ALL FIXED 2026-07-22 (later 4)** (§6). Still
+  OPEN: remove-while-exec race (self-heals, low; do NOT auto-retry — not idempotent); readiness
+  false-negative removes a healthy container (self-heals); the full infra exit-code sentinel (light
+  marker done). **Linux-only** (prod is macOS/bridge): exec-user vs root-provisioned env
+  (Playwright/Chromium in /root mode 700, sudo refuses unknown uids — needs `useradd -o -u <host_uid>`
+  + browsers to a world-readable path + Dockerfile marker bump); `HOST=0.0.0.0` host-mode LAN exposure
+  (`binds_host_netns()` accessor added — services-side `HOST=127.0.0.1` export pending); egress-guard
+  loopback bypass (`[::1]`/decimal IPs; host-netns only).
 - **router serve-only / scaling features** (low) — context_turn_coupling computed at serve but never
   trained (column all-zeros, inert); code_fence_count/coding_language raw not log1p; multi_step
   uses unanchored substrings. Needs a schema bump + retrain.
@@ -843,11 +886,16 @@ model-behavior edges.
   (over-narrow); `selfhood_functional_test` Section C/G non-atomic RMW on the live store + Section D
   hardcodes :8088; `load_tokens` O(n²) filler; timestamp collisions. (**Note:** `ablation_trackb3.py`
   had a report-builder bug — FIXED 2026-07-07.)
-- **interface external GPU servers** (med, home-lab threat model) — TTS/STT + image-gen HTTP servers
-  bind 0.0.0.0 with NO auth on expensive endpoints (LAN resource exhaustion) + unbounded reads +
-  blocking model calls on the async loop; needs a shared-key check coordinated with the clients. The
-  clockwork desktop client parses SSE with `aiter_text` on non-line-aligned chunks (token misframing),
-  ships a placeholder key, leaks camera/QTimer on close.
+- **interface external GPU servers + clients** (node-deployed; SKIPPED per operator 2026-07-22 — "not
+  in use"; reviewed 2026-07-22 later 4, §6). The **image server (Jetson) is already hardened** (07-15:
+  constant-time fleet-key auth, GPU thread, VRAM budget) — only a prompt-token cap is missing. The
+  **voice server (Orin) is the open CRIT**: NO auth on `/stt`+`/tts` bound 0.0.0.0, sync GPU inference
+  on the async loop, unbounded upload into RAM on an 8GB box, no `/health` — fix is to port the image
+  server's `_require_key` + GPU-thread + input-cap pattern (~35 lines) + client `X-Ghost-Key`. uConsole
+  client: SSE `aiter_text` SILENTLY LOSES tokens (persisted into history), camera+60fps QTimer leak on
+  Escape, send-race interleaves streams, unbounded base64-image history. Slack bot: owner-lock HOLDS,
+  but thread-history admits any third-party bot (`or msg.get("bot_id")`) into context + owner
+  `file_share` DMs dropped as unauthorized. (Voice/client fixes are per-device deploys.)
 - **entrypoint / misc lifecycle nits** (low) — `--no-memory` leaks a `/tmp/ghost_no_memory_*` dir per
   boot; `_host_signal_to_bus` logs hardcoded 85/90 thresholds not the configured values; unbounded
   numeric CLI args; scratchpad connections not closed; episode float-epoch timestamp (degraded
@@ -1037,6 +1085,269 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-23 (later 3) — Earn-your-keep / synthetic-ablation route CLOSED as inconclusive (operator decision)
+
+Operator's call after the full arc: **drop the synthetic-battery route entirely and declare the
+self-measuring→self-pruning experiment inconclusive for this model.** The premise was that auto-graded
+deterministic tasks could measure whether each cognitive subsystem earns its keep. Two independent batteries
+proved they can't on this uncontended 35B — Track A puzzles ceilinged (full ≈ thin ~98% once scored fairly),
+Track B4 grounded DOING tasks ceilinged (32/35 at 3/3, the 3 "survivors" pure 300s-timeout flakes). The
+statistical auto-prune rule the harness is built around will therefore **never fire on this instrument**.
+
+**Outcome: NOTHING pruned. Prod config unchanged — every subsystem stays on.** This is a deliberate, honest
+non-result, not a deferral. What the arc DID leave, all standing on their own merit:
+- **Findings:** the per-turn cognitive stack, in aggregate, is *neutral* (neither helps nor hurts) on every
+  measurable task; the **verifier is exonerated** (confirms 100%, never false-refutes — it had been the
+  prime suspect). Per-subsystem resolution was never achievable (LOO deltas all noise under the ceiling).
+- **Real fixes that outlive the experiment:** the `final_number_is` scoring artifact (ablation_hard_tasks),
+  the **journal overflow-spill data-loss fix** (memory/journal.py — [[journal-overflow-spill]]), the
+  `--no-dream` / `--no-self-play` idle-loop gates (useful ablation levers regardless).
+
+**Disposition of the infra (NOT deleted):** `scripts/earn_keep.py`, `ablation_*`, `core/prune_overrides.py`,
+the idle-loop toggles, and the ledgers/pilot artifacts stay in the tree as **dormant** infrastructure. They
+would only be revived if the *instrument* changes — the two live-but-unfunded ideas being observational
+mediation on real production trajectories, or ablating against a deliberately degraded/contended model. Until
+then this is a closed chapter; do not re-propose running more synthetic batteries. Records updated: §4
+"(1) Blocked on operator action" (rewritten to CLOSED), [[earn-keep-harness]] memory.
+
+### 2026-07-23 (later 2) — Memory journal made LOSSLESS (overflow spill); Track-B synthetic battery is a dead end
+
+**Track-B pilot verdict (calibration gate):** ran `ablation_trackb4.py --pilot` (35 grounded DOING candidates ×3
+passes). **32/35 tasks ceiling at 3/3**; the 3 "survivors" are pure **timeout flakes** — every failure is the
+one pass that hit the 300s timeout with an empty artifact; the model solves all 35 when given time. So there is
+**no calibrated Track-B battery either** — the same ceiling as Track A (2026-07-23 earlier), now on grounded tasks.
+Strategic read logged: two independent auto-graded deterministic batteries both ceiling on this uncontended 35B →
+the synthetic-battery instrument can't measure this machinery on this model; hand-authoring a third harder battery
+is a treadmill. Real options for Track B: (A) observational mediation on real trajectories [recommended], (B)
+degrade the model to open headroom, (C) accept the null and make the costed idle loops opt-in. Deferred to operator.
+
+**The journal-drain bug the pilot exposed — FIXED.** During the back-to-back pilot the operator saw repeated
+`Memory journal is full (capacity 50): discarded 1 oldest ... The drain (~2 min idle) is not keeping up`. Root
+cause (`memory/journal.py`): the smart_memory buffer drained ONLY on idle (each consolidation ~90s LLM, must not
+compete with the user), so under sustained load with no idle gap it filled and **silently dropped the OLDEST**
+consolidations. Two harms: (1) it starves the dream arm by construction (dream counts the `type:"auto"` fragments
+smart_memory writes — dropped during back-to-back seeding); (2) genuine production data-loss under bursty load.
+
+Fix — made the journal **lossless by construction** (not just a bigger buffer):
+- Logical queue is now `overflow + hot` (oldest→newest). `append()` past the cap SPILLS the oldest surplus to a
+  new `memory_journal.overflow.json` (drained oldest-first) instead of dropping. `load()` still returns hot only;
+  `pop_all()`/`drain()` take overflow+hot. Hot cap raised 50→256.
+- `push_front()` (drain requeue) folds to the overflow HEAD (drained first); deleted the old capacity-bounded
+  `_merge_front` that discarded surplus. `recover_inflight()` folds a crash-interrupted batch to the overflow head
+  too — crash-recovery is now lossless even when the batch exceeds the hot cap.
+- New `pending_count()` (hot + overflow). **Critical wiring:** the two "is there work?" gates —
+  `agent.py` biological phase-1 and `tools/memory.py` self-play inter-cycle drain — now use `pending_count()`, not
+  `len(load())`; otherwise overflow-only work (a spilled burst, or a requeue) would sit undrained forever.
+- Dropped an early over-design: a hard overflow ceiling whose `.spill-{int(time.time())}` sidecar name COLLIDES
+  within one second under a tight loop → would overwrite/lose. Removed it; overflow is unbounded-but-lossless
+  (small text, any idle gap drains it).
+
+Verified end-to-end: 300 back-to-back appends (old code would drop 250) → 300/300 preserved, drained FIFO, overflow
+file self-clears. Tests: `tests/test_journal.py` (+burst/recovery/push-front-overflow), updated
+`test_memory_audit_fixes.py` / `test_deep_audit_fixes.py` / `test_smart_memory_requeue.py` /
+`test_self_play_loop_and_lessons.py` / watchdog+bio-tick mocks (stub `pending_count`). 782-test memory/dream/
+self-play sweep green. Docs: `docs/memory/journal.html`.
+
+### 2026-07-23 (later) — Track B (Phase 2) BEGUN: idle-loop disable gates + pilot verified ready
+
+Chose the strategic fork after the Track-A ceiling (see prior entry): **pivot earn-keep to Track B** — adjudicate
+the cross-session idle loops (dream / self-play / reflection), the one genuinely open question and where an effect
+is already known to exist (memory 98% vs 0%). Phase-2 order is pinned by the plan AND the fresh Track-A lesson:
+**calibrate the probe battery before building measurement.**
+
+**De-risked the calibration gate (operator's multi-hour job).** The B4 harness (`ablation_trackb4.py`) is verified
+runnable without the model: 35 probe candidates / 8 clusters / 8 seeding tasks all construct; **103 battery
+self-consistency tests pass**; pilot imports + arm-flag construction clean. Operator command handed off:
+`PYTHONPATH=src python scripts/ablation_trackb4.py --pilot --report-dir ablation_out/b4-pilot` (prod stopped, 35B up).
+
+**Built the two missing idle-loop disable gates** (a real per-loop LOO needs them; only `--no-reflection` existed):
+- `--no-dream` — gates the Deep REM Dream phase (biological-watchdog phase 2) at `agent.py`; leaves reflection +
+  self-play intact.
+- `--no-self-play` — gates the Synthetic Self-Play phase (phase 3, `agent.py`) — both fresh self-play AND the
+  counterfactual-replay slot. **Distinct from `--no-frontier-selfplay`**, which only changes cluster *selection*,
+  not whether self-play fires (this was the trap — the plan assumed frontier-selfplay was the self-play toggle).
+- Catalog (`core/prune_overrides.py`): added `dream` (arm `full_no_dream`) and `self_play` (arm `full_no_selfplay`)
+  as Track-B, **costed** (real idle LLM work), non-protected subsystems, alongside `reflection`.
+
+**Gotcha handled:** the gates read `getattr(ctx.args, "no_dream", False) is not True` — NOT a plain truthiness check
+— because ~10 watchdog test files mock `ctx.args` as a `MagicMock`, whose auto-vivified `.no_dream` child is truthy
+and would spuriously disable the phase. `is not True` matches only a real argparse store_true. Verified: 778 idle-loop
+tests pass, flags parse (default OFF, disable when passed).
+
+Tests: `tests/test_biological_watchdog.py` (+3: dream-off skip, self-play-off skip, **isolation** — `--no-dream`
+leaves self-play firing); `tests/test_earn_keep.py` (+3: idle loops catalogued Track-B/costed, arms distinct,
+arg-apply flips `no_dream`/`no_self_play`). Docs: `docs/cli_reference.html` (both flags), `scripts/ABLATION.md`
+(Phase-2 progress table + the remaining 3 steps).
+
+**Next (gated, in order):** pilot → collective `treatment` vs `control` (existing harness, no new toggles) → only if
+non-null, wire `earn_keep run --track B` to boot these arms through the trackb4 seed→idle→probe protocol and fold
+probe outcomes into the ledger. Building the `--track B` orchestration BEFORE the collective result would repeat the
+Track-A over-build mistake, so it waits.
+
+### 2026-07-23 — earn-keep Track A: the "full stack loses to thin" headline was a SCORING ARTIFACT (verifier exonerated)
+
+Ran earn-keep Track A three times (`full` + 8 leave-one-out arms + `thin`, 3×16 tasks/arm/run = 432
+records/run, idle-quiesced, clean). Headline across all 3 runs: `full` 83.3% vs `thin` 86.8%, gap −3.5pp —
+i.e. the full per-turn cognitive stack appeared to *underperform* stripped, reproducing the 2026-06-28
+suspicion. The per-arm split flagged the **verifier** as the biggest apparent loser (`full_no_verifier`
+scored the *highest*, 87.5%), so the operator asked to dig into it before pruning anything.
+
+**The dig reversed the conclusion.** The verifier CONFIRMED 100% on these tasks — it never refuted a correct
+answer; my initial "false-refute" hypothesis was wrong. The harm was entirely a **validator artifact**:
+`final_number_is(n)` scored the *last numeric token* in the reply, and a correct, verified answer that shows
+its work ("the father is 36 … in 12 years 48 = 2×24 ✓") ends on **24** → marked wrong. Verbose arms
+(verifier, deep-reason, metacog) emit more verification prose than `thin`, so the rule docked them for
+*being verbose*. Proof by cross-tab over the ledger:
+
+| bucket | full | thin | gap |
+|---|---|---|---|
+| 12 lenient tasks (`contains_number`) | 98.1% | 99.1% | −0.9% (tie, at ceiling) |
+| 4 strict tasks (`final_number_is`) | 38.9% | 50.0% | **−11.1%** |
+
+The entire −3.5pp headline lived in the 4 strict-scored tasks; on fairly-scored tasks the stack *ties* thin
+(and those are ceilinged at 98–99%, so they can't discriminate anyway). **Pruning metacog/deep_reason on
+this data would have pruned on an artifact.** Auto-prune had (correctly) not fired — every verdict was still
+`insufficient`/`keep` because the CI-upper-<+2pp gate held.
+
+**Fixes (this session).**
+- `scripts/ablation_hard_tasks.py` — rewrote scoring around a canonical `ANSWER: <value>` line. Every prompt
+  is auto-suffixed with the directive; new validators `answer_int` / `answer_num` read the **last `ANSWER:`
+  line** (lenient standalone-token fallback if the marker is missing — so a forgotten marker isn't penalised,
+  but trailing prose can't hijack the score). Removed `final_number_is` / `contains_number` /
+  `contains_any_num`.
+- Added **8 intuition-trap reasoning tasks** (`bat_ball`, `algae_quarter`, `printers_pages`, `avg_speed`,
+  `pct_updown`, `overlap_sets`, `compound_discount`, `clock_angle_315`) to add failure-frontier headroom
+  where reasoning/verification *can* pay off; parameters shifted off textbook values so a recalled trick
+  doesn't win. Suite 16 → 24 tasks.
+- `tests/test_ablation_hard_tasks.py` — 51 tests: every integer answer recomputed independently (incl. the 8
+  traps), decimal-form acceptance, and the regression guard `test_answer_line_beats_trailing_verification_prose`
+  (the exact reply that used to fail must now pass) + `test_last_answer_line_wins`.
+- Archived the contaminated ledger → `ablation_out/earn_keep/results.pre-answerline.jsonl` (the 3 runs were
+  scored under the biased rule; pooling them with fixed runs would re-corrupt `report`). `report` on the
+  fresh slate is clean (0 runs).
+- Docs: `scripts/ABLATION.md` — new "Scoring — the `ANSWER:` line (and why last-number was a trap)" section
+  + a "Ledger hygiene" callout.
+
+**Lesson (generalises):** an ablation's *validator* is part of its measurement. A validator that correlates
+with an arm's **style** (here: verbosity) rather than its **correctness** will invent differences that aren't
+there. Score the declared answer, not the last digit.
+
+**Still open / next:** the difficulty of the new trap tasks is UNCALIBRATED (couldn't run the 35B this
+session — prod stopped for the operator). Whether they actually break the ceiling and land in a
+discriminating band is confirmed by the next run's pass rates; tune from there. Then re-run Track A 3× on the
+fixed battery before trusting any keep/prune verdict. The `--track B` idle-loop adjudication (Phase 2)
+remains the bigger unanswered prize.
+
+### 2026-07-22 (later 5) — STRATEGIC PIVOT: the earn-your-keep self-measuring/self-pruning harness (Phase 1)
+
+After closing the bug-hunt cycle, the agreed next big thing is to stop flying on faith: make the agent
+**self-measuring, then self-pruning**. Every cognitive subsystem must prove it earns its keep or get
+pruned. This is Phase 1 (Track A, in-session) — an ORCHESTRATION build on the ~70% existing ablation
+machinery, not greenfield. Plan: `.claude/plans/spicy-foraging-pudding.md`. Operator decisions: standing
+infra + Track A first; **on-demand** runs (no nightly prod downtime); **auto-prune** on a sustained
+verdict (reversible, loud). Suite green (8957 passed; the 1 "fail" is a pre-existing TERM-brittle CLI
+test — passes with a normal `TERM`). DEPLOYED (both prod changes are validated no-ops until a prune
+exists).
+
+**What shipped:**
+- `scripts/earn_keep.py` — the standing harness. `run` boots the leave-one-out config matrix (`full` +
+  one `full_no_<x>` per subsystem + `thin`) via the paired driver, fires `ablation_hard_tasks` at every
+  arm back-to-back, APPENDS raw per-(arm,repeat,task) pass/fail to a durable ledger
+  (`ablation_out/earn_keep/results.jsonl` — the trending substrate), then re-attributes over the WHOLE
+  ledger and auto-prunes. `report` renders the ranked keep/prune table (Δ-help, 90% bootstrap CI, latency
+  cost, verdict). The marginal contribution of X = the paired `full` vs `full_no_x` delta.
+- `src/ghost_agent/core/prune_overrides.py` — the single-source-of-truth catalog (subsystem ↔ ablation
+  arm ↔ toggle) + the prod-apply (flip arg attrs / set env) + protected-set refusal + defensive load
+  (absent/malformed → `{}`, never raises).
+- `src/ghost_agent/main.py` — reads `$GHOST_HOME/system/earn_keep/pruned.json` at boot: env-kind prunes
+  applied BEFORE `core.agent` import (its toggle constants read env at import), arg-kind after
+  `parse_args()`, each logged loudly. Clean no-op when the file is absent (verified: a malformed file
+  also boots clean — the load-bearing safety invariant).
+- `scripts/ablation_paired.py` — extended `CONFIG_FLAGS` to the full LOO (added `full_no_verifier`,
+  `_selfmodel`, `_workspacemodel`, `_hypothesis`) via a `_full_minus` diff helper + a per-arm `CONFIG_ENV`;
+  `scripts/ablation_eval.py::_boot` gained a backward-compatible `extra_env`; `core/agent.py`
+  `_HYPOTHESIS_GROUNDING_ENABLED` now reads `GHOST_HYPOTHESIS_GROUNDING` (the only new agent toggle).
+- **Pre-registered auto-prune rule** (do not move post-hoc): prune a non-protected subsystem only when,
+  across ≥3 runs / ≥60 matched pairs, Δ ≤ 0 AND 90% CI upper < +2pp AND it carries a compute cost.
+  **Protected (measured, never auto-pruned):** memory (Track-B-proven 98% vs 0%), verifier (correctness).
+  Every prune is reversible (delete the pruned.json entry), auditable, loud.
+
+**Operability (added same session):** `run` is a SINGLE resumable entrypoint. Each run gets
+`ablation_out/earn_keep/run-<id>/` with a unified `progress.log` (tees to stdout + file, absorbs the
+boot/teardown chatter — `tail -f` mirrors the live view), per-arm agent logs (`full.log`, `thin.log`,
+…), and `checkpoint.jsonl`+`manifest.json`. Checkpointing is at (repeat,task)-GROUP granularity — all
+arms fire back-to-back (paired property survives a resume) and a group is written atomically, so a
+kill mid-group redoes only that group. `run --resume` (or `--run-id`) skips done groups; a run's data
+folds into `results.jsonl` ONLY on full completion (no partial run pollutes the trend); a fresh run
+while one is incomplete is refused (→ `--resume`/`--force-new`). The prod-down preflight runs BEFORE
+any run-dir is created, so a refused run leaves no resumable stub. The run prints the `tail -f`
+commands at startup.
+
+Tests: `tests/test_earn_keep.py` (35, pure — attribution math, verdict every branch, prune I/O +
+prod-apply + protected refusal, PLUS the resume machinery: group-done detection, atomic checkpoint,
+dedup-fold, manifest/find-resumable, and the real `_measure_resumable` loop with a fake runner proving
+resume skips done groups — no live boot). Docs: `scripts/ABLATION.md` §Earn-your-keep.
+
+**Deliverable ready for the operator:** `PYTHONPATH=src GHOST_HOME=<live> python scripts/earn_keep.py
+run --track A --repeats 3` (prod stopped) produces the first attribution table; repeated runs trend it;
+sustained losers auto-prune. **Phase 2 (needs an operator evening):** calibrate the B4 battery
+(`ablation_trackb4.py --pilot`) + wire the Track-B idle-loop LOO (dream/self-play/reflection) into
+`run --track B` — adjudicating the idle loops, the one genuinely open question.
+
+
+### 2026-07-22 (later 4) — SANDBOX/EXECUTION + external-infra review (4 agents) + main-host FIXES
+
+First dedicated hunt of the sandbox/execution + external-services layer (docker.py, services.py,
+execute.py's contract, the external GPU servers, the uConsole/Slack clients) — the containment
+boundary every code execution and build passes through, never dedicated-hunted this cycle. 4 review
+agents. Prod is macOS/**bridge** (verified), so the LAN-exposure findings are Linux-only. Fixed the
+main-host cluster (deployable via plain-kill); the node-deployed items (voice server, uConsole/Slack
+clients) were **skipped per operator — not in use**.
+
+Coordinator owned `sandbox/docker.py` + `tools/execute.py` (the coupled pair); the services.py review
+agent was resumed to fix its own findings in `sandbox/services.py`. Suite green.
+
+**docker.py (mine):**
+- **Client-side exec deadline (prod-critical).** docker-py's exec socket read blocks in `poll.poll()`
+  with no timeout (verified in 7.1.0), so a wedged daemon hung the worker thread forever — and the
+  provision execs hold `self._lock`, wedging EVERY other turn's execute with zero logs. All 18
+  `exec_run` sites now go through `_exec_run(cmd, deadline_s)` (daemon thread + `join` deadline → raise
+  `SandboxDaemonTimeout`, releasing the lock). Main command uses `timeout+60`; others use a generous
+  `GHOST_EXEC_DAEMON_DEADLINE` (1200s) that only fires on a true wedge.
+- **Infra failures marked** `[SANDBOX INFRA ERROR — not your code]` instead of a bare exit 1 (the model
+  was debugging its own code on a sandbox fault); the marker also keeps execute.py's heal from firing.
+- **Resume stopped containers** (`_try_resume_stopped`) instead of destroy+reprovision — an RSS restart
+  no longer nukes in-sandbox services + runtime state (the `close(remove=False)` "fast resume" the
+  docstring promised never existed).
+- **Adopted-container published ports** derived from live `PortBindings` (`_derive_published_ports`) on
+  the adopt + 409 + port-conflict-retry paths — the remote hint can't point the operator at a foreign
+  process's port. Added `binds_host_netns()` for the Linux HOST-export follow-up.
+- **Spill-log counter** seeded past existing `run_N.log` (no clobber after a plain-kill deploy).
+
+**execute.py (mine):** the cwd-heal no longer re-runs a command that already executed — timeout kills
+(124/137/143) excluded from the heal trigger, and `_looks_like_file_not_found` returns False on output
+containing a `Traceback` (a traceback = the script ran → a "no such file" is a runtime data-file error
+after side effects, not a wrong-cwd miss). One stale test (`test_root_retry_keeps_real_fnf_traceback…`)
+updated: it pinned the old "re-run then reject" behavior; the fix is strictly better (no re-run, same
+user-visible result).
+
+**services.py (review agent):** port-reclaim ownership check (never TERM/KILL a process another
+registry entry owns; `start()` refuses a port a live service holds); container-generation stamp (a
+recycled pid in a new generation reads DEAD → kills phantom-RUNNING and makes "listening ✓"
+trustworthy); atomic restart preserving the registration on relaunch failure (`_lock`→RLock); dead
+`_reap_dead` removed.
+
+Tests: `test_docker_review_fixes.py` (10), `test_execute_heal_timeout_guard.py` (7),
+`test_sandbox_services_review_fixes.py` (14). Docs: sandbox/docker.html, sandbox/services.html,
+tools/execute.html.
+
+**LOGGED, not fixed (in §4B):** node-deployed items — voice server (Orin) no-auth CRIT + sync-on-loop +
+unbounded upload; uConsole client SSE token-loss + camera/QTimer leak + send-race + unbounded history;
+Slack thread-boundary admits any bot + `file_share` DMs dropped (owner-lock itself holds). Linux-only:
+`HOST=0.0.0.0` host-mode exposure (accessor added, services-side export pending), exec-user
+provisioning, egress-guard loopback bypass. Deferred: readiness false-negative removes a healthy
+container (self-heals); the full infra exit-code sentinel (light `[SANDBOX INFRA ERROR]` marker done).
 
 ### 2026-07-22 (later 3) — MEMORY-SUBSTRATE review + FIXES: the highest-damage cohort yet (multiple CRITs with LIVE data loss)
 

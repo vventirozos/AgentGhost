@@ -1,6 +1,0 @@
-[15:59:57]   ready: pilot on http://127.0.0.1:8046 (pid 97394)
-[15:59:57] === pilot pass 1/3 ===
-[16:33:29] === pilot pass 2/3 ===
-[17:17:19] === pilot pass 3/3 ===
-[18:08:28]   !! arm busy past 900s grace (finished 90/91) — holding up to the ceiling
-[18:09:58]   arm quiet again (finished 91/91)

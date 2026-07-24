@@ -160,10 +160,20 @@ _AGENT_PORT_FILE_NOTE = (
 def _looks_like_file_not_found(out) -> bool:
     """Heuristic: did a command fail because the target file wasn't where it
     looked? Used to trigger the project-scoped → root cwd retry. Matches the
-    common interpreter/shell messages (python, node, bash, cat, ...)."""
+    common interpreter/shell messages (python, node, bash, cat, ...).
+
+    Guard (2026-07-22): a Python TRACEBACK means the interpreter FOUND and RAN
+    the script (it got past startup), so a "no such file" inside it is a
+    RUNTIME data-file error raised AFTER the script's side effects — not a
+    wrong-cwd miss. Re-running from another cwd would just repeat those side
+    effects (DB inserts, appends, API calls). A genuine wrong-cwd miss is a
+    startup error (`can't open file '…'`) with NO traceback, so this only
+    suppresses the unsafe re-run."""
     if not isinstance(out, str):
         return False
     o = out.lower()
+    if "traceback (most recent call last)" in o:
+        return False
     return (
         "can't open file" in o
         or "no such file or directory" in o
@@ -553,7 +563,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # workdir kwarg, i.e. disabled precisely when this happens. Re-derive
         # the project dir from the workspace-model mirror and retry once
         # from there, with a note naming the actual mechanism.
-        if exit_code != 0 and not _workdir_kw and _looks_like_file_not_found(output):
+        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and not _workdir_kw and _looks_like_file_not_found(output):
             _flap_pid = ""
             try:
                 _flap_pid = str(getattr(
@@ -586,7 +596,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                         f"files either drop stateful, or use the absolute "
                         f"project path.]")
 
-        if exit_code != 0 and _workdir_kw and _looks_like_file_not_found(output):
+        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and _workdir_kw and _looks_like_file_not_found(output):
             # Absolute-path variant first: when the command names files under
             # `/workspace/...` a workdir change can't help (absolute paths are
             # cwd-independent) — but the model almost always means the ACTIVE

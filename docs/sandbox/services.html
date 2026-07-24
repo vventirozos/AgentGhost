@@ -238,6 +238,42 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   <code>tests/test_remote_serve_scripts.py</code> guards the
   <code>serve-remote.sh</code>/<code>unserve-remote.sh</code> host helpers
   (1:1 HTTPS map, CLI discovery incl. the macOS app bundle, targeted teardown).</p>
+
+  <h2>State-fidelity hardening <span class="tag">2026-07-22 sandbox review</span></h2>
+  <ul>
+    <li><strong>Port-reclaim never kills a different service.</strong>
+    <code>_kill_service</code>'s <code>ss</code>-based port reclaim used to
+    TERM/KILL whatever held the recorded port — including a DIFFERENT healthy
+    registered service that had reused it. Now reclaim is skipped when another
+    registry entry owns the port, and the holder is killed only when it is NOT
+    provably foreign (matches the recorded pid or its process-group/session
+    leader). <code>start()</code> also refuses a port already claimed by a
+    registered+alive service, naming the claimant.</li>
+    <li><strong>Container-generation stamp kills phantom-RUNNING.</strong> Each
+    registry entry records the container id at registration; a low pid recycled
+    by a fresh container generation (routine after a recreate) no longer reads
+    RUNNING — an entry from a different generation is DEAD by definition, its pid
+    never trusted or signalled. This also makes "listening ✓" trustworthy: a
+    new build that failed to <code>bind()</code> while a stale orphan holds the
+    port is now reported as "port answered by a DIFFERENT process … NOT this
+    service" instead of a false success.</li>
+    <li><strong>Atomic restart preserves the registration.</strong>
+    <code>restart()</code> holds the lock across the whole stop→start
+    (<code>_lock</code> is now an <code>RLock</code>) and, on a relaunch failure,
+    restores the original entry (command/port/workdir) instead of losing it — a
+    follow-up <code>restart</code> no longer gets "no service named".</li>
+    <li><strong>Published-port truth on adopt.</strong> Paired with the
+    <a href="docker.html">docker</a> fix: when a container is adopted (deploy-by-kill,
+    409 race) or the port-conflict retry drops ports, the published set is derived
+    from the live <code>PortBindings</code> / reset to empty, so the remote hint
+    can't point at a foreign process's port. The dead <code>_reap_dead</code> was
+    removed (dead entries are load-bearing — restart-after-death needs the spec).</li>
+  </ul>
+  <p>Covered by <code>tests/test_sandbox_services_review_fixes.py</code>. Linux
+  follow-up (not prod-relevant on macOS/bridge): under host-network mode the
+  <code>HOST=0.0.0.0</code> export exposes services LAN-wide; the manager now
+  offers <code>binds_host_netns()</code> for the services layer to export
+  <code>HOST=127.0.0.1</code> in that mode.</p>
 </main>
 </body>
 </html>

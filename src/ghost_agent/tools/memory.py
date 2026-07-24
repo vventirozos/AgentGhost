@@ -1417,11 +1417,9 @@ async def _consolidate_between_cycles(context):
         return
     try:
         # Cheap check first — avoid the per-item log noise when the
-        # journal is empty.
-        from ..memory.journal import MemoryJournal  # local, avoid cycles
-        with journal._lock:
-            import json as _json
-            items_on_disk = len(_json.loads(journal.file_path.read_text()))
+        # journal is empty. pending_count() includes the overflow spill, so
+        # a burst that overflowed the hot buffer isn't mistaken for "empty".
+        items_on_disk = journal.pending_count()
     except Exception:
         items_on_disk = 0
     if items_on_disk <= 0:

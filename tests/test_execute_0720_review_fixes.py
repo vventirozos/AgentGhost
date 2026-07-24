@@ -100,9 +100,12 @@ async def test_tool_level_errors_still_exit_1(tmp_path):
 
 async def test_root_retry_keeps_real_fnf_traceback_from_existing_script(tmp_path):
     """The scoped script EXISTS and ran — it died on a missing data file
-    (`FileNotFoundError: 'data.csv'`). The root re-run can't even find the
-    script; its bogus "can't open file" must NOT replace the informative
-    traceback (mirror of the guard the other two heals use)."""
+    (`FileNotFoundError: 'data.csv'`). Updated 2026-07-22: the traceback guard
+    now suppresses the root-cwd re-run ENTIRELY (a traceback means the script
+    ran, so a re-run would repeat its side effects), instead of re-running and
+    then rejecting the bogus output. The user-visible result is identical (the
+    real traceback survives, no bogus "can't open file", no misleading note) —
+    only now no wasteful/dangerous second execution happens."""
     real_tb = ("Traceback (most recent call last):\n"
                '  File "process.py", line 12, in <module>\n'
                "    with open('data.csv') as f:\n"
@@ -114,7 +117,7 @@ async def test_root_retry_keeps_real_fnf_traceback_from_existing_script(tmp_path
         command="python3 process.py",
         sandbox_dir=tmp_path, sandbox_manager=mgr,
         container_workdir="/workspace/projects/77adb3005a92")
-    assert mgr.execute.call_count == 2
+    assert mgr.execute.call_count == 1               # NO re-run: side effects not repeated
     assert "data.csv" in result                      # the real error survives
     assert "can't open file '/workspace/process.py'" not in result
     assert "sandbox ROOT" not in result              # no misleading note

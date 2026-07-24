@@ -192,7 +192,10 @@ class ServiceSupervisor:
 
     def __init__(self, sandbox_manager):
         self.sandbox = sandbox_manager
-        self._lock = threading.Lock()
+        # Reentrant: restart() holds it across its stop()+start() pair (each
+        # of which also acquires it) so a concurrent start of the same name
+        # can't slip into the stop→start window (review 2026-07-22).
+        self._lock = threading.RLock()
 
     # -- paths / registry ---------------------------------------------------
 
@@ -259,6 +262,68 @@ class ServiceSupervisor:
               "else 1)")
         _, code = self._exec(f"python3 -c {shlex.quote(py)}", timeout=15)
         return code == 0
+
+    def _container_generation(self) -> Optional[str]:
+        """Id of the LIVE sandbox container, or None when unknown (no
+        container yet / stub manager). Stamped on registry entries at start;
+        a mismatch at liveness time means the recorded pid belonged to a
+        PREVIOUS container generation — the process is gone, and any
+        same-numbered pid in the new container is an UNRELATED process
+        (review 2026-07-22: PID recycling across a container recreate made
+        dead services read RUNNING and pointed stop() at innocents)."""
+        try:
+            cid = getattr(getattr(self.sandbox, "container", None), "id", None)
+            return str(cid) if cid else None
+        except Exception:  # noqa: BLE001 — a mock may refuse attributes
+            return None
+
+    def _entry_alive(self, entry) -> bool:
+        """Entry-level liveness: same container generation AND pid alive.
+        A stamped entry from a DIFFERENT generation is dead by definition —
+        never trust (or signal) its pid number in the new container. Entries
+        without a stamp (legacy) or an unknown current generation fall back
+        to the plain pid check."""
+        if not isinstance(entry, dict):
+            return False
+        stamped = entry.get("container_id")
+        if stamped:
+            gen = self._container_generation()
+            if gen and gen != stamped:
+                return False
+        return self._pid_alive(entry.get("pid"))
+
+    def _holder_pid(self, port) -> Optional[int]:
+        """Pid LISTENING on <port> inside the container, found via `ss`
+        (iproute2, baked into the sandbox image); None when unknown."""
+        out, _ = self._exec(
+            "sh -c \"ss -H -ltnp 'sport = :%d' 2>/dev/null | "
+            "grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2\"" % int(port),
+            timeout=10)
+        holder = (out or "").strip()
+        return int(holder) if holder.isdigit() else None
+
+    def _pid_ownership(self, target, owner) -> Optional[bool]:
+        """Does <target> belong to <owner>'s process tree? True when it IS
+        <owner>, or its process group / session leader is <owner> (setsid
+        made the recorded service pid the leader of both — this also matches
+        the historical mis-tracked `$!` orphan, whose real process kept the
+        launcher's pgid). False on a POSITIVE mismatch. None when /proc gave
+        no answer (process vanished mid-check, stub sandbox) — callers pick
+        the safe direction for unknown. pgid/sid are fields 3/4 after the
+        last ')' in /proc/<pid>/stat (comm may contain spaces/parens)."""
+        try:
+            target, owner = int(target), int(owner)
+        except (TypeError, ValueError):
+            return None
+        if target == owner:
+            return True
+        out, code = self._exec(
+            f"sh -c 'sed \"s/^.*) //\" /proc/{target}/stat 2>/dev/null "
+            f"| cut -d\" \" -f3,4'", timeout=10)
+        fields = (out or "").split()
+        if code != 0 or len(fields) < 2:
+            return None
+        return str(owner) in fields[:2]
 
     def _log_tail(self, name: str, lines: int = 25) -> str:
         try:
@@ -327,16 +392,30 @@ class ServiceSupervisor:
             if key is not None:
                 name = key
             entry = reg.get(name)
-            if entry and self._pid_alive(entry.get("pid")):
+            if entry and self._entry_alive(entry):
                 return (f"Error: service '{name}' is already running "
                         f"(pid {entry.get('pid')}). Use action='restart' "
                         f"to replace it, or 'stop' first.")
             alive = sum(1 for e in reg.values()
                         if e.get("name") != name
-                        and self._pid_alive(e.get("pid")))
+                        and self._entry_alive(e))
             if alive >= MAX_SERVICES:
                 return (f"Error: {MAX_SERVICES} services already running — "
                         f"stop one first (action='status' to list).")
+            # A port another registered+alive service already claims can only
+            # produce a failed bind — worse, the port probe below would see
+            # the OTHER service listening and report a false "listening ✓"
+            # (review 2026-07-22). Refuse up front.
+            if port is not None:
+                _claimant = next(
+                    (n2 for n2, e2 in reg.items()
+                     if n2 != name and e2.get("port") == int(port)
+                     and self._entry_alive(e2)), None)
+                if _claimant is not None:
+                    return (f"Error: port {int(port)} is already claimed by "
+                            f"RUNNING service '{_claimant}'. Stop it first "
+                            f"(action='stop' name='{_claimant}') or pick "
+                            f"another port (suggested: {SUGGESTED_PORTS}).")
 
             # The command ships as a SCRIPT via the bind mount (no quoting
             # hazards), then launches detached: setsid gives it a fresh
@@ -492,10 +571,27 @@ class ServiceSupervisor:
                 else:
                     listening = False
 
+            # The TCP probe is container-wide — it can't tell WHO answered.
+            # If the identified holder is positively foreign (not this pid,
+            # not in its process group/session), the app failed to bind and
+            # something else answers the port: say so instead of a false
+            # "listening ✓" (review 2026-07-22). Unknown holders (probe gave
+            # no pid) keep the old benefit of the doubt.
+            foreign_holder = None
+            if listening:
+                _holder = self._holder_pid(port)
+                if _holder is not None and \
+                        self._pid_ownership(_holder, pid) is False:
+                    foreign_holder = _holder
+
             reg[name] = {
                 "name": name, "command": _cmd_str, "pid": pid,
                 "port": int(port) if port is not None else None,
                 "workdir": wd, "started_at": time.time(),
+                # Container generation stamp: a recreate invalidates every
+                # pid; comparing this at liveness time stops recycled pids
+                # from reading as RUNNING (review 2026-07-22).
+                "container_id": self._container_generation(),
             }
             self._save(reg)
 
@@ -509,6 +605,23 @@ class ServiceSupervisor:
         # deps — a whole browse→fail→install→restart cycle for an error that
         # was already captured. Same log-tail treatment the immediate-exit
         # branch above already gives.
+        # Port answers, but by a process that provably is NOT this service —
+        # the classic "address already in use" shape: the app failed to bind
+        # and whatever already held the port keeps answering. Without this
+        # check the report said "listening ✓" and the agent verified the
+        # WRONG process via the browser (review 2026-07-22).
+        if port is not None and foreign_holder is not None:
+            tail = self._log_tail(name)
+            return (
+                f"Service '{name}' started (pid {pid}) BUT port {port} is "
+                f"answered by a DIFFERENT process (pid {foreign_holder}), not "
+                f"'{name}' — it most likely failed to bind (address already "
+                f"in use). What answers on http://127.0.0.1:{port} is NOT "
+                f"this service. Stop whatever holds the port (action='status' "
+                f"to check registered services) or restart '{name}' on "
+                f"another port.\n--- {name} log tail ---\n{tail}"
+            )
+
         if port is not None and listening is False:
             tail = self._log_tail(name)
             return (
@@ -544,33 +657,52 @@ class ServiceSupervisor:
             self._exec(f"sh -c 'kill -KILL -- -{int(pid)} 2>/dev/null || "
                        f"kill -KILL {int(pid)} 2>/dev/null'", timeout=15)
 
-    def _kill_port_holder(self, port) -> bool:
+    def _kill_port_holder(self, port, owner_pid=None) -> bool:
         """Kill whatever is LISTENING on <port> in the container — the safety
         net for an orphaned service whose tracked pid was wrong (the old `$!`
-        bug), so the real process was left bound to the port. Finds the pid via
-        `ss` (iproute2, baked into the sandbox image); best-effort."""
-        out, _ = self._exec(
-            "sh -c \"ss -H -ltnp 'sport = :%d' 2>/dev/null | "
-            "grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2\"" % int(port),
-            timeout=10)
-        holder = out.strip()
-        if holder.isdigit():
-            self._kill_pgroup(int(holder))
-            return True
-        return False
+        bug), so the real process was left bound to the port. When
+        ``owner_pid`` is given, a holder that PROVABLY belongs to a different
+        process tree (not that pid, nor in its process group/session) is left
+        alone — reclaim must never shoot a process this service doesn't own
+        (review 2026-07-22: stop('dead-twin') used to kill whoever had since
+        taken the port). Unknown ownership (holder vanished mid-check, stub
+        exec) still reclaims: the historical mis-tracked orphan sits in the
+        recorded pid's process group and DOES resolve, and a vanished holder
+        makes the kill a no-op. Best-effort."""
+        holder = self._holder_pid(port)
+        if holder is None:
+            return False
+        if owner_pid is not None and \
+                self._pid_ownership(holder, owner_pid) is False:
+            logger.info(
+                "manage_services: NOT reclaiming port %s — holder pid %s "
+                "belongs to a different process tree than pid %s",
+                port, holder, owner_pid)
+            return False
+        self._kill_pgroup(holder)
+        return True
 
-    def _kill_service(self, entry) -> bool:
+    def _kill_service(self, entry, others=()) -> bool:
         """Kill one service's process tree and reclaim its port. Returns True
-        if anything was actually alive/reclaimed. Also drops its pidfile."""
+        if anything was actually alive/reclaimed. Also drops its pidfile.
+        ``others`` are the OTHER registry entries: when one of them is alive
+        and claims the same port, the port legitimately belongs to IT now and
+        the reclaim is skipped outright — never TERM/KILL a process a
+        different registry entry owns (review 2026-07-22)."""
         pid = entry.get("pid")
         name = entry.get("name")
         port = entry.get("port")
-        was_alive = bool(pid) and self._pid_alive(pid)
+        was_alive = bool(pid) and self._entry_alive(entry)
         if was_alive:
             self._kill_pgroup(pid)
         reclaimed = False
         if port is not None and self._port_listening(port):
-            reclaimed = self._kill_port_holder(port)
+            _other_owns = any(
+                isinstance(o, dict) and o is not entry
+                and o.get("port") == port and self._entry_alive(o)
+                for o in others)
+            if not _other_owns:
+                reclaimed = self._kill_port_holder(port, owner_pid=pid)
         if name:
             try:
                 (self.host_dir / f"{name}.pid").unlink()
@@ -578,18 +710,13 @@ class ServiceSupervisor:
                 pass
         return was_alive or reclaimed
 
-    def _reap_dead(self, reg) -> list:
-        """Drop registry entries whose process is gone (e.g. after a container
-        recreate) so the list can't accumulate zombies. Caller holds the lock
-        and saves. Returns the reaped names."""
-        dead = [n for n, e in reg.items() if not self._pid_alive(e.get("pid"))]
-        for n in dead:
-            reg.pop(n, None)
-            try:
-                (self.host_dir / f"{n}.pid").unlink()
-            except OSError:
-                pass
-        return dead
+    # NB: an auto-reaper for dead registry entries (`_reap_dead`) used to sit
+    # here, defined but never called. It was DELETED (review 2026-07-22)
+    # rather than wired in: dead entries are load-bearing — restart-after-
+    # death is the normal recovery flow and needs the stored command/port/
+    # workdir — so auto-removing them on status() would break exactly that.
+    # Cleanup stays explicit: per-name stop ("was already dead; removed") or
+    # stop-all.
 
     @staticmethod
     def _resolve_name(reg: Dict[str, dict], name: str) -> Optional[str]:
@@ -617,7 +744,9 @@ class ServiceSupervisor:
                 return (f"Error: no service named '{name}' "
                         f"(action='status' lists them).")
             name = key
-            was_alive = self._kill_service(entry)
+            # reg no longer contains the popped entry — the remaining values
+            # are exactly the services the reclaim must not harm.
+            was_alive = self._kill_service(entry, others=reg.values())
             self._save(reg)
         state = "stopped" if was_alive else "was already dead; removed"
         return (f"Service '{name}' {state}. Log kept at "
@@ -632,7 +761,9 @@ class ServiceSupervisor:
                 return "No services registered — nothing to stop."
             killed, cleared = [], []
             for nm, entry in list(reg.items()):
-                (killed if self._kill_service(entry) else cleared).append(nm)
+                _others = [e for n2, e in reg.items() if n2 != nm]
+                (killed if self._kill_service(entry, others=_others)
+                 else cleared).append(nm)
             reg.clear()
             self._save(reg)
         parts = [f"Stopped {len(killed) + len(cleared)} service(s)."]
@@ -646,16 +777,32 @@ class ServiceSupervisor:
         err = self._validate_name(name)
         if err:
             return err
-        reg = self._load()
-        key = self._resolve_name(reg, name)
-        entry = reg.get(key) if key else None
-        if entry is None:
-            return (f"Error: no service named '{name}' to restart "
-                    f"(use action='start' with a command).")
-        self.stop(key)
-        return self.start(key, entry.get("command") or "",
-                          port=entry.get("port"),
-                          workdir=entry.get("workdir"))
+        # Hold the (reentrant) lock across the whole stop→start pair: no
+        # concurrent start of the same name can slip into the window, and a
+        # failed relaunch can restore the registration atomically (review
+        # 2026-07-22 — restart used to pop-and-save via stop() and then
+        # re-validate in start(), so any relaunch failure ERASED the
+        # service's command/port/workdir).
+        with self._lock:
+            reg = self._load()
+            key = self._resolve_name(reg, name)
+            entry = dict(reg[key]) if key in reg else None
+            if entry is None:
+                return (f"Error: no service named '{name}' to restart "
+                        f"(use action='start' with a command).")
+            self.stop(key)
+            out = self.start(key, entry.get("command") or "",
+                             port=entry.get("port"),
+                             workdir=entry.get("workdir"))
+            if out.startswith("Error:"):
+                reg2 = self._load()
+                if key not in reg2:
+                    reg2[key] = entry     # old pid/stamp → reads DEAD, truthfully
+                    self._save(reg2)
+                    out += (f"\n(The registration for '{key}' was preserved — "
+                            f"fix the cause, then action='restart' "
+                            f"name='{key}' again.)")
+            return out
 
     def status(self, name: Optional[str] = None) -> str:
         reg = self._load()
@@ -673,7 +820,7 @@ class ServiceSupervisor:
         lines = []
         _dead = 0
         for n, e in entries.items():
-            alive = self._pid_alive(e.get("pid"))
+            alive = self._entry_alive(e)
             if not alive:
                 _dead += 1
             state = "RUNNING" if alive else "DEAD (exited or container recreated)"

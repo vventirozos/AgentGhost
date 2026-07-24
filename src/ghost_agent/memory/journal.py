@@ -206,9 +206,18 @@ class MemoryJournal:
     queue contents, so that window cannot double-deliver either.
     """
 
-    def __init__(self, path: Path, max_capacity: int = 50):
+    def __init__(self, path: Path, max_capacity: int = 256):
         self.file_path = path / "memory_journal.json"
         self.inflight_path = path / "memory_journal.inflight.json"
+        self.overflow_path = path / "memory_journal.overflow.json"
+        # The drain runs ONLY in idle windows (each consolidation spends up to
+        # ~90 s of LLM and must not compete with the user's live turn). Under
+        # sustained back-to-back load with no idle gap the hot buffer fills.
+        # Historically (cap 50) it then DROPPED the oldest items silently —
+        # ~25 back-to-back turns lost buffered consolidations, and an ablation
+        # driver (hundreds of turns, zero idle) lost far more (found 2026-07-23
+        # in the B4 pilot). The hot cap is now larger AND overflow past it
+        # SPILLS to `overflow_path` (drained oldest-first), never dropped.
         self.max_capacity = max_capacity
         self._lock = threading.RLock()
         self._recovered = False
@@ -266,6 +275,15 @@ class MemoryJournal:
             # (a drain killed mid-flight) back into the queue.
             self._maybe_recover_inflight()
             return self._read_queue()
+
+    def pending_count(self) -> int:
+        """Total items owed a consolidation = overflow (spilled past the hot
+        cap) + the hot buffer. 'Is there work to drain?' checks MUST use this,
+        NOT ``len(load())``: overflow is invisible to load() but still needs
+        draining, so a burst that spilled — or a preemption that requeued to
+        the overflow head — would otherwise sit undrained forever."""
+        with self._lock:
+            return len(self._read_overflow()) + len(self.load())
 
     def _read_queue(self):
         with self._lock:
@@ -339,6 +357,97 @@ class MemoryJournal:
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Could not clear journal in-flight file: %s", exc)
 
+    # ------------------------------------------------------ overflow spill
+    # The logical queue is `overflow + hot` (oldest → newest). `load()` returns
+    # only the hot buffer; overflow holds items spilled past the hot cap and is
+    # invisible to load() but drained FIRST (oldest owed a consolidation → done
+    # first). Nothing here ever drops an item — that is the whole point.
+
+    def _read_overflow(self) -> list:
+        """Contents of the overflow file (oldest-first), or []. Corruption is
+        quarantined to a sidecar like the main queue's — never silently lost."""
+        try:
+            content = self.overflow_path.read_text()
+        except FileNotFoundError:
+            return []
+        except UnicodeDecodeError:
+            content = ""
+        if not content.strip():
+            return []
+        try:
+            data = json.loads(content)
+            if not isinstance(data, list):
+                raise ValueError(
+                    f"overflow is a {type(data).__name__}, expected list")
+            return data
+        except Exception as exc:
+            try:
+                sidecar = self.overflow_path.with_suffix(
+                    f".corrupt-{int(time.time())}.json")
+                os.replace(self.overflow_path, sidecar)
+                logger.warning(
+                    "memory_journal.overflow.json was corrupt (%s); preserved "
+                    "to %s.", exc, sidecar.name)
+            except Exception:
+                pass
+            return []
+
+    def _clear_overflow(self) -> None:
+        try:
+            self.overflow_path.unlink()
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("Could not clear journal overflow file: %s", exc)
+
+    def _write_overflow(self, over: list) -> None:
+        """Persist the overflow list (or clear the file when it drains empty).
+
+        The overflow is intentionally UNBOUNDED: it holds items owed a
+        consolidation that the idle-only drain hasn't reached yet, and losing
+        them is the exact bug this file exists to prevent. Items are small text
+        and any idle window drains the lot, so it stays tiny in practice; a
+        genuinely runaway size means the agent has had no idle gap for a very
+        long time, which the drain warnings surface on their own."""
+        if over:
+            self._atomic_write(self.overflow_path, over)
+        else:
+            self._clear_overflow()
+
+    def _spill_to_overflow(self, items: list) -> None:
+        """Append items to the TAIL of the overflow (newer than what is already
+        spilled, older than the hot buffer)."""
+        if items:
+            self._write_overflow(self._read_overflow() + list(items))
+
+    def _prepend_overflow(self, items: list) -> int:
+        """Put items at the HEAD of the overflow (logical front of the queue) —
+        re-queued / recovered work owed a consolidation, so drained first.
+        De-dups against what is already buffered (the ~1 ms crash window can
+        leave an item in two files). Returns how many NEW items were folded."""
+        if not items:
+            return 0
+        with self._lock:
+            over = self._read_overflow()
+            seen = set()
+            for e in over + self._read_queue():
+                try:
+                    seen.add(json.dumps(e, sort_keys=True))
+                except Exception:
+                    pass
+            fresh = []
+            for e in items:
+                try:
+                    key = json.dumps(e, sort_keys=True)
+                except Exception:
+                    key = None
+                if key is not None and key in seen:
+                    continue
+                fresh.append(e)
+            if fresh:
+                self._write_overflow(fresh + over)
+            return len(fresh)
+
     def _maybe_recover_inflight(self) -> int:
         if self._recovered:
             return 0
@@ -374,8 +483,13 @@ class MemoryJournal:
                     if key is not None and key in seen:
                         continue
                     fresh.append(entry)
+                # A recovered batch is the OLDEST work (a drain takes
+                # oldest-first) and can exceed the hot cap, so it folds to the
+                # overflow HEAD — never the capped hot queue, whose old merge
+                # dropped the surplus. `_prepend_overflow` de-dups again against
+                # both files, so this is safe alongside the `seen` set above.
                 if fresh:
-                    self._save(self._merge_front(fresh, queue))
+                    self._prepend_overflow(fresh)
                 self._clear_inflight()
                 logger.warning(
                     "Recovered %d in-flight journal item(s) from an "
@@ -440,26 +554,32 @@ class MemoryJournal:
             journal = self.load()
             journal.append({"type": item_type, "data": data})
             if len(journal) > self.max_capacity:
-                # Silent until 2026-07-22: ~25 back-to-back turns overflow
-                # the default cap of 50 before the drain's idle window ever
-                # opens, and the OLDEST buffered consolidations were dropped
-                # with no log at any level — while the drain loop logs a
-                # WARNING for dropping a single item. Make the loss visible.
-                dropped = len(journal) - self.max_capacity
-                journal = journal[-self.max_capacity:]
-                logger.warning(
-                    "Memory journal is full (capacity %d): discarded %d oldest "
-                    "buffered item(s) to make room for a new %s. The drain "
-                    "(~2 min idle) is not keeping up.",
-                    self.max_capacity, dropped, item_type,
+                # Was silently DROPPING the oldest until 2026-07-23 (~25
+                # back-to-back turns overflowed the old cap of 50 before the
+                # idle-only drain ever ran; a B4 ablation driver lost far
+                # more). Now the oldest surplus SPILLS to the overflow file —
+                # drained oldest-first on the next idle window — so a busy
+                # agent defers consolidation but never loses it.
+                surplus = len(journal) - self.max_capacity
+                spill, journal = journal[:surplus], journal[-self.max_capacity:]
+                self._spill_to_overflow(spill)
+                logger.info(
+                    "Memory journal hot buffer full (capacity %d): spilled %d "
+                    "oldest item(s) to the overflow file; the drain will consume "
+                    "them on the next idle window (nothing is lost).",
+                    self.max_capacity, surplus,
                 )
             self._save(journal)
 
     def _take_all(self) -> list:
         """Shared body of pop_all/drain: stage the batch as in-flight,
-        clear the queue, return the items."""
+        clear the queue, return the items. The batch is the WHOLE logical
+        queue — overflow (oldest, spilled past the hot cap) then hot — so a
+        drain consolidates everything owed, oldest-first."""
         with self._lock:
-            journal = self.load()
+            hot = self.load()
+            overflow = self._read_overflow()
+            journal = overflow + hot
             if not journal:
                 # Nothing to take → the previous batch (if any) is done.
                 self._clear_inflight()
@@ -477,61 +597,23 @@ class MemoryJournal:
                     "is not crash-recoverable.", exc, len(journal),
                 )
             self._save([])
+            self._clear_overflow()
             return journal
 
     def pop_all(self):
         return self._take_all()
 
     def push_front(self, items: list):
-        if not items: return
+        """Return ``items`` to the FRONT of the logical queue — the drain
+        requeues work it could not finish (the user came back, or a transient
+        consolidation failure needs a retry). They fold to the overflow HEAD,
+        so the next drain takes them FIRST. Lossless: unlike the old
+        capacity-bounded merge (which dropped the surplus), nothing is ever
+        discarded — the overflow file absorbs any amount."""
+        if not items:
+            return
         with self._lock:
-            journal = self.load()
-            self._save(self._merge_front(items, journal))
-
-    def _merge_front(self, items: list, journal: list) -> list:
-        """Put ``items`` at the head of ``journal``, honouring capacity."""
-        combined = items + journal
-        if len(combined) <= self.max_capacity:
-            return combined
-        if len(items) <= self.max_capacity:
-            # Preserve the re-queued items at the head. push_front is
-            # called to requeue work the consolidator could not finish
-            # because the user returned — dropping those items would
-            # silently erase history we were explicitly trying to
-            # save, so we drop the tail (most-recent appends, which
-            # will be re-captured by the next journaling cycle).
-            logger.warning(
-                "Memory journal is full (capacity %d): re-queueing %d item(s) "
-                "discarded %d newest buffered item(s).",
-                self.max_capacity, len(items), len(combined) - self.max_capacity,
-            )
-            return combined[:self.max_capacity]
-        # Pathological: more items than the journal can hold. The caller
-        # (core.agent's drain) passes `requeue + items[i:]`, i.e. the
-        # transient-failure RETRIES sit at the HEAD — and `items[-cap:]`
-        # sliced exactly those off first, preferentially destroying the
-        # entries this mechanism exists to protect. Retries (stamped with
-        # a `retries` count by the drain) now win the capacity fight; the
-        # remaining room goes to the most-recent of the rest.
-        def _is_retry(entry) -> bool:
-            return isinstance(entry, dict) and bool(entry.get("retries"))
-
-        retried = [e for e in items if _is_retry(e)]
-        logger.warning(
-            "Memory journal overflow on re-queue: %d item(s) for %d slots — "
-            "keeping %d retried item(s) and the most recent of the rest.",
-            len(items), self.max_capacity, min(len(retried), self.max_capacity),
-        )
-        if not retried:
-            # No retry stamps to protect: keep the most recent (unchanged
-            # legacy behaviour).
-            return items[-self.max_capacity:]
-        keep = retried[-self.max_capacity:]
-        room = self.max_capacity - len(keep)
-        if room <= 0:
-            return keep
-        others = [e for e in items if not _is_retry(e)]
-        return keep + others[-room:] if others else keep
+            self._prepend_overflow(items)
 
     def drain(self) -> list:
         """Atomically return and clear all journal entries.

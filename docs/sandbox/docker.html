@@ -98,6 +98,52 @@
   <h2>Service ports (2026-07-11)</h2>
   <p>Supervised long-lived services (see <a href="services.html">sandbox.services</a> / the <code>manage_services</code> tool) run detached inside this container. In <strong>bridge</strong> mode (the macOS default) they'd be unreachable from the host, so container creation publishes a small loopback-bound range — <code>GHOST_SANDBOX_SERVICE_PORTS</code>, default <code>8100-8104</code>, empty string disables — letting the OPERATOR open <code>http://127.0.0.1:&lt;port&gt;</code> in their own browser (or put it on the tailnet with <code>tailscale serve</code> — see <a href="services.html#remote-access">services → Remote access</a>). For the bridge-publish to forward, the service must bind <code>0.0.0.0</code> inside the container, so the manager exports <code>HOST=0.0.0.0</code> alongside <code>PORT</code>; a loopback-bound app is reachable in-sandbox but not from the host. <strong>Host</strong> mode (the Linux default) needs no publishing (the service binds host ports directly). Ports <code>8000/8080/8088/9050</code> are never publishable (agent API / NetMon / upstream LLM / Tor). Publishing is a convenience, not a dependency: if a host process already owns one of the ports, <code>containers.run</code> is retried <em>without</em> published ports (warning logged) rather than failing the sandbox — in-sandbox consumers (<code>browser</code>, <code>execute</code>) reach the service on the container's own loopback regardless. Only takes effect when the container is (re)created.</p>
 
+  <h2>Reliability hardening <span class="tag">2026-07-22 sandbox review</span></h2>
+  <ul>
+    <li><strong>Client-side exec deadline (was: infinite hang).</strong> docker-py's
+    exec output read blocks in <code>poll.poll()</code> with <em>no</em> timeout, so
+    a wedged daemon hung the calling worker thread forever — and the provision
+    execs run while holding the provision lock, wedging <em>every</em> other turn's
+    <code>execute</code> with zero log output. All <code>exec_run</code> calls now go
+    through <code>_exec_run(cmd, deadline_s)</code>, which runs the exec on a daemon
+    thread and <code>join</code>s with a deadline: on expiry it abandons the blocked
+    worker and raises <code>SandboxDaemonTimeout</code>, so the lock releases and the
+    agent surfaces a clear error. The per-command exec passes
+    <code>timeout&nbsp;+&nbsp;60&nbsp;s</code> (the command self-limits via the
+    in-container <code>timeout</code>); everything else uses a generous
+    <code>GHOST_EXEC_DAEMON_DEADLINE</code> (1200&nbsp;s) that only fires on a true
+    wedge, never on a slow install.</li>
+    <li><strong>Infra failures are marked, not blamed on the model.</strong> An exec
+    that fails for an infrastructure reason (wedged daemon, remove-while-exec race,
+    provision-backoff refusal) previously returned a bare <code>exit&nbsp;1</code>,
+    so the model debugged its own code and burned strikes. The output is now
+    prefixed <code>[SANDBOX INFRA ERROR — not your code]</code> (which also keeps
+    <code>execute.py</code>'s file-not-found heal from firing on it).</li>
+    <li><strong>Stopped containers RESUME instead of destroy+reprovision.</strong>
+    <code>close(remove=False)</code> merely stops the container, but
+    <code>ensure_running</code> could only adopt a <em>running</em> one — so an
+    RSS-watchdog restart force-removed and recreated it, discarding every in-sandbox
+    service and all runtime <code>apt</code>/<code>pip</code> state (the "fast resume"
+    the docstring promised never existed). <code>_try_resume_stopped</code> now
+    <code>start()</code>s a merely-stopped/paused container and re-probes before the
+    recreate path.</li>
+    <li><strong>Adopted-container published ports read from reality.</strong> When
+    the agent adopts a container it didn't create (routine after a plain-kill deploy,
+    or a 409 name-race, or the port-conflict retry), <code>_published_service_ports</code>
+    is now derived from the live <code>HostConfig.PortBindings</code> (empty on the
+    portless retry) instead of being left stale/None — so the remote-access hint
+    can't point the operator at a foreign process's port. See
+    <a href="services.html#remote-access">services → Remote access</a>.</li>
+    <li><strong>Spill-log counter survives restarts.</strong> <code>_spill_counter</code>
+    (class attr, reset to 0 on every plain-kill deploy) is now seeded past any
+    existing <code>.ghost_runs/run_N.log</code> on first use, so a truncated-output
+    pointer from a prior session isn't clobbered by a new <code>run_1.log</code>.</li>
+  </ul>
+  <p>Covered by <code>tests/test_docker_review_fixes.py</code>. The paired
+  <a href="../tools/execute.html">execute</a> heal-retry safety (a timeout-killed or
+  already-ran command is no longer re-run) is in
+  <code>tests/test_execute_heal_timeout_guard.py</code>.</p>
+
   <h2>Tor</h2>
   <p>If <code>tor_proxy</code> is set in the constructor, the container starts a <code>tor</code> daemon and outbound HTTP from inside the sandbox is routed through it. The spawn is attempted <strong>once per container generation</strong> and verified: under host networking (the Linux default) the in-container tor can never bind — the host tor already owns <code>:9050</code> in the shared netns — so the code logs one explicit warning instead of silently re-attempting the doomed spawn on every command (which flooded the log with per-command "Environment Ready" lines). The native <code>browser</code> tool additionally forces DNS-over-SOCKS via Chromium's <code>--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE localhost"</code> and disables non-proxied WebRTC (<code>--webrtc-ip-handling-policy=disable_non_proxied_udp</code>), so the browser path cannot leak DNS or the host IP even if the LLM forgets to configure the proxy correctly.</p>
 

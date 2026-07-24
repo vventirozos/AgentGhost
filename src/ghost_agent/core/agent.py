@@ -95,7 +95,9 @@ _SELFHOOD_PREFIX_ENABLED = False
 #    deep-reason a value function grounded in real execution (the one mechanism
 #    that can convert a failure into a success). ON by default (no-op without
 #    --deep-reason, which is what wires context.hypothesis_tester).
-_HYPOTHESIS_GROUNDING_ENABLED = True
+#    GHOST_HYPOTHESIS_GROUNDING=0 disables it — the earn-your-keep harness's
+#    ablation arm (full_no_hypothesis) and the prod prune-override use this.
+_HYPOTHESIS_GROUNDING_ENABLED = os.environ.get("GHOST_HYPOTHESIS_GROUNDING", "1").strip().lower() not in ("0", "false", "no")
 #  * Metacog dual-solver arbiter: on a low-confidence shell/sql turn it samples
 #    TWO paraphrased completions, computes their cosine divergence, then throws
 #    both candidates away and dispatches the ORIGINAL args — paying 2x inference
@@ -3035,11 +3037,14 @@ class GhostAgent:
             if since_last_journal >= self._JOURNAL_COOLDOWN:
                 has_items = False
                 try:
-                    # Route through the guarded load() (not a raw read_text +
-                    # json.loads): on a corrupt journal, load() sidecars the
-                    # bytes and returns [] rather than letting `except: pass`
-                    # silently skip consolidation forever.
-                    has_items = len(ctx.journal.load()) > 0
+                    # Route through the guarded pending_count() (not a raw
+                    # read_text + json.loads): on a corrupt journal, load()
+                    # sidecars the bytes and returns [] rather than letting
+                    # `except: pass` silently skip consolidation forever.
+                    # pending_count() (not len(load())) so overflow-only work —
+                    # a burst that spilled, or a preemption requeue — still
+                    # triggers the drain instead of sitting undrained.
+                    has_items = ctx.journal.pending_count() > 0
                 except Exception:
                     pass
                 if has_items:
@@ -3064,7 +3069,14 @@ class GhostAgent:
                     return
 
         # Phase 2: Deep REM Dream (10–60 min idle)
-        if self._bio_scaled(600) < idle_secs <= self._bio_scaled(3600):
+        # --no-dream ablates JUST this loop (Track-B earn-keep dream-off arm),
+        # leaving reflection (phase 1) and self-play (phase 3) untouched.
+        # `is not True` (not a plain truthiness check) so the many watchdog
+        # tests that mock ctx.args as a MagicMock — whose auto-vivified
+        # .no_dream child is truthy — still exercise the dream phase; only a
+        # real argparse store_true (bool True) disables it.
+        if (self._bio_scaled(600) < idle_secs <= self._bio_scaled(3600)
+                and getattr(ctx.args, "no_dream", False) is not True):
             since_last_dream = (datetime.datetime.now() - self._last_dream_at).total_seconds()
             if since_last_dream >= self._DREAM_COOLDOWN:
                 try:
@@ -4009,7 +4021,11 @@ class GhostAgent:
                     self._last_workspace_narrative_at = datetime.datetime.now()
 
         # Phase 3: Synthetic Self-Play (>60 min idle)
-        if idle_secs > self._bio_scaled(3600):
+        # --no-self-play ablates JUST this loop (Track-B earn-keep self-play-off
+        # arm) — both fresh self-play and the counterfactual-replay slot below.
+        # `is not True` for the same MagicMock-args reason as the dream gate.
+        if (idle_secs > self._bio_scaled(3600)
+                and getattr(ctx.args, "no_self_play", False) is not True):
             since_last_selfplay = (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
             if since_last_selfplay >= self._current_selfplay_cooldown and self._bio_roll(0.2):
                 from .dream import Dreamer

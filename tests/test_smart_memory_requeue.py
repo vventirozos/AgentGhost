@@ -116,7 +116,10 @@ async def test_transient_item_is_requeued_with_retry_count(mock_context, tmp_pat
 
     await agent.process_journal_queue()
 
-    remaining = mock_context.journal.load()
+    # The transient-failed item is requeued to the overflow head (drained
+    # first next cycle), so it surfaces via a drain, not len(load()).
+    assert mock_context.journal.pending_count() == 1
+    remaining = mock_context.journal.pop_all()
     assert len(remaining) == 1
     assert remaining[0]["type"] == "smart_memory"
     assert remaining[0]["retries"] == 1

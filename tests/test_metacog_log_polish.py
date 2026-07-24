@@ -112,7 +112,11 @@ class TestThresholdPlumbing:
 # HostTelemetry dedup
 # ──────────────────────────────────────────────────────────────────────
 
-def _snap(*, cpu=10.0, mem=30.0, avail=4000.0, disk=20.0, procs=100, ts=None):
+# A RAM warning now requires high % AND genuinely low free memory (< 1024 MB;
+# 2026-07-22). These dedup tests use RAM as their example warning metric, so the
+# default free sits in the WARNING band [800, 1024): below the 1024 warn floor
+# so mem>=85 warns, above the 800 critical floor so it isn't critical.
+def _snap(*, cpu=10.0, mem=30.0, avail=900.0, disk=20.0, procs=100, ts=None):
     return HostSnapshot(
         ts=ts if ts is not None else time.time(),
         cpu_percent=cpu, mem_percent=mem,
@@ -151,9 +155,9 @@ class TestHostTelemetryDedup:
         not a dedup. Both should emit."""
         telemetry = HostTelemetry(sustain_samples=1, heartbeat_s=300.0)
         snaps = [
-            _snap(mem=96.0, avail=4000.0, ts=1000.0),  # warning
-            _snap(mem=96.0, avail=4000.0, ts=1001.0),  # dedup'd
-            _snap(mem=96.0, avail=400.0,  ts=1002.0),  # CRITICAL — new state
+            _snap(mem=96.0, avail=900.0, ts=1000.0),  # warning (high% + free<1GB)
+            _snap(mem=96.0, avail=900.0, ts=1001.0),  # dedup'd
+            _snap(mem=96.0, avail=400.0, ts=1002.0),  # CRITICAL — new state
         ]
         signals = await _drive(telemetry, snaps)
         assert len(signals) == 2

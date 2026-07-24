@@ -335,6 +335,15 @@ async def test_self_play_loop_consolidates_between_cycles(tmp_path, monkeypatch)
             self._lock = threading.RLock()
             self.file_path = journal_path
 
+        def pending_count(self):
+            # The inter-cycle drain now asks pending_count() (hot + overflow)
+            # instead of reading file_path directly.
+            import json as __json
+            try:
+                return len(__json.loads(self.file_path.read_text()))
+            except Exception:
+                return 0
+
     consolidation_calls = {"n": 0}
 
     class FakeAgent:

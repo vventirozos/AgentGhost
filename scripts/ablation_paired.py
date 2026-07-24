@@ -45,17 +45,41 @@ import ablation_eval as AE  # noqa: E402  (reuse runner/lifecycle/stats)
 
 
 # Config flag sets (mirror scripts/ablation_configs.json, minus the per-config port).
+# The leave-one-out matrix (2026-07-22, earn-your-keep harness): `full` = all
+# in-session cognition ON; each `full_no_<x>` = full minus ONE subsystem, so the
+# paired delta (full vs full_no_x) is that subsystem's marginal contribution;
+# `thin` = the floor. The subsystem↔arm mapping is the single source of truth in
+# core.prune_overrides.SUBSYSTEMS.
+_FULL = ["--enable-metacog", "--deep-reason", "--enable-preflight-guard",
+         "--postmortem", "--smart-memory", "0.9", "--autoadvance-idle"]
+
+
+def _full_minus(*drop_add):
+    """`_FULL` with the given (remove_flag, ...) removed and (add_flag, ...)
+    appended — keeps each LOO arm defined as a diff from full, not re-listed."""
+    remove = {f for f in drop_add if not f.startswith("!")}
+    add = [f[1:] for f in drop_add if f.startswith("!")]
+    return [f for f in _FULL if f not in remove] + add
+
+
 CONFIG_FLAGS: Dict[str, List[str]] = {
-    "full": ["--enable-metacog", "--deep-reason", "--enable-preflight-guard",
-             "--postmortem", "--smart-memory", "0.9", "--autoadvance-idle"],
-    "full_no_metacog": ["--deep-reason", "--enable-preflight-guard",
-                        "--postmortem", "--smart-memory", "0.9", "--autoadvance-idle"],
-    "full_no_deepreason": ["--enable-metacog", "--enable-preflight-guard",
-                          "--postmortem", "--smart-memory", "0.9", "--autoadvance-idle"],
-    "full_no_preflight": ["--enable-metacog", "--deep-reason", "--no-enable-preflight-guard",
-                         "--postmortem", "--smart-memory", "0.9", "--autoadvance-idle"],
+    "full": list(_FULL),
+    "full_no_metacog": _full_minus("--enable-metacog"),
+    "full_no_deepreason": _full_minus("--deep-reason"),
+    "full_no_preflight": _full_minus("--enable-preflight-guard", "!--no-enable-preflight-guard"),
+    "full_no_verifier": _full_minus("!--no-verifier"),
+    "full_no_selfmodel": _full_minus("!--no-self-model"),
+    "full_no_workspacemodel": _full_minus("!--no-workspace-model"),
+    # env-toggled arm (GHOST_HYPOTHESIS_GROUNDING=0), see CONFIG_ENV below.
+    "full_no_hypothesis": list(_FULL),
     "thin": ["--no-self-model", "--no-workspace-model", "--no-reflection",
              "--no-enable-preflight-guard"],
+}
+
+# Per-arm env overrides for subsystems toggled by an env-gated module constant
+# rather than a CLI flag (passed to AE._boot's extra_env).
+CONFIG_ENV: Dict[str, Dict[str, str]] = {
+    "full_no_hypothesis": {"GHOST_HYPOTHESIS_GROUNDING": "0"},
 }
 
 COMMON = ["--upstream-url", "http://127.0.0.1:8088", "--api-key", "",
@@ -88,7 +112,8 @@ def _boot_all(names: List[str], base_port: int, boot_timeout: float, logdir: Pat
         gh = Path(tempfile.mkdtemp(prefix=f"ghost-pair-{name}-"))
         sandbox = gh / "sandbox"
         flags = ["--port", str(port)] + COMMON + CONFIG_FLAGS[name]
-        proc, lf = AE._boot(flags, gh, logdir / f"{name}.log")
+        proc, lf = AE._boot(flags, gh, logdir / f"{name}.log",
+                            extra_env=CONFIG_ENV.get(name))
         base_url = f"http://127.0.0.1:{port}"
         container = AE._container_name(sandbox)
         live[name] = {"proc": proc, "lf": lf, "url": base_url,

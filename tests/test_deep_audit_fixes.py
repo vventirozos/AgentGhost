@@ -65,9 +65,10 @@ def test_tool_failure_empty_error_is_unknown():
 
 
 def test_journal_push_front_truncation_preserves_requeued_items():
-    """push_front is called to preserve unprocessed items across a
-    consolidation interruption, so when truncating we must drop the
-    newly appended tail, NOT the re-queued head we were trying to save."""
+    """push_front preserves unprocessed items across a consolidation
+    interruption. Since 2026-07-23 it is fully LOSSLESS: the requeued head AND
+    the newly-appended tail both survive (the requeue folds to the overflow,
+    which absorbs any amount), and the requeued items drain first."""
     from ghost_agent.memory.journal import MemoryJournal
 
     with tempfile.TemporaryDirectory() as td:
@@ -77,8 +78,8 @@ def test_journal_push_front_truncation_preserves_requeued_items():
         j.append("note", {"n": 2})
         j.append("note", {"n": 3})
 
-        # Re-queue items -3, -2, -1 (ordered oldest→newest) at the head.
-        # Total would be 6 — the cap is 4, so we drop 2 from somewhere.
+        # Re-queue items -3, -2, -1 (oldest→newest) at the head. Total is 6,
+        # past the cap of 4 — but nothing is dropped any more.
         old = [
             {"type": "note", "data": {"n": -3}},
             {"type": "note", "data": {"n": -2}},
@@ -86,12 +87,9 @@ def test_journal_push_front_truncation_preserves_requeued_items():
         ]
         j.push_front(old)
 
-        data = j.load()
-        assert len(data) == 4
-        # Re-queued items must all survive: -3, -2, -1. The tail (most
-        # recent append) is the one that gets dropped — 2 and 3 go.
-        ns = [d["data"]["n"] for d in data]
-        assert ns == [-3, -2, -1, 1]
+        assert j.pending_count() == 6            # nothing dropped
+        ns = [d["data"]["n"] for d in j.pop_all()]
+        assert ns == [-3, -2, -1, 1, 2, 3]       # requeued first, all retained
 
 
 # --------------------------------------------------------------------------- #

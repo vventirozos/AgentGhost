@@ -173,29 +173,31 @@ def test_scratchpad_get_returns_none_after_ttl_persistent(tmp_path):
 # ---------------------------------------------------------------------------
 
 
-def test_journal_push_front_preserves_requeued_when_under_capacity(tmp_path):
+def test_journal_push_front_preserves_requeued_at_head(tmp_path):
     journal = MemoryJournal(tmp_path, max_capacity=5)
     journal.append("a", {"i": 1})
     journal.append("b", {"i": 2})
     journal.append("c", {"i": 3})
     requeued = [{"type": "r1", "data": {}}, {"type": "r2", "data": {}}]
     journal.push_front(requeued)
-    loaded = journal.load()
-    # All requeued items present at the head, all original items kept too.
-    assert [e["type"] for e in loaded] == ["r1", "r2", "a", "b", "c"]
+    # Requeued work folds to the overflow HEAD (invisible to load(), drained
+    # first); every original item is kept too.
+    assert journal.pending_count() == 5
+    assert [e["type"] for e in journal.pop_all()] == ["r1", "r2", "a", "b", "c"]
 
 
-def test_journal_push_front_drops_tail_when_over_capacity(tmp_path):
+def test_journal_push_front_never_drops_tail_over_capacity(tmp_path):
+    """Lossless: requeuing onto a full-ish hot buffer must NOT discard the
+    oldest tail the way the old capacity-bounded merge did."""
     journal = MemoryJournal(tmp_path, max_capacity=4)
     journal.append("a", {"i": 1})
     journal.append("b", {"i": 2})
     journal.append("c", {"i": 3})
     requeued = [{"type": "r1", "data": {}}, {"type": "r2", "data": {}}]
     journal.push_front(requeued)
-    loaded = journal.load()
-    # Requeued items preserved; oldest tail dropped.
-    assert [e["type"] for e in loaded] == ["r1", "r2", "a", "b"]
-    assert all(e["type"] != "c" for e in loaded)
+    drained = journal.pop_all()
+    assert [e["type"] for e in drained] == ["r1", "r2", "a", "b", "c"]
+    assert any(e["type"] == "c" for e in drained)   # 'c' used to be dropped
 
 
 def test_journal_push_front_handles_oversized_items_list(tmp_path):
@@ -203,10 +205,10 @@ def test_journal_push_front_handles_oversized_items_list(tmp_path):
     journal.append("orig", {"i": 0})
     requeued = [{"type": f"r{i}", "data": {}} for i in range(5)]
     journal.push_front(requeued)
-    loaded = journal.load()
-    # When items alone exceed capacity, keep the most-recent items only.
-    assert len(loaded) == 3
-    assert [e["type"] for e in loaded] == ["r2", "r3", "r4"]
+    # Even when the requeue alone exceeds the hot cap, nothing is dropped —
+    # it all lives in the overflow and drains requeued-first.
+    drained = journal.pop_all()
+    assert [e["type"] for e in drained] == ["r0", "r1", "r2", "r3", "r4", "orig"]
 
 
 def test_journal_drain_returns_and_clears(tmp_path):

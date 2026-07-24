@@ -52,6 +52,30 @@
   opted out of project scoping — most often stateful=true") so the model stops guessing.
   Covered by <code>tests/test_execute_path_and_exit1_heal.py</code> (§5).</p>
 
+  <h2>Heal-retry safety — never re-run a command that already ran <span class="tag">2026-07-22</span></h2>
+  <p>The cwd-heals above re-run a command when its output looks like a wrong-cwd
+  file-not-found. Two shapes were being re-run that must NOT be, because the
+  command already executed and a second run would repeat its side effects (DB
+  inserts, appends, API calls) or double a 600&nbsp;s wall-clock:</p>
+  <ul>
+    <li><strong>Timeout kills</strong> — <code>_TIMEOUT_KILL_CODES</code>
+    (124/137/143) are now excluded from both heal triggers. A command killed at
+    its budget whose accumulated output happens to mention ENOENT (pip/wget noise)
+    is no longer silently re-run for another full budget.</li>
+    <li><strong>Ran-then-missing-data-file</strong> — <code>_looks_like_file_not_found</code>
+    now returns False when the output contains a Python <code>Traceback</code>: a
+    traceback means the interpreter <em>found and ran</em> the script, so a "no such
+    file" inside it is a runtime data-file error <em>after</em> side effects, not a
+    wrong-cwd miss. A genuine wrong-cwd miss is a startup error
+    (<code>can't open file '…'</code>) with no traceback, so the legitimate heal is
+    unaffected.</li>
+  </ul>
+  <p>Covered by <code>tests/test_execute_heal_timeout_guard.py</code>. Paired with
+  the <a href="../sandbox/docker.html">sandbox</a> exec-deadline + infra-error
+  marking (an infrastructure failure now returns
+  <code>[SANDBOX INFRA ERROR — not your code]</code> instead of a bare
+  <code>exit&nbsp;1</code>, which this heuristic also correctly declines to heal).</p>
+
   <h2>Tool: <code>execute</code></h2>
   <p>Three execution modes selected from arguments:</p>
 

@@ -131,6 +131,13 @@ class HostTelemetry:
     DEFAULT_CPU_HIGH = 85.0
     DEFAULT_MEM_HIGH = 85.0
     DEFAULT_MEM_FLOOR_MB = 800.0
+    # The RAM WARNING requires BOTH a high percentage AND genuinely low FREE
+    # memory. On a large-RAM box, mem_percent alone is a poor pressure signal —
+    # 91% used with 3+ GB free is NOT pressure, yet it spammed a warning every
+    # heartbeat. Gating on free < 1 GB (≈97% on a 36 GB box) fires only under
+    # real pressure. The CRITICAL floor (DEFAULT_MEM_FLOOR_MB) stays the harder
+    # OOM-imminent line below this.
+    DEFAULT_MEM_WARN_FREE_MB = 1024.0
     DEFAULT_DISK_HIGH = 90.0
     # Sustained-crossing window: severity escalates to warning when the
     # threshold is crossed in N consecutive samples.
@@ -144,6 +151,7 @@ class HostTelemetry:
         cpu_high: float = DEFAULT_CPU_HIGH,
         mem_high: float = DEFAULT_MEM_HIGH,
         mem_floor_mb: float = DEFAULT_MEM_FLOOR_MB,
+        mem_warn_free_mb: float = DEFAULT_MEM_WARN_FREE_MB,
         disk_high: float = DEFAULT_DISK_HIGH,
         sustain_samples: int = DEFAULT_SUSTAIN_SAMPLES,
         heartbeat_s: float = 300.0,
@@ -154,6 +162,7 @@ class HostTelemetry:
         self.cpu_high = float(cpu_high)
         self.mem_high = float(mem_high)
         self.mem_floor_mb = float(mem_floor_mb)
+        self.mem_warn_free_mb = float(mem_warn_free_mb)
         self.disk_high = float(disk_high)
         self.sustain_samples = int(max(1, sustain_samples))
         # Dedup window. When (metric-set, severity) is unchanged from the
@@ -277,10 +286,17 @@ class HostTelemetry:
         else:
             self._cpu_run = 0
 
-        # Memory pct
-        if math.isfinite(snap.mem_percent) and snap.mem_percent >= self.mem_high:
+        # Memory pct — WARN only under REAL pressure: high % AND genuinely low
+        # FREE memory (< mem_warn_free_mb). Percentage alone spams on a
+        # large-RAM box (91% with 3 GB free is not pressure).
+        _mem_pct_hi = math.isfinite(snap.mem_percent) and snap.mem_percent >= self.mem_high
+        _mem_free_low = (math.isfinite(snap.mem_available_mb)
+                         and snap.mem_available_mb < self.mem_warn_free_mb)
+        if _mem_pct_hi and _mem_free_low:
             self._mem_run += 1
-            reasons.append(f"RAM {snap.mem_percent:.0f}%")
+            reasons.append(
+                f"RAM {snap.mem_percent:.0f}% (free {snap.mem_available_mb:.0f}MB"
+                f"<{int(self.mem_warn_free_mb)}MB)")
             metric_tokens.append("ram")
             if self._mem_run >= self.sustain_samples:
                 severity = _escalate(severity, "warning")

@@ -126,6 +126,8 @@ class MetacogBundle:
                                    HostTelemetry.DEFAULT_MEM_HIGH)),
             mem_floor_mb=float(getattr(args, "metacog_mem_floor_mb",
                                        HostTelemetry.DEFAULT_MEM_FLOOR_MB)),
+            mem_warn_free_mb=float(getattr(args, "metacog_mem_warn_free_mb",
+                                           HostTelemetry.DEFAULT_MEM_WARN_FREE_MB)),
             disk_high=float(getattr(args, "metacog_disk_high",
                                     HostTelemetry.DEFAULT_DISK_HIGH)),
             heartbeat_s=float(getattr(args, "metacog_host_heartbeat_s", 300.0)),

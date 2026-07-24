@@ -10,6 +10,23 @@ logger = logging.getLogger("GhostAgent")
 CONTAINER_NAME = "ghost-agent-sandbox"
 CONTAINER_WORKDIR = "/workspace"
 
+# Client-side deadline (seconds) for a container exec when the caller gives no
+# explicit one. docker-py's exec socket read blocks in poll() with NO timeout
+# (verified in 7.1.0), so a wedged daemon would otherwise hang the calling
+# thread forever — and the provision execs run while holding self._lock, which
+# would wedge EVERY other turn's execute. This ceiling is generous on purpose:
+# it must never fire for a legitimately-slow install (apt/pip/playwright), only
+# for a genuinely stuck daemon. The per-command exec passes its own tighter
+# deadline (the in-container `timeout Ns` budget + grace).
+_EXEC_DAEMON_DEADLINE_S = float(os.environ.get("GHOST_EXEC_DAEMON_DEADLINE", "1200") or 1200)
+
+
+class SandboxDaemonTimeout(Exception):
+    """A container exec exceeded its CLIENT-SIDE deadline — the docker daemon
+    is likely wedged. Raised instead of blocking forever so the caller
+    releases self._lock and the agent surfaces a clear error."""
+
+
 class DockerSandbox:
     # Per-container-generation state, reset whenever a container is
     # (re)created. Class-level defaults so test stubs built via __new__
@@ -90,12 +107,50 @@ class DockerSandbox:
 
         pretty_log("Sandbox Init", f"Mounting {self.host_workspace} -> {CONTAINER_WORKDIR}", icon=Icons.SANDBOX_BOX)
 
+    def binds_host_netns(self) -> bool:
+        """True when the sandbox shares the HOST network namespace (docker
+        ``--network host``): the effective default on Linux. In that mode a
+        service the agent hosts binds a real host port, so exporting
+        ``HOST=0.0.0.0`` exposes it LAN-wide unauthenticated — sandbox.services
+        consults this to bind loopback instead. Mirrors the create-time logic
+        (GHOST_SANDBOX_NETWORK override → Linux=host / else bridge)."""
+        import sys as _sys
+        _net = os.environ.get("GHOST_SANDBOX_NETWORK", "").strip().lower()
+        if _net in ("host", "bridge", "none"):
+            return _net == "host"
+        return _sys.platform.startswith("linux")
+
     def published_service_ports(self):
         """The ports docker ACTUALLY published to the host loopback for the
         live container, or None when unknown (no container created yet — the
         caller then falls back to the configured range). getattr-guarded for
         managers whose __init__ was bypassed in tests."""
         return getattr(self, "_published_service_ports", None)
+
+    @staticmethod
+    def _derive_published_ports(container) -> set:
+        """The set of container ports docker actually has published to the host,
+        read from the LIVE container's ``HostConfig.PortBindings`` — the ground
+        truth. Used when we ADOPT a container we didn't create (a pre-existing
+        one after a deploy-by-kill, or a 409 name-race adopt), where the set we
+        computed for our own aborted create says nothing about reality. Returns
+        an empty set on any read failure (host-network containers publish
+        nothing, so empty is the correct default). ``{'8100/tcp': [...]}`` →
+        ``{8100}``."""
+        try:
+            container.reload()
+            bindings = (container.attrs.get("HostConfig", {})
+                        or {}).get("PortBindings") or {}
+            out = set()
+            for key in bindings:
+                # key is like "8100/tcp"; take the numeric port.
+                port = str(key).split("/", 1)[0]
+                if port.isdigit():
+                    out.add(int(port))
+            return out
+        except Exception as e:  # noqa: BLE001 — best-effort; empty is safe
+            logger.debug("could not derive published ports from container: %s", e)
+            return set()
 
     def _ready_is_fresh(self) -> bool:
         # getattr defaults keep this safe when __init__ was bypassed (tests
@@ -144,6 +199,39 @@ class DockerSandbox:
             except Exception:
                 return False
 
+    def _exec_run(self, cmd, deadline_s: float = None, **kwargs):
+        """``self.container.exec_run`` with a CLIENT-SIDE deadline.
+
+        docker-py's exec output read blocks in ``poll.poll()`` with no timeout,
+        so a wedged daemon hangs the calling thread indefinitely. Since the
+        provision execs hold ``self._lock``, that would wedge every other
+        turn's ``execute`` with zero log output. We run the exec on a daemon
+        thread and ``join`` with a deadline: on expiry we ABANDON the blocked
+        worker (a Python thread can't be killed — but a daemon thread won't
+        block process exit and leaks only until the daemon recovers / the
+        process restarts) and raise, so the caller releases the lock and the
+        agent recovers with a clear error instead of a silent infinite hang.
+        """
+        deadline = _EXEC_DAEMON_DEADLINE_S if deadline_s is None else deadline_s
+        result = {}
+
+        def _run():
+            try:
+                result["ok"] = self.container.exec_run(cmd, **kwargs)
+            except BaseException as e:  # noqa: BLE001 — re-raised on the caller thread
+                result["err"] = e
+
+        t = threading.Thread(target=_run, name="sandbox-exec", daemon=True)
+        t.start()
+        t.join(timeout=deadline)
+        if t.is_alive():
+            raise SandboxDaemonTimeout(
+                f"container exec exceeded its {deadline:.0f}s client deadline — "
+                f"the docker daemon may be wedged (command abandoned)")
+        if "err" in result:
+            raise result["err"]
+        return result["ok"]
+
     def _probe_container_ready(self):
         # Verify the volume mount is still valid (not a deleted host inode)
         # AND the container responds to exec — in ONE exec_run. Previously
@@ -159,7 +247,7 @@ class DockerSandbox:
 
         try:
             test_path.touch(exist_ok=True)
-            code, out = self.container.exec_run(
+            code, out = self._exec_run(
                 f"sh -c 'stat {test_file} >/dev/null 2>&1 && echo OK'",
                 workdir=CONTAINER_WORKDIR,
             )
@@ -173,6 +261,38 @@ class DockerSandbox:
             if b"OK" not in out:
                 return False
         return True
+
+    def _try_resume_stopped(self) -> bool:
+        """If ``self.container`` is merely stopped/paused (not gone), start it
+        and re-probe readiness. Returns True if it came back ready — saving a
+        full destroy+reprovision that would kill in-sandbox services and all
+        runtime state. False → the caller proceeds to recreate."""
+        c = self.container
+        if c is None:
+            return False
+        try:
+            c.reload()
+            status = c.status
+        except Exception:
+            return False
+        if status not in ("exited", "created", "paused"):
+            return False
+        try:
+            if status == "paused":
+                c.unpause()
+            else:
+                c.start()
+        except Exception as e:  # noqa: BLE001 — fall through to recreate
+            logger.debug("sandbox resume failed (%s); will recreate", e)
+            return False
+        if self._is_container_ready():
+            pretty_log(
+                "Sandbox Resume",
+                "Resumed stopped container (in-sandbox services + runtime "
+                "state preserved)", icon=Icons.SANDBOX_BOX)
+            self.mark_ready()
+            return True
+        return False
 
     def ensure_running(self):
         # Hold the lock for the WHOLE check+provision. The actual command
@@ -198,10 +318,25 @@ class DockerSandbox:
         try:
             if not self.container:
                 self.container = self.client.containers.get(self.container_name)
+                # Adopted a container we did NOT create this process (routine
+                # after a deploy-by-kill — the container outlives the agent).
+                # Its real publish set lives on the container, not in our
+                # (None) stamp, so read it — otherwise is_published_port falls
+                # back to the configured range, which over-claims when the
+                # survivor was created portless.
+                if getattr(self, "_published_service_ports", None) is None:
+                    self._published_service_ports = self._derive_published_ports(self.container)
         except self.NotFound:
             pass
 
         if not (self.container and self._is_container_ready()):
+            # Before destroying + reprovisioning: if the container merely
+            # STOPPED (e.g. an RSS-watchdog restart called close(remove=False),
+            # whose docstring promised a "fast resume" that never existed),
+            # try to RESUME it. Recreating discards every in-sandbox service
+            # and all runtime apt/pip additions for nothing.
+            if self.container is not None and self._try_resume_stopped():
+                return
             did_work = True
             pretty_log("Sandbox Provision", "Initializing high-performance environment…", icon=Icons.SANDBOX_BOX)
             try:
@@ -406,12 +541,22 @@ class DockerSandbox:
                         except Exception:  # noqa: BLE001 — nothing to clean
                             pass
                         self.container = self.client.containers.run(**run_kwargs)
+                        # We retried WITHOUT ports → nothing is published. The
+                        # stamp from line ~371 still claimed the ports; leaving
+                        # it made is_published_port over-claim and the remote
+                        # hint point the operator (via tailscale serve) at a
+                        # FOREIGN process on that port. Correct it to empty.
+                        self._published_service_ports = set()
                     elif getattr(run_err, "status_code", None) == 409 or "already in use" in msg:
                         # Another process (sharing this docker daemon and the
                         # workspace-derived container name) won the race
                         # between our remove and run — a 409 "name already in
                         # use". Adopt the existing container instead of dying.
                         self.container = self.client.containers.get(self.container_name)
+                        # The adopted container's real publish set is whatever
+                        # IT was created with, not our aborted create's — read
+                        # it from the container itself.
+                        self._published_service_ports = self._derive_published_ports(self.container)
                     else:
                         raise
 
@@ -484,7 +629,7 @@ class DockerSandbox:
         if self._env_verified:
             marker_ok = chromium_ok = True
         else:
-            marker_ok = (self.container.exec_run(f"test -f {marker_path}")[0] == 0)
+            marker_ok = (self._exec_run(f"test -f {marker_path}")[0] == 0)
             chromium_ok = self._chromium_binary_present()
         if not marker_ok or not chromium_ok:
             if time.time() < self._provision_backoff_until:
@@ -519,15 +664,15 @@ class DockerSandbox:
             # call in the agent. The caps are generous — they exist to
             # bound a stall, not to race a slow link.
             apt_cmd = "timeout 900 sh -c 'apt-get update && apt-get install -y sudo coreutils nodejs npm g++ curl wget git procps postgresql-client libpq-dev tor ripgrep sqlite3 iproute2 stockfish'"
-            code, out = self.container.exec_run(apt_cmd, environment=env_vars)
+            code, out = self._exec_run(apt_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"System package installation failed: {err_msg}")
 
-            self.container.exec_run("sh -c 'echo \"ALL ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'")
+            self._exec_run("sh -c 'echo \"ALL ALL=(ALL) NOPASSWD: ALL\" >> /etc/sudoers'")
 
             if self.tor_proxy:
-                code, out = self.container.exec_run("timeout 600 pip install --no-cache-dir pysocks requests")
+                code, out = self._exec_run("timeout 600 pip install --no-cache-dir pysocks requests")
                 if code != 0:
                     err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                     raise Exception(f"PySocks bootstrap failed: {err_msg}")
@@ -541,7 +686,7 @@ class DockerSandbox:
                 "psycopg2-binary asyncpg sqlalchemy tabulate sqlglot playwright html2text lxml "
                 "flask python-chess"
             )
-            code, out = self.container.exec_run(install_cmd, environment=env_vars)
+            code, out = self._exec_run(install_cmd, environment=env_vars)
             if code != 0:
                 err_msg = out.decode("utf-8", errors="replace") if out else "Unknown error"
                 raise Exception(f"Python package installation failed: {err_msg}")
@@ -555,7 +700,7 @@ class DockerSandbox:
             # get a working sandbox (the agent falls back to a runtime install),
             # so a torch flake must not poison provisioning of everything else.
             pretty_log("Sandbox PyTorch", "Installing CPU PyTorch (~1m)…", icon=Icons.SANDBOX_BOX)
-            torch_code, torch_out = self.container.exec_run(
+            torch_code, torch_out = self._exec_run(
                 "timeout 1800 pip install --no-cache-dir torch "
                 "--index-url https://download.pytorch.org/whl/cpu",
                 environment=env_vars,
@@ -588,7 +733,7 @@ class DockerSandbox:
             # manually deleted the supercharged marker without wiping
             # the cache), `playwright install` short-circuits in ~1 s.
             pretty_log("Sandbox Chromium", "Installing headless Chromium (~2m)…", icon=Icons.TOOL_DOWN)
-            pw_code, pw_out = self.container.exec_run(
+            pw_code, pw_out = self._exec_run(
                 "timeout 1800 python3 -m playwright install chromium --with-deps",
                 environment=env_vars,
             )
@@ -615,10 +760,10 @@ class DockerSandbox:
                     "Refusing to mark container as provisioned."
                 )
 
-            self.container.exec_run(f"touch {marker_path}")
+            self._exec_run(f"touch {marker_path}")
             # Remove any legacy v1 marker so a downgrade-then-upgrade
             # cycle doesn't leave stale state around.
-            self.container.exec_run("rm -f /root/.supercharged")
+            self._exec_run("rm -f /root/.supercharged")
 
             # Cache the fully installed environment for instant future
             # startups. Committed UNCONDITIONALLY after a successful
@@ -647,21 +792,21 @@ class DockerSandbox:
         # per-command "Environment Ready" lines.
         if self.tor_proxy and not self._tor_attempted:
             self._tor_attempted = True
-            exit_code, _ = self.container.exec_run("test -f /usr/bin/tor")
+            exit_code, _ = self._exec_run("test -f /usr/bin/tor")
             if exit_code != 0:
                 did_work = True
                 pretty_log("Sandbox Tor", "Installing isolated Tor daemon…", icon=Icons.TOOL_DOWN)
-                self.container.exec_run("timeout 900 sh -c 'apt-get update && apt-get install -y tor'", user="root")
+                self._exec_run("timeout 900 sh -c 'apt-get update && apt-get install -y tor'", user="root")
 
-            code, _ = self.container.exec_run("pgrep -x tor")
+            code, _ = self._exec_run("pgrep -x tor")
             if code != 0:
                 did_work = True
-                self.container.exec_run("su - debian-tor -s /bin/sh -c 'tor --RunAsDaemon 1'", user="root")
+                self._exec_run("su - debian-tor -s /bin/sh -c 'tor --RunAsDaemon 1'", user="root")
                 # Verify it actually came up; under host networking this is
                 # EXPECTED to fail (host tor owns the port) — say so once
                 # instead of silently retrying forever.
                 time.sleep(0.5)
-                code, _ = self.container.exec_run("pgrep -x tor")
+                code, _ = self._exec_run("pgrep -x tor")
                 if code != 0:
                     pretty_log(
                         "Sandbox Tor",
@@ -700,7 +845,7 @@ class DockerSandbox:
         try:
             # `find -print -quit` exits as soon as the first match is
             # printed. Exit code 0 + non-empty stdout → present.
-            code, out = self.container.exec_run(
+            code, out = self._exec_run(
                 "sh -c '"
                 "find /root/.cache/ms-playwright -type f "
                 "\\( -name headless_shell -o -name chrome \\) "
@@ -720,6 +865,7 @@ class DockerSandbox:
     # Monotonic counter for spill filenames (Date/time are unavailable to keep
     # runs reproducible; a counter is enough for uniqueness within a process).
     _spill_counter = 0
+    _spill_counter_seeded = False
 
     def _spill_run_output(self, text: str):
         """Write the full run output to a log file under the workspace and
@@ -728,6 +874,19 @@ class DockerSandbox:
         try:
             spill_dir = self.host_workspace / ".ghost_runs"
             spill_dir.mkdir(parents=True, exist_ok=True)
+            # Seed the counter past any run_N.log left by a PRIOR process
+            # (routine: plain-kill deploy under KeepAlive resets the class
+            # counter to 0). Without this, run_1.log is clobbered and a stale
+            # "saved to run_1.log" pointer in a long-lived project context now
+            # points at unrelated new content. Seed once per process.
+            if not getattr(type(self), "_spill_counter_seeded", False):
+                _existing = 0
+                for _f in spill_dir.glob("run_*.log"):
+                    _stem = _f.stem[4:]  # strip "run_"
+                    if _stem.isdigit():
+                        _existing = max(_existing, int(_stem))
+                type(self)._spill_counter = max(type(self)._spill_counter, _existing)
+                type(self)._spill_counter_seeded = True
             type(self)._spill_counter += 1
             name = f"run_{type(self)._spill_counter}.log"
             path = spill_dir / name
@@ -770,11 +929,16 @@ class DockerSandbox:
             if not is_mac:
                 exec_kwargs["user"] = f"{user_id}:{group_id}"
             
-            exec_result = self.container.exec_run(
+            # The command self-limits via the in-container `timeout -k 5s Ns`
+            # wrapper, so the client deadline only needs to catch a WEDGED
+            # daemon (which never streams the process's EOF back): timeout +
+            # grace. Without it a stuck daemon hangs this worker thread forever.
+            exec_result = self._exec_run(
                 cmd_string,
-                **exec_kwargs 
+                deadline_s=timeout + 60,
+                **exec_kwargs
             )
-            
+
             stdout_bytes = exec_result.output
             exit_code = exec_result.exit_code
 
@@ -835,9 +999,21 @@ class DockerSandbox:
         except Exception as e:
             # The container/daemon may be gone — force a full probe next time.
             self.invalidate_ready()
-            pretty_log("Sandbox Exec Failed", f"{type(e).__name__}: {e}",
-                       icon=Icons.FAIL, level="ERROR")
-            return f"Container Execution Error: {str(e)}", 1
+            # Mark this as a SANDBOX/INFRA failure, not a program failure. The
+            # blanket exit 1 made an infra fault (a wedged daemon, the
+            # remove-while-exec race, the provision-backoff refusal) look like
+            # the model's own code failing, so it debugged its code and burned
+            # strikes on a sandbox condition. The `[SANDBOX INFRA ERROR]` prefix
+            # tells the model (and keeps execute.py's file-not-found heal from
+            # firing on it — the heuristic doesn't match this text). A wedged
+            # daemon gets its own explicit line.
+            _wedged = isinstance(e, SandboxDaemonTimeout)
+            pretty_log(
+                "Sandbox Daemon Wedged" if _wedged else "Sandbox Exec Failed",
+                f"{type(e).__name__}: {e}", icon=Icons.FAIL, level="ERROR")
+            return (
+                f"[SANDBOX INFRA ERROR — not your code] "
+                f"{'docker daemon wedged; ' if _wedged else ''}{str(e)}", 1)
 
     def close(self, remove: bool = False):
         """Tear down the sandbox container at agent shutdown.

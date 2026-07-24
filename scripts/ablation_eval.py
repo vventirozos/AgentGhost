@@ -347,11 +347,15 @@ def _preflight(upstream_url: str, base_url: str) -> List[str]:
     return problems
 
 
-def _boot(flags: List[str], ghost_home: Path, logpath: Path):
+def _boot(flags: List[str], ghost_home: Path, logpath: Path, extra_env: dict = None):
     env = dict(os.environ)
     env["GHOST_HOME"] = str(ghost_home)
     env["FORCE_COLOR"] = "0"
     env.setdefault("GHOST_API_KEY", "")
+    # Per-arm env (e.g. an ablation arm that flips an env-gated module toggle
+    # like GHOST_HYPOTHESIS_GROUNDING). Backward-compatible: default no-op.
+    if extra_env:
+        env.update({k: str(v) for k, v in extra_env.items()})
     cmd = [sys.executable, "-m", "src.ghost_agent.main"] + flags
     lf = open(logpath, "wb")
     proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env,
