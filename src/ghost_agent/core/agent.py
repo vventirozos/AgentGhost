@@ -11547,7 +11547,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # Pass the graph so the briefing can surface
                                 # RELATED WORK — other projects sharing tech
                                 # (feature 3B).
-                                graph_memory=getattr(self.context, "graph_memory", None))
+                                graph_memory=getattr(self.context, "graph_memory", None),
+                                # Selective loading (2026-07-24): condition the
+                                # briefing on THIS request so the model gets the
+                                # matching corner of the file map + journal.
+                                request_text=str(last_user_content or ""))
                             if _briefing:
                                 dynamic_state += _briefing + "\n"
                     except Exception:

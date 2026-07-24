@@ -1109,6 +1109,53 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-24 (later 2) — Project accessibility: file manifest + per-file history + journal densification + selective loading
+
+**Mandate.** Operator: on "resume 6a471d630e81…" the agent just re-reads code — nothing directs it where to
+look; on a hundreds-of-files project that collapses. Goal: make a complicated project accessible to a smaller
+model by breaking it into small pieces. **Diagnosis from the (new) durable log:** the model read `server.js`
+just to learn what "the service" was, then spent ~80s of thinking re-deriving the module architecture a prior
+session had already derived. Existing substrate (Explore-mapped): work_log journal GOOD but sparse (2 rows vs
+8 autoadvance steps — autoadvance bypassed it), design_ledger real but free-prose, deliverables = bare paths,
+briefing = push-everything-top-N, workspace TrackedFile substrate unwired ("0 tracked files").
+
+**Built (all four phases, finish-the-half-built):**
+1. **File manifest** (`memory/projects.py`): `metadata.file_manifest` {rel_path: {desc, role, ts}} — ledger/config
+   idiom (bounded 60 files/200 chars, atomic cross-process, oldest-updated eviction); `describe_file`/`get_file_manifest`;
+   path normalization shared with the artifact keep-set (`_normalize_rel_path` extracted verbatim);
+   `register_file_artifact(description=)` fed by the coding executor (build summary) + task_update DONE (result
+   head); `manage_projects action=describe_file` (tool schema teaches "record it the moment you learn it");
+   dream-cycle `_backfill_file_manifests` (ONE batched off-main worker call, ≤4 files/cycle — caught by the
+   `off_main_only` contention guard on first try, fixed); every write re-renders **PROJECT_MAP.md** into the
+   workspace (atomic) so the map is greppable in-sandbox too.
+2. **Per-file history** (`file_history(pid, path)` + `action=file_history`): newest-first journal slice for one
+   file; BOTH sides normalized (live payloads mix bare names and absolute /workspace paths). "What happened to
+   index.html?" now answerable without re-reading it.
+3. **Journal densification** (`project_advancer._work_log_step`): autoadvance coding DONE/FAILED + generic-tool
+   DONE now mirror into work_log (request prefixed `[autoadvance]`), closing the 2-vs-8 gap.
+4. **Selective loading** (`prompts.build_project_briefing(request_text=)` + agent.py call site): RELEVANT TO THIS
+   REQUEST section — deterministic stopword-stripped keyword overlap over manifest (top-3 files, each with its
+   last history line) + deeper work_log window (beyond the newest-5). Zero LLM cost. Guard test pins that the
+   exact live phrasing ("resume X and give me a status update") matches NOTHING (stopword list built from it).
+   DELIVERABLES upgraded to `path — description` (+ undescribed nudge); tool `_briefing` gains additive `file_map`.
+
+**Verification.** 4 new test files (28 tests: storage bounds/eviction/traversal, tool actions, briefing surfaces,
+autoadvance mirror incl. file_history + manifest seed, relevance slice incl. false-positive guard); full suite
+green. Docs: `docs/memory/projects.html` new "Project accessibility" section. Memory `[[project-accessibility]]`.
+
+**LIVE-VALIDATED (same day, prod :8000) — including one bug found BY the durable log and fixed live.** First
+live `describe_file` probe: the model called it 3× and "got empty" while believing it succeeded — root cause:
+the shared `description` param's schema text said "Task description (task_add/task_update)", so the model didn't
+pass it, and the handler's no-description path silently fell back to manifest read-back. Fixed: schema text now
+covers describe_file; file_path-without-description returns an instructive steer (test pinned); the Project Tool
+log line now carries `file=`/`desc=` for the per-file actions (it was undiagnosable as `action=describe_file`
+alone). Second probe: manifest landed (2 entries with roles) + `PROJECT_MAP.md` rendered with undescribed-file
+nudges. **Then the operator's EXACT original request ("resume 6a471d630e81 , start its service and give me a
+task update") re-run: ZERO file reads, zero sandbox listings** (before: read `server.js` + `sandbox tree`) — the
+model went briefing → start service in 28s, and when the verifier refuted its task-count claim it re-checked via
+project-tool actions, not file re-reads. `turn outcome — ok · confidence 0.99 · tools: manage_services×3,
+manage_projects`.
+
 ### 2026-07-24 (later) — Logging overhaul: the durable log now reconstructs a turn (3-agent audit → keystone + noise + content)
 
 **Mandate.** Operator: logs must be (1) extremely readable for human monitoring and (2) extremely informative — "I often give Claude the log to figure out what the agent did." 3-agent read-only audit (turn/tools, cognitive/memory, infra/errors) + a cross-cutting real-log profile.

@@ -124,6 +124,47 @@
   via <code>manage_projects action=artifact_list</code>. Covered by
   <code>tests/test_project_readside_plumbing.py</code>.</p>
 
+  <h2>Project accessibility — manifest, per-file history, selective loading (2026-07-24)</h2>
+  <p><strong>Goal:</strong> make a complicated project navigable by a small model by breaking it
+  into small, retrievable pieces. Motivating trace: on <code>resume 6a471d630e81</code> the agent
+  had to read <code>server.js</code> just to learn what "the service" was, then spent ~80s of
+  thinking re-deriving the app's module architecture a previous session had already worked out —
+  deliverables were bare paths, the journal had 2 rows (autoadvance bypassed it), and briefing
+  loading was fixed top-N. Four additions close this:</p>
+  <ul>
+    <li><strong>File manifest</strong> — <code>metadata.file_manifest</code>
+      (<code>{rel_path: {desc, role, ts}}</code>; ledger/config idiom: bounded
+      <code>MANIFEST_MAX_FILES=60</code>/<code>DESC_MAX=200</code>, atomic cross-process, oldest-updated
+      evicted). APIs: <code>get_file_manifest</code>, <code>describe_file(pid, path, desc, role)</code>
+      (normalizes through the same <code>_normalize_rel_path</code> as the artifact keep-set, so manifest
+      keys and deliverable payloads always agree). <code>register_file_artifact</code> gained a
+      <code>description</code> param — fed by the coding executor (build summary) and
+      <code>task_update</code> DONE (the model's <code>result</code>). Model-facing:
+      <code>manage_projects action=describe_file</code>. Idle: the dream cycle's
+      <code>_backfill_file_manifests</code> describes undescribed deliverables (one batched
+      off-main worker call, ≤4 files/cycle). Every manifest write re-renders
+      <code>PROJECT_MAP.md</code> into the workspace (atomic) so the map is also greppable in-sandbox.</li>
+    <li><strong>Per-file history</strong> — <code>file_history(pid, path, limit)</code>: newest-first
+      journal slice of every work_log/event that touched the file; both sides normalized because live
+      payloads mix bare names and absolute <code>/workspace/…</code> paths. Model-facing:
+      <code>manage_projects action=file_history</code> — "what happened to X?" without re-reading X.</li>
+    <li><strong>Journal densification</strong> — autoadvance steps now mirror into
+      <code>work_log</code> (<code>_work_log_step</code> in
+      <a href="../core/project_advancer.html">project_advancer</a>: coding DONE/FAILED + generic-tool
+      DONE, request prefixed <code>[autoadvance]</code>). Before, only interactive turns wrote the
+      journal — live: 2 work_log rows vs 8 autoadvance_step events on the same project.</li>
+    <li><strong>Selective loading</strong> — <code>build_project_briefing(request_text=…)</code>
+      injects a RELEVANT TO THIS REQUEST section: deterministic stopword-stripped keyword overlap
+      against the manifest (top-3 files, each with its last history line) and a deeper work_log
+      window (matches beyond the newest-5 RECENT window). Zero LLM cost; empty for generic phrasing
+      ("resume X and give me a status update" matches nothing by design). The briefing DELIVERABLES
+      section now renders <code>path — description</code> for described files and marks the rest
+      undescribed; the tool briefing carries an additive <code>file_map</code> key.</li>
+  </ul>
+  <p>Tests: <code>tests/test_project_file_manifest.py</code>,
+  <code>test_project_manifest_tool_and_briefing.py</code>, <code>test_autoadvance_work_log.py</code>,
+  <code>test_briefing_relevance_slice.py</code>.</p>
+
   <h2>Public API</h2>
   <h3>Projects</h3>
   <ul>

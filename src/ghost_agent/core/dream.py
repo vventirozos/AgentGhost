@@ -1402,6 +1402,21 @@ class Dreamer:
         except Exception as pde:
             logger.debug(f"project dream pass skipped: {pde}")
 
+        # --- FILE-MANIFEST BACKFILL (2026-07-24) ------------------------
+        # Describe undescribed project deliverables while idle (bounded: one
+        # batched worker call, few files per cycle) so the per-file map
+        # fills in even when the live turns never volunteered descriptions.
+        try:
+            _mbf = await self._backfill_file_manifests(model_name)
+            if _mbf:
+                pretty_log(
+                    "Dream Manifest",
+                    f"Described {_mbf} project file(s) in the manifest",
+                    icon=Icons.MEM_SAVE,
+                )
+        except Exception as mbe:
+            logger.debug(f"manifest backfill skipped: {mbe}")
+
         try:
             results = await asyncio.to_thread(
                 self.memory.collection.get,
@@ -1965,6 +1980,110 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 except Exception as e:
                     logger.debug("rrf ledger trim failed: %s", e)
         return True
+
+    async def _backfill_file_manifests(self, model_name: str,
+                                       max_files: int = 4,
+                                       max_projects: int = 2) -> int:
+        """Fill missing per-file descriptions for project deliverables.
+
+        The live write paths (coding executor / task_update result heads /
+        the model's describe_file calls) seed the manifest, but legacy
+        projects and files created before 2026-07-24 have none — and an
+        undescribed deliverable is exactly the file a resumed session
+        re-reads wholesale. This idle pass reads each undescribed file's
+        HEAD from the host-mounted workspace and asks the worker for
+        one-line descriptions in ONE batched call. Bounded: ``max_projects``
+        most-recently-updated non-archived projects, ``max_files`` files per
+        cycle, head-only excerpts. Returns files described.
+        """
+        store = getattr(self.context, "project_store", None)
+        if store is None or not type(store).__module__.startswith("ghost_agent"):
+            return 0
+        candidates = []  # (project_id, rel, host_path)
+        try:
+            projects = [
+                p for p in store.list_projects()
+                if str(p.get("status", "")).upper() not in ("ARCHIVED",)
+            ][:max_projects]
+        except Exception:
+            return 0
+        for proj in projects:
+            pid = proj.get("id")
+            ws = (proj.get("workspace_dir") or "").strip()
+            if not pid or not ws:
+                continue
+            try:
+                manifest = store.get_file_manifest(pid)
+                for rel in store.list_deliverables(pid):
+                    if rel in manifest:
+                        continue
+                    host = Path(ws) / rel
+                    if host.is_file():
+                        candidates.append((pid, rel, host))
+                    if len(candidates) >= max_files:
+                        break
+            except Exception as e:
+                logger.debug("manifest candidate scan skipped (%s): %s", pid, e)
+            if len(candidates) >= max_files:
+                break
+        if not candidates:
+            return 0
+
+        blocks = []
+        for i, (pid, rel, host) in enumerate(candidates):
+            try:
+                head = host.read_text(encoding="utf-8", errors="replace")[:1500]
+            except Exception:
+                head = "(unreadable)"
+            blocks.append(f"FILE {i + 1}: {rel}\n---\n{head}\n---")
+        prompt = (
+            "For each file below, write ONE line (max 25 words) describing "
+            "what the file IS and DOES in its project — concrete nouns "
+            "(frameworks, endpoints, data), no filler.\n\n"
+            + "\n\n".join(blocks)
+            + '\n\nReturn ONLY JSON: {"descriptions": ["<line for FILE 1>", …]}'
+        )
+        payload = {
+            "model": model_name,
+            "messages": [
+                {"role": "system",
+                 "content": "You are a precise code cartographer. Output JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 400,
+            "response_format": {"type": "json_object"},
+        }
+        try:
+            # off_main_only: an idle backfill must DEGRADE on worker-pool
+            # failure, never dogpile the main model's foreground slot
+            # (contention convention, test_dream_offmain_contention).
+            data = await self.context.llm_client.chat_completion(
+                payload, use_worker=True, is_background=True,
+                off_main_only=True, timeout=90.0,
+                task_label="manifest-backfill",
+            )
+            content = data["choices"][0]["message"]["content"] or ""
+            import re as _re
+            parsed = json.loads(_re.search(r"\{[\s\S]*\}", content).group())
+            descs = parsed.get("descriptions") or []
+        except Exception as e:
+            logger.debug("manifest backfill LLM call failed: %s", e)
+            return 0
+
+        described = 0
+        for (pid, rel, _host), desc in zip(candidates, descs):
+            d = " ".join(str(desc or "").split())
+            if len(d) < 8:
+                continue  # empty/garbage line — leave undescribed for retry
+            try:
+                if store.describe_file(pid, rel, d, role=""):
+                    described += 1
+                    logger.info("manifest backfill: %s/%s — %s",
+                                pid[:8], rel, d[:80])
+            except Exception as e:
+                logger.debug("manifest backfill write skipped (%s): %s", rel, e)
+        return described
 
     async def _consolidate_episodes(self, model_name: str,
                                     min_episodes: int = 3,

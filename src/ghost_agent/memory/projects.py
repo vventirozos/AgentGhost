@@ -13,6 +13,7 @@ dream consolidator without cross-imports.
 
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
@@ -943,9 +944,16 @@ class ProjectStore:
                        {"kind": kind, "artifact_id": art_id})
         return art_id
 
-    def register_file_artifact(self, task_id: str, rel_path: str) -> Optional[str]:
+    def register_file_artifact(self, task_id: str, rel_path: str,
+                               description: str = "") -> Optional[str]:
         """Register a deliverable file (``kind='file'``) for ``task_id``,
         deduplicated within the project.
+
+        ``description`` (optional, 2026-07-24): a one-line "what this file
+        is/does". When given, it is upserted into the project's file
+        manifest (see ``describe_file``) so the briefing can show
+        ``path — purpose`` instead of a bare path. Best-effort — a manifest
+        failure never blocks artifact registration.
 
         This is the durable "keep me" marker the workspace cleanup sweep
         reads: any file path registered here survives a project's
@@ -970,6 +978,27 @@ class ProjectStore:
         if not task:
             return None
         project_id = task["project_id"]
+        rel = self._normalize_rel_path(project_id, rel_path)
+        if rel is None:
+            return None
+        if description:
+            try:
+                self.describe_file(project_id, rel, description)
+            except Exception as e:
+                logger.debug("manifest upsert on register skipped: %s", e)
+        for art in self.list_artifacts(project_id=project_id):
+            if (art.get("kind") == "file"
+                    and (art.get("payload") or "").strip() == rel):
+                return art.get("id")
+        return self.add_artifact(task_id, "file", rel)
+
+    @staticmethod
+    def _normalize_rel_path(project_id: str, rel_path: str) -> Optional[str]:
+        """Reduce a path to the normalized project-relative POSIX form used
+        by both the artifact keep-set and the file manifest (extracted
+        verbatim from ``register_file_artifact`` — see its docstring for why
+        this exact shape matters to the cleanup sweep). Returns ``None`` for
+        blank / traversal-rejected paths."""
         rel = (rel_path or "").strip().replace("\\", "/")
         while rel.startswith("./"):
             rel = rel[2:]
@@ -982,12 +1011,7 @@ class ProjectStore:
         parts = [p for p in rel.split("/") if p not in ("", ".")]
         if not parts or any(p == ".." for p in parts):
             return None
-        rel = "/".join(parts)
-        for art in self.list_artifacts(project_id=project_id):
-            if (art.get("kind") == "file"
-                    and (art.get("payload") or "").strip() == rel):
-                return art.get("id")
-        return self.add_artifact(task_id, "file", rel)
+        return "/".join(parts)
 
     def list_deliverables(self, project_id: str) -> List[str]:
         """Deduped, insertion-ordered file paths registered as deliverable
@@ -1169,6 +1193,115 @@ class ProjectStore:
             return ""
         return new_text
 
+    # ------------------------------------------------------------------ file manifest
+    #
+    # The manifest is the project's per-file "what is this and what does it
+    # do" map — the piece the design ledger (free prose) and deliverables
+    # (bare paths) both lacked. It exists so a resumed session, or a small
+    # model on a large project, is DIRECTED to the right files instead of
+    # re-deriving the layout by re-reading everything (observed live
+    # 2026-07-24: ~80s of thinking re-deriving a 2-file app's architecture
+    # that a previous session had already worked out).
+    # Shape: metadata.file_manifest = {rel_path: {"desc": str, "role": str,
+    # "ts": float}} — bounded, most-recently-updated entries win eviction.
+    MANIFEST_MAX_FILES = 60
+    MANIFEST_DESC_MAX = 200
+    MANIFEST_ROLE_MAX = 40
+
+    def get_file_manifest(self, project_id: str) -> Dict[str, Dict[str, Any]]:
+        """The project's file manifest, ``{rel_path: {desc, role, ts}}``.
+        Empty dict when absent/legacy."""
+        proj = self.get_project(project_id)
+        mf = ((proj or {}).get("metadata") or {}).get("file_manifest")
+        return dict(mf) if isinstance(mf, dict) else {}
+
+    def describe_file(self, project_id: str, rel_path: str,
+                      description: str, role: str = "") -> bool:
+        """Upsert one file's manifest entry (atomic across processes,
+        bounded). ``rel_path`` is normalized to the same project-relative
+        form the artifact keep-set uses, so manifest keys and deliverable
+        payloads always agree. Re-describing a path replaces its entry.
+        Returns False for a blank/rejected path or unknown project.
+
+        Also re-renders ``PROJECT_MAP.md`` in the project workspace
+        (best-effort) so the manifest is greppable in-sandbox, not only
+        briefing-injected."""
+        rel = self._normalize_rel_path(_canon_id(project_id), rel_path)
+        desc = " ".join((description or "").split())[: self.MANIFEST_DESC_MAX]
+        if rel is None or not desc:
+            return False
+
+        def _mutate(meta):
+            mf = meta.get("file_manifest")
+            mf = dict(mf) if isinstance(mf, dict) else {}
+            mf[rel] = {
+                "desc": desc,
+                "role": " ".join((role or "").split())[: self.MANIFEST_ROLE_MAX],
+                "ts": _now(),
+            }
+            if len(mf) > self.MANIFEST_MAX_FILES:
+                # Evict oldest-updated entries beyond the cap.
+                victims = sorted(
+                    mf.items(), key=lambda kv: kv[1].get("ts") or 0.0,
+                )[: len(mf) - self.MANIFEST_MAX_FILES]
+                for k, _ in victims:
+                    mf.pop(k, None)
+            meta["file_manifest"] = mf
+            return meta
+
+        updated = self._atomic_metadata_update(project_id, _mutate)
+        if updated is None:
+            return False
+        try:
+            self.render_project_map(project_id)
+        except Exception as e:
+            logger.debug("PROJECT_MAP render skipped: %s", e)
+        return True
+
+    def render_project_map(self, project_id: str) -> Optional[str]:
+        """Write ``PROJECT_MAP.md`` into the project workspace: goal head +
+        every deliverable with its manifest description (undescribed ones
+        marked, so the idle backfill and the model can see what's missing).
+        Atomic (tmp + os.replace), best-effort. Returns the path written,
+        or ``None`` when the project/workspace is unavailable."""
+        proj = self.get_project(project_id)
+        if not proj:
+            return None
+        ws = (proj.get("workspace_dir") or "").strip()
+        if not ws:
+            return None
+        mf = self.get_file_manifest(project_id)
+        deliverables = self.list_deliverables(project_id)
+        # Union: manifest may describe files not (yet) registered and
+        # vice versa — show both, deliverables first in registration order.
+        ordered = deliverables + [p for p in sorted(mf) if p not in deliverables]
+        lines = [
+            f"# PROJECT MAP — {proj.get('title') or project_id}",
+            "",
+            f"Goal: {(proj.get('goal') or '').strip()[:300]}",
+            "",
+            "## Files",
+        ]
+        for p in ordered:
+            e = mf.get(p) or {}
+            role = f" [{e['role']}]" if e.get("role") else ""
+            desc = e.get("desc") or "(no description yet — use manage_projects action='describe_file')"
+            lines.append(f"- `{p}`{role} — {desc}")
+        if not ordered:
+            lines.append("- (no deliverables registered yet)")
+        text = "\n".join(lines) + "\n"
+        try:
+            ws_path = Path(ws)
+            ws_path.mkdir(parents=True, exist_ok=True)
+            target = ws_path / "PROJECT_MAP.md"
+            tmp = target.with_suffix(".md.tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, target)
+            return str(target)
+        except Exception as e:
+            logger.debug("PROJECT_MAP write failed: %s", e)
+            return None
+
     # The config slot is the project's durable record of settings that shape
     # how it builds/runs — env vars, key flags, dependency versions, the
     # model, ports, DB URIs — kept as a small bounded key→value map in
@@ -1307,6 +1440,51 @@ class ProjectStore:
     def recent_work_logs(self, project_id: str, limit: int = 6) -> List[Dict[str, Any]]:
         """Newest-first work-log events, for the briefing and status views."""
         return self.list_events(project_id, limit=limit, event_type="work_log")
+
+    def file_history(self, project_id: str, rel_path: str,
+                     limit: int = 10) -> List[Dict[str, Any]]:
+        """Newest-first journal slice for ONE file: every work_log /
+        artifact_added / autoadvance event whose payload touched it.
+
+        Answers "what happened to X?" from the journal instead of forcing a
+        re-read of the file (2026-07-24). Both sides are normalized through
+        ``_normalize_rel_path`` because live payloads carry a mix of forms —
+        work_log ``files`` holds bare names AND absolute
+        ``/workspace/projects/<id>/…`` paths (observed on 6a471d630e81).
+        Returns compact rows: {ts, type, outcome, request, note}.
+        """
+        project_id = _canon_id(project_id)
+        target = self._normalize_rel_path(project_id, rel_path)
+        if target is None:
+            return []
+        out: List[Dict[str, Any]] = []
+        # Bounded scan over the newest events (EVENTS_MAX_LIMIT cap inside).
+        for ev in self.list_events(project_id, limit=self.EVENTS_MAX_LIMIT):
+            p = ev.get("payload") or {}
+            candidates: List[str] = []
+            files = p.get("files")
+            if isinstance(files, list):
+                candidates.extend(str(f) for f in files)
+            for key in ("path", "rel", "rel_path", "file", "payload"):
+                v = p.get(key)
+                if isinstance(v, str) and v.strip():
+                    candidates.append(v)
+            hit = any(
+                self._normalize_rel_path(project_id, c) == target
+                for c in candidates
+            )
+            if not hit:
+                continue
+            out.append({
+                "ts": ev.get("ts"),
+                "type": ev.get("type"),
+                "outcome": str(p.get("outcome") or p.get("status") or ""),
+                "request": str(p.get("request") or p.get("description") or "")[:160],
+                "note": str(p.get("note") or p.get("result_summary") or "")[:200],
+            })
+            if len(out) >= max(1, int(limit)):
+                break
+        return out
 
     #: hard ceiling for list_events — a negative LIMIT is "no limit" to
     #: SQLite, so an unclamped caller (the tool passes limit through

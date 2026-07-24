@@ -50,6 +50,8 @@ _ACTIONS = {
     "task_add", "task_update", "task_decompose", "task_next", "task_list",
     # artifacts / events / durable working memory
     "artifact_add", "artifact_list", "event_log", "ledger", "config",
+    # per-file manifest + per-file action history (2026-07-24)
+    "describe_file", "file_history",
     # workspace hygiene
     "cleanup",
     # inbox promotion (suggestion-accepted path)
@@ -1170,6 +1172,15 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
         deliverables = store.list_deliverables(project_id)[:20]
     except Exception:
         deliverables = []
+    # File manifest (2026-07-24): per-file descriptions, additive key so
+    # existing consumers of `deliverables` (bare paths) are untouched.
+    try:
+        file_map = {
+            p: {"desc": e.get("desc", ""), "role": e.get("role", "")}
+            for p, e in store.get_file_manifest(project_id).items()
+        }
+    except Exception:
+        file_map = {}
     retrospective = None
     if str(proj.get("status", "")).upper() in ("DONE", "FAILED", "ARCHIVED"):
         try:
@@ -1200,6 +1211,7 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
         ],
         "recent_work_log": work_log,
         "deliverables": deliverables,
+        "file_map": file_map,
         "retrospective": retrospective,
         "last_dream_digest": last_dream_digest,
         "research": research,
@@ -1271,6 +1283,9 @@ async def tool_manage_projects(
     ledger: str = "",
     config_key: str = "",
     config_value: str = "",
+    # per-file manifest / history
+    file_path: str = "",
+    file_role: str = "",
     # autonomous batch pacing
     count: Any = None,
     # research
@@ -1370,7 +1385,14 @@ async def tool_manage_projects(
                 task_ids = list(task_ids or []) + expanded
                 task_id = None
 
-    pretty_log("Project Tool", f"action={act}", icon=Icons.BRAIN_PLAN)
+    # Include the target file for the per-file actions — "action=describe_file"
+    # alone was undiagnosable in the live log (2026-07-24: three calls, no way
+    # to see what they targeted or carried).
+    _log_detail = f"action={act}"
+    if act in ("describe_file", "file_history"):
+        _log_detail += (f" file={file_path or payload or '?'}"
+                        + (f" desc={description[:60]!r}" if description else " (no desc)"))
+    pretty_log("Project Tool", _log_detail, icon=Icons.BRAIN_PLAN)
 
     # Resolve an implicit project_id from context.current_project_id so
     # the LLM doesn't have to pass it on every call while in project mode.
@@ -2049,9 +2071,15 @@ async def tool_manage_projects(
                     keep_paths = list(deliverables or [])
                     if artifact_kind == "file" and (payload or "").strip():
                         keep_paths.append(payload)
+                    # Manifest seed (2026-07-24): the model's own result
+                    # summary for this DONE describes what it built — reuse
+                    # it as each registered file's description head (refined
+                    # later via describe_file).
+                    _fdesc = " ".join((result or "").split())[:180]
                     for rel in keep_paths:
                         try:
-                            store.register_file_artifact(tid, rel)
+                            store.register_file_artifact(
+                                tid, rel, description=_fdesc)
                         except Exception:
                             logger.debug("deliverable registration skipped: %s",
                                          rel, exc_info=True)
@@ -2417,6 +2445,60 @@ async def tool_manage_projects(
                 })
             return _ok({"config": store.get_config(project_id)})
 
+        if act == "describe_file":
+            # Per-file manifest write (2026-07-24): record WHAT a file
+            # is/does the moment the insight is earned, so the next session
+            # (or a smaller model) is directed to the right files instead of
+            # re-deriving the layout. Without `description` → read the
+            # manifest back.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            fp = (file_path or payload or "").strip()
+            desc = (description or "").strip()
+            if not desc and not fp:
+                # Bare describe_file → read the manifest back.
+                mf = store.get_file_manifest(project_id)
+                return _ok({"file_manifest": mf, "files": len(mf)})
+            if not desc:
+                # file_path given but no text: the caller INTENDED to write —
+                # steer instead of silently returning the (possibly empty)
+                # manifest, which read as "the tool returned empty" live.
+                return _err(
+                    f"describe_file needs `description` — the one-line 'what "
+                    f"{fp} is/does' text to record. Retry with BOTH "
+                    f"file_path and description.")
+            if not fp:
+                return _err("file_path is required (project-relative, e.g. "
+                            "'server.js')")
+            if not store.describe_file(project_id, fp, desc, role=file_role):
+                return _err(f"could not describe {fp!r} (blank/traversal "
+                            "path, or project not found)")
+            return _ok({
+                "described": fp,
+                "desc": desc[:200],
+                "action_taken": "manifest_updated",
+                "note": "PROJECT_MAP.md refreshed in the workspace.",
+            })
+
+        if act == "file_history":
+            # Per-file action journal read (2026-07-24): every work_log /
+            # event row that touched this file — "what happened to X?"
+            # answered from the journal instead of re-reading the file.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            fp = (file_path or payload or "").strip()
+            if not fp:
+                return _err("file_path is required")
+            hist = store.file_history(project_id, fp, limit=max(1, int(limit)))
+            mf_entry = store.get_file_manifest(project_id).get(
+                store._normalize_rel_path(project_id, fp) or fp)
+            return _ok({
+                "file": fp,
+                "description": (mf_entry or {}).get("desc", ""),
+                "history": hist,
+                "shown": len(hist),
+            })
+
         # ---- self-advancing loop ---------------------------------------
 
         if act == "autoadvance":
@@ -2638,7 +2720,15 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "`cleanup` to remove debris from the project workspace NOW "
             "(stray screenshots, caches, helper scaffolding) — "
             "deliverables, source files and media referenced by the code "
-            "are never touched; use when the user asks to tidy up."
+            "are never touched; use when the user asks to tidy up. "
+            "`describe_file` to record WHAT a file is/does the moment you "
+            "learn it (file_path + description, optional file_role) — it "
+            "feeds the per-file map in the briefing and PROJECT_MAP.md, so "
+            "future sessions read the right file instead of everything; "
+            "call it whenever you create a file or work out an undescribed "
+            "one. `file_history` (file_path) to see every recorded action "
+            "that touched a file — check it BEFORE re-reading a large file "
+            "to answer 'what changed / what was tried'."
         ),
         "parameters": {
             "type": "object",
@@ -2659,7 +2749,7 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "task_ids": {"type": "array", "items": {"type": "string"},
                              "description": "A LIST of task ids for batch task_update only — e.g. mark several tasks DONE in one call. Use this (not task_id) whenever you have more than one id. Pass as a real JSON array, not a string."},
                 "parent_id": {"type": "string", "description": "Parent task id when creating a subtask."},
-                "description": {"type": "string", "description": "Task description (task_add/task_update)."},
+                "description": {"type": "string", "description": "Task description (task_add/task_update) — OR, for action=describe_file, the one-line 'what this file is/does' text to record (REQUIRED there, e.g. 'Node/Express static host + API on port 8100')."},
                 "status": {"type": "string",
                            "enum": ["PENDING", "READY", "IN_PROGRESS", "DONE",
                                     "FAILED", "BLOCKED", "PAUSED", "NEEDS_USER"]},
@@ -2700,6 +2790,10 @@ MANAGE_PROJECTS_TOOL_DEF = {
                                "description": "action=config: the name of ONE durable project setting to record — an env var, key flag, dependency version, the model, a port, a DB URI (e.g. 'GHOST_MODEL', 'port', 'torch'). Surfaced in the project briefing every turn so the next turn runs/builds under the right settings instead of re-discovering them from requirements.txt / env / argv. Omit both config_key and config_value to read the current config map back; pass config_key with an empty config_value to delete that setting."},
                 "config_value": {"type": "string",
                                  "description": "action=config: the value for `config_key` (e.g. 'qwen-3.6-35b-a3', '8000', '2.3.1'). Empty value deletes the key."},
+                "file_path": {"type": "string",
+                              "description": "actions describe_file/file_history: the project-relative file (e.g. 'server.js', 'src/app.py')."},
+                "file_role": {"type": "string",
+                              "description": "action=describe_file: optional short role tag, e.g. 'entrypoint', 'styles', 'data-layer'."},
             },
             "required": ["action"],
         },

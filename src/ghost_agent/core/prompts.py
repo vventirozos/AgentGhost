@@ -1,9 +1,32 @@
 # src/ghost_agent/core/prompts.py
 
+import re
+
 # How many trailing lines of the design ledger to surface in the briefing.
 # The ledger itself is bounded by ProjectStore.LEDGER_MAX_LINES; this caps
 # what we inject into the prompt each turn so it stays compact.
 _LEDGER_BRIEFING_LINES = 20
+
+
+_BRIEFING_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "be", "it", "its", "this", "that", "my", "me",
+    "you", "your", "i", "we", "do", "does", "not", "no", "can", "cant",
+    "please", "now", "then", "when", "after", "but", "have", "has", "get",
+    "give", "make", "made", "them", "they", "there", "what", "which",
+    "project", "task", "tasks", "update", "status", "resume", "start",
+    "service", "file", "files", "fix", "still", "same", "work", "works",
+})
+
+
+def _briefing_tokens(text: str) -> set:
+    """Significant lowercase tokens for the relevance slice — stopword- and
+    generic-verb-stripped so 'resume X and give me a status update' doesn't
+    match everything."""
+    return {
+        t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", (text or "").lower())
+        if len(t) > 2 and t not in _BRIEFING_STOPWORDS
+    }
 
 
 def build_project_briefing(store, project_id: str, max_events: int = 3,
@@ -13,7 +36,8 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                            max_work_logs: int = 5,
                            max_deliverables: int = 12,
                            suppress_next_task: bool = False,
-                           graph_memory=None) -> str:
+                           graph_memory=None,
+                           request_text: str = "") -> str:
     """Render a compact project-scope briefing for the system prompt.
 
     The briefing is appended to DYNAMIC SYSTEM STATE when a project is
@@ -165,6 +189,65 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         for k, v in config.items():
             lines.append(f"  {k} = {v}")
 
+    # RELEVANT TO THIS REQUEST (2026-07-24, the selective-loading slice).
+    # Fixed top-N sections scale to a point; on a large project the model
+    # needs the CORNER of the map that matches the request, not the whole
+    # map. Deterministic keyword overlap between the user's request and
+    # (a) the file manifest, (b) a deeper work_log window — zero LLM cost,
+    # bounded output. Files matched here are the "read these FIRST" set.
+    _req_tokens = _briefing_tokens(request_text) if request_text else set()
+    if _req_tokens:
+        try:
+            _mf_all = store.get_file_manifest(project_id)
+        except Exception:
+            _mf_all = {}
+        _scored_files = []
+        for _p, _e in _mf_all.items():
+            _hay = _briefing_tokens(
+                f"{_p.replace('/', ' ').replace('.', ' ').replace('-', ' ')} "
+                f"{_e.get('desc', '')} {_e.get('role', '')}")
+            _s = len(_req_tokens & _hay)
+            if _s >= 1:
+                _scored_files.append((_s, _p, _e))
+        _scored_files.sort(key=lambda t: t[0], reverse=True)
+        _rel_lines = []
+        for _s, _p, _e in _scored_files[:3]:
+            _role = f" [{_e['role']}]" if _e.get("role") else ""
+            _line = f"  - {_p}{_role} — {str(_e.get('desc', ''))[:110]}"
+            try:
+                _fh = store.file_history(project_id, _p, limit=1)
+                if _fh:
+                    _line += (f" | last: {_fh[0].get('outcome') or '?'}"
+                              f" \"{(_fh[0].get('note') or '')[:60]}\"")
+            except Exception:
+                pass
+            _rel_lines.append(_line)
+        # Older journal rows matching the request (the newest-5 are shown in
+        # RECENT WORK LOG below — only surface DEEPER matches here).
+        try:
+            _deep_logs = store.recent_work_logs(project_id, limit=30)[max_work_logs:]
+        except Exception:
+            _deep_logs = []
+        _log_hits = 0
+        for _w in _deep_logs:
+            _pl = _w.get("payload") or {}
+            _hay = _briefing_tokens(
+                f"{_pl.get('request', '')} {_pl.get('note', '')} "
+                + " ".join(str(f) for f in (_pl.get('files') or [])))
+            if len(_req_tokens & _hay) >= 2:
+                _rel_lines.append(
+                    f"  - (journal) \"{str(_pl.get('request', ''))[:70]}\""
+                    f" · {_pl.get('outcome') or ''}:"
+                    f" {str(_pl.get('note', ''))[:90]}")
+                _log_hits += 1
+                if _log_hits >= 2:
+                    break
+        if _rel_lines:
+            lines.append(
+                "RELEVANT TO THIS REQUEST (matched from the file map + "
+                "journal — read/check these FIRST before any broad listing):")
+            lines.extend(_rel_lines)
+
     try:
         plan = ProjectPlan(store, project_id)
     except Exception:
@@ -296,11 +379,32 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
     if deliverables:
         shown_files = deliverables[:max_deliverables]
         more_files = len(deliverables) - len(shown_files)
+        # File manifest (2026-07-24): annotate each path with its recorded
+        # "what it is/does" so the model is DIRECTED to the right file
+        # instead of re-reading everything. Described files get one line
+        # each; undescribed ones stay comma-packed (compact + visibly
+        # unmapped, nudging a describe_file).
+        try:
+            _mf = store.get_file_manifest(project_id)
+        except Exception:
+            _mf = {}
         lines.append(
             f"DELIVERABLES ({len(deliverables)} file(s) the project built — "
             "per-task detail via manage_projects action=artifact_list):")
-        lines.append("  " + ", ".join(shown_files)
-                     + (f"  (+{more_files} more)" if more_files > 0 else ""))
+        _undescribed = []
+        for p in shown_files:
+            e = _mf.get(p) or {}
+            if e.get("desc"):
+                role = f" [{e['role']}]" if e.get("role") else ""
+                lines.append(f"  - {p}{role} — {str(e['desc'])[:110]}")
+            else:
+                _undescribed.append(p)
+        if _undescribed:
+            lines.append("  " + ", ".join(_undescribed)
+                         + " (undescribed — record purpose via "
+                           "manage_projects action=describe_file)")
+        if more_files > 0:
+            lines.append(f"  (+{more_files} more)")
 
     # RETROSPECTIVE — only for projects in a terminal state, where the
     # structured what-worked/what-failed record (assembled from

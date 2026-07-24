@@ -423,6 +423,29 @@ def _metacog_set_task(context, task_id) -> None:
         pass
 
 
+def _work_log_step(store, project_id, nxt, *, outcome: str,
+                   files=None, tools=None, note: str = "") -> None:
+    """Mirror an autoadvance step into the project's work_log journal.
+
+    Until 2026-07-24 only INTERACTIVE turns wrote work_log (the finalize
+    chain), so a project mostly built by autoadvance had a near-empty
+    journal (live: 2 work_log rows vs 8 autoadvance_step events on
+    6a471d630e81) and `file_history` / the RECENT WORK LOG briefing
+    couldn't see what the idle loop did. Best-effort — never breaks a step.
+    """
+    try:
+        store.add_work_log(
+            project_id,
+            request=f"[autoadvance] {(nxt.description or '').strip()}",
+            files=list(files or []),
+            tools=dict(tools or {}),
+            outcome=outcome,
+            note=note or "",
+        )
+    except Exception:
+        logger.debug("autoadvance work_log skipped", exc_info=True)
+
+
 def _finalize_coding(context, store, plan, project_id, nxt, cres,
                      tick_started_at) -> AdvanceResult:
     """Persist the outcome of a real coding build (CodingResult) for one leaf.
@@ -437,9 +460,14 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
     from .project_safety import record_runtime
 
     if cres.ok:
+        # Per-file manifest seed (2026-07-24): the build's summary (or the
+        # task description) is the best available "what this file does" at
+        # creation time — with file-per-task granularity it describes the
+        # file. The model/dream can refine it later via describe_file.
+        _fdesc = " ".join(str(cres.summary or nxt.description or "").split())[:180]
         for rel in (cres.files or []):
             try:
-                store.register_file_artifact(nxt.id, rel)
+                store.register_file_artifact(nxt.id, rel, description=_fdesc)
             except Exception:
                 logger.debug("artifact register skipped: %s", rel, exc_info=True)
         if cres.ledger_note:
@@ -462,6 +490,10 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
         store.log_event(project_id, nxt.id, "autoadvance_step",
                         {"tool": "code_executor", "classification": "coding",
                          "files": list(cres.files or [])[:8]})
+        _work_log_step(store, project_id, nxt, outcome="completed",
+                       files=list(cres.files or []),
+                       tools={"code_executor": 1},
+                       note=str(cres.summary or "")[:280])
         return AdvanceResult(True, nxt.id, "coding",
                              f"built: {cres.summary}", None)
 
@@ -481,6 +513,10 @@ def _finalize_coding(context, store, plan, project_id, nxt, cres,
         logger.debug("actual_cost stamp skipped", exc_info=True)
     store.log_event(project_id, nxt.id, "autoadvance_failed",
                     {"tool": "code_executor", "reason": (cres.summary or "")[:200]})
+    _work_log_step(store, project_id, nxt, outcome="had_failures",
+                   files=list(cres.files or []),
+                   tools={"code_executor": 1},
+                   note=f"build FAILED: {(cres.summary or '')[:240]}")
     return AdvanceResult(True, nxt.id, "coding",
                          f"code build failed: {cres.summary}", None)
 
@@ -1008,6 +1044,10 @@ async def advance_once(
     if research_path:
         step_payload["research_path"] = research_path
     store.log_event(project_id, nxt.id, "autoadvance_step", step_payload)
+    _work_log_step(store, project_id, nxt, outcome="completed",
+                   files=([research_path] if research_path else []),
+                   tools=({tool_name: 1} if tool_name else {}),
+                   note=str(result_summary or "")[:280])
     summary = (f"advanced via {tool_name}"
                + (f"; saved research to {research_path}" if research_path else ""))
     return AdvanceResult(True, nxt.id, classification, summary, artifact_id)
