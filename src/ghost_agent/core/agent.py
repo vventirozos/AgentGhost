@@ -5897,6 +5897,11 @@ class GhostAgent:
                 if reason and outcome == _Outcome.FAILED.value \
                         and not (cached.failure_reason or ""):
                     cached.failure_reason = reason
+            # Outcome-gated lesson feedback: drain any surfaced-trigger set
+            # stashed for this turn at finalize (async-critic mode), now that
+            # the verdict has landed. No-op when the turn recorded inline.
+            self._flush_stashed_lesson_outcome(
+                trajectory_id, outcome == _Outcome.PASSED.value)
             # spawn_bg: strong ref + warning-level failure logging + shutdown
             # drain — a GC'd or silently-failed backfill loses the corpus
             # outcome with no trace (same rule as the user-correction path).
@@ -5916,6 +5921,80 @@ class GhostAgent:
                 "late-verdict outcome backfill skipped: %s: %s",
                 type(e).__name__, e,
             )
+
+    # Bounded map trajectory_id -> surfaced lesson triggers, for turns whose
+    # verdict is still pending at finalize (async-critic mode is production).
+    # The late verdict (_backfill_trajectory_outcome) drains it. Bounded so a
+    # stream of never-verdicted turns can't grow it without limit.
+    _SURFACED_TRIG_STASH_MAX = 256
+
+    async def _record_lesson_outcomes(self, *, surfaced_triggers,
+                                      execution_failure_count,
+                                      verifier_backfill, trajectory_id):
+        """Attribute this turn's outcome to the lessons it surfaced — the
+        FAILURE ARM the success-only credit path (`credit_recent_retrievals`)
+        cannot produce.
+
+        Decisive now (structural execution failure, or an inline verifier
+        verdict) -> record immediately. Undecided (clean turn, async verdict
+        still pending) -> stash by trajectory_id for `_backfill_trajectory_
+        outcome` to drain. Grounded-only: a turn that never earns a verdict
+        contributes nothing (its stash entry is evicted uncounted), so the
+        arms never fill from mere absence-of-failure. Never raises —
+        post-turn feedback must not break finalize.
+        """
+        try:
+            sm = getattr(self.context, "skill_memory", None)
+            triggers = [t for t in (surfaced_triggers or []) if t]
+            if sm is None or not triggers:
+                return
+            rec = getattr(sm, "record_surfaced_outcomes", None)
+            if not callable(rec):
+                return
+            verifier_failed = bool(
+                verifier_backfill and verifier_backfill[0] == "failed")
+            verifier_passed = bool(
+                verifier_backfill and verifier_backfill[0] == "passed")
+            if execution_failure_count > 0 or verifier_failed:
+                await asyncio.to_thread(rec, triggers, False)
+                return
+            if verifier_passed:
+                await asyncio.to_thread(rec, triggers, True)
+                return
+            # Undecided: clean turn, no inline verdict. Stash for the late
+            # verdict; if none lands (e.g. a no-evidence chat turn) the entry
+            # is evicted uncounted rather than booked as a success.
+            if not trajectory_id:
+                return
+            stash = getattr(self.context, "_surfaced_triggers_by_traj", None)
+            if stash is None:
+                from collections import OrderedDict
+                stash = OrderedDict()
+                self.context._surfaced_triggers_by_traj = stash
+            stash[trajectory_id] = triggers
+            stash.move_to_end(trajectory_id)
+            while len(stash) > self._SURFACED_TRIG_STASH_MAX:
+                stash.popitem(last=False)
+        except Exception as e:
+            logger.debug("record_lesson_outcomes skipped: %s", e)
+
+    def _flush_stashed_lesson_outcome(self, trajectory_id, success):
+        """Drain a stashed surfaced-trigger set when its late verdict lands.
+        No-op when the turn recorded its outcome inline (nothing stashed)."""
+        try:
+            stash = getattr(self.context, "_surfaced_triggers_by_traj", None)
+            if not stash or trajectory_id not in stash:
+                return
+            triggers = stash.pop(trajectory_id)
+            sm = getattr(self.context, "skill_memory", None)
+            rec = getattr(sm, "record_surfaced_outcomes", None) if sm else None
+            if callable(rec) and triggers:
+                _glog.spawn_bg(
+                    asyncio.to_thread(rec, triggers, bool(success)),
+                    name="lesson-outcome-late-flush",
+                )
+        except Exception as e:
+            logger.debug("flush stashed lesson outcome skipped: %s", e)
 
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
                              last_tool=None, force_correction=False):
@@ -9208,6 +9287,23 @@ class GhostAgent:
                     )
             except Exception:
                 pass
+
+        # Outcome-gated lesson feedback (2026-07-24): attribute THIS turn's
+        # verified outcome — including the FAILURE arm the credit block above
+        # lacks — to the lessons it surfaced. Runs on BOTH outcome classes
+        # (outside the execution_failure_count==0 gate), like the calibration
+        # spine below, so present-on-failure is actually recorded.
+        try:
+            await self._record_lesson_outcomes(
+                surfaced_triggers=(
+                    list(getattr(sm, "last_playbook_triggers", []) or [])
+                    if sm is not None else []),
+                execution_failure_count=execution_failure_count,
+                verifier_backfill=verifier_backfill,
+                trajectory_id=current_trajectory_id,
+            )
+        except Exception:
+            pass
 
         # Calibration spine (roadmap phase 2.5): pair THIS turn's
         # last composite-confidence reading with the realized
@@ -14137,6 +14233,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         )
                 except Exception:
                     pass
+
+            # Outcome-gated lesson feedback (streamed path): the verifier runs
+            # LATE here (trajectory recorded with verifier=None), so only a
+            # structural execution failure is decisive now; a clean turn is
+            # stashed by trajectory_id and drained when the async verdict lands
+            # via _backfill_trajectory_outcome.
+            try:
+                await self._record_lesson_outcomes(
+                    surfaced_triggers=(
+                        list(getattr(sm, "last_playbook_triggers", []) or [])
+                        if sm is not None else []),
+                    execution_failure_count=execution_failure_count,
+                    verifier_backfill=None,
+                    trajectory_id=current_trajectory_id,
+                )
+            except Exception:
+                pass
 
         # Keep THIS turn registered — visible in /api/turns and
         # cancellable — for the WHOLE streamed drain, then

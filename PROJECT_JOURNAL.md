@@ -296,6 +296,7 @@ graded factual Q&A classified "conversational" → temp 1.0 + presence_penalty 1
 | Selfhood wake-up prefix OFF; workspace prefix gated on active project | `_SELFHOOD_PREFIX_ENABLED = False` | **OFF** |
 | Harness-dimension failure attribution (lessons + work_logs) | `GHOST_FAILURE_DIM` env kill; `learn_lesson` chokepoint + finalize work_log (2026-07-19) | live |
 | Failure-cluster distillation + project dream pass (REM pre-gate) | `GHOST_FAILURE_DISTILL` / `GHOST_FAILURE_ADJUDICATE` / `GHOST_FAILURE_DISTILL_MAX` env kills; `dream()` pre-gate (2026-07-19) | live |
+| Outcome-gated lesson utility (failure arm → `compute_lesson_utility` → prune) | `GHOST_LESSON_OUTCOME_UTILITY` env kill (`=0` → record-only); `_record_lesson_outcomes` both finalize paths + late-verdict drain (2026-07-24) | live (recording always on; prune effect cold-start-gated) |
 
 **Re-enable criteria (why each OFF toggle is parked, not deleted):**
 - `_MCTS_TURNSTART_ENABLED` — only with an **execution-grounded** value fn (not self-prediction).
@@ -309,7 +310,10 @@ graded factual Q&A classified "conversational" → temp 1.0 + presence_penalty 1
 `GHOST_FAILURE_DIM` if the dimension distribution in work_logs reads as noise in spot audits
 (misattribution > ~30% — the tag is a prior, not a verdict; the debug log carries the matched
 signal for auditing). Kill `GHOST_FAILURE_DISTILL` if distilled lessons crowd playbook slots or
-their `helpful_retrievals` stay at zero while occupying retrieval budget.
+their `helpful_retrievals` stay at zero while occupying retrieval budget. Kill
+`GHOST_LESSON_OUTCOME_UTILITY` (→ record-only) if the prune drops lessons whose `failed_retrievals`
+came from failures they demonstrably did not cause (co-occurrence ≠ causation — spot-check pruned
+rows against their source turns; the `_OUTCOME_MIN_OBS=4` gate + verified-pin bound the risk).
 
 **Do NOT re-enable an OFF layer** without meeting its criterion or a fresh paired-ablation win.
 The default-OFF state is the measured-neutral configuration, not an accident.
@@ -1104,6 +1108,65 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-24 — Outcome-gated learning loop: the FAILURE arm the retrieval-feedback loop never had
+
+**Feature (research → build).** Surveyed the metacognition / self-improvement frontier against the current cognitive
+stack; the one high-impact gap that honoured the grounded-or-off doctrine was **closing the memory learning loop with
+real outcome labels**. The retrieval-feedback loop was **credit-only**: `record_helpful_retrieval` /
+`credit_recent_retrievals` bump `helpful_retrievals` on success (relevance-gated), but **nothing ever debited a lesson
+for being surfaced on a turn that FAILED**. So `hit_rate = helpful/retrievals` conflated "present on an uncredited
+success" with "present on a failure", and a harmful lesson could ride along on failing turns invisibly — the
+*experience-following* failure mode (retrieved memory reproduced whether appropriate or not; good and bad lessons
+transfer with equal fidelity). The existing scrub (`retract_lessons_from_trajectory`) only removes lessons *authored in*
+a failed turn, never lessons *retrieved into* one. And `judge_hydration_usefulness` credits via an **LLM judge** of
+surface usefulness — the curation mode the 2026 literature shows silently fails.
+
+**Mechanism.** Two new lesson arms `succeeded_retrievals` / `failed_retrievals` (schema + `_normalize_lesson`
+back-fill, legacy-safe). New bulk one-write `SkillMemory.record_surfaced_outcomes(triggers, success)` (mirrors
+`record_retrievals_bulk`). `compute_lesson_utility` folds in `outcome_mult = 0.4 + 0.75·out_rate` where
+`out_rate = (succeeded+1)/(succeeded+failed+2)` — ×0.40 for present-only-on-failure (sinks below the prune cutoff),
+×1.15 for present-only-on-pass. **The loop closes through the existing bounded prune** (`prune_low_utility`: ≤25%/pass,
+verified pinned, ≥5 retrievals) — no new destructive path. Cold-start-neutral until `_OUTCOME_MIN_OBS=4` decisive
+outcomes accrue (competence-Beta philosophy).
+
+**Grounding — real outcome, not self-report.** Keyed off `resolve_turn_outcome` (passed/failed) — a structural
+execution failure or a real verifier verdict — never the LLM hydration judge, never absence-of-failure. Only decisive
+outcomes are recorded. Wiring (`Agent._record_lesson_outcomes`) runs at **both finalize paths** on both outcome classes
+(outside the success-only credit gate). Decisive-at-finalize → record now; undecided (clean turn, async-critic verdict
+pending — the prod case) → stash surfaced triggers by `trajectory_id` in a bounded map that
+`_backfill_trajectory_outcome` drains via `_flush_stashed_lesson_outcome` when the late verdict lands. This gives the
+late-verdict path a **second consumer** and captures the REFUTED signal a finalize-only hook would miss.
+
+**Defaults / safety.** Recording always on (pure bookkeeping, zero behaviour change). The ranking/prune effect is
+governed by **`GHOST_LESSON_OUTCOME_UTILITY`** (default on; `=0` → record-only, so the operator can watch the arms fill
+before letting them prune) — see §3. Deliberately **on the retrieval/utility axis only**, NOT the smart-memory
+write-admission threshold (`adaptive_threshold.py` stays inert — changing what gets *stored* is a separate
+operator-visible retention decision, per its own docstring). Read-only skill proxies (`ReadOnlySkillMemory` + dream's
+sim proxy) block the new mutator so idle sims never touch the prod playbook.
+
+**Relation to #4/#27b.** This is the **live observational-utility instrument** for "does a learned lesson improve
+outcomes?" — per-lesson success/failure co-occurrence on real traffic. It is NOT a revival of the CLOSED
+synthetic-ablation earn-keep harness (§6 2026-07-23 later 3, do-not-resurface); it is the *different instrument*
+(observational mediation on live trajectories) that closure explicitly left open. It does not by itself settle #4, but
+it is the first grounded per-lesson outcome signal the corpus has ever carried.
+
+**Verification.** New suite `tests/test_lesson_outcome_utility.py` (13 tests: schema, recorder, failure-arm demotion,
+cold-start neutrality, kill switch, end-to-end prune of a present-on-failure lesson, verified-pin preserved). Touched-
+surface regression: **877 passed / 1 skip** (skill/lesson/playbook/readonly/dream/prune) + **503 passed / 1 skip**
+(finalize/verifier/late-verdict/calibration/trajectory). Docs: `docs/memory/skills.html` (schema + utility formula +
+new *Outcome-gated learning loop* section + method table), `docs/memory/adaptive_threshold.html` (axis-distinction
+note). Memory `[[outcome-gated-learning-loop]]`; relates to `[[built-but-unwired-loops]]`.
+
+**LIVE-VALIDATED (2026-07-24, prod :8000, async-critic + `GHOST_LESSON_OUTCOME_UTILITY` unset→ON).** 4 driven turns:
+(1) execution-failure turn → 5 surfaced code/error lessons `failed_retrievals 0→1` (synchronous decisive path);
+(2–4) clean verified-CONFIRMED tasks → `succeeded_retrievals++`. The **streamed** path (call site hardcodes
+`verifier_backfill=None`) recorded success — provable ONLY via `_flush_stashed_lesson_outcome`, so the stash→drain is
+exercised and correct; every increment is exactly **+1 (no double-count)**. Flagship: *"When executing code, always
+anticipate and handle errors"* reached `succ=3 fail=1` (present on 3 passes + 1 failure, each attributed to the right
+arm; just crossed `_OUTCOME_MIN_OBS=4` so its `outcome_mult` is now live). Zero errors/tracebacks in
+`_record_lesson_outcomes`/`record_surfaced_outcomes`/`_flush_stashed_lesson_outcome` across the session; RSS flat
+(436→435 MB); playbook JSON intact (50 lessons, 12 now carry ticks). Prune effect not yet observed (runs idle/dream).
 
 ### 2026-07-23 (later 4) — #5 step 4a: client-SSE streamer extracted from handle_chat (LIVE-VALIDATED)
 

@@ -61,6 +61,8 @@
   "verification_attempted": bool,
   "retrievals":          int,
   "helpful_retrievals":  int,
+  "succeeded_retrievals": int,
+  "failed_retrievals":   int,
   "last_retrieved_at":   "ISO",
   "source":              str,
   "source_trajectory_id": str,
@@ -89,7 +91,9 @@
   </ol>
 
   <h3>Utility formula</h3>
-  <pre><code>utility = confidence·0.5 + hit_rate·0.8 + (0.3 if verified) + log(freq)·0.1 + stale_penalty</code></pre>
+  <pre><code>utility = confidence·0.5 + hit_rate·0.8 + (0.3 if verified) + log(freq)·0.1 + stale_penalty
+        × outcome_mult   # 2026-07-24, once ≥ _OUTCOME_MIN_OBS decisive outcomes accrue</code></pre>
+  <p><strong>outcome_mult (2026-07-24):</strong> <code>hit_rate</code> above is relevance-gated <em>success</em> credit only — a lesson can lose rank by not being credited but never by being <em>present when a turn failed</em>. The outcome arms close that gap: <code>out_rate = (succeeded_retrievals + 1) / (succeeded + failed + 2)</code> (Beta(1,1)-smoothed present-on-success fraction), and <code>outcome_mult = 0.4 + 0.75·out_rate</code> — <code>×0.40</code> for a lesson present only on failures (sinks it below the prune cutoff), <code>×1.15</code> for one present only on passes. Cold-start-safe: neutral until <code>_OUTCOME_MIN_OBS = 4</code> decisive outcomes accrue, so a fresh lesson is never punished for one unlucky co-occurring failure. Kill switch <code>GHOST_LESSON_OUTCOME_UTILITY=0</code> makes the arms record-only (bookkeeping without the ranking effect). See <em>Outcome-gated learning loop</em> below.</p>
 
   <h2>Retrieval (three-tier, picked by <code>query</code> + <code>memory_system</code> presence)</h2>
   <p><code>get_playbook_context(query, memory_system, distance_threshold=0.45, limit, record_retrievals)</code> dispatches to one of three paths:</p>
@@ -121,7 +125,8 @@
       <tr><td><code>build_lesson(task, trigger, anti_pattern, correct_pattern, domains, confidence, source_challenge_hash, verified, source) → dict</code></td><td>Factory.</td></tr>
       <tr><td><code>learn_lesson(task, mistake, solution, memory_system=None, **structured)</code></td><td>Write lesson with dedup, merge, trim.</td></tr>
       <tr><td><code>list_lessons(scope="all", source="", limit=20) → list</code></td><td>Time-window + source filter; local-time boundaries; most-recent first.</td></tr>
-      <tr><td><code>record_retrieval(trigger)</code> / <code>record_helpful_retrieval(trigger)</code></td><td>Hit-rate accounting. <code>record_retrieval</code> emits a debug log with <code>source_challenge_hash</code> for observability.</td></tr>
+      <tr><td><code>record_retrieval(trigger)</code> / <code>record_helpful_retrieval(trigger)</code></td><td>Hit-rate accounting (success-only). <code>record_retrieval</code> emits a debug log with <code>source_challenge_hash</code> for observability.</td></tr>
+      <tr><td><code>record_surfaced_outcomes(triggers, success)</code></td><td>Outcome-gated feedback (2026-07-24) — the FAILURE arm. Bulk one-write: attributes a turn's <em>verified</em> outcome to every surfaced lesson, incrementing <code>succeeded_retrievals</code> or <code>failed_retrievals</code>. Call only with a decisive outcome. See below.</td></tr>
       <tr><td><code>credit_recent_retrievals(window_seconds=300, *, query="", top_triggers=None, min_token_overlap=2)</code></td><td>Discriminative bulk credit (idempotent per window). Credits a recently-retrieved lesson only when it is relevant to the succeeding <code>query</code> (≥ <code>min_token_overlap</code> significant-token overlap) or its trigger is in <code>top_triggers</code>. With no <code>query</code>/<code>top_triggers</code> it falls back to the legacy "credit everything" behaviour.</td></tr>
       <tr><td><code>prune_low_utility(min_retrievals=5, max_drop_fraction=0.25)</code></td><td>Drop bottom-quartile.</td></tr>
       <tr><td><code>get_recent_failures(limit) → str</code></td><td>Format for LLM injection.</td></tr>
@@ -142,6 +147,13 @@
   that actually entered the prompt this turn; turns are globally serialized) and
   <code>_record_turn_trajectory</code> stamps them into the trajectory's
   <code>extra.hydrated_lessons</code> — the attribution set a future regression points at.</p>
+
+  <h2>Outcome-gated learning loop (2026-07-24)</h2>
+  <p><strong>The gap it closes.</strong> The retrieval-feedback loop was <em>credit-only</em>: <code>record_helpful_retrieval</code> and <code>credit_recent_retrievals</code> increment <code>helpful_retrievals</code> when a turn succeeds and the lesson is relevant, but nothing ever debited a lesson for being <em>surfaced on a turn that FAILED</em>. So <code>hit_rate = helpful/(retrievals)</code> conflated two very different populations — "present on a success it wasn't credited for" and "present on a failure" — and a genuinely harmful lesson could ride along on failing turns invisibly, its retrievals climbing while nothing marked it as a liability. This is the <em>experience-following</em> failure mode (a retrieved memory is reproduced whether or not it is appropriate; good and bad lessons transfer with equal fidelity). The prior scrub path (<code>retract_lessons_from_trajectory</code>) only removes lessons <em>authored in</em> a failed turn — never lessons <em>retrieved into</em> one.</p>
+  <p><strong>The mechanism.</strong> Two new arms — <code>succeeded_retrievals</code> / <code>failed_retrievals</code> — record, per lesson, the <em>verified</em> outcome of the turns it was surfaced into (fed by <code>record_surfaced_outcomes</code>). <code>compute_lesson_utility</code> folds the ratio in via <code>outcome_mult</code> (above), so a lesson persistently present when turns fail loses utility and becomes a <code>prune_low_utility</code> candidate — the loop closes through the <em>existing</em>, bounded prune machinery (≤ 25%/pass, verified pinned, needs ≥ 5 retrievals). No new destructive path.</p>
+  <p><strong>Grounding — it uses the real outcome, not an LLM judge.</strong> The separate <code>judge_hydration_usefulness</code> path (in <a href="../core/bus.html">MemoryBus</a>) credits via a worker LLM's opinion of whether a snippet <em>looked</em> used in the reply; that is a surface signal and LLM-judge-based curation silently fails to retire bad items. The outcome arms instead key off <code>resolve_turn_outcome</code> (passed/failed) — a structural execution failure or a real verifier verdict. Only <em>decisive</em> outcomes are recorded; a turn that never earns a verdict contributes nothing, so the arms never fill from mere absence-of-failure.</p>
+  <p><strong>Wiring (both finalize paths + the async-critic late path).</strong> <code>Agent._record_lesson_outcomes</code> runs at finalize on <em>both</em> outcome classes (outside the success-only credit gate). When the outcome is decisive at finalize (a structural execution failure, or an inline verifier verdict) it records immediately. When it is undecided — a clean turn whose async-critic verdict has not yet landed (the production case) — it stashes the surfaced triggers by <code>trajectory_id</code> in a bounded map; <code>_backfill_trajectory_outcome</code> drains that stash via <code>_flush_stashed_lesson_outcome</code> when the late verdict arrives. This gives the late-verdict path a second consumer and captures the verifier's REFUTED signal (the strongest "this answer was wrong") that a finalize-only hook would miss.</p>
+  <p><strong>Defaults &amp; safety.</strong> Recording is always on (pure bookkeeping, zero behaviour change). The ranking/prune <em>effect</em> is cold-start-neutral until <code>_OUTCOME_MIN_OBS = 4</code> decisive outcomes accrue and is governed by <code>GHOST_LESSON_OUTCOME_UTILITY</code> (default on; set <code>0</code> for record-only, so the operator can watch the arms fill before letting them prune). Verified lessons remain pinned regardless — verification outranks co-occurrence statistics. The read-only skill proxies (<a href="readonly.html">ReadOnlySkillMemory</a>, dream's sim proxy) block <code>record_surfaced_outcomes</code> so idle simulations never mutate the production playbook. Tests: <code>tests/test_lesson_outcome_utility.py</code>.</p>
 </main>
 </body>
 </html>

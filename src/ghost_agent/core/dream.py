@@ -3810,6 +3810,9 @@ Return ONLY a JSON object with:
             def credit_recent_retrievals(self, *args, **kwargs):
                 return 0
 
+            def record_surfaced_outcomes(self, *args, **kwargs):
+                return 0
+
             def retract_lessons_from_trajectory(self, *args, **kwargs):
                 return 0
 

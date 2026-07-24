@@ -207,6 +207,10 @@ def _normalize_lesson(lesson: dict) -> dict:
     out.setdefault("verification_attempted", False)
     out["retrievals"] = int(out.get("retrievals") or 0)
     out["helpful_retrievals"] = int(out.get("helpful_retrievals") or 0)
+    # Outcome-gated arms (see build_lesson). Legacy lessons predate them and
+    # normalize to 0 — cold-start neutral, so they aren't punished on sight.
+    out["succeeded_retrievals"] = int(out.get("succeeded_retrievals") or 0)
+    out["failed_retrievals"] = int(out.get("failed_retrievals") or 0)
     out.setdefault("last_retrieved_at", "")
     out.setdefault("source", "")
     # Harness dimension the recorded failure was attributed to (see
@@ -288,6 +292,16 @@ def build_lesson(
         "verification_attempted": False,
         "retrievals": 0,
         "helpful_retrievals": 0,
+        # Outcome-gated arms (2026-07-24): how many times this lesson was
+        # surfaced into a turn whose VERIFIED outcome was passed / failed.
+        # Distinct from helpful_retrievals, which is relevance-gated SUCCESS
+        # credit only and can never fall for being present on a failure. The
+        # failed arm is the signal the credit path structurally lacked — a
+        # lesson repeatedly present when turns fail loses utility and becomes
+        # prune-eligible, defusing experience-following (bad lessons riding
+        # along on failures unseen). Fed by record_surfaced_outcomes.
+        "succeeded_retrievals": 0,
+        "failed_retrievals": 0,
         "last_retrieved_at": "",
         "source": source or "",
         "source_trajectory_id": source_trajectory_id or "",
@@ -359,11 +373,36 @@ def _bm25_like_score(query: str, trigger: str) -> float:
     return len(q_tokens & t_tokens) / len(q_tokens)
 
 
+# --- Outcome-gated utility (2026-07-24) -----------------------------------
+# The FAILURE ARM of compute_lesson_utility. hit_rate below is relevance-gated
+# SUCCESS credit (helpful_retrievals) — a lesson can only lose rank by NOT
+# being credited, never by being present when a turn FAILED. The outcome arms
+# (succeeded/failed_retrievals, fed by record_surfaced_outcomes from the
+# verified turn outcome) close that gap so a lesson that keeps riding along on
+# failures sinks and becomes prune-eligible.
+#
+# _OUTCOME_MIN_OBS: decisive (passed/failed) outcomes a lesson must accumulate
+# before its outcome rate is allowed to move its utility. Below this it stays
+# neutral, so a lesson is never punished for one unlucky co-occurring failure
+# (same cold-start philosophy as the competence Beta prior).
+_OUTCOME_MIN_OBS = 4
+# Master switch. RECORDING the arms is always on (pure bookkeeping); this only
+# gates whether they INFLUENCE ranking/prune — i.e. the operator-visible
+# retention effect. Default on (the signal is grounded in real outcomes and
+# cold-start-safe); GHOST_LESSON_OUTCOME_UTILITY=0 makes the arms record-only
+# so the operator can watch the data accumulate before letting it prune.
+_OUTCOME_UTILITY_ENABLED = (
+    os.environ.get("GHOST_LESSON_OUTCOME_UTILITY", "1").strip().lower()
+    not in ("0", "false", "no", "off")
+)
+
+
 def compute_lesson_utility(lesson: dict) -> float:
     """Utility score used for ranking + prune decisions.
 
     Combines:
-      - helpful_retrievals / retrievals  (empirical utility)
+      - helpful_retrievals / retrievals  (empirical utility, success-only)
+      - succeeded/failed_retrievals       (verified-outcome arm, incl. failure)
       - confidence                        (initial trust)
       - verified                          (verification-grounded boost)
       - frequency                         (diminishing log)
@@ -387,6 +426,19 @@ def compute_lesson_utility(lesson: dict) -> float:
     # helped, demote it harder than a never-retrieved one.
     if r >= 5 and hit_rate < 0.35:
         score *= 0.5
+    # Outcome-gated adjustment: fold in the verified-outcome arm once enough
+    # decisive outcomes have accrued. out_rate is the Beta(1,1)-smoothed
+    # present-on-success fraction; the multiplier is monotone and bounded:
+    #   out_rate 0.0 -> x0.40  (present only on failures -> sink & prune)
+    #   out_rate 0.5 -> x0.775
+    #   out_rate 1.0 -> x1.15  (present only on passes -> mild lift)
+    if _OUTCOME_UTILITY_ENABLED:
+        s_out = int(lesson.get("succeeded_retrievals") or 0)
+        f_out = int(lesson.get("failed_retrievals") or 0)
+        n_out = s_out + f_out
+        if n_out >= _OUTCOME_MIN_OBS:
+            out_rate = (s_out + 1) / (n_out + 2)
+            score *= (0.4 + 0.75 * out_rate)
     return round(score, 4)
 
 
@@ -1373,6 +1425,57 @@ class SkillMemory:
                     self._save_playbook_unlocked(playbook)
         except Exception as e:
             logger.debug(f"record_retrievals_bulk failed (non-critical): {e}")
+        return updated
+
+    def record_surfaced_outcomes(self, triggers, success: bool) -> int:
+        """Attribute a turn's VERIFIED outcome to the lessons surfaced into
+        it, in ONE playbook write. This is the FAILURE ARM the credit path
+        lacked.
+
+        ``record_helpful_retrieval`` / ``credit_recent_retrievals`` only ever
+        INCREMENT helpful_retrievals on success, so a lesson surfaced on a
+        FAILING turn was indistinguishable from one surfaced on a success
+        where it merely wasn't the credited item — both just carried
+        un-credited ``retrievals``. That let a harmful lesson ride along on
+        failing turns invisibly (experience-following). Here every surfaced
+        lesson gets a decisive success/failure tick; ``compute_lesson_utility``
+        folds the ratio in, so a lesson persistently present when turns FAIL
+        loses utility and becomes a ``prune_low_utility`` candidate.
+
+        MUST be called only with a DECISIVE outcome (a real passed/failed
+        verdict or a structural execution failure), never on UNKNOWN, so the
+        arms stay grounded in outcomes and never fill from absence-of-failure.
+        Mirrors ``record_retrievals_bulk``: one lock, one save. Duplicate /
+        empty triggers are ignored. Returns lessons updated.
+        """
+        keys = {t.strip().lower() for t in (triggers or []) if t and str(t).strip()}
+        if not keys:
+            return 0
+        field = "succeeded_retrievals" if success else "failed_retrievals"
+        updated = 0
+        try:
+            with self._get_lock():
+                playbook = self._load_playbook()
+                changed = False
+                for idx, raw in enumerate(playbook):
+                    t = (raw.get("trigger") or raw.get("task") or "").strip().lower()
+                    if t in keys:
+                        lesson = _normalize_lesson(raw)
+                        lesson[field] = int(lesson.get(field) or 0) + 1
+                        playbook[idx] = lesson
+                        changed = True
+                        updated += 1
+                if changed:
+                    self._save_playbook_unlocked(playbook)
+        except Exception as e:
+            logger.debug(f"record_surfaced_outcomes failed (non-critical): {e}")
+        if updated and not success:
+            # File-log only (operator monitors WARNING+ pretty stream; a
+            # present-on-failure tick is diagnostic, not actionable-per-turn).
+            logger.debug(
+                "lesson_outcome: %d surfaced lesson(s) marked present-on-FAILURE",
+                updated,
+            )
         return updated
 
     def _playbook_items_and_branch(
