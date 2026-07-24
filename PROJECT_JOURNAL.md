@@ -1109,6 +1109,34 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-24 (later) — Logging overhaul: the durable log now reconstructs a turn (3-agent audit → keystone + noise + content)
+
+**Mandate.** Operator: logs must be (1) extremely readable for human monitoring and (2) extremely informative — "I often give Claude the log to figure out what the agent did." 3-agent read-only audit (turn/tools, cognitive/memory, infra/errors) + a cross-cutting real-log profile.
+
+**Root cause (all 3 agents converged).** The two sinks were disjoint: `pretty_log` → stdout ONLY (pretty stream `~/Data/AI/Logs/ghost-agent.log`, truncated, wiped each boot; the DEBUG_MODE file mirror was off in prod), while `logger.*` → durable `$GHOST_HOME/system/ghost-agent.log`. Measured: the durable log had **0** turn narratives / verifier verdicts / tool results, and was **56% one repeated line** (`Semantic Toolkit Router injected 2 acquired skills` ×1096). Neither log alone could reconstruct a turn.
+
+**Keystone fix — `utils/logging.py` `_mirror()`.** pretty_log now emits its FULL untruncated content (+ req-id + delta + level) to a dedicated file-only logger (`GhostStream`, propagate=False, carries only the file handler → never double-prints on stdout), on EVERY call incl. BEGIN/END/SECTION frames, regardless of DEBUG_MODE. The durable log is now a COMPLETE, plain-text, restart-surviving record; the pretty stream stays the truncated curated view. (Operator chose: mirror-to-durable + drop `--verbose` for a clean stream + fix code-side bugs / flag config bugs.)
+
+**Noise (Tier 1).** Removed the redundant `logger.info` router twin (56% of the log) and made the surviving pretty line NAME the skills; watchdog start/cancel + composed-skill re-register → DEBUG; `PRM serve-inert` + journal-recovery WARNING → INFO (off the operator's WARNING+ stream).
+
+**Content, not counts (Tier 2/3).** Verifier verdicts now carry their reasoning (CONFIRMED says WHAT); `SKILL ACQUIRED` names the fix; belief revision (was debug-only → dropped in prod) names the dropped facts; file writes report size; circuit-breaker RECOVERY + HALF_OPEN probe now log (node healing was invisible — only trips logged); self-play crash now NAMES self-play then RE-RAISES (contract: it deliberately propagates to the tick handler with the anchor moved by finally — pinned by `test_anchor_updates_even_when_self_play_raises`, which the audit's naive "add except" would have broken); `transformers`/`py.warnings` captured into both sinks (surfaces the 159k>131k context-overflow that escaped only to raw `.err`).
+
+**Real bugs surfaced (operator: fix code-side, flag config).** Code: context-overflow now surfaced (transformers capture). CONFIG (flagged to operator, not changed): node `192.168.0.20:8088` circuit-flapping = a LAN IP an off-host node can't reach (should be tailnet, see `[[macos-daemon-local-network]]`); `FATAL embedder/store mismatch` (a store's 161 fragments in old MiniLM space vs bge-small → garbage retrieval, re-embed). Still open: `Frontier record_run failed: 'runs'` KeyError.
+
+**Verification.** New `tests/test_logging_durable_mirror.py` (4) + updated `test_registry_skills`; full suite **9035 passed / 13 skip / 0 fail**. LIVE (redeployed via KeepAlive): the durable log now reconstructs a full tool turn end-to-end — request-started → hydration → named routing → **thinking** → **shell command** → exit code → **verifier CONFIRMED + reasoning** → confidence → finished. Docs: `docs/logging.html` (new "Two sinks + durable mirror" section). Memory `[[logging-convention]]`.
+
+**Tail sweep (later same day) — 12 more items landed.** Turn-narrative: execute STDOUT on success (was "exit 0" only); consolidated **Turn Outcome** line (state+confidence+tools, non-streamed path); SQL text on `postgres_admin`; **Service** start/stop/restart pretty_log (mutating sandbox-service ops were silent); download URL no longer pre-truncated to 35 (starved the mirror). Cognitive content-not-counts: **hydration-judge** now names which surfaced memories the reply used; **quarantine** now logs the pulled belief+reason (was silent); **Skill Retracted** names the scrubbed triggers; **Graph Updated** shows the actual `s→r→o` triples. Infra: **complexity-router** decision logged (label+confidence+escalated+reason — the "why deep-reasoning fired" record); circuit-breaker recovery already done in the main pass. **Real bug fixed:** `Frontier record_run failed: 'runs'` was NOT the cluster (that's back-filled by `_ensure_cluster`) — it was a LEGACY per-template dict predating the "runs" key, so `tstats["runs"] += 1` raised KeyError; fixed with `.get`, regression test `tests/test_frontier_legacy_template.py`. Full suite green throughout.
+
+**Idle-scheduler instrumentation (later — the last deferred item, now DONE).** The noise design: the per-cycle summary is **INFO → durable log only** (off the now-`--verbose`-free pretty stream) and fires **once per idle cycle that actually did work** (frequent all-cooldown ticks append nothing → stay silent), so no per-tick spam. In `_biological_tick`: a `_idle_ran` accumulator that each meaningful phase appends to (dream / self-play / postmortem / skills-auto) → one `logger.info("idle cycle: ran … (idle Xm)")` at tick end. **The flagged blind spot fixed:** self-play's dice roll was ANDed with the cooldown (`cooldown and _bio_roll(0.2)`) so "never fired" was indistinguishable from crash / lost-roll / not-idle — split into three branches, each logged (cooldown-skip DEBUG, dice-miss INFO, ran). Reflection + PRM/router already log their own result/SKIP so they're left out of the summary (would double-count). Tests: `tests/test_idle_scheduler_logging.py` (dice-miss logged + doesn't run; run emits summary); self-play C3 anchor contract still green.
+
+**Final closure (later — operator: "close logging today"; ALL previously-deferred items now DONE):**
+- *Cognitive content-naming*: **Dream Consolidated** now logs each ACCEPTED synthesis (`N fragment(s) → text`; before, only rejections logged — the stream showed what the dream refused, never what it built); the counts-only "Dream Complete" stays as an index line since every category now has per-event content lines beneath it. **RRF refit** logs observation count + changed cells with old→new deltas (was a silent hot-swap of the fusion matrix). **Hippocampus** names each consolidated item (`type: subject-head`). **Recall-threshold retunes** log old→new (inert under `--smart-memory 0.9`, but recorded for when load-bearing). **Episode commits**: lesson-bearing → durable INFO named; ordinary per-turn → DEBUG. **Reflection conclusions** → one INFO per reflected turn (failed request → diagnosis → plan head → verify verdict) via `GhostReflect`.
+- *Icon de-collision*: EVENT_BUS 📡→🔀, VECTOR_EMBED 🧬→🧮 (both wide-base; added to app.js `ICON_CLASS` + `?v=3.8→3.9` bump per convention); SKILL ACQUIRED 🎓→💡 (🎓 now reserved for real graduation in dream.py — its usage test still green); **all 18** "Verifier"-titled 💭 BRAIN_THINK icons → 🧪 VERIFIER_LAB via a context-aware transform (one icon = one subsystem; REFUTED no longer wears the thinking icon).
+- *"Loop Breaker" split*: three distinct events → three distinct titles: **Failure Cap** (dispatch-pipeline fail cap), **Strike Cap** (turn-loop strike cap), **Think-Loop Halt** (thinking-loop force-final). The dispatch-extraction landmark test updated to the new marker; `test_agent_tool_limits` was coupled to different content (unaffected).
+- Docs icon catalog updated. Full suite green; deployed.
+
+**Logging work is CLOSED** — nothing deferred remains.
+
 ### 2026-07-24 — Outcome-gated learning loop: the FAILURE arm the retrieval-feedback loop never had
 
 **Feature (research → build).** Surveyed the metacognition / self-improvement frontier against the current cognitive
@@ -1167,6 +1195,15 @@ anticipate and handle errors"* reached `succ=3 fail=1` (present on 3 passes + 1 
 arm; just crossed `_OUTCOME_MIN_OBS=4` so its `outcome_mult` is now live). Zero errors/tracebacks in
 `_record_lesson_outcomes`/`record_surfaced_outcomes`/`_flush_stashed_lesson_outcome` across the session; RSS flat
 (436→435 MB); playbook JSON intact (50 lessons, 12 now carry ticks). Prune effect not yet observed (runs idle/dream).
+
+**Observability (added + verified after a launchd redeploy).** Per-turn recording → `logger.info`
+(`lesson-outcome: N surfaced lesson(s) -> present-on-{FAILURE|success}`, + `… stashed … await late verdict`) in the
+grep-log `$GHOST_HOME/system/ghost-agent.log` — the same sink as `Hydration tiers`, NOT the operator's pretty stream
+`~/Data/AI/Logs/ghost-agent.log` (stdout/pretty, WARNING+). Actionable prune → `pretty_log("SKILL PRUNE", "… K
+outcome-gated (present-on-failure): '<trigger>' (succ,fail)")` in the pretty stream (was generic "low-utility"). Matches
+the file-only-vs-pretty convention (`[[logging-convention]]`, now documenting the two log destinations). +2 logging
+tests; full suite **9031 passed / 13 skip**. Verified live post-redeploy: `13:09:50 … lesson-outcome: 5 surfaced
+lesson(s) -> present-on-FAILURE` and a `present-on-success` line, both in the grep-log.
 
 ### 2026-07-23 (later 4) — #5 step 4a: client-SSE streamer extracted from handle_chat (LIVE-VALIDATED)
 

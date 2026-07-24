@@ -12,6 +12,7 @@ import asyncio
 import logging
 
 from ..sandbox.services import get_service_supervisor, SUGGESTED_PORTS
+from ..utils.logging import pretty_log, Icons
 
 logger = logging.getLogger("GhostAgent")
 
@@ -46,6 +47,15 @@ async def tool_manage_services(action: str = None, name: str = None,
     sup = get_service_supervisor(sandbox_manager)
     if sup is None:
         return "Error: Sandbox manager not initialized."
+
+    # Mutating service ops are real cross-turn side effects (a server left
+    # running, a port reclaimed) — make them visible; they were silent before,
+    # only failures logged. status/logs are read-only, so skip them.
+    if action in ("start", "stop", "restart", "stop-all"):
+        _detail = action + (f" {name}" if name else "")
+        if action == "start" and command:
+            _detail += f" · {command}" + (f" :{port}" if port else "")
+        pretty_log("Service", _detail, icon=Icons.SANDBOX_BOX)
 
     try:
         if action == "start":

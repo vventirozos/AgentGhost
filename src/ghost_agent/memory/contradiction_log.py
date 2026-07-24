@@ -160,7 +160,16 @@ class ContradictionLog:
             if len(entries) > self.MAX_ENTRIES:
                 entries = entries[:self.MAX_ENTRIES]
             self._save(entries)
-        logger.debug(f"Contradiction logged: '{new_fact[:60]}' superseded {len(deleted_ids)} old facts")
+        # INFO (was debug → dropped in prod): the agent changing its mind by
+        # deleting old facts is a first-class cognitive event and must be
+        # reconstructable from the durable log — WITH the dropped facts named.
+        _dropped = "; ".join(
+            (s.get("text") or "")[:40] for s in (superseded or [])[:2])
+        logger.info(
+            "Belief revised: '%s' superseded %d old fact(s)%s",
+            new_fact[:60], len(deleted_ids),
+            f": {_dropped}" if _dropped else "",
+        )
 
     def get_recent(self, limit: int = 10) -> list:
         """Return the most recent contradiction events."""

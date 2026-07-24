@@ -397,4 +397,18 @@ class Reflector:
                 reflected.extra["plan_verify_note"] = f"verify error: {type(e).__name__}"
 
         out.reflected_trajectory = reflected
+        # Surface the CONCLUSION — the self-critique's actual output was
+        # never logged (audit A7): it appeared, at best, indirectly as a
+        # SKILL ACQUIRED trigger. One durable INFO line per reflected turn:
+        # what failed, the diagnosis, the plan head, and the verify verdict.
+        logger.info(
+            "reflection: %r (failed: %s) → diagnosis: %s | plan[%d]: %s%s",
+            (traj.user_request or "")[:60],
+            (traj.failure_reason or "unknown")[:60],
+            diagnosis[:160],
+            len(plan),
+            "; ".join(s[:60] for s in plan[:2]),
+            (f" | verified={out.plan_verified}"
+             if out.plan_verified is not None else ""),
+        )
         return out

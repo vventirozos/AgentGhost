@@ -1660,6 +1660,15 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 _syn_id = hashlib.md5(str(synthesis).encode("utf-8")).hexdigest()
                 await asyncio.to_thread(self.memory.add, synthesis, _syn_meta)
                 applied_consolidations += 1
+                # Log what was ACCEPTED, not only the rejections — before this,
+                # every "Dream Skip" logged while the actual work was silent,
+                # so the stream showed what the dream refused but never what it
+                # built. Durable mirror keeps the full synthesis.
+                pretty_log(
+                    "Dream Consolidated",
+                    f"{len(merged_ids or [])} fragment(s) → {str(synthesis)[:120]}",
+                    icon=Icons.MEM_REINFORCE,
+                )
                 if merged_ids:
                     ids_to_delete = [mid.split(":")[-1].strip() for mid in merged_ids]
                     ids_to_delete = [i for i in ids_to_delete if i and i != _syn_id]
@@ -1919,6 +1928,32 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                 save_intent_weights(ledger.parent / "weights.json", fitted)
             except Exception as e:
                 logger.debug("rrf weights save failed: %s", e)
+            # Name the structural change: which fusion cells moved and by how
+            # much. A silent refit of how memory is fused was unrecoverable
+            # from the log (audit A6). Durable-only INFO; capped to the
+            # biggest deltas so the line stays one line.
+            try:
+                _prev = getattr(bus, "_intent_weights", None) or {}
+                _deltas = []
+                for _int, _row in (fitted or {}).items():
+                    for _src, _w in (_row or {}).items():
+                        _old = ((_prev.get(_int) or {}).get(_src)
+                                if isinstance(_prev.get(_int), dict) else None)
+                        if _old is None or abs(float(_w) - float(_old)) >= 0.05:
+                            _deltas.append(
+                                (abs(float(_w) - float(_old or 0.0)),
+                                 f"{_int}/{_src} "
+                                 f"{'' if _old is None else f'{float(_old):.2f}→'}"
+                                 f"{float(_w):.2f}"))
+                _deltas.sort(reverse=True)
+                logger.info(
+                    "rrf refit: %d observation(s) → %d cell(s) changed ≥0.05%s",
+                    len(obs), len(_deltas),
+                    (" — " + "; ".join(d for _, d in _deltas[:6])
+                     if _deltas else ""),
+                )
+            except Exception as _rlx:
+                logger.debug("rrf refit delta log skipped: %s", _rlx)
             bus._intent_weights = fitted  # hot swap for the running process
             # Trim the ledger so it can't grow unboundedly.
             if len(lines) > max_ledger_lines:

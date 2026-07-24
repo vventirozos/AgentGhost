@@ -93,7 +93,8 @@ def test_handle_chat_delegates_to_the_method():
 def test_method_carries_the_pipeline_landmarks():
     src = inspect.getsource(GhostAgent._dispatch_and_process_tool_batch)
     for marker in ("pending_idempotent = set()", "SYSTEM 3 PIVOT",
-                   "Loop Breaker", "unescape_xml_values"):
+                   "Failure Cap",  # was "Loop Breaker" (title de-collided 2026-07-24)
+                   "unescape_xml_values"):
         assert marker in src, f"pipeline landmark missing: {marker}"
     # the two rewritten control-flow statements
     assert "return True  # was `break`" in src

@@ -469,6 +469,16 @@ class MemoryBus:
                 await asyncio.to_thread(_append)
             except Exception as e:
                 logger.debug(f"usefulness ledger append failed: {e}")
+        # Name WHICH surfaced memories the reply actually drew on — the
+        # retrieval feedback loop was invisible (this drives spaced-repetition
+        # credit + skill hit-rate + the RRF refit), so the durable log now shows
+        # what recall paid off.
+        if used_idx:
+            _used = [str(survivors[i].get("trigger")
+                         or survivors[i].get("text", ""))[:40]
+                     for i in sorted(used_idx)]
+            logger.info("hydration-judge: %d/%d surfaced memor(ies) used -> %s",
+                        len(used_idx), len(survivors), "; ".join(_used))
         return len(used_idx)
 
     def _credit_surfaced(self, survivors: List[Dict[str, Any]]) -> None:

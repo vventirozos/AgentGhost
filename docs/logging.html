@@ -53,6 +53,21 @@
     grep-friendly format (now stamped with the logger name).
   </div>
 
+  <h2>Two sinks, and the durable narrative mirror (2026-07-24)</h2>
+  <p>There are <strong>two</strong> physical destinations, and they are NOT the same content:</p>
+  <table>
+    <thead><tr><th>Sink</th><th>Path</th><th>What it is</th></tr></thead>
+    <tbody>
+      <tr><td><strong>Pretty stream</strong></td><td><code>stdout</code> → <code>~/Data/AI/Logs/ghost-agent.log</code></td><td>The aligned, iconed, per-request, <em>truncated</em> view a human watches. Redacted. Rewritten each boot (launchd stdout).</td></tr>
+      <tr><td><strong>Durable log</strong></td><td><code>$GHOST_HOME/system/ghost-agent.log</code></td><td>Plain <code>HH:MM:SS - name - LEVEL - msg</code>, append-only, survives restarts. The log you <code>grep</code> or hand to another reader to reconstruct a turn.</td></tr>
+    </tbody>
+  </table>
+  <p><strong>The problem it fixed.</strong> <code>pretty_log</code> historically wrote to stdout <em>only</em> (the durable mirror was gated on <code>DEBUG_MODE</code>, off in prod), while <code>logger.info/debug</code> wrote to the durable file <em>only</em>. So the entire turn/tool/cognition <strong>narrative</strong> — thinking, tool calls + results, verifier verdicts, what was learned — lived only on the ephemeral stdout stream, and the durable log held only failures + repetitive noise. An audit measured <strong>0</strong> turn narratives / verdicts / tool results in the durable log, and it was <strong>56%</strong> one repeated line. Neither log alone could reconstruct a turn.</p>
+  <p><strong>The fix — <code>_mirror()</code>.</strong> <code>pretty_log</code> now emits its <strong>full, untruncated</strong> content to a dedicated file-only logger (<code>GhostStream</code>, <code>propagate=False</code>, carries only the file handler so it never double-prints on stdout) on <em>every</em> call — normal lines and <code>BEGIN</code>/<code>END</code>/<code>SECTION</code> frames — regardless of <code>DEBUG_MODE</code>. Result: the <strong>durable log is now a complete, plain-text, restart-surviving record of everything the agent did</strong>, while the pretty stream stays the truncated, curated live view. The stream truncates a long line to 60 chars (240 for WARNING+); the durable mirror always keeps the whole thing.</p>
+  <p><strong>Companion changes.</strong> (1) <em>Noise</em>: the top repeated durable lines were demoted to DEBUG or de-duplicated — the <code>Semantic Routing</code> line dropped its redundant <code>logger.info</code> twin (it was 56% of the log) and now names the injected skills; watchdog start/cancel and composed-skill re-register → DEBUG; the <code>PRM serve-inert</code> and journal-recovery lines → INFO so they leave the operator's WARNING+ stream. (2) <em>Content, not counts</em>: verifier verdicts now carry their reasoning (a CONFIRMED says <em>what</em>); <code>SKILL ACQUIRED</code> names the fix, not just the trigger; belief revision (was debug-only) names the dropped facts; file writes report size; circuit-breaker <strong>recovery</strong> is now logged (symmetric with the trip), so a node healing is visible. (3) <em>Escaped warnings</em>: <code>transformers</code> + <code>py.warnings</code> (e.g. the context-overflow <code>token indices … longer than …</code>) are now captured into both sinks instead of vanishing to raw stderr.</p>
+  <p><strong>Idle loop reconstructable.</strong> The nightly biological tick now emits one durable <code>idle cycle: ran dream, self-play (idle 42m)</code> summary per cycle that did work (INFO, so durable-only; frequent all-cooldown ticks stay silent). Self-play's 20% dice roll — previously ANDed with the cooldown so "never fired" looked identical to a crash or a lost roll — is split so each outcome (cooldown-skip / dice-miss / ran) is logged distinctly.</p>
+  <p><strong>Live-stream philosophy.</strong> Because completeness now lives in the durable log, the pretty stream is kept clean: routine per-turn diagnostics stay at INFO (durable-only), and only actionable events reach the WARNING+ pretty channel. Running the launcher <em>without</em> <code>--verbose</code> keeps the stream truncated and free of raw thinking tokens while losing nothing (the durable log has it all).</p>
+
   <h2>Reading a line</h2>
   <p>Each line has a fixed anatomy — once your eye learns the columns, a busy multi-request stream is scannable:</p>
   <pre><code>│  A7  💭  +0.42s  thinking            128 tokens · 0.9s
@@ -86,7 +101,7 @@
       <tr><td>Reasoning</td><td>💭 thinking · 🧠 summary · 📋 plan · 🧩 context · 🧭 route · 🎯 frontier · 🌳 MCTS · 🧪 verifier</td></tr>
       <tr><td>Tools</td><td>🌐 search · 🔬 deep/vision · 🐍 code · 🐚 shell · 🌎 browser · 🐘 postgres · 🎨 image · 📄 PDF</td></tr>
       <tr><td>Inference nodes</td><td>🔧 worker · 🛸 swarm edge</td></tr>
-      <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 💪 reinforce · 🧹 wipe · 🌙 dream (REM consolidation) · 👤 profile · 🪞 self-state · 🎓 skill graduate · 🧾 belief</td></tr>
+      <tr><td>Memory &amp; identity</td><td>📝 save · 🔎 recall · 📚 ingest · 📓 library · 🧬 embed · 🧮 vector-store boot · 💪 reinforce · 🧹 wipe · 🌙 dream (REM consolidation) · 👤 profile · 🪞 self-state · 💡 lesson acquired · 🎓 skill graduate (reserved for real graduation) · 🧾 belief · 📡 activity ledger · 🔀 event bus</td></tr>
       <tr><td>Status</td><td>✅ ok · ❌ fail · 🔶 warn · 🛑 stop · 🔄 retry · ⏩ skip · 💡 idea · 🔒 shield (security/guard) · 🔻 cut</td></tr>
     </tbody>
   </table>

@@ -175,7 +175,18 @@ class AdaptiveThreshold:
             # high-score useless, sustaining the lock near CEILING.)
             cleared_bar = score >= self.threshold
             self.window.append((score, was_useful, cleared_bar))
+            _old = self.threshold
             self._recalculate()
+            if abs(self.threshold - _old) >= 0.01:
+                # A self-retune was previously invisible (audit A5) — the
+                # value never surfaced anywhere. Durable INFO. (Note: under
+                # the live --smart-memory 0.9 the learned value is inert —
+                # see the module docstring — but when it IS load-bearing
+                # this is the record of the gate moving.)
+                logger.info(
+                    "recall threshold retuned %.2f → %.2f (window n=%d)",
+                    _old, self.threshold, len(self.window),
+                )
             self._save()
 
     def _recalculate(self):

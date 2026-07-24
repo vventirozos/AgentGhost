@@ -17,6 +17,19 @@ LOG_TRUNCATE_LIMIT = 60
 DEBUG_MODE = False
 VERBOSE_MODE = False  # When True, raw streamed thinking tokens are printed.
 
+# File-only logger that receives pretty_log's FULL untruncated content, so the
+# durable log becomes a complete plain-text record (see pretty_log / _mirror /
+# setup_logging). None until setup_logging wires it; _mirror no-ops meanwhile.
+_MIRROR_LOGGER: Optional[logging.Logger] = None
+
+# level-name -> numeric, for the durable mirror (getLevelName is unreliable
+# for the short "WARN" form across versions).
+_LEVELNO = {
+    "DEBUG": logging.DEBUG, "INFO": logging.INFO, "WARN": logging.WARNING,
+    "WARNING": logging.WARNING, "ERROR": logging.ERROR,
+    "CRITICAL": logging.CRITICAL,
+}
+
 
 def spawn_task(coro):
     """Spawn an asyncio task that inherits the CURRENT contextvars.
@@ -291,13 +304,13 @@ class Icons:
     BOOT_AWAKE       = "🌅"   # process spark — the very first line
     SANDBOX_BOX      = "📦"   # sandbox container mount
     GRAPH_WEB        = "🪢"   # triplet / knowledge-graph store (wide-base; was 🕸️)
-    VECTOR_EMBED     = "🧬"   # vector DB + sentence embeddings
+    VECTOR_EMBED     = "🧮"   # vector DB + sentence embeddings (was 🧬, colliding with MEM_EMBED)
     MEM_INDEX        = "📇"   # memory system fully loaded with items (wide-base; was 🗃️)
     MEM_LIBRARY      = "📓"   # indexed fragments ready for recall (distinct from MEM_INGEST 📚)
     BELIEF_SCALES    = "🧾"   # contradiction log / belief versioning (wide-base; was ⚖️)
     THRESHOLD_TUNE   = "📶"   # adaptive recall threshold (wide-base; was 🎚️)
     EPISODE_REEL     = "🎥"   # episodic memory (sessions = frames) (wide-base; was 🎞️)
-    EVENT_BUS        = "📡"   # memory-bus pub/sub fan-out
+    EVENT_BUS        = "🔀"   # memory-bus pub/sub fan-out (was 📡, colliding with ACTIVITY)
     VERIFIER_LAB     = "🧪"   # self-evaluation gate
     UNCERTAINTY_DIE  = "🎲"   # uncertainty tracker
     MCTS_TREE        = "🌳"   # deep-reason MCTS search tree
@@ -388,6 +401,44 @@ def setup_logging(log_file: str, debug: bool = False, daemon: bool = False, verb
 
     for lib in ["httpx", "uvicorn", "docker", "chromadb", "urllib3", "pypdf"]:
         logging.getLogger(lib).setLevel(logging.WARNING)
+
+    # Durable-mirror logger: pretty_log writes its FULL untruncated content
+    # here so the on-disk log is a COMPLETE plain-text, restart-surviving
+    # record of what the agent did (the stdout pretty stream is truncated and
+    # wiped each boot). File-only — it carries ONLY the shared file handler and
+    # propagate=False, so a mirror line NEVER double-prints to the operator's
+    # stdout stream (the pretty_handler is not attached here).
+    global _MIRROR_LOGGER
+    _MIRROR_LOGGER = logging.getLogger("GhostStream")
+    for old in list(_MIRROR_LOGGER.handlers):
+        try:
+            old.close()
+        except Exception:
+            pass
+        _MIRROR_LOGGER.removeHandler(old)
+    _MIRROR_LOGGER.setLevel(logging.DEBUG)
+    _MIRROR_LOGGER.addHandler(fh)
+    _MIRROR_LOGGER.propagate = False
+
+    # Surface third-party WARNING+ that used to escape only to raw stderr —
+    # notably transformers' "Token indices sequence length is longer than the
+    # specified maximum" (a real context-overflow → silent truncation risk)
+    # and any warnings.warn(...) deprecations. Route them to BOTH the durable
+    # file and the operator's pretty stream so they can't hide.
+    logging.captureWarnings(True)
+    for extra in ("transformers", "py.warnings"):
+        lg = logging.getLogger(extra)
+        for old in list(lg.handlers):
+            try:
+                old.close()
+            except Exception:
+                pass
+            lg.removeHandler(old)
+        lg.setLevel(logging.WARNING)
+        lg.addHandler(fh)
+        if not daemon:
+            lg.addHandler(pretty_handler)
+        lg.propagate = False
 
 
 # ---------------------------------------------------------------------------
@@ -543,6 +594,29 @@ def _redact_log(s: str) -> str:
         return s
 
 
+def _mirror(req_id: str, title: str, content: str, level: str = "INFO") -> None:
+    """Write pretty_log's FULL (untruncated) content to the durable file sink.
+
+    This is what makes ``$GHOST_HOME/system/ghost-agent.log`` a COMPLETE,
+    plain-text, restart-surviving record of everything the agent did — the log
+    you can grep or hand to another reader to reconstruct a turn. File-only
+    (the GhostStream logger carries no stdout handler; see setup_logging), so a
+    mirror line never double-prints on the operator's monitored stream. Never
+    raises — logging must not break the app.
+    """
+    lg = _MIRROR_LOGGER
+    if lg is None:
+        return
+    try:
+        delta = _format_delta(req_id).strip()
+        prefix = f"{req_id[:8]} {delta}".strip()
+        sep = " — " if content else ""
+        lg.log(_LEVELNO.get(level.upper(), logging.INFO),
+               "[%s] %s%s%s", prefix, title, sep, content)
+    except Exception:
+        pass
+
+
 def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str = "INFO", special_marker: str = None, no_truncate: bool = False):
     req_id = request_id_context.get()
     tag = _req_tag(req_id)
@@ -562,11 +636,14 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{DIM}request started  {ts}{RESET} "
             f"{rcol}{rule}{RESET}"
         )
+        _mirror(req_id, "request started", f"{req_id[:8]} at {ts}", "INFO")
         atomic_print(line)
         return
 
     if special_marker == "END":
         delta = _format_delta(req_id).strip()
+        # delta already carries its leading "+" (e.g. "+22.3s") — don't double it.
+        _mirror(req_id, "request finished", delta, "INFO")
         with _REQ_STATE_LOCK:
             _REQ_STATE.pop(req_id, None)
         visible = len(f"└─ {tag}  request finished  {delta} ")
@@ -587,6 +664,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▼ {title_str}{RESET}"
         )
+        _mirror(req_id, f"section start: {title_str}", "", "INFO")
         atomic_print(line)
         return
 
@@ -598,6 +676,7 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
             f"{DIM}{delta}{RESET}  "
             f"{BOLD}▲ {title_str}{RESET}"
         )
+        _mirror(req_id, f"section end: {title_str}", "", "INFO")
         atomic_print(line)
         return
 
@@ -606,46 +685,38 @@ def pretty_log(title: str, content: Any = None, icon: str = "🔹", level: str =
     title_str = title.lower().replace("_", " ")
 
     if content is None:
-        content_str = ""
+        raw = ""
     elif isinstance(content, (dict, list)):
         try:
-            content_str = repr(content) if len(content) > 50 else json.dumps(content, default=str)
+            raw = repr(content) if len(content) > 50 else json.dumps(content, default=str)
         except Exception:
-            content_str = str(content)
+            raw = str(content)
     else:
-        content_str = str(content)
+        raw = str(content)
 
-    # Failures get a larger content budget so the *why* (exception text, the
-    # cause) survives on the monitored stream — not just in --verbose / the
-    # file. INFO/DEBUG stay tight (60) to keep the stream scannable.
-    # ``no_truncate`` exempts a line from the budget entirely — used for
-    # 💭 thinking blocks (operator request 2026-07-08: full reasoning on the
-    # stream in EVERY mode); newline-flattening, redaction and column
-    # wrapping still apply so the format stays identical.
+    # Flatten + redact ONCE to the full content, then derive two views:
+    #   • FULL → the durable file mirror (_mirror): the complete, untruncated,
+    #     restart-surviving record used to reconstruct what the agent did.
+    #   • truncated + column-wrapped → the operator's scannable stdout stream.
+    # Failures get a larger stream budget (240) so the *why* survives the live
+    # view; the mirror always has the whole thing. ``no_truncate`` exempts the
+    # stream line from the budget (💭 thinking blocks); the mirror is unaffected.
+    full = _redact_log(raw.replace("\n", " ").replace("\r", ""))
+    _mirror(req_id, title_str, full, level)
+
+    stream_content = full
     if not no_truncate:
         _limit = LOG_TRUNCATE_LIMIT
         if level.upper() in ("WARNING", "WARN", "ERROR", "CRITICAL"):
             _limit = max(LOG_TRUNCATE_LIMIT, 240)
-        content_str = _truncate(content_str, _limit)
-    content_str = content_str.replace("\n", " ").replace("\r", "")
-    # Redact secrets / .onion / home-paths / PII from the monitored stream
-    # (post-truncation so the regex cost is bounded to the visible line).
-    content_str = _redact_log(content_str)
-    content_str = _wrap_content(content_str)
+        stream_content = _truncate(stream_content, _limit)
+    stream_content = _wrap_content(stream_content)
 
     lvl_col = _LEVEL_COLOR.get(level.upper(), "")
-    sep = "  " if content_str else ""
+    sep = "  " if stream_content else ""
     line = (
         f"{rcol}│{RESET}  {rcol}{tag}{RESET}  {_icon_cell(icon)}  "
         f"{DIM}{delta}{RESET}  "
-        f"{lvl_col}{BOLD}{_fit_title(title_str)}{RESET}{sep}{content_str}"
+        f"{lvl_col}{BOLD}{_fit_title(title_str)}{RESET}{sep}{stream_content}"
     )
     atomic_print(line)
-
-    if DEBUG_MODE:
-        # Lazy formatting via %-args so the logger only stringifies + slices
-        # when the DEBUG handler is actually going to emit. The previous
-        # f-string built the full string (and the full `repr(content)`)
-        # eagerly, on EVERY call, which became a measurable cost when
-        # `content` was a giant payload. `%.1000s` truncates at format time.
-        logger.debug("[%s] %s: %.1000s", req_id, title, _redact_log(str(content)[:1000]))

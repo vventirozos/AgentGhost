@@ -190,6 +190,49 @@ def test_present_on_failure_lesson_gets_pruned(tmp_path):
     assert len(survivors) == 10
 
 
+# ------------------------------------------------------------- logging
+
+
+def test_record_surfaced_outcomes_logs_info_line(tmp_path, caplog):
+    """Per-turn recording lands in the file log (INFO) so the §3 audit can
+    grep it — but NOT at WARNING+, so it never spams the pretty stream."""
+    import logging
+    _write_playbook(tmp_path, [{"trigger": "parse json"}])
+    sm = SkillMemory(tmp_path)
+    with caplog.at_level(logging.INFO, logger="GhostAgent"):
+        sm.record_surfaced_outcomes(["parse json"], success=False)
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("lesson-outcome" in m and "present-on-FAILURE" in m for m in msgs)
+    # Must not be a WARNING/ERROR (those auto-render in the pretty stream).
+    assert all(r.levelno < logging.WARNING for r in caplog.records
+               if "lesson-outcome" in r.getMessage())
+
+
+def test_prune_attributes_outcome_gated_cause(tmp_path, monkeypatch):
+    """When the loop retires a present-on-failure lesson, the SKILL PRUNE
+    pretty-stream line must name it as outcome-gated (not generic
+    'low-utility'), so the operator sees the loop act."""
+    captured = {}
+    monkeypatch.setattr(
+        skills_mod, "pretty_log",
+        lambda title, detail, **kw: captured.update(title=title, detail=detail))
+    lessons = [{
+        "trigger": f"good-{i}", "retrievals": 2, "confidence": 0.7,
+        "timestamp": f"2026-07-24T00:00:{i:02d}",
+    } for i in range(10)]
+    lessons.append({
+        "trigger": "harmful", "retrievals": 8, "helpful_retrievals": 2,
+        "confidence": 0.6, "succeeded_retrievals": 0, "failed_retrievals": 8,
+        "timestamp": "2026-07-24T00:00:99",
+    })
+    _write_playbook(tmp_path, lessons)
+    sm = SkillMemory(tmp_path)
+    assert sm.prune_low_utility(min_retrievals=5) == 1
+    assert captured.get("title") == "SKILL PRUNE"
+    assert "outcome-gated" in captured.get("detail", "")
+    assert "fail=8" in captured.get("detail", "")
+
+
 def test_verified_lesson_is_never_pruned_even_if_present_on_failures(tmp_path):
     """Verification is a stronger signal than co-occurrence statistics —
     prune_low_utility pins verified lessons (mirrors the existing contract)."""

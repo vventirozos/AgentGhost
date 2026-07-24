@@ -491,7 +491,11 @@ class MemoryJournal:
                 if fresh:
                     self._prepend_overflow(fresh)
                 self._clear_inflight()
-                logger.warning(
+                # INFO not WARNING: the journal is lossless-by-design and this
+                # recovery fires on EVERY restart — expected/routine, so it
+                # belongs in the durable log, not flashing 🔶 on the operator's
+                # pretty stream each deploy.
+                logger.info(
                     "Recovered %d in-flight journal item(s) from an "
                     "interrupted drain (%d already back in the queue).",
                     len(fresh), len(staged) - len(fresh),

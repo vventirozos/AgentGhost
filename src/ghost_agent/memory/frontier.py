@@ -779,7 +779,14 @@ class FrontierTracker:
                             "saturated_at": None,
                         },
                     )
-                    tstats["runs"] += 1
+                    # .get: a LEGACY persisted template predating the "runs"
+                    # key is returned as-is by the setdefault above (it no-ops
+                    # on an existing dict), so a bare `tstats["runs"] += 1`
+                    # raised KeyError('runs') and aborted record_run — the live
+                    # "Frontier record_run failed: 'runs'" (recurring on old
+                    # templates only; the CLUSTER is already back-filled by
+                    # _ensure_cluster, the template was the gap).
+                    tstats["runs"] = int(tstats.get("runs", 0)) + 1
                     tstats["recent_outcomes"] = (
                         tstats.get("recent_outcomes", []) + [{
                             "passed": bool(passed),

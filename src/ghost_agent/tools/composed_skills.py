@@ -359,7 +359,9 @@ class ComposedSkillRegistry:
 
         self.skills[skill.name] = skill
         self.save()
-        logger.info("Registered composed skill: %s (%d steps)", skill.name, len(skill.steps))
+        # DEBUG: re-registration fires on every rebuild (~119x identical lines
+        # in the durable log); keep it greppable in debug, out of the signal.
+        logger.debug("Registered composed skill: %s (%d steps)", skill.name, len(skill.steps))
         return True
 
     # NOTE: a keyword-overlap `find_matching(query)` used to live here — it

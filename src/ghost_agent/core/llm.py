@@ -229,6 +229,13 @@ class NodeCircuitBreaker:
             elapsed = time.time() - (state["open_since"] or 0)
             if elapsed >= self.cooldown_seconds:
                 state["state"] = "half_open"
+                # Durable node-health timeline: the OPEN trip logged but the
+                # probe/recovery never did, so the operator saw nodes die and
+                # never heal. Probe is diagnostic (grep-log); recovery is
+                # operator-facing (pretty stream, below).
+                logger.info(
+                    "Circuit breaker HALF_OPEN for node %s — probing after "
+                    "%.0fs cooldown", node_url, self.cooldown_seconds)
                 return True  # Allow probe request
             return False
         # half_open — allow one probe
@@ -237,9 +244,15 @@ class NodeCircuitBreaker:
     def record_success(self, node_url: str):
         """Record a successful request — reset the breaker."""
         state = self._get_state(node_url)
+        prev = state["state"]
         state["failures"] = 0
         state["open_since"] = None
         state["state"] = "closed"
+        # Surface RECOVERY on the operator's stream, symmetric with the OPEN
+        # trip warning — a node healing is exactly as newsworthy as it tripping.
+        if prev != "closed":
+            pretty_log("Node Recovered",
+                       f"{node_url} circuit CLOSED (was {prev})", icon=Icons.OK)
 
     def record_failure(self, node_url: str):
         """Record a failed request — potentially trip the breaker."""

@@ -994,10 +994,19 @@ class SkillMemory:
                 }
                 memory_system.add(text, meta)
 
+            # Name the lesson BODY, not just the trigger — "learned a lesson"
+            # without the lesson is unreconstructable. Durable mirror keeps the
+            # full fix; the stream shows the head.
+            _fix = (new_lesson.get("correct_pattern")
+                    or new_lesson.get("solution") or "").strip()
             pretty_log(
                 "SKILL ACQUIRED",
-                f"Lesson learned: {effective_trigger[:30]}...",
-                icon=Icons.SKILL_GRADUATE,
+                f"{effective_trigger[:60]}"
+                + (f" → {_fix[:140]}" if _fix else ""),
+                # IDEA, not SKILL_GRADUATE: 🎓 is reserved for a lesson
+                # GRADUATING into a reusable skill (dream.py) — using it for
+                # every plain acquisition made the two indistinguishable.
+                icon=Icons.IDEA,
             )
             return "written"
         except Exception as e:
@@ -1058,6 +1067,7 @@ class SkillMemory:
             with self._get_lock():
                 playbook = self._load_playbook()
                 kept = []
+                removed_triggers = []
                 for entry in playbook:
                     src = (
                         entry.get("source_trajectory_id")
@@ -1065,6 +1075,9 @@ class SkillMemory:
                     )
                     if isinstance(src, str) and src == trajectory_id:
                         removed += 1
+                        if isinstance(entry, dict):
+                            removed_triggers.append(
+                                entry.get("trigger") or entry.get("task") or "")
                         continue
                     kept.append(entry)
                 if removed:
@@ -1107,8 +1120,10 @@ class SkillMemory:
             try:
                 pretty_log(
                     "Skill Retracted",
-                    f"removed {removed} lesson(s) sourced from "
-                    f"trajectory {trajectory_id[:8]}",
+                    f"removed {removed} lesson(s) from trajectory "
+                    f"{trajectory_id[:8]}"
+                    + (": " + "; ".join(t[:40] for t in removed_triggers if t)
+                       if removed_triggers else ""),
                     icon=Icons.MEM_WIPE,
                 )
             except Exception:
@@ -1313,11 +1328,30 @@ class SkillMemory:
             for lesson in _pruned_lessons:
                 _delete_lesson_twin(memory_system, lesson)
         if removed:
-            pretty_log(
-                "SKILL PRUNE",
-                f"Dropped {removed} low-utility lesson(s).",
-                icon=Icons.MEM_WIPE,
-            )
+            # Attribute the outcome-gated cause: which drops were driven by
+            # the failure arm (present-on-failure, past the min-obs gate).
+            # This is the actionable "the learning loop just retired a lesson
+            # that kept riding along on failures" signal — so it belongs in
+            # the pretty stream, named, not buried as generic "low-utility".
+            detail = f"Dropped {removed} low-utility lesson(s)."
+            if _OUTCOME_UTILITY_ENABLED:
+                oc = [
+                    l for l in _pruned_lessons
+                    if (int(l.get("succeeded_retrievals") or 0)
+                        + int(l.get("failed_retrievals") or 0)) >= _OUTCOME_MIN_OBS
+                    and int(l.get("failed_retrievals") or 0)
+                        > int(l.get("succeeded_retrievals") or 0)
+                ]
+                if oc:
+                    sample = "; ".join(
+                        f"{str(l.get('trigger') or l.get('task'))[:40]!r} "
+                        f"(succ={int(l.get('succeeded_retrievals') or 0)},"
+                        f"fail={int(l.get('failed_retrievals') or 0)})"
+                        for l in oc[:3]
+                    )
+                    detail += (f" {len(oc)} outcome-gated (present-on-failure): "
+                               f"{sample}")
+            pretty_log("SKILL PRUNE", detail, icon=Icons.MEM_WIPE)
         return removed
 
     def get_playbook_items(
@@ -1393,6 +1427,14 @@ class SkillMemory:
                     self._save_playbook_unlocked(playbook)
         except Exception as e:
             logger.debug(f"quarantine_lesson failed: {e}")
+        if updated:
+            # Pulling a belief out of active use (e.g. a counterfactual
+            # regression) was silent — surface it named, with the reason.
+            pretty_log(
+                "Lesson Quarantined",
+                f"{(trigger or '')[:50]} — {(reason or 'no reason given')[:80]}",
+                icon=Icons.MEM_WIPE,
+            )
         return updated
 
     def record_retrievals_bulk(self, triggers) -> int:
@@ -1469,12 +1511,14 @@ class SkillMemory:
                     self._save_playbook_unlocked(playbook)
         except Exception as e:
             logger.debug(f"record_surfaced_outcomes failed (non-critical): {e}")
-        if updated and not success:
-            # File-log only (operator monitors WARNING+ pretty stream; a
-            # present-on-failure tick is diagnostic, not actionable-per-turn).
-            logger.debug(
-                "lesson_outcome: %d surfaced lesson(s) marked present-on-FAILURE",
-                updated,
+        if updated:
+            # File-log INFO (lands in ghost-agent.log for the §3 audit and
+            # live tracing), NOT the WARNING+ pretty stream — a per-turn
+            # outcome tick is diagnostic, not actionable, so it must not spam
+            # the operator's live view. One summary line per turn, both arms.
+            logger.info(
+                "lesson-outcome: %d surfaced lesson(s) -> present-on-%s",
+                updated, "FAILURE" if not success else "success",
             )
         return updated
 

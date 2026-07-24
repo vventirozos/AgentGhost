@@ -265,6 +265,21 @@ class EpisodicMemory:
                         forget(vid)
                     except Exception:
                         pass
+        # Episode commits were silent (audit A8). Episodes land every turn, so
+        # the ordinary commit stays DEBUG; a LESSON-BEARING episode is a real
+        # learning event and gets durable INFO — named, with the outcome.
+        if lesson:
+            logger.info(
+                "episode #%d committed with lesson: %r (trigger: %s, %s)",
+                episode_id, lesson[:100], trigger[:60],
+                "success" if success else "failure",
+            )
+        else:
+            logger.debug(
+                "episode #%d committed (trigger: %s, %s, %d action(s))",
+                episode_id, trigger[:60],
+                "success" if success else "failure", len(actions or []),
+            )
         return episode_id
 
     def _ingest_episode_vector(self, episode_id: int, trigger: str,

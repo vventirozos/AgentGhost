@@ -682,8 +682,17 @@ def get_active_tool_definitions(context, query: str = None):
                             target_skill_names = [n for n in raw_names if n in active_skills and active_skills[n].get("status") == "active"]
 
                             if target_skill_names:
-                                logger.info(f"Semantic Toolkit Router injected {len(target_skill_names)} acquired skills.")
-                                pretty_log("Semantic Routing", f"Loaded {len(target_skill_names)} skills.", icon=Icons.BRAIN_ROUTE)
+                                # ONE line on both sinks (the pretty mirror now
+                                # carries it to the durable log too) — the old
+                                # separate logger.info was redundant and, at
+                                # ~1100 identical count-only lines, was 56% of
+                                # the durable log. Name the skills so the line
+                                # says WHAT was injected, not just how many.
+                                pretty_log(
+                                    "Semantic Routing",
+                                    f"injected {len(target_skill_names)}: "
+                                    f"{', '.join(target_skill_names)}",
+                                    icon=Icons.BRAIN_ROUTE)
                 except Exception as rag_err:
                     logger.warning(
                         "Acquired-skill semantic routing failed (%s: %s); "

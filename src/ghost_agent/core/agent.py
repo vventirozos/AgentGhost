@@ -2858,7 +2858,7 @@ class GhostAgent:
         is propagated cleanly on shutdown. Timing thresholds for Journal
         consolidation, REM dreaming, and synthetic self-play are unchanged.
         """
-        logger.info("Biological watchdog daemon started")
+        logger.debug("Biological watchdog daemon started")
         try:
             while True:
                 await asyncio.sleep(60)
@@ -2879,7 +2879,7 @@ class GhostAgent:
                 except Exception as e:
                     logger.error(f"Biological watchdog tick failed: {e}")
         except asyncio.CancelledError:
-            logger.info("Biological watchdog daemon cancelled")
+            logger.debug("Biological watchdog daemon cancelled")
             raise
 
     def _current_rss_mb(self):
@@ -3071,6 +3071,14 @@ class GhostAgent:
 
         idle_secs = (datetime.datetime.now() - ctx.last_activity_time).total_seconds()
 
+        # Per-idle-cycle instrumentation: each phase appends its name when it
+        # actually does work; the tick emits ONE durable summary at the end
+        # (INFO → durable log only, off the operator's clean pretty stream), so
+        # "did the nightly loop dream / reflect / self-play, and what ran?" is
+        # answerable from the log. Frequent all-cooldown ticks stay silent
+        # (nothing appends → no summary).
+        _idle_ran: list = []
+
         # Phase 1: Process Short-Term Journal (>120s idle)
         if idle_secs > self._bio_scaled(120) and getattr(ctx, 'journal', None) is not None:
             since_last_journal = (datetime.datetime.now() - self._last_journal_at).total_seconds()
@@ -3160,6 +3168,7 @@ class GhostAgent:
                         logger.debug("dream self-play eligibility failed: %s", _spx)
                 if _dream_eligible:
                     if self._bio_roll(0.5):
+                        _idle_ran.append("dream")
                         from .dream import Dreamer
                         pretty_log("Biological Hook",
                                    "Agent is idle. Entering spontaneous REM cycle...",
@@ -3338,6 +3347,7 @@ class GhostAgent:
                     pm_cooldown = float(self._POSTMORTEM_COOLDOWN)
                 since_last_pm = (datetime.datetime.now() - self._last_postmortem_at).total_seconds()
                 if since_last_pm >= pm_cooldown:
+                    _idle_ran.append("postmortem")
                     pretty_log(
                         "Biological Hook",
                         "Agent is idle. Running post-mortem on worst recent failures...",
@@ -3375,6 +3385,7 @@ class GhostAgent:
             if since_last_skills >= self._SKILLS_AUTO_COOLDOWN:
                 traj_collector = getattr(ctx, 'trajectory_collector', None)
                 if traj_collector is not None:
+                    _idle_ran.append("skills-auto")
                     self._last_skills_auto_at = datetime.datetime.now()
                     try:
                         from ..skills_auto import (
@@ -4067,7 +4078,20 @@ class GhostAgent:
         if (idle_secs > self._bio_scaled(3600)
                 and getattr(ctx.args, "no_self_play", False) is not True):
             since_last_selfplay = (datetime.datetime.now() - self._last_selfplay_at).total_seconds()
-            if since_last_selfplay >= self._current_selfplay_cooldown and self._bio_roll(0.2):
+            # Split the old combined `cooldown and dice` so each outcome is
+            # DISTINGUISHABLE in the log — this was the flagged blind spot:
+            # "self-play never fired" was indistinguishable from a crash, a lost
+            # dice roll, or "not idle enough".
+            if since_last_selfplay < self._current_selfplay_cooldown:
+                logger.debug("idle self-play: skip — cooldown %d/%ds",
+                             int(since_last_selfplay),
+                             int(self._current_selfplay_cooldown))
+            elif not self._bio_roll(0.2):
+                # Eligible (idle >60m, cooldown elapsed) but lost the 20% roll.
+                logger.info(
+                    "idle self-play: eligible, skipped this tick (20%% dice miss)")
+            else:
+                _idle_ran.append("self-play")
                 from .dream import Dreamer
                 pretty_log("Biological Hook",
                            "Agent is deeply idle. Initiating Synthetic Self-Play...",
@@ -4116,6 +4140,16 @@ class GhostAgent:
                             "self_play",
                             "synthetic self-play session ran (new lessons land "
                             "in the skills playbook)")
+                except Exception as _spe:
+                    # NAME self-play in the log (the tick handler's catch-all
+                    # otherwise attributes the crash to "the tick"), then
+                    # RE-RAISE — self-play is the last phase and deliberately
+                    # propagates to the tick handler, with the cooldown anchor
+                    # still moved by the finally below. Contract pinned by
+                    # test_anchor_updates_even_when_self_play_raises (C3).
+                    logger.warning("Self-play phase failed: %s: %s",
+                                   type(_spe).__name__, _spe)
+                    raise
                 finally:
                     ctx.last_activity_time = datetime.datetime.now()
                     self._last_selfplay_at = datetime.datetime.now()
@@ -4129,6 +4163,13 @@ class GhostAgent:
                         except Exception as e:
                             logger.warning(f"Adaptive cooldown lookup failed: {e}")
                             self._current_selfplay_cooldown = self._SELFPLAY_COOLDOWN
+
+        # One durable summary per idle cycle that actually did work (phase-1
+        # journal returns early above and logs itself). Reconstructs the loop:
+        # "idle cycle: ran dream, reflection (idle 42m)".
+        if _idle_ran:
+            logger.info("idle cycle: ran %s (idle %.0fm since last activity)",
+                        ", ".join(_idle_ran), idle_secs / 60.0)
 
     async def process_journal_queue(self, *, respect_idle: bool = True):
         from ..memory.journal import (
@@ -4157,6 +4198,7 @@ class GhostAgent:
         pretty_log("Hippocampus", f"Waking up to process {len(items)} buffered memories...", icon=Icons.BRAIN_THINK)
 
         processed = 0
+        _done_digests = []  # per-item digests for the consolidation summary
         requeue = []  # items that failed upstream-transiently → back to the journal
         for i, item in enumerate(items):
             if respect_idle:
@@ -4173,6 +4215,15 @@ class GhostAgent:
                 elif item["type"] == "post_mortem":
                     await self._execute_post_mortem(item["data"]["user"], item["data"]["tools"], item["data"]["ai"], item["data"]["model"])
                 processed += 1
+                # Digest for the summary line: type + a head of what the item
+                # was about, so "consolidated N memories" names its subjects.
+                try:
+                    _src = str((item.get("data") or {}).get("text")
+                               or (item.get("data") or {}).get("user") or "")
+                    _done_digests.append(
+                        f"{item['type']}: {' '.join(_src.split())[:50]}")
+                except Exception:
+                    _done_digests.append(str(item.get("type", "?")))
             except _RetryableConsolidation as e:
                 # The item was already popped, so dropping it here is
                 # PERMANENT — the fact never reaches memory and nothing
@@ -4204,7 +4255,15 @@ class GhostAgent:
         if requeue:
             await asyncio.to_thread(self.context.journal.push_front, requeue)
         if processed > 0:
-            pretty_log("Hippocampus", f"Successfully consolidated {processed} memories.", icon=Icons.OK)
+            # Name WHAT was consolidated, not just how many (audit B4). The
+            # durable mirror keeps every digest; the stream shows the head.
+            pretty_log(
+                "Hippocampus",
+                f"Consolidated {processed} memor(ies): "
+                + " | ".join(_done_digests[:5])
+                + (f" (+{len(_done_digests) - 5} more)"
+                   if len(_done_digests) > 5 else ""),
+                icon=Icons.OK)
 
     async def run_smart_memory_task(self, interaction_context: str, model_name: str, selectivity: float):
         from ..memory.journal import RetryableConsolidationError as _RetryableConsolidation
@@ -4289,7 +4348,20 @@ class GhostAgent:
                 if getattr(self.context, 'graph_memory', None) and graph_triplets:
                     added = await asyncio.to_thread(self.context.graph_memory.add_triplets, graph_triplets)
                     if added and added > 0:
-                        pretty_log("Graph Updated", f"Mapped {added} topological edges", icon=Icons.MEM_SAVE)
+                        # Show the actual edges, not just a count — the triples
+                        # ARE the knowledge learned this turn.
+                        def _tri(t):
+                            if isinstance(t, dict):
+                                return (f"{t.get('subject', '?')}→"
+                                        f"{t.get('predicate') or t.get('relation', '?')}→"
+                                        f"{t.get('object', '?')}")
+                            if isinstance(t, (list, tuple)) and len(t) >= 3:
+                                return f"{t[0]}→{t[1]}→{t[2]}"
+                            return str(t)[:40]
+                        _sample = "; ".join(_tri(t) for t in graph_triplets[:3])
+                        pretty_log("Graph Updated",
+                                   f"Mapped {added} edge(s): {_sample}",
+                                   icon=Icons.MEM_SAVE)
 
                 if fact is None: fact = ""
                 # A removal / non-ownership fact ("user previously had an
@@ -5308,20 +5380,20 @@ class GhostAgent:
                             f"VISUAL {_vv.verdict.value} "
                             f"({_vv.confidence:.0%}): "
                             f"{(_vv.reasoning or '')[:120]}",
-                            icon=Icons.BRAIN_THINK,
+                            icon=Icons.VERIFIER_LAB,
                         )
                     else:
                         pretty_log(
                             "Verifier",
                             "VISUAL check skipped (vision returned no verdict)",
-                            icon=Icons.BRAIN_THINK,
+                            icon=Icons.VERIFIER_LAB,
                         )
                 else:
                     pretty_log(
                         "Verifier",
                         "VISUAL check skipped (no rendered after-image "
                         f"this turn; before={'yes' if _before_img else 'no'})",
-                        icon=Icons.BRAIN_THINK,
+                        icon=Icons.VERIFIER_LAB,
                     )
         except Exception as _vv_exc:
             pretty_log(
@@ -5348,7 +5420,7 @@ class GhostAgent:
                         "Verifier",
                         "WEB-EXEC check skipped (no loadable entry page "
                         "or navigation failed)",
-                        icon=Icons.BRAIN_THINK,
+                        icon=Icons.VERIFIER_LAB,
                     )
                 else:
                     page_rel, err_block = check
@@ -5367,14 +5439,14 @@ class GhostAgent:
                         pretty_log(
                             "Verifier",
                             f"WEB-EXEC REFUTED: '{page_rel}' throws on load",
-                            icon=Icons.BRAIN_THINK,
+                            icon=Icons.VERIFIER_LAB,
                         )
                     else:
                         pretty_log(
                             "Verifier",
                             f"WEB-EXEC clean: '{page_rel}' loaded with no "
                             f"uncaught exceptions",
-                            icon=Icons.BRAIN_THINK,
+                            icon=Icons.VERIFIER_LAB,
                         )
         except Exception as _wx_exc:
             _wx_inconclusive = True
@@ -5403,7 +5475,7 @@ class GhostAgent:
                 "Verifier",
                 "WEB-EXEC inconclusive → CONFIRMED capped at "
                 f"{self._WEB_EXEC_SKIP_CONF_CAP:.0%} (artifact never executed)",
-                icon=Icons.BRAIN_THINK, level="WARNING",
+                icon=Icons.VERIFIER_LAB, level="WARNING",
             )
         # File-artifact ground-truth override (2026-07-16) — the general form
         # of the web-exec check for NON-web deliverables. If the answer claims
@@ -5434,7 +5506,7 @@ class GhostAgent:
                     pretty_log(
                         "Verifier",
                         f"FILE-ARTIFACT REFUTED: {(_fa.reasoning or '')[:130]}",
-                        icon=Icons.BRAIN_THINK, level="WARNING",
+                        icon=Icons.VERIFIER_LAB, level="WARNING",
                     )
                 else:
                     pretty_log(
@@ -5443,7 +5515,7 @@ class GhostAgent:
                         f"({len(_claimed)} claimed + "
                         f"{len(_to_check) - len(_claimed)} mutated) present "
                         f"+ non-empty",
-                        icon=Icons.BRAIN_THINK,
+                        icon=Icons.VERIFIER_LAB,
                     )
         except Exception as _fa_exc:
             pretty_log(
@@ -5479,7 +5551,7 @@ class GhostAgent:
                     "INTERACTION untested → CONFIRMED capped at "
                     f"{self._WEB_EXEC_SKIP_CONF_CAP:.0%} "
                     "(behavior never exercised)",
-                    icon=Icons.BRAIN_THINK, level="WARNING",
+                    icon=Icons.VERIFIER_LAB, level="WARNING",
                 )
         except Exception as _ic_exc:
             pretty_log(
@@ -5975,6 +6047,10 @@ class GhostAgent:
             stash.move_to_end(trajectory_id)
             while len(stash) > self._SURFACED_TRIG_STASH_MAX:
                 stash.popitem(last=False)
+            logger.info(
+                "lesson-outcome: stashed %d surfaced trigger(s) for traj %s "
+                "(await late verdict)", len(triggers), str(trajectory_id)[:8],
+            )
         except Exception as e:
             logger.debug("record_lesson_outcomes skipped: %s", e)
 
@@ -6018,7 +6094,7 @@ class GhostAgent:
                     "Verifier",
                     "no verdict — turn carried no verifiable evidence "
                     "(bookkeeping-only tools); skipped by design",
-                    icon=Icons.BRAIN_THINK,
+                    icon=Icons.VERIFIER_LAB,
                 )
             elif getattr(getattr(self.context, "verifier", None),
                          "llm_client", None) is None:
@@ -6027,7 +6103,7 @@ class GhostAgent:
                     "Verifier",
                     "no verdict — verifier not attached in this context "
                     "(sim/ablation); skipped by design",
-                    icon=Icons.BRAIN_THINK,
+                    icon=Icons.VERIFIER_LAB,
                 )
             else:
                 # Evidence existed AND a verifier is attached, yet no
@@ -6106,7 +6182,7 @@ class GhostAgent:
                         "Verifier",
                         "identical correction already queued for this "
                         "conversation — not stacking",
-                        icon=Icons.BRAIN_THINK,
+                        icon=Icons.VERIFIER_LAB,
                     )
                 else:
                     self._pending_corrections.append({
@@ -8126,7 +8202,18 @@ class GhostAgent:
                                 last_error_preview = str_res[:60].replace("\n", " ")
                         else:
                             if is_mutating: seen_tools.clear()
-                            pretty_log("Execution Ok", "Script completed with exit code 0", icon=Icons.OK)
+                            # Log the actual OUTPUT on success, not just "exit 0"
+                            # — the script's stdout is the point of running it.
+                            # Durable mirror keeps it (capped so a giant dump
+                            # can't bloat the log); the stream shows the head.
+                            _ok_out = ""
+                            if "STDOUT/STDERR:" in str_res:
+                                _ok_out = str_res.split(
+                                    "STDOUT/STDERR:", 1)[1].strip().replace("\n", " ⏎ ")[:1500]
+                            pretty_log(
+                                "Execution Ok",
+                                "exit 0" + (f" · {_ok_out}" if _ok_out else ""),
+                                icon=Icons.OK)
 
                             # --- SIMULATION SHORT-CIRCUIT ---
                             # In self-play (read-only skill memory
@@ -8429,7 +8516,10 @@ class GhostAgent:
                             return False  # was `continue` — the region is the loop-body tail
 
                     if execution_failure_count >= 6 or total_fail >= 8:
-                        pretty_log("Loop Breaker", "Forcing final response", icon=Icons.STOP)
+                        # Distinct title (was "Loop Breaker", shared by 3
+                        # different events): this is the dispatch-pipeline
+                        # failure cap forcing a final answer.
+                        pretty_log("Failure Cap", "Forcing final response", icon=Icons.STOP)
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed. Provide a final response explaining the situation."})
                         force_final_response = True
                 else:
@@ -9094,7 +9184,7 @@ class GhostAgent:
                     pretty_log(
                         "Verifier",
                         f"REFUTED ({v_result.confidence:.0%}): {issues_str[:120]}",
-                        icon=Icons.BRAIN_THINK,
+                        icon=Icons.VERIFIER_LAB,
                     )
                     # Verifier-driven retraction: the
                     # Perfection-Protocol's `learn_lesson`
@@ -9134,9 +9224,14 @@ class GhostAgent:
                         )
                 else:
                     if v_result:
+                        # Include the REASONING so a CONFIRMED says WHAT it
+                        # confirmed (not just "confirmed 100%") — the durable
+                        # mirror keeps the full text; the stream shows the head.
+                        _vreason = (getattr(v_result, "reasoning", "") or "").strip()
                         pretty_log(
                             "Verifier",
-                            f"{v_result.verdict.value} ({v_result.confidence:.0%})",
+                            f"{v_result.verdict.value} ({v_result.confidence:.0%})"
+                            + (f" — {_vreason}" if _vreason else ""),
                             icon=Icons.VERIFIER_LAB,
                         )
                     else:
@@ -9866,6 +9961,29 @@ class GhostAgent:
         # Deterministically prepend any deferred async-verdict
         # correction staged at turn start (GHOST_CRITIC_ASYNC).
         final_ai_content = self._take_active_correction() + (final_ai_content or "")
+
+        # Consolidated TURN OUTCOME — one grep-able summary per turn so a reader
+        # (or the operator's eye) gets success/fail + confidence + the tools
+        # used, without replaying the whole turn. (Non-streamed path; streamed
+        # turns get their late verdict via _backfill_trajectory_outcome.)
+        try:
+            _verifier_failed = bool(verifier_backfill and verifier_backfill[0] == "failed")
+            _verifier_passed = bool(verifier_backfill and verifier_backfill[0] == "passed")
+            _state = ("failed" if (execution_failure_count > 0 or _verifier_failed)
+                      else ("verified" if _verifier_passed else "ok"))
+            _conf = getattr(getattr(self.context, "last_confidence", None), "composite", None)
+            _tnames = [t.get("name") for t in (tools_run_this_turn or [])
+                       if isinstance(t, dict) and t.get("name")]
+            pretty_log(
+                "Turn Outcome",
+                _state
+                + (f" · confidence {_conf:.2f}" if isinstance(_conf, (int, float)) else "")
+                + (f" · tools: {', '.join(_tnames)}" if _tnames else " · no tools")
+                + f" · {len(final_ai_content or '')} chars",
+                icon=(Icons.FAIL if _state == "failed" else Icons.OK),
+                level=("WARNING" if _state == "failed" else "INFO"))
+        except Exception:
+            pass
         return final_ai_content, created_time, req_id
 
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
@@ -10148,6 +10266,16 @@ class GhostAgent:
                             "escalated": decision.escalated,
                             "reason": decision.reason,
                         }
+                        # Durable diagnostic: this decision gates MCTS lookahead
+                        # + the strategic planner, so it's the "why did/didn't
+                        # deep-reasoning fire" record. INFO (durable-only; a
+                        # per-turn routing call isn't operator-stream news).
+                        logger.info(
+                            "complexity router: %s (confidence %.2f)%s — %s",
+                            decision.label, decision.confidence,
+                            " ESCALATED" if decision.escalated else "",
+                            decision.reason,
+                        )
                 except Exception as e:
                     logger.debug(f"complexity router consultation skipped: {e}")
 
@@ -10828,7 +10956,7 @@ class GhostAgent:
                     # combined cap is 8 total failures of any kind.
                     total_failures = execution_failure_count + transient_failure_count
                     if execution_failure_count >= 6 or total_failures >= 8:
-                        pretty_log("Loop Breaker", f"Strike cap hit (structural={execution_failure_count}, transient={transient_failure_count}). Aborting turn loop.", icon=Icons.STOP)
+                        pretty_log("Strike Cap", f"structural={execution_failure_count}, transient={transient_failure_count} — aborting turn loop.", icon=Icons.STOP)
                         messages.append({"role": "user", "content": "SYSTEM ALERT: You have failed too many times. The task cannot be completed."})
                         if not final_ai_content:
                             final_ai_content = "I hit a hard limit after repeated failures and could not complete this task. Please rephrase or break it into smaller steps."
@@ -12219,7 +12347,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 break
                             messages.append({"role": "user", "content": "SYSTEM ALERT: Your previous turn entered a self-repeating thinking loop and was killed. STOP re-deriving the same paragraph. Do NOT resume hypothesizing from memory — a killed loop means your mental model is missing a fact only OBSERVATION can supply. Your next output must be ONE grounding tool call: execute the code, load the page in the browser, or re-read the exact error/output you are reasoning about — then base the next step on what it returns. If a self-generated test assertion disagrees with your function's output, the TEST is likely wrong — re-read the spec and fix the assertion before changing the function. If you have ALREADY proven the task cannot be solved as specified (e.g. the validator has a structural bug), call `abort_attempt` now with a specific reason. Do not write a long <think> block."})
                             if execution_failure_count >= 6:
-                                pretty_log("Loop Breaker", "Forcing final response after thinking loops", icon=Icons.STOP)
+                                pretty_log("Think-Loop Halt", "Forcing final response after repeated thinking loops", icon=Icons.STOP)
                                 force_final_response = True
                             continue
                     except (httpx.ConnectError, httpx.ConnectTimeout):
@@ -14162,13 +14290,13 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         "Verifier",
                         "stream gate: no verifier attached "
                         "— skipped",
-                        icon=Icons.BRAIN_THINK)
+                        icon=Icons.VERIFIER_LAB)
                 elif not _sv_claim:
                     pretty_log(
                         "Verifier",
                         "stream gate: empty claim after "
                         "think-strip — skipped",
-                        icon=Icons.BRAIN_THINK)
+                        icon=Icons.VERIFIER_LAB)
                 elif _sv_tool is None:
                     pretty_log(
                         "Verifier",
@@ -14176,7 +14304,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         f"in {len(stream_tools_snapshot)} "
                         "record(s) — skipped "
                         "(bookkeeping-only turn)",
-                        icon=Icons.BRAIN_THINK)
+                        icon=Icons.VERIFIER_LAB)
                 else:
                     _sv_task = _glog.spawn_task(
                         self._compute_verifier_verdict(
@@ -14195,7 +14323,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         "stream gate: verdict deferred — "
                         "verifying asynchronously after "
                         "the stream",
-                        icon=Icons.BRAIN_THINK)
+                        icon=Icons.VERIFIER_LAB)
             except Exception as _svx:
                 pretty_log(
                     "Verifier",

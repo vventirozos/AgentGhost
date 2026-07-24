@@ -66,7 +66,12 @@ def _get_connection(connection_string: str):
 async def tool_postgres_admin(action: str = None, connection_string: Optional[str] = None, query: Optional[str] = None, table_name: Optional[str] = None, default_uri: Optional[str] = None, timeout_ms: Optional[int] = None, confirm: bool = False, **kwargs):
     if not action:
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
-    pretty_log("Postgres Admin", f"Action: {action}", icon=Icons.POSTGRES)
+    # Include the SQL itself — the action verb alone ("run_query") can't tell
+    # you what ran. Durable mirror keeps the full statement; stream shows head.
+    _sql = (query or "").strip().replace("\n", " ")
+    pretty_log("Postgres Admin",
+               f"{action}" + (f" · {_sql}" if _sql else ""),
+               icon=Icons.POSTGRES)
     try:
         import psycopg2
         import psycopg2.extras

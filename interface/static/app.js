@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=3.8';
+import * as matrixGraphFace from './matrix_graph.js?v=3.9';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -143,7 +143,8 @@ const ICON_CLASS = {
     '📚': 'memory',   // MEM_INGEST
     '📑': 'memory',   // MEM_SPLIT
     '🔻': 'memory',   // CUT
-    '🧬': 'memory',   // MEM_EMBED / VECTOR_EMBED
+    '🧬': 'memory',   // MEM_EMBED
+    '🧮': 'memory',   // VECTOR_EMBED (de-collided from 🧬 2026-07-24)
     '🧹': 'memory',   // MEM_WIPE
     '📔': 'memory',   // MEM_SCRATCH
     '💪': 'memory',   // MEM_REINFORCE
@@ -153,7 +154,8 @@ const ICON_CLASS = {
     '🧾': 'memory',   // BELIEF_SCALES
     '📶': 'memory',   // THRESHOLD_TUNE
     '🎥': 'memory',   // EPISODE_REEL
-    '📡': 'memory',   // ACTIVITY / EVENT_BUS
+    '📡': 'memory',   // ACTIVITY
+    '🔀': 'memory',   // EVENT_BUS (de-collided from 📡 2026-07-24)
     '👤': 'memory',   // USER_ID
     '🐘': 'memory',   // POSTGRES
 

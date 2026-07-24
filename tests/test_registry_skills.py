@@ -38,16 +38,16 @@ def test_get_active_tool_definitions_with_query(temp_dirs, mock_context):
     }
     mock_context.memory_system.collection = mock_collection
     
-    with patch("ghost_agent.tools.registry.logger.info") as mock_logger_info, \
-         patch("ghost_agent.tools.registry.pretty_log") as mock_pretty_log:
-         
+    with patch("ghost_agent.tools.registry.pretty_log") as mock_pretty_log:
         # Retrieve with query
         definitions = get_active_tool_definitions(mock_context, query="find skill two")
-        
-        # Verify log format: should only load 1 active skill
-        mock_logger_info.assert_called_with("Semantic Toolkit Router injected 1 acquired skills.")
+
+        # One line on both sinks now (the redundant logger.info was removed —
+        # it was 56% of the durable log — and the pretty_log mirror carries it
+        # durably). The line NAMES the injected skill, not just the count.
         assert mock_pretty_log.call_args[0][0] == "Semantic Routing"
-        assert mock_pretty_log.call_args[0][1] == "Loaded 1 skills."
+        assert mock_pretty_log.call_args[0][1].startswith("injected 1:")
+        assert "skill_two" in mock_pretty_log.call_args[0][1]
     
     # Verify natural born tools are there (e.g., file_system)
     tool_names = [d["function"]["name"] for d in definitions]

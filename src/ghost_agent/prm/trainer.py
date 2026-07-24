@@ -280,7 +280,10 @@ class PRMTrainer:
                     "serve-inert features vary in training but read 0 at "
                     "turn-start scoring: " + ", ".join(sorted(skewed))
                 )
-                logger.warning("PRM %s", report.feature_skew_warning)
+                # INFO not WARNING: a known PRM quirk (serve-inert features),
+                # diagnostic not operator-actionable — keep it durable/greppable
+                # but off the operator's WARNING+ pretty stream (fired ~42x).
+                logger.info("PRM %s", report.feature_skew_warning)
         except Exception as exc:
             logger.debug("PRM feature-skew check skipped: %s", exc)
 

@@ -2256,7 +2256,10 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
 
 
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
-    pretty_log("File Write", filename, icon=Icons.TOOL_FILE_W)
+    # Include the size so the log says HOW MUCH was written, not just the path
+    # (a path-only line can't tell an empty write from a 40 KB one).
+    _n = len(content) if isinstance(content, (str, bytes)) else len(str(content or ""))
+    pretty_log("File Write", f"{filename} ({_n} chars)", icon=Icons.TOOL_FILE_W)
     try:
         # Reject a missing/empty payload, or the LITERAL Python None the LLM
         # sometimes emits as a string. Do NOT reject a legitimate file whose
@@ -2504,7 +2507,9 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
     proxy_url = tor_proxy
     mode = "TOR" if proxy_url and "127.0.0.1" in proxy_url else "WEB"
 
-    pretty_log(f"Download [{mode}]", f"{url[:35]}..", icon=Icons.TOOL_DOWN)
+    # Full URL — the [:35] pre-truncation also starved the durable mirror (it
+    # saw 35 chars too). Let the stream truncate; the durable log keeps it whole.
+    pretty_log(f"Download [{mode}]", url, icon=Icons.TOOL_DOWN)
     
     if proxy_url and proxy_url.startswith("socks5://"): 
         proxy_url = proxy_url.replace("socks5://", "socks5h://")
