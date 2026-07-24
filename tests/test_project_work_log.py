@@ -260,7 +260,9 @@ def test_both_paths_call_work_log_helper():
     import inspect
     import ghost_agent.core.agent as agent_mod
     fin = inspect.getsource(agent_mod.GhostAgent._finalize_and_return)
-    hc = inspect.getsource(agent_mod.GhostAgent.handle_chat)
+    # #5 step 4a moved the streamed-path work_log write into _stream_final_generation.
+    hc = (inspect.getsource(agent_mod.GhostAgent.handle_chat)
+          + inspect.getsource(agent_mod.GhostAgent._stream_final_generation))
     assert "_write_project_work_log_safe" in fin
     assert "_write_project_work_log_safe" in hc
 

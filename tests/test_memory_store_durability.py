@@ -224,14 +224,14 @@ def test_inflight_batch_survives_a_crash_mid_drain(tmp_path):
     assert (tmp_path / "memory_journal.inflight.json").exists()
 
     # …and the process is killed here (deploy): a brand-new instance is
-    # the next boot.
+    # the next boot. Recovered work folds to the overflow HEAD (drained
+    # first), so it surfaces via pending_count()/pop_all(), not len(load()).
     reborn = MemoryJournal(tmp_path, max_capacity=10)
-    recovered = reborn.load()
-    assert [e["data"]["text"] for e in recovered] == \
-        ["fact 0", "fact 1", "fact 2"]
+    assert reborn.pending_count() == 3
     # Recovery is one-shot: the staging file is consumed.
     assert not (tmp_path / "memory_journal.inflight.json").exists()
-    assert MemoryJournal(tmp_path, max_capacity=10).load() == recovered
+    assert [e["data"]["text"] for e in reborn.pop_all()] == \
+        ["fact 0", "fact 1", "fact 2"]
 
 
 def test_ack_prevents_replay(tmp_path):
@@ -250,7 +250,7 @@ def test_partial_ack_replays_only_the_unfinished_items(tmp_path):
     taken = j.pop_all()
     j.ack([taken[0]])             # first item consolidated, then crash
 
-    recovered = MemoryJournal(tmp_path, max_capacity=10).load()
+    recovered = MemoryJournal(tmp_path, max_capacity=10).pop_all()
     assert [e["data"]["text"] for e in recovered] == ["two"]
 
 
@@ -264,7 +264,7 @@ def test_next_take_rotates_the_previous_batch_away(tmp_path):
     j.append("smart_memory", {"text": "new"})
     j.pop_all()
 
-    recovered = MemoryJournal(tmp_path, max_capacity=10).load()
+    recovered = MemoryJournal(tmp_path, max_capacity=10).pop_all()
     assert [e["data"]["text"] for e in recovered] == ["new"]
 
 
@@ -294,7 +294,7 @@ def test_recovered_items_go_to_the_front_of_the_queue(tmp_path):
     j.pop_all()
     # A new turn journals something before the restart happens.
     j2 = MemoryJournal(tmp_path, max_capacity=10)   # recovers on construction
-    order = [e["data"]["text"] for e in j2.load()]
+    order = [e["data"]["text"] for e in j2.pop_all()]   # overflow head drains first
     assert order[0] == "in flight"
 
 
@@ -312,7 +312,8 @@ def test_drain_shares_the_inflight_lifecycle(tmp_path):
     j = MemoryJournal(tmp_path, max_capacity=10)
     j.append("post_mortem", {"text": "dream work"})
     assert len(j.drain()) == 1
-    assert len(MemoryJournal(tmp_path, max_capacity=10).load()) == 1
+    # recovered on the next boot to the overflow head → counted by pending_count
+    assert MemoryJournal(tmp_path, max_capacity=10).pending_count() == 1
 
 
 @root_skip
@@ -482,18 +483,21 @@ def test_generic_merge_keys_are_capped_too(tmp_path):
 # =========================================================================
 
 
-def test_capacity_overflow_warns(tmp_path, caplog):
+def test_capacity_overflow_spills_losslessly(tmp_path, caplog):
+    # 2026-07-23: overflow past the hot cap now SPILLS to the overflow file
+    # (drained oldest-first) instead of dropping the oldest. No WARNING — it
+    # is a lossless INFO-level spill, not data loss.
     j = MemoryJournal(tmp_path, max_capacity=3)
     for i in range(3):
         j.append("smart_memory", {"text": f"f{i}"})
     with caplog.at_level(logging.WARNING, logger="GhostAgent"):
         j.append("smart_memory", {"text": "overflow"})
 
-    msgs = " ".join(r.getMessage() for r in caplog.records
-                    if r.levelno >= logging.WARNING)
-    assert "journal is full" in msgs.lower()
-    assert len(j.load()) == 3
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    # hot buffer holds the newest cap; f0 spilled but is NOT lost.
     assert [e["data"]["text"] for e in j.load()] == ["f1", "f2", "overflow"]
+    assert j.pending_count() == 4
+    assert [e["data"]["text"] for e in j.pop_all()] == ["f0", "f1", "f2", "overflow"]
 
 
 def test_no_warning_when_under_capacity(tmp_path, caplog):
@@ -505,9 +509,10 @@ def test_no_warning_when_under_capacity(tmp_path, caplog):
 
 
 def test_push_front_overflow_preserves_retried_items(tmp_path):
-    """core.agent pushes back ``requeue + items[i:]`` — the transient
-    retries sit at the HEAD, and the old ``items[-cap:]`` sliced exactly
-    those off first, destroying what the mechanism exists to protect."""
+    """core.agent pushes back ``requeue + items[i:]`` — the transient retries
+    sit at the HEAD. Since 2026-07-23 push_front folds to the overflow HEAD and
+    is LOSSLESS: everything is retained (past the cap too) and the requeued
+    retries drain FIRST."""
     j = MemoryJournal(tmp_path, max_capacity=3)
     requeue = [
         {"type": "smart_memory", "data": {"text": "retry a"}, "retries": 1},
@@ -519,25 +524,28 @@ def test_push_front_overflow_preserves_retried_items(tmp_path):
     ]
     j.push_front(requeue + unprocessed)
 
-    kept = [e["data"]["text"] for e in j.load()]
-    assert "retry a" in kept and "retry b" in kept
-    assert len(kept) == 3
-    # The remaining slot goes to the most recent unprocessed item.
-    assert kept[-1] == "pending 3"
+    assert j.pending_count() == 6                      # nothing dropped
+    drained = [e["data"]["text"] for e in j.pop_all()]
+    assert drained[:2] == ["retry a", "retry b"]       # retries drain first
+    assert set(drained) == {"retry a", "retry b",
+                            "pending 0", "pending 1", "pending 2", "pending 3"}
 
 
-def test_push_front_without_retry_stamps_keeps_legacy_recency(tmp_path):
+def test_push_front_without_retry_stamps_is_lossless(tmp_path):
     j = MemoryJournal(tmp_path, max_capacity=3)
     items = [{"type": "note", "data": {"n": i}} for i in range(5)]
     j.push_front(items)
-    assert [e["data"]["n"] for e in j.load()] == [2, 3, 4]
+    # Past the hot cap, but nothing dropped — drains in order (overflow head).
+    assert [e["data"]["n"] for e in j.pop_all()] == [0, 1, 2, 3, 4]
 
 
-def test_push_front_under_capacity_is_unchanged(tmp_path):
+def test_push_front_under_capacity_is_drained_front_first(tmp_path):
     j = MemoryJournal(tmp_path, max_capacity=5)
     j.append("tail", {"n": 1})
     j.push_front([{"type": "head", "data": {"n": 0}}])
-    assert [e["type"] for e in j.load()] == ["head", "tail"]
+    # push_front goes to the overflow head (invisible to load(), drained first).
+    assert [e["type"] for e in j.load()] == ["tail"]
+    assert [e["type"] for e in j.pop_all()] == ["head", "tail"]
 
 
 # =========================================================================

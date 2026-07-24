@@ -2251,6 +2251,46 @@ class FinalizeState:
     _verifier_verdict_cache: Any
 
 
+@dataclass
+class StreamState:
+    """Read-only inputs to `_stream_final_generation` (#5 decomposition,
+    step 4a — the client-facing SSE branch). Like `FinalizeState` there are
+    NO mutated fields: the streaming branch early-returns a response tuple,
+    nothing after it reads these locals, and the `stream_wrapper` async
+    generator runs AFTER handle_chat returns — it only READS the captured
+    values (via the method's unpacked locals), never writing back to the
+    caller's frame. The field set is the exact free-variable capture of the
+    two nested closures (`stream_wrapper` + `_stream_then_unregister`),
+    computed with symtable; see PROJECT_JOURNAL.md §4A #5.
+    """
+    created_time: Any
+    current_trajectory_id: Any
+    execution_failure_count: Any
+    fname: Any
+    force_stop: Any
+    forget_was_called: Any
+    has_coding_intent: Any
+    is_final_generation: Any
+    last_user_content: Any
+    last_was_failure: Any
+    lc: Any
+    messages: Any
+    model: Any
+    payload: Any
+    req_id: Any
+    stream_conv_fp: Any
+    stream_messages_snapshot: Any
+    stream_model: Any
+    stream_prefix: Any
+    stream_thought: Any
+    stream_tools_snapshot: Any
+    stream_verify_messages: Any
+    was_complex_task: Any
+    _active_turn: Any
+    _proj_task_closed_this_req: Any
+    _turn_reg: Any
+
+
 class GhostAgent:
     def _rebuild_available_tools(self):
         """Rebuild the dispatch dict from the registry after a lookup miss
@@ -11593,717 +11633,42 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _body_prefix = final_ai_content.strip() + "\n\n" if final_ai_content.strip() else ""
                         stream_prefix = _corr_banner + _body_prefix
 
-                        async def stream_wrapper():
-                            full_content = ""
-                            loop_detected = False
-
-                            # NEW: Flush intermediate text to the UI as the first stream chunk
-                            if stream_prefix:
-                                start_chunk = {
-                                    "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created_time,
-                                    "model": stream_model, "choices": [{"index": 0, "delta": {"content": stream_prefix}, "finish_reason": None}]
-                                }
-                                yield f"data: {json.dumps(start_chunk)}\n\n".encode('utf-8')
-                                full_content += stream_prefix
-
-                            # On a final-generation turn (force_final_response
-                            # or target_tool='none') the model is expected to
-                            # emit plain TEXT — any <tool_call>, <function>
-                            # or <tool_response> in the stream is a bug the
-                            # user should never see. The non-streaming path
-                            # already strips these (the widened end-of-
-                            # handle_chat scrub), but the streaming `yield
-                            # chunk` below ships raw upstream bytes straight
-                            # to the client and nothing downstream can scrub
-                            # them. Trace: the user reported seeing the
-                            # literal `<tool_call><function name="self_play">
-                            # </function></tool_call>` as the assistant's
-                            # reply on a second `run self play` — that was
-                            # this exact path. Scrubbed streaming mirrors the
-                            # non-streaming scrub: accumulate full_content,
-                            # compute the scrubbed view, and emit only the
-                            # new SCRUBBED portion as a synthetic SSE chunk.
-                            # Non-final-generation streams (still in a tool
-                            # loop) keep the old raw-yield behaviour because
-                            # legitimate tool_call XML there has to reach the
-                            # parser downstream.
-                            _stream_scrub_active = bool(is_final_generation)
-                            # When the scrub is active we must also buffer
-                            # upstream's `data: [DONE]\n\n` sentinel until
-                            # AFTER the post-loop fallback check. SSE
-                            # clients close the connection the moment they
-                            # see [DONE], so emitting [DONE] first and the
-                            # fallback second means the user never sees
-                            # the fallback. Observed trace: the
-                            # `Scrub consumed entire response` pretty_log
-                            # fired but the client still rendered empty
-                            # because [DONE] had already reached it. Hold
-                            # [DONE] and emit it once at the very end.
-                            _held_done_chunk = None
-                            # Use `\Z` (absolute end of string) instead of
-                            # `$` as the missing-close-tag alternative. In
-                            # Python's non-MULTILINE mode, `$` matches BOTH
-                            # at end-of-string AND just before a trailing
-                            # newline — so `<tool_call>\n` matches as just
-                            # `<tool_call>`, and the `\n` escapes the scrub.
-                            # That's exactly the bug that left the user
-                            # seeing an empty reply on a second `self play`:
-                            # the model's entire response was
-                            # `<tool_call>...\n</tool_call>`, the scrub
-                            # dropped everything except the trailing `\n`,
-                            # 1 char of whitespace reached the client, and
-                            # the empty-output fallback didn't fire because
-                            # `_scrubbed_emitted_len=1 > len(stream_prefix)=0`.
-                            # `\Z` closes that loophole without affecting any
-                            # closed-tag match.
-                            _stream_scrub_pattern = re.compile(
-                                r'<(tool_call|tool|function|tool_response)\b[^>]*>.*?'
-                                r'(?:</\1\b[^>]*>|\Z)',
-                                flags=re.DOTALL | re.IGNORECASE,
-                            )
-                            _scrubbed_emitted_len = len(full_content) if _stream_scrub_active else 0
-                            # Once ANY '<' appears we must run the full scrub
-                            # regex (a tag might be forming). Until then — the
-                            # common case for a plain-text final answer — the
-                            # sub is a guaranteed no-op, so we skip it and emit
-                            # the raw new tokens. This turns the per-chunk
-                            # O(len(answer)) re-sub into O(1) for tag-free
-                            # answers (the majority of final generations).
-                            _scrub_seen_lt = False
-
-                            # Metacog entropy tracker (roadmap phase 2.2).
-                            # Allocated once per stream; observes one top-K
-                            # logprob vector per chunk that carries one.
-                            # Reading is stashed on the agent context for
-                            # the post-stream composite-confidence check.
-                            _mc_for_stream = getattr(self.context, "metacog", None)
-                            _entropy_tracker = None
-                            # Create the tracker whenever metacog is enabled —
-                            # NOT gated on logprobs_enabled. The post-stream
-                            # confidence calc is logprob-OPTIONAL (phase 2.5):
-                            # token entropy contributes when it flows, but
-                            # competence + verbalised-uncertainty drive the
-                            # score when the per-token logprob stream is sparse
-                            # (speculative decoding / MTP) or disabled. Keeping
-                            # the tracker present means that calc always runs
-                            # and calibration collects a sample every turn.
-                            if (_mc_for_stream is not None
-                                    and getattr(_mc_for_stream, "enabled", False)):
-                                try:
-                                    from .entropy import EntropyTracker
-                                    _entropy_tracker = EntropyTracker(window=32, top_k=5)
-                                except Exception as _etx:
-                                    logger.debug("entropy tracker init failed: %s", _etx)
-
-                            async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
-                                if loop_detected: break
-                                # Cooperative cancel boundary (2026-07-15): the
-                                # turn stays registered for the whole drain now,
-                                # so /api/turn/cancel can flag it mid-stream —
-                                # stop emitting on the next chunk. Finalization
-                                # after the loop still runs on the partial text.
-                                if _turn_reg.is_cancelled(req_id):
-                                    break
-                                self.context.last_activity_time = datetime.datetime.now() # Heartbeat
-
-                                # Decode FIRST so we can decide whether to
-                                # yield the raw chunk or substitute a
-                                # scrubbed synthetic chunk. Non-data chunks
-                                # (e.g. `data: [DONE]`) always pass through
-                                # unchanged.
-                                _is_content_chunk = False
-                                _new_text = ""
-                                try:
-                                    chunk_str = chunk.decode("utf-8")
-                                    if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
-                                        chunk_data = json.loads(chunk_str[6:])
-                                        # Upstream abort frame (no "choices"): the
-                                        # final answer was cut off mid-stream. The
-                                        # frame passes through to the client and
-                                        # the finalize verifier gate REFUTES the
-                                        # partial, but log it so a truncated
-                                        # user-facing answer isn't a silent gap.
-                                        if "error" in chunk_data and "choices" not in chunk_data:
-                                            pretty_log(
-                                                "Stream Aborted",
-                                                "Upstream aborted the FINAL answer "
-                                                f"mid-stream: {str(chunk_data.get('error'))[:200]}",
-                                                level="WARNING", icon=Icons.WARN,
-                                            )
-                                        if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
-                                            delta = chunk_data["choices"][0].get("delta", {})
-                                            if "content" in delta and delta["content"] is not None:
-                                                _is_content_chunk = True
-                                                _new_text = delta["content"]
-                                                full_content += _new_text
-                                            # Metacog: pipe top-logprobs into
-                                            # the entropy tracker. Lives in
-                                            # the same try/except as the
-                                            # content decode so a malformed
-                                            # logprobs payload never breaks
-                                            # the stream — the tracker just
-                                            # skips that chunk.
-                                            if _entropy_tracker is not None:
-                                                try:
-                                                    from .entropy import extract_top_logprobs
-                                                    _top_lps = extract_top_logprobs(chunk_data)
-                                                    if _top_lps:
-                                                        _entropy_tracker.observe(_top_lps)
-                                                except Exception as _etxx:
-                                                    logger.debug(
-                                                        "entropy observe failed: %s",
-                                                        _etxx,
-                                                    )
-                                except Exception as e:
-                                    logger.debug(f"Stream chunk decode error: {type(e).__name__}")
-
-                                if _stream_scrub_active and _is_content_chunk:
-                                    # Emit only the NEW portion of the
-                                    # scrubbed view. If the model is
-                                    # currently mid-<tool_call>, the
-                                    # non-greedy pattern won't match until
-                                    # the close tag arrives — so `scrubbed`
-                                    # stops growing during a tool_call body
-                                    # and resumes once the close lands,
-                                    # with the whole block removed. Net
-                                    # effect: the client sees clean text
-                                    # and never sees the XML flicker past.
-                                    if not _scrub_seen_lt and "<" in full_content[_scrubbed_emitted_len:]:
-                                        _scrub_seen_lt = True
-                                    if _scrub_seen_lt:
-                                        _scrubbed_view = _stream_scrub_pattern.sub('', full_content)
-                                    else:
-                                        # No '<' anywhere yet → the sub is a
-                                        # no-op; the scrubbed view equals the
-                                        # raw buffer. Skip the O(n) regex.
-                                        _scrubbed_view = full_content
-                                    _to_emit = _scrubbed_view[_scrubbed_emitted_len:]
-                                    if _to_emit:
-                                        _synthetic = {
-                                            "id": f"chatcmpl-{req_id}",
-                                            "object": "chat.completion.chunk",
-                                            "created": created_time,
-                                            "model": stream_model,
-                                            "choices": [{
-                                                "index": 0,
-                                                "delta": {"content": _to_emit},
-                                                "finish_reason": None,
-                                            }],
-                                        }
-                                        yield f"data: {json.dumps(_synthetic)}\n\n".encode('utf-8')
-                                        _scrubbed_emitted_len = len(_scrubbed_view)
-                                    # Skip the raw chunk — we already
-                                    # emitted the scrubbed equivalent.
-                                elif _stream_scrub_active and not _is_content_chunk:
-                                    # Non-content chunk on the scrub path.
-                                    # The [DONE] sentinel must be held back
-                                    # so the fallback (emitted AFTER this
-                                    # loop) reaches the client before the
-                                    # SSE stream closes. Every other non-
-                                    # content chunk passes through.
-                                    try:
-                                        _chunk_str = chunk.decode("utf-8")
-                                    except Exception:
-                                        _chunk_str = ""
-                                    if _chunk_str.strip() == "data: [DONE]":
-                                        _held_done_chunk = chunk
-                                    else:
-                                        yield chunk
-                                else:
-                                    # Non-scrub path (mid-tool-loop stream,
-                                    # or non-content chunk): pass raw upstream
-                                    # bytes through as before.
-                                    yield chunk
-
-                                # Cognitive Watchdog — tightened to reduce false positives
-                                # on legitimate repetitive output (lists, tables, error
-                                # traces). Now requires a longer window (400 chars) and
-                                # a longer repeating motif (60 chars) seen 5+ times before
-                                # severing the stream.
-                                if _is_content_chunk and ("\n" in _new_text or "?" in _new_text):
-                                    tail = full_content[-400:]
-                                    if len(tail) == 400:
-                                        last_60 = tail[-60:]
-                                        if last_60.strip() and tail.count(last_60) >= 5:
-                                            pretty_log("Cognitive Watchdog", "Infinite <think> loop detected. Severing stream.", level="WARNING", icon=Icons.STOP)
-                                            loop_detected = True
-                                            break_text = "\n</think>\n<tool_call>\n<function name=\"replan\">\n<parameter name=\"reason\">SYSTEM OVERRIDE: My internal monologue got stuck in an infinite loop. I am forcing a strategy reset.</parameter>\n</function>\n</tool_call>"
-                                            break_chunk = {
-                                                "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created_time,
-                                                "model": stream_model, "choices": [{"index": 0, "delta": {"content": break_text}, "finish_reason": None}]
-                                            }
-                                            yield f"data: {json.dumps(break_chunk)}\n\n".encode('utf-8')
-                                            full_content += break_text
-
-                            # --- SCRUBBED-STREAM EMPTY-OUTPUT FALLBACK ---
-                            # If the scrub was active and swallowed EVERY
-                            # content chunk (i.e. the whole upstream response
-                            # was <tool_call>/<function> XML), the client has
-                            # received zero visible text beyond the prefix.
-                            # Before this fallback, the user saw a blank reply
-                            # — which is what happened on the user's third
-                            # `self play` invocation: the planner routed it as
-                            # text-only (target_tool='none'), the model emitted
-                            # a pure tool_call, the scrub stripped it, and the
-                            # SSE stream closed with nothing in it. Emit a
-                            # synthetic fallback so the user sees SOMETHING
-                            # actionable instead of an empty bubble.
-                            if (
-                                _stream_scrub_active
-                                and full_content.strip()
-                                and len(full_content.strip()) > len(stream_prefix.strip())
-                                and _scrubbed_emitted_len <= len(stream_prefix)
-                            ):
-                                _intended = ""
-                                _fn_m = re.search(
-                                    r'<function(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_]+)',
-                                    full_content,
-                                    re.IGNORECASE,
-                                )
-                                if _fn_m:
-                                    _intended = _fn_m.group(1)
-
-                                # The "cycle already completed" branch that
-                                # used to live here was retired once terminal
-                                # tools (self_play, dream_mode) started
-                                # bypassing the summary LLM turn entirely —
-                                # see the DIRECT-FROM-TOOL SUMMARY block in
-                                # the tool-execution path. That path now
-                                # writes directly to `final_ai_content` and
-                                # flips `force_stop`, so we never reach this
-                                # stream-scrub fallback when a terminal tool
-                                # ran in the same handle_chat. This
-                                # single-branch fallback handles only the
-                                # remaining case: the planner routed the
-                                # turn as text-only but the model still
-                                # emitted a tool_call.
-                                # When the turn was finalized BECAUSE a project
-                                # task closed this turn (one-task-per-turn gate),
-                                # the scrubbed tool_call was the model trying to
-                                # barrel into the next task — say that honestly
-                                # rather than telling the user to "rephrase" a
-                                # request that already succeeded.
-                                _fallback_text = _scrub_fallback_message(
-                                    _intended, _proj_task_closed_this_req)
-                                _fallback_chunk = {
-                                    "id": f"chatcmpl-{req_id}",
-                                    "object": "chat.completion.chunk",
-                                    "created": created_time,
-                                    "model": stream_model,
-                                    "choices": [{
-                                        "index": 0,
-                                        "delta": {"content": _fallback_text},
-                                        "finish_reason": None,
-                                    }],
-                                }
-                                yield f"data: {json.dumps(_fallback_chunk)}\n\n".encode('utf-8')
-                                if _proj_task_closed_this_req:
-                                    # Expected: the one-task gate finalized the
-                                    # turn and dropped the model's attempt to
-                                    # start the next task. Not a problem — log
-                                    # at INFO so it doesn't read as an error.
-                                    pretty_log(
-                                        "One Task / Turn",
-                                        f"Stopped after a task closed; dropped the model's "
-                                        f"next-task {_intended or 'tool'} call — awaiting user go-ahead.",
-                                        level="INFO", icon=Icons.BRAIN_PLAN,
-                                    )
-                                else:
-                                    pretty_log(
-                                        "Stream Scrub Fallback",
-                                        f"Scrub consumed entire response (intended={_intended or 'unknown'}); emitted fallback.",
-                                        level="WARNING", icon=Icons.WARN,
-                                    )
-
-                            # Release any held [DONE] sentinel now that
-                            # (a) all content chunks have been emitted and
-                            # (b) the fallback has had its chance to fire.
-                            # Without this, the SSE stream would never
-                            # terminate cleanly on the scrub path when no
-                            # [DONE] is yielded elsewhere.
-                            if _held_done_chunk is not None:
-                                yield _held_done_chunk
-
-                            # Metacog: compute this turn's composite confidence
-                            # (logprob-OPTIONAL — phase 2.5). The entropy term
-                            # is used when the window observed tokens; otherwise
-                            # it is neutral (0.5) and competence + verbalised
-                            # uncertainty drive the score. Runs on every metacog
-                            # turn so calibration always records a sample, even
-                            # on speculative-decoding / no-logprobs upstreams.
-                            if _entropy_tracker is not None:
-                                try:
-                                    _reading = _entropy_tracker.reading()
-                                    if _reading is not None:
-                                        if _reading.n > 0:
-                                            self.context.last_entropy_reading = _reading
-                                        # Composite confidence (roadmap
-                                        # phase 2.4). Fuse entropy with the
-                                        # per-domain competence prior for
-                                        # the most-recently-dispatched tool.
-                                        # The result is logged and stashed
-                                        # on the context so observability
-                                        # and downstream gating share one
-                                        # source of truth. Tool name comes
-                                        # from `fname` if set this turn,
-                                        # otherwise falls back to a global
-                                        # roll-up via domain="other".
-                                        _mc_conf = getattr(self.context, "metacog", None)
-                                        if (_mc_conf is not None
-                                                and getattr(_mc_conf, "confidence", None) is not None
-                                                and getattr(_mc_conf, "competence", None) is not None):
-                                            try:
-                                                from .metacog import _domain_for_tool
-                                                _dom = _domain_for_tool(fname or "")
-                                                _p = _mc_conf.competence.estimate(_dom, fname or None)
-                                                _n = _mc_conf.competence.observations(_dom, fname or None)
-                                                # Verbalised-uncertainty pressure
-                                                # (core.uncertainty) — fuses the
-                                                # "agent said it was unsure" track
-                                                # into the composite. No-op until
-                                                # the calibration spine fits λ > 0.
-                                                _upress = 0.0
-                                                try:
-                                                    _utk = getattr(self.context, "uncertainty_tracker", None)
-                                                    if _utk is not None:
-                                                        _upress = _utk.pressure()
-                                                except Exception:
-                                                    _upress = 0.0
-                                                # Entropy term is neutral (0.5)
-                                                # when the window is empty, so
-                                                # competence + uncertainty drive
-                                                # the score on logprob-starved
-                                                # upstreams instead of suppressing
-                                                # the whole reading.
-                                                _norm = _reading.norm if _reading.n > 0 else 0.5
-                                                _cr = _mc_conf.confidence.score(
-                                                    normalised_entropy=_norm,
-                                                    competence_p_success=_p,
-                                                    n_observations=_n,
-                                                    uncertainty_pressure=_upress,
-                                                )
-                                                self.context.last_confidence = _cr
-                                                # Stash for the turn-end calibration
-                                                # record (paired with the realized
-                                                # outcome). Last reading of the turn
-                                                # wins — that's the one we score
-                                                # against the turn's outcome.
-                                                # Tagged with THIS request's id: the
-                                                # SSE drain runs after the semaphore
-                                                # is released, so this write can land
-                                                # mid-turn-B — the tag lets B's
-                                                # finalize reject a reading that
-                                                # isn't its own instead of pairing
-                                                # A's confidence with B's outcome.
-                                                self.context._calib_pending = (req_id, _cr)
-                                                # Push the reading into the
-                                                # bundle so the mid-turn
-                                                # arbiter gate (consulted
-                                                # at the next tool dispatch)
-                                                # has authoritative state to
-                                                # decide on. Without this
-                                                # push the gate would never
-                                                # fire — it reads from the
-                                                # bundle, not the context.
-                                                try:
-                                                    _mc_conf.record_confidence(_cr)
-                                                    _mc_conf.count(
-                                                        confidence_total=True,
-                                                        confidence_below=_cr.below_threshold,
-                                                    )
-                                                except Exception as _crx:
-                                                    logger.debug(
-                                                        "metacog record_confidence failed: %s",
-                                                        _crx,
-                                                    )
-                                                # Log noise control: per-turn
-                                                # confidence readings are
-                                                # high-volume. We only want
-                                                # INFO for the actionable
-                                                # case (below threshold —
-                                                # the arbiter is now armed
-                                                # for the next mutating
-                                                # dispatch). Above-threshold
-                                                # readings drop to DEBUG so
-                                                # monitoring greps stay
-                                                # signal-rich.
-                                                from .metacog_log import (
-                                                    emit as _mc_emit,
-                                                    Subsystem as _mc_ss,
-                                                    LEVEL_INFO, LEVEL_DEBUG,
-                                                )
-                                                _mc_emit(
-                                                    _mc_ss.CONF,
-                                                    level=(LEVEL_INFO if _cr.below_threshold
-                                                           else LEVEL_DEBUG),
-                                                    below=_cr.below_threshold,
-                                                    C=_cr.composite,
-                                                    entropy=_cr.entropy_component,
-                                                    competence=_cr.competence_component,
-                                                    n=_n,
-                                                    domain=_dom,
-                                                    tool=fname or None,
-                                                    ent_obs=_reading.n,
-                                                    threshold=_cr.threshold,
-                                                )
-                                            except Exception as _cex:
-                                                logger.debug(
-                                                    "metacog confidence score failed: %s",
-                                                    _cex,
-                                                )
-                                        logger.debug(
-                                            "metacog entropy: norm=%.3f (n=%d)",
-                                            _reading.norm, _reading.n,
-                                        )
-                                except Exception as _erx:
-                                    logger.debug("entropy stash failed: %s", _erx)
-
-                            # Internal (sub-/sched-) requests never feed smart
-                            # memory: machine-generated prompts (chess FENs,
-                            # job payloads) polluted retrieval AND their
-                            # worker-side extract/scoring calls (max_tokens
-                            # 3072) kept nova busy enough to time out the next
-                            # request's routing calls (2026-07-12).
-                            from .autonomous_activity import (
-                                is_internal_request as _is_int_req_m1)
-                            if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id):
-                                micro_msgs = []
-                                for m in [msg for msg in stream_messages_snapshot if msg.get("role") in ["user", "assistant"]][-4:]:
-                                    role = m.get("role", "user").upper()
-                                    clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")), flags=re.DOTALL)
-                                    micro_msgs.append(f"{role}: {clean_content[:500].strip()}")
-                                clean_ai = re.sub(r'```.*?```', '', full_content, flags=re.DOTALL)
-                                recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
-                                if getattr(self.context, 'journal', None):
-
-                                    await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': stream_model})
-
-                            # --- EXTRACT & LOG INTERNAL THINKING (STREAM) ---
-                            think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', full_content, flags=re.DOTALL | re.IGNORECASE)
-                            for think_text in think_matches:
-                                clean_think = think_text.strip()
-                                if clean_think:
-                                    ui_think = clean_think.replace('\n', ' | ')
-                                    logger.info(f"PLANNER MONOLOGUE: {ui_think}")
-
-                                    timestamp = datetime.datetime.now().strftime('%H:%M:%S')
-                                    print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*15} AGENT INTERNAL THINKING {'='*15}", flush=True)
-                                    for line in clean_think.split('\n'):
-                                        if line.strip():
-                                            print(f"[INFO ] 💭 {timestamp} - [{req_id}] {line.strip()}", flush=True)
-                                    print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*55}", flush=True)
-
-                            if was_complex_task or execution_failure_count > 0:
-                                if not force_stop or "READY TO FINALIZE" in stream_thought.upper():
-                                    # Gated on `--smart-memory > 0.0` to honour
-                                    # the contract in CLAUDE.md ("Memory writes
-                                    # are gated on --smart-memory / --no-memory").
-                                    # Without this, a `--smart-memory 0.0` run
-                                    # still queued post_mortem entries → phase 1
-                                    # consumer → SkillMemory.learn_lesson, leaking
-                                    # auto-extracted lessons into the playbook on
-                                    # every complex/failing turn.
-                                    if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
-
-                                        await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
-                                    await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
-
-                            # Post-turn hydration usefulness judge (fire-and-
-                            # forget, worker-hosted) — every finalized turn,
-                            # matching the non-streaming site.
-                            self._judge_hydration_safe(
-                                full_content, turn_id=str(req_id or ""))
-
-                            # Streamed-turn trajectory + work_log (2026-07-20 H1).
-                            # A streamed forced-final turn RETURNS the SSE
-                            # generator before `_finalize_and_return` ever runs,
-                            # so `_record_turn_trajectory` and the project
-                            # work_log — both sole-called from finalize — never
-                            # fired for streamed turns: no corpus record (dead
-                            # user-correction loop + abort detection) and no
-                            # project work_log (the "forgets project work" gap).
-                            # Web UI always streams AND one-task-per-turn forces
-                            # this ending on task-closing turns, so this is the
-                            # COMMON case, not an edge. Record here directly with
-                            # the real `full_content` (the earlier finalize-time
-                            # backfill was inert — it keyed off a trajectory
-                            # finalize never wrote). The verifier runs LATE below
-                            # and backfills the outcome by `current_trajectory_id`,
-                            # so pass verifier=None here.
-                            try:
-                                if (isinstance(full_content, str)
-                                        and full_content.strip()):
-                                    self._record_turn_trajectory(
-                                        messages=messages,
-                                        final_content=full_content,
-                                        req_id=req_id,
-                                        model=model,
-                                        trajectory_id=current_trajectory_id,
-                                        user_request=last_user_content,
-                                        verifier=None,
-                                        execution_failed=(
-                                            execution_failure_count > 0
-                                            and bool(last_was_failure)),
-                                    )
-                            except Exception as _sbf_exc:
-                                logger.debug(
-                                    "streamed trajectory record skipped: %s",
-                                    _sbf_exc)
-                            # Project work_log — same helper finalize uses. No
-                            # synchronous verdict on the stream path (verifier is
-                            # late), so the outcome is execution-based here.
-                            await self._write_project_work_log_safe(
-                                last_user_content=last_user_content,
-                                final_ai_content=full_content,
-                                execution_failure_count=execution_failure_count,
-                                verifier_backfill=None,
-                            )
-
-                            # --- VERIFIER GATE (STREAM), 2026-07-18 ---
-                            # The gated verdict was historically invoked only
-                            # from _finalize_and_return — the NON-streaming
-                            # finalization — so every streamed answer shipped
-                            # unverified, with no log line of any kind (found
-                            # when the operator asked why a turn had no
-                            # verdict and the USR2 task dump showed none).
-                            # The text is already out, so an inline verdict
-                            # could never amend it: the verdict ALWAYS runs
-                            # late here, regardless of GHOST_CRITIC_ASYNC —
-                            # spawn the pure computation and hand it to the
-                            # late handler (logs every outcome, scrubs
-                            # poisoned lessons, backfills the trajectory).
-                            # force_correction=True because a streamed reply
-                            # never carries an inline Verifier note — a
-                            # high-conf REFUTED queues a banner that the next
-                            # stream already prepends via
-                            # _take_active_correction. Skipped when the turn
-                            # carried no verifiable evidence (toolless chat):
-                            # spawning there adds only a no-op task and a
-                            # noise line per message. The claim strips
-                            # <think> blocks — they streamed to the client
-                            # but are not part of the answer, and they would
-                            # eat the verifier's 2000-char claim budget.
-                            # Every branch is LOUD (log-only, INFO): the
-                            # first live deploy produced total silence on
-                            # streamed project turns and none of the debug
-                            # channels are captured at INFO — a gate whose
-                            # skip reasons are invisible cannot be
-                            # distinguished from a gate that never ran
-                            # (same lesson as _on_done's once-silent
-                            # exception path).
-                            try:
-                                _sv_claim = re.sub(
-                                    r'<think>.*?(?:</think>|$)', '',
-                                    full_content,
-                                    flags=re.DOTALL | re.IGNORECASE,
-                                ).strip()
-                                _sv_tool = _find_substantive_tool_for_verifier(
-                                    stream_tools_snapshot)
-                                if getattr(self.context.args,
-                                           "no_verifier", False):
-                                    pass  # ablation off-switch: silent
-                                elif getattr(self.context, "verifier",
-                                             None) is None:
-                                    pretty_log(
-                                        "Verifier",
-                                        "stream gate: no verifier attached "
-                                        "— skipped",
-                                        icon=Icons.BRAIN_THINK)
-                                elif not _sv_claim:
-                                    pretty_log(
-                                        "Verifier",
-                                        "stream gate: empty claim after "
-                                        "think-strip — skipped",
-                                        icon=Icons.BRAIN_THINK)
-                                elif _sv_tool is None:
-                                    pretty_log(
-                                        "Verifier",
-                                        "stream gate: no substantive tool "
-                                        f"in {len(stream_tools_snapshot)} "
-                                        "record(s) — skipped "
-                                        "(bookkeeping-only turn)",
-                                        icon=Icons.BRAIN_THINK)
-                                else:
-                                    _sv_task = _glog.spawn_task(
-                                        self._compute_verifier_verdict(
-                                            tools_run_this_turn=stream_tools_snapshot,
-                                            messages=stream_verify_messages,
-                                            final_ai_content=_sv_claim,
-                                            last_user_content=last_user_content,
-                                            lc=lc,
-                                        ))
-                                    self._attach_late_verdict_handler(
-                                        _sv_task, current_trajectory_id,
-                                        stream_conv_fp,
-                                        force_correction=True)
-                                    pretty_log(
-                                        "Verifier",
-                                        "stream gate: verdict deferred — "
-                                        "verifying asynchronously after "
-                                        "the stream",
-                                        icon=Icons.BRAIN_THINK)
-                            except Exception as _svx:
-                                pretty_log(
-                                    "Verifier",
-                                    "stream gate spawn failed: "
-                                    f"{type(_svx).__name__}: "
-                                    f"{str(_svx)[:160]}",
-                                    icon=Icons.WARN, level="WARNING")
-
-                            # Retrieval feedback loop: credit lessons that
-                            # were surfaced during this turn whenever the
-                            # turn finished without an execution failure.
-                            # `credit_recent_retrievals` is idempotent per
-                            # retrieval (via `last_credited_at`) and only
-                            # touches lessons whose `last_retrieved_at`
-                            # falls inside the window, so calling it on
-                            # turns that didn't surface any lesson is a
-                            # no-op. The previous gate
-                            # (`was_complex_task or execution_failure_count
-                            # > 0`) excluded simple successful tool turns
-                            # — exactly the population where lessons are
-                            # most likely to be helping — so the feedback
-                            # signal was biased toward complex tasks and
-                            # the pruner drifted accordingly.
-                            sm = getattr(self.context, 'skill_memory', None)
-                            if sm is not None and execution_failure_count == 0:
-                                try:
-                                    if hasattr(sm, 'credit_recent_retrievals'):
-                                        # Discriminative form — see the
-                                        # finalize-path call for rationale.
-                                        await asyncio.to_thread(
-                                            sm.credit_recent_retrievals, 300,
-                                            query=str(last_user_content or ""),
-                                            top_triggers=list(
-                                                getattr(sm, "last_playbook_triggers", []) or []),
-                                        )
-                                except Exception:
-                                    pass
-
-                        # Keep THIS turn registered — visible in /api/turns and
-                        # cancellable — for the WHOLE streamed drain, then
-                        # unregister when the client finishes reading. The outer
-                        # finally used to unregister the instant handle_chat
-                        # returned this generator (before a single token
-                        # streamed), so the tail was invisible + uncancellable
-                        # and could overlap the next turn (2026-07-15). The
-                        # agent_semaphore is deliberately NOT held across the
-                        # drain: stream_chat_completion already counts
-                        # foreground_tasks for the whole stream (the single LLM
-                        # slot isn't stolen), and holding the permit would couple
-                        # turn serialization to CLIENT read speed — a stalled
-                        # reader would then block every later turn.
+                        ss = StreamState(
+                            created_time=created_time,
+                            current_trajectory_id=current_trajectory_id,
+                            execution_failure_count=execution_failure_count,
+                            fname=fname,
+                            force_stop=force_stop,
+                            forget_was_called=forget_was_called,
+                            has_coding_intent=has_coding_intent,
+                            is_final_generation=is_final_generation,
+                            last_user_content=last_user_content,
+                            last_was_failure=last_was_failure,
+                            lc=lc,
+                            messages=messages,
+                            model=model,
+                            payload=payload,
+                            req_id=req_id,
+                            stream_conv_fp=stream_conv_fp,
+                            stream_messages_snapshot=stream_messages_snapshot,
+                            stream_model=stream_model,
+                            stream_prefix=stream_prefix,
+                            stream_thought=stream_thought,
+                            stream_tools_snapshot=stream_tools_snapshot,
+                            stream_verify_messages=stream_verify_messages,
+                            was_complex_task=was_complex_task,
+                            _active_turn=_active_turn,
+                            _proj_task_closed_this_req=_proj_task_closed_this_req,
+                            _turn_reg=_turn_reg,
+                        )
+                        # WRITE-BACK (not a captured read): the streaming path
+                        # defers the turn-unregister to _stream_then_unregister's
+                        # finally (runs when the client finishes the drain), so
+                        # handle_chat's OWN finally must skip it. This flag lives
+                        # in handle_chat's frame; the identical assignment inside
+                        # _stream_final_generation only sets a dead method local.
                         _stream_owns_unregister = True
-
-                        async def _stream_then_unregister(_gen):
-                            try:
-                                async for _chunk in _gen:
-                                    yield _chunk
-                            finally:
-                                _turn_reg.unregister(req_id, _active_turn)
-
-                        return (_stream_then_unregister(stream_wrapper()),
-                                created_time, req_id)
+                        return self._stream_final_generation(ss)
 
                     # Ensure msg is always defined in this scope
                     msg = {"role": "assistant", "content": "", "tool_calls": []}
@@ -14049,6 +13414,754 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 pass
 
         task.add_done_callback(_log_post_turn_reflection_result)
+
+
+    def _stream_final_generation(self, ss: "StreamState"):
+        # #5 step 4a: the client-facing SSE branch, extracted verbatim from
+        # handle_chat. This is SYNC (like the original inline branch): it only
+        # DEFINES the nested async generators and returns the response tuple —
+        # no top-level await — so handle_chat returns the tuple directly.
+        # handle_chat. Captures are unpacked from ss (symtable free-var set);
+        # the stream_wrapper generator runs AFTER handle_chat returns, so every
+        # frame local it closes over MUST arrive via ss.
+        created_time = ss.created_time
+        current_trajectory_id = ss.current_trajectory_id
+        execution_failure_count = ss.execution_failure_count
+        fname = ss.fname
+        force_stop = ss.force_stop
+        forget_was_called = ss.forget_was_called
+        has_coding_intent = ss.has_coding_intent
+        is_final_generation = ss.is_final_generation
+        last_user_content = ss.last_user_content
+        last_was_failure = ss.last_was_failure
+        lc = ss.lc
+        messages = ss.messages
+        model = ss.model
+        payload = ss.payload
+        req_id = ss.req_id
+        stream_conv_fp = ss.stream_conv_fp
+        stream_messages_snapshot = ss.stream_messages_snapshot
+        stream_model = ss.stream_model
+        stream_prefix = ss.stream_prefix
+        stream_thought = ss.stream_thought
+        stream_tools_snapshot = ss.stream_tools_snapshot
+        stream_verify_messages = ss.stream_verify_messages
+        was_complex_task = ss.was_complex_task
+        _active_turn = ss._active_turn
+        _proj_task_closed_this_req = ss._proj_task_closed_this_req
+        _turn_reg = ss._turn_reg
+
+        async def stream_wrapper():
+            full_content = ""
+            loop_detected = False
+
+            # NEW: Flush intermediate text to the UI as the first stream chunk
+            if stream_prefix:
+                start_chunk = {
+                    "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created_time,
+                    "model": stream_model, "choices": [{"index": 0, "delta": {"content": stream_prefix}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(start_chunk)}\n\n".encode('utf-8')
+                full_content += stream_prefix
+
+            # On a final-generation turn (force_final_response
+            # or target_tool='none') the model is expected to
+            # emit plain TEXT — any <tool_call>, <function>
+            # or <tool_response> in the stream is a bug the
+            # user should never see. The non-streaming path
+            # already strips these (the widened end-of-
+            # handle_chat scrub), but the streaming `yield
+            # chunk` below ships raw upstream bytes straight
+            # to the client and nothing downstream can scrub
+            # them. Trace: the user reported seeing the
+            # literal `<tool_call><function name="self_play">
+            # </function></tool_call>` as the assistant's
+            # reply on a second `run self play` — that was
+            # this exact path. Scrubbed streaming mirrors the
+            # non-streaming scrub: accumulate full_content,
+            # compute the scrubbed view, and emit only the
+            # new SCRUBBED portion as a synthetic SSE chunk.
+            # Non-final-generation streams (still in a tool
+            # loop) keep the old raw-yield behaviour because
+            # legitimate tool_call XML there has to reach the
+            # parser downstream.
+            _stream_scrub_active = bool(is_final_generation)
+            # When the scrub is active we must also buffer
+            # upstream's `data: [DONE]\n\n` sentinel until
+            # AFTER the post-loop fallback check. SSE
+            # clients close the connection the moment they
+            # see [DONE], so emitting [DONE] first and the
+            # fallback second means the user never sees
+            # the fallback. Observed trace: the
+            # `Scrub consumed entire response` pretty_log
+            # fired but the client still rendered empty
+            # because [DONE] had already reached it. Hold
+            # [DONE] and emit it once at the very end.
+            _held_done_chunk = None
+            # Use `\Z` (absolute end of string) instead of
+            # `$` as the missing-close-tag alternative. In
+            # Python's non-MULTILINE mode, `$` matches BOTH
+            # at end-of-string AND just before a trailing
+            # newline — so `<tool_call>\n` matches as just
+            # `<tool_call>`, and the `\n` escapes the scrub.
+            # That's exactly the bug that left the user
+            # seeing an empty reply on a second `self play`:
+            # the model's entire response was
+            # `<tool_call>...\n</tool_call>`, the scrub
+            # dropped everything except the trailing `\n`,
+            # 1 char of whitespace reached the client, and
+            # the empty-output fallback didn't fire because
+            # `_scrubbed_emitted_len=1 > len(stream_prefix)=0`.
+            # `\Z` closes that loophole without affecting any
+            # closed-tag match.
+            _stream_scrub_pattern = re.compile(
+                r'<(tool_call|tool|function|tool_response)\b[^>]*>.*?'
+                r'(?:</\1\b[^>]*>|\Z)',
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            _scrubbed_emitted_len = len(full_content) if _stream_scrub_active else 0
+            # Once ANY '<' appears we must run the full scrub
+            # regex (a tag might be forming). Until then — the
+            # common case for a plain-text final answer — the
+            # sub is a guaranteed no-op, so we skip it and emit
+            # the raw new tokens. This turns the per-chunk
+            # O(len(answer)) re-sub into O(1) for tag-free
+            # answers (the majority of final generations).
+            _scrub_seen_lt = False
+
+            # Metacog entropy tracker (roadmap phase 2.2).
+            # Allocated once per stream; observes one top-K
+            # logprob vector per chunk that carries one.
+            # Reading is stashed on the agent context for
+            # the post-stream composite-confidence check.
+            _mc_for_stream = getattr(self.context, "metacog", None)
+            _entropy_tracker = None
+            # Create the tracker whenever metacog is enabled —
+            # NOT gated on logprobs_enabled. The post-stream
+            # confidence calc is logprob-OPTIONAL (phase 2.5):
+            # token entropy contributes when it flows, but
+            # competence + verbalised-uncertainty drive the
+            # score when the per-token logprob stream is sparse
+            # (speculative decoding / MTP) or disabled. Keeping
+            # the tracker present means that calc always runs
+            # and calibration collects a sample every turn.
+            if (_mc_for_stream is not None
+                    and getattr(_mc_for_stream, "enabled", False)):
+                try:
+                    from .entropy import EntropyTracker
+                    _entropy_tracker = EntropyTracker(window=32, top_k=5)
+                except Exception as _etx:
+                    logger.debug("entropy tracker init failed: %s", _etx)
+
+            async for chunk in self.context.llm_client.stream_chat_completion(payload, use_coding=has_coding_intent):
+                if loop_detected: break
+                # Cooperative cancel boundary (2026-07-15): the
+                # turn stays registered for the whole drain now,
+                # so /api/turn/cancel can flag it mid-stream —
+                # stop emitting on the next chunk. Finalization
+                # after the loop still runs on the partial text.
+                if _turn_reg.is_cancelled(req_id):
+                    break
+                self.context.last_activity_time = datetime.datetime.now() # Heartbeat
+
+                # Decode FIRST so we can decide whether to
+                # yield the raw chunk or substitute a
+                # scrubbed synthetic chunk. Non-data chunks
+                # (e.g. `data: [DONE]`) always pass through
+                # unchanged.
+                _is_content_chunk = False
+                _new_text = ""
+                try:
+                    chunk_str = chunk.decode("utf-8")
+                    if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
+                        chunk_data = json.loads(chunk_str[6:])
+                        # Upstream abort frame (no "choices"): the
+                        # final answer was cut off mid-stream. The
+                        # frame passes through to the client and
+                        # the finalize verifier gate REFUTES the
+                        # partial, but log it so a truncated
+                        # user-facing answer isn't a silent gap.
+                        if "error" in chunk_data and "choices" not in chunk_data:
+                            pretty_log(
+                                "Stream Aborted",
+                                "Upstream aborted the FINAL answer "
+                                f"mid-stream: {str(chunk_data.get('error'))[:200]}",
+                                level="WARNING", icon=Icons.WARN,
+                            )
+                        if "choices" in chunk_data and len(chunk_data["choices"]) > 0:
+                            delta = chunk_data["choices"][0].get("delta", {})
+                            if "content" in delta and delta["content"] is not None:
+                                _is_content_chunk = True
+                                _new_text = delta["content"]
+                                full_content += _new_text
+                            # Metacog: pipe top-logprobs into
+                            # the entropy tracker. Lives in
+                            # the same try/except as the
+                            # content decode so a malformed
+                            # logprobs payload never breaks
+                            # the stream — the tracker just
+                            # skips that chunk.
+                            if _entropy_tracker is not None:
+                                try:
+                                    from .entropy import extract_top_logprobs
+                                    _top_lps = extract_top_logprobs(chunk_data)
+                                    if _top_lps:
+                                        _entropy_tracker.observe(_top_lps)
+                                except Exception as _etxx:
+                                    logger.debug(
+                                        "entropy observe failed: %s",
+                                        _etxx,
+                                    )
+                except Exception as e:
+                    logger.debug(f"Stream chunk decode error: {type(e).__name__}")
+
+                if _stream_scrub_active and _is_content_chunk:
+                    # Emit only the NEW portion of the
+                    # scrubbed view. If the model is
+                    # currently mid-<tool_call>, the
+                    # non-greedy pattern won't match until
+                    # the close tag arrives — so `scrubbed`
+                    # stops growing during a tool_call body
+                    # and resumes once the close lands,
+                    # with the whole block removed. Net
+                    # effect: the client sees clean text
+                    # and never sees the XML flicker past.
+                    if not _scrub_seen_lt and "<" in full_content[_scrubbed_emitted_len:]:
+                        _scrub_seen_lt = True
+                    if _scrub_seen_lt:
+                        _scrubbed_view = _stream_scrub_pattern.sub('', full_content)
+                    else:
+                        # No '<' anywhere yet → the sub is a
+                        # no-op; the scrubbed view equals the
+                        # raw buffer. Skip the O(n) regex.
+                        _scrubbed_view = full_content
+                    _to_emit = _scrubbed_view[_scrubbed_emitted_len:]
+                    if _to_emit:
+                        _synthetic = {
+                            "id": f"chatcmpl-{req_id}",
+                            "object": "chat.completion.chunk",
+                            "created": created_time,
+                            "model": stream_model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": _to_emit},
+                                "finish_reason": None,
+                            }],
+                        }
+                        yield f"data: {json.dumps(_synthetic)}\n\n".encode('utf-8')
+                        _scrubbed_emitted_len = len(_scrubbed_view)
+                    # Skip the raw chunk — we already
+                    # emitted the scrubbed equivalent.
+                elif _stream_scrub_active and not _is_content_chunk:
+                    # Non-content chunk on the scrub path.
+                    # The [DONE] sentinel must be held back
+                    # so the fallback (emitted AFTER this
+                    # loop) reaches the client before the
+                    # SSE stream closes. Every other non-
+                    # content chunk passes through.
+                    try:
+                        _chunk_str = chunk.decode("utf-8")
+                    except Exception:
+                        _chunk_str = ""
+                    if _chunk_str.strip() == "data: [DONE]":
+                        _held_done_chunk = chunk
+                    else:
+                        yield chunk
+                else:
+                    # Non-scrub path (mid-tool-loop stream,
+                    # or non-content chunk): pass raw upstream
+                    # bytes through as before.
+                    yield chunk
+
+                # Cognitive Watchdog — tightened to reduce false positives
+                # on legitimate repetitive output (lists, tables, error
+                # traces). Now requires a longer window (400 chars) and
+                # a longer repeating motif (60 chars) seen 5+ times before
+                # severing the stream.
+                if _is_content_chunk and ("\n" in _new_text or "?" in _new_text):
+                    tail = full_content[-400:]
+                    if len(tail) == 400:
+                        last_60 = tail[-60:]
+                        if last_60.strip() and tail.count(last_60) >= 5:
+                            pretty_log("Cognitive Watchdog", "Infinite <think> loop detected. Severing stream.", level="WARNING", icon=Icons.STOP)
+                            loop_detected = True
+                            break_text = "\n</think>\n<tool_call>\n<function name=\"replan\">\n<parameter name=\"reason\">SYSTEM OVERRIDE: My internal monologue got stuck in an infinite loop. I am forcing a strategy reset.</parameter>\n</function>\n</tool_call>"
+                            break_chunk = {
+                                "id": f"chatcmpl-{req_id}", "object": "chat.completion.chunk", "created": created_time,
+                                "model": stream_model, "choices": [{"index": 0, "delta": {"content": break_text}, "finish_reason": None}]
+                            }
+                            yield f"data: {json.dumps(break_chunk)}\n\n".encode('utf-8')
+                            full_content += break_text
+
+            # --- SCRUBBED-STREAM EMPTY-OUTPUT FALLBACK ---
+            # If the scrub was active and swallowed EVERY
+            # content chunk (i.e. the whole upstream response
+            # was <tool_call>/<function> XML), the client has
+            # received zero visible text beyond the prefix.
+            # Before this fallback, the user saw a blank reply
+            # — which is what happened on the user's third
+            # `self play` invocation: the planner routed it as
+            # text-only (target_tool='none'), the model emitted
+            # a pure tool_call, the scrub stripped it, and the
+            # SSE stream closed with nothing in it. Emit a
+            # synthetic fallback so the user sees SOMETHING
+            # actionable instead of an empty bubble.
+            if (
+                _stream_scrub_active
+                and full_content.strip()
+                and len(full_content.strip()) > len(stream_prefix.strip())
+                and _scrubbed_emitted_len <= len(stream_prefix)
+            ):
+                _intended = ""
+                _fn_m = re.search(
+                    r'<function(?:\s+name=|=)\s*["\']?([a-zA-Z0-9_]+)',
+                    full_content,
+                    re.IGNORECASE,
+                )
+                if _fn_m:
+                    _intended = _fn_m.group(1)
+
+                # The "cycle already completed" branch that
+                # used to live here was retired once terminal
+                # tools (self_play, dream_mode) started
+                # bypassing the summary LLM turn entirely —
+                # see the DIRECT-FROM-TOOL SUMMARY block in
+                # the tool-execution path. That path now
+                # writes directly to `final_ai_content` and
+                # flips `force_stop`, so we never reach this
+                # stream-scrub fallback when a terminal tool
+                # ran in the same handle_chat. This
+                # single-branch fallback handles only the
+                # remaining case: the planner routed the
+                # turn as text-only but the model still
+                # emitted a tool_call.
+                # When the turn was finalized BECAUSE a project
+                # task closed this turn (one-task-per-turn gate),
+                # the scrubbed tool_call was the model trying to
+                # barrel into the next task — say that honestly
+                # rather than telling the user to "rephrase" a
+                # request that already succeeded.
+                _fallback_text = _scrub_fallback_message(
+                    _intended, _proj_task_closed_this_req)
+                _fallback_chunk = {
+                    "id": f"chatcmpl-{req_id}",
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": stream_model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": _fallback_text},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(_fallback_chunk)}\n\n".encode('utf-8')
+                if _proj_task_closed_this_req:
+                    # Expected: the one-task gate finalized the
+                    # turn and dropped the model's attempt to
+                    # start the next task. Not a problem — log
+                    # at INFO so it doesn't read as an error.
+                    pretty_log(
+                        "One Task / Turn",
+                        f"Stopped after a task closed; dropped the model's "
+                        f"next-task {_intended or 'tool'} call — awaiting user go-ahead.",
+                        level="INFO", icon=Icons.BRAIN_PLAN,
+                    )
+                else:
+                    pretty_log(
+                        "Stream Scrub Fallback",
+                        f"Scrub consumed entire response (intended={_intended or 'unknown'}); emitted fallback.",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+
+            # Release any held [DONE] sentinel now that
+            # (a) all content chunks have been emitted and
+            # (b) the fallback has had its chance to fire.
+            # Without this, the SSE stream would never
+            # terminate cleanly on the scrub path when no
+            # [DONE] is yielded elsewhere.
+            if _held_done_chunk is not None:
+                yield _held_done_chunk
+
+            # Metacog: compute this turn's composite confidence
+            # (logprob-OPTIONAL — phase 2.5). The entropy term
+            # is used when the window observed tokens; otherwise
+            # it is neutral (0.5) and competence + verbalised
+            # uncertainty drive the score. Runs on every metacog
+            # turn so calibration always records a sample, even
+            # on speculative-decoding / no-logprobs upstreams.
+            if _entropy_tracker is not None:
+                try:
+                    _reading = _entropy_tracker.reading()
+                    if _reading is not None:
+                        if _reading.n > 0:
+                            self.context.last_entropy_reading = _reading
+                        # Composite confidence (roadmap
+                        # phase 2.4). Fuse entropy with the
+                        # per-domain competence prior for
+                        # the most-recently-dispatched tool.
+                        # The result is logged and stashed
+                        # on the context so observability
+                        # and downstream gating share one
+                        # source of truth. Tool name comes
+                        # from `fname` if set this turn,
+                        # otherwise falls back to a global
+                        # roll-up via domain="other".
+                        _mc_conf = getattr(self.context, "metacog", None)
+                        if (_mc_conf is not None
+                                and getattr(_mc_conf, "confidence", None) is not None
+                                and getattr(_mc_conf, "competence", None) is not None):
+                            try:
+                                from .metacog import _domain_for_tool
+                                _dom = _domain_for_tool(fname or "")
+                                _p = _mc_conf.competence.estimate(_dom, fname or None)
+                                _n = _mc_conf.competence.observations(_dom, fname or None)
+                                # Verbalised-uncertainty pressure
+                                # (core.uncertainty) — fuses the
+                                # "agent said it was unsure" track
+                                # into the composite. No-op until
+                                # the calibration spine fits λ > 0.
+                                _upress = 0.0
+                                try:
+                                    _utk = getattr(self.context, "uncertainty_tracker", None)
+                                    if _utk is not None:
+                                        _upress = _utk.pressure()
+                                except Exception:
+                                    _upress = 0.0
+                                # Entropy term is neutral (0.5)
+                                # when the window is empty, so
+                                # competence + uncertainty drive
+                                # the score on logprob-starved
+                                # upstreams instead of suppressing
+                                # the whole reading.
+                                _norm = _reading.norm if _reading.n > 0 else 0.5
+                                _cr = _mc_conf.confidence.score(
+                                    normalised_entropy=_norm,
+                                    competence_p_success=_p,
+                                    n_observations=_n,
+                                    uncertainty_pressure=_upress,
+                                )
+                                self.context.last_confidence = _cr
+                                # Stash for the turn-end calibration
+                                # record (paired with the realized
+                                # outcome). Last reading of the turn
+                                # wins — that's the one we score
+                                # against the turn's outcome.
+                                # Tagged with THIS request's id: the
+                                # SSE drain runs after the semaphore
+                                # is released, so this write can land
+                                # mid-turn-B — the tag lets B's
+                                # finalize reject a reading that
+                                # isn't its own instead of pairing
+                                # A's confidence with B's outcome.
+                                self.context._calib_pending = (req_id, _cr)
+                                # Push the reading into the
+                                # bundle so the mid-turn
+                                # arbiter gate (consulted
+                                # at the next tool dispatch)
+                                # has authoritative state to
+                                # decide on. Without this
+                                # push the gate would never
+                                # fire — it reads from the
+                                # bundle, not the context.
+                                try:
+                                    _mc_conf.record_confidence(_cr)
+                                    _mc_conf.count(
+                                        confidence_total=True,
+                                        confidence_below=_cr.below_threshold,
+                                    )
+                                except Exception as _crx:
+                                    logger.debug(
+                                        "metacog record_confidence failed: %s",
+                                        _crx,
+                                    )
+                                # Log noise control: per-turn
+                                # confidence readings are
+                                # high-volume. We only want
+                                # INFO for the actionable
+                                # case (below threshold —
+                                # the arbiter is now armed
+                                # for the next mutating
+                                # dispatch). Above-threshold
+                                # readings drop to DEBUG so
+                                # monitoring greps stay
+                                # signal-rich.
+                                from .metacog_log import (
+                                    emit as _mc_emit,
+                                    Subsystem as _mc_ss,
+                                    LEVEL_INFO, LEVEL_DEBUG,
+                                )
+                                _mc_emit(
+                                    _mc_ss.CONF,
+                                    level=(LEVEL_INFO if _cr.below_threshold
+                                           else LEVEL_DEBUG),
+                                    below=_cr.below_threshold,
+                                    C=_cr.composite,
+                                    entropy=_cr.entropy_component,
+                                    competence=_cr.competence_component,
+                                    n=_n,
+                                    domain=_dom,
+                                    tool=fname or None,
+                                    ent_obs=_reading.n,
+                                    threshold=_cr.threshold,
+                                )
+                            except Exception as _cex:
+                                logger.debug(
+                                    "metacog confidence score failed: %s",
+                                    _cex,
+                                )
+                        logger.debug(
+                            "metacog entropy: norm=%.3f (n=%d)",
+                            _reading.norm, _reading.n,
+                        )
+                except Exception as _erx:
+                    logger.debug("entropy stash failed: %s", _erx)
+
+            # Internal (sub-/sched-) requests never feed smart
+            # memory: machine-generated prompts (chess FENs,
+            # job payloads) polluted retrieval AND their
+            # worker-side extract/scoring calls (max_tokens
+            # 3072) kept nova busy enough to time out the next
+            # request's routing calls (2026-07-12).
+            from .autonomous_activity import (
+                is_internal_request as _is_int_req_m1)
+            if self.context.args.smart_memory > 0.0 and last_user_content and not forget_was_called and not last_was_failure and not _is_int_req_m1(req_id):
+                micro_msgs = []
+                for m in [msg for msg in stream_messages_snapshot if msg.get("role") in ["user", "assistant"]][-4:]:
+                    role = m.get("role", "user").upper()
+                    clean_content = re.sub(r'```.*?```', '', str(m.get("content", "")), flags=re.DOTALL)
+                    micro_msgs.append(f"{role}: {clean_content[:500].strip()}")
+                clean_ai = re.sub(r'```.*?```', '', full_content, flags=re.DOTALL)
+                recent_arc = "\n".join(micro_msgs) + f"\nAI: {clean_ai[:500].strip()}"
+                if getattr(self.context, 'journal', None):
+
+                    await self._journal_append_safe('smart_memory', {'text': recent_arc, 'model': stream_model})
+
+            # --- EXTRACT & LOG INTERNAL THINKING (STREAM) ---
+            think_matches = re.findall(r'<think>(.*?)(?:</think>|$)', full_content, flags=re.DOTALL | re.IGNORECASE)
+            for think_text in think_matches:
+                clean_think = think_text.strip()
+                if clean_think:
+                    ui_think = clean_think.replace('\n', ' | ')
+                    logger.info(f"PLANNER MONOLOGUE: {ui_think}")
+
+                    timestamp = datetime.datetime.now().strftime('%H:%M:%S')
+                    print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*15} AGENT INTERNAL THINKING {'='*15}", flush=True)
+                    for line in clean_think.split('\n'):
+                        if line.strip():
+                            print(f"[INFO ] 💭 {timestamp} - [{req_id}] {line.strip()}", flush=True)
+                    print(f"[INFO ] 💭 {timestamp} - [{req_id}] {'='*55}", flush=True)
+
+            if was_complex_task or execution_failure_count > 0:
+                if not force_stop or "READY TO FINALIZE" in stream_thought.upper():
+                    # Gated on `--smart-memory > 0.0` to honour
+                    # the contract in CLAUDE.md ("Memory writes
+                    # are gated on --smart-memory / --no-memory").
+                    # Without this, a `--smart-memory 0.0` run
+                    # still queued post_mortem entries → phase 1
+                    # consumer → SkillMemory.learn_lesson, leaking
+                    # auto-extracted lessons into the playbook on
+                    # every complex/failing turn.
+                    if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
+
+                        await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
+                    await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
+
+            # Post-turn hydration usefulness judge (fire-and-
+            # forget, worker-hosted) — every finalized turn,
+            # matching the non-streaming site.
+            self._judge_hydration_safe(
+                full_content, turn_id=str(req_id or ""))
+
+            # Streamed-turn trajectory + work_log (2026-07-20 H1).
+            # A streamed forced-final turn RETURNS the SSE
+            # generator before `_finalize_and_return` ever runs,
+            # so `_record_turn_trajectory` and the project
+            # work_log — both sole-called from finalize — never
+            # fired for streamed turns: no corpus record (dead
+            # user-correction loop + abort detection) and no
+            # project work_log (the "forgets project work" gap).
+            # Web UI always streams AND one-task-per-turn forces
+            # this ending on task-closing turns, so this is the
+            # COMMON case, not an edge. Record here directly with
+            # the real `full_content` (the earlier finalize-time
+            # backfill was inert — it keyed off a trajectory
+            # finalize never wrote). The verifier runs LATE below
+            # and backfills the outcome by `current_trajectory_id`,
+            # so pass verifier=None here.
+            try:
+                if (isinstance(full_content, str)
+                        and full_content.strip()):
+                    self._record_turn_trajectory(
+                        messages=messages,
+                        final_content=full_content,
+                        req_id=req_id,
+                        model=model,
+                        trajectory_id=current_trajectory_id,
+                        user_request=last_user_content,
+                        verifier=None,
+                        execution_failed=(
+                            execution_failure_count > 0
+                            and bool(last_was_failure)),
+                    )
+            except Exception as _sbf_exc:
+                logger.debug(
+                    "streamed trajectory record skipped: %s",
+                    _sbf_exc)
+            # Project work_log — same helper finalize uses. No
+            # synchronous verdict on the stream path (verifier is
+            # late), so the outcome is execution-based here.
+            await self._write_project_work_log_safe(
+                last_user_content=last_user_content,
+                final_ai_content=full_content,
+                execution_failure_count=execution_failure_count,
+                verifier_backfill=None,
+            )
+
+            # --- VERIFIER GATE (STREAM), 2026-07-18 ---
+            # The gated verdict was historically invoked only
+            # from _finalize_and_return — the NON-streaming
+            # finalization — so every streamed answer shipped
+            # unverified, with no log line of any kind (found
+            # when the operator asked why a turn had no
+            # verdict and the USR2 task dump showed none).
+            # The text is already out, so an inline verdict
+            # could never amend it: the verdict ALWAYS runs
+            # late here, regardless of GHOST_CRITIC_ASYNC —
+            # spawn the pure computation and hand it to the
+            # late handler (logs every outcome, scrubs
+            # poisoned lessons, backfills the trajectory).
+            # force_correction=True because a streamed reply
+            # never carries an inline Verifier note — a
+            # high-conf REFUTED queues a banner that the next
+            # stream already prepends via
+            # _take_active_correction. Skipped when the turn
+            # carried no verifiable evidence (toolless chat):
+            # spawning there adds only a no-op task and a
+            # noise line per message. The claim strips
+            # <think> blocks — they streamed to the client
+            # but are not part of the answer, and they would
+            # eat the verifier's 2000-char claim budget.
+            # Every branch is LOUD (log-only, INFO): the
+            # first live deploy produced total silence on
+            # streamed project turns and none of the debug
+            # channels are captured at INFO — a gate whose
+            # skip reasons are invisible cannot be
+            # distinguished from a gate that never ran
+            # (same lesson as _on_done's once-silent
+            # exception path).
+            try:
+                _sv_claim = re.sub(
+                    r'<think>.*?(?:</think>|$)', '',
+                    full_content,
+                    flags=re.DOTALL | re.IGNORECASE,
+                ).strip()
+                _sv_tool = _find_substantive_tool_for_verifier(
+                    stream_tools_snapshot)
+                if getattr(self.context.args,
+                           "no_verifier", False):
+                    pass  # ablation off-switch: silent
+                elif getattr(self.context, "verifier",
+                             None) is None:
+                    pretty_log(
+                        "Verifier",
+                        "stream gate: no verifier attached "
+                        "— skipped",
+                        icon=Icons.BRAIN_THINK)
+                elif not _sv_claim:
+                    pretty_log(
+                        "Verifier",
+                        "stream gate: empty claim after "
+                        "think-strip — skipped",
+                        icon=Icons.BRAIN_THINK)
+                elif _sv_tool is None:
+                    pretty_log(
+                        "Verifier",
+                        "stream gate: no substantive tool "
+                        f"in {len(stream_tools_snapshot)} "
+                        "record(s) — skipped "
+                        "(bookkeeping-only turn)",
+                        icon=Icons.BRAIN_THINK)
+                else:
+                    _sv_task = _glog.spawn_task(
+                        self._compute_verifier_verdict(
+                            tools_run_this_turn=stream_tools_snapshot,
+                            messages=stream_verify_messages,
+                            final_ai_content=_sv_claim,
+                            last_user_content=last_user_content,
+                            lc=lc,
+                        ))
+                    self._attach_late_verdict_handler(
+                        _sv_task, current_trajectory_id,
+                        stream_conv_fp,
+                        force_correction=True)
+                    pretty_log(
+                        "Verifier",
+                        "stream gate: verdict deferred — "
+                        "verifying asynchronously after "
+                        "the stream",
+                        icon=Icons.BRAIN_THINK)
+            except Exception as _svx:
+                pretty_log(
+                    "Verifier",
+                    "stream gate spawn failed: "
+                    f"{type(_svx).__name__}: "
+                    f"{str(_svx)[:160]}",
+                    icon=Icons.WARN, level="WARNING")
+
+            # Retrieval feedback loop: credit lessons that
+            # were surfaced during this turn whenever the
+            # turn finished without an execution failure.
+            # `credit_recent_retrievals` is idempotent per
+            # retrieval (via `last_credited_at`) and only
+            # touches lessons whose `last_retrieved_at`
+            # falls inside the window, so calling it on
+            # turns that didn't surface any lesson is a
+            # no-op. The previous gate
+            # (`was_complex_task or execution_failure_count
+            # > 0`) excluded simple successful tool turns
+            # — exactly the population where lessons are
+            # most likely to be helping — so the feedback
+            # signal was biased toward complex tasks and
+            # the pruner drifted accordingly.
+            sm = getattr(self.context, 'skill_memory', None)
+            if sm is not None and execution_failure_count == 0:
+                try:
+                    if hasattr(sm, 'credit_recent_retrievals'):
+                        # Discriminative form — see the
+                        # finalize-path call for rationale.
+                        await asyncio.to_thread(
+                            sm.credit_recent_retrievals, 300,
+                            query=str(last_user_content or ""),
+                            top_triggers=list(
+                                getattr(sm, "last_playbook_triggers", []) or []),
+                        )
+                except Exception:
+                    pass
+
+        # Keep THIS turn registered — visible in /api/turns and
+        # cancellable — for the WHOLE streamed drain, then
+        # unregister when the client finishes reading. The outer
+        # finally used to unregister the instant handle_chat
+        # returned this generator (before a single token
+        # streamed), so the tail was invisible + uncancellable
+        # and could overlap the next turn (2026-07-15). The
+        # agent_semaphore is deliberately NOT held across the
+        # drain: stream_chat_completion already counts
+        # foreground_tasks for the whole stream (the single LLM
+        # slot isn't stolen), and holding the permit would couple
+        # turn serialization to CLIENT read speed — a stalled
+        # reader would then block every later turn.
+        _stream_owns_unregister = True
+
+        async def _stream_then_unregister(_gen):
+            try:
+                async for _chunk in _gen:
+                    yield _chunk
+            finally:
+                _turn_reg.unregister(req_id, _active_turn)
+
+        return (_stream_then_unregister(stream_wrapper()),
+                created_time, req_id)
 
     async def _journal_append_safe(self, kind: str, payload: dict,
                                    timeout: float = 10.0) -> None:

@@ -309,7 +309,9 @@ def test_streaming_loop_detector_thresholds_raised():
     """Window must be 400+ chars and require 5+ repeats of a 60-char motif."""
     import inspect
     from ghost_agent.core import agent as agentmod
-    src = inspect.getsource(agentmod.GhostAgent.handle_chat)
+    # #5 step 4a moved the streaming loop-detector into _stream_final_generation.
+    src = (inspect.getsource(agentmod.GhostAgent.handle_chat)
+           + inspect.getsource(agentmod.GhostAgent._stream_final_generation))
     # Pin the new thresholds so a future tweak doesn't silently regress.
     assert "tail = full_content[-400:]" in src
     assert "if len(tail) == 400" in src

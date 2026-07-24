@@ -390,8 +390,27 @@ deferred findings, (C) functional-hunt deferred findings, (D) the B4 outcome-bat
   direct tests `tests/test_finalize_extraction.py` (6); 3 stale source-inspection tests updated.
   **Live-validated on a throwaway agent** (same code path; file-write probe → exact bytes on disk,
   verifier gate — which lives INSIDE the extracted chain — CONFIRMED 100%, zero errors); prod picks
-  it up at its next restart. Remaining: (4) final-generation streamer closure (~502 lines, heaviest
-  closure coupling — extend TurnState from a fresh capture analysis). Same protocol.
+  it up at its next restart. **Step 4a (client-facing SSE branch → `_stream_final_generation(self, ss:
+  StreamState)`) shipped + LIVE-VALIDATED 2026-07-23:** ~711 lines moved out of handle_chat, verbatim
+  (16-space dedent), captures unpacked from a new read-only `StreamState` (26 fields = the exact symtable
+  free-var set of the two nested closures). Two transform bugs caught by the suite: the method must be a
+  plain `def` (no top-level await — only lazy generators), and `_stream_owns_unregister` is a WRITE-BACK
+  (set in handle_chat's frame before the return, else its finally unregisters the streaming turn
+  prematurely — the exact class of cross-frame-state bug steps 1–2 warned about; symtable frees only catch
+  reads). Suite 9016 passed/0 failed; guards `tests/test_stream_client_extraction.py` (symtable zero-frees
+  invariant). Live: prod restart → a `stream:true` request streamed `chat.completion.chunk` deltas → clean
+  `[DONE]`, zero errors in ghost-agent.err. **Step 4b (internal stream consumer, ~1,078 lines) — ATTEMPTED
+  2026-07-23 and DELIBERATELY STOPPED (not a step-2 clone).** The structural part is easy (uniform 3-way
+  control flow: 9 `continue`/7 `break`→returns, fall-through→"proceed"; transform works). What stops it: the
+  exact INPUT and REPACK sets need real loop-carried DATAFLOW analysis, and every AST set-heuristic has a
+  distinct failure mode — conditionally-bound region-locals (`content`) → UnboundLocalError at construction;
+  read-modify-write loop-carried state (`notify_steer_fired`) hidden by symtable's `is_local` → UnboundLocalError
+  in-method; and the dangerous one — **cross-iteration repack is SILENT if wrong** (a var written in Region B and
+  read on the NEXT turn must be copied back; a naive "read-after" scan misses next-turn reads → the next turn
+  sees stale steering/counters, no crash). On the MAIN request path that risk isn't worth the maintainability
+  gain, and a green suite wouldn't reliably catch a silent cross-turn bug. **Left Region B inline; decomposition
+  stands at 3.5/4 (handle_chat already ~711 lines lighter from 4a).** To revisit: a real liveness/reaching-defs
+  pass (live-in=inputs, live-out-across-back-edge=repack), not AST heuristics. See memory `[[agent-py-decomposition]]`.
 - **#6 — `GHOST_PIN_TOOL_SCHEMAS` durable — DONE 2026-07-07.** Durability was already in place: the
   launcher (`bin/start-ghost-agent.sh` line 231) exports `GHOST_PIN_TOOL_SCHEMAS=1`, which launchd
   runs — so prod is durable across restarts. Confirmed the pin is **holding live**: a per-turn
@@ -1085,6 +1104,42 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-23 (later 4) — #5 step 4a: client-SSE streamer extracted from handle_chat (LIVE-VALIDATED)
+
+Continued the handle_chat decomposition (steps 1–3 already shipped). **Step 4a** extracts the client-facing
+streaming branch (`if is_final_generation and stream_response:`, ~711 lines) into a new
+`GhostAgent._stream_final_generation(self, ss: StreamState)`. Method: `symtable` capture analysis → the 2 nested
+closures (`stream_wrapper` + `_stream_then_unregister`) close over exactly **26** handle_chat locals → new
+read-only `StreamState` dataclass (beside TurnState/FinalizeState). Extraction shape: unpack `ss.*` → locals at
+the method top, then the closure bodies moved **byte-for-byte** (uniform 16-space dedent, zero in-body edits), so
+equivalence is by byte-identity. Done via a validated transform script (ast.parse + symtable zero-frees + dedent
+gates) writing a candidate file, reviewed, then swapped in.
+
+**Two bugs the transform introduced, both caught before trust:**
+1. I wrote the method `async def` → handle_chat returned an un-awaited coroutine (`cannot unpack`). It's a plain
+   `def` (the original branch had no top-level await — only lazy async generators — so it returns the tuple
+   directly).
+2. **The real one:** `_stream_owns_unregister = True` (the flag telling handle_chat's finally to DEFER the
+   turn-unregister to the stream drain) was inside the moved region, so it set a method-local while
+   handle_chat's frame stayed False → its finally unregistered the streaming turn prematurely (invisible /
+   uncancellable mid-drain). Caught by `test_streaming_tail_cancellable`. Fix: set the flag in handle_chat's
+   frame before the return. This is the WRITE-BACK case steps 1–2 flagged; my symtable pass only enumerated
+   *reads* (free vars), not this cross-frame *write*.
+
+**Collateral caught by the full suite:** 4 stale source-inspection tests (markers moved into the method:
+loop-detector `tail=full_content[-400:]`, smart-mem `_is_int_req_m1`, work_log `_write_project_work_log_safe`) +
+**9 `test_memory_store_durability.py` tests** that were actually left broken by the EARLIER journal overflow-spill
+change (my narrower `-k` sweep hadn't matched that filename) — all updated to the lossless overflow model. Lesson:
+run the FULL suite after a semantics change, not just a name-filtered slice.
+
+Verification: **full suite 9016 passed / 13 skipped / 0 failed.** New guards `tests/test_stream_client_extraction.py`
+(the load-bearing one: `_stream_final_generation` must have zero symtable free vars, so a future edit can't
+reintroduce the mid-stream NameError). **LIVE:** operator restarted prod (which also fired the journal recovery —
+"Recovered 1 in-flight journal item"); a `stream:true` probe streamed `chat.completion.chunk` deltas → clean
+`[DONE]`, zero errors in ghost-agent.err. **Next: 4b** (Region B internal consumer, ~1,170 lines, turn-loop tail +
+the `_emit_thinking`/`_flush_thinking` nonlocals — its own method with a repack, like step 2). Plan:
+`.claude/plans/spicy-foraging-pudding.md`; memory `[[agent-py-decomposition]]`.
 
 ### 2026-07-23 (later 3) — Earn-your-keep / synthetic-ablation route CLOSED as inconclusive (operator decision)
 
