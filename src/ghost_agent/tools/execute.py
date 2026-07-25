@@ -21,6 +21,40 @@ from .file_system import _get_safe_path
 # genuine errors (bad regex, unreadable file) with exit 2 + stderr output.
 _EXIT1_MEANS_NO_MATCH = {"grep", "egrep", "fgrep", "zgrep", "rg", "pgrep"}
 
+# Released-workspace shell guard (see call site in tool_execute).
+_RELEASED_PROJ_RE = re.compile(r"projects/([0-9a-f]{12})(?:/|\b)")
+_SHELL_MUTATION_RE = re.compile(
+    r"(?:^|[;&|]\s*|\b)(?:rm|mv|cp|tee|touch|mkdir|rmdir|chmod|chown|"
+    r"truncate|dd|ln|unzip|tar|patch)\b|>>?|\bsed\s+-i\b|\bperl\s+-i\b",
+)
+
+
+def _released_shell_block(project_store, command: str):
+    """Refusal message when a shell command would mutate a RELEASED
+    project's workspace, else None. Heuristic by necessity (shell), so it
+    only fires on the conjunction: released-project path referenced AND a
+    mutation token present. Never raises."""
+    try:
+        if project_store is None or not command:
+            return None
+        ids = set(_RELEASED_PROJ_RE.findall(str(command)))
+        if not ids or not _SHELL_MUTATION_RE.search(str(command)):
+            return None
+        for pid in ids:
+            proj = project_store.get_project(pid)
+            if proj and str(proj.get("status", "")).upper() == "RELEASED":
+                return (
+                    f"SYSTEM BLOCK: project {pid} is RELEASED (immutable) and "
+                    f"this command contains a mutation (rm/mv/redirect/"
+                    f"sed -i/…) targeting its workspace — NOT executed. Fork "
+                    f"a development copy first: manage_projects "
+                    f"action=create_version project_id={pid}, then work in "
+                    f"the new version's workspace. Read-only commands "
+                    f"(cat/grep/ls) on released files are fine.")
+    except Exception:
+        return None
+    return None
+
 # Execution budget for sandboxed runs (seconds). The sandbox layer wraps
 # every run in `timeout -k 5s <budget>s`, so hitting the budget surfaces
 # as exit 124 (or 137/143 when the -k SIGKILL / a SIGTERM landed).
@@ -503,6 +537,16 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         try:
             from .validators import validate_shell
             _shell_ok, _shell_reason = validate_shell(command)
+            # Released-workspace shell guard (2026-07-25 round 2): the
+            # file-tool write block was bypassable via `execute` (redirects,
+            # rm/mv/sed -i). A command that references a RELEASED project's
+            # path AND carries a mutation token is refused with the same
+            # create_version steer. Read-only commands pass untouched.
+            if _shell_ok:
+                _rb = _released_shell_block(
+                    kwargs.get("project_store"), command)
+                if _rb:
+                    return _format_error(_rb)
         except Exception as _vexc:
             logging.getLogger("GhostAgent").debug("shell validator crashed: %s", _vexc)
             _shell_ok, _shell_reason = True, ""

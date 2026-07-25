@@ -2001,17 +2001,26 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
             return 0
         candidates = []  # (project_id, rel, host_path)
         try:
+            # ALL non-archived projects, recent-first. The original
+            # `[:max_projects]` slice consumed the budget on the top-2
+            # most-recently-updated projects BEFORE checking whether they
+            # needed anything — once those were fully described, older
+            # projects were starved forever (2026-07-25 review: 6 legacy
+            # DONE projects with zero manifest entries, unreachable).
+            # max_projects now counts projects that CONTRIBUTE candidates.
             projects = [
                 p for p in store.list_projects()
                 if str(p.get("status", "")).upper() not in ("ARCHIVED",)
-            ][:max_projects]
+            ]
         except Exception:
             return 0
+        contributing = 0
         for proj in projects:
             pid = proj.get("id")
             ws = (proj.get("workspace_dir") or "").strip()
             if not pid or not ws:
                 continue
+            found_here = 0
             try:
                 manifest = store.get_file_manifest(pid)
                 for rel in store.list_deliverables(pid):
@@ -2020,11 +2029,14 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                     host = Path(ws) / rel
                     if host.is_file():
                         candidates.append((pid, rel, host))
+                        found_here += 1
                     if len(candidates) >= max_files:
                         break
             except Exception as e:
                 logger.debug("manifest candidate scan skipped (%s): %s", pid, e)
-            if len(candidates) >= max_files:
+            if found_here:
+                contributing += 1
+            if len(candidates) >= max_files or contributing >= max_projects:
                 break
         if not candidates:
             return 0

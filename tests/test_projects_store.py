@@ -501,7 +501,13 @@ def test_add_task_reopens_paused_project(store):
     assert store.get_project(pid)["status"] == ProjectStatus.ACTIVE.value
 
 
-def test_add_task_never_reopens_archived_or_needs_user(store):
+def test_add_task_never_reopens_archived_but_reopens_needs_user(store):
+    """CONTRACT CHANGE 2026-07-25 (review H1): NEEDS_USER now REOPENS on
+    add_task. The old 'stays put' behavior was the trap — adding work to a
+    waiting project created tasks the advancer could never reach
+    (advance_once refuses non-ACTIVE), the same unreachable-work class
+    fixed for DONE on 2026-07-11. ARCHIVED (and RELEASED) remain deliberate
+    end-states that never auto-resurrect."""
     a = store.create_project("A")
     store.add_task(a, "t")
     store.update_project(a, status="ARCHIVED")
@@ -513,7 +519,7 @@ def test_add_task_never_reopens_archived_or_needs_user(store):
     store.update_task(tid, status="NEEDS_USER")
     assert store.get_project(n)["status"] == ProjectStatus.NEEDS_USER.value
     store.add_task(n, "more")
-    assert store.get_project(n)["status"] == ProjectStatus.NEEDS_USER.value
+    assert store.get_project(n)["status"] == ProjectStatus.ACTIVE.value
 
 
 def test_update_task_reopen_reactivates_failed_project(store):

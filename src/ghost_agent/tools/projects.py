@@ -51,9 +51,11 @@ _ACTIONS = {
     # artifacts / events / durable working memory
     "artifact_add", "artifact_list", "event_log", "ledger", "config",
     # per-file manifest + per-file action history (2026-07-24)
-    "describe_file", "file_history",
+    "describe_file", "file_history", "unregister_file",
     # human-attested release + versioning (2026-07-25)
-    "release", "create_version",
+    "release", "create_version", "unrelease", "verify_release",
+    # task removal (round 3 — store.delete_task existed unexposed)
+    "task_delete",
     # workspace hygiene
     "cleanup",
     # inbox promotion (suggestion-accepted path)
@@ -1200,6 +1202,32 @@ def _probe_tcp(port, attempts: int = 4, delay_s: float = 1.0) -> bool:
     return False
 
 
+def _stop_project_services(context, project_id: str) -> int:
+    """Stop (and thereby deregister from liveness) every service whose
+    workdir/command belongs to ``project_id``. Lifecycle coupling
+    (2026-07-25 review H6): hard delete used to rmtree the workspace out
+    from under a RUNNING service, and archiving a released project left its
+    rehearsed services up forever. Best-effort; returns services stopped."""
+    stopped = 0
+    try:
+        from ..sandbox.services import get_service_supervisor
+        sup = get_service_supervisor(getattr(context, "sandbox_manager", None))
+        if sup is None:
+            return 0
+        for e in _project_service_entries(context, project_id):
+            try:
+                sup.stop(str(e.get("name") or ""))
+                stopped += 1
+            except Exception:
+                continue
+        if stopped:
+            pretty_log("Service", f"stopped {stopped} service(s) of project "
+                                  f"{project_id} (lifecycle)", icon=Icons.STOP)
+    except Exception:
+        return stopped
+    return stopped
+
+
 def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[str, Any]:
     """Cold-start the project from its own recorded operational facts and
     verify it comes up — the release gate that keeps the dossier honest.
@@ -1255,10 +1283,36 @@ def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[st
 
 
 def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
-    """Compact status snapshot suitable for a resume banner."""
+    """Compact status snapshot suitable for a resume banner.
+
+    RELEASED projects get a RUNBOOK shape (2026-07-25 round 2): the old
+    dev-style briefing told the model about task trees and "files you
+    write live HERE" on an immutable workspace — contradicting the
+    system-prompt runbook mode. Operational facts only, plus routing.
+    """
     proj = store.get_project(project_id)
     if not proj:
         return {}
+    if str(proj.get("status", "")).upper() == "RELEASED":
+        rel = store.get_release(project_id) or {}
+        children = [
+            {"id": c["id"], "title": c["title"], "status": c["status"]}
+            for c in store.list_children(project_id)
+        ]
+        return {
+            "project": {
+                "id": proj["id"], "title": proj["title"],
+                "kind": proj["kind"], "status": "RELEASED",
+                "goal": proj["goal"],
+                "version": (proj.get("metadata") or {}).get("version", 1),
+            },
+            "release": rel,
+            "versions": children,
+            "note": ("RELEASED (immutable). To RUN it: follow release.directions "
+                     "(start the listed services via manage_services if down). "
+                     "To CHANGE it: action=create_version. Do not write into "
+                     "this workspace."),
+        }
     plan = ProjectPlan(store, project_id)
     nxt = plan.next_ready_leaf()
     events = store.list_events(project_id, limit=5)
@@ -1315,7 +1369,12 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
             "status": proj["status"],
             "goal": proj["goal"],
         },
-        "task_tree": plan.render() or "(empty)",
+        # Capped (2026-07-25 round 2): a 50-task project's full render blew
+        # past 100KB into the tool result — the exact hazard task_list was
+        # slimmed for.
+        "task_tree": ((lambda t: t[:3500] + "\n… (tree truncated — use "
+                       "action=task_list for the rest)" if len(t) > 3500
+                       else t)(plan.render() or "(empty)")),
         "next_ready": (
             {"id": nxt.id, "description": nxt.description, "status": nxt.status.value}
             if nxt else None
@@ -1373,7 +1432,11 @@ async def tool_manage_projects(
     action: str = "",
     # create / update
     title: str = "",
-    kind: str = "GENERAL",
+    # Empty = not passed. The old default "GENERAL" made an explicit
+    # `update kind=GENERAL` indistinguishable from no intent, so a CODING
+    # project could never be set back (round-2 M9). _infer_kind treats ""
+    # as no-explicit for create/promote.
+    kind: str = "",
     goal: str = "",
     metadata: Optional[Dict[str, Any]] = None,
     # identifiers
@@ -1523,7 +1586,8 @@ async def tool_manage_projects(
     # short-circuits on a valid project_id and ignores the title.
     # NB: "update" is NOT here — its `title` arg is a RENAME value, not a
     # lookup key, so auto-filling `current` for a rename is correct.
-    _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch", "resume"}
+    _TITLE_RESOLVABLE = {"delete", "archive", "get", "switch", "resume",
+                         "release", "create_version"}
     if project_id is None and act not in {"create", "list", "promote_from_context"}:
         if not (title and act in _TITLE_RESOLVABLE):
             project_id = getattr(context, "current_project_id", None)
@@ -1536,7 +1600,7 @@ async def tool_manage_projects(
     _RELEASED_MUTATING = {
         "task_add", "task_update", "task_decompose", "artifact_add",
         "ledger", "config", "describe_file", "autoadvance", "update",
-        "research", "cleanup",
+        "research", "cleanup", "unregister_file", "task_delete",
     }
     if act in _RELEASED_MUTATING:
         # ledger/config READ forms (no payload) stay allowed.
@@ -1588,9 +1652,24 @@ async def tool_manage_projects(
                 # create a NEW one (observed live, after a delete that never
                 # took effect). Terminal projects are superseded by a fresh
                 # create; only ACTIVE / PAUSED / NEEDS_USER are reused.
-                if existing["status"] in _TERMINAL_PROJECT_STATUSES:
-                    continue
                 if (existing["title"] or "").strip().lower() != normalized:
+                    continue
+                # A same-title RELEASED project must NOT be reused (2026-07-25):
+                # the old path bound the conversation to it, wrote retry
+                # metadata straight through the store (bypassing the
+                # immutability choke), then told the model to task_add — which
+                # the released guard refused. Contradictory guard pair; steer
+                # to versioning instead.
+                if str(existing.get("status", "")).upper() == "RELEASED":
+                    return _err(
+                        f"a RELEASED project with this title already exists "
+                        f"({existing['id']}). It is immutable — to build on "
+                        f"it, fork a new version: manage_projects "
+                        f"action=create_version project_id={existing['id']} "
+                        f"description=\"<what you want to change>\". To start "
+                        f"something genuinely unrelated, pick a different "
+                        f"title.")
+                if existing["status"] in _TERMINAL_PROJECT_STATUSES:
                     continue
                 # Existence-based guard: an in-flight project with the same
                 # title means the user is asking us to continue, not start
@@ -1830,9 +1909,17 @@ async def tool_manage_projects(
             # bare title delete has cascaded before). Making the id the
             # first column of a ready-made display block, with a note that
             # it MUST be shown, is the reliable contract for a small model.
+            def _fam(p):
+                m = p.get("metadata") or {}
+                bits = []
+                if m.get("version"):
+                    bits.append(f"v{m['version']}")
+                if m.get("parent_project_id"):
+                    bits.append(f"fork of {m['parent_project_id']}")
+                return f"  [{', '.join(bits)}]" if bits else ""
             lines = [
                 f"{p.get('id')}  {str(p.get('status') or ''):<9}  "
-                f"{p.get('title')}"
+                f"{p.get('title')}{_fam(p)}"
                 + ("   <- ACTIVE" if p.get("id") == current else "")
                 for p in projs
             ]
@@ -1865,7 +1952,22 @@ async def tool_manage_projects(
                 # memory hits so the model can answer without a second,
                 # unprompted tool hop.
                 return await _not_found_with_recall(context, project_id or title)
-            return _ok(store.get_project(rid))
+            # Slim view (2026-07-25 round 2): the raw row dumped the FULL
+            # metadata blob — 60-entry manifest, 4KB release directions,
+            # runtime counters — into the tool result. Compact summary +
+            # the briefing; deep metadata stays reachable via the dedicated
+            # read actions (describe_file/ledger/config/artifact_list).
+            _p = store.get_project(rid) or {}
+            _m = _p.get("metadata") or {}
+            return _ok({
+                "id": _p.get("id"), "title": _p.get("title"),
+                "kind": _p.get("kind"), "status": _p.get("status"),
+                "goal": _p.get("goal"),
+                "version": _m.get("version", 1),
+                "parent_project_id": _m.get("parent_project_id"),
+                "workspace_dir": _p.get("workspace_dir"),
+                "briefing": _briefing(store, rid),
+            })
 
         if act == "switch":
             if not project_id and not title:
@@ -1878,10 +1980,16 @@ async def tool_manage_projects(
             if not rid:
                 return _err(f"project not found: {project_id or title!r}")
             _set_current(context, rid)
+            _b = _briefing(store, rid)
+            # A RELEASED runbook briefing carries its own routing note —
+            # don't override it with the "files you write live HERE"
+            # workspace note on an immutable workspace (round-2 M5).
+            _note = (_b.get("note") if isinstance(_b, dict) and _b.get("release")
+                     else _workspace_note(rid))
             return _ok({"switched_to": rid,
                         "workspace": f"projects/{rid}",
-                        "note": _workspace_note(rid),
-                        "briefing": _briefing(store, rid)})
+                        "note": _note,
+                        "briefing": _b})
 
         if act == "exit":
             prev = getattr(context, "current_project_id", None)
@@ -1913,7 +2021,7 @@ async def tool_manage_projects(
                         "action=release (requires the project DONE, usage "
                         "`directions`, and a passing release rehearsal).")
                 fields["status"] = status
-            if kind and kind != "GENERAL":
+            if kind:
                 fields["kind"] = kind
             if metadata is not None:
                 fields["metadata"] = metadata
@@ -1948,6 +2056,10 @@ async def tool_manage_projects(
                            f"Hard delete of '{rid}' refused (not user-visible "
                            "in this request)", icon=Icons.STOP)
                 return _err(gate)
+            # Stop the project's services BEFORE the workspace vanishes —
+            # rmtree under a running service left orphaned processes +
+            # registry entries (review H6).
+            _stop_project_services(context, rid)
             ok = store.delete_project(rid, hard=True)
             if not ok:
                 return _err(f"delete failed for {rid} — nothing was removed.")
@@ -1970,6 +2082,10 @@ async def tool_manage_projects(
                     f"project not found: {project_id or title!r} — NOTHING was "
                     f"archived. Use action=list to see the real ids."
                 )
+            # Retiring a project retires its services too — archiving a
+            # RELEASED project used to leave its rehearsed services running
+            # forever (review H6). Resume can restart them per the dossier.
+            _stop_project_services(context, rid)
             ok = store.delete_project(rid, hard=False)
             if not ok:
                 return _err(f"archive failed for {rid} — nothing was changed.")
@@ -1994,18 +2110,46 @@ async def tool_manage_projects(
             proj = store.get_project(project_id)
             if not proj:
                 return _err(f"project not found: {project_id}")
-            # Flip an ARCHIVED project back to ACTIVE — otherwise autoadvance
-            # refuses it ("not ACTIVE") and the duplicate-create guard still
-            # treats it as terminal, contradicting the "archive is reversible"
-            # contract.
+            # Un-archive by restoring the status it was archived FROM
+            # (metadata.archived_from, stashed by delete_project since
+            # 2026-07-25). The old unconditional →ACTIVE silently STRIPPED
+            # a RELEASED project's attestation on resume — the guards all
+            # key on status and vanished while RELEASE.md still claimed
+            # immutability. Legacy archives without the stash restore to
+            # ACTIVE as before.
             if str(proj.get("status", "")).upper() == "ARCHIVED":
-                store.update_project(project_id, status="ACTIVE")
+                _from = str(((proj.get("metadata") or {})
+                             .get("archived_from")) or "ACTIVE").upper()
+                store.update_project(project_id, status=_from)
+
+                def _clear_af(meta):
+                    meta.pop("archived_from", None)
+                    return meta
+                try:
+                    store._atomic_metadata_update(project_id, _clear_af)
+                except Exception:
+                    pass
+                if _from == "RELEASED":
+                    store.log_event(project_id, None, "project_resumed",
+                                    {"restored_status": "RELEASED"})
+                    _b = _briefing(store, project_id)
+                    if isinstance(_b, dict):
+                        _b = {**_b,
+                              "note": ("Restored to RELEASED (immutable). "
+                                       "To run it, follow the release "
+                                       "directions; to change it, "
+                                       "action=create_version.")}
+                    _set_current(context, project_id)
+                    return _ok(_b)
             _set_current(context, project_id)
             store.log_event(project_id, None, "project_resumed", {})
             _b = _briefing(store, project_id)
             if isinstance(_b, dict):
+                # Keep the runbook note on RELEASED resumes (round-2 M5).
+                _note = (_b.get("note") if _b.get("release")
+                         else _workspace_note(project_id))
                 _b = {**_b, "workspace": f"projects/{project_id}",
-                      "note": _workspace_note(project_id)}
+                      "note": _note}
             return _ok(_b)
 
         if act == "status":
@@ -2630,6 +2774,30 @@ async def tool_manage_projects(
                 "note": "PROJECT_MAP.md refreshed in the workspace.",
             })
 
+        if act == "unregister_file":
+            # Repair path for renamed/removed deliverables (2026-07-25): a
+            # stale file-artifact row otherwise blocks release FOREVER
+            # ("deliverable missing on disk", no tool could fix the record).
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            fp = (file_path or payload or "").strip()
+            if not fp:
+                return _err("file_path is required (the project-relative "
+                            "path to remove from the deliverable record + "
+                            "file map)")
+            counts = store.unregister_file(project_id, fp)
+            if not (counts["artifacts_removed"] or counts["manifest_removed"]):
+                return _err(f"{fp!r} was not registered (check "
+                            f"action=artifact_list for the recorded paths)")
+            return _ok({
+                "unregistered": fp, **counts,
+                "note": ("Removed from deliverables + file map; if the file "
+                         "still exists on disk it is no longer in the "
+                         "cleanup keep-set. Re-register the renamed file "
+                         "with task_update deliverables=[...] or "
+                         "describe_file."),
+            })
+
         if act == "file_history":
             # Per-file action journal read (2026-07-24): every work_log /
             # event row that touched this file — "what happened to X?"
@@ -2657,8 +2825,16 @@ async def tool_manage_projects(
             # deterministic rehearsal — tidy, then cold-start the services /
             # verify deliverables — so the dossier is written from facts
             # that worked seconds before RELEASED was stamped.
-            if not project_id:
-                return _err("no active project (pass project_id or switch first)")
+            if not project_id and not title:
+                return _err("no active project (pass project_id, a title, "
+                            "or switch first)")
+            # Title-resolve like every other destructive action (round-2 M9):
+            # "release the journal" must work without the hex id.
+            _rid, _rerr = _resolve_project_ref(store, project_id, title)
+            if _rerr:
+                return _err(_rerr)
+            if _rid:
+                project_id = _rid
             proj = store.get_project(project_id)
             if not proj:
                 return _err(f"project not found: {project_id}")
@@ -2691,6 +2867,15 @@ async def tool_manage_projects(
             if not reh.get("ok"):
                 store.log_event(project_id, None, "release_rehearsal_failed",
                                 {"detail": reh.get("detail", "")[:400]})
+                # WARNING pretty: a failed release attempt is exactly the
+                # actionable class per the chat-noise policy — and stop
+                # whatever the rehearsal restarted (don't leave half-started
+                # services of a NOT-released project running).
+                pretty_log("Release Failed",
+                           f"{proj.get('title')}: rehearsal failed — "
+                           f"{reh.get('detail', '')[:120]}",
+                           icon=Icons.FAIL, level="WARNING")
+                _stop_project_services(context, project_id)
                 return _err(
                     f"release rehearsal FAILED — project stays DONE. "
                     f"{reh.get('detail', '')}. Fix the issue (or register "
@@ -2698,8 +2883,15 @@ async def tool_manage_projects(
             # (3) compose the dossier from REHEARSED facts.
             mf = store.get_file_manifest(project_id)
             meta = (proj.get("metadata") or {})
+            # Re-release after an unrelease bumps the dossier REVISION
+            # (fork numbering owns "version"; a same-project re-test is a
+            # revision of the same version).
+            _prior = meta.get("release") or {}
+            _revision = int(_prior.get("revision") or 0) + 1 \
+                if _prior.get("unreleased_at") else int(_prior.get("revision") or 1)
             release = {
                 "version": int(meta.get("version") or 1),
+                "revision": _revision,
                 "released_at": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "directions": _dirs[:4000],
                 "services": reh.get("services") or [],
@@ -2731,6 +2923,13 @@ async def tool_manage_projects(
             except Exception as e:
                 logger.debug("release port seed skipped: %s", e)
             store.update_project(project_id, status="RELEASED")
+            # OS-level immutability (round 2): mode bits catch what the
+            # tool guards can't see (shell writes). AFTER RELEASE.md — the
+            # dossier render needs the last write.
+            try:
+                store.set_workspace_readonly(project_id, True)
+            except Exception:
+                logger.debug("release chmod skipped", exc_info=True)
             store.log_event(project_id, None, "project_released",
                             {"version": release["version"],
                              "services": len(release["services"]),
@@ -2756,8 +2955,14 @@ async def tool_manage_projects(
             # ledger, config, manifest, constraints) but NOT the release
             # dossier, task history, or journal — and its service port is
             # bumped so v(n) and v(n+1) never collide.
-            if not project_id:
-                return _err("no active project (pass project_id or switch first)")
+            if not project_id and not title:
+                return _err("no active project (pass project_id, a title, "
+                            "or switch first)")
+            _rid, _rerr = _resolve_project_ref(store, project_id, title)
+            if _rerr:
+                return _err(_rerr)
+            if _rid:
+                project_id = _rid
             parent = store.get_project(project_id)
             if not parent:
                 return _err(f"project not found: {project_id}")
@@ -2770,6 +2975,23 @@ async def tool_manage_projects(
             pmeta = (parent.get("metadata") or {})
             new_version = int(pmeta.get("version") or 1) + 1
             base_title = re.sub(r"\s+v\d+$", "", str(parent.get("title") or ""))
+            # Fork-exists guard (2026-07-25): a model retry loop calling
+            # create_version twice minted TWO "X v2" projects, both on the
+            # same bumped port. An existing non-archived fork is returned
+            # idempotently instead.
+            for _child in store.list_children(project_id):
+                if str(_child.get("status", "")).upper() == "ARCHIVED":
+                    continue
+                _set_current(context, _child["id"])
+                _b = _briefing(store, _child["id"])
+                if isinstance(_b, dict):
+                    _b = {**_b, "workspace": f"projects/{_child['id']}",
+                          "note": (f"A development fork already exists — "
+                                   f"switched to it ({_child['title']}, "
+                                   f"{_child['status']}). Not creating a "
+                                   f"duplicate."),
+                          "existing_fork": True}
+                return _ok(_b)
             # Inherited development knowledge; release dossier deliberately
             # NOT carried; port bumped to avoid colliding with the running
             # released version.
@@ -2809,6 +3031,12 @@ async def tool_manage_projects(
                 shutil.copytree(src_ws, dst_ws, ignore=_ignore,
                                 dirs_exist_ok=True)
                 copied = sum(1 for p in dst_ws.rglob("*") if p.is_file())
+                # copytree copies MODE BITS — a fork of a chmod'd-read-only
+                # released workspace would itself be unwritable. Restore.
+                try:
+                    store.set_workspace_readonly(new_pid, False)
+                except Exception:
+                    pass
             # Seed task + re-register the parent's deliverables on it so the
             # copied files are in THIS project's cleanup keep-set (an
             # unregistered copy would be deleted by the end-of-life sweep).
@@ -2848,6 +3076,97 @@ async def tool_manage_projects(
                       "parent_project_id": project_id,
                       "seed_task": seed_tid}
             return _ok(_b)
+
+        if act == "unrelease":
+            # Human-commanded demotion RELEASED → DONE (round 3): the only
+            # sanctioned demote. The dossier is RETAINED (stamped
+            # unreleased_at) for history and future re-release; the
+            # workspace becomes writable again. Re-releasing bumps the
+            # dossier's revision.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            proj = store.get_project(project_id)
+            if not proj:
+                return _err(f"project not found: {project_id}")
+            if str(proj.get("status", "")).upper() != "RELEASED":
+                return _err(f"project is {proj.get('status')}, not RELEASED "
+                            f"— nothing to unrelease.")
+            rel = store.get_release(project_id)
+            if rel:
+                rel["unreleased_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                store.set_release(project_id, rel)
+            store.update_project(project_id, status="DONE")
+            try:
+                store.set_workspace_readonly(project_id, False)
+            except Exception:
+                pass
+            store.log_event(project_id, None, "project_unreleased", {})
+            pretty_log("Project Unreleased",
+                       f"{proj.get('title')} → DONE (workspace writable; "
+                       f"dossier retained)", icon=Icons.STOP, level="WARNING")
+            return _ok({"status": "DONE", "action_taken": "unreleased",
+                        "note": ("Editable again. Re-release with "
+                                 "action=release when re-tested — the "
+                                 "dossier revision will bump.")})
+
+        if act == "verify_release":
+            # Release health-check (round 3): re-run the rehearsal against
+            # today's reality and report drift vs the dossier. Read-only on
+            # the record (no status change); restarting a dead service is
+            # sanctioned operational healing per the runbook.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            proj = store.get_project(project_id)
+            if not proj:
+                return _err(f"project not found: {project_id}")
+            if str(proj.get("status", "")).upper() != "RELEASED":
+                return _err(f"project is {proj.get('status')}, not RELEASED "
+                            f"— verify_release only checks released projects.")
+            rel = store.get_release(project_id)
+            reh = _release_rehearsal(context, store, project_id)
+            drift = []
+            _now_names = {s.get("name") for s in (reh.get("services") or [])}
+            for s in (rel.get("services") or []):
+                if s.get("name") not in _now_names:
+                    drift.append(f"service '{s.get('name')}' from the dossier "
+                                 f"is no longer registered")
+            healthy = bool(reh.get("ok")) and not drift
+            store.log_event(project_id, None, "release_health",
+                            {"healthy": healthy,
+                             "detail": reh.get("detail", "")[:300],
+                             "drift": drift[:5]})
+            if not healthy:
+                pretty_log("Release Health",
+                           f"{proj.get('title')}: DEGRADED — "
+                           f"{'; '.join(drift) or reh.get('detail', '')[:100]}",
+                           icon=Icons.WARN, level="WARNING")
+            return _ok({
+                "healthy": healthy,
+                "rehearsal": reh.get("detail", ""),
+                "drift": drift,
+                "note": ("Healthy — the dossier still matches reality."
+                         if healthy else
+                         "Degraded — fix the environment, or unrelease / "
+                         "create_version if the artifact itself must change."),
+            })
+
+        if act == "task_delete":
+            # store.delete_task existed since the beginning but was never
+            # exposed — a mistaken duplicate task was permanent (round 3).
+            if not task_id:
+                return _err("task_id is required for action=task_delete")
+            _t = store.get_task(task_id)
+            if not _t:
+                return _err(f"task not found: {task_id}")
+            _rg = _released_guard(store, _t.get("project_id"))
+            if _rg:
+                return _err(_rg)
+            if not store.delete_task(task_id):
+                return _err(f"delete failed for task {task_id}")
+            store.log_event(_t.get("project_id"), task_id, "task_deleted",
+                            {"description": str(_t.get("description"))[:120]})
+            return _ok({"deleted": task_id,
+                        "description": str(_t.get("description"))[:120]})
 
         # ---- self-advancing loop ---------------------------------------
 
@@ -3089,7 +3408,13 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "change), which forks a v(n+1) copy — files, ledger, config "
             "(port bumped), file map carried over; task history and the "
             "release dossier stay with the released version, which keeps "
-            "running untouched."
+            "running untouched. `unrelease` (user command only) demotes "
+            "RELEASED→DONE for in-place fixes (dossier retained; re-release "
+            "bumps its revision). `verify_release` health-checks a released "
+            "project against its dossier (restarts dead services, probes "
+            "ports, reports drift) — use when the user asks whether a "
+            "released app still runs. `task_delete` (task_id) removes a "
+            "mistaken/duplicate task permanently."
         ),
         "parameters": {
             "type": "object",
@@ -3152,7 +3477,7 @@ MANAGE_PROJECTS_TOOL_DEF = {
                 "config_value": {"type": "string",
                                  "description": "action=config: the value for `config_key` (e.g. 'qwen-3.6-35b-a3', '8000', '2.3.1'). Empty value deletes the key."},
                 "file_path": {"type": "string",
-                              "description": "actions describe_file/file_history: the project-relative file (e.g. 'server.js', 'src/app.py')."},
+                              "description": "actions describe_file/file_history/unregister_file: the project-relative file (e.g. 'server.js', 'src/app.py'). unregister_file removes a RENAMED/DELETED file from the deliverable record + file map (then re-register the new name)."},
                 "file_role": {"type": "string",
                               "description": "action=describe_file: optional short role tag, e.g. 'entrypoint', 'styles', 'data-layer'."},
                 "directions": {"type": "string",

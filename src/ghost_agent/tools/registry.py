@@ -808,6 +808,7 @@ def get_available_tools(context):
             memory_dir=context.memory_dir,
             _metacog_bundle=getattr(context, "metacog", None),
             workspace_model=getattr(context, "workspace_model", None),
+            project_store=getattr(context, "project_store", None),
             **kwargs,
         )
 

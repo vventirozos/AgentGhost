@@ -205,6 +205,42 @@
   "run my journal" resumes into <em>operational</em> context, not a task tree. The tool briefing
   carries a <code>release</code> key. Tests: <code>tests/test_project_release_lifecycle.py</code>.</p>
 
+  <h2>Round-1 correctness fixes (2026-07-25 re-evaluation)</h2>
+  <p><strong>State machine:</strong> the rollup lock is now {DONE, ARCHIVED, RELEASED, PAUSED} — store-level
+  task writes can no longer roll a released project to DONE (firing the sweep on an attested workspace) or
+  auto-complete a paused one. The rollup gained a <em>back-to-ACTIVE</em> branch: open work reappearing on a
+  NEEDS_USER/BLOCKED project reactivates it (the answered-question trap — advance_once refuses non-ACTIVE — is
+  closed), and the add_task/update_task reopen tuples cover NEEDS_USER + BLOCKED. <code>archive</code> stashes
+  <code>metadata.archived_from</code> and <code>resume</code> RESTORES it, so un-archiving a released project
+  returns it to RELEASED with all guards intact (previously it silently stripped to ACTIVE).
+  <strong>Versioning:</strong> same-title <code>create</code> over a RELEASED project steers to
+  <code>create_version</code> (was: reuse + guard contradiction); <code>create_version</code> is idempotent
+  (existing non-archived fork returned with <code>existing_fork: true</code> — no more double-fork title/port
+  collisions); <code>store.list_children</code> answers "what versions exist"; <code>list</code> annotates
+  <code>[vN, fork of &lt;parent&gt;]</code>. <strong>Repair path:</strong> <code>action=unregister_file</code>
+  removes a renamed/deleted file from the deliverable record + manifest (+ map re-render) — stale rows no longer
+  block release permanently. <strong>Idle/digest:</strong> the dream manifest-backfill no longer starves legacy
+  projects (counts only <em>contributing</em> projects against its cap), and the "While you were away" digest
+  surfaces the milestone events (released / version-forked / rehearsal-failed / autoadvance-failed /
+  budget-exhausted / reopened) with RELEASED projects included in the scan. Tests:
+  <code>tests/test_projects_round1_fixes.py</code>.</p>
+
+  <h2>Round-2/3 hardening + features (2026-07-25)</h2>
+  <p><strong>Services follow the lifecycle:</strong> hard delete, archive, and a failed release rehearsal all
+  stop the project's services (no more orphaned processes under an rmtree'd workspace, or a retired release's
+  services running forever). <strong>OS-level immutability:</strong> release chmods the workspace read-only
+  (fork restores +w on the copy — copytree copies mode bits; hard delete restores +w path-direct before rmtree);
+  <code>execute</code> refuses shell commands that reference a RELEASED path AND carry a mutation token
+  (rm/mv/redirect/<code>sed -i</code>…) — closing the shell bypass of the file-tool guard. <strong>Views:</strong>
+  the tool briefing for RELEASED is runbook-shaped (release + versions + routing; no task tree, no
+  workspace-write note); <code>task_tree</code> renders capped at 3500 chars; <code>get</code> returns a slim
+  summary. <strong>Round-3 actions:</strong> <code>unrelease</code> (sanctioned demote → DONE, dossier retained,
+  workspace writable, re-release bumps the dossier <em>revision</em>); <code>verify_release</code> (re-runs the
+  rehearsal, reports drift vs the dossier, logs <code>release_health</code>, warns on degraded, never demotes);
+  <code>task_delete</code> (finally exposed, released-guarded). Plus title-resolution for
+  release/create_version and the <code>update kind=GENERAL</code> fix. Tests:
+  <code>tests/test_projects_round23_fixes.py</code>.</p>
+
   <h2>Public API</h2>
   <h3>Projects</h3>
   <ul>

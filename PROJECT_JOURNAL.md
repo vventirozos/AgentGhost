@@ -1109,6 +1109,105 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-25 (later 4) — PROJECTS full re-evaluation: findings LOGGED (fixes pending operator go-ahead)
+
+Post-RELEASED-lifecycle design review (my targeted pass + independent full-surface review agent; both converged).
+Live population: 9 projects (6 DONE, 2 RELEASED, 1 ARCHIVED); only 2 carry manifests.
+
+**BUGS (ranked):**
+- **P1 NEEDS_USER trap**: rollup can enter NEEDS_USER but nothing returns to ACTIVE (reopen tuples cover
+  DONE/FAILED/PAUSED only; tool status enum omits ACTIVE; advance_once refuses non-ACTIVE) — answered questions
+  strand the project forever. Same class as the 2026-07-11 DONE-reopen deadlock, missed for NEEDS_USER (+BLOCKED).
+- **P2 RELEASED not locked at the store + archive→resume strips it**: `_maybe_rollup_project_status` locks only
+  {DONE, ARCHIVED} — a store-level task write on a RELEASED project rolls it to DONE and FIRES THE SWEEP on a
+  released workspace; archive(RELEASED)→resume lands ACTIVE (attestation + all three guards silently vanish,
+  stale dossier/RELEASE.md still claim immutability). Needs: RELEASED in the rollup lock, resume restores
+  prior status (or refuses), and an explicit `unrelease` policy.
+- **P3 duplicate-create refusal loop**: `_TERMINAL_PROJECT_STATUSES` omits RELEASED → same-title `create` REUSES
+  the released project (writing metadata via store, bypassing the choke) then steers the model to task_add —
+  which the released guard refuses. Contradictory guard pair; should steer to create_version.
+- **P4 no unregister path**: no delete_artifact / manifest-entry removal anywhere → a renamed deliverable
+  permanently fails the release rehearsal with NO tool-side repair.
+- **P5 double-fork collisions**: create_version has no fork-exists check and bypasses the duplicate-title guard
+  → two "X v2" both on parent-port+1. No children index / family listing anywhere.
+- **P6 services orphaned by lifecycle**: hard delete rmtree's under a running service; archive of a released
+  project leaves its services running; failed release leaves rehearsal-restarted services up.
+- Also: manifest dream-backfill starves legacy projects (top-2-recently-updated sliced BEFORE checking need —
+  my 2026-07-24 code); digest blind to autoadvance_failed/budget_exhausted/project_reopened + all 4 release/
+  version event types AND never scans RELEASED/PAUSED/BLOCKED/ARCHIVED projects; PAUSED not rollup-locked;
+  `execute` bypasses the released write-guard (shell redirection); tool `_briefing.task_tree` uncapped (context
+  hazard ≥50 tasks); `get` dumps the raw row; RELEASED switch/status still return dev-style briefing (view
+  disagreement with the runbook mode); release/create_version don't title-resolve; rename breaks the `vN` title
+  convention; sweep recovery registers PROJECT_MAP.md/RELEASE.md as deliverables.
+
+**MISSING FEATURES (justified shortlist):** version-family listing + children index; release health-check /
+re-rehearsal action (dossier rot detection); explicit unrelease→DONE (dossier retained); deliverable/manifest
+unregister + rename reconciliation; service-lifecycle coupling (stop on delete/archive, optional start-on-resume
+for released); task delete/reorder surface (store.delete_task exists, unexposed); cross-project work_log/
+deliverable search; inter-project dependency edges; template/clone-without-lineage; notify-severity for
+release_rehearsal_failed (actionable-event class per chat-noise policy).
+
+Full detail in this entry + the review transcript.
+
+**ROUND 1 FIXES SHIPPED (same day — operator: "proceed with round 1"):**
+- **State machine (P1/P2 + PAUSED)**: rollup lock now {DONE, ARCHIVED, RELEASED, PAUSED} — a store-level task
+  write can no longer roll a released project to DONE (and fire the sweep on an attested workspace) or complete a
+  deliberately-paused one; the rollup gained a **back-to-ACTIVE branch** (open work reappearing on a
+  NEEDS_USER/BLOCKED project rolls it ACTIVE — the answered-question trap is closed); reopen tuples on
+  add_task/update_task now cover NEEDS_USER + BLOCKED (ARCHIVED/RELEASED still never auto-resurrect);
+  **archive stashes `metadata.archived_from` and resume RESTORES it** — un-archiving a released project returns
+  it to RELEASED with guards intact (legacy archives without the stash restore to ACTIVE as before). CONTRACT
+  CHANGE: `test_add_task_never_reopens_archived_or_needs_user` updated (NEEDS_USER now reopens, rationale in-test).
+- **Versioning (P3/P5)**: same-title `create` over a RELEASED project now steers to create_version (no more
+  reuse-then-refuse contradiction, no store-bypass metadata writes); `create_version` is **idempotent** — an
+  existing non-archived fork is returned with `existing_fork: true` (double-fork title+port collision closed);
+  new `store.list_children`; `list` display annotates `[vN, fork of <parent>]`.
+- **Unregister path (P4)**: `store.unregister_file` + tool action `unregister_file` (released-guarded) removes
+  stale deliverable rows + manifest entry + re-renders PROJECT_MAP.md — renamed files no longer block release
+  forever; the file also leaves the cleanup keep-set (correct for renamed-away paths).
+- **Backfill starvation + digest (mine + M1)**: `_backfill_file_manifests` iterates ALL non-archived projects and
+  counts only CONTRIBUTING ones against max_projects (the 6 legacy DONE projects are now reachable); digest
+  `_RELEVANT` + renderer gained the milestone events (project_released/version_forked/release_rehearsal_failed/
+  autoadvance_failed/budget_exhausted/project_reopened) with a "Milestones:" section, and the candidate scan now
+  includes RELEASED projects (version_forked logs on the parent — was structurally unreachable).
+Tests: `tests/test_projects_round1_fixes.py` (9) + contract update. Full suite green; deployed.
+**ROUNDS 2+3 SHIPPED (same day — operator: "proceed with round 2, then round 3"):**
+- *R2a services*: `_stop_project_services` on hard delete (before rmtree — no more orphaned processes under a
+  vanishing workspace), on archive (retiring retires services), and on a FAILED release rehearsal (don't leave
+  half-started services of a not-released project up). Rehearsal failure now also pretty-WARNINGs.
+- *R2b hardening*: release chmods the workspace tree a-w (`set_workspace_readonly` / path-direct `_chmod_tree` —
+  hard delete restores +w BEFORE rmtree since the DB row is already gone by then; create_version restores +w on
+  the fork because copytree copies mode bits); `execute` gained `_released_shell_block` — a command referencing a
+  RELEASED project's path AND carrying a mutation token (rm/mv/redirect/sed -i/…) is refused with the
+  create_version steer, read-only shell untouched. Closes the shell bypass (review M8).
+- *R2c views*: `_briefing` returns a RUNBOOK shape for RELEASED (release + versions list + routing note; no task
+  tree, no "files you write live HERE"); switch/resume keep the runbook note; `task_tree` render capped at 3500
+  chars (the ≥50-task 100KB tool-result hazard); `get` returns a slim summary (id/status/goal/version/parent +
+  briefing) instead of the raw metadata dump.
+- *R2d polish*: release/create_version title-resolve (+ joined _TITLE_RESOLVABLE so an explicit title beats the
+  current-project auto-fill); `kind` default "" so `update kind=GENERAL` finally works (old default made intent
+  indistinguishable).
+- *R3 features*: **`unrelease`** (the sanctioned demote: →DONE, dossier RETAINED + stamped, workspace +w;
+  re-release bumps the dossier **revision** — fork numbering keeps "version"); **`verify_release`** (re-runs the
+  rehearsal + reports drift vs the dossier services; logs `release_health`; WARNING on degraded; never demotes);
+  **`task_delete`** exposed (store.delete_task had zero callers; released-guarded).
+Tests: `tests/test_projects_round23_fixes.py` (9; incl. chmod/fork-writability, shell-guard allow/block, runbook
+switch view, unrelease→re-release revision bump, health-check drift, task_delete guard). Two found-in-test bugs
+fixed: hard-delete's chmod restore ran after the DB row was gone (path-direct now), and the drift test needed
+dir +w for unlink. Full suite green; deployed.
+**LIVE-VERIFIED (v2 release health, 2026-07-25 09:53).** Two independent paths: (1) natural request ("is v2 still
+runnable?") → the model verified MANUALLY (restarted jj-journal, browsed, HTTP 200) and reported operational; (2)
+explicit `action=verify_release` → **healthy** ("jj-journal: up · port 8100 reachable", drift: []), `release_health`
+event logged, status untouched (RELEASED). **Deploy-hygiene lesson caught en route**: probe 1 hit "unknown action" —
+the serving process (81880, up since 09:32) predated rounds 2/3 because the 09:48 "deploy" killed a `pgrep|head -1`
+match that was NOT the listener, and the respawn health-loop then found the already-running old agent and declared
+success. Correct deploy handle: **the pid from `lsof -iTCP:8000 -sTCP:LISTEN` (or `launchctl print`), never
+pgrep head -1** — and verify the LISTENER pid changed, not just that health returns ok.
+
+**Remaining from the review, deliberately deferred**: cross-project search, inter-project dependency edges,
+templates/clone-without-lineage, cross-version journal chaining, PROJECT_MAP/RELEASE.md keep-set formalization
+(currently safe by suffix), sweep-recovery deliverable-classification of system .md files.
+
 ### 2026-07-25 (later 3) — Vision-claims refute class closed: claim-conditioned evidence selection
 
 Diagnosis overturned the design: the 🌙→☀️ "vision claim" was never vision-only — the click result CARRIED the

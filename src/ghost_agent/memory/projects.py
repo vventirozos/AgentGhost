@@ -421,6 +421,21 @@ class ProjectStore:
         """
         project_id = _canon_id(project_id)
         if not hard:
+            # Remember what we archived FROM (2026-07-25): resume used to
+            # flip ARCHIVED → ACTIVE unconditionally, silently STRIPPING a
+            # RELEASED project's attestation (and with it every immutability
+            # guard, while RELEASE.md still claimed otherwise). The resume
+            # path restores this value.
+            prev = str((self.get_project(project_id) or {})
+                       .get("status") or "").upper()
+            if prev and prev != ProjectStatus.ARCHIVED.value:
+                try:
+                    def _mut(meta):
+                        meta["archived_from"] = prev
+                        return meta
+                    self._atomic_metadata_update(project_id, _mut)
+                except Exception:
+                    logger.debug("archived_from stash skipped", exc_info=True)
             return self.update_project(project_id, status=ProjectStatus.ARCHIVED.value)
 
         # Resolve the workspace path BEFORE deleting the row.
@@ -459,6 +474,15 @@ class ProjectStore:
                     else str(ws_p).startswith(str(root) + "/")
                 )
                 if contained and ws_p.exists():
+                    # Restore writability first — a RELEASED workspace is
+                    # chmod'd read-only and rmtree(ignore_errors) would
+                    # silently leave the tree behind. Path-direct: the DB
+                    # row is already gone at this point, so the
+                    # project-id-based helper would no-op.
+                    try:
+                        self._chmod_tree(ws_p, False)
+                    except Exception:
+                        pass
                     shutil.rmtree(ws_p, ignore_errors=True)
             except Exception as e:
                 logger.warning("Could not remove workspace for %s: %s", project_id, e)
@@ -605,7 +629,14 @@ class ProjectStore:
                     "SELECT status FROM projects WHERE id = ?", (project_id,)
                 ).fetchone()
                 prev = ((prow["status"] if prow else "") or "").upper()
-                if prev in ("DONE", "FAILED", "PAUSED"):
+                # NEEDS_USER/BLOCKED joined 2026-07-25: adding work to a
+                # waiting/blocked project previously created tasks the
+                # advancer could NEVER reach (advance_once refuses
+                # non-ACTIVE) — the same unreachable-work trap fixed for
+                # DONE on 2026-07-11. ARCHIVED and RELEASED stay excluded:
+                # deliberate end-states, resurrect explicitly.
+                if prev in ("DONE", "FAILED", "PAUSED", "NEEDS_USER",
+                            "BLOCKED"):
                     cur = conn.execute(
                         "UPDATE projects SET updated_at = ?, status = 'ACTIVE' "
                         "WHERE id = ? AND status = ?",
@@ -720,7 +751,7 @@ class ProjectStore:
                     (row["project_id"],),
                 ).fetchone()
                 prev = ((prow["status"] if prow else "") or "").upper()
-                if prev in ("FAILED", "PAUSED"):
+                if prev in ("FAILED", "PAUSED", "NEEDS_USER", "BLOCKED"):
                     rcur = conn.execute(
                         "UPDATE projects SET status = 'ACTIVE', updated_at = ? "
                         "WHERE id = ? AND status = ?",
@@ -758,16 +789,23 @@ class ProjectStore:
             terminal)                            → project NEEDS_USER
           * otherwise (real open work remains)   → no-op
 
-        DONE and ARCHIVED are *locked*: once reached we never auto-undo
-        them (a manual archive or a genuine completion stays put). FAILED
-        and NEEDS_USER are NOT locked — a revised/answered task can roll
-        the project forward to DONE on a later update.
+        DONE, ARCHIVED, RELEASED and PAUSED are *locked*: once reached we
+        never auto-undo them. RELEASED/PAUSED joined the lock 2026-07-25 —
+        a store-level task write on a RELEASED project could roll it to
+        DONE and FIRE THE CLEANUP SWEEP on a human-attested workspace, and
+        one task flip on a deliberately-PAUSED project could complete it
+        under the operator. FAILED and NEEDS_USER are NOT locked — a
+        revised/answered task rolls the project forward (or, since
+        2026-07-25, BACK to ACTIVE when real open work reappears: the
+        answered-question NEEDS_USER trap left projects stranded forever
+        because nothing ever rolled back).
         """
         proj = self.get_project(project_id)
         if not proj:
             return
         current = (proj.get("status") or "").upper()
-        if current in {ProjectStatus.DONE.value, ProjectStatus.ARCHIVED.value}:
+        if current in {ProjectStatus.DONE.value, ProjectStatus.ARCHIVED.value,
+                       ProjectStatus.RELEASED.value, ProjectStatus.PAUSED.value}:
             return
         tasks = self.list_tasks(project_id)
         if not tasks:
@@ -785,10 +823,18 @@ class ProjectStore:
         else:
             # Not all terminal — only roll up if the *only* non-terminal
             # work is waiting on the user. Anything else means there is
-            # still autonomous work to do, so leave the project ACTIVE.
+            # still autonomous work to do.
             open_states = {s for s in statuses if s not in terminal}
             if open_states and open_states == {"NEEDS_USER"}:
                 new_status = ProjectStatus.NEEDS_USER.value
+            elif current in (ProjectStatus.NEEDS_USER.value,
+                             ProjectStatus.BLOCKED.value):
+                # Real open work reappeared on a waiting/blocked project
+                # (the user answered; a task was revised) — roll BACK to
+                # ACTIVE so the advancer and the tool enum can reach it.
+                # Without this branch the project stayed NEEDS_USER forever
+                # (the trap: advance_once refuses non-ACTIVE).
+                new_status = ProjectStatus.ACTIVE.value
             else:
                 return
 
@@ -1308,6 +1354,105 @@ class ProjectStore:
         except Exception as e:
             logger.debug("PROJECT_MAP write failed: %s", e)
             return None
+
+    @staticmethod
+    def _chmod_tree(ws: Path, readonly: bool) -> int:
+        """Walk ``ws`` flipping the write bits. Path-direct so callers that
+        have already deleted the DB row (hard delete) can still restore
+        writability before rmtree."""
+        import stat
+        touched = 0
+        try:
+            for p in [ws, *ws.rglob("*")]:
+                try:
+                    mode = p.stat().st_mode
+                    if readonly:
+                        new_mode = mode & ~(stat.S_IWUSR | stat.S_IWGRP
+                                            | stat.S_IWOTH)
+                    else:
+                        new_mode = mode | stat.S_IWUSR
+                    if new_mode != mode:
+                        p.chmod(new_mode)
+                        touched += 1
+                except Exception:
+                    continue
+        except Exception:
+            return touched
+        return touched
+
+    def set_workspace_readonly(self, project_id: str, readonly: bool) -> int:
+        """chmod the whole workspace tree a-w (or restore u+w). OS-level
+        half of release immutability (2026-07-25 round 2): the file-tool
+        guard can't see `execute` shell writes, but mode bits can stop the
+        common case (container root via virtiofs still maps through the
+        host user on macOS). Best-effort — never raises; returns paths
+        touched. Callers: release (True), unrelease (False), hard delete
+        (False, before rmtree — which fails on read-only dirs)."""
+        proj = self.get_project(project_id)
+        ws = Path(str((proj or {}).get("workspace_dir") or ""))
+        if not ws or not ws.is_dir():
+            return 0
+        return self._chmod_tree(ws, readonly)
+
+    def unregister_file(self, project_id: str, rel_path: str) -> Dict[str, int]:
+        """Remove a file from the deliverable record AND the manifest.
+
+        The missing repair path (2026-07-25 review H4): a renamed/deleted
+        deliverable's stale artifact row made the release rehearsal fail
+        PERMANENTLY ("deliverable missing on disk") with no tool-side fix.
+        Removes matching ``kind='file'`` artifact rows, the manifest entry,
+        re-renders PROJECT_MAP.md. Returns counts. NOTE: also removes the
+        path from the cleanup keep-set — the file (if still on disk) becomes
+        sweepable debris, which is exactly right for a renamed-away file.
+        """
+        project_id = _canon_id(project_id)
+        rel = self._normalize_rel_path(project_id, rel_path)
+        out = {"artifacts_removed": 0, "manifest_removed": 0}
+        if rel is None:
+            return out
+        with self._lock, self._connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM task_artifacts WHERE project_id = ? "
+                "AND kind = 'file' AND payload = ?",
+                (project_id, rel),
+            )
+            conn.commit()
+            out["artifacts_removed"] = cur.rowcount
+
+        def _mut(meta):
+            mf = meta.get("file_manifest")
+            if isinstance(mf, dict) and rel in mf:
+                mf = dict(mf)
+                mf.pop(rel, None)
+                meta["file_manifest"] = mf
+                out["manifest_removed"] = 1
+            return meta
+
+        try:
+            self._atomic_metadata_update(project_id, _mut)
+        except Exception:
+            logger.debug("manifest unregister skipped", exc_info=True)
+        if out["artifacts_removed"] or out["manifest_removed"]:
+            self.log_event(project_id, None, "file_unregistered",
+                           {"path": rel, **out})
+            try:
+                self.render_project_map(project_id)
+            except Exception:
+                pass
+        return out
+
+    def list_children(self, project_id: str) -> List[Dict[str, Any]]:
+        """Projects forked FROM ``project_id`` via create_version
+        (``metadata.parent_project_id``), any status. Lineage was one-way
+        until 2026-07-25 — "what versions of X exist?" was unanswerable and
+        a double-fork was undetectable."""
+        project_id = _canon_id(project_id)
+        out = []
+        for p in self.list_projects():
+            if str((p.get("metadata") or {})
+                   .get("parent_project_id") or "") == project_id:
+                out.append(p)
+        return out
 
     # ------------------------------------------------------------------ release dossier
 

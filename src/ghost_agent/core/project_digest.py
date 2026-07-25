@@ -30,7 +30,25 @@ _NEEDS_USER_EVENTS = ("autoadvance_needs_user", "human_gate_triggered")
 # Written by ProjectStore._maybe_rollup_project_status when task updates
 # settle the whole project's status.
 _ROLLUP_EVENTS = ("project_auto_rollup",)
-_RELEVANT = frozenset(_ADVANCE_EVENTS + _NEEDS_USER_EVENTS + _ROLLUP_EVENTS)
+# Milestones the operator should hear about (2026-07-25 review: all of
+# these were invisible in "While you were away" — a failed autonomous
+# build only surfaced if the whole project rolled FAILED, and nothing
+# release/version-related ever surfaced).
+_MILESTONE_EVENTS = ("project_released", "version_forked",
+                     "release_rehearsal_failed", "autoadvance_failed",
+                     "budget_exhausted", "project_reopened")
+_RELEVANT = frozenset(_ADVANCE_EVENTS + _NEEDS_USER_EVENTS + _ROLLUP_EVENTS
+                      + _MILESTONE_EVENTS)
+
+# Human phrasings for the milestone lines, keyed by event type.
+_MILESTONE_PHRASES = {
+    "project_released": "was RELEASED (v{version})",
+    "version_forked": "forked a new development version",
+    "release_rehearsal_failed": "FAILED its release rehearsal",
+    "autoadvance_failed": "hit a FAILED build during autoadvance",
+    "budget_exhausted": "exhausted its step budget",
+    "project_reopened": "was reopened ({reason})",
+}
 
 # DONE/FAILED project lists grow without bound, and only the most recently
 # updated few can hold events newer than the watermark — cap the terminal
@@ -44,11 +62,13 @@ class DigestResult:
     projects_touched: int = 0
     needs_user: List[Tuple[str, str]] = field(default_factory=list)  # (project_title, task_desc)
     finished: List[Tuple[str, str]] = field(default_factory=list)  # (project_title, new_status)
+    milestones: List[str] = field(default_factory=list)  # rendered lines
     new_event_id: int = 0
 
     @property
     def has_content(self) -> bool:
-        return self.advanced > 0 or bool(self.needs_user) or bool(self.finished)
+        return (self.advanced > 0 or bool(self.needs_user)
+                or bool(self.finished) or bool(self.milestones))
 
 
 def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -> DigestResult:
@@ -63,7 +83,11 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
     candidates: List[dict] = []
     for status, cap in (("ACTIVE", None), ("NEEDS_USER", None),
                         ("DONE", _RECENT_TERMINAL_LIMIT),
-                        ("FAILED", _RECENT_TERMINAL_LIMIT)):
+                        ("FAILED", _RECENT_TERMINAL_LIMIT),
+                        # RELEASED joined 2026-07-25: version_forked logs on
+                        # the RELEASED parent, so an ACTIVE-only scan could
+                        # never surface it.
+                        ("RELEASED", _RECENT_TERMINAL_LIMIT)):
         try:
             projs = store.list_projects(status) or []
         except Exception as e:
@@ -101,6 +125,17 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
                 if new_status in ("DONE", "FAILED"):
                     touched.add(pid)
                     res.finished.append((title, new_status))
+            elif etype in _MILESTONE_EVENTS:
+                touched.add(pid)
+                payload = ev.get("payload") or {}
+                try:
+                    phrase = _MILESTONE_PHRASES[etype].format(
+                        version=payload.get("version", "?"),
+                        reason=str(payload.get("reason") or "new work")[:60],
+                    )
+                except Exception:
+                    phrase = etype.replace("_", " ")
+                res.milestones.append(f"[{title}] {phrase}")
             else:  # needs-user
                 touched.add(pid)
                 payload = ev.get("payload") or {}
@@ -129,6 +164,11 @@ def render_digest(res: DigestResult, *, max_needs_user: int = 3) -> str:
         lines.append(f"{len(res.finished)} project(s) reached a final status:")
         for title, status in res.finished[:max_needs_user]:
             lines.append(f"  - [{title}] → {status}")
+    if res.milestones:
+        lines.append("Milestones:")
+        lines.extend(f"  - {m}" for m in res.milestones[:4])
+        if len(res.milestones) > 4:
+            lines.append(f"  - …and {len(res.milestones) - 4} more")
     if res.needs_user:
         lines.append(f"{len(res.needs_user)} now need your input:")
         for title, desc in res.needs_user[:max_needs_user]:
