@@ -1172,8 +1172,14 @@ def _project_service_entries(context, project_id: str) -> list:
         if sup is None:
             return []
         needle = f"projects/{project_id}"
+        # Match workdir OR command: live registry entries carry
+        # workdir="/workspace" with the project path inside the COMMAND
+        # (`cd /workspace/projects/<id> && node server.js`) — observed
+        # 2026-07-25 when the v2 release rehearsal missed a running,
+        # registered service and fell back to the deliverables check.
         return [e for e in sup.list_entries()
-                if needle in str(e.get("workdir") or "")]
+                if needle in str(e.get("workdir") or "")
+                or needle in str(e.get("command") or "")]
     except Exception:
         return []
 
@@ -2709,13 +2715,29 @@ async def tool_manage_projects(
             }
             if not store.set_release(project_id, release):
                 return _err("failed to persist the release dossier")
+            # Seed config.port from the REHEARSED service (2026-07-25): the
+            # first live fork served on the released version's port because
+            # the parent never recorded one, so create_version's bump had
+            # nothing to bump. The rehearsal's discovered port is the
+            # authoritative value — record it so every future fork can
+            # allocate around it.
+            try:
+                _svc_ports = [s["port"] for s in release["services"]
+                              if s.get("port")]
+                if _svc_ports and not str(
+                        (meta.get("config") or {}).get("port", "")).strip():
+                    store.set_config_value(project_id, "port",
+                                           str(_svc_ports[0]))
+            except Exception as e:
+                logger.debug("release port seed skipped: %s", e)
             store.update_project(project_id, status="RELEASED")
             store.log_event(project_id, None, "project_released",
                             {"version": release["version"],
                              "services": len(release["services"]),
                              "rehearsal": release["rehearsal"][:200]})
+            _rel_title = re.sub(r"\s+v\d+$", "", str(proj.get("title") or ""))
             pretty_log("Project Released",
-                       f"{proj.get('title')} v{release['version']} — "
+                       f"{_rel_title} v{release['version']} — "
                        f"rehearsal passed ({release['rehearsal'][:80]})",
                        icon=Icons.OK)
             return _ok({

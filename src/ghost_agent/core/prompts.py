@@ -834,7 +834,8 @@ You are the Subconscious Synthesizer. Extract high-signal data from this task ep
 ### SCORING MATRIX
 - 1.0 : EXPLICIT IDENTITY (Names, locations, professions). -> TRIGGERS PROFILE UPDATE.
 - 0.9 : INFERRED PREFERENCES ("I prefer async Python", "Always use pytest"). -> TRIGGERS PROFILE UPDATE.
-- 0.8 : PROJECT CONTEXT (Current complex bugs, architectural choices, library versions).
+- 0.8 : GENERAL TECHNICAL CONTEXT not tied to a managed project (host quirks, recurring bugs, library versions in the user's environment).
+- 0.2 : TRACKED-PROJECT STATE — anything about a MANAGED PROJECT's files, architecture, tasks, testing, or release status (episodes mentioning a 12-hex project id or a project the agent manages). The project store already records these; saving them here creates stale duplicates ("user is working on X" read weeks later as current truth). -> DISCARD. NEVER put project state in profile_update. A durable USER preference learned during project work ("user prefers dark UIs") is still 0.9.
 - 0.1 : EPHEMERAL CHIT-CHAT -> DISCARD.
 
 ### OUTPUT FORMAT

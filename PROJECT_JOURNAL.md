@@ -1109,6 +1109,38 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-25 (later 2) — Operator log-review trio: project-state memory hygiene + id-linkage evidence + release port seed
+
+Operator flagged three log entries from the dark-theme turn; all three were real. (1) **User-memory pollution**: the
+smart-memory prompt scored "PROJECT CONTEXT" at 0.8 and the model inflated to 0.9 → three project-status "facts"
+stored as timeless user truths AND churned through the profile's 3-slot notes.info (100% of the user's notes became
+project chatter, evicting whatever was there). Fix: prompt rescored (tracked-project state → 0.2 DISCARD; "the
+project store owns these"; preferences learned during project work stay 0.9) + deterministic backstop
+`_is_tracked_project_state` (12-hex token verified against the store, or bound-project title; preference-cue
+sentences exempt) applied to BOTH the fact and the EFFECTIVE profile value (profile_up.value falls back to fact —
+the fallback is screened too). Graph triplets deliberately untouched (project concepts belong in the graph). The 3
+polluted notes.info values scrubbed on deploy. (2) **Category-error refute**: verifier refuted the correct close
+because "task ID d8a307dd196f does not match project ID 6be718ab7dc3" — different entity types; the linkage evidence
+(task_update confirmation naming the task id) was under the packer's 200-char bar. Fix: short bookkeeping results
+carrying a 12-hex id are packed (linkage-evidence class). Noted consequence chain: that LATE REFUTED (90%) backfilled
+the trajectory FAILED → the outcome-gated loop ticked `failed_retrievals` on lessons from a turn that actually
+SUCCEEDED — false refutes now poison the failure arm, raising the stakes on verifier precision (`_OUTCOME_MIN_OBS=4`
+bounds it). The second refute half ("evidence only shows initial state" for the 🌙→☀️ claim) is the vision-claims
+class — screenshot-observed facts aren't in text evidence; logged, not fixed. (3) **Release port seed**: the dossier
+rehearsal's discovered service port is now written to `config.port` when absent — so create_version's bump always
+has a source (the first live fork served on v1's port for lack of one). Tests:
+`tests/test_project_state_memory_hygiene.py` (9). Full suite green; deployed; profile scrubbed (3/3 slots were
+chatter — nothing durable had survived their churn).
+
+**v2 RELEASED with the FULL dossier (after one more found-bug).** First v2 release rehearsal STILL fell back to the
+deliverables check: the live service registry stores workdir="/workspace" with the project path only in the COMMAND
+(`cd /workspace/projects/<id> && node server.js`) — the workdir-only matcher missed it. Fixed
+(`_project_service_entries` matches workdir OR command; test updated to the live registry shape) + "v2 v2" title
+cosmetic. Re-released (store-level DONE revert, operator-authorized re-validation): **rehearsal took the service
+path — "jj-journal: up · port 8100 reachable"** — dossier carries the verified start command + URL, and
+`config.port=8100` seeded → a future v3 fork bumps to 8101. The release pipeline is now validated on both rehearsal
+paths (deliverables + live service).
+
 ### 2026-07-25 (later) — RELEASED lifecycle: human-attested terminal state + rehearsed runbook + versioning
 
 **Operator idea, evaluated + hardened, then built.** DONE = the agent's self-assessment; RELEASED = the human's.
@@ -1139,6 +1171,17 @@ service-rehearsal w/ stub supervisor, update/guard/add_task/file-write immutabil
 bump + keep-set re-registration + parent untouched, runbook briefing). Full suite **9086/0** (one fixture needed
 `asyncio.run` — `get_event_loop` broke under the suite's loop state). Docs: `docs/memory/projects.html` "RELEASED"
 section. Memory `[[project-accessibility]]` updated.
+
+**First real v2 development turn (dark-theme task, same day).** The agent implemented the toggle in v2's
+index.html (3 surgical replaces), started the service pointed at **v2's workdir**, and browser-verified the
+toggle live (navigate → click → 🌙→☀️ → screenshot) before closing the task DONE with a real result summary; v2
+rolled up DONE. **Immutability proven by checksum: v1's files byte-identical after the full turn; v1 still
+RELEASED.** The same-day audit fixes fired visibly in production: the WEB-EXEC file:// gate declared itself
+inconclusive (page calls fetch) and the verifier caught a task-ID inconsistency in the closing claim.
+**Finding:** v2 served on :8100 — v1's advertised port — because v1 never recorded `config.port`, so the fork's
+bump had nothing to bump (and the model ran service stop-all first; harmless here since v1's service was already
+dead, but a real collision hazard when a released service is RUNNING). Follow-up: seed `config.port` at release
+time from the rehearsal's discovered services so every fork has a bump source.
 
 **LIVE-VALIDATED (prod :8000, the real Jiu Jitsu Journal).** (1) "I have tested it, release it" → model called
 `action=release` with genuinely good user-manual directions → rehearsal passed (deliverables path: "all 6 present")

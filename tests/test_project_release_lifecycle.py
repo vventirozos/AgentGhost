@@ -112,8 +112,12 @@ async def test_release_service_rehearsal_probes_port(context, store, monkeypatch
         def __init__(self):
             self.restarted = []
         def list_entries(self):
-            return [{"name": "svc", "command": "node server.js",
-                     "port": 8123, "workdir": f"/workspace/projects/{pid}"}]
+            # workdir deliberately "/workspace" with the project path only
+            # in the COMMAND — the live registry shape that the workdir-only
+            # matcher missed (2026-07-25 v2 release).
+            return [{"name": "svc",
+                     "command": f"cd /workspace/projects/{pid} && node server.js",
+                     "port": 8123, "workdir": "/workspace"}]
         def restart(self, name):
             self.restarted.append(name)
             return "ok"

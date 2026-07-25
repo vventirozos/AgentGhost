@@ -357,7 +357,15 @@ def _collect_verifier_evidence(tools_run: Optional[list],
             _c = str(tool.get("content", "")).strip()
             _informational = (len(_c) >= 200
                               or _c.startswith(("Error", "SYSTEM BLOCK",
-                                                "REJECTED")))
+                                                "REJECTED"))
+                              # Short confirmations CARRYING AN ID are
+                              # linkage evidence (2026-07-25): the verifier
+                              # refuted a correct close because the
+                              # task_update result naming task d8a307dd196f
+                              # was under the length bar, so it "compared"
+                              # the task id against the PROJECT id and
+                              # called the mismatch an error.
+                              or bool(re.search(r"\b[0-9a-f]{12}\b", _c)))
             if not _informational:
                 continue
         picked.append(tool)
@@ -4298,6 +4306,42 @@ class GhostAgent:
                    if len(_done_digests) > 5 else ""),
                 icon=Icons.OK)
 
+    _PROJECT_ID_TOKEN_RE = re.compile(r"\b[0-9a-f]{12}\b")
+    _PREFERENCE_CUE_RE = re.compile(
+        r"\b(prefer|prefers|loves?|hates?|favorite|favourite|always wants?|"
+        r"never wants?|likes?|dislikes?)\b", re.IGNORECASE)
+
+    def _is_tracked_project_state(self, text: str) -> bool:
+        """True when ``text`` is state about a MANAGED project (verified
+        12-hex id or an active/known project title) rather than a durable
+        user fact. Preference-phrased sentences pass (a real preference
+        learned during project work is still user memory). Never raises."""
+        try:
+            t = (text or "").strip()
+            if not t or self._PREFERENCE_CUE_RE.search(t):
+                return False
+            store = getattr(self.context, "project_store", None)
+            if store is None:
+                return False
+            for tok in self._PROJECT_ID_TOKEN_RE.findall(t.lower()):
+                try:
+                    if store.get_project(tok):
+                        return True
+                except Exception:
+                    continue
+            # Title match against the currently-bound project only (cheap;
+            # scanning every title on every consolidation would be a query
+            # per project).
+            pid = getattr(self.context, "current_project_id", None)
+            if pid:
+                proj = store.get_project(pid)
+                title = str((proj or {}).get("title") or "").strip().lower()
+                if len(title) >= 6 and title in t.lower():
+                    return True
+        except Exception:
+            return False
+        return False
+
     async def run_smart_memory_task(self, interaction_context: str, model_name: str, selectivity: float):
         from ..memory.journal import RetryableConsolidationError as _RetryableConsolidation
         if not self.context.memory_system: return
@@ -4405,6 +4449,34 @@ class GhostAgent:
                 if is_removal_or_negation_text(fact):
                     pretty_log("Auto Memory Skip", f"Discarded removal/negation tombstone: {fact}", icon=Icons.STOP)
                     return
+                # Project-state backstop (2026-07-25): the prompt now scores
+                # tracked-project state at 0.2, but a small model inflates —
+                # observed live: 3 project-status "facts" stored at 0.90 AND
+                # churned through the profile's 3-slot notes.info (100% of the
+                # user's notes became project chatter). Deterministic second
+                # line: a fact naming an EXISTING managed project (12-hex id
+                # verified against the store) is project-state — the project
+                # store owns it — unless it reads as a durable preference.
+                # Graph triplets stay untouched (project concepts belong in
+                # the graph by design; _link_project_in_graph puts them there).
+                if self._is_tracked_project_state(fact):
+                    pretty_log(
+                        "Auto Memory Skip",
+                        f"project-state fact routed to the project store, "
+                        f"not user memory: {fact[:80]}",
+                        icon=Icons.SKIP)
+                    fact = ""
+                # Check the EFFECTIVE profile value — the apply path falls
+                # back to `fact` when profile_up carries no "value", so the
+                # fallback must be screened too.
+                if profile_up and self._is_tracked_project_state(
+                        str(profile_up.get("value", fact) or "")):
+                    pretty_log(
+                        "Profile Skip",
+                        "project-state note dropped from profile_update "
+                        "(the project store owns it)",
+                        icon=Icons.SKIP)
+                    profile_up = None
                 fact_lc = fact.lower()
                 is_personal = any(w in fact_lc for w in ["user", "me", "my ", " i ", "identity", "preference", "like"])
                 is_technical = any(w in fact_lc for w in ["file", "path", "code", "error", "script", "project", "repo", "build", "library", "version"])
