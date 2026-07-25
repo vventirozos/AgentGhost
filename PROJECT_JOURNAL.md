@@ -1129,8 +1129,13 @@ never fire. Three-layer close in `run_smart_memory_task` + `profile.py`:
 3. **Sink rotation → debug** in `ProfileMemory._bounded`: a fixed 3-ring rotating at its designed cap is by-design
    routine, not the context-leak signal — WARNING stays only for real merged keys hitting the 8-cap (chat-noise
    rule: operator stream = actionable only).
-Live profile scrubbed post-deploy (3/3 slots were theme chatter again). Vector-store side left alone (belief
-revision already erased 2 of the 3 near-dups; retrieval-ranked, not prompt-injected). Tests:
+Live profile scrubbed post-deploy (3/3 slots were theme chatter again). Vector store purged too (operator-asked,
+same session) via `/api/memory/delete`: the surviving theme-toggle near-dup + 3 OLDER identity-typed "user is
+working on Jiu Jitsu Journal…" facts from the pre-fix session (found by read-only sqlite scan on chroma.sqlite3 —
+NEVER a second PersistentClient, and probe the DELETE endpoint only with substrings you've already verified unique:
+a broad probe deleted an unintended fragment — recovered because it turned out to be an ORPHANED lesson twin, no
+JSON playbook entry, the very orphan that morning's "no JSON twin to bump" dedup-skip named, so net hygiene).
+2 episode-typed utterance records about the project deliberately KEPT (legitimate history, not identity). Tests:
 `test_project_state_memory_hygiene.py` (+3: live-leaked values verbatim, storeless cue screen, durable/preference
 immunity), `test_agent_smart_updates.py` (+2: sink-bound dropped + explicit slot still writes),
 `test_memory_store_durability.py` (+2: sink rotation silent, generic cap still WARNs). Full suite 9129 green.
