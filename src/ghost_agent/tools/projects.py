@@ -56,6 +56,8 @@ _ACTIONS = {
     "release", "create_version", "unrelease", "verify_release",
     # task removal (round 3 — store.delete_task existed unexposed)
     "task_delete",
+    # cross-project features (2026-07-25 final round)
+    "search", "set_dependency", "clone",
     # workspace hygiene
     "cleanup",
     # inbox promotion (suggestion-accepted path)
@@ -1469,6 +1471,8 @@ async def tool_manage_projects(
     file_role: str = "",
     # release runbook prose (action=release)
     directions: str = "",
+    # cross-project search (action=search)
+    query: str = "",
     # autonomous batch pacing
     count: Any = None,
     # research
@@ -1601,6 +1605,7 @@ async def tool_manage_projects(
         "task_add", "task_update", "task_decompose", "artifact_add",
         "ledger", "config", "describe_file", "autoadvance", "update",
         "research", "cleanup", "unregister_file", "task_delete",
+        "set_dependency",
     }
     if act in _RELEASED_MUTATING:
         # ledger/config READ forms (no payload) stay allowed.
@@ -3168,6 +3173,140 @@ async def tool_manage_projects(
             return _ok({"deleted": task_id,
                         "description": str(_t.get("description"))[:120]})
 
+        # ---- cross-project features (2026-07-25 final round) ------------
+
+        if act == "search":
+            # "Which project touched X / used technique Y" — keyword search
+            # over titles/goals/deliverables/manifests/ledgers/work_logs/
+            # research across ALL projects. Read-only.
+            q = (query or "").strip()
+            if not q:
+                return _err("query is required for action=search")
+            hits = store.search_projects(q, limit=max(1, int(limit or 5)))
+            if not hits:
+                return _ok({"hits": [], "note": (
+                    "No project matched. Try action=list for titles, or "
+                    "recall for general memory — facts about untracked work "
+                    "often live there.")})
+            return _ok({"hits": hits, "query": q})
+
+        if act == "set_dependency":
+            # Inter-project dependency edges: this project cannot autoadvance
+            # until every project in `depends_on` is DONE or RELEASED.
+            # Replaces the whole list; empty list clears. Cycles rejected.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            deps_in = depends_on or []
+            resolved = []
+            for ref in deps_in:
+                rid2, rerr2 = _resolve_project_ref(store, str(ref), "")
+                if rerr2:
+                    return _err(rerr2)
+                if not rid2:
+                    return _err(f"dependency not found: {ref!r}")
+                if rid2 == project_id:
+                    return _err("a project cannot depend on itself")
+                resolved.append(rid2)
+            # Cycle guard: walking each candidate's own dependency chain
+            # must never reach back to THIS project (depth-capped).
+            def _reaches(start: str, target: str, depth: int = 0) -> bool:
+                if depth > 10:
+                    return False
+                meta2 = (store.get_project(start) or {}).get("metadata") or {}
+                for d in meta2.get("depends_on_projects") or []:
+                    if d == target or _reaches(d, target, depth + 1):
+                        return True
+                return False
+            for rid2 in resolved:
+                if _reaches(rid2, project_id):
+                    return _err(
+                        f"cycle: {rid2} already depends (directly or "
+                        f"transitively) on this project")
+            def _mut(meta):
+                if resolved:
+                    meta["depends_on_projects"] = resolved
+                else:
+                    meta.pop("depends_on_projects", None)
+                return meta
+            if store._atomic_metadata_update(project_id, _mut) is None:
+                return _err(f"project not found: {project_id}")
+            store.log_event(project_id, None, "dependencies_set",
+                            {"depends_on": resolved})
+            return _ok({"depends_on": resolved,
+                        "note": ("Autoadvance will wait until every "
+                                 "dependency is DONE or RELEASED."
+                                 if resolved else "Dependencies cleared.")})
+
+        if act == "clone":
+            # Template/clone-without-lineage: start a NEW project from an
+            # existing one's shape — any source status (a RELEASED source is
+            # read-only-copied). Unlike create_version: no parent/version
+            # lineage, fresh identity, title REQUIRED.
+            if not project_id:
+                return _err("no active project (pass project_id — the "
+                            "SOURCE — or switch first)")
+            if not title:
+                return _err("title is required for action=clone (the NEW "
+                            "project's name)")
+            src = store.get_project(project_id)
+            if not src:
+                return _err(f"project not found: {project_id}")
+            smeta = (src.get("metadata") or {})
+            new_cfg = dict(smeta.get("config") or {})
+            for _pk in ("port", "PORT"):
+                if str(new_cfg.get(_pk, "")).strip().isdigit():
+                    new_cfg[_pk] = str(int(new_cfg[_pk]) + 1)
+                    break
+            new_pid = store.create_project(
+                title, kind=str(src.get("kind") or "GENERAL"),
+                goal=(goal or str(src.get("goal") or "")),
+                metadata={
+                    "design_ledger": smeta.get("design_ledger") or "",
+                    "config": new_cfg,
+                    "file_manifest": smeta.get("file_manifest") or {},
+                    "constraints": smeta.get("constraints") or [],
+                    "cloned_from": project_id,
+                })
+            import shutil
+            src_ws = Path(str(src.get("workspace_dir") or ""))
+            dst_ws = Path(str((store.get_project(new_pid) or {})
+                              .get("workspace_dir") or ""))
+            copied = 0
+            if src_ws.is_dir() and str(dst_ws):
+                shutil.copytree(
+                    src_ws, dst_ws, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(
+                        "RELEASE.md", ".services", "__pycache__", "*.pyc",
+                        "node_modules"))
+                copied = sum(1 for p in dst_ws.rglob("*") if p.is_file())
+                # copytree copies mode bits — a RELEASED source is a-w.
+                try:
+                    store.set_workspace_readonly(new_pid, False)
+                except Exception:
+                    pass
+            seed_tid = store.add_task(
+                new_pid, " ".join((description or "").split())
+                or f"Adapt the clone of '{src.get('title')}' to its new purpose")
+            for rel_path in store.list_deliverables(project_id):
+                try:
+                    store.register_file_artifact(seed_tid, rel_path)
+                except Exception:
+                    pass
+            store.log_event(new_pid, seed_tid, "project_cloned",
+                            {"source": project_id, "files_copied": copied})
+            _set_current(context, new_pid)
+            store.render_project_map(new_pid)
+            pretty_log("Project Cloned",
+                       f"'{title}' ({new_pid}) from {src.get('title')} — "
+                       f"{copied} file(s); no lineage",
+                       icon=Icons.BRAIN_PLAN)
+            _b = _briefing(store, new_pid)
+            if isinstance(_b, dict):
+                _b = {**_b, "workspace": f"projects/{new_pid}",
+                      "note": _workspace_note(new_pid),
+                      "cloned_from": project_id, "seed_task": seed_tid}
+            return _ok(_b)
+
         # ---- self-advancing loop ---------------------------------------
 
         if act == "autoadvance":
@@ -3414,7 +3553,18 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "project against its dossier (restarts dead services, probes "
             "ports, reports drift) — use when the user asks whether a "
             "released app still runs. `task_delete` (task_id) removes a "
-            "mistaken/duplicate task permanently."
+            "mistaken/duplicate task permanently. "
+            "`search` (query) finds WHICH project touched a file / used a "
+            "technique — searches every project's deliverables, file map, "
+            "ledger, journal, and research; use it before answering 'which "
+            "project did X'. `set_dependency` (depends_on=[ids/titles]) "
+            "makes this project wait for others: autoadvance holds until "
+            "every dependency is DONE/RELEASED (empty list clears; cycles "
+            "rejected). `clone` (project_id=SOURCE, title=NEW name, "
+            "optional description/goal) starts a FRESH project from an "
+            "existing one's files+knowledge WITHOUT lineage — use for "
+            "'make another one like X'; for changing a RELEASED project "
+            "itself use create_version instead."
         ),
         "parameters": {
             "type": "object",
@@ -3480,6 +3630,8 @@ MANAGE_PROJECTS_TOOL_DEF = {
                               "description": "actions describe_file/file_history/unregister_file: the project-relative file (e.g. 'server.js', 'src/app.py'). unregister_file removes a RENAMED/DELETED file from the deliverable record + file map (then re-register the new name)."},
                 "file_role": {"type": "string",
                               "description": "action=describe_file: optional short role tag, e.g. 'entrypoint', 'styles', 'data-layer'."},
+                "query": {"type": "string",
+                          "description": "action=search: what to find across ALL projects (a filename, technique, library, topic)."},
                 "directions": {"type": "string",
                                "description": "action=release (REQUIRED there): the usage runbook for the USER — what the project is, how to use it, features, known limitations. Written in second person, ≥2 sentences. The tool appends the VERIFIED service commands/ports itself; do not guess them here."},
             },

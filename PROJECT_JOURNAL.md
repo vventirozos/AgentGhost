@@ -1109,6 +1109,35 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-25 (later 5) — notes.info refill closed: workflow-cue backstop + sink-write guard + sink log level
+
+Operator: "i still got 'profile capped — notes.info hit the 3-value cap'". Real recurrence, not stale code: the
+serving process (boot 10:18:21) postdated the (later 2) fix (agent.py mtime 10:17:33), yet by 10:22 the freshly-
+scrubbed ring held 3 NEW theme-toggle chatter values. Root cause: the post-boot **hippocampus drain of 14 buffered
+journal items** (from the pre-restart dark-theme session) re-scored the episodes — the model inflated to 0.90 again
+(rescored prompt ignored, as (later 2) predicted) — and the paraphrased facts ("…as previous attempts failed
+verification / were refuted by a verifier / verify against specific project IDs and visual evidence") carry **no
+12-hex id and no bound title** (drain runs unbound anyway), so `_is_tracked_project_state`'s two store checks could
+never fire. Three-layer close in `run_smart_memory_task` + `profile.py`:
+1. **`_WORK_STATE_CUE_RE`** in the backstop: verifier/refuted/failed-verification/previous-attempts/"project IDs"
+   vocabulary = the agent describing its own loop, never a durable user fact; checked BEFORE the store lookups
+   (store-independent), preference-exemption still first. Screens all 3 live-leaked values verbatim.
+2. **Sink-write guard**: a `profile_update` naming NEITHER category nor key (the notes.info default shape) is
+   dropped before the profile write — the fact already stores in vector memory on the same path, so the sink write
+   was pure duplication churning the ring every consolidation. Well-formed updates flow; dropped ones degrade to
+   `auto` type (same convention as the non-dict shape).
+3. **Sink rotation → debug** in `ProfileMemory._bounded`: a fixed 3-ring rotating at its designed cap is by-design
+   routine, not the context-leak signal — WARNING stays only for real merged keys hitting the 8-cap (chat-noise
+   rule: operator stream = actionable only).
+Live profile scrubbed post-deploy (3/3 slots were theme chatter again). Vector-store side left alone (belief
+revision already erased 2 of the 3 near-dups; retrieval-ranked, not prompt-injected). Tests:
+`test_project_state_memory_hygiene.py` (+3: live-leaked values verbatim, storeless cue screen, durable/preference
+immunity), `test_agent_smart_updates.py` (+2: sink-bound dropped + explicit slot still writes),
+`test_memory_store_durability.py` (+2: sink rotation silent, generic cap still WARNs). Full suite 9129 green.
+Docs: `docs/memory/profile.html` (log levels + "Project-state screening + sink-write guard"). NOTE for the earlier
+suite runs: this shell exports FORCE_COLOR=3 → 2 pretty_log non-TTY color tests fail on ENV, not code; run with
+`env -u FORCE_COLOR`.
+
 ### 2026-07-25 (later 4) — PROJECTS full re-evaluation: findings LOGGED (fixes pending operator go-ahead)
 
 Post-RELEASED-lifecycle design review (my targeted pass + independent full-surface review agent; both converged).
@@ -1204,9 +1233,23 @@ match that was NOT the listener, and the respawn health-loop then found the alre
 success. Correct deploy handle: **the pid from `lsof -iTCP:8000 -sTCP:LISTEN` (or `launchctl print`), never
 pgrep head -1** — and verify the LISTENER pid changed, not just that health returns ok.
 
-**Remaining from the review, deliberately deferred**: cross-project search, inter-project dependency edges,
-templates/clone-without-lineage, cross-version journal chaining, PROJECT_MAP/RELEASE.md keep-set formalization
-(currently safe by suffix), sweep-recovery deliverable-classification of system .md files.
+**FINAL ROUND SHIPPED (same day — operator: "proceed with the deferred features"):**
+- **`action=search`** (`store.search_projects`): "which project touched X / used Y" across ALL projects —
+  keyword-scored over title/goal (3×), deliverables + manifest descs (2×), ledger/research/work_logs (1×);
+  ranked hits with kind-tagged snippets; empty-hit response steers to list/recall. Deterministic, no LLM.
+- **`action=set_dependency`**: `metadata.depends_on_projects` (ids/titles resolved; self + transitive cycles
+  rejected, depth-10 cap); **`advance_once` gates on it** — a dependent project reports "waiting on dependency
+  'X' (STATUS)" until every dep is DONE/RELEASED, so the round-robin can sequence project chains; briefing shows
+  DEPENDS ON with live statuses; `dependencies_set` event.
+- **`action=clone`** (template/clone-without-lineage): fresh-titled project from any-status source (RELEASED
+  sources copy fine — mode bits restored on the copy), carrying files/ledger/config(port+1)/manifest/constraints;
+  provenance = `cloned_from` only (NOT a version fork — list_children ignores clones); deliverables re-registered
+  on the seed task; auto-switch + PROJECT_MAP render.
+Tests: `tests/test_projects_cross_features.py` (7). Full suite green; deployed (listener-pid-verified per the new
+deploy rule); live search sanity on the real 9-project population.
+
+**Still-deferred residue (small, non-blocking)**: cross-version journal chaining; PROJECT_MAP/RELEASE.md keep-set
+formalization (safe by suffix today); sweep-recovery deliverable-classification of system .md files.
 
 ### 2026-07-25 (later 3) — Vision-claims refute class closed: claim-conditioned evidence selection
 

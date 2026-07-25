@@ -241,6 +241,20 @@
   release/create_version and the <code>update kind=GENERAL</code> fix. Tests:
   <code>tests/test_projects_round23_fixes.py</code>.</p>
 
+  <h2>Cross-project features (2026-07-25 final round)</h2>
+  <p><strong><code>action=search</code></strong> — "which project touched X / used Y?": deterministic keyword
+  search across every project's title/goal (3×), deliverable paths + manifest descriptions (2×), design ledger,
+  research topics, and recent work_log entries (1×), returning ranked hits with kind-tagged snippets
+  (<code>store.search_projects</code>). <strong><code>action=set_dependency</code></strong> — inter-project
+  edges in <code>metadata.depends_on_projects</code> (ids/titles resolved; self/transitive cycles rejected,
+  depth-capped): <code>advance_once</code> refuses to advance a project until every dependency is DONE or
+  RELEASED, and the briefing shows a DEPENDS ON line with live statuses. Empty list clears.
+  <strong><code>action=clone</code></strong> — template/clone-without-lineage: fresh project (title required)
+  from any-status source (a RELEASED source copies fine; mode bits restored on the copy), carrying files,
+  ledger, config (port bumped), manifest, constraints; provenance via <code>metadata.cloned_from</code> only —
+  no version/parent lineage, so <code>list_children</code> and the fork machinery ignore clones. Deliverables
+  re-registered on the seed task (keep-set). Tests: <code>tests/test_projects_cross_features.py</code>.</p>
+
   <h2>Public API</h2>
   <h3>Projects</h3>
   <ul>

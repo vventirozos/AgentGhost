@@ -667,6 +667,19 @@ async def advance_once(
         return AdvanceResult(True, None, "blocked",
                              f"project is {proj['status']}, not ACTIVE")
 
+    # Inter-project dependency gate (2026-07-25): a project that depends on
+    # others (metadata.depends_on_projects, set via action=set_dependency)
+    # doesn't autoadvance until every dependency is DONE or RELEASED — the
+    # advancer's round-robin can now sequence project chains.
+    _deps = ((proj.get("metadata") or {}).get("depends_on_projects") or [])
+    for _dep in _deps:
+        _dp = store.get_project(_dep) or {}
+        if str(_dp.get("status", "")).upper() not in ("DONE", "RELEASED"):
+            return AdvanceResult(
+                True, None, "blocked",
+                f"waiting on dependency project "
+                f"'{_dp.get('title') or _dep}' ({_dp.get('status') or 'missing'})")
+
     budget = _get_budget(store, project_id)
     if budget["used"] >= budget["cap"]:
         _log_budget_exhausted(store, project_id,

@@ -287,6 +287,17 @@ _EVIDENCE_CLAIM_STOPWORDS = frozenset({
 })
 
 
+def _is_narration_only_trim(smoothed: str, original: str) -> bool:
+    """True when reply smoothing reduced a reply to a short working-
+    narration line — the inverted-trim failure (2026-07-25): the smoother
+    kept "Let me search more specifically…" and dropped the findings."""
+    s = (smoothed or "").strip()
+    return (s != (original or "").strip()
+            and len(s) < 90
+            and bool(re.match(
+                r"(Let me|Now |Next,? |I'll |I will |First,? |Then )", s)))
+
+
 def _claim_tokens(text: str) -> set:
     """Significant lowercase tokens of a claim, for evidence relevance."""
     return {
@@ -4355,16 +4366,34 @@ class GhostAgent:
     _PREFERENCE_CUE_RE = re.compile(
         r"\b(prefer|prefers|loves?|hates?|favorite|favourite|always wants?|"
         r"never wants?|likes?|dislikes?)\b", re.IGNORECASE)
+    # Agent-workflow vocabulary that marks a sentence as WORK-EPISODE state
+    # even when it names no project id or title. Second operator flag,
+    # 2026-07-25: a buffered-journal drain refilled all 3 notes.info slots
+    # minutes after the deploy-scrub with "…as previous attempts failed
+    # verification / were refuted by a verifier / verify against specific
+    # project IDs" — paraphrased project state that carries neither a
+    # 12-hex id nor the bound title, so the store checks below never fire.
+    # Verifier/refute/attempt vocabulary is the agent describing its own
+    # loop; it does not occur in durable user facts. (A preference-phrased
+    # sentence is exempted before this check runs.)
+    _WORK_STATE_CUE_RE = re.compile(
+        r"\b(verifiers?|refuted?|refutes?|failed verification|"
+        r"previous attempts?|project ids?)\b", re.IGNORECASE)
 
     def _is_tracked_project_state(self, text: str) -> bool:
         """True when ``text`` is state about a MANAGED project (verified
-        12-hex id or an active/known project title) rather than a durable
-        user fact. Preference-phrased sentences pass (a real preference
-        learned during project work is still user memory). Never raises."""
+        12-hex id, an active/known project title, or agent-workflow
+        verification vocabulary) rather than a durable user fact.
+        Preference-phrased sentences pass (a real preference learned
+        during project work is still user memory). Never raises."""
         try:
             t = (text or "").strip()
             if not t or self._PREFERENCE_CUE_RE.search(t):
                 return False
+            # Text-shape check first: needs no store, and the drain path
+            # often runs with no project bound.
+            if self._WORK_STATE_CUE_RE.search(t):
+                return True
             store = getattr(self.context, "project_store", None)
             if store is None:
                 return False
@@ -4521,6 +4550,19 @@ class GhostAgent:
                         "project-state note dropped from profile_update "
                         "(the project store owns it)",
                         icon=Icons.SKIP)
+                    profile_up = None
+                # Sink-bound (malformed) profile_update: naming NEITHER a
+                # category nor a key would land it in the notes.info junk
+                # drawer with the whole fact as its value — pure duplication
+                # (the fact is stored in vector memory below) that churns
+                # the 3-slot ring on every consolidation and re-renders into
+                # every system prompt. Drop the profile write, keep the fact.
+                if profile_up is not None and not (
+                        profile_up.get("category") or profile_up.get("key")):
+                    logger.debug(
+                        "smart-memory: dropped sink-bound profile_update "
+                        "(no category/key): %.120s",
+                        str(profile_up.get("value", fact)))
                     profile_up = None
                 fact_lc = fact.lower()
                 is_personal = any(w in fact_lc for w in ["user", "me", "my ", " i ", "identity", "preference", "like"])
@@ -9105,6 +9147,19 @@ class GhostAgent:
             try:
                 from .reply_smoothing import smooth_reply
                 _smoothed = smooth_reply(final_ai_content)
+                # Never reduce a reply to narration-only (2026-07-25 live:
+                # a 317-char answer containing real findings was trimmed to
+                # exactly its one "Let me search more specifically…" line —
+                # the user received pure narration and none of the
+                # substance). If what SURVIVES the trim is a short
+                # working-narration line, the trim picked the wrong part —
+                # deliver the original.
+                if _is_narration_only_trim(_smoothed, final_ai_content):
+                    logger.info(
+                        "reply smoothing REVERTED: result was narration-only "
+                        "(%d chars) — delivering the untrimmed reply",
+                        len(_smoothed.strip()))
+                    _smoothed = final_ai_content
                 if _smoothed != final_ai_content:
                     pretty_log(
                         "Reply Smoothing",

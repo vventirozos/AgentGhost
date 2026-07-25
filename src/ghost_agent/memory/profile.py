@@ -1,4 +1,5 @@
 import json
+import logging
 import threading
 import os
 from pathlib import Path
@@ -115,12 +116,22 @@ class ProfileMemory:
             return values
         dropped = len(values) - cap
         trimmed = values[-cap:]
-        pretty_log(
-            "Profile Capped",
-            f"{cat}.{key} hit the {cap}-value cap; dropped {dropped} oldest "
-            f"value(s) to keep the system prompt bounded",
-            icon=Icons.USER_ID, level="WARNING",
-        )
+        if (cat, key) in _SINK_KEYS:
+            # The junk-drawer ring rotating at its designed cap is routine
+            # by-design behaviour, not a leak signal — forensics-level only,
+            # never the operator stream (flagged as noise 2026-07-25).
+            logging.getLogger(__name__).debug(
+                "profile sink %s.%s rotated: dropped %d oldest value(s)",
+                cat, key, dropped)
+        else:
+            # A real multi-valued key overflowing ITS cap is the
+            # context-pressure-leak signal the warning exists for.
+            pretty_log(
+                "Profile Capped",
+                f"{cat}.{key} hit the {cap}-value cap; dropped {dropped} oldest "
+                f"value(s) to keep the system prompt bounded",
+                icon=Icons.USER_ID, level="WARNING",
+            )
         return trimmed
 
     def update(self, category: str, key: str, value: Any):

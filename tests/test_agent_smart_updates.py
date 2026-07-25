@@ -135,3 +135,48 @@ async def test_intent_driven_skill_recall(mock_context):
              # Since our previous turn was an assistant turn with json:
              assert "Context:" in query_used or "Write me a react component" in query_used
              
+
+
+@pytest.mark.asyncio
+async def test_sink_bound_profile_update_is_dropped(mock_context):
+    """A profile_update naming neither category nor key would land in the
+    notes.info junk drawer with the whole fact as its value (observed live
+    2026-07-25: a buffered-journal drain refilled all 3 slots with project
+    chatter minutes after the deploy scrub). The profile write is skipped;
+    the fact still stores as a normal 'auto' memory."""
+    agent = GhostAgent(mock_context)
+    mock_context.memory_system.search_advanced.return_value = []
+    mock_context.llm_client.chat_completion.side_effect = [
+        {"choices": [{"message": {"content":
+            '{"score": 0.95, "fact": "User keeps a home lab with three Macs.",'
+            ' "profile_update": {"value": "User keeps a home lab with three Macs."}}'}}]},
+    ]
+
+    await agent.run_smart_memory_task(
+        "User: my home lab has three Macs.\nAI: noted.", "test-model", 0.5)
+
+    mock_context.memory_system.add.assert_called()
+    call_args = mock_context.memory_system.add.call_args[0]
+    assert call_args[0] == "User keeps a home lab with three Macs."
+    # Degrades to 'auto' (same convention as a non-dict profile_update).
+    assert call_args[1]["type"] == "auto"
+    mock_context.profile_memory.update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_explicit_profile_update_still_writes(mock_context):
+    """A profile_update that names its slot is a real profile fact and must
+    keep flowing — the sink guard only screens the malformed default."""
+    agent = GhostAgent(mock_context)
+    mock_context.memory_system.search_advanced.return_value = []
+    mock_context.llm_client.chat_completion.side_effect = [
+        {"choices": [{"message": {"content":
+            '{"score": 0.95, "fact": "User uses ripgrep for all code search.",'
+            ' "profile_update": {"category": "preferences", "key": "grep_tool", "value": "ripgrep"}}'}}]},
+    ]
+
+    await agent.run_smart_memory_task(
+        "User: I always use ripgrep.\nAI: ok.", "test-model", 0.5)
+
+    mock_context.profile_memory.update.assert_called_with(
+        "preferences", "grep_tool", "ripgrep")

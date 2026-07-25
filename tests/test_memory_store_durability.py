@@ -478,6 +478,33 @@ def test_generic_merge_keys_are_capped_too(tmp_path):
     assert "topic 29" in topics
 
 
+def test_sink_rotation_is_not_operator_stream_noise(tmp_path, monkeypatch):
+    # The junk-drawer ring rotating at its designed 3-cap is routine, not a
+    # leak signal — it must never render a WARNING onto the operator stream
+    # (flagged as noise 2026-07-25).
+    calls = []
+    monkeypatch.setattr("ghost_agent.memory.profile.pretty_log",
+                        lambda *a, **k: calls.append((a, k)))
+    pm = ProfileMemory(tmp_path)
+    for i in range(6):
+        pm.update("notes", "info", f"stray fact {i}")
+    assert not [c for c in calls if c[0][0] == "Profile Capped"]
+
+
+def test_generic_key_cap_still_warns(tmp_path, monkeypatch):
+    # A real multi-valued key overflowing the 8-cap IS the context-leak
+    # signal the warning exists for — that path must keep warning.
+    calls = []
+    monkeypatch.setattr("ghost_agent.memory.profile.pretty_log",
+                        lambda *a, **k: calls.append((a, k)))
+    pm = ProfileMemory(tmp_path)
+    for i in range(12):
+        pm.update("interests", "topics", f"topic {i}")
+    warned = [c for c in calls if c[0][0] == "Profile Capped"]
+    assert warned
+    assert warned[0][1].get("level") == "WARNING"
+
+
 # =========================================================================
 # 6. MED — capacity overflow is visible; requeued items survive it
 # =========================================================================

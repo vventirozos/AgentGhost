@@ -77,6 +77,47 @@ def test_no_store_never_blocks(store):
     assert not a._is_tracked_project_state("anything at all abcdefabcdef")
 
 
+# ------------------- paraphrased work-state (round 2, same-day refill)
+
+# The three values that refilled the freshly-scrubbed notes.info ring on
+# 2026-07-25: paraphrased project state carrying NO 12-hex id and NO
+# project title, drained from buffered journal items with no project
+# bound — every store-based check missed them.
+LIVE_LEAKED_VALUES = [
+    "The user requires a robust dark/light theme toggle implementation "
+    "that persists state and correctly cycles between modes, as previous "
+    "attempts failed verification.",
+    "The user requires the dark/light theme toggle to be fully functional, "
+    "including persistence and correct state transitions, as previous "
+    "attempts were refuted by a verifier.",
+    "The user requires a dark/light theme toggle implementation with "
+    "persistence, and the system needs to verify the functionality against "
+    "specific project IDs and visual evidence.",
+]
+
+
+def test_verification_workflow_phrasing_is_project_state(store):
+    a = _agent_with(store)  # nothing bound, no id in the text
+    for value in LIVE_LEAKED_VALUES:
+        assert a._is_tracked_project_state(value), value
+
+
+def test_workflow_cue_screens_even_without_a_store():
+    a = agent_mod.GhostAgent.__new__(agent_mod.GhostAgent)
+    a.context = SimpleNamespace(project_store=None, current_project_id=None)
+    assert a._is_tracked_project_state(
+        "The user requires X, as previous attempts were refuted by a verifier.")
+
+
+def test_durable_facts_unaffected_by_workflow_cue(store):
+    a = _agent_with(store)
+    assert not a._is_tracked_project_state(
+        "The user works at EvolMonkey and lives in Athens.")
+    # Preference phrasing is exempted BEFORE the workflow cue runs.
+    assert not a._is_tracked_project_state(
+        "The user prefers packages from verifiers they trust.")
+
+
 # ------------------------------------------- id-bearing evidence
 
 def test_short_id_bearing_confirmation_is_packed():

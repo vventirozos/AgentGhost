@@ -231,6 +231,21 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         for k, v in config.items():
             lines.append(f"  {k} = {v}")
 
+    # DEPENDS ON — inter-project edges (2026-07-25): the advancer waits on
+    # these; the model should know WHY autoadvance reports blocked.
+    try:
+        _deps = ((proj.get("metadata") or {}).get("depends_on_projects") or [])
+        if _deps:
+            _dep_bits = []
+            for _d in _deps:
+                _dp = store.get_project(_d) or {}
+                _dep_bits.append(
+                    f"{_dp.get('title') or _d} ({_dp.get('status') or '?'})")
+            lines.append("DEPENDS ON (autoadvance waits until DONE/RELEASED): "
+                         + ", ".join(_dep_bits))
+    except Exception:
+        pass
+
     # RELEVANT TO THIS REQUEST (2026-07-24, the selective-loading slice).
     # Fixed top-N sections scale to a point; on a large project the model
     # needs the CORNER of the map that matches the request, not the whole

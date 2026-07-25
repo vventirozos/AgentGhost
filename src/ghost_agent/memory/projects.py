@@ -1441,6 +1441,76 @@ class ProjectStore:
                 pass
         return out
 
+    # Stopword set for cross-project search (mirrors the briefing slice's
+    # philosophy: strip generic verbs so "which project used X" matches X,
+    # not the question's furniture).
+    _SEARCH_STOPWORDS = frozenset({
+        "the", "a", "an", "and", "or", "of", "to", "in", "on", "for",
+        "with", "is", "are", "was", "it", "this", "that", "which", "what",
+        "project", "projects", "file", "files", "used", "uses", "using",
+        "did", "does", "have", "has", "where", "who", "touched",
+    })
+
+    def search_projects(self, query: str, limit: int = 5,
+                        per_project_events: int = 40) -> List[Dict[str, Any]]:
+        """Cross-project keyword search (2026-07-25 review missing-feature
+        #7): "which project touched X / used technique Y" was unanswerable —
+        the graph covers concepts only, and every other record was
+        per-project. Scans titles/goals, deliverable paths, manifest
+        descriptions, design ledgers, research topics, and recent work_log
+        entries. Deterministic token overlap, bounded, no LLM. Returns
+        ranked ``[{project_id, title, status, score, matches: [{kind,
+        snippet}]}]``."""
+        tokens = {
+            t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+",
+                                  (query or "").lower())
+            if len(t) > 2 and t not in self._SEARCH_STOPWORDS
+        }
+        if not tokens:
+            return []
+
+        def _hits(text: str) -> int:
+            tl = (text or "").lower()
+            return sum(1 for t in tokens if t in tl)
+
+        results = []
+        for proj in self.list_projects():
+            pid = proj.get("id")
+            meta = proj.get("metadata") or {}
+            matches: List[Dict[str, str]] = []
+            score = 0
+
+            def _add(kind: str, text: str, weight: int = 1):
+                nonlocal score
+                h = _hits(text)
+                if h:
+                    score += h * weight
+                    matches.append({"kind": kind,
+                                    "snippet": " ".join(text.split())[:120]})
+
+            _add("title/goal", f"{proj.get('title')} {proj.get('goal')}", 3)
+            for p in self.list_deliverables(pid)[:40]:
+                _add("deliverable", p, 2)
+            for p, e in (meta.get("file_manifest") or {}).items():
+                _add("manifest", f"{p}: {e.get('desc', '')}", 2)
+            _add("ledger", meta.get("design_ledger") or "", 1)
+            for r in (meta.get("research_index") or [])[:10]:
+                _add("research", str(r.get("topic") or ""), 1)
+            for ev in self.list_events(pid, limit=per_project_events,
+                                       event_type="work_log"):
+                pl = ev.get("payload") or {}
+                _add("work_log",
+                     f"{pl.get('request', '')} {pl.get('note', '')} "
+                     + " ".join(str(f) for f in (pl.get('files') or [])), 1)
+            if score:
+                results.append({
+                    "project_id": pid, "title": proj.get("title"),
+                    "status": proj.get("status"), "score": score,
+                    "matches": matches[:5],
+                })
+        results.sort(key=lambda r: r["score"], reverse=True)
+        return results[:max(1, int(limit))]
+
     def list_children(self, project_id: str) -> List[Dict[str, Any]]:
         """Projects forked FROM ``project_id`` via create_version
         (``metadata.parent_project_id``), any status. Lineage was one-way
