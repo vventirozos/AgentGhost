@@ -165,6 +165,46 @@
   <code>test_project_manifest_tool_and_briefing.py</code>, <code>test_autoadvance_work_log.py</code>,
   <code>test_briefing_relevance_slice.py</code>.</p>
 
+  <h2>RELEASED — the human-attested terminal state (2026-07-25)</h2>
+  <p><strong>Why.</strong> DONE means "the agent believes it finished" — a self-assessment, and the
+  2026-07-25 audit showed exactly how far that can drift (a broken deliverable confirmed at 0.99).
+  RELEASED is the state only a HUMAN can trigger, after using/testing the artifact. It does three
+  things: freezes a verified operational runbook, makes the artifact immutable, and routes all
+  future changes into versioned copies.</p>
+  <p><strong>The release flow</strong> (<code>manage_projects action=release</code>): requires the
+  project DONE + model-written <code>directions</code> (the usage runbook prose). The tool then
+  (1) tidies the workspace, (2) runs a <em>deterministic release rehearsal</em> — cold-restarts every
+  registered service via the ServiceSupervisor and TCP-probes its port (or, for service-less
+  projects, verifies every registered deliverable exists post-tidy — which also catches keep-set
+  gaps), and (3) only on a passing rehearsal composes the <strong>release dossier</strong>
+  (<code>metadata.release</code>: directions, verified service commands/ports, URLs, deliverables
+  with manifest descriptions, config, rehearsal transcript) and renders <code>RELEASE.md</code> in
+  the workspace (dual pattern, like the manifest's PROJECT_MAP.md). A failed rehearsal leaves the
+  project DONE with the failure detail. The rollup can never set RELEASED; neither can
+  <code>action=update</code>.</p>
+  <p><strong>Immutability (hard guards, not convention):</strong> every mutating tool action on a
+  RELEASED project (task_add/update/decompose, ledger/config/describe_file writes, artifact_add,
+  autoadvance, research, cleanup, update) is refused with a steer to <code>create_version</code>
+  (read forms stay allowed); <code>ProjectStore.add_task</code> does NOT auto-reopen RELEASED (the
+  reopen tuple is DONE/FAILED/PAUSED only); and the <em>file-write path itself</em>
+  (<code>tool_file_system</code> write/replace/delete/move/append) blocks any target inside a
+  RELEASED project's workspace via <code>_released_write_block</code> — the agent's measured
+  failure mode is regressing working artifacts, so the write path refuses rather than trusts.</p>
+  <p><strong>Versioning</strong> (<code>action=create_version</code>, RELEASED parents only —
+  DONE projects are edited in place): forks <em>Title v(n+1)</em> with precise inheritance —
+  <em>carried</em>: workspace files (minus RELEASE.md/.services/caches), design ledger, config
+  (<strong>port bumped</strong> so v(n) keeps running while v(n+1) develops), file manifest,
+  constraints, research; <em>fresh</em>: task tree (seeded with the change request), work log,
+  events (lineage recorded both sides: <code>version_forked</code>/<code>version_created</code>);
+  <em>stays with the parent</em>: the dossier, task history, retrospective. Copied deliverables are
+  re-registered on the seed task so the cleanup keep-set covers them. The context auto-switches to
+  the new version.</p>
+  <p><strong>Runbook briefing mode:</strong> <code>build_project_briefing</code> for a RELEASED
+  project suppresses all development scaffolding (one-task rule, NEXT/OPEN/STUCK tasks) and leads
+  with RELEASE DIRECTIONS + verified SERVICE/URL lines + the immutability/versioning routing — so
+  "run my journal" resumes into <em>operational</em> context, not a task tree. The tool briefing
+  carries a <code>release</code> key. Tests: <code>tests/test_project_release_lifecycle.py</code>.</p>
+
   <h2>Public API</h2>
   <h3>Projects</h3>
   <ul>

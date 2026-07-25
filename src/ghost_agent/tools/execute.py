@@ -522,9 +522,13 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     pass
             return _format_error(
                 f"SYSTEM BLOCK: shell command rejected by pre-execution "
-                f"validator: {_shell_reason}. The command was not run. Re-emit a "
-                f"safer form, or use file_system + execute if you need to "
-                f"run a script."
+                f"validator: {_shell_reason}. The command was not run. "
+                f"IMPORTANT: retry the SAME verification intent in an allowed "
+                f"form — do NOT substitute a weaker check. Allowed patterns: "
+                f"write the command's output to a file first and inspect it "
+                f"(`curl … -o /tmp/out.json` then `python3 -m json.tool "
+                f"/tmp/out.json`), or put the logic in a script via "
+                f"file_system + execute (urllib for HTTP checks works well)."
             )
 
         # Execute the command securely using the sandbox manager's built-in execute wrapper.

@@ -1109,6 +1109,155 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-25 (later) — RELEASED lifecycle: human-attested terminal state + rehearsed runbook + versioning
+
+**Operator idea, evaluated + hardened, then built.** DONE = the agent's self-assessment; RELEASED = the human's.
+Three pillars, each with a hard mechanism (not convention):
+1. **`action=release`** (DONE + human command + model-written `directions` required) → workspace tidy → **deterministic
+   release rehearsal** (ServiceSupervisor cold-restart + TCP port probe per service; deliverables-exist check for
+   service-less projects — rehearsal-after-tidy also catches keep-set gaps) → on pass, freeze the **release dossier**
+   (`metadata.release`: directions + VERIFIED service commands/ports + URLs + deliverables w/ manifest descs + config +
+   rehearsal transcript) + render `RELEASE.md` (dual pattern like PROJECT_MAP.md) → status RELEASED. Fail → stays DONE
+   with detail. Rollup can never set it; `update` rejects `status=RELEASED` ("earned, never assigned").
+2. **Immutability, three layers**: tool-level choke (`_released_guard` on all mutating actions incl. autoadvance/
+   research/cleanup, read-forms exempt, steer → create_version); store-level (add_task's reopen tuple excludes
+   RELEASED); **file-write-path level** (`_released_write_block` in tool_file_system write/replace/delete/move/append —
+   matches `projects/<12hex>/` in the target, one status lookup; registry lambda threads `project_store`). Rationale:
+   the same-day audit measured the agent regressing working artifacts — the write path must refuse, not trust.
+3. **`action=create_version`** (RELEASED parents only; DONE edits in place): forks "Title v(n+1)" — carries files
+   (minus RELEASE.md/.services), ledger, config with **port bumped** (v(n) keeps running while v(n+1) develops; ledger
+   seed line records the split), manifest, constraints, research; FRESH task tree (seeded w/ the change request) +
+   work log; copied deliverables re-registered on the seed task (cleanup keep-set safety); lineage events both sides;
+   auto-switch. Dossier/task-history/retrospective stay with the parent.
+Plus **runbook briefing mode**: RELEASED briefing = RELEASE DIRECTIONS + verified SERVICE/URL lines + routing
+("run → follow directions; change → create_version"), all dev scaffolding suppressed. `_briefing` gains `release` key.
+New `ServiceSupervisor.list_entries()` accessor. Tool schema teaches both actions ("release ONLY when the USER
+explicitly confirms the project works").
+
+**Verification.** `tests/test_project_release_lifecycle.py` (13: gates, happy path incl. RELEASE.md, rehearsal fail,
+service-rehearsal w/ stub supervisor, update/guard/add_task/file-write immutability, version inheritance incl. port
+bump + keep-set re-registration + parent untouched, runbook briefing). Full suite **9086/0** (one fixture needed
+`asyncio.run` — `get_event_loop` broke under the suite's loop state). Docs: `docs/memory/projects.html` "RELEASED"
+section. Memory `[[project-accessibility]]` updated.
+
+**LIVE-VALIDATED (prod :8000, the real Jiu Jitsu Journal).** (1) "I have tested it, release it" → model called
+`action=release` with genuinely good user-manual directions → rehearsal passed (deliverables path: "all 6 present")
+→ **RELEASED v1** + RELEASE.md on disk, dossier in metadata. (2) "add a dark theme toggle" → model, unprompted beyond
+the briefing, reasoned "project is RELEASED, I need to create a version fork first" → `create_version` → **v2
+(6be718ab7dc3)**: ACTIVE, lineage recorded, ledger+manifest carried, NO release key, seed task "Add dark theme toggle"
+PENDING, 9 files copied WITHOUT RELEASE.md; **v1 untouched and still RELEASED**. Two noted minors: the service
+registry was empty at rehearsal time so the dossier has `services: []` (the URL survives in the directions; the
+verified-start-command slot fills on projects whose services are registered at release time), and the port bump
+no-opped because v1's config never recorded a port (bump requires a config `port` key — by design).
+
+### 2026-07-25 — Log-mined deficiency audit (statistical + behavioral) over the 33h window 07-23 21:02 → 07-25 06:09
+
+**Method.** First real payoff of the durable-log overhaul: one statistical pass (error/warning dedup, timing anatomy,
+loop yields) + one behavioral deep-read of full turn narratives (30 requests; deep-read 9). Findings ranked.
+
+**A. VERIFICATION THEATER (SEV-HIGH — the headline).** The persistence-migration turn (`4e42973e`, 1058s, 40/40
+turns) shipped BROKEN code at confidence 0.99: turn ended on budget exhaustion mid-verification (last click never
+evaluated) yet outcome=ok; the async verifier **LATE CONFIRMED (90%) off a `file://` page load** — which cannot
+exercise a fetch-backed API app; the decisive POST→reload→GET test never ran (the intended `curl … | python3` was
+validator-BLOCKED and the agent substituted a weaker GET-on-empty-store check instead of retrying in an allowed
+form — which `6e0922c8` proved works via base64 urllib). User then filed 2 bug reports the same evening
+(reload-empties-page = the fire-and-forget cache init; broken nav = see B). Related: bookkeeping-only turns are a
+**verifier blind spot by design** — `5ae632e6` hallucinated describe_file success (3 empty returns → "calls were
+made successfully", conf 0.95, verifier skipped); `54a10d05`/`82e2c451` fabricated briefing specifics (OS version,
+dates) caught only by LATE refutes. **Directions:** cap confidence on budget-exhausted/PARTIAL turns; WEB-EXEC
+evidence for served API apps must not be `file://`; validator-block → retry same intent in allowed form; echo-back
+verification for bookkeeping writes; specifics (dates/versions) must trace to current-turn tool output.
+
+**B. SELF-INFLICTED REGRESSION, not caught (`6e0922c8`→`ffcebd96`).** Bootstrap refactor replaced `Router.init()`
+with `bootstrap()` but left nav-listener registration in the now-orphaned `init()` — broke all top navigation; the
+post-edit browser check loaded the page but clicked nothing. Next turn correctly diagnosed "Router.init() is
+defined but never called!" — its OWN 24-min-old change. All 3 evening bug reports were fallout of the agent's own
+preceding edits. **Directions:** after replacing an entrypoint symbol, grep for references to the old name;
+post-edit verification must exercise ≥1 interaction.
+
+**C. VERIFIER FALSE REFUTES burn repair rounds.** `82e2c451`: refuted "Two lessons learned" though list_lessons
+showed exactly 2 (repair destroyed a mostly-correct reply, 68-char final). `d32e2429`: refuted "All 9 tasks
+complete" though task_list showed 9/9 DONE (625-token think + 3 redundant calls chasing an unsatisfiable refute →
+loop breaker). Signature matches `[[verifier-evidence-packer]]` truncation — audit the evidence packer BEFORE
+blaming the judge. Also `40ed42be` +509s refute was defensible-but-redundant (~60s re-proving rg-proven facts).
+
+**D. EFFICIENCY.** (1) Latency is **94–97% reasoning-token generation** on the big turns (536/569s, 1002/1058s,
+474/488s); tools are sub-second. Every LLM call re-opens with a task restatement (4–6×/turn); design deliberation
+reverses in-token (turn 17: 1832 tokens cycling 5 designs, then reversed anyway). (2) Malformed SEARCH/REPLACE
+tax: ~15–20% of the big turn's wall clock (4 failed edit attempts incl. the `content==replace_with` corruption
+guard + 2 marker-parse failures) — `[[native-tools-corruption]]` still a live tax. (3) `6e0922c8` thinking-loop:
+n-gram abort at 9568 chars after ~5 repetitions of the same 3-hypothesis cycle; proposed the decisive experiment
+in-think and NEVER executed it (re-read code instead; loop breaker ended the turn). **Direction:** a
+proposed-in-think experiment should become the next tool call; >2 design reversals → forced written plan step.
+
+**E. IDLE LOOPS (yield ≈ 0 tonight).** Dream: 8 cycles → **0 meta-memories every time**, "Auto-memory pool thin
+(2)" every cycle (dream-seed starvation is total; 2–4 dedup-churned heuristics/cycle). Reflection: 7 cycles
+re-walked the same 85 failures for **1** new reflection (no incremental watermark). Self-play recycled the SAME 4
+challenges all night, all first-try/Δ=0.000/write=False — root cause: the frontier `record_run` KeyError meant
+runs never recorded, so saturation never accrued; all 6 occurrences PRE-DATE the 07-24 fix → **expect rotation to
+self-heal; verify next overnight.** Lesson-outcome stash→drain rate ~20% (5 stashes → 1 drain): most clean turns
+never earn a decisive verdict → arms fill failure-biased; watch at the 2-week audit.
+
+**F. INFRA OUTSTANDING.** (1) **Embedder/store mismatch STILL live** (24 FATALs at 21:31 — re-embed never run).
+(2) **68 doomed-node breaker trips, 0 recoveries**: `192.168.0.20:8088` (52×) AND `http://nova:8088` (16×, post-
+config-fix) — worker is configured by tailnet IP, so something registers the LAN identity at runtime; prime
+suspect: swarm-advertise/alias storing the node's self-reported hostname (macOS daemon drops LAN SYNs —
+`[[macos-daemon-local-network]]`, launcher comment has the tcpdump proof). Fix: canonicalize advertised URLs to
+configured tailnet addresses. (3) **transformers overflow capture BROKEN**: 0 lines in durable log, new
+`194308 > 131072` in .err — the logger-capture is bypassed (custom transformers logging or subprocess). (4)
+`System 3 pivot failed:` logs an EMPTY reason. (5) resource_tracker semaphore-leak warnings ×22 (minor).
+
+**G. What worked (calibration).** Guard stack prevented every failure from becoming corruption or a hang (but 3
+user-facing turns ended BECAUSE a guardrail force-terminated them — compensation, not health). `ffcebd96` fixed
+the nav bug correctly in 71s with click-verification. Frontier fix holds (0 post-fix failures). 0 hard-failed
+turns. The new instrumentation (turn outcomes, idle summaries, hydration-judge, lesson-outcome) made this audit
+take minutes.
+
+**One-line summary:** mechanics are solid; the core deficiency is **verification theater** — high-confidence
+success claims on work never end-to-end tested, a verifier that confirmed a broken deliverable off `file://`
+evidence while refuting two true claims, and ~95% of wall-clock spent on often-circular reasoning tokens.
+
+**FIXES (same day — operator: "proceed with all fixes"; 9 items, all shipped):**
+1. *Budget-exhaustion confidence cap*: `FinalizeState.turn_budget_exhausted` (default False; set by the for-else
+   PARTIAL path) → outcome_penalty 0.8 in the finalize confidence compute + calibration outcome 0.0 + Turn
+   Outcome shows `partial (budget exhausted)` at WARNING. A 40/40-turn reply can no longer ship at C=0.99.
+2. *file:// evidence gate*: `_execute_web_artifact` declares itself INCONCLUSIVE when a probed page calls the
+   network (fetch/XHR/axios//api/) — a file:// load can't exercise it (fetch rejections don't even trip the
+   uncaught-exception marker); the existing `_WEB_EXEC_SKIP_CONF_CAP=0.6` then caps any text-only CONFIRMED.
+3. *Validator precision* (`tools/validators.py`): the curl-pipe deny rule split — shells stay fully blocked;
+   interpreters block only when fed the pipe AS THE PROGRAM (bare `| python3` or `| python3 -`);
+   `| python3 -m json.tool` / `-c` / script-file forms are DATA and now pass. Root cause of the substituted
+   weaker check in the 4e42973e migration turn.
+4. *Validator-block retry steer* (`tools/execute.py`): the SYSTEM BLOCK message now instructs retrying the SAME
+   verification intent in allowed form (curl -o file + json.tool, or file_system+execute urllib) — never
+   downgrade to a weaker check.
+5. *Bookkeeping blind spot*: `_find_substantive_tool_for_verifier` now returns a bookkeeping tool whose content
+   starts with Error/SYSTEM BLOCK/REJECTED — errors are evidence, so a success claim over three failed
+   describe_file calls gets verified (and refuted) instead of skipped "by design".
+6. *Evidence packer false-refute fix*: `_collect_verifier_evidence` now packs INFORMATIONAL bookkeeping output
+   (≥200 chars or error-prefixed) — task_list/list_lessons data behind a claim reaches the judge; short
+   state-change confirmations stay excluded (the 2026-04-19 `{"exited":…}` blast radius). Run-gate vs
+   evidence-set deliberately split.
+7. *Node-list boot validation* (`main.py`): six copy-pasted parse loops → one `_parse_node_list` helper that
+   WARNS at boot on LAN IPs (192.168./10./172.16-31, non-tailnet) and dotless hostnames — the 68 doomed breaker
+   trips were transient launcher states (192.168.0.20 = the old documented config; nova = a ~16:05–18:00
+   intermediate edit); current config verified clean (tailnet). Misconfigs now announce themselves at boot, not
+   after 68 failures.
+8. *Self-identifying embedder FATAL* (`memory/vector.py`): the mismatch error now names chroma_dir + pid + cwd —
+   the 24-FATAL respawn loop at 21:31 was undiagnosable post-hoc because the message never said WHICH store
+   (main store verified healthy, 7376 docs + fingerprint; the 161-doc offender is not on disk under any known
+   path — next occurrence will name itself). Blind re-embed deliberately NOT run.
+9. *Oversized-payload signal owned* (`utils/token_counter.py`): transformers' sequence-length warning silenced
+   at the counting layer (verbose=False — it escaped only to raw stderr and is noise where no forward pass
+   happens); estimate_tokens now logs its own durable INFO when a payload exceeds the 131k window (the real
+   signal: something built a 194k-token string). Plus `System 3 pivot failed: %r` (empty-message exceptions no
+   longer log blank) and the **orphaned-symbol guard** (`tools/file_system.py`): a replace that REMOVES a
+   function/def whose references survive appends a named warning to the tool result — the Router.init class.
+Tests: `tests/test_audit_fixes_20260725.py` (14); full suite green; deployed. NOT fixed by design: the
+efficiency cluster (reasoning-token latency, restatement preambles — model-behavior work, needs its own pass)
+and idle-loop yield (self-play rotation expected to self-heal post frontier-fix; dream-seed starvation is the
+known #4 blocker).
+
 ### 2026-07-24 (later 2) — Project accessibility: file manifest + per-file history + journal densification + selective loading
 
 **Mandate.** Operator: on "resume 6a471d630e81…" the agent just re-reads code — nothing directs it where to

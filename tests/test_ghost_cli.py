@@ -218,7 +218,13 @@ def _png_bytes():
 
 
 class TestRenderers:
-    def test_iterm_escape_shape(self, capsys):
+    def test_iterm_escape_shape(self, capsys, monkeypatch):
+        # Pin a non-tmux environment (like the sixel/passthrough siblings):
+        # under TERM=tmux-256color _emit_raw legitimately wraps the escape in
+        # a tmux passthrough and the raw-shape assertion below would fail on
+        # the runner's terminal, not on the code (seen 2026-07-25).
+        monkeypatch.delenv("TMUX", raising=False)
+        monkeypatch.setenv("TERM", "xterm-256color")
         data = _png_bytes()
         assert cli._render_iterm(data, "x.png")
         out = capsys.readouterr().out

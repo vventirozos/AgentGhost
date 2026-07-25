@@ -115,6 +115,59 @@ def _mandatory_tor_env_default() -> bool:
     return os.environ.get("GHOST_MANDATORY_TOR", "").lower() not in ("0", "false", "no")
 
 
+def _parse_node_list(spec, pool_name: str) -> list:
+    """Parse one `url|model,url|model` node-list argument (shared by all six
+    pools) and WARN at boot on address forms that are doomed at runtime.
+
+    2026-07-25 audit: 68 circuit-breaker trips with zero recoveries came
+    from two transient launcher states — a LAN IP (`192.168.0.20`) and a
+    dotless hostname (`nova`) — that a macOS system daemon cannot reach
+    (Local Network privacy silently drops LAN SYNs; tcpdump proof in the
+    launcher comments). Nothing said so until dozens of doomed calls had
+    failed. Validation announces the misconfig at boot instead:
+      - dotless hostname → bypasses the Tor proxy (see llm.get_proxy) AND
+        resolves via mDNS/search-domain to whatever the resolver picks —
+        use the tailnet IP (100.x.y.z) or full MagicDNS name.
+      - RFC1918 LAN IP (192.168./10./172.16-31.) → unreachable from a
+        system daemon on macOS; use the node's tailnet IP.
+    Warnings only — never rejects (a dev box without the daemon issue may
+    legitimately use LAN addresses)."""
+    out = []
+    if not spec:
+        return out
+    import ipaddress
+    from urllib.parse import urlparse
+    for node_str in spec.split(","):
+        parts = node_str.split("|")
+        url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
+        model = parts[1].strip() if len(parts) > 1 else "default"
+        if not url:
+            continue
+        out.append({"url": url, "model": model})
+        try:
+            host = urlparse(url).hostname or ""
+            try:
+                ip = ipaddress.ip_address(host)
+                if ip.is_private and not str(host).startswith("100.") \
+                        and not ip.is_loopback:
+                    logger.warning(
+                        "%s node %s uses a LAN IP — a macOS system daemon "
+                        "cannot reach LAN addresses (Local Network privacy "
+                        "drops the SYNs silently). Use the node's tailnet "
+                        "100.x address; this node will likely trip the "
+                        "circuit breaker on every call.", pool_name, url)
+            except ValueError:
+                if host and "." not in host and host != "localhost":
+                    logger.warning(
+                        "%s node %s uses a dotless hostname — it bypasses "
+                        "the proxy and may resolve to an unreachable LAN "
+                        "address depending on the resolver. Use the tailnet "
+                        "IP or full MagicDNS name.", pool_name, url)
+        except Exception:
+            pass
+    return out
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Ghost Agent: Autonomous AI Service")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default 0.0.0.0 — reachable over the network, e.g. a Tailscale host). Use 127.0.0.1 to restrict to loopback. A non-loopback bind refuses to boot without an explicit API key.")
@@ -233,65 +286,12 @@ def parse_args():
     parser.add_argument("--metacog-host-heartbeat-s", type=float, default=300.0, help="Re-emit a steady-state host signal every N seconds even when (metric, severity) hasn't changed. Default 300 (5 min). Prevents 1Hz log spam while keeping a periodic 'still degraded' trail.")
     args = parser.parse_args()
     
-    swarm_nodes_list = []
-    if args.swarm_nodes:
-        for node_str in args.swarm_nodes.split(","):
-            parts = node_str.split("|")
-            url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
-            model = parts[1].strip() if len(parts) > 1 else "default"
-            if url:
-                swarm_nodes_list.append({"url": url, "model": model})
-    args.swarm_nodes_parsed = swarm_nodes_list
-
-    worker_nodes_list = []
-    if args.worker_nodes:
-        for node_str in args.worker_nodes.split(","):
-            parts = node_str.split("|")
-            url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
-            model = parts[1].strip() if len(parts) > 1 else "default"
-            if url:
-                worker_nodes_list.append({"url": url, "model": model})
-    args.worker_nodes_parsed = worker_nodes_list
-
-    visual_nodes_list = []
-    if args.visual_nodes:
-        for node_str in args.visual_nodes.split(","):
-            parts = node_str.split("|")
-            url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
-            model = parts[1].strip() if len(parts) > 1 else "default"
-            if url:
-                visual_nodes_list.append({"url": url, "model": model})
-    args.visual_nodes_parsed = visual_nodes_list
-
-    coding_nodes_list = []
-    if args.coding_nodes:
-        for node_str in args.coding_nodes.split(","):
-            parts = node_str.split("|")
-            url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
-            model = parts[1].strip() if len(parts) > 1 else "default"
-            if url:
-                coding_nodes_list.append({"url": url, "model": model})
-    args.coding_nodes_parsed = coding_nodes_list
-
-    image_gen_nodes_list = []
-    if args.image_gen_nodes:
-        for node_str in args.image_gen_nodes.split(","):
-            parts = node_str.split("|")
-            url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
-            model = parts[1].strip() if len(parts) > 1 else "default"
-            if url:
-                image_gen_nodes_list.append({"url": url, "model": model})
-    args.image_gen_nodes_parsed = image_gen_nodes_list
-
-    critic_nodes_list = []
-    if args.critic_nodes:
-        for node_str in args.critic_nodes.split(","):
-            parts = node_str.split("|")
-            url = parts[0].strip().replace("http:://", "http://").replace("https:://", "https://")
-            model = parts[1].strip() if len(parts) > 1 else "default"
-            if url:
-                critic_nodes_list.append({"url": url, "model": model})
-    args.critic_nodes_parsed = critic_nodes_list
+    args.swarm_nodes_parsed = _parse_node_list(args.swarm_nodes, "swarm")
+    args.worker_nodes_parsed = _parse_node_list(args.worker_nodes, "worker")
+    args.visual_nodes_parsed = _parse_node_list(args.visual_nodes, "visual")
+    args.coding_nodes_parsed = _parse_node_list(args.coding_nodes, "coding")
+    args.image_gen_nodes_parsed = _parse_node_list(args.image_gen_nodes, "image_gen")
+    args.critic_nodes_parsed = _parse_node_list(args.critic_nodes, "critic")
 
     if args.upstream_url:
         args.upstream_url = args.upstream_url.replace("http:://", "http://").replace("https:://", "https://")

@@ -220,6 +220,14 @@ class ServiceSupervisor:
         tmp.write_text(json.dumps(reg, indent=2))
         os.replace(tmp, self._registry_path)
 
+    def list_entries(self) -> list:
+        """Public read-only snapshot of the registered services
+        (``[{name, command, port, workdir, pid, …}]``). Added for the
+        project release rehearsal (2026-07-25), which needs to enumerate a
+        project's services to cold-start and probe them without parsing the
+        prose ``status()`` output."""
+        return [dict(e) for e in self._load().values()]
+
     # -- container helpers ---------------------------------------------------
 
     def _published_ports(self) -> Optional[set]:

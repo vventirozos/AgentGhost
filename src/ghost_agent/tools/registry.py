@@ -854,7 +854,7 @@ def get_available_tools(context):
     
     tools = {
         "system_utility": lambda **kwargs: tool_system_utility(tor_proxy=context.tor_proxy, profile_memory=context.profile_memory, context=context, **kwargs),
-        "file_system": lambda **kwargs: tool_file_system(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, read_budget=getattr(context, "_read_budget", None), **kwargs),
+        "file_system": lambda **kwargs: tool_file_system(sandbox_dir=_proj_ws()[0], tor_proxy=context.tor_proxy, max_context=context.args.max_context, sandbox_manager=context.sandbox_manager, read_budget=getattr(context, "_read_budget", None), project_store=getattr(context, "project_store", None), **kwargs),
         "manage_services": lambda **kwargs: tool_manage_services(sandbox_manager=context.sandbox_manager, **kwargs),
         "delegate": lambda **kwargs: tool_delegate(context=context, **kwargs),
         "jobs": lambda **kwargs: tool_jobs(context=context, **kwargs),

@@ -41,6 +41,13 @@ class ProjectStatus(str, Enum):
     PAUSED = "PAUSED"
     DONE = "DONE"
     ARCHIVED = "ARCHIVED"
+    # Human-attested terminal state (2026-07-25): only the release action can
+    # set it (after a rehearsal that cold-starts the project from its own
+    # release directions), never the rollup and never a generic update. A
+    # RELEASED project is immutable — changes fork a new version via
+    # create_version. The release dossier lives in metadata.release and is
+    # rendered as RELEASE.md in the workspace.
+    RELEASED = "RELEASED"
     # Terminal-with-failure and waiting states. Before these existed the
     # status rollup collapsed *every* terminal outcome to DONE — a project
     # whose tasks all FAILED reported as "done". FAILED/BLOCKED record a
@@ -1300,6 +1307,88 @@ class ProjectStore:
             return str(target)
         except Exception as e:
             logger.debug("PROJECT_MAP write failed: %s", e)
+            return None
+
+    # ------------------------------------------------------------------ release dossier
+
+    def get_release(self, project_id: str) -> Dict[str, Any]:
+        """The release dossier (``metadata.release``), or {} when absent."""
+        proj = self.get_project(project_id)
+        rel = ((proj or {}).get("metadata") or {}).get("release")
+        return dict(rel) if isinstance(rel, dict) else {}
+
+    def set_release(self, project_id: str, release: Dict[str, Any]) -> bool:
+        """Persist the release dossier (atomic) and render RELEASE.md.
+
+        The dossier is the RELEASED project's operational runbook — usage
+        directions, verified service commands/ports, URLs, deliverables —
+        composed at release time from REHEARSED facts (the tool cold-starts
+        the services before writing this). Injected runbook-first by the
+        briefing when the project is resumed/run.
+        """
+        if not isinstance(release, dict) or not release:
+            return False
+
+        def _mutate(meta):
+            meta["release"] = release
+            return meta
+
+        if self._atomic_metadata_update(project_id, _mutate) is None:
+            return False
+        try:
+            self.render_release_md(project_id)
+        except Exception as e:
+            logger.debug("RELEASE.md render skipped: %s", e)
+        return True
+
+    def render_release_md(self, project_id: str) -> Optional[str]:
+        """Write RELEASE.md into the workspace from the stored dossier
+        (atomic, best-effort) — the human/grep-readable twin of
+        ``metadata.release``, same dual pattern as the file manifest's
+        PROJECT_MAP.md."""
+        proj = self.get_project(project_id)
+        if not proj:
+            return None
+        rel = self.get_release(project_id)
+        ws = (proj.get("workspace_dir") or "").strip()
+        if not rel or not ws:
+            return None
+        lines = [
+            f"# RELEASE — {proj.get('title') or project_id} "
+            f"(v{rel.get('version', 1)})",
+            "",
+            f"Released: {rel.get('released_at', '')}",
+            "",
+            "## How to use",
+            str(rel.get("directions") or "").strip() or "(no directions recorded)",
+        ]
+        if rel.get("services"):
+            lines += ["", "## Services (rehearsed at release)"]
+            for s in rel["services"]:
+                lines.append(
+                    f"- `{s.get('name')}` — `{s.get('command')}`"
+                    + (f" (port {s['port']})" if s.get("port") else ""))
+        if rel.get("urls"):
+            lines += ["", "## URLs"]
+            lines += [f"- {u}" for u in rel["urls"]]
+        if rel.get("deliverables"):
+            lines += ["", "## Files"]
+            for d in rel["deliverables"]:
+                lines.append(f"- `{d.get('path')}`"
+                             + (f" — {d['desc']}" if d.get("desc") else ""))
+        lines += ["", "_This project is RELEASED (immutable). "
+                      "Changes go to a new version: "
+                      "`manage_projects action=create_version`._", ""]
+        try:
+            ws_path = Path(ws)
+            ws_path.mkdir(parents=True, exist_ok=True)
+            target = ws_path / "RELEASE.md"
+            tmp = target.with_suffix(".md.tmp")
+            tmp.write_text("\n".join(lines), encoding="utf-8")
+            os.replace(tmp, target)
+            return str(target)
+        except Exception as e:
+            logger.debug("RELEASE.md write failed: %s", e)
             return None
 
     # The config slot is the project's durable record of settings that shape

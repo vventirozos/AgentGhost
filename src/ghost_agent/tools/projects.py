@@ -52,6 +52,8 @@ _ACTIONS = {
     "artifact_add", "artifact_list", "event_log", "ledger", "config",
     # per-file manifest + per-file action history (2026-07-24)
     "describe_file", "file_history",
+    # human-attested release + versioning (2026-07-25)
+    "release", "create_version",
     # workspace hygiene
     "cleanup",
     # inbox promotion (suggestion-accepted path)
@@ -1139,6 +1141,113 @@ def _link_concepts_in_graph(context, project_id: str):
         logger.debug("graph concept link skipped", exc_info=True)
 
 
+def _released_guard(store: ProjectStore, project_id) -> Optional[str]:
+    """Error string when ``project_id`` is RELEASED (mutations must fork a
+    version), else None. Applied to every mutating action — a RELEASED
+    project is human-attested working software and the agent's own measured
+    failure mode is regressing exactly such artifacts (2026-07-25 audit)."""
+    try:
+        if not project_id:
+            return None
+        proj = store.get_project(project_id)
+        if proj and str(proj.get("status", "")).upper() == "RELEASED":
+            return (
+                f"project {project_id} is RELEASED (human-attested, "
+                f"immutable). To make changes, fork a new version: "
+                f"manage_projects action=create_version project_id="
+                f"{project_id} description=\"<the requested change>\" — "
+                f"the released version keeps working untouched. To run/use "
+                f"it, follow the RELEASE DIRECTIONS in the briefing."
+            )
+    except Exception:
+        return None
+    return None
+
+
+def _project_service_entries(context, project_id: str) -> list:
+    """Service-registry entries whose workdir belongs to this project."""
+    try:
+        from ..sandbox.services import get_service_supervisor
+        sup = get_service_supervisor(getattr(context, "sandbox_manager", None))
+        if sup is None:
+            return []
+        needle = f"projects/{project_id}"
+        return [e for e in sup.list_entries()
+                if needle in str(e.get("workdir") or "")]
+    except Exception:
+        return []
+
+
+def _probe_tcp(port, attempts: int = 4, delay_s: float = 1.0) -> bool:
+    """Bounded local TCP reachability probe (release rehearsal)."""
+    import socket
+    import time as _time
+    for _ in range(max(1, attempts)):
+        try:
+            with socket.socket() as s:
+                s.settimeout(1.5)
+                if s.connect_ex(("127.0.0.1", int(port))) == 0:
+                    return True
+        except Exception:
+            pass
+        _time.sleep(delay_s)
+    return False
+
+
+def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[str, Any]:
+    """Cold-start the project from its own recorded operational facts and
+    verify it comes up — the release gate that keeps the dossier honest.
+
+    Service projects: restart every registered service and TCP-probe its
+    port. Static/GENERAL projects (no services): verify every registered
+    deliverable exists on disk (rehearsal-after-tidy also catches
+    deliverables the cleanup keep-set missed). Deterministic, no LLM.
+    Returns {ok, services, checks, detail}.
+    """
+    from ..sandbox.services import get_service_supervisor
+    entries = _project_service_entries(context, project_id)
+    services: list = []
+    checks: list = []
+    ok = True
+    if entries:
+        sup = get_service_supervisor(getattr(context, "sandbox_manager", None))
+        for e in entries:
+            name = str(e.get("name") or "")
+            port = e.get("port")
+            try:
+                sup.restart(name)
+            except Exception as ex:
+                ok = False
+                checks.append(f"{name}: restart raised {type(ex).__name__}")
+                continue
+            alive = _probe_tcp(port) if port else True
+            services.append({"name": name,
+                             "command": str(e.get("command") or ""),
+                             "port": port})
+            if port and not alive:
+                ok = False
+                checks.append(f"{name}: port {port} unreachable after restart")
+            else:
+                checks.append(f"{name}: up"
+                              + (f" · port {port} reachable" if port else ""))
+    else:
+        deliverables = store.list_deliverables(project_id)
+        proj = store.get_project(project_id) or {}
+        ws = Path(str(proj.get("workspace_dir") or ""))
+        missing = [p for p in deliverables if not (ws / p).is_file()]
+        if not deliverables:
+            ok = False
+            checks.append("no services registered AND no deliverables — "
+                          "nothing to release")
+        elif missing:
+            ok = False
+            checks.append(f"deliverable(s) missing on disk: {missing[:5]}")
+        else:
+            checks.append(f"all {len(deliverables)} deliverable(s) present")
+    return {"ok": ok, "services": services, "checks": checks,
+            "detail": "; ".join(checks)}
+
+
 def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
     """Compact status snapshot suitable for a resume banner."""
     proj = store.get_project(project_id)
@@ -1212,6 +1321,9 @@ def _briefing(store: ProjectStore, project_id: str) -> Dict[str, Any]:
         "recent_work_log": work_log,
         "deliverables": deliverables,
         "file_map": file_map,
+        # RELEASED runbook (2026-07-25): present only on released projects —
+        # the operational directions the resume/run flow leads with.
+        "release": (store.get_release(project_id) or None),
         "retrospective": retrospective,
         "last_dream_digest": last_dream_digest,
         "research": research,
@@ -1286,6 +1398,8 @@ async def tool_manage_projects(
     # per-file manifest / history
     file_path: str = "",
     file_role: str = "",
+    # release runbook prose (action=release)
+    directions: str = "",
     # autonomous batch pacing
     count: Any = None,
     # research
@@ -1407,6 +1521,29 @@ async def tool_manage_projects(
     if project_id is None and act not in {"create", "list", "promote_from_context"}:
         if not (title and act in _TITLE_RESOLVABLE):
             project_id = getattr(context, "current_project_id", None)
+
+    # RELEASED immutability choke point (2026-07-25): every action that
+    # would mutate a released project's record or workspace is refused with
+    # a steer to create_version. Reads, switch/resume/status, archive
+    # (retiring a release is legitimate), delete (tombstoned, explicit),
+    # and release/create_version themselves stay allowed.
+    _RELEASED_MUTATING = {
+        "task_add", "task_update", "task_decompose", "artifact_add",
+        "ledger", "config", "describe_file", "autoadvance", "update",
+        "research", "cleanup",
+    }
+    if act in _RELEASED_MUTATING:
+        # ledger/config READ forms (no payload) stay allowed.
+        _is_read_form = (
+            (act == "ledger" and not (ledger or "").strip())
+            or (act == "config" and not (config_key or "").strip())
+            or (act == "describe_file" and not (description or "").strip()
+                and not (file_path or payload or "").strip())
+        )
+        if not _is_read_form:
+            _rg = _released_guard(store, project_id)
+            if _rg:
+                return _err(_rg)
 
     try:
         # ---- project lifecycle ------------------------------------------
@@ -1762,6 +1899,13 @@ async def tool_manage_projects(
             if goal:
                 fields["goal"] = goal
             if status:
+                if str(status).upper() == "RELEASED":
+                    # RELEASED is earned, never assigned: only action=release
+                    # (human command + rehearsal + dossier) may set it.
+                    return _err(
+                        "status=RELEASED cannot be set via update — use "
+                        "action=release (requires the project DONE, usage "
+                        "`directions`, and a passing release rehearsal).")
                 fields["status"] = status
             if kind and kind != "GENERAL":
                 fields["kind"] = kind
@@ -2499,6 +2643,190 @@ async def tool_manage_projects(
                 "shown": len(hist),
             })
 
+        # ---- human-attested release + versioning (2026-07-25) ----------
+
+        if act == "release":
+            # DONE → RELEASED, gated on: (1) the human asked (this call IS
+            # the confirmation), (2) model-supplied usage directions, (3) a
+            # deterministic rehearsal — tidy, then cold-start the services /
+            # verify deliverables — so the dossier is written from facts
+            # that worked seconds before RELEASED was stamped.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            proj = store.get_project(project_id)
+            if not proj:
+                return _err(f"project not found: {project_id}")
+            _status = str(proj.get("status", "")).upper()
+            if _status == "RELEASED":
+                return _ok({"status": "RELEASED",
+                            "note": "already released",
+                            "release": store.get_release(project_id)})
+            if _status != "DONE":
+                return _err(
+                    f"project is {_status}, not DONE — finish it first "
+                    f"(all tasks closed, status rolled up to DONE), then "
+                    f"release.")
+            _dirs = " ".join((directions or "").split())
+            if len(_dirs) < 30:
+                return _err(
+                    "release needs `directions`: a usage runbook for the "
+                    "USER (what this project is, how to use it, what the "
+                    "features are, any known limitations). Write it from "
+                    "what you know of the project and retry — the tool "
+                    "adds the verified service commands/ports itself.")
+            # (1) tidy so the rehearsal validates the KEPT file set.
+            from ..core.workspace_cleanup import tidy_project_workspace
+            try:
+                tidy_project_workspace(store, project_id, min_age_hours=0.0)
+            except Exception as e:
+                logger.debug("release tidy skipped: %s", e)
+            # (2) rehearse.
+            reh = _release_rehearsal(context, store, project_id)
+            if not reh.get("ok"):
+                store.log_event(project_id, None, "release_rehearsal_failed",
+                                {"detail": reh.get("detail", "")[:400]})
+                return _err(
+                    f"release rehearsal FAILED — project stays DONE. "
+                    f"{reh.get('detail', '')}. Fix the issue (or register "
+                    f"the missing deliverables) and retry.")
+            # (3) compose the dossier from REHEARSED facts.
+            mf = store.get_file_manifest(project_id)
+            meta = (proj.get("metadata") or {})
+            release = {
+                "version": int(meta.get("version") or 1),
+                "released_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "directions": _dirs[:4000],
+                "services": reh.get("services") or [],
+                "urls": [f"http://127.0.0.1:{s['port']}/"
+                         for s in (reh.get("services") or [])
+                         if s.get("port")],
+                "deliverables": [
+                    {"path": p, "desc": (mf.get(p) or {}).get("desc", "")}
+                    for p in store.list_deliverables(project_id)[:30]
+                ],
+                "config": (meta.get("config") or {}),
+                "rehearsal": reh.get("detail", "")[:600],
+            }
+            if not store.set_release(project_id, release):
+                return _err("failed to persist the release dossier")
+            store.update_project(project_id, status="RELEASED")
+            store.log_event(project_id, None, "project_released",
+                            {"version": release["version"],
+                             "services": len(release["services"]),
+                             "rehearsal": release["rehearsal"][:200]})
+            pretty_log("Project Released",
+                       f"{proj.get('title')} v{release['version']} — "
+                       f"rehearsal passed ({release['rehearsal'][:80]})",
+                       icon=Icons.OK)
+            return _ok({
+                "status": "RELEASED",
+                "version": release["version"],
+                "rehearsal": release["rehearsal"],
+                "release_md": "RELEASE.md written to the workspace",
+                "note": ("This project is now immutable. Changes fork a new "
+                         "version via action=create_version."),
+            })
+
+        if act == "create_version":
+            # Fork a RELEASED project into a fresh development line. The
+            # released version keeps working untouched (its services, its
+            # dossier); the copy inherits the development knowledge (files,
+            # ledger, config, manifest, constraints) but NOT the release
+            # dossier, task history, or journal — and its service port is
+            # bumped so v(n) and v(n+1) never collide.
+            if not project_id:
+                return _err("no active project (pass project_id or switch first)")
+            parent = store.get_project(project_id)
+            if not parent:
+                return _err(f"project not found: {project_id}")
+            if str(parent.get("status", "")).upper() != "RELEASED":
+                return _err(
+                    f"project is {parent.get('status')}, not RELEASED — "
+                    f"non-released projects are edited IN PLACE (just make "
+                    f"the changes); create_version exists to protect a "
+                    f"released artifact.")
+            pmeta = (parent.get("metadata") or {})
+            new_version = int(pmeta.get("version") or 1) + 1
+            base_title = re.sub(r"\s+v\d+$", "", str(parent.get("title") or ""))
+            # Inherited development knowledge; release dossier deliberately
+            # NOT carried; port bumped to avoid colliding with the running
+            # released version.
+            new_cfg = dict(pmeta.get("config") or {})
+            _old_port = None
+            for _pk in ("port", "PORT"):
+                if str(new_cfg.get(_pk, "")).strip().isdigit():
+                    _old_port = int(new_cfg[_pk])
+                    new_cfg[_pk] = str(_old_port + 1)
+                    break
+            new_meta = {
+                "version": new_version,
+                "parent_project_id": project_id,
+                "design_ledger": pmeta.get("design_ledger") or "",
+                "config": new_cfg,
+                "file_manifest": pmeta.get("file_manifest") or {},
+                "constraints": pmeta.get("constraints") or [],
+                "research_index": pmeta.get("research_index") or [],
+            }
+            new_pid = store.create_project(
+                f"{base_title} v{new_version}",
+                kind=str(parent.get("kind") or "GENERAL"),
+                goal=str(parent.get("goal") or ""),
+                metadata=new_meta,
+            )
+            # Copy workspace files (not RELEASE.md — the dossier belongs to
+            # the released version; not service scaffolding or caches).
+            import shutil
+            src_ws = Path(str(parent.get("workspace_dir") or ""))
+            dst_ws = Path(str((store.get_project(new_pid) or {})
+                              .get("workspace_dir") or ""))
+            copied = 0
+            if src_ws.is_dir() and str(dst_ws):
+                _ignore = shutil.ignore_patterns(
+                    "RELEASE.md", ".services", "__pycache__", "*.pyc",
+                    "node_modules")
+                shutil.copytree(src_ws, dst_ws, ignore=_ignore,
+                                dirs_exist_ok=True)
+                copied = sum(1 for p in dst_ws.rglob("*") if p.is_file())
+            # Seed task + re-register the parent's deliverables on it so the
+            # copied files are in THIS project's cleanup keep-set (an
+            # unregistered copy would be deleted by the end-of-life sweep).
+            seed_desc = " ".join((description or "").split()) or (
+                f"Apply requested changes (fork of {base_title} "
+                f"v{new_version - 1})")
+            seed_tid = store.add_task(new_pid, seed_desc)
+            for rel_path in store.list_deliverables(project_id):
+                try:
+                    store.register_file_artifact(seed_tid, rel_path)
+                except Exception:
+                    pass
+            if _old_port is not None:
+                store.append_ledger(
+                    new_pid,
+                    f"v{new_version} runs on port {_old_port + 1} — "
+                    f"v{new_version - 1} (RELEASED) keeps {_old_port}; "
+                    f"register services under a -v{new_version} name")
+            store.log_event(project_id, None, "version_forked",
+                            {"child": new_pid, "version": new_version})
+            store.log_event(new_pid, seed_tid, "version_created",
+                            {"parent": project_id,
+                             "version": new_version,
+                             "files_copied": copied})
+            _set_current(context, new_pid)
+            store.render_project_map(new_pid)
+            pretty_log("Version Forked",
+                       f"{base_title} v{new_version} ({new_pid}) — "
+                       f"{copied} file(s) copied; v{new_version - 1} stays "
+                       f"released and running",
+                       icon=Icons.BRAIN_PLAN)
+            _b = _briefing(store, new_pid)
+            if isinstance(_b, dict):
+                _b = {**_b, "workspace": f"projects/{new_pid}",
+                      "note": _workspace_note(new_pid),
+                      "version": new_version,
+                      "parent_project_id": project_id,
+                      "seed_task": seed_tid}
+            return _ok(_b)
+
         # ---- self-advancing loop ---------------------------------------
 
         if act == "autoadvance":
@@ -2728,7 +3056,18 @@ MANAGE_PROJECTS_TOOL_DEF = {
             "call it whenever you create a file or work out an undescribed "
             "one. `file_history` (file_path) to see every recorded action "
             "that touched a file — check it BEFORE re-reading a large file "
-            "to answer 'what changed / what was tried'."
+            "to answer 'what changed / what was tried'. "
+            "`release` (ONLY when the USER explicitly confirms the project "
+            "works): promotes a DONE project to RELEASED — pass `directions` "
+            "(a usage runbook for the user); the tool tidies the workspace, "
+            "COLD-STARTS the services / verifies deliverables (release "
+            "rehearsal), and freezes a release dossier + RELEASE.md. A "
+            "RELEASED project is IMMUTABLE: to change it use "
+            "`create_version` (optional description = the requested "
+            "change), which forks a v(n+1) copy — files, ledger, config "
+            "(port bumped), file map carried over; task history and the "
+            "release dossier stay with the released version, which keeps "
+            "running untouched."
         ),
         "parameters": {
             "type": "object",
@@ -2794,6 +3133,8 @@ MANAGE_PROJECTS_TOOL_DEF = {
                               "description": "actions describe_file/file_history: the project-relative file (e.g. 'server.js', 'src/app.py')."},
                 "file_role": {"type": "string",
                               "description": "action=describe_file: optional short role tag, e.g. 'entrypoint', 'styles', 'data-layer'."},
+                "directions": {"type": "string",
+                               "description": "action=release (REQUIRED there): the usage runbook for the USER — what the project is, how to use it, features, known limitations. Written in second person, ≥2 sentences. The tool appends the VERIFIED service commands/ports itself; do not guess them here."},
             },
             "required": ["action"],
         },

@@ -6,7 +6,7 @@ import urllib.parse
 import json
 import shlex
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 import httpx
 try:
     from curl_cffi import requests as curl_requests
@@ -1850,6 +1850,68 @@ def _remap_node_diag(diag: str, start_line: int) -> str:
     return head + (f"\n    {src_line[:160]}" if src_line else "")
 
 
+# Definition shapes the orphan guard recognizes: Python def/class, JS
+# function declarations/assignments, and object-literal/class method
+# shorthand. Keyword heads are excluded so `if (...) {` never reads as a
+# method definition.
+_SYMBOL_DEF_RES = (
+    re.compile(r"^\s*(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(", re.M),
+    re.compile(r"^\s*class\s+([A-Za-z_]\w*)\b", re.M),
+    re.compile(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(", re.M),
+    re.compile(r"\b([A-Za-z_$][\w$]*)\s*[:=]\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>)", re.M),
+    re.compile(r"^\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{", re.M),
+)
+_SYMBOL_KEYWORDS = frozenset({
+    "if", "for", "while", "switch", "catch", "function", "return", "with",
+    "else", "do", "try", "new", "await", "typeof", "constructor", "super",
+})
+
+
+def _defined_symbols(text: str) -> set:
+    out = set()
+    for rx in _SYMBOL_DEF_RES:
+        for m in rx.finditer(text or ""):
+            name = m.group(1)
+            if name and name not in _SYMBOL_KEYWORDS:
+                out.add(name)
+    return out
+
+
+def _orphaned_symbol_warning(old_text: str, new_text: str,
+                             final_content: str) -> str:
+    """Warn when a replace REMOVES a function/def whose references survive.
+
+    The 2026-07-24 Router.init() regression: a refactor replaced ``init()``
+    with ``bootstrap()`` but the nav-listener registration kept calling the
+    now-orphaned name — all top navigation broke, undetected, and the NEXT
+    session diagnosed it as its own 24-minute-old change. Deterministic and
+    cheap: symbols defined in the removed block but not in the replacement,
+    that still have references in the final file, get named in the tool
+    result so the model fixes the callers in the SAME turn. Advisory only —
+    never blocks the edit. Never raises."""
+    try:
+        removed = _defined_symbols(old_text) - _defined_symbols(new_text)
+        if not removed:
+            return ""
+        warnings = []
+        for sym in sorted(removed):
+            refs = len(re.findall(rf"\b{re.escape(sym)}\b", final_content or ""))
+            if refs > 0:
+                warnings.append(f"`{sym}` ({refs} remaining reference(s))")
+        if not warnings:
+            return ""
+        return (
+            "\nWARNING: this replace REMOVED the definition of "
+            + ", ".join(warnings)
+            + " but the file still references it/them. If you renamed or "
+              "replaced the function, update those call sites NOW (grep the "
+              "file for each name) — orphaned wiring is how the last nav "
+              "regression shipped."
+        )
+    except Exception:
+        return ""
+
+
 async def _syntax_feedback(path: Path, filename: str) -> str:
     """Best-effort post-write syntax check. Returns "" when clean or unknown.
 
@@ -2252,7 +2314,12 @@ async def _write_replace_guarded(path: Path, prev_content: str, new_content: str
     # them back as the exact original bytes; a default (strict) write would raise
     # UnicodeEncodeError on those surrogates.
     await asyncio.to_thread(path.write_text, new_content, encoding="utf-8", errors="surrogateescape")
-    return success_msg + await _syntax_feedback(path, filename)
+    # Whole-file defs diff: symbols defined in the previous content but not
+    # in the new content were removed by this edit; surviving references to
+    # them get named in the result (see _orphaned_symbol_warning).
+    return (success_msg
+            + _orphaned_symbol_warning(prev_content, new_content, new_content)
+            + await _syntax_feedback(path, filename))
 
 
 async def tool_write_file(filename: str, content: Any, sandbox_dir: Path):
@@ -3075,9 +3142,51 @@ async def tool_read_document_chunked(filename: str, sandbox_dir: Path, page: int
     except Exception as e: return f"Error reading document: {e}"
 
 # Unified router
+_PROJECT_DIR_RE = re.compile(r"projects/([0-9a-f]{12})(?:/|$)")
+
+
+def _released_write_block(project_store, sandbox_dir, target) -> Optional[str]:
+    """Refusal message when a write would land inside a RELEASED project's
+    workspace, else None. The hard half of release immutability (2026-07-25):
+    the briefing steers, but the agent's measured failure mode is regressing
+    working artifacts, so the write path itself must refuse. Derives the
+    project id from the scoped sandbox_dir OR the target path; one cheap
+    status lookup. Never raises — an unresolvable store never blocks a write.
+    """
+    try:
+        if project_store is None:
+            return None
+        hay = f"{sandbox_dir}/{'' if target is None else target}"
+        m = _PROJECT_DIR_RE.search(str(hay).replace("\\", "/"))
+        if not m:
+            return None
+        pid = m.group(1)
+        proj = project_store.get_project(pid)
+        if proj and str(proj.get("status", "")).upper() == "RELEASED":
+            return (
+                f"SYSTEM BLOCK: project {pid} is RELEASED (human-attested, "
+                f"immutable) — this write was NOT applied. To change it, "
+                f"fork a development copy first: manage_projects "
+                f"action=create_version project_id={pid} "
+                f"description=\"<the requested change>\", then edit the new "
+                f"version's workspace. The released version keeps running "
+                f"untouched.")
+    except Exception:
+        return None
+    return None
+
+
 async def tool_file_system(operation: str = None, sandbox_dir: Path = None, path: str = None, content: str = None, replace_with: str = None, destination: str = None, pattern: str = None, max_context: int = 8192, read_budget: "ReadBudget | None" = None, **kwargs):
     if not operation:
         return "SYSTEM INSTRUCTION: The 'operation' parameter is MANDATORY. You must specify it (e.g., operation='read')."
+    # Release immutability: block mutations into a RELEASED project's
+    # workspace at the WRITE PATH (see _released_write_block).
+    if operation in ("write", "replace", "delete", "move", "append"):
+        _rb = _released_write_block(
+            kwargs.get("project_store"), sandbox_dir,
+            path or kwargs.get("filename") or destination)
+        if _rb:
+            return _rb
     # Unified mapping for common parameter hallucinations
     url = kwargs.get("url")
     

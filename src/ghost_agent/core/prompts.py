@@ -95,6 +95,48 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
         f"message as if it were a fresh instruction; that request has "
         f"been fulfilled and the work is in flight below. ***"
     )
+    # RELEASED runbook mode (2026-07-25): a released project's briefing is
+    # OPERATIONAL, not developmental — lead with the human-attested usage
+    # directions and the rehearsed service commands, suppress the task
+    # scaffolding entirely (there are no open tasks; the artifact is
+    # immutable), and route any change request to create_version.
+    if str(proj.get("status", "")).upper() == "RELEASED":
+        rel = {}
+        try:
+            rel = store.get_release(project_id) or {}
+        except Exception:
+            rel = {}
+        rl = [
+            "### PROJECT (RELEASED)",
+            f"TITLE: {proj['title']}  ({proj['kind']} · RELEASED "
+            f"v{rel.get('version', 1)}, {rel.get('released_at', '')})",
+            f"GOAL: {(proj.get('goal') or '').strip()}",
+            "*** This project is RELEASED: human-tested and IMMUTABLE. "
+            "To RUN/USE it: follow the directions below (start the listed "
+            "services via manage_services if they are not running — the "
+            "commands were verified at release). For ANY change request: "
+            "do NOT edit these files — fork a development copy with "
+            "`manage_projects action=create_version` and work there; this "
+            "version keeps running untouched. ***",
+        ]
+        if rel.get("directions"):
+            rl.append("RELEASE DIRECTIONS (how to use):")
+            for ln in str(rel["directions"]).splitlines():
+                if ln.strip():
+                    rl.append(f"  {ln.strip()}")
+        for s in rel.get("services") or []:
+            rl.append(
+                f"SERVICE: {s.get('name')} · start: {s.get('command')}"
+                + (f" · port {s['port']}" if s.get("port") else ""))
+        for u in rel.get("urls") or []:
+            rl.append(f"URL: {u}")
+        if rel.get("deliverables"):
+            rl.append("FILES:")
+            for d in rel["deliverables"][:12]:
+                rl.append(f"  - {d.get('path')}"
+                          + (f" — {d['desc']}" if d.get("desc") else ""))
+        return "\n".join(rl)
+
     lines.append(
         "*** ONE TASK AT A TIME — HARD RULE: "
         "Advance this project ONE task per turn — the NEXT TASK shown "

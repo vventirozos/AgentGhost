@@ -59,11 +59,22 @@ _SHELL_DENY: tuple = (
     # Chmod 777 on root / system dirs
     re.compile(r"\bchmod\b\s+(?:-R\s+)?(?:0?777|a\+rwx)\b\s+/(?:bin|etc|usr|sys|root)\b"),
     # Download piped straight into an interpreter — common malware shape.
-    # Covers curl/wget/fetch | (sudo) sh/bash/zsh/dash/python/perl/ruby/node/php,
-    # including `| bash -s`.
+    # SHELLS stay fully blocked (curl | sh, | bash -s, …). Scripting
+    # interpreters block only when the pipe feeds them AS THE PROGRAM —
+    # bare (`| python3`) or explicit stdin (`| python3 -`). With `-m mod`,
+    # `-c code`, or a script file the piped bytes are DATA, not code:
+    # `curl … | python3 -m json.tool` is a legitimate verification pattern
+    # the old blanket rule false-positived on (2026-07-25 audit: the block
+    # made the agent substitute a WEAKER check instead of pretty-printing
+    # its POST result).
     re.compile(
         r"\b(?:curl|wget|fetch)\b[^|]+\|\s*(?:sudo\s+)?"
-        r"(?:sh|bash|zsh|dash|ksh|python[0-9.]*|perl|ruby|node|php)\b",
+        r"(?:sh|bash|zsh|dash|ksh)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:curl|wget|fetch)\b[^|]+\|\s*(?:sudo\s+)?"
+        r"(?:python[0-9.]*|perl|ruby|node|php)\s*(?:-\s*)?(?:\||;|&|$)",
         re.IGNORECASE,
     ),
 )

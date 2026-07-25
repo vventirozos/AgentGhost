@@ -256,6 +256,15 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
         # "managetasks" → "manage_tasks" mapping elsewhere).
         collapsed = name.replace("-", "_").replace(" ", "_")
         if collapsed in _BOOKKEEPING_TOOL_NAMES:
+            # A bookkeeping tool that ERRORED is evidence, not bookkeeping
+            # (2026-07-25 audit: three describe_file errors in a row, reply
+            # claimed success at 0.95, verifier skipped "by design" — the
+            # exact blind spot where self-report goes unchecked). Let the
+            # verifier see the error so a success claim over it gets
+            # refuted.
+            _c = str(tool.get("content", "")).lstrip()
+            if _c.startswith(("Error", "SYSTEM BLOCK", "REJECTED")):
+                return tool
             continue
         return tool
     return None
@@ -334,7 +343,23 @@ def _collect_verifier_evidence(tools_run: Optional[list],
         name = str(tool.get("name", "")).lower().strip()
         collapsed = name.replace("-", "_").replace(" ", "_")
         if collapsed in _BOOKKEEPING_TOOL_NAMES:
-            continue
+            # INFORMATIONAL bookkeeping output IS evidence (2026-07-25
+            # audit): the verifier refuted "Two lessons learned" and "All 9
+            # tasks complete" — both TRUE — because list_lessons/task_list
+            # outputs were excluded here, so the judge literally could not
+            # see the data behind the claim. Keep excluding the short
+            # state-change confirmations (the 2026-04-19 blast radius:
+            # `{"exited": …}` in the evidence slot guarantees a REFUTED),
+            # but pack substantial read output and error text. This
+            # deliberately diverges from _find_substantive_tool_for_verifier
+            # (which still decides IF the verifier runs — bookkeeping-only
+            # turns keep skipping): the split is run-gate vs evidence-set.
+            _c = str(tool.get("content", "")).strip()
+            _informational = (len(_c) >= 200
+                              or _c.startswith(("Error", "SYSTEM BLOCK",
+                                                "REJECTED")))
+            if not _informational:
+                continue
         picked.append(tool)
         if len(picked) >= max_items:
             break
@@ -2249,6 +2274,14 @@ class FinalizeState:
     _stable_conv_fp: Any
     _verdict_is_fresh: Any
     _verifier_verdict_cache: Any
+    # True when the turn loop ran out of turns WITHOUT a deliberate finish
+    # (the for-else PARTIAL path). Consumed by the finalize confidence
+    # compute: a budget-exhausted reply is working state, not a result, and
+    # must not ship at high confidence (2026-07-24: a broken persistence
+    # migration went out at C=0.99 exactly this way). Defaulted so the
+    # streamed-path construction (which cannot exhaust the loop) needs no
+    # change.
+    turn_budget_exhausted: Any = False
 
 
 @dataclass
@@ -5175,6 +5208,30 @@ class GhostAgent:
             hosts.append(host)
         if not hosts:
             return None
+        # file:// cannot exercise a fetch-backed app (2026-07-25 audit: a
+        # broken persistence migration was LATE CONFIRMED at 90% off a
+        # file:// load — the page's /api/ calls can never run there, and
+        # fetch rejections don't even trip the uncaught-exception marker).
+        # A page that calls the network is only verifiable SERVED, so the
+        # probe declares itself inconclusive — the existing
+        # _WEB_EXEC_SKIP_CONF_CAP (0.6) then caps any text-only CONFIRMED
+        # below every consumption gate.
+        for host in hosts:
+            try:
+                _head = host.read_text(encoding="utf-8", errors="replace")[:60000]
+                if re.search(r"\bfetch\s*\(|XMLHttpRequest|axios[.(]|[\"'`]/api/",
+                             _head):
+                    pretty_log(
+                        "Verifier",
+                        f"WEB-EXEC inconclusive: '{host.name}' calls the "
+                        "network (fetch/XHR/api) — a file:// load can't "
+                        "exercise it; verify via the RUNNING service URL "
+                        "instead. Confidence will be capped.",
+                        icon=Icons.VERIFIER_LAB,
+                    )
+                    return None
+            except Exception:
+                pass
         clean_pages: list = []
         for host in hosts:
             try:
@@ -9461,9 +9518,15 @@ class GhostAgent:
                         # "below=no on broken work" failure). 0.8 reliably
                         # pulls a 0.92–0.96 competence reading below the
                         # 0.89 threshold.
+                        # Budget exhaustion counts as an objective negative
+                        # too: the reply is flagged working-state/PARTIAL, so
+                        # a 0.9+ confidence reading on it is exactly the
+                        # verification theater the 2026-07-25 audit flagged
+                        # (broken migration shipped at C=0.99 on a 40/40 turn).
                         _outcome_penalty = (
-                            0.8 if (verifier_backfill
-                                    and verifier_backfill[0] == "failed")
+                            0.8 if ((verifier_backfill
+                                     and verifier_backfill[0] == "failed")
+                                    or getattr(fs, "turn_budget_exhausted", False))
                             else 0.0
                         )
                         _pending = _mc.confidence.score(
@@ -9507,7 +9570,8 @@ class GhostAgent:
                     verifier_backfill and verifier_backfill[0] == "failed"
                 )
                 _calib_outcome = (
-                    0.0 if (execution_failure_count > 0 or _verifier_failed)
+                    0.0 if (execution_failure_count > 0 or _verifier_failed
+                            or getattr(fs, "turn_budget_exhausted", False))
                     else 1.0
                 )
                 await asyncio.to_thread(
@@ -9970,7 +10034,9 @@ class GhostAgent:
             _verifier_failed = bool(verifier_backfill and verifier_backfill[0] == "failed")
             _verifier_passed = bool(verifier_backfill and verifier_backfill[0] == "passed")
             _state = ("failed" if (execution_failure_count > 0 or _verifier_failed)
-                      else ("verified" if _verifier_passed else "ok"))
+                      else ("partial (budget exhausted)"
+                            if getattr(fs, "turn_budget_exhausted", False)
+                            else ("verified" if _verifier_passed else "ok")))
             _conf = getattr(getattr(self.context, "last_confidence", None), "composite", None)
             _tnames = [t.get("name") for t in (tools_run_this_turn or [])
                        if isinstance(t, dict) and t.get("name")]
@@ -9980,8 +10046,10 @@ class GhostAgent:
                 + (f" · confidence {_conf:.2f}" if isinstance(_conf, (int, float)) else "")
                 + (f" · tools: {', '.join(_tnames)}" if _tnames else " · no tools")
                 + f" · {len(final_ai_content or '')} chars",
-                icon=(Icons.FAIL if _state == "failed" else Icons.OK),
-                level=("WARNING" if _state == "failed" else "INFO"))
+                icon=(Icons.FAIL if _state == "failed"
+                      else (Icons.STOP if _state.startswith("partial") else Icons.OK)),
+                level=("WARNING" if (_state == "failed"
+                                     or _state.startswith("partial")) else "INFO"))
         except Exception:
             pass
         return final_ai_content, created_time, req_id
@@ -13065,6 +13133,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         "(project work log / ledger / notes) instead of starting over.\n\n"
                         + (final_ai_content or "")
                     )
+                    _turn_budget_exhausted = True
 
                 # #5 step 3: the finalization chain lives in _finalize_and_return
                 # (verbatim extraction; FinalizeState is read-only inputs — see the
@@ -13092,6 +13161,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     _stable_conv_fp=_stable_conv_fp,
                     _verdict_is_fresh=_verdict_is_fresh,
                     _verifier_verdict_cache=_verifier_verdict_cache,
+                    turn_budget_exhausted=locals().get(
+                        "_turn_budget_exhausted", False),
                 ))
 
         except TurnCancelled as _tc:
@@ -15001,6 +15072,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             pretty_log("System 3 Complete", f"Winning strategy: {result.get('winning_id', '?')} — {result.get('justification', '')[:120]}", icon=Icons.BRAIN_THINK)
             return result
         except Exception as e:
-            logger.error(f"System 3 pivot failed: {e}")
+            # repr(): a bare {e} rendered EMPTY for exception types with no
+            # message (2026-07-25 audit: "System 3 pivot failed: " — cause
+            # unknowable from the log).
+            logger.error("System 3 pivot failed: %r", e)
             return {}
 

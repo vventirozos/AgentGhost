@@ -378,13 +378,19 @@ class VectorMemory:
             _mismatch = _embedder_sidecar_mismatch(
                 self._embedder_sidecar, EMBED_MODEL_NAME, _count) if _is_real else None
             if _mismatch:
+                # Name the STORE PATH + pid: a 2026-07-25 respawn-loop (24
+                # FATALs) was undiagnosable post-hoc because this message
+                # never said WHICH store (the main store was healthy; the
+                # 161-doc offender was some other path/process sharing the
+                # log file). Self-identifying errors or nothing.
                 logger.error(
-                    "FATAL: embedder/store mismatch — %s. Every stored vector "
-                    "is in the OLD model's space and retrieval would return "
-                    "plausible-looking garbage. Fix: re-embed the store with\n"
+                    "FATAL: embedder/store mismatch at %s (pid=%d, cwd=%s) — "
+                    "%s. Every stored vector is in the OLD model's space and "
+                    "retrieval would return plausible-looking garbage. Fix: "
+                    "re-embed THIS store with\n"
                     "    PYTHONPATH=src python scripts/reembed_memory.py\n"
                     "(or set GHOST_EMBED_MODEL back to the old model).",
-                    _mismatch,
+                    self.chroma_dir, os.getpid(), os.getcwd(), _mismatch,
                 )
                 sys.exit(1)
             self._stamp_embedder_sidecar()

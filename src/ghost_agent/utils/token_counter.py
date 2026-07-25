@@ -147,10 +147,31 @@ def _short_cache_key(text: str) -> tuple:
     return (digest, len(text))
 
 
+# Above this count, log the oversized payload ourselves (durable log).
+# transformers' own "Token indices sequence length is longer than…" warning
+# escaped ONLY to raw stderr (2026-07-25 audit: a 194308-token estimate
+# left no trace in either log) — and at this layer it is noise anyway (we
+# only COUNT; no model forward pass happens). We silence it per-call and
+# emit the actually-useful signal through our own logger instead.
+_HUGE_ESTIMATE_TOKENS = 131072
+
+
 def _encoder_count(text: str) -> int:
     if TOKEN_ENCODER:
         try:
-            return len(TOKEN_ENCODER.encode(text))
+            # verbose=False suppresses the sequence-length warning that
+            # bypassed our logging (it goes through transformers' own
+            # stderr handler).
+            try:
+                n = len(TOKEN_ENCODER.encode(text, verbose=False))
+            except TypeError:  # tokenizer without verbose kwarg
+                n = len(TOKEN_ENCODER.encode(text))
+            if n > _HUGE_ESTIMATE_TOKENS:
+                _logger.info(
+                    "estimate_tokens: %d-token payload exceeds the model "
+                    "window (%d) — whatever built this string is oversized "
+                    "(head: %.80s…)", n, _HUGE_ESTIMATE_TOKENS, text[:80])
+            return n
         except Exception as e:
             _warn_fallback_once(f"encoder error: {type(e).__name__}")
             return len(text) // 4
