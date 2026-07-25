@@ -272,8 +272,27 @@ def _find_substantive_tool_for_verifier(tools_run: Optional[list]) -> Optional[d
 
 # Newest-heavy evidence budget splits for _collect_verifier_evidence,
 # indexed by (item count - 1). A single-tool turn keeps the FULL budget —
-# behaviourally identical to the old single-output evidence path.
-_EVIDENCE_BUDGET_WEIGHTS = ([1.0], [0.65, 0.35], [0.5, 0.3, 0.2])
+# behaviourally identical to the old single-output evidence path. The
+# 4-way split exists for the claim-relevance path (an older evidence-
+# bearing output pulled in alongside the newest three).
+_EVIDENCE_BUDGET_WEIGHTS = ([1.0], [0.65, 0.35], [0.5, 0.3, 0.2],
+                            [0.4, 0.25, 0.2, 0.15])
+
+_EVIDENCE_CLAIM_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with",
+    "is", "are", "was", "were", "be", "been", "it", "its", "this", "that",
+    "i", "you", "your", "have", "has", "had", "now", "then", "will",
+    "can", "not", "no", "task", "project", "done", "complete", "completed",
+    "successfully", "verified", "user",
+})
+
+
+def _claim_tokens(text: str) -> set:
+    """Significant lowercase tokens of a claim, for evidence relevance."""
+    return {
+        t for t in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]+", (text or "").lower())
+        if len(t) > 2 and t not in _EVIDENCE_CLAIM_STOPWORDS
+    }
 
 
 # A URL this long is feed/tracking plumbing (UTM params, slug echoes), not
@@ -305,10 +324,18 @@ def _squeeze_evidence_noise(text: str) -> str:
 
 def _collect_verifier_evidence(tools_run: Optional[list],
                                max_items: int = 3,
-                               budget: int = 4000) -> str:
+                               budget: int = 4000,
+                               claim_text: str = "") -> str:
     """Build the EVIDENCE string for the verifier's ``verify_claim`` gate
     from the last ``max_items`` substantive tool outputs — not just the
-    single most recent one.
+    single most recent one — plus, when ``claim_text`` is given, the older
+    output that best SUPPORTS the claim (claim-conditioned selection,
+    2026-07-25): on the dark-theme turn the 🌙→☀️ observation lived in a
+    mid-turn click result, but a failed click + re-navigate + task close
+    pushed it outside the newest-3 window and the verifier refuted a true
+    claim as "evidence only shows the initial state". Positional windows
+    miss mid-turn evidence; the claim's own tokens say which older output
+    matters.
 
     Why: the final answer of a multi-source research turn synthesises
     MANY tool outputs, but the gate used to judge it against only the
@@ -334,7 +361,7 @@ def _collect_verifier_evidence(tools_run: Optional[list],
     substantive tool exists — callers fall back / skip exactly as the
     single-tool path does.
     """
-    picked: list = []
+    candidates: list = []
     for tool in reversed(tools_run or []):
         if not tool:
             continue
@@ -368,9 +395,27 @@ def _collect_verifier_evidence(tools_run: Optional[list],
                               or bool(re.search(r"\b[0-9a-f]{12}\b", _c)))
             if not _informational:
                 continue
-        picked.append(tool)
-        if len(picked) >= max_items:
+        candidates.append(tool)  # newest-first
+        if len(candidates) >= 10:  # bounded deep window for the claim scan
             break
+    if not candidates:
+        return ""
+    picked = candidates[:max_items]  # positional newest-N (legacy behaviour)
+    # Claim-conditioned pull: an OLDER output whose text overlaps the claim
+    # (≥2 significant tokens) is the evidence the claim leans on — add the
+    # best such item as a 4th slot rather than letting a failed retry or a
+    # bookkeeping-adjacent tail displace it.
+    if claim_text and len(candidates) > max_items:
+        ct = _claim_tokens(claim_text)
+        if ct:
+            best, best_score = None, 1
+            for tool in candidates[max_items:]:
+                overlap = len(ct & _claim_tokens(
+                    str(tool.get("content", ""))[:6000]))
+                if overlap > best_score:
+                    best, best_score = tool, overlap
+            if best is not None and len(picked) < len(_EVIDENCE_BUDGET_WEIGHTS):
+                picked.append(best)
     if not picked:
         return ""
     picked.reverse()  # chronological: oldest → newest
@@ -5461,8 +5506,12 @@ class GhostAgent:
         # against whichever tool ran last REFUTED correct answers on a
         # trailing 403 (req 738c/73). Code-shaped verdicts keep the
         # single-output view: they audit one specific run.
+        # claim_text: lets the packer pull the OLDER output the claim leans
+        # on (mid-turn observation displaced by a failed-retry tail —
+        # 2026-07-25 dark-theme refute).
         claim_evidence = _collect_verifier_evidence(
-            tools_run_this_turn) or tool_output
+            tools_run_this_turn,
+            claim_text=str(final_ai_content or "")) or tool_output
         if "execute" in tool_name.lower() or "postgres" in tool_name.lower():
             code_text = _reconstruct_executed_code(messages, last_tool)
             if code_text:

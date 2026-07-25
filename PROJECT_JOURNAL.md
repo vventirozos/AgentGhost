@@ -1109,6 +1109,20 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-25 (later 3) — Vision-claims refute class closed: claim-conditioned evidence selection
+
+Diagnosis overturned the design: the 🌙→☀️ "vision claim" was never vision-only — the click result CARRIED the
+post-click state as text ("button now shows ☀️") and the screenshot description confirmed it. The verifier refuted
+a true claim because a failed-click retry + re-navigate + task close pushed the evidence-bearing outputs **outside
+the newest-3 positional window** — the souvlaki class (2026-07-16) one level up. So the fix is not vision plumbing:
+`_collect_verifier_evidence(claim_text=)` now scans a bounded deeper window (10 substantive outputs) and pulls the
+older output that best overlaps the CLAIM's significant tokens (≥2, stopword-stripped) as a 4th evidence slot
+(new 4-way budget split [0.4/0.25/0.2/0.15]; newest-3 positional behaviour unchanged when no claim/no hit;
+deterministic, zero extra LLM calls). Call site threads `final_ai_content` as the claim. Genuinely-vision-only
+claims (state visible ONLY in pixels, never in any tool text) remain a theoretical residue — none observed yet;
+verify_visual exists if one ever does. Tests: 3 more in `test_project_state_memory_hygiene.py` (displaced-evidence
+reproduction, legacy-window preservation, overlap threshold). Full suite green; deployed.
+
 ### 2026-07-25 (later 2) — Operator log-review trio: project-state memory hygiene + id-linkage evidence + release port seed
 
 Operator flagged three log entries from the dark-theme turn; all three were real. (1) **User-memory pollution**: the

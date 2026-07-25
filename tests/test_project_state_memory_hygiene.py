@@ -134,3 +134,51 @@ async def test_release_seeds_port_from_rehearsed_service(store, tmp_path, monkey
     assert json.loads(res)["status"] == "RELEASED"
     # The rehearsed port is now durable config — the fork's bump source.
     assert store.get_config(pid)["port"] == "8144"
+
+
+# ------------------------------- claim-conditioned evidence (2026-07-25)
+
+def _mk(name, content):
+    return {"name": name, "content": content}
+
+
+def test_claim_pulls_displaced_mid_turn_evidence():
+    """Dark-theme reproduction: the 🌙→☀️ observation lives in a mid-turn
+    click result, displaced beyond newest-3 by a failed retry tail. The
+    claim's tokens must pull it back into evidence."""
+    tools = [
+        _mk("browser", "clicked #theme-toggle: button now shows sun icon, "
+                       "dark theme toggle switched page to light mode css"),
+        _mk("browser", "Error: click: runner exit 1 — TargetClosedError"),
+        _mk("browser", "navigated: page loaded, nav visible"),
+        _mk("browser", "interact: scrolled to footer, no errors"),
+    ]
+    claim = ("The dark theme toggle works: clicking it switched the page "
+             "to light mode and the button shows the sun icon.")
+    ev = _collect_verifier_evidence(tools, claim_text=claim)
+    assert "sun icon" in ev            # displaced item pulled in
+    assert "TargetClosedError" in ev   # newest window intact
+    assert len(ev) <= 4000
+
+
+def test_no_claim_keeps_legacy_newest_window():
+    tools = [
+        _mk("browser", "old evidence about the sun icon toggle theme"),
+        _mk("execute", "OUTPUT: a\nEXIT CODE: 0"),
+        _mk("execute", "OUTPUT: b\nEXIT CODE: 0"),
+        _mk("execute", "OUTPUT: c\nEXIT CODE: 0"),
+    ]
+    ev = _collect_verifier_evidence(tools)
+    assert "sun icon" not in ev  # positional newest-3 only, as before
+
+
+def test_irrelevant_older_output_not_pulled():
+    tools = [
+        _mk("web_search", "weather in paris is sunny and warm today"),
+        _mk("execute", "OUTPUT: a\nEXIT CODE: 0"),
+        _mk("execute", "OUTPUT: b\nEXIT CODE: 0"),
+        _mk("execute", "OUTPUT: c\nEXIT CODE: 0"),
+    ]
+    claim = "The dark theme toggle switches the journal to light mode."
+    ev = _collect_verifier_evidence(tools, claim_text=claim)
+    assert "paris" not in ev  # overlap below threshold — not pulled
