@@ -151,7 +151,12 @@ async def _not_found_with_recall(context, term) -> str:
     hits = []
     if callable(search):
         try:
-            raw = await asyncio.to_thread(search, str(term), 3)
+            # record_retrievals=False: this is a lookup-miss probe, not a
+            # real retrieval — the default bumped prune-survival stats on
+            # 3 arbitrary nearby rows (including hits discarded by the
+            # 1.15 gate below) on every project-name miss.
+            raw = await asyncio.to_thread(
+                search, str(term), 3, record_retrievals=False)
             for h in raw or []:
                 if not isinstance(h, dict) or not h.get("text"):
                     continue
@@ -2268,7 +2273,16 @@ async def tool_manage_projects(
             gated_constraints: List[str] = []
             active_constraints: List[str] = []
             judged_violations: List[str] = []
-            constraint_audit = None  # (ok, reason) — one audit per call
+            judged_violation_reasons: List[str] = []
+            # (ok, reason) audit cache keyed by the task's FILE SET. The
+            # audit is per-file-set (constraint_gate judges specific files);
+            # a single per-CALL cache reused the FIRST task's verdict for
+            # every sibling in a bulk close, so a constraint-VIOLATING
+            # sibling with different files inherited the first task's clean
+            # verdict and closed DONE unaudited (the exact bypass this gate
+            # exists to stop). Keyed by frozenset(files) so identical file
+            # sets still cost one audit, but distinct files are each judged.
+            _constraint_audit_cache: Dict[frozenset, Any] = {}
             for tid in target_ids:
                 if tid not in plan.tree.nodes:
                     missing.append(tid)
@@ -2340,24 +2354,34 @@ async def tool_manage_projects(
                     # exactly the bug.
                     _task_files = _files_for_task(store, project_id, tid,
                                                   deliverables)
-                    if _task_files and constraint_audit is None:
-                        try:
-                            from ..core.build_gates import constraint_gate
-                            constraint_audit = await constraint_gate(
-                                context, task_constraints, _task_files,
-                                is_background=False)
-                        except Exception:
-                            logger.debug("constraint judgment gate skipped",
-                                         exc_info=True)
-                            constraint_audit = (True, "")
-                    # Refuse only tasks that HAD files to audit. The one-
-                    # audit-per-call cache above must not leak the first
-                    # task's verdict onto a fileless SIBLING in the same
-                    # batch — no files → skip the judgment gate, per the
-                    # contract documented on _files_for_task.
-                    if (_task_files and constraint_audit is not None
-                            and not constraint_audit[0]):
+                    # Audit THIS task's own files. Cache by the file set so a
+                    # bulk close with identical file sets still costs one
+                    # audit, but a sibling with DIFFERENT files is judged on
+                    # its OWN artifact — never the first task's verdict.
+                    _task_audit = None
+                    if _task_files:
+                        _fkey = frozenset(_task_files)
+                        _task_audit = _constraint_audit_cache.get(_fkey)
+                        if _task_audit is None:
+                            try:
+                                from ..core.build_gates import constraint_gate
+                                _task_audit = await constraint_gate(
+                                    context, task_constraints, _task_files,
+                                    is_background=False)
+                            except Exception:
+                                logger.debug("constraint judgment gate skipped",
+                                             exc_info=True)
+                                _task_audit = (True, "")
+                            _constraint_audit_cache[_fkey] = _task_audit
+                    # Refuse only tasks that HAD files to audit. Fileless
+                    # tasks skip the judgment gate (the evidence gate above
+                    # still applies), per the _files_for_task contract.
+                    if (_task_files and _task_audit is not None
+                            and not _task_audit[0]):
                         judged_violations.append(tid)
+                        _reason = _task_audit[1] if len(_task_audit) > 1 else ""
+                        if _reason:
+                            judged_violation_reasons.append(_reason)
                         continue
                 # Register deliverables BEFORE flipping the task to DONE.
                 # update_status can roll the whole project to DONE on this
@@ -2452,7 +2476,8 @@ async def tool_manage_projects(
                     f"REFUSED to mark {len(judged_violations)} task(s) DONE: "
                     "an audit of the project files found a violation of the "
                     "user's stated constraints. "
-                    + (constraint_audit[1] if constraint_audit else "")
+                    + ("; ".join(dict.fromkeys(judged_violation_reasons))
+                       if judged_violation_reasons else "")
                     + " Fix the deliverable so it actually honors the "
                     "constraint, then re-call task_update with status=done "
                     "and a `result`. Only if the USER has explicitly "

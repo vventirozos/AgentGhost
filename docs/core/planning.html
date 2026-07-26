@@ -137,6 +137,10 @@
   </ul>
   <div class="note"><strong>Tests:</strong> covered by <code>tests/test_planning_root_postconditions.py</code> and <code>tests/test_router_bootstrap.py</code>.</div>
 
+
+  <h2>Dependency-cycle guard (2026-07-26c)</h2>
+  <p><code>deps_satisfied</code> now detects a <code>depends_on</code> CYCLE (A→B→A). Unlike <code>set_dependency</code>, <code>add_task</code>/<code>decompose</code> don't reject cyclic deps, so every task in a cycle stayed permanently ineligible — <code>next_ready_leaf</code> returned None and <code>advance_many</code> falsely reported <code>project_done</code> on a plan that still held open PENDING work. When a node is in a cycle, its cyclic deps are treated as satisfied (same "a bad reference can't deadlock the whole plan" philosophy as unknown dep ids) so the cycle drains. A normal unsatisfied dep still blocks. Tests: <code>tests/test_bughunt_fixes_2026_07_26b.py::TestDepsCycle</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

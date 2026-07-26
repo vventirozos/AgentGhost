@@ -127,6 +127,10 @@
 
   <p>Detailed RRF derivation in <a href="../algorithms/memory_hydration.html">algorithms / memory hydration</a>.</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Identity facts REPLACE, not stack:</strong> <code>publish_fact</code>'s vector leg was a plain <code>add()</code>, which left <code>smart_update</code> (and its whole subject/attribute conflict guard) with no production caller once the bus was always wired — every profile change minted a new row and stale values kept being served (live: duplicate <code>home_lab_worker_node</code> facts, 5 coexisting paraphrases of one activity fact). Identity-typed facts now route through <code>smart_update</code>. <strong>Fail-open reporting closed:</strong> the bus swallows subsystem exceptions into its report dict by design, but the memory tools discarded the report — a total write failure returned "SUCCESS". <code>remember</code>/<code>update_profile</code>/<code>learn_skill</code> now surface <code>PARTIAL:</code> with the failing subsystems (restores the legacy path's contract). <strong>Stash clobber:</strong> a survivor-less hydration only clears its OWN turn's <code>last_hydration</code> stash now (blind None destroyed an overlapping turn's stash before its judge consumed it). Profile leg requires category+key (junk-key guard). Tests: <code>::TestBusIdentitySmartUpdate</code>, <code>::TestBusPartialReporting</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

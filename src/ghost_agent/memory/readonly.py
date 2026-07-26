@@ -125,7 +125,26 @@ class ReadOnlySkillMemory(_ReadOnlyProxy):
         "credit_recent_retrievals", "record_retrievals_bulk",
         "record_surfaced_outcomes",
         "prune_low_utility", "mark_verified", "remove_by_trigger",
+        # quarantine_lesson landed 2026-07-17, AFTER the 2026-07-14 façade
+        # hardening — without this entry a delegated sub-agent (e.g. via
+        # counterfactual regression checks) could quarantine a REAL operator
+        # lesson through the façade.
+        "quarantine_lesson",
     })
+
+    def get_playbook_context(self, *a, **kw):
+        """Results pass through, but the two write side-effects are forced
+        OFF: the retrieval-stat bump (`record_retrievals`) — same leak class
+        `ReadOnlyVectorMemory.search` closes — and the
+        `last_playbook_triggers` attribution stamp (`stamp_triggers`), which
+        would otherwise overwrite the OPERATOR turn's hydration record with
+        the sub-agent's lesson set mid-turn."""
+        real = self.__dict__.get("_real")
+        if real is None:
+            return ""
+        kw["record_retrievals"] = False
+        kw["stamp_triggers"] = False
+        return real.get_playbook_context(*a, **kw)
 
 
 class ReadOnlyGraphMemory(_ReadOnlyProxy):

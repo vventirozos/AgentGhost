@@ -29,7 +29,7 @@ logger = logging.getLogger("GhostAgent")
 
 
 _VALID_ACTIONS = frozenset({"summary", "stats", "narrative", "recent",
-                            "recall", "activity"})
+                            "recall", "activity", "learning"})
 
 _DEFAULT_RECENT = 5
 _DEFAULT_RECALL = 5
@@ -199,6 +199,21 @@ async def tool_introspect(
     # "what did you do while I was away?" lands here.
     if raw_action == "activity":
         return _render_activity(context, hours=hours, limit=limit)
+
+    # 'learning' reads the learning-loop stores (lessons, competence,
+    # episodes, calibration), not the SelfModel — it branches before the
+    # self_model gate so it works with selfhood disabled. This is the
+    # instrument for the "watch/keep-or-kill in ~2 weeks" criteria the
+    # 2026-07 loop-closing work left pending.
+    if raw_action == "learning":
+        try:
+            from ..core.learning_health import render_learning_health
+            _md = getattr(context, "memory_dir", None)
+            if _md is None:
+                return "Learning health: memory_dir unavailable."
+            return render_learning_health(_md)
+        except Exception as e:
+            return f"Learning health unavailable: {type(e).__name__}: {e}"
 
     if self_model is None or not getattr(self_model, "enabled", False):
         return (

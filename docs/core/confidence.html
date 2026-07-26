@@ -77,6 +77,10 @@ if r.below_threshold:
   <p>
     <code>apply_fitted(params)</code> hot-swaps the threshold τ, weights, and λ from a <a href="calibration.html">calibration fit</a> — at startup (loading a persisted fit) and from the idle refit phase (2.7c). A long-running agent's confidence becomes empirically calibrated against realized outcomes instead of the hardcoded τ = 0.55 / 0.5–0.5 defaults, with no restart.
   </p>
+
+  <h2>Calibration composite-leak (bug-hunt 2026-07-26b)</h2>
+  <p><code>ConfidenceReading</code> gained <code>pre_penalty_composite</code>: the composite BEFORE the <code>outcome_penalty</code> multiply. The calibration spine records THAT, not the penalized composite — the penalty is a function of the turn's outcome label, so recording the penalized value made Brier/ECE read optimistically on exactly the negative samples the loop exists to catch (a refuted turn's stored confidence was pulled to ~0.18, so its Brier contribution looked tiny). The <code>below_threshold</code> DECISION still uses the penalized composite. Defaults to <code>composite</code> for positionally-built readings. Tests: <code>tests/test_bughunt_fixes_2026_07_26b.py::TestConfidencePrePenalty</code>.</p>
+
 </main>
 </body>
 </html>

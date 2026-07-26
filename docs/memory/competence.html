@@ -58,6 +58,14 @@
       <tr><td><code>flush()</code></td><td>Persist any debounced records (no-op when write-through / already clean).</td></tr>
     </tbody>
   </table>
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p>Saves fsync before rename (torn-write window, journal.py rationale). Known-open (logged, not yet wired): <code>by_domain()</code> / <code>get_context_string()</code> still have no consumer — the docstring's "used by the planner" remains aspirational.</p>
+
+
+  <h2>Wired into the prompt (2026-07-26)</h2>
+  <p><code>get_context_string()</code> / <code>by_domain()</code> were computed on every tool outcome (39 live cells) but rendered NOWHERE — the docstring's "used by the planner" was aspirational. Now injected into the system-prompt continuity blocks (agent.py), gated on <code>_COMPETENCE_MIN_OBS</code> (20) total observations so a cold profile doesn't inject small-n noise, so the model can prefer a domain it's reliable in and be cautious in a weak one. Tests: <code>tests/test_memory_audit_fixes_2026_07_26.py::TestCompetenceContextString</code>. Also: saves fsync before rename.</p>
+
 </main>
 </body>
 </html>

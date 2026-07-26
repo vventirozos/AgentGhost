@@ -71,6 +71,10 @@
   <p><code>_persist_entry</code> now logs at <code>warning</code> (was <code>debug</code>) when the DB write fails while <code>set()</code> keeps serving the value from memory — a locked or full DB was silently making swarm results memory-only, a loss that surfaced only after the next restart. The operator watches the live stream, so this must be visible the moment it starts.</p>
   <p>Separately, the string <code>set()</code> echoes back is bounded by <code>max_echo_chars</code> (default 500): the ack is handed straight to the model, so echoing a multi-KB swarm result doubled it into context for nothing (the model just wrote it). The STORED value is never truncated — only the acknowledgement is capped.</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>LRU eviction is sentinel-aware:</strong> a busy project writing <code>max_entries</code>+ keys could durably evict <code>__current_project__</code> or another conversation's pending swarm <code>output_key</code> — dunder-named keys are now skipped (evict-anything only when nothing else remains). <strong>Session export/restore:</strong> new <code>export_state()</code> / <code>restore_state()</code> — the API route read <code>_data</code> without the lock (RuntimeError under concurrent mutation) and dropped namespace tags, so restore re-tagged every key into whatever namespace was active; legacy flat exports restore into the GLOBAL scope. The dream self-play report now passes <code>namespace=None</code> explicitly (it inherited the active project's namespace and got wiped by that project's <code>clear_namespace</code>). Tests: <code>::TestScratchpadHardening</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

@@ -91,7 +91,12 @@ class GraduatedSkillStore:
                     int(existing.get("support", 0)),
                     int(getattr(candidate, "support", 0)),
                 )
-                existing["confidence"] = round(max(existing.get("confidence", 0.0), conf), 4)
+                # Track the verifier's CURRENT confidence, not a running
+                # max: max() made downgrades impossible, so a skill's
+                # stored confidence could only ever ratchet above its
+                # observed pass-rate and the deprecation threshold became
+                # unreachable.
+                existing["confidence"] = round(conf, 4)
                 existing["verifications"] = int(existing.get("verifications", 0)) + 1
                 existing["last_verified_at"] = now
                 entry = existing
@@ -127,6 +132,26 @@ class GraduatedSkillStore:
             # return None so the caller doesn't count/mint a macro for a skill
             # the store won't surface.
             return entry if sig in data else None
+
+    def remove(self, signature_hash: str) -> bool:
+        """Remove a graduated skill by signature hash. Returns True when an
+        entry was actually deleted.
+
+        This is the deprecation path the verifier's ``action="deprecate"``
+        verdict always implied but never had: without it, a skill that
+        failed re-verification could only ever leave the store via silent
+        lowest-confidence eviction at the MAX_SKILLS cap."""
+        if not signature_hash:
+            return False
+        with self._lock:
+            data = self._load()
+            if signature_hash not in data:
+                return False
+            del data[signature_hash]
+            self._save(data)
+        logger.info("auto-skill store: removed deprecated skill %s",
+                    signature_hash)
+        return True
 
     # ------------------------------------------------------------------
     # Read API

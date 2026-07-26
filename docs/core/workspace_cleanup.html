@@ -166,6 +166,10 @@
   partial-keep-set recovery suite (chess-scenario regression, idempotent
   re-registration, debris-outranks-source, registered-vs-unregistered media,
   dry-run no-registration).</p>
+
+  <h2>Binary-deliverable partial-recovery (bug-hunt 2026-07-26b)</h2>
+  <p>On a PARTIAL keep-set (some files registered), the DONE sweep deleted an unregistered <strong>data/binary deliverable</strong> — an app database (<code>.db</code>/<code>.sqlite</code>), trained model weights (<code>.pt</code>/<code>.safetensors</code>/<code>.onnx</code>), or a dataset (<code>.parquet</code>/<code>.npy</code>) — because the partial-recovery only rescued source-like files, and the empty-keep-set recovery (which keeps everything non-debris) doesn't run once ANY file is registered. A coding project's seeded <code>data.db</code> / <code>model.pt</code> vanished at the moment of completion when <code>app.py</code> alone was registered. The recovery now also rescues <code>_is_data_deliverable</code> files; media scratch (screenshots, renders) stays deletable. Tests: <code>::TestDataDeliverableRecovery</code>.</p>
+
 </main>
 </body>
 </html>

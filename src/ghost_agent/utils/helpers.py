@@ -178,64 +178,133 @@ async def helper_fetch_url_content(
         curl_cffi = None
 
     # Hard body-size cap. A malicious / misconfigured server can stream
-    # multi-GB content under any timeout; we count bytes ourselves.
+    # multi-GB content under any timeout; we count bytes ourselves. The
+    # comment used to say "we count bytes ourselves" while actually reading
+    # resp.text (the WHOLE body into RAM) first — now we truly stream and
+    # stop at the cap, like the darkweb sibling (_fetch_raw_html).
     MAX_BODY_BYTES = 5 * 1024 * 1024  # 5 MB ceiling
+    _STREAM_LIMIT = MAX_BODY_BYTES + 4096
+    _base_proxy = proxy_url
 
     for attempt in range(3):
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
-            if curl_cffi:
-                proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-                async with curl_cffi.requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0) as client:
-                    resp = await client.get(url, headers=headers)
-            else:
-                # Fallback to httpx if curl_cffi is missing for some reason
-                async with httpx.AsyncClient(proxy=proxy_url, timeout=20.0, follow_redirects=True) as client:
-                    resp = await client.get(url, headers=headers)
+            # Rotate the CIRCUIT per attempt via SOCKS-auth isolation (no
+            # control port, no daemon restart) so a 503-blocked exit is
+            # swapped on retry — see the 503 branch below.
+            _attempt_proxy = _base_proxy
+            if _base_proxy and attempt > 0:
+                _rot = socks_url_with_identity(_base_proxy, f"fetch{attempt}")
+                if _rot:
+                    _attempt_proxy = _rot
 
-            content_type = resp.headers.get("content-type", "").lower()
-            # Check the URL *path*, not the raw URL — "/report.pdf?dl=1"
-            # must still trip the binary short-circuit.
+            # Read the response HEADERS first (available on a streaming
+            # response before the body), decide whether we even want the
+            # body, and only then drain it with a byte cap — a rejected
+            # PDF/oversized/non-200 page is never downloaded.
             from urllib.parse import urlparse
             url_path = urlparse(url).path.lower()
-            if "application/pdf" in content_type or "application/octet-stream" in content_type or url_path.endswith((".pdf", ".zip")):
+
+            def _drain_sync(resp):
+                buf = bytearray()
+                try:
+                    for chunk in resp.iter_content():
+                        if chunk:
+                            buf.extend(chunk)
+                            if len(buf) >= _STREAM_LIMIT:
+                                break
+                finally:
+                    try: resp.close()
+                    except Exception: pass
+                return bytes(buf)
+
+            async def _drain_async(resp):
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) >= _STREAM_LIMIT:
+                        break
+                return bytes(buf)
+
+            def _classify(status_code, content_type, _cl):
+                is_binary = ("application/pdf" in content_type
+                             or "application/octet-stream" in content_type
+                             or url_path.endswith((".pdf", ".zip")))
+                try:
+                    clen = int(_cl or "0")
+                except (TypeError, ValueError):
+                    clen = 0
+                oversize = clen and clen > MAX_BODY_BYTES
+                # Only drain the body for a 200 we intend to parse.
+                want = (status_code == 200 and not is_binary and not oversize)
+                return is_binary, oversize, want
+
+            _raw = b""
+            if curl_cffi:
+                proxies = {"http": _attempt_proxy, "https": _attempt_proxy} if _attempt_proxy else None
+                async with curl_cffi.requests.AsyncSession(impersonate="chrome110", proxies=proxies, timeout=20.0) as client:
+                    resp = await client.get(url, headers=headers, stream=True)
+                    content_type = resp.headers.get("content-type", "").lower()
+                    status_code = resp.status_code
+                    _cl = resp.headers.get("content-length")
+                    _encoding = getattr(resp, "encoding", None) or "utf-8"
+                    _is_binary, _oversize, _want = _classify(status_code, content_type, _cl)
+                    if _want:
+                        _raw = await asyncio.to_thread(_drain_sync, resp)
+                    else:
+                        try: resp.close()
+                        except Exception: pass
+            else:
+                # Fallback to httpx if curl_cffi is missing for some reason
+                async with httpx.AsyncClient(proxy=_attempt_proxy, timeout=20.0, follow_redirects=True) as client:
+                    async with client.stream("GET", url, headers=headers) as resp:
+                        content_type = resp.headers.get("content-type", "").lower()
+                        status_code = resp.status_code
+                        _cl = resp.headers.get("content-length")
+                        _encoding = resp.encoding or "utf-8"
+                        _is_binary, _oversize, _want = _classify(status_code, content_type, _cl)
+                        if _want:
+                            _raw = await _drain_async(resp)
+
+            # Header-only short-circuits (no body was read for these).
+            if _is_binary:
                 return "Error: URL points to a binary file. To read PDFs, download them using file_system and ingest them using knowledge_base."
+            if _oversize:
+                _clen = int(_cl or "0")
+                return f"Error: response from {url} is {_clen // (1024*1024)} MB; refusing to read more than {MAX_BODY_BYTES // (1024*1024)} MB."
 
-            # Enforce Content-Length cap before reading the body if the
-            # server tells us the size up front.
-            try:
-                content_length = int(resp.headers.get("content-length", "0") or "0")
-            except (TypeError, ValueError):
-                content_length = 0
-            if content_length and content_length > MAX_BODY_BYTES:
-                return f"Error: response from {url} is {content_length // (1024*1024)} MB; refusing to read more than {MAX_BODY_BYTES // (1024*1024)} MB."
-
-            status_code = resp.status_code
-            text = resp.text
-            # And cap the actual decoded text in case the server lied about
-            # Content-Length or sent chunked transfer encoding.
-            if isinstance(text, str) and len(text) > MAX_BODY_BYTES:
-                text = text[:MAX_BODY_BYTES] + "\n[... TRUNCATED at 5 MB ceiling ...]"
-            
             if status_code != 200:
-                # Only renew the Tor identity on 503. 401/403 are
-                # APPLICATION-level "you are forbidden" responses (auth
-                # token, geo block, account state) — rotating the exit
-                # node won't change them, and burning identities on every
-                # 401 just slows the next legitimate request. Reserve
-                # rotation for 503, which often signals the exit node
+                # Only rotate the exit on 503. 401/403 are APPLICATION-level
+                # "you are forbidden" responses (auth token, geo block,
+                # account state) — rotating the exit node won't change them.
+                # Reserve rotation for 503, which often signals the exit node
                 # itself is being rate-limited or filtered.
                 if status_code == 503 and proxy_url:
                     if attempt < 2 and renew_identity:
-                        await asyncio.to_thread(request_new_tor_identity)
-                        await asyncio.sleep(5)
+                        # Rotate via a fresh SOCKS-isolated CIRCUIT on the next
+                        # attempt (handled at the top of the loop), NOT via
+                        # request_new_tor_identity: on this box the control
+                        # port (9051) is closed, so that path fell back to
+                        # `brew services restart tor` — bouncing the WHOLE Tor
+                        # daemon (up to 2x per fetch) and re-circuiting every
+                        # concurrent sibling fetch. Per-circuit isolation gets
+                        # a fresh exit with none of that blast radius.
+                        await asyncio.sleep(2)
                         continue
                     return f"Error: Access Denied (503) via Tor. The site {url} likely blocks Tor exit nodes. Try a different source."
                 if status_code in (401, 403):
                     return f"Error: Access Denied ({status_code}) from {url}. Application-level forbidden — Tor rotation will not help."
                 return f"Error: Received status {status_code} from {url}"
-            
+
+            # 200 — decode the drained body (charset-aware) and cap.
+            try:
+                text = _raw.decode(_encoding, errors="replace")
+            except (LookupError, TypeError):
+                text = _raw.decode("utf-8", errors="replace")
+            if len(text) > MAX_BODY_BYTES:
+                text = text[:MAX_BODY_BYTES] + "\n[... TRUNCATED at 5 MB ceiling ...]"
+
             def _parse_html(html_content):
                 from bs4 import BeautifulSoup
                 soup = BeautifulSoup(html_content, 'html.parser')
@@ -248,11 +317,13 @@ async def helper_fetch_url_content(
             
         except Exception as e:
             if attempt < 2 and proxy_url and renew_identity:
-                await asyncio.to_thread(request_new_tor_identity)
-                await asyncio.sleep(5)
+                # Retry on a fresh circuit (rotated at the top of the loop
+                # via socks_url_with_identity), NOT a global NEWNYM/daemon
+                # restart — see the 503 branch above.
+                await asyncio.sleep(2)
                 continue
             return f"Error reading {url}: {str(e)}"
-            
+
     return f"Error fetching {url} after 3 retries."
 
 # --------------------------------------------------------------------------
@@ -402,13 +473,38 @@ def recursive_split_text(text: str, chunk_size: int = 500, chunk_overlap: int = 
         temp_chunks = []
 
         for p in parts:
-            fragment = p + found_sep if found_sep.strip() else p
+            # Re-attach the separator to EVERY fragment. It used to be
+            # re-attached only for punctuation separators ('. ', '? ', …);
+            # for whitespace ones ('\n\n', '\n', ' ') `found_sep.strip()`
+            # is falsy, so the separator was dropped on rejoin — fusing the
+            # last word of each line to the first word of the next in every
+            # chunk (live: all 7,131 postgresql-manual chunks), corrupting
+            # embeddings, BM25 token matching, and the passage text itself.
+            # The final fragment gains one trailing separator that wasn't in
+            # the source; the edge .strip() below removes it for whitespace
+            # and it is harmless for punctuation.
+            fragment = p + found_sep
             if len(buffer) + len(fragment) <= chunk_size:
                 buffer += fragment
             else:
                 if buffer:
                     temp_chunks.append(buffer.strip())
-                buffer = fragment
+                    # Honor chunk_overlap on the separator path too — it was
+                    # only ever applied on the no-separator hard split, so
+                    # separator-path chunks had zero overlap despite the
+                    # documented contract. Carry the flushed buffer's tail
+                    # into the next chunk so cross-boundary context survives
+                    # retrieval. The carry is capped at chunk_size//4:
+                    # callers CAN arrive with overlap clamped to
+                    # chunk_size-1 (semantic_split_text shrinks the
+                    # effective chunk_size below the overlap for long
+                    # headers), and an uncapped carry then advances ONE
+                    # fragment per chunk — quadratic output blowup that
+                    # spun the test suite for 36 CPU-minutes. The cap
+                    # guarantees ≥ 3/4 forward progress per chunk.
+                    _carry = min(chunk_overlap, chunk_size // 4)
+                    buffer = buffer[-_carry:] if _carry > 0 else ""
+                buffer += fragment
 
         if buffer:
             temp_chunks.append(buffer.strip())

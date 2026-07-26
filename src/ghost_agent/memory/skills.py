@@ -1172,7 +1172,23 @@ class SkillMemory:
 
         def _match(raw):
             t = (raw.get("trigger") or raw.get("task") or "").strip().lower()
-            return t == trigger.strip().lower()
+            if t != trigger.strip().lower():
+                return False
+            # Idempotency (both orderings): production runs the inline
+            # `credit_recent_retrievals` pass FIRST and the async hydration
+            # judge lands seconds later — without this check the judge
+            # re-credits the same retrieval (+2 helpful per turn), inflating
+            # hit_rate past the stale/prune gates. Mirrors the guard inside
+            # credit_recent_retrievals, which only covers judge-first order.
+            last_credit = raw.get("last_credited_at") or ""
+            last_ret = raw.get("last_retrieved_at") or ""
+            if last_credit and last_ret:
+                try:
+                    if datetime.fromisoformat(last_credit) >= datetime.fromisoformat(last_ret):
+                        return False
+                except Exception:
+                    pass
+            return True
 
         def _mut(lesson):
             lesson["helpful_retrievals"] = int(lesson.get("helpful_retrievals") or 0) + 1
@@ -1653,6 +1669,7 @@ class SkillMemory:
         distance_threshold: float = DEFAULT_RETRIEVAL_DISTANCE,
         limit: int = 5,
         record_retrievals: bool = True,
+        stamp_triggers: bool = True,
     ) -> str:
         """Render the top lessons relevant to `query` for prompt injection.
 
@@ -1662,7 +1679,25 @@ class SkillMemory:
         retrieval counters on every lesson actually surfaced so the
         feedback loop can tell which lessons the agent sees. (The
         MemoryBus uses `get_playbook_items` instead and credits AFTER
-        fusion decides what enters the prompt.)"""
+        fusion decides what enters the prompt.)
+
+        ``stamp_triggers=False`` is for callers whose retrieval must NOT
+        become the operator turn's attribution record — the read-only
+        sub-agent façade and the dream simulator both pass it, otherwise
+        their lesson sets leak into ``last_playbook_triggers`` mid-turn
+        and the outcome arms book the wrong lessons."""
+        # Reset the attribution side-channel UP FRONT: the empty branches
+        # below return early, and without this reset a turn whose own
+        # retrieval is empty would inherit the PREVIOUS turn's trigger
+        # list — the outcome arms then book this turn's success/failure
+        # against lessons that were never in its prompt. Unstamped callers
+        # (dream sim, read-only façade) get their triggers on a SEPARATE
+        # attribute so they can still observe what surfaced without
+        # touching the operator turn's record.
+        if stamp_triggers:
+            self.last_playbook_triggers = []
+        else:
+            self.last_sim_triggers = []
         items, branch = self._playbook_items_and_branch(
             query, memory_system,
             distance_threshold=distance_threshold, limit=limit,
@@ -1676,16 +1711,20 @@ class SkillMemory:
         items = self._filter_quarantined(items)
         # Hydration side-channel (counterfactual phase 1, 2026-07-17):
         # which lessons entered THIS prompt. Turns are globally
-        # serialized (agent semaphore), so a plain attribute is safe;
+        # serialized (agent semaphore) and non-turn callers pass
+        # stamp_triggers=False, so a plain attribute is safe;
         # _record_turn_trajectory stamps it into the trajectory's extra
         # so a later regression can be attributed to the lessons that
         # were actually in context — without this, attribution data is
         # unrecoverable after the fact.
         try:
-            self.last_playbook_triggers = [
-                it["trigger"] for it in items if it.get("trigger")]
+            _surfaced = [it["trigger"] for it in items if it.get("trigger")]
         except Exception:
-            self.last_playbook_triggers = []
+            _surfaced = []
+        if stamp_triggers:
+            self.last_playbook_triggers = _surfaced
+        else:
+            self.last_sim_triggers = _surfaced
 
         if record_retrievals and items:
             try:

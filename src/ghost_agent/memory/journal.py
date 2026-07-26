@@ -252,22 +252,36 @@ class MemoryJournal:
     def _save(self, data):
         self._atomic_write(self.file_path, data)
 
+    @staticmethod
+    def _preserve_corrupt(path, label: str, exc="") -> list:
+        """PRESERVE a corrupt file's raw bytes in a timestamped sidecar
+        BEFORE any subsequent write destroys them, then report empty.
+        If even the preserve fails, say so LOUDLY — silence here is the
+        exact loss mode this mechanism exists to prevent."""
+        try:
+            sidecar = path.with_suffix(f".corrupt-{int(time.time())}.json")
+            os.replace(path, sidecar)
+            logger.warning(
+                "%s was corrupt (%s); preserved to %s.",
+                label, exc or "undecodable", sidecar.name,
+            )
+        except FileNotFoundError:
+            pass
+        except Exception as p_exc:
+            logger.warning(
+                "%s was corrupt (%s) and could NOT be preserved (%s: %s) — "
+                "the bytes may be destroyed by the next write.",
+                label, exc or "undecodable", type(p_exc).__name__, p_exc,
+            )
+        return []
+
     def _quarantine_corrupt(self) -> list:
         """Corruption: PRESERVE the raw bytes in a timestamped sidecar
         BEFORE any subsequent _save() overwrites them, then start clean.
         Without this, a partial write silently discarded every queued
         post_mortem / smart_memory entry (the dream consolidator's work
         queue). Matches the SkillMemory / FrontierTracker recovery policy."""
-        try:
-            sidecar = self.file_path.with_suffix(f".corrupt-{int(time.time())}.json")
-            os.replace(self.file_path, sidecar)
-            logger.warning(
-                "memory_journal.json was corrupt; preserved to %s and "
-                "started a fresh journal.", sidecar.name,
-            )
-        except Exception:
-            pass
-        return []
+        return self._preserve_corrupt(self.file_path, "memory_journal.json")
 
     def load(self):
         with self._lock:
@@ -326,8 +340,13 @@ class MemoryJournal:
             content = self.inflight_path.read_text()
         except FileNotFoundError:
             return []
-        except UnicodeDecodeError:
-            content = ""
+        except UnicodeDecodeError as exc:
+            # Undecodable bytes are corruption too — treating them as an
+            # EMPTY staging file let recover_inflight unlink the batch with
+            # no sidecar and no log (the exact silent loss TAKE/ACK exists
+            # to prevent).
+            return self._preserve_corrupt(
+                self.inflight_path, "memory_journal.inflight.json", exc)
         if not content.strip():
             return []
         try:
@@ -337,17 +356,8 @@ class MemoryJournal:
                     f"in-flight is a {type(data).__name__}, expected list")
             return data
         except Exception as exc:
-            try:
-                sidecar = self.inflight_path.with_suffix(
-                    f".corrupt-{int(time.time())}.json")
-                os.replace(self.inflight_path, sidecar)
-                logger.warning(
-                    "memory_journal.inflight.json was corrupt (%s); preserved "
-                    "to %s.", exc, sidecar.name,
-                )
-            except Exception:
-                pass
-            return []
+            return self._preserve_corrupt(
+                self.inflight_path, "memory_journal.inflight.json", exc)
 
     def _clear_inflight(self) -> None:
         try:
@@ -370,8 +380,12 @@ class MemoryJournal:
             content = self.overflow_path.read_text()
         except FileNotFoundError:
             return []
-        except UnicodeDecodeError:
-            content = ""
+        except UnicodeDecodeError as exc:
+            # Same rule as the in-flight reader: undecodable = corrupt,
+            # never "empty" (an empty read here both hid pending work from
+            # pending_count() and let the next spill overwrite the bytes).
+            return self._preserve_corrupt(
+                self.overflow_path, "memory_journal.overflow.json", exc)
         if not content.strip():
             return []
         try:
@@ -381,16 +395,8 @@ class MemoryJournal:
                     f"overflow is a {type(data).__name__}, expected list")
             return data
         except Exception as exc:
-            try:
-                sidecar = self.overflow_path.with_suffix(
-                    f".corrupt-{int(time.time())}.json")
-                os.replace(self.overflow_path, sidecar)
-                logger.warning(
-                    "memory_journal.overflow.json was corrupt (%s); preserved "
-                    "to %s.", exc, sidecar.name)
-            except Exception:
-                pass
-            return []
+            return self._preserve_corrupt(
+                self.overflow_path, "memory_journal.overflow.json", exc)
 
     def _clear_overflow(self) -> None:
         try:
@@ -420,6 +426,22 @@ class MemoryJournal:
         if items:
             self._write_overflow(self._read_overflow() + list(items))
 
+    @staticmethod
+    def _dedup_key(entry):
+        """Canonical identity of a queue item for crash-recovery dedup.
+        Volatile bookkeeping keys are EXCLUDED: the transient-retry path
+        re-queues a copy with a mutated ``retries`` counter, so an
+        exact-dump key treated the staged original and its requeued twin
+        as two DIFFERENT items — a kill in that window folded both back
+        in at recovery and the item was consolidated twice."""
+        try:
+            e = entry
+            if isinstance(entry, dict) and "retries" in entry:
+                e = {k: v for k, v in entry.items() if k != "retries"}
+            return json.dumps(e, sort_keys=True)
+        except Exception:
+            return None
+
     def _prepend_overflow(self, items: list) -> int:
         """Put items at the HEAD of the overflow (logical front of the queue) —
         re-queued / recovered work owed a consolidation, so drained first.
@@ -431,16 +453,12 @@ class MemoryJournal:
             over = self._read_overflow()
             seen = set()
             for e in over + self._read_queue():
-                try:
-                    seen.add(json.dumps(e, sort_keys=True))
-                except Exception:
-                    pass
+                key = self._dedup_key(e)
+                if key is not None:
+                    seen.add(key)
             fresh = []
             for e in items:
-                try:
-                    key = json.dumps(e, sort_keys=True)
-                except Exception:
-                    key = None
+                key = self._dedup_key(e)
                 if key is not None and key in seen:
                     continue
                 fresh.append(e)
@@ -470,16 +488,12 @@ class MemoryJournal:
                 # staging and clearing leaves an item in BOTH files.
                 seen = set()
                 for entry in queue:
-                    try:
-                        seen.add(json.dumps(entry, sort_keys=True))
-                    except Exception:
-                        pass
+                    key = self._dedup_key(entry)
+                    if key is not None:
+                        seen.add(key)
                 fresh = []
                 for entry in staged:
-                    try:
-                        key = json.dumps(entry, sort_keys=True)
-                    except Exception:
-                        key = None
+                    key = self._dedup_key(entry)
                     if key is not None and key in seen:
                         continue
                     fresh.append(entry)
@@ -524,16 +538,12 @@ class MemoryJournal:
                 return
             done = set()
             for entry in items or []:
-                try:
-                    done.add(json.dumps(entry, sort_keys=True))
-                except Exception:
-                    pass
+                key = self._dedup_key(entry)
+                if key is not None:
+                    done.add(key)
             remaining = []
             for entry in staged:
-                try:
-                    key = json.dumps(entry, sort_keys=True)
-                except Exception:
-                    key = None
+                key = self._dedup_key(entry)
                 if key is not None and key in done:
                     continue
                 remaining.append(entry)

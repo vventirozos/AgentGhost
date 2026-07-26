@@ -209,8 +209,12 @@ class CompetenceProfile:
             self._last_flush = time.monotonic()
 
     def get_context_string(self) -> str:
-        """Prompt-renderable summary, used by the planner to know which
-        domains the agent's track record supports."""
+        """Prompt-renderable summary of the agent's per-domain track record.
+
+        Injected into the system prompt's continuity blocks (agent.py,
+        gated on ``_COMPETENCE_MIN_OBS`` total observations) so the model
+        can prefer domains it's reliable in — wired 2026-07-26; before that
+        this was computed but rendered nowhere."""
         roll = self.by_domain()
         if not roll:
             return ""
@@ -337,7 +341,11 @@ class CompetenceProfile:
                 for (d, t), cell in self._cells.items()
             }
             tmp = self.file_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2))
+            # fsync before rename (torn-write window; journal.py rationale).
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(data, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, self.file_path)
         except Exception as exc:
             logger.warning("CompetenceProfile save failed: %s", exc)

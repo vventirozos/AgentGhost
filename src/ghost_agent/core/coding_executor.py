@@ -81,8 +81,16 @@ def _short(text: str, n: int = 180) -> str:
 
 def _op_ok(out: str) -> bool:
     """A file_system op reports ``SUCCESS: …`` on success; a no-match replace
-    returns ``SYSTEM INSTRUCTION: … NOT found``. So success == a SUCCESS head."""
-    return "success" in (out or "").lower()[:200]
+    returns ``SYSTEM INSTRUCTION: … NOT found``. So success == a SUCCESS head.
+
+    Anchored on the HEAD, not a substring: the no-match message embeds the
+    filename (``… NOT found in 'payment_success.html'``), so a SUBSTRING
+    test for "success" matched a failed replace on any ``*success*``-named
+    file (common in web deliverables) and counted the un-applied edit as
+    applied — closing the leaf DONE with the file unchanged. Mirrors the
+    anchored discipline of the sibling ``_looks_like_write_error``."""
+    head = (out or "").strip()[:80].lower()
+    return head.startswith("success")
 
 
 def _looks_like_write_error(out: str) -> bool:
@@ -96,7 +104,11 @@ def _looks_like_write_error(out: str) -> bool:
         or head.startswith("system error")
         or head.startswith("system instruction")
         or head.startswith("error:")
-        or "security error" in head
+        # Anchored, not substring: a SUCCESSFUL write to a file whose name
+        # contains these words ("SUCCESS: Wrote … to 'security error
+        # handler.py'") must not read as a write error. The real marker is
+        # a "Security Error:" head raised by file_system's path guard.
+        or head.startswith("security error")
     )
 
 

@@ -60,6 +60,11 @@ class ProfileMemory:
     def __init__(self, path: Path):
         self.file_path = path / "user_profile.json"
         self._lock = threading.RLock()
+        # Fail-closed flag (same discipline as contradiction_log /
+        # adaptive_threshold / competence): a transient READ failure must
+        # block writes until a read succeeds, or the next save() overwrites
+        # the intact on-disk identity with the default skeleton.
+        self._degraded = False
         if not self.file_path.exists():
             self.save({"root": {"name": "User"}, "relationships": {}, "interests": {}, "assets": {}})
 
@@ -72,8 +77,23 @@ class ProfileMemory:
                 # would break every caller (data[cat] = {}). Treat it as corrupt.
                 if not isinstance(data, dict):
                     raise ValueError(f"profile is a {type(data).__name__}, expected object")
+                self._degraded = False
                 return data
             except FileNotFoundError:
+                return dict(_default)
+            except OSError as e:
+                # Transient disk sickness (EIO/EACCES/…), NOT corruption:
+                # the on-disk profile is probably intact, so do not shunt
+                # it to a sidecar — serve the default in-memory and refuse
+                # writes until a read succeeds. The old path treated this
+                # like corruption: intact profile sidecar'd away, identity
+                # reverted, and if the replace also failed the next save()
+                # destroyed the real file.
+                self._degraded = True
+                pretty_log("Profile Read Failed",
+                           f"{type(e).__name__}: {e}; serving default identity, "
+                           "writes DISABLED until a read succeeds",
+                           icon=Icons.USER_ID, level="WARNING")
                 return dict(_default)
             except Exception as e:
                 # A corrupt profile would otherwise silently revert the user's
@@ -101,8 +121,19 @@ class ProfileMemory:
 
     def save(self, data: Dict[str, Any]):
         with self._lock:
+            if self._degraded:
+                pretty_log("Profile Write Blocked",
+                           "profile store is read-degraded; refusing to "
+                           "overwrite the on-disk identity",
+                           icon=Icons.USER_ID, level="WARNING")
+                return
             temp_path = self.file_path.with_suffix('.tmp')
-            temp_path.write_text(json.dumps(data, indent=2))
+            # fsync before rename: the rename alone can publish a torn/empty
+            # file on power loss (see journal.py's identical rationale).
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(json.dumps(data, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(temp_path, self.file_path)
 
     @staticmethod

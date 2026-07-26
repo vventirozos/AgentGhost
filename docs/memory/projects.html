@@ -311,6 +311,10 @@
   </ul>
   <p>Covered by <code>tests/test_projects_store.py</code>.</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong><code>update_task</code> reopens DONE projects</strong> — its reopen tuple was missing DONE (add_task's had it since 2026-07-11), so reviving an existing task on a DONE project created permanently unreachable work. <strong>artifact_added carries a path</strong> — the payload was <code>{kind, artifact_id}</code> only (live: all 60 events pathless), making registrations invisible to <code>file_history</code>; kind='file' events now carry the rel path. <strong>Correction-linking needs strong evidence</strong> — 0.5 Jaccard with ONE shared token mislinked distinct projects ("Chess Game" → "Chess Tutorial" stamped correction_of); now ≥2 shared significant tokens or identical token sets. <strong>Per-type event retention</strong> — task_updated/project_updated/work_log rows cap at <code>_EVENTS_RETAIN_PER_TYPE</code> (300) per project; they grew unbounded (reads were capped, the table never). Work-log side (agent.py): failed work-tool calls now accumulate too, so an all-failure debugging turn writes a work_log row (<code>&lt;tool&gt;_failed</code> counts) instead of nothing; and an off-project interlude ("get me the news" — live: the lead row on Jiu Jitsu Calendar) is dropped by a relevance gate (files touched, or command naming the project dir, or token overlap with title/tasks; fail-open). Tests: <code>::TestProjectReopenAndEvents</code>, <code>::TestWorkLogRelevanceGate</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

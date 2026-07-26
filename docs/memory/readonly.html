@@ -49,6 +49,10 @@
 
   <p class="note">NOTE: <code>core.dream</code>'s self-play path defines its own equivalent classes inline (they predate this module and carry self-play-specific behaviour). Keep the semantics in sync if you change them there.</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><code>ReadOnlySkillMemory</code> closed two leaks (found independently by two auditors): <code>quarantine_lesson</code> — a real playbook writer added 2026-07-17, AFTER the façade hardening — was missing from <code>_MUTATORS</code>, so a delegated sub-agent could quarantine a REAL operator lesson; and <code>get_playbook_context</code> passed through with its default retrieval-stat bump AND stamped the operator's <code>last_playbook_triggers</code> attribution record. A façade override now forces <code>record_retrievals=False, stamp_triggers=False</code> (mirror of <code>ReadOnlyVectorMemory.search</code>). The drift-guard test's <code>_WRITE_HINTS</code> gained the "quarantine" prefix — the guard can only catch writers it can name. Tests: <code>::TestReadOnlySkillFacade</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

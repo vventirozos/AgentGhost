@@ -226,9 +226,21 @@ class Scratchpad:
             self._timestamps[key] = time.time()
             self._scopes[key] = ns
 
-            # Evict oldest if over capacity
+            # Evict oldest if over capacity — but never a dunder sentinel
+            # (e.g. __current_project__): LRU was namespace- and
+            # sentinel-blind, so a busy project writing max_entries+ keys
+            # could durably evict the resume sentinel or another
+            # conversation's pending swarm output_key — the same loss class
+            # the namespace redesign fixed for clears.
             if len(self._data) > self.max_entries:
-                evicted_key, _ = self._data.popitem(last=False)
+                evicted_key = None
+                for _k in self._data:  # oldest-first (OrderedDict)
+                    if not (_k.startswith("__") and _k.endswith("__")):
+                        evicted_key = _k
+                        break
+                if evicted_key is None:
+                    evicted_key = next(iter(self._data))
+                self._data.pop(evicted_key, None)
                 self._timestamps.pop(evicted_key, None)
                 self._scopes.pop(evicted_key, None)
                 self._persist_delete(evicted_key)
@@ -255,6 +267,32 @@ class Scratchpad:
                 self._timestamps[key] = time.time()
                 return self._data[key]
         return None
+
+    def export_state(self) -> dict:
+        """Lock-held snapshot for session export:
+        ``{key: {"value": ..., "namespace": ...}}``. Session export used to
+        read ``_data`` directly (racing concurrent mutation → RuntimeError
+        mid-export) and dropped the namespace tags, so a later restore
+        re-tagged every key into whatever namespace happened to be
+        active."""
+        with self._lock:
+            return {
+                k: {"value": v, "namespace": self._scopes.get(k)}
+                for k, v in self._data.items()
+            }
+
+    def restore_state(self, data: dict) -> int:
+        """Inverse of :meth:`export_state`. Also accepts the legacy flat
+        ``{key: value}`` export shape — those restore into the GLOBAL
+        scope (namespace=None), never the currently-active one."""
+        n = 0
+        for k, v in (data or {}).items():
+            if isinstance(v, dict) and "value" in v and "namespace" in v:
+                self.set(k, v.get("value"), namespace=v.get("namespace"))
+            else:
+                self.set(k, v, namespace=None)
+            n += 1
+        return n
 
     def list_all(self, namespace: Any = _UNSET) -> str:
         """Render the scratchpad. With no argument this is every entry

@@ -811,6 +811,18 @@ _MACRO_IGNORE_TOOLS = frozenset({
 # name on approval). Mirror the validator in composed_skills without importing.
 _MACRO_NAME_UNSAFE_RE = re.compile(r"[^A-Za-z0-9_]")
 
+# Tools whose args must NEVER be frozen into a macro's param template:
+# baking the most-common CONCRETE arg set for a mutating tool replays a
+# stale one-off WRITE verbatim on every macro run (live: a proposed macro
+# carried manage_projects(action='task_update', status='DONE',
+# project_id=<old>, task_id=<old>, description='Simplified demo.py…')).
+# These steps get empty templates; args are supplied at run time.
+_MACRO_UNSAFE_PARAM_TOOLS = {
+    "execute", "file_system", "manage_projects", "manage_services",
+    "browser", "knowledge_base", "manage_skills", "manage_composed_skills",
+    "update_profile", "remember", "forget",
+}
+
 
 def _safe_macro_name(tools_seq) -> str:
     """Build a valid-identifier macro name from a tool-name sequence."""
@@ -845,8 +857,10 @@ def mine_recurring_tool_sequences(
     appears in (and is >= ``min_support``), and each step's ``params`` is
     the MOST COMMON argument set observed at that position across all
     occurrences — so an approved macro replays realistic arguments, not an
-    empty skeleton. Trajectories whose outcome is ``"failed"`` are skipped:
-    we don't want to immortalise failure patterns as macros.
+    empty skeleton. Only trajectories whose outcome is ``"passed"`` count
+    as support: the old bar (skip only ``"failed"``) let UNKNOWN-outcome —
+    i.e. never-validated — turns underwrite a macro advertised to the
+    operator as a proven sequence.
     """
     from collections import Counter
 
@@ -854,7 +868,7 @@ def mine_recurring_tool_sequences(
     sig_arg_samples: Dict[tuple, list] = {}   # signature -> [ [json-args, ...] per position ]
 
     for traj in trajectories:
-        if (getattr(traj, "outcome", "") or "") == "failed":
+        if (getattr(traj, "outcome", "") or "") != "passed":
             continue
         calls = getattr(traj, "tool_calls", None) or []
         names = [getattr(c, "name", "") or "" for c in calls]
@@ -910,7 +924,8 @@ def mine_recurring_tool_sequences(
         steps = []
         for pos, tool in enumerate(sig):
             params: Dict[str, Any] = {}
-            if pos < len(samples) and samples[pos]:
+            if (pos < len(samples) and samples[pos]
+                    and tool not in _MACRO_UNSAFE_PARAM_TOOLS):
                 common_json, _ = Counter(samples[pos]).most_common(1)[0]
                 try:
                     decoded = json.loads(common_json)
@@ -920,7 +935,9 @@ def mine_recurring_tool_sequences(
                     params = {}
             steps.append({
                 "tool": tool,
-                "description": f"{tool} (step {pos + 1})",
+                "description": f"{tool} (step {pos + 1})"
+                               + ("" if params or tool not in _MACRO_UNSAFE_PARAM_TOOLS
+                                  else " — params required at run time"),
                 "params": params,
             })
         proposals.append({
@@ -1426,7 +1443,9 @@ class Dreamer:
                 # idempotency cache as "dreamed" without them ever entering
                 # the prompt — permanently consumed, never consolidated.
                 limit=150,
-                include=["documents", "metadatas", "embeddings"]
+                # No "embeddings": nothing in dream.py reads them, and
+                # materializing 150x384 floats per REM cycle was pure waste.
+                include=["documents", "metadatas"]
             )
         except Exception as e:
             msg = f"Dream error: {e}"
@@ -1651,7 +1670,14 @@ Return ONLY valid JSON. If no patterns exist, return empty lists.
                         if doc_id == _cid:
                             _prov.append({"id": _cid, "excerpt": str(doc_text)[:100]})
                             break
-                _syn_meta = {"type": "synthesis"}
+                # Timestamp is load-bearing: _prune_if_needed age-ties on
+                # str(last_accessed or timestamp), so a synthesis stored
+                # without one sorted as "" = oldest and was the FIRST
+                # eviction victim at cap — despite being the highest-
+                # curation prunable type (its merged sources are deleted
+                # right below, so eviction loses the only copy).
+                from ..utils.helpers import get_utc_timestamp as _guts
+                _syn_meta = {"type": "synthesis", "timestamp": _guts()}
                 if _prov:
                     # Cap the LIST, not the serialized string: slicing the
                     # JSON at 1800 chars made it unparseable for ~12+
@@ -3944,11 +3970,17 @@ Return ONLY a JSON object with:
             def get_playbook_context(self, *args, **kwargs):
                 if self.real_sm:
                     # Reads must stay pure: the real method bumps retrieval
-                    # counters by default (keyword-only flag).
+                    # counters by default (keyword-only flag), and the
+                    # attribution stamp must go to the SIM side-channel —
+                    # stamping last_playbook_triggers here leaked the idle
+                    # sim's lesson set into the next user turn's outcome
+                    # attribution whenever that turn's own retrieval was
+                    # empty.
                     kwargs["record_retrievals"] = False
+                    kwargs["stamp_triggers"] = False
                     out = self.real_sm.get_playbook_context(*args, **kwargs)
                     self._note_triggers(
-                        getattr(self.real_sm, "last_playbook_triggers", None))
+                        getattr(self.real_sm, "last_sim_triggers", None))
                     return out
                 return ""
 
@@ -5327,7 +5359,14 @@ Return ONLY a JSON object with:
                 # post-mortem to the main agent's next turn.
                 if self.context.scratchpad and report_val:
                     try:
-                        self.context.scratchpad.set("Self-Play Report", report_val)
+                        # namespace=None: background-job output must go to
+                        # the GLOBAL scope (scratchpad.py contract) — bare
+                        # set() inherits active_namespace, so with a project
+                        # active during idle the report got project-tagged,
+                        # deleted by that project's clear_namespace, and
+                        # snapshotted into the wrong project's event log.
+                        self.context.scratchpad.set(
+                            "Self-Play Report", report_val, namespace=None)
                     except Exception as _spe:
                         logger.debug(f"Scratchpad write skipped: {_spe}")
 

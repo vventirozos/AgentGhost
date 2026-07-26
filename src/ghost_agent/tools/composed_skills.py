@@ -340,6 +340,16 @@ class ComposedSkillRegistry:
 
     def register(self, skill: ComposedSkill) -> bool:
         """Register a new composed skill."""
+        # Merge-don't-demote on re-register (belt-and-braces below the
+        # compile_from_pattern no-op guard): an unconditional overwrite
+        # reverted an approved macro to "proposed" and zeroed its stats.
+        existing = self.skills.get(skill.name)
+        if existing is not None:
+            if existing.status == "active" and skill.status != "active":
+                skill.status = "active"
+            skill.usage_count = max(skill.usage_count, existing.usage_count)
+            skill.success_count = max(skill.success_count, existing.success_count)
+            skill.last_used = max(skill.last_used, existing.last_used)
         # Only evict when ADDING a genuinely new name — re-registering an
         # existing macro doesn't grow the count, so it must not evict a
         # bystander.
@@ -392,6 +402,24 @@ class ComposedSkillRegistry:
         advertised to the LLM or dispatchable until the user approves it via
         ``manage_composed_skills(action="approve")``.
         """
+        # Sanitize into a legal tool identifier. Minted skills-auto names
+        # arrive DOTTED (auto.<cluster>.<head>.<sha6>) and used to flow
+        # straight into the registry — on approval a dotted name entered
+        # the LLM function catalogue, violating this module's own naming
+        # contract (live: auto.generic.manage_services_manage_services.c73e69).
+        safe_name = re.sub(r"[^A-Za-z0-9_]", "_", str(pattern_name or "skill"))
+        if not re.match(r"^[A-Za-z_]", safe_name):
+            safe_name = f"m_{safe_name}"
+        safe_name = _validate_composed_name(safe_name[:64])
+
+        # Re-minting an existing macro must be a no-op, not an overwrite:
+        # the phase-2.6 mint used to re-register on every re-graduation of
+        # the same candidate, demoting an operator-APPROVED macro back to
+        # "proposed" (vanishing from the tool list) and wiping its stats.
+        existing = self.skills.get(safe_name)
+        if existing is not None:
+            return existing
+
         steps = []
         for i, entry in enumerate(tool_sequence):
             steps.append(SkillStep(
@@ -400,7 +428,7 @@ class ComposedSkillRegistry:
                 param_template=entry.get("params", {}) or {},
             ))
         skill = ComposedSkill(
-            name=pattern_name,
+            name=safe_name,
             trigger_description=description,
             steps=steps,
             execution_mode=execution_mode,
@@ -772,6 +800,21 @@ def register_composed_skills(tool_definitions: list, context) -> int:
         for t in tool_definitions
         if isinstance(t, dict)
     }
+    # Shadow against the FULL acquired-skill registry, not just the defs
+    # present this turn: semantic routing filters acquired defs per query,
+    # so on a turn where a same-named acquired def was routed OUT, the
+    # composed def was advertised while dispatch (which registers ALL
+    # acquired runners) executed the ACQUIRED skill — advertised schema ≠
+    # executed tool.
+    try:
+        from .acquired_skills import AcquiredSkillManager
+        _base = getattr(context, "memory_dir", None) or getattr(context, "sandbox_dir", None)
+        if _base is not None:
+            _mgr = AcquiredSkillManager.get_shared(
+                _base, None, legacy_sandbox_dir=getattr(context, "sandbox_dir", None))
+            existing_names |= set(_mgr.get_all_skills().keys())
+    except Exception as e:
+        logger.debug("composed-shadow acquired-registry read skipped: %s", e)
     added = 0
     for entry in reg.to_tool_definitions():
         name = entry.get("function", {}).get("name")
@@ -976,10 +1019,24 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         sk.status = "active"
         reg.save()
         pretty_log("Macro Approved", f"Activated proposed macro: {name}", icon=Icons.OK)
+        # Say what is actually true about the params: graduation-minted
+        # macros carry EMPTY param templates (the miner knows tool order,
+        # not per-step args), so the old blanket "mined from past calls"
+        # claim was false on that path and the approved macro surprised the
+        # operator by demanding args at run time.
+        _has_params = any(getattr(st, "param_template", None) for st in sk.steps)
+        _param_note = (
+            "Its step parameters were mined from past calls; delete + "
+            "redefine if you want to adjust them."
+            if _has_params else
+            "NOTE: its step parameter templates are EMPTY (auto-graduated "
+            "sequences carry tool order only) — each step's mandatory "
+            "params must be supplied at invocation, or delete + redefine "
+            "with concrete params."
+        )
         return (
             f"Success: composed skill '{name}' approved and activated. It is now "
-            f"a top-level tool — invoke it by name. (Its step parameters were "
-            f"mined from past calls; delete + redefine if you want to adjust them.)"
+            f"a top-level tool — invoke it by name. ({_param_note})"
         )
 
     if action == "delete":

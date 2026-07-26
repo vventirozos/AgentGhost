@@ -207,10 +207,17 @@ class EpisodicMemory:
                 # be handed to the vector store for orphan removal below.
                 count = conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
                 if count > self.MAX_EPISODES:
-                    # Prefer deleting oldest non-lesson, unconsolidated episodes.
+                    # Prefer deleting oldest SPENT episodes: consolidated,
+                    # no lesson attached. The old preference was inverted —
+                    # it deleted `consolidated = 0` rows, i.e. the dream
+                    # loop's PENDING INPUT (live: 163/165 consolidated, so
+                    # at cap every insert would have evicted the freshest
+                    # experience while weeks-old spent rows fossilized, and
+                    # the pending pool could never reach _consolidate's
+                    # min_episodes=3 again).
                     victims = [r[0] for r in conn.execute(
                         '''SELECT id FROM episodes
-                           WHERE lesson = '' AND consolidated = 0
+                           WHERE lesson = '' AND consolidated = 1
                            ORDER BY timestamp ASC LIMIT ?''',
                         (count - self.MAX_EPISODES,)
                     ).fetchall()]
@@ -843,7 +850,7 @@ class EpisodicMemory:
         the system used to behave"."""
         age = EpisodicMemory._relative_age(ep.get("timestamp"))
         entry = (
-            f"- [{ep.get('cluster_id', 'general')}] "
+            f"- [{ep.get('cluster_id') or 'general'}] "
             f"{('[' + age + '] ') if age else ''}"
             f"Trigger: {ep['trigger'][:100]} | "
             f"Outcome: {'SUCCESS' if ep.get('outcome_success') else 'FAILURE'} — "

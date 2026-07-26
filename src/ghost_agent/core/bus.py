@@ -288,11 +288,20 @@ class MemoryBus:
         # with the turn id so an overlapping turn's judge (or a turn that
         # skipped hydration) can't consume another turn's stash and
         # misattribute usefulness observations (found 2026-07-15).
-        self.last_hydration = (
-            {"intent": intent, "survivors": survivors, "ts": time.time(),
-             "turn_id": str(turn_id or "")}
-            if survivors else None
-        )
+        if survivors:
+            self.last_hydration = {
+                "intent": intent, "survivors": survivors, "ts": time.time(),
+                "turn_id": str(turn_id or ""),
+            }
+        else:
+            # Survivor-less hydration: clear only OUR OWN (or an unstamped)
+            # stash. Blindly writing None here destroyed an overlapping
+            # turn's stash before its judge consumed it — the turn_id stamp
+            # guarded consumption but not clobbering.
+            prev = self.last_hydration
+            if not (isinstance(prev, dict) and prev.get("turn_id")
+                    and str(prev.get("turn_id")) != str(turn_id or "")):
+                self.last_hydration = None
         return out
 
     # Short tags for the per-hydration instrumentation line, in fetch order.
@@ -1131,7 +1140,20 @@ class MemoryBus:
                 "type": event_type,
             }
             try:
-                await asyncio.to_thread(self.vector.add, text, meta)
+                _type = str(meta.get("type") or "")
+                smart = getattr(self.vector, "smart_update", None)
+                if _type == "identity" and callable(smart):
+                    # Identity facts must REPLACE their predecessor, not
+                    # stack: the plain add() here left smart_update (and its
+                    # whole subject/attribute conflict guard) with no
+                    # production caller once the bus was always wired — every
+                    # profile change minted a NEW row and the stale value
+                    # kept being served alongside it (live: duplicate
+                    # home_lab_worker_node facts, 5 coexisting paraphrases of
+                    # one activity fact).
+                    await asyncio.to_thread(smart, text, "identity")
+                else:
+                    await asyncio.to_thread(self.vector.add, text, meta)
                 results["vector"] = "ok"
             except Exception as e:
                 results["vector"] = f"error: {e}"
@@ -1152,11 +1174,18 @@ class MemoryBus:
             if not self.profile or not update:
                 results["profile"] = "skip"
                 return
+            # A well-formed profile write names BOTH category and key —
+            # the old defaults ("notes"/"info") minted junk `<cat>.info` /
+            # notes-drawer keys from malformed updates (same guard as the
+            # smart-memory consolidation side, 2026-07-26).
+            if not (update.get("category") and update.get("key")):
+                results["profile"] = "skip"
+                return
             try:
                 await asyncio.to_thread(
                     self.profile.update,
-                    update.get("category", "notes"),
-                    update.get("key", "info"),
+                    update.get("category"),
+                    update.get("key"),
                     update.get("value", ""),
                 )
                 results["profile"] = "ok"

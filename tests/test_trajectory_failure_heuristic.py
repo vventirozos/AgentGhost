@@ -495,9 +495,21 @@ def test_tool_call_failed_prefers_flag():
 
 def test_recorder_populates_error_flag_on_chat_path():
     """The trajectory recorder must set ToolCall.error for a failing chat tool
-    result (integration guard on the agent-side wiring)."""
-    import inspect
+    result. The pairing/error-flag logic was extracted to
+    `_reconstruct_tool_calls` (2026-07-26c) — assert on BEHAVIOUR now, not
+    just the source of the caller."""
     from ghost_agent.core.agent import GhostAgent
-    src = inspect.getsource(GhostAgent._record_turn_trajectory)
+    msgs = [
+        {"role": "assistant", "tool_calls": [
+            {"function": {"name": "execute", "arguments": '{"command": "x"}'}}]},
+        {"role": "tool", "name": "execute",
+         "content": "Error: command failed with exit code 1"},
+    ]
+    tcs = GhostAgent._reconstruct_tool_calls(msgs)
+    assert len(tcs) == 1
+    assert (tcs[0].error or "")  # the failing result set the structured flag
+    # And the source of the extracted helper still wires the heuristic.
+    import inspect
+    src = inspect.getsource(GhostAgent._reconstruct_tool_calls)
     assert "obj.error = _normalize_tool_error" in src
     assert "_looks_like_tool_error(obj.result)" in src

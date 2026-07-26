@@ -216,6 +216,49 @@ def _looks_like_file_not_found(out) -> bool:
     )
 
 
+# Command heads that MUTATE state (create/remove/write/clone). If one of
+# these leads a non-final segment of a COMPOUND command, the file-not-found
+# heals must NOT re-run the whole command: the earlier segment already
+# committed its side effect, so the re-run fails differently (e.g.
+# `mkdir out && cat out/x` → the re-run's `mkdir out` fails "File exists",
+# `&&` short-circuits, and that non-file-not-found output is ADOPTED,
+# replacing the real cat error with a misleading one).
+_MUTATING_HEADS = frozenset({
+    "mkdir", "touch", "rm", "rmdir", "mv", "cp", "ln", "git", "wget",
+    "curl", "tee", "dd", "truncate", "install", "unzip", "tar", "chmod",
+    "chown", "sed", "npm", "pip", "pip3", "apt", "apt-get", "make",
+})
+
+
+def _rerun_unsafe(command: str) -> bool:
+    """True when re-running the WHOLE command could repeat a side effect —
+    i.e. it is a compound (&&/||/;/newline/pipe) whose non-final segment
+    starts with a mutating verb or contains an output redirect. A simple
+    command, or a compound whose leading segments are read-only
+    (cd/pwd/ls/cat/echo…), is safe to re-run."""
+    if not isinstance(command, str):
+        return False
+    import re as _re
+    # Split on shell sequencing operators (approximate — good enough to
+    # decide "is there a mutating prefix"). Pipes count too: a producer in
+    # a pipeline can mutate.
+    segments = _re.split(r"&&|\|\||;|\n|\|", command)
+    for seg in segments[:-1]:  # non-final segments only
+        s = seg.strip()
+        if not s:
+            continue
+        if ">" in s:  # output redirect writes a file
+            return True
+        head = s.split()[0].lower() if s.split() else ""
+        # Strip a leading env-var assignment / sudo.
+        if head in ("sudo", "env"):
+            parts = s.split()
+            head = parts[1].lower() if len(parts) > 1 else head
+        if head in _MUTATING_HEADS:
+            return True
+    return False
+
+
 async def tool_execute(filename: str = None, content: str = None, sandbox_dir: Path = None, sandbox_manager=None, scrapbook=None, args: list = None, memory_dir: Path = None, stateful: bool = False, command: str = None, workspace_model=None, container_workdir: str = None, **kwargs):
     # When a project is active, run from /workspace/projects/<id> so files
     # written via file_system (also scoped) read back. Passed ONLY when set,
@@ -611,7 +654,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
         # workdir kwarg, i.e. disabled precisely when this happens. Re-derive
         # the project dir from the workspace-model mirror and retry once
         # from there, with a note naming the actual mechanism.
-        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and not _workdir_kw and _looks_like_file_not_found(output):
+        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and not _workdir_kw and _looks_like_file_not_found(output) and not _rerun_unsafe(command):
             _flap_pid = ""
             try:
                 _flap_pid = str(getattr(
@@ -644,7 +687,7 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                         f"files either drop stateful, or use the absolute "
                         f"project path.]")
 
-        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and _workdir_kw and _looks_like_file_not_found(output):
+        if exit_code != 0 and exit_code not in _TIMEOUT_KILL_CODES and _workdir_kw and _looks_like_file_not_found(output) and not _rerun_unsafe(command):
             # Absolute-path variant first: when the command names files under
             # `/workspace/...` a workdir change can't help (absolute paths are
             # cwd-independent) — but the model almost always means the ACTIVE

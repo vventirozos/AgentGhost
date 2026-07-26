@@ -171,6 +171,11 @@ class ProjectStore:
     ``ALTER TABLE`` calls in ``_init_db``.
     """
 
+    #: Per-(project, type) retention for high-churn bookkeeping events
+    #: (task_updated / project_updated / work_log). Readers use windows of
+    #: ≤ 20; 300 keeps generous forensic depth while bounding the table.
+    _EVENTS_RETAIN_PER_TYPE = 300
+
     def __init__(self, memory_dir: Path, sandbox_root: Optional[Path] = None,
                  db_name: str = "projects.db"):
         self.memory_dir = Path(memory_dir)
@@ -513,7 +518,13 @@ class ProjectStore:
             if not have:
                 continue
             overlap = len(want & have) / max(1, len(want | have))
-            if overlap >= 0.5:
+            # Correction-linking demands STRONG title evidence: ≥2 shared
+            # significant tokens, or identical token sets (covers short
+            # titles). A lone shared token at 0.5 Jaccard mislinked
+            # distinct projects — delete "Chess Game" ({chess} after
+            # stopwords), create "Chess Tutorial" → stamped correction_of
+            # and re-planned as if the user rejected the previous build.
+            if overlap >= 0.5 and (len(want & have) >= 2 or want == have):
                 return dict(row)
         return None
 
@@ -751,7 +762,14 @@ class ProjectStore:
                     (row["project_id"],),
                 ).fetchone()
                 prev = ((prow["status"] if prow else "") or "").upper()
-                if prev in ("FAILED", "PAUSED", "NEEDS_USER", "BLOCKED"):
+                # DONE joined 2026-07-26 to match add_task's tuple: reviving
+                # an EXISTING task on a DONE project ("redo task X") left
+                # the project locked DONE — the rollup refuses to leave
+                # DONE, advance_once refuses non-ACTIVE, and the tool's
+                # status enum omits ACTIVE, so the revived task was
+                # permanently unreachable. ARCHIVED/RELEASED stay excluded
+                # (deliberate end-states), same as add_task.
+                if prev in ("DONE", "FAILED", "PAUSED", "NEEDS_USER", "BLOCKED"):
                     rcur = conn.execute(
                         "UPDATE projects SET status = 'ACTIVE', updated_at = ? "
                         "WHERE id = ? AND status = ?",
@@ -993,8 +1011,27 @@ class ProjectStore:
                 (art_id, task_id, task["project_id"], kind, payload, now),
             )
             conn.commit()
-        self.log_event(task["project_id"], task_id, "artifact_added",
-                       {"kind": kind, "artifact_id": art_id})
+        # Include a path key when the payload carries one: file_history's
+        # reader scans ("path","rel","rel_path","file","payload") keys, and
+        # a pathless artifact_added payload made registration events
+        # invisible to per-file history (live: all 60 events pathless).
+        # For kind='file' the payload IS the normalized rel path
+        # (register_file_artifact contract); other kinds may carry a JSON
+        # object with a path-ish key.
+        _evt = {"kind": kind, "artifact_id": art_id}
+        try:
+            if kind == "file" and isinstance(payload, str) and payload:
+                _evt["path"] = payload
+            else:
+                _pl = json.loads(payload) if isinstance(payload, str) else payload
+                if isinstance(_pl, dict):
+                    for _pk in ("path", "rel_path", "rel", "file"):
+                        if _pl.get(_pk):
+                            _evt["path"] = str(_pl[_pk])
+                            break
+        except Exception:
+            pass
+        self.log_event(task["project_id"], task_id, "artifact_added", _evt)
         return art_id
 
     def register_file_artifact(self, task_id: str, rel_path: str,
@@ -1687,6 +1724,22 @@ class ProjectStore:
                     "DELETE FROM project_events WHERE project_id = ? "
                     "AND type = 'scratchpad_snapshot' AND id < ?",
                     (project_id, new_id),
+                )
+            # Per-type retention for the high-churn bookkeeping types —
+            # one row per status write / field update / request meant
+            # monotonic unbounded growth on any long-lived project
+            # (EVENTS_MAX_LIMIT caps reads only, never the table). The
+            # newest _EVENTS_RETAIN_PER_TYPE rows comfortably exceed every
+            # reader's window (briefing slices read ≤ 20).
+            if event_type in ("task_updated", "project_updated", "work_log"):
+                conn.execute(
+                    "DELETE FROM project_events WHERE project_id = ? "
+                    "AND type = ? AND id NOT IN ("
+                    "  SELECT id FROM project_events "
+                    "  WHERE project_id = ? AND type = ? "
+                    "  ORDER BY id DESC LIMIT ?)",
+                    (project_id, event_type, project_id, event_type,
+                     self._EVENTS_RETAIN_PER_TYPE),
                 )
             conn.commit()
             return new_id

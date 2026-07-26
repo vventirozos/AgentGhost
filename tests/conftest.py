@@ -186,3 +186,55 @@ def mock_context(temp_dirs, mock_llm):
     
     return context
 
+
+
+# --------------------------------------------------------------------------
+# Streaming HTTP response mock (2026-07-26: helper_fetch_url_content and the
+# darkweb/download fetchers stream the body and stop at a byte cap instead of
+# reading resp.text/`.get()` in one shot). A single factory keeps the ~half
+# dozen fetch tests consistent with that interface.
+# --------------------------------------------------------------------------
+def make_streaming_resp(status=200, body="", content_type="text/html",
+                        content_length=None, encoding="utf-8"):
+    """MagicMock HTTP response usable by BOTH fetch paths:
+    * curl_cffi:  awaited get(stream=True) → resp.iter_content() (sync), .close()
+    * httpx:      client.stream(...) async-ctx → resp.aiter_bytes() (async)
+    """
+    from unittest.mock import MagicMock
+    raw = body.encode(encoding) if isinstance(body, str) else body
+    headers = {"content-type": content_type}
+    if content_length is not None:
+        headers["content-length"] = str(content_length)
+
+    resp = MagicMock()
+    resp.status_code = status
+    resp.headers = headers
+    resp.encoding = encoding
+    resp.text = body
+    resp.iter_content = MagicMock(return_value=[raw])
+    resp.close = MagicMock()
+
+    async def _aiter():
+        yield raw
+    resp.aiter_bytes = MagicMock(side_effect=_aiter)
+    return resp
+
+
+def make_httpx_stream_client(resps):
+    """An httpx.AsyncClient() mock whose .stream(...) yields the given resp(s)
+    as async context managers, in order. `resps` may be one resp or a list."""
+    from unittest.mock import MagicMock, AsyncMock
+    if not isinstance(resps, (list, tuple)):
+        resps = [resps]
+    seq = list(resps)
+
+    def _stream(*_a, **_k):
+        resp = seq.pop(0) if len(seq) > 1 else seq[0]
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=resp)
+        cm.__aexit__ = AsyncMock(return_value=False)
+        return cm
+
+    client = AsyncMock()
+    client.stream = MagicMock(side_effect=_stream)
+    return client

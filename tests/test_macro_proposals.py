@@ -15,8 +15,11 @@ from ghost_agent.distill.collector import TrajectoryCollector
 from ghost_agent.tools.composed_skills import _registry_from_context
 
 
-def _traj(tid, seq, outcome="unknown"):
-    """seq is a list of (tool_name, args_dict)."""
+def _traj(tid, seq, outcome="passed"):
+    """seq is a list of (tool_name, args_dict). Default outcome is
+    "passed": since 2026-07-26 the miner counts only VALIDATED successes
+    as support — unknown/never-verified turns no longer underwrite a
+    "proven" macro."""
     return Trajectory(
         id=tid, outcome=outcome,
         tool_calls=[ToolCall(name=n, arguments=a) for n, a in seq],

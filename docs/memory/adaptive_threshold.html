@@ -64,6 +64,10 @@
   <h2>Concurrency</h2>
   <p><code>threading.RLock</code> guards both reads and writes. Writes are atomic via temp file.</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><code>record()</code> takes <code>effective_threshold</code> — the bar acceptance ACTUALLY gated on (<code>max(cli, learned)</code>). <code>cleared_bar</code> was computed against the learned value alone, so under the live CLI 0.9 / learned ≈0.6 split, scores in (0.6, 0.9) were score-rejects mislabelled "cleared the bar" and excluded from the median-useless clamp — blinding it to exactly the band that should raise the bar once the CLI value is lowered. Saves fsync before rename. Tests: <code>::TestAdaptiveThresholdEffectiveBar</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

@@ -210,6 +210,26 @@ _SOURCE_SUFFIXES = {
 }
 _SOURCE_NAMES = {"makefile", "dockerfile", "readme", "license", "notice"}
 
+# Binary/data DELIVERABLES the agent commonly produces but forgets to
+# register: app databases, trained model weights, datasets. Distinct from
+# media SCRATCH (.png screenshots, .mp4 renders) which the sweep exists to
+# remove. On a PARTIAL keep-set these were deleted at the moment of
+# completion because the source-only recovery didn't cover them — a real
+# completion-time data-loss path (a coding project's seeded data.db /
+# model.pt vanished when app.py alone was registered).
+_DATA_DELIVERABLE_SUFFIXES = {
+    ".db", ".sqlite", ".sqlite3", ".parquet", ".feather", ".arrow",
+    ".pt", ".pth", ".ckpt", ".safetensors", ".onnx", ".pb", ".h5", ".hdf5",
+    ".npy", ".npz", ".pkl", ".pickle", ".joblib", ".model",
+}
+
+
+def _is_data_deliverable(rel: str) -> bool:
+    """True for a binary/data deliverable (database / model weights /
+    dataset) — a plausibly-forgotten deliverable, NOT media scratch."""
+    name = rel.split("/")[-1].lower()
+    return any(name.endswith(s) for s in _DATA_DELIVERABLE_SUFFIXES)
+
 
 def _is_source_like(rel: str) -> bool:
     """True when a project-relative path looks like source/documentation —
@@ -278,7 +298,8 @@ def _recover_unregistered_sources(store, project_id: str, root: Path,
                                   keep: Set[str],
                                   *, dry_run: bool = False) -> Set[str]:
     """Partial-registration recovery (chess incident, 2026-07-02): the set of
-    unregistered, non-debris, non-symlink SOURCE files under the workspace.
+    unregistered, non-debris, non-symlink SOURCE files — and binary/data
+    deliverables (databases, model weights, datasets) — under the workspace.
 
     A non-empty keep-set proves the agent engaged with registration, not
     that it finished the job — one registered file out of four built ones
@@ -300,7 +321,13 @@ def _recover_unregistered_sources(store, project_id: str, root: Path,
                 rel = fpath.relative_to(root).as_posix()
             except ValueError:
                 continue
-            if rel in keep or _is_debris(rel) or not _is_source_like(rel):
+            if rel in keep or _is_debris(rel):
+                continue
+            # Rescue source-like files AND binary/data deliverables
+            # (databases, model weights, datasets) — both are plausibly
+            # forgotten deliverables. Media scratch (screenshots, renders)
+            # is neither and stays deletable.
+            if not (_is_source_like(rel) or _is_data_deliverable(rel)):
                 continue
             found.add(rel)
     if found:

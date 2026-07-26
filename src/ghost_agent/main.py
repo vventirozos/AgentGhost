@@ -495,6 +495,30 @@ async def lifespan(app):
         try:
             context.episodic_memory = EpisodicMemory(context.memory_dir)
             pretty_log("Episodic Memory", "Cross-session episode store initialized", icon=Icons.EPISODE_REEL)
+            # Boot reconcile (the hook reconcile_vector_index was written
+            # for but never got): episodes whose vector twin failed to
+            # embed are invisible to semantic recall until re-added — live
+            # count had grown 9 → 12 unique-trigger orphans while this
+            # stayed unwired. Background thread: it may embed a handful of
+            # rows and must not hold up boot.
+            if getattr(context, "memory_system", None) is not None:
+                import threading
+
+                def _episode_reconcile():
+                    try:
+                        n = context.episodic_memory.reconcile_vector_index(
+                            context.memory_system)
+                        if n:
+                            pretty_log(
+                                "Episodic Reconcile",
+                                f"re-embedded {n} episode(s) missing a vector twin",
+                                icon=Icons.MEM_REINFORCE)
+                    except Exception as re_err:
+                        logger.warning("episode vector reconcile failed: %s", re_err)
+                threading.Thread(
+                    target=_episode_reconcile,
+                    name="episode-vector-reconcile", daemon=True,
+                ).start()
         except Exception as e:
             pretty_log("Episodic Memory Failed", str(e), level="WARNING", icon=Icons.WARN)
     else:

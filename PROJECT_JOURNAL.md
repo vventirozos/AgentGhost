@@ -1109,6 +1109,233 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-26 (later 7) — Improvements batch: 7 deferred LOWs + learning-health telemetry (#1) + Tor cache (#4) + wire-or-retire observability (#5)
+
+Operator: "do all improvements except pg re-ingest and GAIA including the deferred lows."
+DEFERRED LOWs (7, all fixed+tested): (1) helper_fetch_url_content now STREAMS the body with a byte cap and
+checks headers FIRST (rejected PDF/oversized/non-200 never downloaded) — the "we count bytes ourselves" comment
+was false; (2) 503/error retries rotate the CIRCUIT via socks_url_with_identity instead of
+request_new_tor_identity, which on this box (control port 9051 closed) fell back to `brew services restart tor`
+— bouncing the WHOLE daemon up to 2x/fetch and re-circuiting every sibling; (3) execute.py file-not-found heals
+gated on _rerun_unsafe(command) — a compound with a mutating prefix (mkdir&&cat) no longer re-runs and adopts a
+misleading "File exists"; (4) streamed trajectory records the EFFECTIVE visible content (fallback sentence), not
+scrubbed tool-XML tag-soup; (5) read-budget occupancy now includes the ~24k injection reserve (_INJECTION_RESERVE
+_TOKENS), not just history; (6) id-less native tool-call pairing keys by (name, occurrence) so two same-named
+id-less calls don't collide/drop a result (extracted _reconstruct_tool_calls, now unit-tested); (7) intra-project
+depends_on CYCLE guard in deps_satisfied (was silently reporting project_done on a plan with open cyclic work).
+6 fetch tests updated to the streaming+circuit contract via a new conftest make_streaming_resp/make_httpx_stream_client.
+IMPROVEMENT #1 (learning-health telemetry — the top eval rec): new core/learning_health.py (pure, defensive,
+tested) → introspect action='learning' + scripts/learning_health.py. Aggregates lessons (outcome arms, hit-rate,
+prune candidates), competence (domains crossing the 20-obs gate), episodes (field coverage), calibration
+(Brier, entropy-distinctness), auto-skills, activity, and a COGNITIVE WIRING section. LIVE SIGNALS it surfaced:
+FAILURE arm = 0 fail-only lessons (demotion loop likely inert on this 35B); calibration entropy = 2 distinct
+values, w_entropy=0 (unlearnable — the streamed-path calibration fix from later-6 should now diversify it);
+episodes 0/165 context coverage (predate the later-3 fix). This is the "measure before building more" instrument.
+IMPROVEMENT #4 (Tor cache): the 300s success-only cache already existed; added _norm_cache_key (near-dup queries
+share a key), cap 64→128.
+IMPROVEMENT #5 (wire-or-retire): INVESTIGATION FINDING — the eval's "write-only, retire for RSS" premise is
+mostly overstated. calibration/confidence feed the telemetry + idle refit; selfhood is read by introspect and its
+stores are compaction-bounded (2MB/512KB) — NOT write-only, retiring would break readers. Only self_consistency
+is genuinely inert (no caller). So rather than retire (a product decision, risky), made the wiring OBSERVABLE via
+the telemetry's COGNITIVE WIRING section so the operator decides with data. self_consistency flagged as a
+retirement candidate — left for the operator to delete.
+NOT DONE (per operator): PG re-ingest, GAIA. #6 agent.py decomposition DELIBERATELY LEFT — the eval ranked it
+last, it was stopped pending a real reaching-defs pass, and doing that 15.8k-line hot-path refactor autonomously
+is the silent-cross-turn-bug risk the operator flagged. Tests: test_bughunt_fixes_2026_07_26b.py (deferred LOWs),
+test_learning_health.py (6). Docs: introspect/search/execute/planning. DEPLOYED (listener 70296→75294, health ok);
+full suite 9290 passed / 0 failed; functional_live_test 32/32 (streamed turn incl.); headless
+scripts/learning_health.py verified against live stores. Operator next step: run `introspect action='learning'`
+(or the script) periodically — it's the instrument for the ~2-week keep/kill watch on the learning stack.
+
+### 2026-07-26 (later 6) — Six-agent bug hunt (least-audited systems) + improvement eval → HIGH/MED batch FIXED
+
+Operator: "do a bug hunt on the systems that need it most, and evaluate for major improvements." Six parallel
+read-only agents on the systems least-recently deeply audited (turn-loop core, web/search/browser, execution/
+coding-correction, verifier/self-improvement, project-autonomy) + one improvement strategist. ~22 verified bugs
+(3 HIGH, 9 MED, 10 LOW); every prior audit's fixes re-confirmed still holding. Agents told the §4B catalogue is
+STALE (verify-before-report) — no re-report noise this time. Orchestrator verified every HIGH at source.
+CROSS-CUTTING THEME: the streamed (default web-UI) path keeps diverging from _finalize_and_return — 3 separate
+findings were one root cause. FIXED BATCH (operator "proceed"):
+• Streamed-path cluster (agent.py): extracted _record_calibration_safe → called from finalize AND the streamed
+  drain (streamed recorded ZERO calibration samples → fit trained on non-streaming subset; and only the stream
+  path has real logprob entropy, so w_entropy was unlearnable — both closed); streamed post_mortem gained the
+  not-forget_was_called gate (tombstone resurrection on the common path, incomplete fix from later-3); streamed
+  drain now reads a req_id-tagged project-work SNAPSHOT captured under the semaphore (was reading/clearing
+  process-global current_project_id + accumulators live, after release → misattribution/loss under concurrent
+  turn B); late-refute filing uses the snapshot pid too.
+• Calibration composite-leak (confidence.py): ConfidenceReading.pre_penalty_composite — record the prediction
+  BEFORE the outcome penalty (penalty is a function of the label → Brier read optimistically on negatives).
+• Constraint-gate sibling bypass (projects.py, HIGH): per-CALL audit cache reused the first task's verdict for
+  every sibling in a bulk close → a violating sibling with different files closed DONE UNAUDITED. Now cached by
+  frozenset(files).
+• _op_ok substring (coding_executor.py): failed replace on a *success*-named file counted as applied → leaf DONE
+  unchanged. Anchored to startswith; sibling _looks_like_write_error "security error" substring nit fixed too.
+• Darkweb dead-engine (darkweb_search.py, HIGH): Ahmia (2/3 default engines) serves JS-only template (live-
+  confirmed, 4727 bytes, 0 links) → silent empty-parse. Added 200-with-0-results diagnostic + JS-only detection
+  + GHOST_ONION_ENGINES pointer; charset-aware decode (was force-utf-8 → mojibake on Cyrillic/CJK).
+• Search (search.py): per-minute circuit bucket → 100ms (same-minute retries rode dead exits); race pool 4→8
+  waves (isolated, safe); formatter .get(k) or default None-trap.
+• Project-autonomy (advancer/cleanup): inter-project dep deadlock (deleted/archived/failed dep blocked forever;
+  now cleared-with-warning, paused still blocks); partial keep-set now rescues binary deliverables (.db/.pt/.npy
+  — were deleted at completion); autoadvance postcondition-demoted leaf no longer logged "completed".
+Tests: test_bughunt_fixes_2026_07_26b.py (14) + test_projects_tool_review_fixes.py (+1 HIGH). Docs: 9 pages.
+DEFERRED LOWs (logged, low value): id-less native tool-call collision, streamed-trajectory tag-soup, read-budget
+injection omission, depends_on intra-project cycle, darkweb helper full-body-buffer, Tor control-port restart.
+IMPROVEMENT EVAL (top 5, ranked leverage÷effort — NOT yet done): #1 learning-health telemetry surface (the FIX
+for the calibration streamed-path bug was a prerequisite — you couldn't measure it before); #2 GAIA run (operator
+huggingface login); #3 PG-manual re-ingest (96.7% of vector store, 100% corrupt); #4 Tor search reliability;
+#5 wire-or-retire the write-only cognitive subsystems (selfhood/PRM/confidence consumers dead-gated). Live signal
+worth noting: the outcome-gated FAILURE arm has produced ZERO lesson demotions — may be inert on this 35B.
+DEPLOYED (listener 62438→70296, health ok); full suite 9278 passed / 0 failed; functional_live_test 32/32
+(streamed turn included — confirms the streamed-path refactor serves correctly). WATCH: once #1 telemetry lands,
+verify the streamed calibration samples now carry real (non-0.5) entropy and the fit's w_entropy actually moves.
+
+### 2026-07-26 (later 5) — Functional live-test runner (scripts/functional_live_test.py)
+
+Operator: "make functional tests against port 8000 ensure everything works correctly." NEW: a standalone runner
+that hits the LIVE agent (no in-process mocks — tests/ already covers that) and validates the API layer + the
+audit-fixed behaviors end-to-end. Non-destructive (nonce-tagged, self-cleaning; verified 0 durable pollution).
+Two tiers: CORE (deterministic, no LLM — health/config/nodes, auth 403, malformed-body→4xx-never-500,
+version/tags, memory-delete absent→clean-409, sessions CRUD, workspace-save + scratchpad-snapshot-is-a-dict via
+in-zip session.json read = the export_state fix) and LIVE-LLM (real turns, tolerant/soft: PONG coherence,
+manage_skills list names news_headlines+generate_password with no traceback, in-conversation recall). Result vs
+prod (listener 62438): 32/32 pass, agent healthy after. Gotchas baked in: workspace zip is ~25MB (whole sandbox)
+so DON'T re-upload it — read session.json out of the saved bytes instead; recall nonces must be ALPHABETIC (the
+model normalizes a digit suffix, "zephyrine123"→"Zephyrine", reading as a false miss). Flags: --core (skip LLM),
+--strict (soft→hard), --base. Not in the pytest suite (needs live node/Tor/data-dir); run manually or from cron.
+
+### 2026-07-26 (later 4) — Post-audit improvements #1 (§4B residuals) + #2 (dormant subsystems wired)
+
+Operator: "proceed with #1 and #2" from the improvement shortlist.
+#1 (§4B backlog): AUDIT FOUND MOSTLY-ALREADY-FIXED. Confirmed at source that the contention theme (warm_up/
+keepalive off_main_only, jobs-collect mark_collected read-marking), the router boot landmine (own try + retrain
+fallback), the post_mortem transient-requeue re-raise, the streamed mid-stream fail-open (chunk_data.get("error")),
+the idle code-gen max_tokens=4096, and the scratchpad injection cap (6000) were all fixed in the 2026-07-20/22
+passes and just never struck from the §4B catalogue — the catalogue is STALE, not the code. ONE genuinely-open
+item fixed: AcquiredSkillManager was constructed fresh at every call site, each with its own RLock → lock
+serialized nothing, concurrent telemetry could lose a failure_count increment. Added AcquiredSkillManager.
+get_shared(base_dir) — one process-wide instance per resolved path (upgrades a cached None memory_system);
+all 4 call sites switched. Regression: 8 threads × 60 increments, zero loss.
+#2 (dormant subsystems, the real value): (a) _record_episode_safe now populates context + cluster_id — all 165
+live episodes had them EMPTY, so search_recoveries weighed only outcome text, consolidation grouped everything as
+"general", and injected lines rendered "[]". Cheap (no extra LLM call): cluster_id = domain of first substantive
+tool (metacog._domain_for_tool, aligns with competence taxonomy), context = tool-chain trace + explicit
+"recovered after failures in: …" signal (what makes a turn detectable as a reusable recovery for the System-3
+loop we wired in later-3). (b) competence.get_context_string() (39 live cells, computed-but-rendered-nowhere)
+now injects into the prompt continuity blocks, gated on _COMPETENCE_MIN_OBS=20 total obs so a cold profile
+doesn't inject small-n noise. Tests: TestSharedAcquiredManager (3), TestEpisodeFieldPopulation (2),
+TestCompetenceContextString (2) in test_memory_audit_fixes_2026_07_26.py. Docs: acquired_skills/episodes/
+competence pages. NOTE: §4B catalogue below is stale — treat its line items as "verify before fixing", not
+"open". DEPLOYED (listener 60937→62438, health ok); full suite 9263 passed / 0 failed. Watch over the next
+~2 weeks whether the competence block changes planner tool-choice and whether episode context/cluster improve
+search_recoveries hit-rate (both now have real data to work with, unlike before).
+
+### 2026-07-26 (later 3) — Memory-substrate audit: ALL ~60 actionable findings FIXED (7 clusters), tests+docs done
+
+Operator authorized unattended fix-everything after the (later 2) scan. Every cluster fixed, unit-tested
+(tests/test_memory_audit_fixes_2026_07_26.py, 59 tests + pinned-test updates elsewhere), and documented (dated
+"Audit fixes (2026-07-26)" sections across 19 docs pages). By cluster:
+• SPLITTER: helpers.py recursive_split_text re-attaches separators to EVERY fragment (whitespace seps were
+  dropped → word fusion in all chunks) + chunk_overlap now honored on the separator path, carry CAPPED at
+  chunk_size//4 (uncapped, the overlap-clamped-to-size-1 case — semantic_split_text long headers — advanced one
+  fragment per chunk: quadratic blowup that spun the suite 36 CPU-min mid-session; cap guarantees ≥3/4 progress
+  per chunk). Existing corpora stay corrupt until re-ingested; PG manual source PDF is GONE from disk, so
+  re-ingest needs a fresh download (postgresql.org pdf) — deferred to operator, corrupt-but-answering corpus
+  left in place deliberately.
+• ATTRIBUTION: get_playbook_context resets last_playbook_triggers up front + stamp_triggers=False for dream sim
+  (new last_sim_triggers channel) and ReadOnlySkillMemory (façade also blocks quarantine_lesson; _WRITE_HINTS
+  gained "quarantine"); record_helpful_retrieval idempotent both orderings; PASSED flush moved before the corpus
+  direction guard; _surfaced_lesson_triggers merges bus skill-tier survivors into the outcome arms (turn_id
+  guard); belief-revision probe record_retrievals=False + $nin scope + delete restricted to OFFERED ids;
+  projects lookup-miss probe silent.
+• VECTOR: bus routes identity facts through smart_update (plain add left the conflict guard caller-less; live
+  dupes); forget sweeps type-scoped ($nin document/episode/skill/acquired_skill + belt) — was deleting doc
+  chunks via the distance-ignoring literal override; is_name_memory narrowed to real name statements (the
+  "user's"/"user is" prose net granted -20 absolute rank + fake MASTER SUMMARY label); search_items off-topic
+  gate mins over query-batch distances only (identity-probe distances defeated the 0.42 floor); syntheses +
+  acquired-skill embeds get timestamps (timestampless synthesis = first eviction victim); ingest dedup re-check
+  after filename auto-resolution; bus publish failures surface as PARTIAL in remember/update_profile/learn_skill;
+  last_hydration clobber guarded by turn_id; REM fetch drops unused embeddings; CancelledError no longer eaten.
+• GRAPH/EPISODES: add_triplets shape-guards non-dict triplets (one malformed triplet aborted fact+profile writes)
+  + relation-key fallback + logged per-triplet errors; functional expiry skips _EXPIRY_GENERIC_SUBJECTS
+  (project/task/app/… — generic-subject rows made expiry cross-project destructive); episode cap eviction
+  UN-INVERTED (was deleting the dream's pending input, fossilizing spent rows); streamed episode write gained
+  smart_memory/forget gates; reconcile_vector_index wired at boot (bg thread in main.py); System-3 pivot now
+  injects search_recoveries via SYSTEM_3_EPISODIC_CONTEXT (was built on both ends, wired on neither);
+  frontier duplicate re-rolls no longer inflate templates[*].runs; cluster_id render fallback.
+• SKILL STORES: compile_from_pattern sanitizes dotted minted names + no-ops on existing (re-graduation demoted
+  APPROVED macros + wiped stats; register() merges-not-demotes as belt); composed defs shadow against the FULL
+  acquired registry (routed-subset gap = advertised≠dispatched); create_skill refuses builtin/macro names;
+  degraded status recoverable (success clears; changed-content re-create starts clean; retirement catches
+  legacy zombies by status; dead ≥5-rule dropped); TDD gate parses exit banner (substring was spoofable by
+  echoed banners); telemetry: stale-file failures counted, infra outcomes (SYSTEM ERROR/124/137) charged to
+  NEITHER side (_acquired_skill_result_class); routing []≠None (all-stale hits degrade to advertise-all);
+  manage_skills list marks degraded/proposed; miner requires outcome=="passed" + _MACRO_UNSAFE_PARAM_TOOLS get
+  empty templates (was baking stale task_update writes verbatim); GraduatedSkillStore.remove() + non-monotonic
+  confidence + deprecate/retain_monitor verdicts handled at the phase-2.6 caller.
+• SMALL STORES: journal in-flight/overflow UnicodeDecodeError → _preserve_corrupt sidecar (was silent unlink);
+  _dedup_key strips retries (requeue twin double-consolidation); explain_belief_change token-overlap matching
+  (whole-substring was inert for multi-word messages); profile _degraded fail-closed on OSError (intact file no
+  longer sidecar'd away/overwritten); fsync-before-rename in profile/contradiction/adaptive/competence;
+  category+key required for profile writes on BOTH the consolidation and bus legs (junk <cat>.info keys);
+  adaptive record() takes effective_threshold (cleared_bar mislabeling); scratchpad LRU skips dunder sentinels;
+  export_state/restore_state (locked, namespace-preserving; legacy flat shape → global scope); self-play report
+  namespace=None; pending_count gate failure logged.
+• PROJECTS/WORK-LOG: update_task reopen tuple gained DONE (revive-task deadlock); artifact_added carries path
+  (file_history blind to registrations — live 60/60 pathless); find_deleted_similar needs ≥2 shared tokens or
+  identical sets (Chess Game→Chess Tutorial mislink); project_events per-type retention (300) for
+  task_updated/project_updated/work_log; work_log now records all-failure turns (<tool>_failed counts) and
+  drops off-project interludes via _request_relevant_to_project (fail-open; live: news-curl row on Jiu Jitsu).
+FULL SUITE: 9256 passed / 0 failed (3 pinned-test updates: macro-miner fixture outcome→"passed",
+forget-hardening FakeCollection.query grew the `where` kwarg, workspace-save route degrades to legacy flat
+scratchpad read for doubles). DEPLOYED (listener 52163→60937, health ok). DATA REPAIRS DONE + VERIFIED:
+15 stale contradictory graph rows expired in the deploy down-window (chess-v4 status/pid, generic
+project/task/service/system status rows, webos ×2 → 0 live conflicts); 7 stale identity rows deleted via
+/api/memory/delete (5+1 chess "currently playing" paraphrases, old home_lab twin — richer "nova (runs Gemma)"
+kept); episode boot reconcile ran live on first respawn: twins 131→141 (remaining gap = shared-trigger dedup
+by design). REMAINING (operator input needed): PG manual re-ingest — source PDF no longer on disk; corpus left
+serving (corrupt-but-answering beats absent); repair = download postgresql-17 PDF into the sandbox, then
+knowledge_base(forget→ingest_document) with the fixed splitter.
+
+### 2026-07-26 (later 2) — Six-agent memory-substrate defect scan: ~67 verified findings, 10 HIGH (NO fixes applied yet)
+
+Operator asked for a defect scan across ALL memory layers. Six parallel read-only auditors (vector/recall, lesson
+playbook, small stores, graph+episodes+frontier, projects+ingest, skill stores), each requiring file:line evidence
++ live-store probes (ro-sqlite only); orchestrator spot-verified every HIGH at source. Highlights by damage:
+• INGEST (live-corrupt): utils/helpers.py:404 `recursive_split_text` drops whitespace separators on rejoin — ALL
+  7,131 postgresql-manual chunks have words fused across line breaks ("DocumentationThe PostgreSQL…"); overlap=150
+  honored only on the no-separator path. Fix + re-ingest = biggest RAG win available.
+• LEARNING-LOOP POISONING: skills.py:1671 `last_playbook_triggers` never cleared on empty branches (early return
+  precedes stamp) → outcome arms/hydrated_lessons/credit book stale or sub-agent/dream-sim trigger sets against
+  wrong turns; readonly.py:122 ReadOnlySkillMemory lacks `quarantine_lesson` in _MUTATORS + no record_retrievals
+  override (found independently by 2 auditors; drift-guard test _WRITE_HINTS lacks "quarantine" prefix). Plus:
+  judge-after-inline double credit (skills.py:1166), PASSED flush starvation (agent.py:6302), bus-tier lessons
+  invisible to FAILURE arm (agent.py:6341), belief-revision search phantom-credits + unscoped deletes (agent.py:4654).
+• VECTOR ROT/LOSS: bus.py:1134 update_profile leg is plain add — smart_update (whole subject-conflict guard) dead
+  in prod, live DB shows duplicate/contradictory identity rows; tools/memory.py:751 unified_forget sweep is
+  type-unscoped w/ distance-ignoring literal override → deletes doc chunks/episode/skill twins (96.6% of rows are
+  chunks); dream syntheses stored w/o timestamp → first evicted (dream.py:1654).
+• GRAPH/EPISODES: graph.py:164 `t.get("subject")` outside per-triplet try — one malformed LLM triplet aborts the
+  whole smart-memory task incl. fact+profile writes; episodes.py:208 cap eviction INVERTED (deletes unconsolidated
+  pending input, fossilizes spent rows; latent at 165/500); streamed finalize writes episodes ungated by
+  smart_memory/forget (agent.py:14740); System-3 recovery loop built on both ends, wired on neither
+  (episodes.py:691 + prompts.py:1035); generic-subject `project HAS_STATUS` rows make functional expiry
+  cross-project destructive (graph.py:47); 12 unique-trigger episodes lack vector twins (reconcile still uncalled).
+• SKILL STORES: phase-2.6 re-mint demotes APPROVED macros to proposed + wipes stats (agent.py:3583 + unconditional
+  register()); minted names bypass validation (the dotted auto.generic.* macro seen live today); shadowing
+  one-directional → advertised def ≠ dispatched tool under routing filter (registry.py:709); "degraded" status is
+  a one-way trap (no path back to active, re-create preserves it); skills_auto verifier is a tautological
+  threshold re-check, confidence monotonic, deprecation unreachable.
+• SMALL STORES: journal in-flight/overflow UnicodeDecodeError → treated as empty then unlinked/overwritten (silent
+  loss, journal.py:329/373); explain_belief_change requires whole-message substring → inert (contradiction_log.py:190);
+  profile.py lacks the _degraded fail-closed path its 4 siblings have; category-only profile updates mint junk
+  `<cat>.info` keys (live: cli_tools.info); update_task reopen tuple missing DONE (projects.py:754); work_log
+  attribution writes off-topic turns into project journals (live: "get me the news" on Jiu Jitsu Calendar);
+  all-failure turns write NO work_log; artifact_added payload pathless → file_history blind to registrations.
+Full ranked list with failure scenarios delivered in-session (2026-07-26); nothing fixed yet — awaiting operator
+prioritization. Suggested order: splitter+re-ingest → attribution cluster → forget-scope+bus-dedup →
+graph-abort+episode-gate → skill-store demotion/degraded-trap → rest batched per file.
+
 ### 2026-07-26 (later) — Duplicate skill embeddings: "injected 3" vs 2 registered skills
 
 Operator: routing log said `injected 3: news_headlines, news_headlines,…` while `manage_skills` listed 2 skills.

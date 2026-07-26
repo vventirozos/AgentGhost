@@ -202,18 +202,17 @@ class TestTokenCacheThreadSafety:
 class TestBinaryUrlPathCheck:
     @pytest.mark.asyncio
     async def test_pdf_with_query_string_short_circuits(self):
+        from tests.conftest import make_streaming_resp, make_httpx_stream_client
+        # Server lies: generic content-type on a PDF URL. The .pdf path
+        # trips the binary short-circuit from HEADERS — the body is never
+        # streamed.
+        resp = make_streaming_resp(200, "%PDF-1.7 binary garbage",
+                                   content_type="text/html")
+        client = make_httpx_stream_client(resp)
         with patch("ghost_agent.utils.helpers.url_ssrf_reason", lambda u, **k: None), \
              patch("ghost_agent.utils.helpers.httpx.AsyncClient") as mock_client_cls, \
              patch.dict("sys.modules", {"curl_cffi": None, "curl_cffi.requests": None}):
-            mock_client = AsyncMock()
-            mock_client_cls.return_value.__aenter__.return_value = mock_client
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            # Server lies: generic content-type on a PDF URL.
-            mock_resp.headers = {"content-type": "text/html"}
-            mock_resp.text = "%PDF-1.7 binary garbage"
-            mock_client.get.return_value = mock_resp
-
+            mock_client_cls.return_value.__aenter__.return_value = client
             result = await helper_fetch_url_content("http://example.com/report.pdf?dl=1")
             assert "binary file" in result
 

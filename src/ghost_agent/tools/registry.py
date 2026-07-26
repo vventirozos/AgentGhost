@@ -38,23 +38,37 @@ import re
 from ..utils.logging import pretty_log, Icons
 
 
-def _acquired_skill_result_ok(result) -> bool:
-    """Classify an acquired-skill execution result as success/failure.
+def _acquired_skill_result_class(result) -> str:
+    """Classify an acquired-skill execution result: "ok" / "fail" / "infra".
 
     `tool_execute` RETURNS error strings (non-zero EXIT CODE, tracebacks,
-    [SYSTEM ERROR]) rather than raising, so an unconditional success=True
-    telemetry write recorded broken skills as wins — resetting
-    failure_count and defeating degraded-skill retirement.
+    [SYSTEM ERROR]) rather than raising. "infra" marks outcomes where the
+    SANDBOX/host failed, not the skill — [SYSTEM ERROR] (sandbox down) and
+    timeout/SIGKILL exit codes. Charging those to the skill degraded a
+    healthy tool after three sandbox outages; callers skip telemetry on
+    "infra".
     """
     s = str(result)
     if "[SYSTEM ERROR]" in s or "Critical Tool Error" in s:
-        return False
+        return "infra"
     m = re.search(r"EXIT CODE:\s*(\d+)", s)
     if m:
-        return m.group(1) == "0"
+        code = m.group(1)
+        if code == "0":
+            return "ok"
+        if code in ("124", "137"):  # timeout / SIGKILL: host pressure
+            return "infra"
+        return "fail"
     # No exit-code banner (non-execute-shaped result): success unless it
     # clearly starts with an error marker.
-    return not s.lstrip().startswith(("Error", "ERROR", "SYSTEM ERROR", "Traceback"))
+    if s.lstrip().startswith(("Error", "ERROR", "SYSTEM ERROR", "Traceback")):
+        return "fail"
+    return "ok"
+
+
+def _acquired_skill_result_ok(result) -> bool:
+    """Back-compat boolean view of `_acquired_skill_result_class`."""
+    return _acquired_skill_result_class(result) == "ok"
 
 logger = logging.getLogger("GhostAgent")
 
@@ -196,7 +210,7 @@ TOOL_DEFINITIONS = [
     {"type": "function", "function": {"name": "flag_uncertainty", "description": "Register what you DON'T know or are unsure about with your metacognitive tracker. Call action='unknown' when you need a fact you don't have (set impact 1-5 — 4+ means it materially affects correctness; resolution tells how to get it: 'ask user', 'search web', 'read file'). Call action='assumption' when you are proceeding on a belief you have NOT verified (set confidence 0.0-1.0). action='list' shows what is currently flagged plus recurring blind-spots from past turns. A critical unknown (impact>=4, resolution='ask user') triggers a clarification prompt before your answer is finalized — so flag honestly rather than guessing. Everything flagged persists, so questions you keep hitting become visible as recurring blind-spots.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["unknown", "assumption", "list"]}, "text": {"type": "string", "description": "For action='unknown': what you don't know. For action='assumption': the unverified belief."}, "impact": {"type": "integer", "minimum": 1, "maximum": 5, "description": "For action='unknown': how much not knowing this affects correctness (1 minor, 5 critical)."}, "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0, "description": "For action='assumption': how confident you are in the belief (0.0-1.0)."}, "resolution": {"type": "string", "description": "For action='unknown': how to resolve it — 'ask user', 'search web', 'read file', etc."}, "basis": {"type": "string", "description": "For action='assumption': why you believe it."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "workspace", "description": "READ-ONLY view of the user's WORKSPACE state — what's outside of you (files, scheduled-task outcomes, research artifacts you've pulled, commands you ran). This is the world-model counterpart to introspect (which reads your selfhood). Use this when the user asks 'what changed since yesterday?', 'what did my scheduled task do?', 'have I already pulled this URL?', 'show me what you've been doing in my project'. Distinct from: introspect (your own selfhood), file_system (one-shot reads of the filesystem), recall (vector search over ingested docs). Actions: 'summary' (default; stats + narrative + recent changes + recent tasks/research); 'stats' (counts); 'files' (the watchlist); 'changes' (diff tracked files against last-seen snapshot); 'tasks' (recent scheduled-task outcomes); 'research' (URLs you've already pulled); 'commands' (significant command outcomes); 'narrative' (the running workspace summary); 'recent' (the activity log, mixed kinds); 'search' (keyword search over the activity log — pass 'query').", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "files", "changes", "tasks", "research", "commands", "narrative", "recent", "search"], "description": "Default 'summary' if omitted."}, "limit": {"type": "integer", "description": "For tasks/research/commands/recent/search: how many entries to return. Defaults to 10; capped at 50."}, "query": {"type": "string", "description": "For action='search': keywords to find in past workspace events (filenames, commands, URLs, task names)."}}, "required": []}}},
     {"type": "function", "function": {"name": "workspace_track", "description": "WRITE path into the WORKSPACE state — author the watchlist of files to track, free-form workspace notes, and manual research dedup markers. Counterpart to the read-only workspace tool. Actions: 'track' (add a file path to the watchlist; optional 'label' for a human descriptor); 'untrack' (remove a path); 'note' (record a free-form workspace observation); 'mark_seen' (record a URL as already-pulled so future research dedups against it). Tracked files get a stat-cache diff on every wake-up, so 'track' is how you get 'what changed in this file since last session' to surface automatically.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["track", "untrack", "note", "mark_seen"]}, "path": {"type": "string", "description": "For track/untrack: the file path to add/remove from the watchlist."}, "label": {"type": "string", "description": "Optional for track: a short human descriptor (e.g. 'main config', 'experiment log')."}, "text": {"type": "string", "description": "Required for note: the free-form observation."}, "url": {"type": "string", "description": "Required for mark_seen: the URL to record as already-pulled."}}, "required": ["action"]}}},
-    {"type": "function", "function": {"name": "introspect", "description": "READ-ONLY introspection over your OWN selfhood — your running first-person diary, recent experiences, topic clusters, and counts. Use this when the user asks you to describe yourself, what you've been working on, what you remember, or what you've done before. Distinct from: self_state (which AUTHORS open questions / threads / mood for the next session), knowledge_base (facts about the world), update_profile (facts about the USER). Actions: 'summary' (default; renders stats + running diary + recent experiences in one block — the natural answer to 'tell me about yourself'); 'stats' (counts and the topic cluster mix); 'narrative' (just the running diary); 'recent' (the last N first-person experiences); 'recall' (relevance-ranked search over your past, IDF-weighted, no embeddings — pass 'query'); 'activity' (the background-activity ledger: dream/REM cycles, PRM/router/calibration retrains, skills graduated, self-play, scheduled-task conclusions — THE answer to 'what did you do while I was away?' / 'what ran in the background?', since routine maintenance no longer auto-surfaces in replies; optional 'hours' window and 'limit'). All reads route through your SelfModel; nothing here writes.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "narrative", "recent", "recall", "activity"], "description": "Default 'summary' if omitted."}, "query": {"type": "string", "description": "Required for action='recall': what to search your past for (e.g. 'postgres migrations', 'the trapdoor question')."}, "limit": {"type": "integer", "description": "For action='recent'/'recall': how many results (default 5, cap 25). For action='activity': how many ledger lines (default 30, cap 100)."}, "hours": {"type": "number", "description": "For action='activity': look-back window in hours. Default 24; capped at 336 (14 days)."}}, "required": []}}},
+    {"type": "function", "function": {"name": "introspect", "description": "READ-ONLY introspection over your OWN selfhood — your running first-person diary, recent experiences, topic clusters, and counts. Use this when the user asks you to describe yourself, what you've been working on, what you remember, or what you've done before. Distinct from: self_state (which AUTHORS open questions / threads / mood for the next session), knowledge_base (facts about the world), update_profile (facts about the USER). Actions: 'summary' (default; renders stats + running diary + recent experiences in one block — the natural answer to 'tell me about yourself'); 'stats' (counts and the topic cluster mix); 'narrative' (just the running diary); 'recent' (the last N first-person experiences); 'recall' (relevance-ranked search over your past, IDF-weighted, no embeddings — pass 'query'); 'activity' (the background-activity ledger: dream/REM cycles, PRM/router/calibration retrains, skills graduated, self-play, scheduled-task conclusions — THE answer to 'what did you do while I was away?' / 'what ran in the background?', since routine maintenance no longer auto-surfaces in replies; optional 'hours' window and 'limit'). All reads route through your SelfModel; nothing here writes.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["summary", "stats", "narrative", "recent", "recall", "activity", "learning"], "description": "Default 'summary' if omitted."}, "query": {"type": "string", "description": "Required for action='recall': what to search your past for (e.g. 'postgres migrations', 'the trapdoor question')."}, "limit": {"type": "integer", "description": "For action='recent'/'recall': how many results (default 5, cap 25). For action='activity': how many ledger lines (default 30, cap 100)."}, "hours": {"type": "number", "description": "For action='activity': look-back window in hours. Default 24; capped at 336 (14 days)."}}, "required": []}}},
     {"type": "function", "function": {"name": "postmortem", "description": "READ-ONLY view of your post-mortem DEFECT QUEUE — the durable, classified findings your idle-time post-mortem engine files after analysing the whole transcript of your worst FAILED runs. Use this when asked 'what have you found broken in yourself?', 'what defects are open?', 'show me the post-mortem of that bad run', or to review a proposed fix before it's applied by a human. Each defect is one of: 'behavioural' (you chose badly — already routed to a lesson), 'configuration' (a flag/threshold let it through), or 'code_defect' (a tool/loop is broken — may carry a proposed reproducing test + diff, stored for review, NEVER auto-applied). Distinct from: introspect (your selfhood/diary), workspace (the user's world). Actions: 'pending' (default; open defects, worst first); 'list' (all, any status); 'show' (full detail incl. any proposed test/patch — pass 'defect_id'); 'stats' (counts by category/status).", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["pending", "list", "show", "stats"], "description": "Default 'pending' if omitted."}, "defect_id": {"type": "string", "description": "Required for action='show': the defect id (or an id-prefix) from a 'pending'/'list' result."}, "limit": {"type": "integer", "description": "For 'pending'/'list': how many to return. Defaults to 10; capped at 25."}}, "required": []}}},
     {"type": "function", "function": {"name": "self_state", "description": "Author your OWN cross-session continuity state — the open questions, unfinished threads, and mood you carry from this session into the next. This is YOUR forward-looking self, not facts about the world. Use it when you finish a turn but something is left unresolved that the next session of you should pick up. Distinct from: knowledge_base (facts/documents), update_profile (facts about the USER), scratchpad (notes for THIS conversation only). action='note_question' records something you are still trying to figure out; 'resolve_question' marks one answered; 'add_unfinished' notes a task left mid-flight; 'close_unfinished' completes one; 'set_mood' records your current functional state (e.g. 'curious', 'stuck', 'satisfied'); 'note_principle' records an operating principle — how you CHOOSE to work (e.g. 'I verify before asserting', 'I prefer reversible actions') — surfaced in your wake-up prefix every session to shape your behaviour; 'list' shows what is currently on file. Whatever you record here is shown to you at the start of your next session.", "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["note_question", "resolve_question", "add_unfinished", "close_unfinished", "set_mood", "note_principle", "list"]}, "text": {"type": "string", "description": "For note_question/add_unfinished/note_principle: the question, thread, or principle text. For resolve_question/close_unfinished: the id (or id-prefix, or a text substring) of the item to close."}, "mood": {"type": "string", "description": "Required for set_mood: a short functional-state label (e.g. 'curious', 'stuck', 'satisfied')."}, "evidence": {"type": "string", "description": "Optional for set_mood: one sentence on why."}}, "required": ["action"]}}},
     {"type": "function", "function": {"name": "web_search", "description": "Search the internet (Anonymous via Tor). ALWAYS use this FIRST for simple factual questions and general web searches. CRITICAL: Keep your queries concise and keyword-focused (e.g., 'PostgreSQL 16 release notes'). DO NOT use long conversational sentences. PLAIN KEYWORDS ONLY — do NOT use search operators like 'site:', quoted \"exact phrases\", or boolean OR/AND. The search runs over Tor against scraper backends (DuckDuckGo, Brave, Mojeek) that DO NOT honour those operators; including them returns ZERO results. To bias toward an official source, just add its name as a keyword (e.g. 'python asyncio docs' or 'numpy wikipedia'), not 'site:python.org'.", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
@@ -655,7 +669,7 @@ def get_active_tool_definitions(context, query: str = None):
             # in tests etc.); the legacy-migration path inside the
             # manager handles moving any pre-existing skills over.
             _skills_base = getattr(context, 'memory_dir', None) or context.sandbox_dir
-            manager = AcquiredSkillManager(
+            manager = AcquiredSkillManager.get_shared(
                 _skills_base, context.memory_system,
                 legacy_sandbox_dir=context.sandbox_dir,
             )
@@ -685,6 +699,16 @@ def get_active_tool_definitions(context, query: str = None):
                         if raw_names:
                             active_skills = manager.get_all_skills()
                             target_skill_names = [n for n in raw_names if n in active_skills and active_skills[n].get("status") == "active"]
+                            if not target_skill_names:
+                                # Every hit mapped to NO active skill (stale
+                                # or degraded-skill embeddings crowding the
+                                # pool). [] would filter EVERY acquired def
+                                # from the schema while dispatch runners
+                                # stay registered — exactly the invisible-
+                                # but-callable drift the exception branch
+                                # below already degrades away from. Same
+                                # degrade here: advertise all.
+                                target_skill_names = None
 
                             if target_skill_names:
                                 # ONE line on both sinks (the pretty mirror now
@@ -921,7 +945,7 @@ def get_available_tools(context):
     if context and getattr(context, 'sandbox_dir', None) and getattr(context, 'memory_system', None):
         try:
             _skills_base = getattr(context, 'memory_dir', None) or context.sandbox_dir
-            manager = AcquiredSkillManager(
+            manager = AcquiredSkillManager.get_shared(
                 _skills_base, context.memory_system,
                 legacy_sandbox_dir=context.sandbox_dir,
             )
@@ -964,6 +988,14 @@ def get_available_tools(context):
                                 )
                                 logger.error(msg)
                                 pretty_log("Skill Missing", msg, level="ERROR", icon=Icons.FAIL)
+                                # A stale entry must accrue failures like any
+                                # other broken skill — without this it never
+                                # degraded/retired and was re-advertised
+                                # every turn forever.
+                                try:
+                                    manager.log_telemetry(name, success=False)
+                                except Exception:
+                                    pass
                                 return msg
                             except Exception as e:
                                 msg = f"Could not read acquired skill {name}: {type(e).__name__}: {e}"
@@ -983,13 +1015,20 @@ def get_available_tools(context):
                                 # strings rather than raising, so classify
                                 # the RESULT. Logging success=True
                                 # unconditionally let broken skills reset
-                                # their failure_count and dodge retirement.
-                                ok = _acquired_skill_result_ok(result)
-                                manager.log_telemetry(name, success=ok)
-                                if ok:
-                                    logger.info(f"Acquired Skill '{name}' executed successfully.")
+                                # their failure_count and dodge retirement;
+                                # infra-shaped outcomes (sandbox down,
+                                # timeout kill) are charged to NEITHER side.
+                                klass = _acquired_skill_result_class(result)
+                                if klass == "infra":
+                                    logger.warning(
+                                        f"Acquired Skill '{name}': infrastructure "
+                                        f"failure — telemetry skipped.")
                                 else:
-                                    logger.warning(f"Acquired Skill '{name}' returned a failure result.")
+                                    manager.log_telemetry(name, success=(klass == "ok"))
+                                    if klass == "ok":
+                                        logger.info(f"Acquired Skill '{name}' executed successfully.")
+                                    else:
+                                        logger.warning(f"Acquired Skill '{name}' returned a failure result.")
                                 return result
                             except Exception as e:
                                 # Telemetry: Log failure

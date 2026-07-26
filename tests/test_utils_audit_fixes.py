@@ -241,16 +241,11 @@ async def test_fetch_url_403_does_not_renew_tor(monkeypatch):
     monkeypatch.setattr(helpers, "request_new_tor_identity",
                         MagicMock(return_value=(True, "ok")))
 
-    # Mock httpx response: 403.
-    fake_resp = MagicMock()
-    fake_resp.status_code = 403
-    fake_resp.headers = {"content-type": "text/html"}
-    fake_resp.text = "<html>nope</html>"
-
-    fake_client = MagicMock()
-    fake_client.get = AsyncMock(return_value=fake_resp)
+    # Mock httpx streaming response: 403.
+    from tests.conftest import make_streaming_resp, make_httpx_stream_client
+    resp = make_streaming_resp(403, "<html>nope</html>")
     fake_ctx = AsyncMock()
-    fake_ctx.__aenter__.return_value = fake_client
+    fake_ctx.__aenter__.return_value = make_httpx_stream_client(resp)
     fake_ctx.__aexit__.return_value = None
 
     # Patch httpx.AsyncClient AND make curl_cffi import fail so we hit the
@@ -260,40 +255,32 @@ async def test_fetch_url_403_does_not_renew_tor(monkeypatch):
         mock_httpx.AsyncClient = MagicMock(return_value=fake_ctx)
         result = await helpers.helper_fetch_url_content("https://example.com/forbidden")
 
-    # Tor identity rotation must NOT have been triggered for a 403.
+    # 403 → no exit rotation of any kind (the daemon-restarting
+    # request_new_tor_identity is no longer called on any path).
     helpers.request_new_tor_identity.assert_not_called()
     assert "403" in result or "Forbidden" in result or "Denied" in result
 
 
 @pytest.mark.asyncio
-async def test_fetch_url_503_does_renew_tor(monkeypatch):
+async def test_fetch_url_503_rotates_circuit_not_daemon(monkeypatch):
     from ghost_agent.utils import helpers
+    from tests.conftest import make_streaming_resp, make_httpx_stream_client
 
-    # Pin TOR_PROXY — see test_fetch_url_403_does_not_renew_tor for why.
-    # The 503 branch at helpers.py (status_code == 503 and proxy_url) is
-    # gated on a truthy proxy_url, and a CI runner exporting an empty
-    # TOR_PROXY would silently skip the rotation this test asserts.
+    # Pin TOR_PROXY — the 503 branch gates on a truthy proxy_url.
     monkeypatch.setenv("TOR_PROXY", "socks5://127.0.0.1:9050")
 
-    rotate_calls = {"n": 0}
-
-    def _fake_rotate(*a, **kw):
-        rotate_calls["n"] += 1
-        return (True, "rotated")
-
-    monkeypatch.setattr(helpers, "request_new_tor_identity", _fake_rotate)
-    # Skip the 5s sleep between retries.
+    # The daemon-restarting request_new_tor_identity must NEVER be called now
+    # (control port 9051 is closed on the box, so it fell back to
+    # `brew services restart tor`). 503 rotation is per-circuit instead.
+    monkeypatch.setattr(helpers, "request_new_tor_identity",
+                        MagicMock(return_value=(True, "ok")))
     monkeypatch.setattr(helpers.asyncio, "sleep", AsyncMock(return_value=None))
 
-    fake_resp = MagicMock()
-    fake_resp.status_code = 503
-    fake_resp.headers = {"content-type": "text/html"}
-    fake_resp.text = "blocked"
-
-    fake_client = MagicMock()
-    fake_client.get = AsyncMock(return_value=fake_resp)
+    # Every attempt 503 → retries on rotated circuits, then returns the error.
+    resps = [make_streaming_resp(503, "blocked") for _ in range(3)]
+    client = make_httpx_stream_client(resps)
     fake_ctx = AsyncMock()
-    fake_ctx.__aenter__.return_value = fake_client
+    fake_ctx.__aenter__.return_value = client
     fake_ctx.__aexit__.return_value = None
 
     with patch.object(helpers, "httpx") as mock_httpx, \
@@ -301,6 +288,6 @@ async def test_fetch_url_503_does_renew_tor(monkeypatch):
         mock_httpx.AsyncClient = MagicMock(return_value=fake_ctx)
         result = await helpers.helper_fetch_url_content("https://example.com/maybe-tor-blocked")
 
-    # 503 should have triggered AT LEAST one rotation across the retry loop.
-    assert rotate_calls["n"] >= 1
+    helpers.request_new_tor_identity.assert_not_called()   # no daemon restart
+    assert client.stream.call_count >= 2                   # retried on a fresh circuit
     assert "503" in result or "Denied" in result or "Tor" in result

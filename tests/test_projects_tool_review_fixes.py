@@ -330,3 +330,47 @@ async def test_mangled_parent_id_still_hits_sibling_duplicate_guard(context):
                 if t.get("parent_id") == parent
                 and t["description"] == "build the child"]
     assert len(siblings) == 1
+
+
+async def test_bulk_violating_sibling_with_different_files_is_audited(
+        context, monkeypatch):
+    """HIGH (2026-07-26 hunt): the per-CALL audit cache reused the first
+    task's verdict for every sibling. A sibling with DIFFERENT files that
+    VIOLATES must be audited on its OWN files and refused — not inherit the
+    first (clean) task's pass."""
+    import ghost_agent.core.build_gates as bg
+
+    async def _audit_by_file(ctx, constraints, files, is_background=False):
+        # Clean iff the file set is only b.txt; a.txt violates.
+        joined = " ".join(sorted(files))
+        if "a.txt" in joined:
+            return (False, "audit: a.txt uses the forbidden approach")
+        return (True, "")
+
+    monkeypatch.setattr(bg, "constraint_gate", _audit_by_file)
+
+    store = context.project_store
+    pid = await _create(context, title="Gated Build 2",
+                        constraints=["honor the approach"],
+                        subtasks=["Clean part", "Dirty part"])
+    tasks = store.list_tasks(pid)
+    clean = next(t["id"] for t in tasks if "Clean" in t["description"])
+    dirty = next(t["id"] for t in tasks if "Dirty" in t["description"])
+
+    ws = Path(store.sandbox_root) / "projects" / pid
+    ws.mkdir(parents=True, exist_ok=True)
+    (ws / "b.txt").write_text("fine")
+    (ws / "a.txt").write_text("forbidden")
+    store.add_artifact(clean, "file", "b.txt")   # clean's own file
+    store.add_artifact(dirty, "file", "a.txt")   # dirty's own file
+
+    # Order: clean first (its pass must NOT be reused for dirty).
+    res = _parse(await tool_manage_projects(
+        context, action="task_update", task_ids=[clean, dirty], status="DONE",
+        result="both parts done"))
+
+    assert res.get("constraint_violations") == [dirty]
+    assert store.get_task(clean)["status"] == "DONE"
+    assert store.get_task(dirty)["status"] != "DONE"
+    # The refusal message carries the DIRTY task's own audit reason.
+    assert "forbidden approach" in res["agent_instruction_violation"]

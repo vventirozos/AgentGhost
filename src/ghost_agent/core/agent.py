@@ -3225,8 +3225,15 @@ class GhostAgent:
                     # a burst that spilled, or a preemption requeue — still
                     # triggers the drain instead of sitting undrained.
                     has_items = ctx.journal.pending_count() > 0
-                except Exception:
-                    pass
+                except Exception as _pc_err:
+                    # journal.py deliberately PROPAGATES OSErrors (fail-loud
+                    # policy) — swallowing them here silently parked
+                    # consolidation forever. Keep the gate resilient but
+                    # never quiet about it.
+                    logger.warning(
+                        "journal pending_count failed (%s: %s) — "
+                        "consolidation skipped this tick",
+                        type(_pc_err).__name__, _pc_err)
                 if has_items:
                     # Anchor BEFORE the await so an exception inside
                     # `process_journal_queue` doesn't leave
@@ -3557,49 +3564,75 @@ class GhostAgent:
                                     for _cand in consolidated:
                                         try:
                                             _vr = verify_candidate(_cand, _verify_fn)
-                                            if _vr.passed and _vr.action == "keep":
-                                                _persisted = _store.graduate(
-                                                    _cand,
-                                                    confidence=_vr.updated_confidence,
-                                                )
-                                                if _persisted is None:
-                                                    # Overflow-trimmed by the store
-                                                    # (lowest confidence) — not really
-                                                    # graduated; skip count + macro mint.
-                                                    continue
-                                                _graduated += 1
-                                                # Also mint the proven sequence
-                                                # as a composed-skill MACRO so a
-                                                # graduated skill becomes a
-                                                # dispatchable unit, not just
-                                                # prose (redesign #8). Status
-                                                # "proposed": auto-activation
-                                                # needs per-step runtime arg
-                                                # templates the name-only
-                                                # candidate doesn't carry yet, so
-                                                # we surface it for activation
-                                                # rather than risk a param-less
-                                                # active tool. Best-effort.
-                                                try:
-                                                    from ..tools.composed_skills import _registry_from_context
-                                                    _reg = _registry_from_context(ctx)
-                                                    _seq = getattr(_cand, 'tool_sequence', ()) or ()
-                                                    if _reg is not None and _seq:
-                                                        _steps = [
-                                                            {"tool": _t, "description": "", "params": {}}
-                                                            for _t in _seq
-                                                        ]
-                                                        _reg.compile_from_pattern(
-                                                            getattr(_cand, 'name', 'skill') or 'skill',
-                                                            _steps,
-                                                            f"Proven {len(_seq)}-step sequence graduated "
-                                                            f"from {getattr(_cand, 'support', 0)} successful runs",
-                                                            status="proposed",
-                                                            execution_mode="sequential",
-                                                        )
-                                                except Exception as _ce:
-                                                    logger.debug(
-                                                        "composed-macro mint skipped: %s", _ce)
+                                            if not (_vr.passed and _vr.action == "keep"):
+                                                # The failure verdicts were
+                                                # silently dropped before —
+                                                # once graduated, a skill
+                                                # could only leave via cap
+                                                # eviction. deprecate: remove
+                                                # the stored twin (it no
+                                                # longer clears the bar);
+                                                # retain_monitor: write the
+                                                # REDUCED confidence back so
+                                                # repeated failures can walk
+                                                # it down to deprecation.
+                                                _sig = getattr(_cand, "signature_hash", "")
+                                                if _vr.action == "deprecate":
+                                                    _store.remove(_sig)
+                                                elif _vr.action == "retain_monitor" and any(
+                                                        s.get("signature_hash") == _sig
+                                                        for s in _store.all_skills()):
+                                                    # Downgrade ONLY an entry
+                                                    # already in the store —
+                                                    # graduate() on a fresh
+                                                    # failed candidate would
+                                                    # ADD it.
+                                                    _store.graduate(
+                                                        _cand,
+                                                        confidence=_vr.updated_confidence)
+                                                continue
+                                            _persisted = _store.graduate(
+                                                _cand,
+                                                confidence=_vr.updated_confidence,
+                                            )
+                                            if _persisted is None:
+                                                # Overflow-trimmed by the store
+                                                # (lowest confidence) — not really
+                                                # graduated; skip count + macro mint.
+                                                continue
+                                            _graduated += 1
+                                            # Also mint the proven sequence
+                                            # as a composed-skill MACRO so a
+                                            # graduated skill becomes a
+                                            # dispatchable unit, not just
+                                            # prose (redesign #8). Status
+                                            # "proposed": auto-activation
+                                            # needs per-step runtime arg
+                                            # templates the name-only
+                                            # candidate doesn't carry yet, so
+                                            # we surface it for activation
+                                            # rather than risk a param-less
+                                            # active tool. Best-effort.
+                                            try:
+                                                from ..tools.composed_skills import _registry_from_context
+                                                _reg = _registry_from_context(ctx)
+                                                _seq = getattr(_cand, 'tool_sequence', ()) or ()
+                                                if _reg is not None and _seq:
+                                                    _steps = [
+                                                        {"tool": _t, "description": "", "params": {}}
+                                                        for _t in _seq
+                                                    ]
+                                                    _reg.compile_from_pattern(
+                                                        getattr(_cand, 'name', 'skill') or 'skill',
+                                                        _steps,
+                                                        f"Proven {len(_seq)}-step sequence graduated "
+                                                        f"from {getattr(_cand, 'support', 0)} successful runs",
+                                                        status="proposed",
+                                                        execution_mode="sequential",
+                                                    )
+                                            except Exception as _ce:
+                                                logger.debug(
+                                                    "composed-macro mint skipped: %s", _ce)
                                         except Exception as _ve:
                                             logger.debug(
                                                 "skill graduation skipped for "
@@ -4586,17 +4619,20 @@ class GhostAgent:
                         "(the project store owns it)",
                         icon=Icons.SKIP)
                     profile_up = None
-                # Sink-bound (malformed) profile_update: naming NEITHER a
-                # category nor a key would land it in the notes.info junk
-                # drawer with the whole fact as its value — pure duplication
-                # (the fact is stored in vector memory below) that churns
-                # the 3-slot ring on every consolidation and re-renders into
-                # every system prompt. Drop the profile write, keep the fact.
+                # Sink-bound (malformed) profile_update: a well-formed write
+                # names BOTH a category and a key. Missing key defaults to
+                # "info", minting permanent `<category>.info` junk keys
+                # OUTSIDE the notes.info ring (no 3-value rotation, no
+                # 200-char value cap — live: cli_tools.info carrying a whole
+                # sentence into every prompt); missing category defaults to
+                # the notes drawer. Either way the fact itself is stored in
+                # vector memory below, so the profile write is pure
+                # duplication — drop it, keep the fact.
                 if profile_up is not None and not (
-                        profile_up.get("category") or profile_up.get("key")):
+                        profile_up.get("category") and profile_up.get("key")):
                     logger.debug(
                         "smart-memory: dropped sink-bound profile_update "
-                        "(no category/key): %.120s",
+                        "(missing category or key): %.120s",
                         str(profile_up.get("value", fact)))
                     profile_up = None
                 fact_lc = fact.lower()
@@ -4639,7 +4675,11 @@ class GhostAgent:
                 )
                 if at_is_real:
                     try:
-                        at.record(score=score, was_useful=passed_basic_gate)
+                        # Pass the bar acceptance ACTUALLY used so the
+                        # cleared_bar flag matches reality (learned-only
+                        # mislabelled the (learned, cli) band).
+                        at.record(score=score, was_useful=passed_basic_gate,
+                                  effective_threshold=effective_threshold)
                     except Exception:
                         pass
 
@@ -4651,7 +4691,20 @@ class GhostAgent:
 
                     # --- CONTRADICTION ENGINE (LLM-Driven Belief Revision) ---
                     try:
-                        candidates = await asyncio.to_thread(self.context.memory_system.search_advanced, fact, limit=3)
+                        # Scoped + silent: this is a background write-path
+                        # probe, not a retrieval — record_retrievals=False so
+                        # it stops phantom-bumping the 3 nearest rows' prune-
+                        # survival stats on every consolidation; the $nin
+                        # scope keeps document chunks / episode twins / skill
+                        # twins out of the candidate (and thus delete) pool.
+                        candidates = await asyncio.to_thread(
+                            self.context.memory_system.search_advanced, fact,
+                            limit=3,
+                            where={"type": {"$nin": [
+                                "document", "episode", "skill",
+                                "acquired_skill"]}},
+                            record_retrievals=False,
+                        )
                         ids_to_delete = []
                         old_facts = []
 
@@ -4668,6 +4721,12 @@ class GhostAgent:
 
                             raw_ids = eval_res.get("ids", [])
                             ids_to_delete = [str(i).replace("ID: ", "").replace("ID:", "").strip() for i in raw_ids]
+                            # Only ids we actually OFFERED may be deleted — the
+                            # judge model can (and did) return malformed or
+                            # hallucinated ids, and an unscoped collection
+                            # delete would erase whatever they happened to hit.
+                            _offered = {f["id"] for f in old_facts}
+                            ids_to_delete = [i for i in ids_to_delete if i in _offered]
 
                         if ids_to_delete:
                             await asyncio.to_thread(self.context.memory_system.collection.delete, ids=ids_to_delete)
@@ -6299,6 +6358,17 @@ class GhostAgent:
                 if getattr(t, "id", None) == trajectory_id:
                     cached = t
                     break
+            # Outcome-gated lesson feedback: drain any surfaced-trigger set
+            # stashed for this turn at finalize (async-critic mode), now that
+            # the verdict has landed. No-op when the turn recorded inline.
+            # MUST run BEFORE the PASSED direction guard below: that guard
+            # protects the CORPUS from outcome upgrades, but a PASSED verdict
+            # whose trajectory was cache-evicted / unfingerprintable /
+            # heuristic-promoted returned early here and the stashed lesson
+            # success-tick was silently lost — FAILED verdicts always got
+            # through, so succeeded_retrievals systematically undercounted.
+            self._flush_stashed_lesson_outcome(
+                trajectory_id, outcome == _Outcome.PASSED.value)
             if outcome == _Outcome.PASSED.value:
                 if cached is None or cached.outcome != _Outcome.UNKNOWN.value:
                     return
@@ -6307,11 +6377,6 @@ class GhostAgent:
                 if reason and outcome == _Outcome.FAILED.value \
                         and not (cached.failure_reason or ""):
                     cached.failure_reason = reason
-            # Outcome-gated lesson feedback: drain any surfaced-trigger set
-            # stashed for this turn at finalize (async-critic mode), now that
-            # the verdict has landed. No-op when the turn recorded inline.
-            self._flush_stashed_lesson_outcome(
-                trajectory_id, outcome == _Outcome.PASSED.value)
             # spawn_bg: strong ref + warning-level failure logging + shutdown
             # drain — a GC'd or silently-failed backfill loses the corpus
             # outcome with no trace (same rule as the user-correction path).
@@ -6337,6 +6402,37 @@ class GhostAgent:
     # The late verdict (_backfill_trajectory_outcome) drains it. Bounded so a
     # stream of never-verdicted turns can't grow it without limit.
     _SURFACED_TRIG_STASH_MAX = 256
+
+    # Minimum TOTAL per-domain observations before the competence profile
+    # is injected into the prompt — below this the percentages are
+    # small-n noise the planner shouldn't anchor on.
+    _COMPETENCE_MIN_OBS = 20
+
+    def _surfaced_lesson_triggers(self, sm, turn_id: str = "") -> list:
+        """Every lesson trigger that entered THIS turn's prompt, across BOTH
+        injection surfaces: the ### SKILL PLAYBOOK block
+        (``skill_memory.last_playbook_triggers``) and the MemoryBus skill
+        tier (fused survivors with ``source == "skill"``). The outcome arms
+        used to read only the former, so a lesson surfacing exclusively via
+        the bus kept riding failing turns invisibly. Applies the same
+        turn_id guard as the hydration judge so a foreign turn's stash
+        can't contaminate attribution. Order-preserving dedup."""
+        out = []
+        try:
+            if sm is not None:
+                out.extend(
+                    t for t in (getattr(sm, "last_playbook_triggers", []) or []) if t)
+            bus = getattr(self.context, "memory_bus", None)
+            stash = getattr(bus, "last_hydration", None) if bus is not None else None
+            if stash and not (turn_id and stash.get("turn_id")
+                              and stash["turn_id"] != str(turn_id)):
+                for it in stash.get("survivors") or []:
+                    if isinstance(it, dict) and it.get("source") == "skill" \
+                            and it.get("trigger"):
+                        out.append(it["trigger"])
+        except Exception:
+            pass
+        return list(dict.fromkeys(out))
 
     async def _record_lesson_outcomes(self, *, surfaced_triggers,
                                       execution_failure_count,
@@ -7515,8 +7611,15 @@ class GhostAgent:
                 # budget hits zero and every whole-file read is refused with
                 # the summarize-first steer (ranged reads stay exempt).
                 try:
+                    # Occupancy must include the per-turn INJECTION block
+                    # (schemas + briefing + hydration + scratchpad), not just
+                    # history: at ~80% history alone the real prompt already
+                    # overflows once ~24k of injection is composed on top, so
+                    # a whole-file read filling the "20% headroom" overshot.
+                    # Reuse the same reserve _history_budget subtracts.
                     _occ = _estimate_messages_tokens(messages)
-                    _headroom = int(max(0, 0.80 * _mc - _occ) * 3.5)
+                    _inj = min(_INJECTION_RESERVE_TOKENS, max(0, _mc - 32000))
+                    _headroom = int(max(0, 0.80 * _mc - _occ - _inj) * 3.5)
                     _cap = min(_cap, _headroom)
                 except Exception:
                     pass
@@ -8498,6 +8601,21 @@ class GhostAgent:
                     # per-request work_log event — the write-back that
                     # finally makes interactive (incl. post-DONE debugging)
                     # work visible to future turns.
+                    if (_res_is_error and fname in (
+                            "execute", "browser", "vision_analysis",
+                            "file_system")
+                            and getattr(self.context,
+                                        "current_project_id", None)):
+                        # Count FAILED work-tool calls too — see the
+                        # accumulator init: all-failure turns must still
+                        # produce a work_log row.
+                        try:
+                            _wft = getattr(self.context,
+                                           "_project_work_failed_tools", None)
+                            if isinstance(_wft, dict):
+                                _wft[fname] = _wft.get(fname, 0) + 1
+                        except Exception:
+                            pass
                     if not _res_is_error and fname and getattr(
                             self.context, "current_project_id", None):
                         try:
@@ -9213,7 +9331,7 @@ class GhostAgent:
 
     async def _write_project_work_log_safe(
             self, *, last_user_content, final_ai_content,
-            execution_failure_count, verifier_backfill=None):
+            execution_failure_count, verifier_backfill=None, req_id=None):
         """Write ONE bounded project work_log event for a turn that did
         real work (mutated files / ran work tools) while a project was
         bound, then clear the per-turn accumulators. Records request head,
@@ -9225,14 +9343,71 @@ class GhostAgent:
         drain (2026-07-20 H1: streamed forced-final turns bypass finalize,
         so this MUST also run there or streamed project turns leave no
         work_log — re-opening the "agent forgets project work" gap).
+
+        ``req_id``: when given AND a matching request-tagged snapshot was
+        captured under the semaphore (streamed path), read the project
+        state from the SNAPSHOT rather than live self.context — the drain
+        runs after semaphore release, so live reads race a concurrent
+        turn's reconcile. On the snapshot path we do NOT clear the live
+        accumulators (they belong to whoever owns the context now).
         Non-fatal.
         """
         try:
-            _wl_pid = getattr(self.context, "current_project_id", None)
+            _snap = None
+            _pend = getattr(self.context, "_project_work_pending", None)
+            if (req_id is not None and isinstance(_pend, tuple)
+                    and len(_pend) == 2 and _pend[0] == req_id):
+                _snap = _pend[1]
+                try:
+                    self.context._project_work_pending = None
+                except Exception:
+                    pass
+            _using_snapshot = _snap is not None
             _wl_store = getattr(self.context, "project_store", None)
-            _wl_files = getattr(self.context, "_project_work_files", None) or set()
-            _wl_tools = getattr(self.context, "_project_work_tools", None) or {}
-            if _wl_pid and _wl_store is not None and (_wl_files or _wl_tools):
+            if _using_snapshot:
+                _wl_pid = _snap.get("pid")
+                _wl_files = set(_snap.get("files") or set())
+                _wl_tools = dict(_snap.get("tools") or {})
+                _wl_failed = dict(_snap.get("failed") or {})
+                _wl_cmds = list(_snap.get("cmds") or [])
+                _wl_failure_texts = list(_snap.get("failure_texts") or [])
+            else:
+                _wl_pid = getattr(self.context, "current_project_id", None)
+                _wl_files = getattr(self.context, "_project_work_files", None) or set()
+                _wl_tools = getattr(self.context, "_project_work_tools", None) or {}
+                _wl_failed = getattr(
+                    self.context, "_project_work_failed_tools", None) or {}
+                _wl_cmds = list(getattr(self.context, "_project_work_cmds", None) or [])
+                _wl_failure_texts = list(getattr(self.context, "_turn_failure_texts", None) or [])
+            if _wl_pid and _wl_store is not None and (
+                    _wl_files or _wl_tools or _wl_failed):
+                # Relevance gate (2026-07-26): a project-bound conversation
+                # serves off-topic interludes too ("get me the news") — a
+                # successful execute alone must not journal them into the
+                # project (live: the lead work_log row on a DONE project was
+                # a news-feed curl, topping its resume briefing). Files
+                # touched = relevant by construction (they live in the
+                # project tree); a command naming the project dir counts;
+                # otherwise require a significant token shared between the
+                # request and the project's title/task text.
+                if not _wl_files and not self._request_relevant_to_project(
+                        _wl_store, _wl_pid, last_user_content, cmds=_wl_cmds):
+                    logger.debug(
+                        "work_log skipped: off-project interlude (%.60s)",
+                        str(last_user_content or ""))
+                    if not _using_snapshot:
+                        try:
+                            self.context._project_work_files = set()
+                            self.context._project_work_tools = {}
+                            self.context._project_work_failed_tools = {}
+                        except Exception:
+                            pass
+                    return
+                # Fold failed counts into the recorded tool map with an
+                # explicit marker so the briefing distinguishes "ran 3x"
+                # from "failed 3x".
+                for _ft, _fc in _wl_failed.items():
+                    _wl_tools[f"{_ft}_failed"] = _fc
                 if verifier_backfill is not None:
                     _wl_outcome = f"verifier:{verifier_backfill[0]}"
                 elif execution_failure_count > 0:
@@ -9249,9 +9424,7 @@ class GhostAgent:
                         from .failure_dimension import (
                             classify_failure_dimension, failure_dim_enabled)
                         if failure_dim_enabled():
-                            _parts = list(getattr(
-                                self.context, "_turn_failure_texts",
-                                None) or [])[-3:]
+                            _parts = list(_wl_failure_texts)[-3:]
                             if (verifier_backfill is not None
                                     and verifier_backfill[0] == "failed"):
                                 _parts.insert(
@@ -9272,22 +9445,61 @@ class GhostAgent:
                     request=last_user_content or "",
                     files=list(_wl_files),
                     tools=dict(_wl_tools),
-                    commands=list(getattr(self.context,
-                                          "_project_work_cmds", None) or []),
+                    commands=list(_wl_cmds),
                     outcome=_wl_outcome,
                     note=final_ai_content or "",
                     failure_dimension=_wl_dim,
                 )
                 # Consumed — a queued follow-up in the same process must
-                # not re-attribute this request's work.
-                try:
-                    self.context._project_work_files = set()
-                    self.context._project_work_tools = {}
-                    self.context._turn_failure_texts = []
-                except Exception:
-                    pass
+                # not re-attribute this request's work. On the snapshot
+                # path the live accumulators belong to whoever owns the
+                # context now, so we must NOT clear them here.
+                if not _using_snapshot:
+                    try:
+                        self.context._project_work_files = set()
+                        self.context._project_work_tools = {}
+                        self.context._project_work_failed_tools = {}
+                        self.context._turn_failure_texts = []
+                    except Exception:
+                        pass
         except Exception as e:
             logger.debug(f"project work-log write skipped: {type(e).__name__}: {e}")
+
+    def _request_relevant_to_project(self, store, project_id, request,
+                                     cmds=None) -> bool:
+        """True when `request` plausibly concerns `project_id`: shares a
+        significant token with the project title or its task descriptions,
+        or an accumulated command names the project's directory. Fail-OPEN
+        (True) on any store error — the gate exists to drop obvious
+        off-topic interludes, not to risk losing real work records.
+
+        ``cmds``: the command list to check; the streamed drain passes its
+        request-tagged snapshot rather than the (possibly-reassigned) live
+        self.context accumulator."""
+        try:
+            req_tokens = {
+                t for t in re.findall(
+                    r"[a-z0-9]+", str(request or "").lower())
+                if len(t) > 3}
+            if not req_tokens:
+                return False
+            _cmds = cmds if cmds is not None else (
+                getattr(self.context, "_project_work_cmds", None) or [])
+            for _cmd in _cmds:
+                if project_id and str(project_id) in str(_cmd):
+                    return True
+            proj = store.get_project(project_id) or {}
+            hay = str(proj.get("title") or "") + " " + str(proj.get("description") or "")
+            try:
+                for t in store.list_tasks(project_id) or []:
+                    hay += " " + str(t.get("description") or "")
+            except Exception:
+                pass
+            hay_tokens = {
+                t for t in re.findall(r"[a-z0-9]+", hay.lower()) if len(t) > 3}
+            return bool(req_tokens & hay_tokens)
+        except Exception:
+            return True
 
     async def _finalize_and_return(self, fs: "FinalizeState"):
         """The post-turn-loop finalization chain — output scrubbers,
@@ -9899,9 +10111,10 @@ class GhostAgent:
         # spine below, so present-on-failure is actually recorded.
         try:
             await self._record_lesson_outcomes(
-                surfaced_triggers=(
-                    list(getattr(sm, "last_playbook_triggers", []) or [])
-                    if sm is not None else []),
+                # BOTH injection surfaces (playbook block + bus skill tier) —
+                # bus-only lessons were invisible to the FAILURE arm.
+                surfaced_triggers=self._surfaced_lesson_triggers(
+                    sm, turn_id=str(req_id or "")),
                 execution_failure_count=execution_failure_count,
                 verifier_backfill=verifier_backfill,
                 trajectory_id=current_trajectory_id,
@@ -9920,144 +10133,15 @@ class GhostAgent:
         # are represented. `_calib_pending` is set only when a
         # reading was computed this turn, so we never record a
         # stale cross-turn pair.
-        try:
-            _ct = getattr(self.context, "calibration_tracker", None)
-            _pending = getattr(self.context, "_calib_pending", None)
-            # The stash is (req_id, reading): accept only a reading this
-            # request produced. A cross-request leftover (an overlapping
-            # streamed turn's drain fired after our turn-start reset)
-            # falls through to the compute-now path below, which pairs
-            # THIS turn's own signals with THIS turn's outcome.
-            if isinstance(_pending, tuple) and len(_pending) == 2:
-                _pending = _pending[1] if _pending[0] == req_id else None
-            # Finalization fallback (the load-bearing path in practice):
-            # most turns never enter the streaming
-            # is_final_generation+stream_response branch where the
-            # entropy/confidence path lives, so _pending is usually None
-            # here. Compute the reading NOW — logprob-optional: neutral
-            # entropy term, competence + verbalised uncertainty drive it
-            # — so calibration records on EVERY full-loop metacog turn
-            # (and the arbiter bundle gets a reading via record_confidence).
-            if _pending is None and _ct is not None:
-                try:
-                    _mc = getattr(self.context, "metacog", None)
-                    if (_mc is not None and getattr(_mc, "enabled", False)
-                            and getattr(_mc, "confidence", None) is not None
-                            and getattr(_mc, "competence", None) is not None):
-                        _last_tool = ""
-                        for _t in reversed(tools_run_this_turn or []):
-                            if isinstance(_t, dict) and _t.get("name"):
-                                _last_tool = _t["name"]
-                                break
-                        from .metacog import _domain_for_tool
-                        _dom = _domain_for_tool(_last_tool or "")
-                        _p = _mc.competence.estimate(_dom, _last_tool or None)
-                        _n = _mc.competence.observations(_dom, _last_tool or None)
-                        _upress = 0.0
-                        try:
-                            _ut = getattr(self.context, "uncertainty_tracker", None)
-                            if _ut is not None:
-                                _upress = _ut.pressure()
-                        except Exception:
-                            _upress = 0.0
-                        # Objective outcome penalty: a REFUTED verdict or
-                        # an unverified mutation (both surface as
-                        # verifier_backfill[0]=="failed") is ground truth
-                        # that THIS answer is wrong/unconfirmed. Without
-                        # it the reading is ≈ competence, so a historically
-                        # strong domain reports high confidence on a build
-                        # the verifier just rejected (the req_44/C0
-                        # "below=no on broken work" failure). 0.8 reliably
-                        # pulls a 0.92–0.96 competence reading below the
-                        # 0.89 threshold.
-                        # Budget exhaustion counts as an objective negative
-                        # too: the reply is flagged working-state/PARTIAL, so
-                        # a 0.9+ confidence reading on it is exactly the
-                        # verification theater the 2026-07-25 audit flagged
-                        # (broken migration shipped at C=0.99 on a 40/40 turn).
-                        _outcome_penalty = (
-                            0.8 if ((verifier_backfill
-                                     and verifier_backfill[0] == "failed")
-                                    or getattr(fs, "turn_budget_exhausted", False))
-                            else 0.0
-                        )
-                        _pending = _mc.confidence.score(
-                            normalised_entropy=0.5,
-                            competence_p_success=_p,
-                            n_observations=_n,
-                            uncertainty_pressure=_upress,
-                            outcome_penalty=_outcome_penalty,
-                        )
-                        self.context.last_confidence = _pending
-                        try:
-                            _mc.record_confidence(_pending)
-                            _mc.count(confidence_total=True,
-                                      confidence_below=_pending.below_threshold)
-                        except Exception:
-                            pass
-                        from .metacog_log import (
-                            emit as _mc_emit, Subsystem as _mc_ss,
-                            LEVEL_INFO, LEVEL_DEBUG,
-                        )
-                        _mc_emit(
-                            _mc_ss.CONF,
-                            level=(LEVEL_INFO if _pending.below_threshold else LEVEL_DEBUG),
-                            below=_pending.below_threshold, C=_pending.composite,
-                            entropy=_pending.entropy_component,
-                            competence=_pending.competence_component,
-                            n=_n, domain=_dom, tool=_last_tool or None,
-                            src="finalize", threshold=_pending.threshold,
-                        )
-                except Exception as _cfx:
-                    logger.debug("finalize confidence compute failed: %s", _cfx)
-            if _ct is not None and _pending is not None:
-                # Outcome from the signals available THIS turn: a
-                # structural tool failure OR a verifier REFUTED verdict
-                # (≥0.7 → verifier_backfill[0]=="failed") is a negative.
-                # Without a real negative source, free-form chat turns
-                # are almost all "clean" → single-class → the fit bails;
-                # the verifier verdict is what gives calibration its
-                # "confidently wrong" examples.
-                _verifier_failed = bool(
-                    verifier_backfill and verifier_backfill[0] == "failed"
-                )
-                _calib_outcome = (
-                    0.0 if (execution_failure_count > 0 or _verifier_failed
-                            or getattr(fs, "turn_budget_exhausted", False))
-                    else 1.0
-                )
-                await asyncio.to_thread(
-                    _ct.record,
-                    composite=_pending.composite,
-                    entropy_component=_pending.entropy_component,
-                    competence_component=_pending.competence_component,
-                    uncertainty_pressure=getattr(_pending, "uncertainty_pressure", 0.0),
-                    outcome=_calib_outcome,
-                )
-                # Stash the components keyed by this response's
-                # fingerprint so a NEXT-turn user-correction can record
-                # a (C, 0.0) negative for this turn — the strongest
-                # "confidently wrong" calibration signal (the user is
-                # the cheapest supervisor for free-form chat).
-                try:
-                    from collections import OrderedDict as _OD
-                    _cc = getattr(self.context, "_recent_calib_for_correction", None)
-                    if _cc is None:
-                        _cc = _OD()
-                        self.context._recent_calib_for_correction = _cc
-                    _cc[self._response_fingerprint(final_ai_content or "")] = {
-                        "composite": _pending.composite,
-                        "entropy_component": _pending.entropy_component,
-                        "competence_component": _pending.competence_component,
-                        "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
-                    }
-                    while len(_cc) > 32:
-                        _cc.popitem(last=False)
-                except Exception:
-                    pass
-                self.context._calib_pending = None
-        except Exception as _calx:
-            logger.debug("calibration record failed: %s", _calx)
+        await self._record_calibration_safe(
+            req_id=req_id,
+            tools_run=tools_run_this_turn,
+            verifier_backfill=verifier_backfill,
+            execution_failure_count=execution_failure_count,
+            budget_exhausted=bool(getattr(fs, "turn_budget_exhausted", False)),
+            final_ai_content=final_ai_content,
+        )
+
 
         # Surface critical unknowns/assumptions tracked during this
         # turn. The UncertaintyTracker is a shared per-process
@@ -10506,6 +10590,164 @@ class GhostAgent:
             pass
         return final_ai_content, created_time, req_id
 
+
+    async def _record_calibration_safe(self, *, req_id, tools_run,
+                                       verifier_backfill,
+                                       execution_failure_count,
+                                       budget_exhausted, final_ai_content):
+        """Record ONE calibration sample pairing this turn's confidence
+        reading with its realized outcome. Extracted from the finalize
+        chain (2026-07-26) so the STREAMED drain can call it too — the
+        streamed path returns the SSE generator before _finalize_and_return
+        runs, so it recorded ZERO samples, biasing the fit to the
+        non-streaming subset AND (since only the streamed path produces
+        real logprob entropy) leaving every recorded sample at the neutral
+        0.5 entropy the finalize fallback hardcodes — making w_entropy
+        unlearnable. Never raises."""
+        try:
+            _ct = getattr(self.context, "calibration_tracker", None)
+            _pending = getattr(self.context, "_calib_pending", None)
+            # The stash is (req_id, reading): accept only a reading this
+            # request produced. A cross-request leftover (an overlapping
+            # streamed turn's drain fired after our turn-start reset)
+            # falls through to the compute-now path below, which pairs
+            # THIS turn's own signals with THIS turn's outcome.
+            if isinstance(_pending, tuple) and len(_pending) == 2:
+                _pending = _pending[1] if _pending[0] == req_id else None
+            # Finalization fallback (the load-bearing path in practice):
+            # most turns never enter the streaming
+            # is_final_generation+stream_response branch where the
+            # entropy/confidence path lives, so _pending is usually None
+            # here. Compute the reading NOW — logprob-optional: neutral
+            # entropy term, competence + verbalised uncertainty drive it
+            # — so calibration records on EVERY full-loop metacog turn
+            # (and the arbiter bundle gets a reading via record_confidence).
+            if _pending is None and _ct is not None:
+                try:
+                    _mc = getattr(self.context, "metacog", None)
+                    if (_mc is not None and getattr(_mc, "enabled", False)
+                            and getattr(_mc, "confidence", None) is not None
+                            and getattr(_mc, "competence", None) is not None):
+                        _last_tool = ""
+                        for _t in reversed(tools_run or []):
+                            if isinstance(_t, dict) and _t.get("name"):
+                                _last_tool = _t["name"]
+                                break
+                        from .metacog import _domain_for_tool
+                        _dom = _domain_for_tool(_last_tool or "")
+                        _p = _mc.competence.estimate(_dom, _last_tool or None)
+                        _n = _mc.competence.observations(_dom, _last_tool or None)
+                        _upress = 0.0
+                        try:
+                            _ut = getattr(self.context, "uncertainty_tracker", None)
+                            if _ut is not None:
+                                _upress = _ut.pressure()
+                        except Exception:
+                            _upress = 0.0
+                        # Objective outcome penalty: a REFUTED verdict or
+                        # an unverified mutation (both surface as
+                        # verifier_backfill[0]=="failed") is ground truth
+                        # that THIS answer is wrong/unconfirmed. Without
+                        # it the reading is ≈ competence, so a historically
+                        # strong domain reports high confidence on a build
+                        # the verifier just rejected (the req_44/C0
+                        # "below=no on broken work" failure). 0.8 reliably
+                        # pulls a 0.92–0.96 competence reading below the
+                        # 0.89 threshold.
+                        # Budget exhaustion counts as an objective negative
+                        # too: the reply is flagged working-state/PARTIAL, so
+                        # a 0.9+ confidence reading on it is exactly the
+                        # verification theater the 2026-07-25 audit flagged
+                        # (broken migration shipped at C=0.99 on a 40/40 turn).
+                        _outcome_penalty = (
+                            0.8 if ((verifier_backfill
+                                     and verifier_backfill[0] == "failed")
+                                    or budget_exhausted)
+                            else 0.0
+                        )
+                        _pending = _mc.confidence.score(
+                            normalised_entropy=0.5,
+                            competence_p_success=_p,
+                            n_observations=_n,
+                            uncertainty_pressure=_upress,
+                            outcome_penalty=_outcome_penalty,
+                        )
+                        self.context.last_confidence = _pending
+                        try:
+                            _mc.record_confidence(_pending)
+                            _mc.count(confidence_total=True,
+                                      confidence_below=_pending.below_threshold)
+                        except Exception:
+                            pass
+                        from .metacog_log import (
+                            emit as _mc_emit, Subsystem as _mc_ss,
+                            LEVEL_INFO, LEVEL_DEBUG,
+                        )
+                        _mc_emit(
+                            _mc_ss.CONF,
+                            level=(LEVEL_INFO if _pending.below_threshold else LEVEL_DEBUG),
+                            below=_pending.below_threshold, C=_pending.composite,
+                            entropy=_pending.entropy_component,
+                            competence=_pending.competence_component,
+                            n=_n, domain=_dom, tool=_last_tool or None,
+                            src="finalize", threshold=_pending.threshold,
+                        )
+                except Exception as _cfx:
+                    logger.debug("finalize confidence compute failed: %s", _cfx)
+            if _ct is not None and _pending is not None:
+                # Outcome from the signals available THIS turn: a
+                # structural tool failure OR a verifier REFUTED verdict
+                # (≥0.7 → verifier_backfill[0]=="failed") is a negative.
+                # Without a real negative source, free-form chat turns
+                # are almost all "clean" → single-class → the fit bails;
+                # the verifier verdict is what gives calibration its
+                # "confidently wrong" examples.
+                _verifier_failed = bool(
+                    verifier_backfill and verifier_backfill[0] == "failed"
+                )
+                _calib_outcome = (
+                    0.0 if (execution_failure_count > 0 or _verifier_failed
+                            or budget_exhausted)
+                    else 1.0
+                )
+                await asyncio.to_thread(
+                    _ct.record,
+                    # pre_penalty_composite: the prediction that did NOT
+                    # know the outcome — recording the penalized composite
+                    # made Brier/ECE read optimistically on the negative
+                    # class (the penalty is a function of the label).
+                    composite=getattr(_pending, "pre_penalty_composite",
+                                      _pending.composite),
+                    entropy_component=_pending.entropy_component,
+                    competence_component=_pending.competence_component,
+                    uncertainty_pressure=getattr(_pending, "uncertainty_pressure", 0.0),
+                    outcome=_calib_outcome,
+                )
+                # Stash the components keyed by this response's
+                # fingerprint so a NEXT-turn user-correction can record
+                # a (C, 0.0) negative for this turn — the strongest
+                # "confidently wrong" calibration signal (the user is
+                # the cheapest supervisor for free-form chat).
+                try:
+                    from collections import OrderedDict as _OD
+                    _cc = getattr(self.context, "_recent_calib_for_correction", None)
+                    if _cc is None:
+                        _cc = _OD()
+                        self.context._recent_calib_for_correction = _cc
+                    _cc[self._response_fingerprint(final_ai_content or "")] = {
+                        "composite": _pending.composite,
+                        "entropy_component": _pending.entropy_component,
+                        "competence_component": _pending.competence_component,
+                        "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
+                    }
+                    while len(_cc) > 32:
+                        _cc.popitem(last=False)
+                except Exception:
+                    pass
+                self.context._calib_pending = None
+        except Exception as _calx:
+            logger.debug("calibration record failed: %s", _calx)
+
     async def handle_chat(self, body: Dict[str, Any], background_tasks, request_id: Optional[str] = None):
         req_id = request_id or str(uuid.uuid4())[:8]
         token = request_id_context.set(req_id)
@@ -10670,6 +10912,12 @@ class GhostAgent:
                 self.context._project_work_files = set()
                 self.context._project_work_tools = {}
                 self.context._project_work_cmds = []
+                # FAILED work-tool counts (2026-07-26): an all-failure
+                # debugging turn used to write NO work_log at all — the
+                # success-only accumulators stayed empty and the writer's
+                # (files or tools) gate skipped the exact "evening of fix
+                # attempts" scenario the write-back was built for.
+                self.context._project_work_failed_tools = {}
                 # Failure-text capture for harness-dimension attribution
                 # (core/failure_dimension.py). Filled in the dispatch loop
                 # next to classify_tool_failure; classified and consumed by
@@ -10939,6 +11187,27 @@ class GhostAgent:
                             continuity_blocks.append(_uctx)
                 except Exception as e:
                     logger.debug(f"uncertainty context injection skipped: {e}")
+
+                # Competence context (phase 2.3, wired 2026-07-26). The
+                # per-domain p(success) profile was computed on every tool
+                # outcome (39 live cells) but rendered nowhere — the
+                # planner never saw its own track record. Surface it so the
+                # model can prefer a domain it's reliable in and be cautious
+                # in a weak one. Gated on >= _COMPETENCE_MIN_OBS total
+                # observations so a cold profile doesn't inject noisy
+                # small-n percentages. Non-fatal.
+                try:
+                    _mc_comp = getattr(self.context, 'metacog', None)
+                    _comp = getattr(_mc_comp, 'competence', None) if _mc_comp is not None else None
+                    if _comp is not None and hasattr(_comp, 'get_context_string'):
+                        _roll = _comp.by_domain()
+                        _total_n = sum(n for _, n in _roll.values()) if _roll else 0
+                        if _total_n >= self._COMPETENCE_MIN_OBS:
+                            _cctx = _comp.get_context_string()
+                            if isinstance(_cctx, str) and _cctx:
+                                continuity_blocks.append(_cctx)
+                except Exception as e:
+                    logger.debug(f"competence context injection skipped: {e}")
 
                 # Graduated-skill injection (proposal item #9). Surface
                 # auto-acquired, verification-passed tool sequences that
@@ -12380,6 +12649,27 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _corr_banner = self._take_active_correction()
                         _body_prefix = final_ai_content.strip() + "\n\n" if final_ai_content.strip() else ""
                         stream_prefix = _corr_banner + _body_prefix
+
+                        # Snapshot the project-work state NOW, under the
+                        # semaphore, tagged with this request's id. The SSE
+                        # drain runs AFTER the semaphore is released, so if it
+                        # read current_project_id / the work accumulators live
+                        # (as _write_project_work_log_safe does), a concurrent
+                        # turn B's reconcile could have re-pointed the project
+                        # and reset the accumulators — filing A's work under
+                        # B's project and wiping B's in-flight accumulation.
+                        # Same req_id-tag guard the calibration stash uses.
+                        try:
+                            self.context._project_work_pending = (req_id, {
+                                "pid": getattr(self.context, "current_project_id", None),
+                                "files": set(getattr(self.context, "_project_work_files", None) or set()),
+                                "tools": dict(getattr(self.context, "_project_work_tools", None) or {}),
+                                "failed": dict(getattr(self.context, "_project_work_failed_tools", None) or {}),
+                                "cmds": list(getattr(self.context, "_project_work_cmds", None) or []),
+                                "failure_texts": list(getattr(self.context, "_turn_failure_texts", None) or []),
+                            })
+                        except Exception:
+                            self.context._project_work_pending = None
 
                         ss = StreamState(
                             created_time=created_time,
@@ -14491,6 +14781,12 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # SSE stream closed with nothing in it. Emit a
             # synthetic fallback so the user sees SOMETHING
             # actionable instead of an empty bubble.
+            # Effective visible content = what the user actually received.
+            # Defaults to full_content; overwritten with the fallback text
+            # when the whole reply was scrubbed tool-XML, so the trajectory
+            # corpus stores the ANSWER the user saw, not tag-soup (which
+            # then trained the self-improvement loop on garbage).
+            _stream_effective_content = full_content
             if (
                 _stream_scrub_active
                 and full_content.strip()
@@ -14528,6 +14824,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 # request that already succeeded.
                 _fallback_text = _scrub_fallback_message(
                     _intended, _proj_task_closed_this_req)
+                # Record the fallback sentence as the turn's answer (what the
+                # user saw), not the stripped tool-XML in full_content.
+                _stream_effective_content = (stream_prefix + _fallback_text) if stream_prefix else _fallback_text
                 _fallback_chunk = {
                     "id": f"chatcmpl-{req_id}",
                     "object": "chat.completion.chunk",
@@ -14746,16 +15045,41 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # consumer → SkillMemory.learn_lesson, leaking
                     # auto-extracted lessons into the playbook on
                     # every complex/failing turn.
-                    if getattr(self.context, 'journal', None) and self.context.args.smart_memory > 0.0:
-
+                    # post_mortem shares the SAME gates as the episode write
+                    # below and the non-streaming site (10030): smart_memory
+                    # > 0.0 AND not forget_was_called. Without the forget
+                    # guard, a streamed `forget` turn queued a post_mortem →
+                    # phase-1 consumer → learn_lesson, resurrecting the
+                    # forgotten content as a playbook lesson (tombstone
+                    # resurrection) on the COMMON streaming path — the same
+                    # vector the episode write already closed.
+                    if (getattr(self.context, 'journal', None)
+                            and self.context.args.smart_memory > 0.0
+                            and not forget_was_called):
                         await self._journal_append_safe('post_mortem', {'user': last_user_content, 'tools': stream_tools_snapshot, 'ai': full_content, 'model': stream_model})
-                    await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
+                    if self.context.args.smart_memory > 0.0 and not forget_was_called:
+                        await self._record_episode_safe(last_user_content, stream_tools_snapshot, full_content)
 
             # Post-turn hydration usefulness judge (fire-and-
             # forget, worker-hosted) — every finalized turn,
             # matching the non-streaming site.
             self._judge_hydration_safe(
                 full_content, turn_id=str(req_id or ""))
+
+            # Peek the request-tagged project snapshot for the pid BEFORE
+            # the work_log call consumes it — the late-refute follow-up
+            # filing below also runs in this drain (after semaphore
+            # release) and must file against THIS turn's project, not a
+            # concurrent turn's re-pointed current_project_id.
+            _drain_pid = None
+            try:
+                _dp = getattr(self.context, "_project_work_pending", None)
+                if isinstance(_dp, tuple) and len(_dp) == 2 and _dp[0] == req_id:
+                    _drain_pid = (_dp[1] or {}).get("pid")
+                else:
+                    _drain_pid = getattr(self.context, "current_project_id", None)
+            except Exception:
+                _drain_pid = getattr(self.context, "current_project_id", None)
 
             # Streamed-turn trajectory + work_log (2026-07-20 H1).
             # A streamed forced-final turn RETURNS the SSE
@@ -14774,11 +15098,15 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # and backfills the outcome by `current_trajectory_id`,
             # so pass verifier=None here.
             try:
-                if (isinstance(full_content, str)
-                        and full_content.strip()):
+                # Record the EFFECTIVE visible content (the fallback text
+                # when the reply was all scrubbed tool-XML), never tag-soup.
+                _traj_content = locals().get(
+                    "_stream_effective_content", full_content) or full_content
+                if (isinstance(_traj_content, str)
+                        and _traj_content.strip()):
                     self._record_turn_trajectory(
                         messages=messages,
-                        final_content=full_content,
+                        final_content=_traj_content,
                         req_id=req_id,
                         model=model,
                         trajectory_id=current_trajectory_id,
@@ -14800,6 +15128,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 final_ai_content=full_content,
                 execution_failure_count=execution_failure_count,
                 verifier_backfill=None,
+                req_id=req_id,
+            )
+
+            # Calibration sample — same reason as the trajectory/work_log
+            # re-runs above: the streamed path returns before
+            # _finalize_and_return, so this was NEVER recorded on the common
+            # (web-UI) path, biasing the fit to non-streaming turns and
+            # starving it of the real-logprob entropy only the stream path
+            # produces (the finalize fallback hardcodes 0.5). The streamed
+            # reading was stashed as _calib_pending=(req_id, reading);
+            # verifier is late here so pass verifier_backfill=None (a late
+            # REFUTE re-pairs via the correction-negative path).
+            await self._record_calibration_safe(
+                req_id=req_id,
+                tools_run=stream_tools_snapshot,
+                verifier_backfill=None,
+                execution_failure_count=execution_failure_count,
+                budget_exhausted=False,
+                final_ai_content=full_content,
             )
 
             # --- VERIFIER GATE (STREAM), 2026-07-18 ---
@@ -14879,8 +15226,7 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         _sv_task, current_trajectory_id,
                         stream_conv_fp,
                         force_correction=True,
-                        project_id=getattr(
-                            self.context, "current_project_id", None))
+                        project_id=_drain_pid)
                     pretty_log(
                         "Verifier",
                         "stream gate: verdict deferred — "
@@ -14932,9 +15278,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # via _backfill_trajectory_outcome.
             try:
                 await self._record_lesson_outcomes(
-                    surfaced_triggers=(
-                        list(getattr(sm, "last_playbook_triggers", []) or [])
-                        if sm is not None else []),
+                    # BOTH injection surfaces — see the finalize-path call.
+                    surfaced_triggers=self._surfaced_lesson_triggers(
+                        sm, turn_id=str(req_id or "")),
                     execution_failure_count=execution_failure_count,
                     verifier_backfill=None,
                     trajectory_id=current_trajectory_id,
@@ -15062,33 +15408,76 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         was always empty and the MemoryBus's episodic RAG tier returned
         nothing. This populates it from the turn's tool sequence + outcome.
         Never raises — episodic logging is secondary to the turn.
+
+        ``context`` and ``cluster_id`` are populated cheaply (NO extra LLM
+        call on the finalize path): all 165 live episodes had them empty, so
+        search_recoveries could only weigh the outcome text, consolidation
+        grouped everything as ``general``, and every injected episode line
+        rendered a bare ``[]`` tag.
         """
         em = getattr(self.context, "episodic_memory", None)
         if em is None:
             return
         try:
+            from .metacog import _domain_for_tool
             actions = []
+            _fail_tools = []
+            _first_real_tool = ""
             for t in (tools or []):
                 if not isinstance(t, dict):
                     continue
                 content = str(t.get("content", ""))
+                _ok = not content.lstrip().startswith(
+                    ("Error", "ERROR", "SYSTEM ERROR", "[SYSTEM ERROR]", "Traceback"))
+                _name = t.get("name", "unknown")
                 actions.append({
-                    "tool": t.get("name", "unknown"),
+                    "tool": _name,
                     "args": {},  # post_mortem entries keep result, not args
                     "result": content,
-                    "success": not content.lstrip().startswith(
-                        ("Error", "ERROR", "SYSTEM ERROR", "[SYSTEM ERROR]", "Traceback")
-                    ),
+                    "success": _ok,
                 })
+                if _name not in ("unknown", ""):
+                    if not _first_real_tool:
+                        _first_real_tool = _name
+                    if not _ok:
+                        _fail_tools.append(_name)
             ai_head = str(ai_text or "")[:80].lower()
             success = bool(ai_text) and "error" not in ai_head and "failed" not in ai_head
+
+            # cluster_id: the domain of the FIRST substantive tool
+            # (shell/code/fetch/fs/sql/memory/vision/other) — aligns
+            # episodic grouping with the competence taxonomy and gives
+            # consolidation a real key instead of "general".
+            cluster_id = _domain_for_tool(_first_real_tool) if _first_real_tool else ""
+
+            # context: a compact machine-readable trace — the tool chain and
+            # any FAILED-then-recovered signal. search_recoveries scans this
+            # (plus outcome) for recovery markers, so naming the tools that
+            # failed en route to a success is what makes a turn detectable as
+            # a recovery worth reusing.
+            _chain = " → ".join(
+                f"{a['tool']}{'' if a['success'] else '(FAILED)'}"
+                for a in actions[:8]) or "no tools"
+            _ctx_parts = [f"tools: {_chain}"]
+            if _fail_tools and success:
+                _ctx_parts.append(
+                    "recovered after failures in: " + ", ".join(
+                        dict.fromkeys(_fail_tools)))
+            _turn_fails = list(getattr(
+                self.context, "_turn_failure_texts", None) or [])[:2]
+            if _turn_fails:
+                _ctx_parts.append("errors: " + " | ".join(
+                    str(f)[:120] for f in _turn_fails))
+            context = " ; ".join(_ctx_parts)[:2000]
+
             await asyncio.to_thread(
                 em.record_episode,
                 trigger=str(user_text or "")[:500],
-                context="",
+                context=context,
                 actions=actions,
                 outcome=str(ai_text or "")[:1000],
                 success=success,
+                cluster_id=cluster_id,
                 # Index the episode into the vector store so the MemoryBus's
                 # episodic tier can recall it semantically, not just by
                 # substring (feature 1C — previously a dormant ingestion gap).
@@ -15140,6 +15529,66 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             )
             pretty_log("Internal Learning", "Saved optimization strategy to playbook.", icon=Icons.MEM_SAVE)
         return p_msg
+
+    @staticmethod
+    def _reconstruct_tool_calls(msgs):
+        """Pair every assistant tool_call with the tool response that
+        follows it. By tool_call_id when present; for id-LESS native calls,
+        by the k-th call of a name → the k-th result of that name (two
+        same-named id-less calls used to collide on `name`, dropping one
+        result → the Signal-3 repeated-error counter undercounted).
+        Returns a list of ToolCall objects with .result / .error set."""
+        from ..distill.schema import ToolCall
+        tool_calls = []
+        pending_calls = {}       # key -> (name, args, ToolCall)
+        _call_seq: dict = {}
+        _result_seq: dict = {}
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role")
+            if role == "assistant":
+                for tc in (m.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    name = str(fn.get("name") or tc.get("name") or "").strip()
+                    args_raw = fn.get("arguments")
+                    args = {}
+                    if isinstance(args_raw, str):
+                        try:
+                            args = json.loads(args_raw)
+                        except Exception:
+                            args = {"_raw": args_raw[:500]}
+                    elif isinstance(args_raw, dict):
+                        args = args_raw
+                    _tid = tc.get("id")
+                    if not _tid:
+                        _k = _call_seq.get(name, 0)
+                        _call_seq[name] = _k + 1
+                        _tid = f"__noid__:{name}:{_k}"
+                    pending_calls[_tid] = (name, args, ToolCall(name=name, arguments=args))
+                    tool_calls.append(pending_calls[_tid][2])
+            elif role == "tool":
+                tc_id = m.get("tool_call_id")
+                if not tc_id:
+                    _rn = str(m.get("name") or "").strip()
+                    _k = _result_seq.get(_rn, 0)
+                    _result_seq[_rn] = _k + 1
+                    tc_id = f"__noid__:{_rn}:{_k}"
+                entry = pending_calls.get(tc_id)
+                if entry is not None:
+                    _n, _a, obj = entry
+                    obj.result = str(m.get("content") or "")[:4000]
+                    try:
+                        from ..distill.outcome_heuristics import (
+                            _looks_like_tool_error, _normalize_tool_error,
+                        )
+                        if _looks_like_tool_error(obj.result):
+                            obj.error = _normalize_tool_error(obj.result)
+                    except Exception:
+                        pass
+        return tool_calls
 
     def _record_turn_trajectory(
         self,
@@ -15199,52 +15648,8 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             # the caller couldn't supply the real request.
             user_request = fallback_user_request
 
-        # Reconstruct tool call pairs. Walk the messages left-to-right;
-        # every assistant with tool_calls gets paired with the tool
-        # responses that follow it (by tool_call_id when present).
-        tool_calls = []
-        pending_calls = {}  # id -> (name, arguments)
-        for m in msgs:
-            if not isinstance(m, dict):
-                continue
-            role = m.get("role")
-            if role == "assistant":
-                for tc in (m.get("tool_calls") or []):
-                    if not isinstance(tc, dict):
-                        continue
-                    fn = tc.get("function") or {}
-                    name = str(fn.get("name") or tc.get("name") or "").strip()
-                    args_raw = fn.get("arguments")
-                    args: dict = {}
-                    if isinstance(args_raw, str):
-                        try:
-                            args = json.loads(args_raw)
-                        except Exception:
-                            args = {"_raw": args_raw[:500]}
-                    elif isinstance(args_raw, dict):
-                        args = args_raw
-                    pending_calls[tc.get("id") or name] = (name, args, ToolCall(name=name, arguments=args))
-                    tool_calls.append(pending_calls[tc.get("id") or name][2])
-            elif role == "tool":
-                tc_id = m.get("tool_call_id") or m.get("name")
-                entry = pending_calls.get(tc_id)
-                if entry is not None:
-                    _n, _a, obj = entry
-                    obj.result = str(m.get("content") or "")[:4000]
-                    # Populate the STRUCTURED error flag on the chat path too
-                    # (previously only self-play/batch set it, so the outcome
-                    # heuristics had to regex-sniff result TEXT and missed
-                    # atypical shapes — e.g. native-tools corruption). A short
-                    # normalized signature is enough for the repeated-error
-                    # counter; the full text stays in `result`.
-                    try:
-                        from ..distill.outcome_heuristics import (
-                            _looks_like_tool_error, _normalize_tool_error,
-                        )
-                        if _looks_like_tool_error(obj.result):
-                            obj.error = _normalize_tool_error(obj.result)
-                    except Exception:
-                        pass
+        # Reconstruct tool call pairs (extracted 2026-07-26 for testability).
+        tool_calls = self._reconstruct_tool_calls(msgs)
 
         # Final response content. Non-string (streaming generator) is
         # logged as empty — the stream path gets richer tool-call data
@@ -15507,11 +15912,43 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 except Exception as e:
                     logger.debug(f"Hypothesis prelude skipped: {e}")
 
+            # Past-recovery context. This closes the System-3 loop that was
+            # built on BOTH ends but connected on neither: search_recoveries
+            # had zero production callers and SYSTEM_3_EPISODIC_CONTEXT was
+            # referenced nowhere, so every crisis pivot ignored how past
+            # crises were actually survived. Best-effort, bounded.
+            recovery_hint = ""
+            _epi = getattr(self.context, "episodic_memory", None)
+            if _epi is not None and hasattr(_epi, "search_recoveries"):
+                try:
+                    _recs = await asyncio.to_thread(
+                        _epi.search_recoveries, error_context, 3,
+                        getattr(self.context, "memory_system", None))
+                    if _recs:
+                        from .prompts import SYSTEM_3_EPISODIC_CONTEXT
+                        _lines = [
+                            f"- [{_r.get('recovery_evidence', '?')}] "
+                            f"{str(_r.get('trigger') or '')[:120]} → "
+                            f"{str(_r.get('outcome') or '')[:160]}"
+                            for _r in _recs
+                        ]
+                        recovery_hint = SYSTEM_3_EPISODIC_CONTEXT.format(
+                            recovery_episodes="\n".join(_lines)) + "\n"
+                        pretty_log(
+                            "System 3 Memory",
+                            f"{len(_recs)} past recovery episode(s) informing "
+                            f"strategy generation",
+                            icon=Icons.MEM_READ,
+                        )
+                except Exception as e:
+                    logger.debug(f"System-3 recovery context skipped: {e}")
+
             # Step 1: Generate 3 distinct strategies
             pretty_log("System 3 Generator", "Analysing failure and generating alternative strategies...", icon=Icons.BRAIN_THINK)
             gen_user_msg = (
                 f"### TASK CONTEXT:\n{task_context}\n\n"
                 f"{hypotheses_hint}"
+                f"{recovery_hint}"
                 f"### ERROR CONTEXT (what failed and why):\n{error_context[:3000]}\n\n"
                 f"### CURRENT SANDBOX STATE:\n{sandbox_state[:1500]}"
             )

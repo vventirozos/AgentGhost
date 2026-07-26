@@ -54,6 +54,18 @@ class GraphMemory:
         "HAS_STATUS", "STATUS", "HAS_PID",
     }
 
+    #: Subjects too GENERIC for functional expiry to be safe. The extractor
+    #: routinely writes per-entity facts under aggregate nouns (live rows:
+    #: `project HAS_STATUS done/active/needs_user` — three DIFFERENT
+    #: projects) — expiring "all other objects of (project, HAS_STATUS)"
+    #: would erase other projects' real statuses on every write. Same
+    #: rationale that kept HAS_NAME out of _FUNCTIONAL_PREDICATES entirely;
+    #: these subjects just make ANY functional predicate unsafe.
+    _EXPIRY_GENERIC_SUBJECTS = {
+        "project", "task", "app", "service", "process", "system",
+        "it", "this", "that",
+    }
+
     def __init__(self, memory_dir: Path):
         self.db_path = memory_dir / "knowledge_graph.db"
         self._lock = threading.RLock()
@@ -162,8 +174,19 @@ class GraphMemory:
         with self._lock:
             with sqlite3.connect(self.db_path) as conn:
                 for t in triplets:
+                    # Shape guard BEFORE any attribute access: LLM extractors
+                    # do emit list/tuple-shaped or `relation`-keyed triplets
+                    # (the display helper `_tri` handles both defensively).
+                    # A single malformed one used to raise AttributeError out
+                    # of the whole batch — and at the smart-memory call site
+                    # that aborted the turn's fact embed AND profile write,
+                    # since graph ingestion runs first.
+                    if not isinstance(t, dict):
+                        logger.debug("add_triplets: skipped non-dict triplet %r",
+                                     str(t)[:80])
+                        continue
                     s = t.get("subject", "")
-                    p = t.get("predicate", "")
+                    p = t.get("predicate", "") or t.get("relation", "")
                     o = t.get("object", "")
                     if not (s and p and o):
                         continue
@@ -181,7 +204,8 @@ class GraphMemory:
                         # (LIKES, KNOWS, HAS_*, OWNS, IS) are excluded: expiring
                         # those is silent data loss, not an update.
                         conflicting = []
-                        if pn in self._FUNCTIONAL_PREDICATES:
+                        if (pn in self._FUNCTIONAL_PREDICATES
+                                and sn not in self._EXPIRY_GENERIC_SUBJECTS):
                             conflicting = conn.execute(
                                 '''SELECT object FROM triplets
                                    WHERE subject = ? AND predicate = ? AND object != ?
@@ -222,8 +246,13 @@ class GraphMemory:
                         ).fetchone()
                         weight = int(row[0]) if row and row[0] is not None else 1
                         self._upsert_edge(sn, pn, on, weight)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # A dropped write deflates `added` — never silently:
+                        # multi-process access is assumed elsewhere, so
+                        # sqlite errors here are real signal.
+                        logger.warning(
+                            "add_triplets: dropped (%s %s %s): %s",
+                            sn, pn, on, e)
                 conn.commit()
         return added
 

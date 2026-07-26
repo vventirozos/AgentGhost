@@ -58,6 +58,7 @@ from .search import (
     _clean_for_cpp,
     _cache_get,
     _cache_put,
+    _norm_cache_key,
 )
 
 # --------------------------------------------------------------------------
@@ -118,6 +119,11 @@ _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
 # `_DDGS_TOR_TIMEOUT=18` comment in search.py documents for mojeek). 30s
 # clears a healthy onion engine; dead ones still fail fast on connect error.
 _ONION_TIMEOUT = 30
+
+# Marker text an engine serves when its results are JS-rendered (no
+# server-side HTML to parse). Ahmia's non-JS notice contains this; a
+# raw-HTML fetch can never extract results from such a page.
+_JS_ONLY_MARKER = "javascript"
 
 # Per-onion-page fetch ceiling during the research (deep-read) phase. Onion
 # content pages are slower still than the search engines; give them room.
@@ -355,7 +361,23 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
     # `_cap_body` could truncate it OOMs the host. Stream and stop at the cap.
     _STREAM_LIMIT = _MAX_ONION_BODY_BYTES + 4096
 
-    def _decode(buf: bytes) -> str:
+    def _decode(buf: bytes, content_type: Optional[str] = None) -> str:
+        # Honour the declared charset before falling back to utf-8. Onion
+        # sites carry a large fraction of Cyrillic/CJK content; force-utf-8
+        # decoding turned those bodies into mojibake (and BeautifulSoup,
+        # handed an already-decoded str, could no longer sniff the real
+        # charset from the meta/Content-Type). Try declared → utf-8 →
+        # latin-1 (never raises).
+        _charset = None
+        if content_type and "charset=" in content_type.lower():
+            _charset = content_type.lower().split("charset=", 1)[1].split(";")[0].strip() or None
+        for _enc in (_charset, "utf-8"):
+            if not _enc:
+                continue
+            try:
+                return buf.decode(_enc)
+            except (LookupError, UnicodeDecodeError):
+                continue
         return buf.decode("utf-8", errors="replace")
 
     def run() -> Tuple[Optional[int], str]:
@@ -380,7 +402,7 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
                     try: r.close()
                     except Exception: pass
                 return _cap_body(r.status_code, r.headers.get("content-type"),
-                                 r.headers.get("content-length"), _decode(bytes(buf)))
+                                 r.headers.get("content-length"), _decode(bytes(buf), r.headers.get("content-type")))
         except ImportError:
             import httpx
 
@@ -392,7 +414,7 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
                         if len(buf) >= _STREAM_LIMIT:
                             break
                     return _cap_body(r.status_code, r.headers.get("content-type"),
-                                     r.headers.get("content-length"), _decode(bytes(buf)))
+                                     r.headers.get("content-length"), _decode(bytes(buf), r.headers.get("content-type")))
 
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(_ONION_EXECUTOR, run)
@@ -467,6 +489,24 @@ async def _query_engine(
                             icon=Icons.TOOL_DARKWEB,
                         )
                         return parsed
+                    # 200 but ZERO parseable results. This was silent — a
+                    # broken/JS-only engine looked identical to "no onion
+                    # index has this query," so the tool blamed the query.
+                    # Ahmia now serves a JS-only template (all results are
+                    # client-rendered), unparseable by a raw-HTML fetch —
+                    # detect and name that so the operator knows to set
+                    # GHOST_ONION_ENGINES to a working engine.
+                    _js_only = _JS_ONLY_MARKER in body.lower()
+                    pretty_log(
+                        "Darkweb Engine Empty",
+                        f"{engine['name']}: HTTP 200 but 0 parseable results"
+                        + (" — engine serves a JS-only page (no non-JS "
+                           "results; set GHOST_ONION_ENGINES to a working "
+                           "engine)" if _js_only
+                           else f" ({len(body)} bytes; parser found no onion "
+                                "links — engine format may have drifted)"),
+                        level="WARNING", icon=Icons.WARN,
+                    )
             except Exception as e:  # noqa: BLE001
                 pretty_log(
                     "Darkweb Engine Error",
@@ -607,7 +647,7 @@ async def tool_darkweb_search(
     tor_proxy = _normalize_tor_proxy(tor_proxy)
     pretty_log("Darkweb Search", query, icon=Icons.TOOL_DARKWEB)
 
-    cache_key = "onion::" + (query or "").strip().lower()
+    cache_key = "onion::" + _norm_cache_key(query)
     cached = _cache_get(cache_key)
     if cached is not None:
         return cached

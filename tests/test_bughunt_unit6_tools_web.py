@@ -222,10 +222,7 @@ class TestHelperFetchParams:
                             lambda *a, **k: renewed.__setitem__("count", renewed["count"] + 1))
         monkeypatch.setattr(helpers, "url_ssrf_reason", lambda u, **k: None)
 
-        class _Resp:
-            status_code = 503
-            headers = {}
-            text = ""
+        from tests.conftest import make_streaming_resp
 
         class _Session:
             def __init__(self, *a, **k):
@@ -238,7 +235,7 @@ class TestHelperFetchParams:
                 return False
 
             async def get(self, *a, **k):
-                return _Resp()
+                return make_streaming_resp(503, "")
 
         import types
         fake_curl = types.SimpleNamespace(requests=types.SimpleNamespace(AsyncSession=_Session))
@@ -249,4 +246,4 @@ class TestHelperFetchParams:
             "http://example.com", proxy_override="socks5://127.0.0.1:9050", renew_identity=False,
         )
         assert "503" in out
-        assert renewed["count"] == 0  # NEWNYM suppressed
+        assert renewed["count"] == 0  # NEWNYM / daemon restart suppressed

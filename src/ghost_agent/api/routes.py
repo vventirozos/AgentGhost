@@ -601,6 +601,27 @@ async def chat_proxy(request: Request, background_tasks: BackgroundTasks):
         "done": True, "created_at": get_utc_timestamp()
     })
 
+def _scratchpad_snapshot(sp) -> dict:
+    """Namespace-preserving scratchpad snapshot for session export.
+
+    Prefers the lock-held `export_state()` (real Scratchpad); degrades to
+    the legacy flat `_data` read for scratchpad-like doubles that only
+    carry `_data` (and returns {} when neither yields a dict)."""
+    if sp is None:
+        return {}
+    try:
+        state = sp.export_state()
+        if isinstance(state, dict):
+            return state
+    except Exception:
+        pass
+    try:
+        flat = dict(getattr(sp, "_data", {}) or {})
+        return flat if isinstance(flat, dict) else {}
+    except Exception:
+        return {}
+
+
 @router.post("/api/workspace/save", dependencies=[Security(verify_api_key)])
 async def save_workspace(request: Request):
     """Packages the current chat history, scratchpad, and sandbox into a downloadable zip."""
@@ -630,7 +651,11 @@ async def save_workspace(request: Request):
     chat_history = body.get("chat_history", [])
     session_data = {
         "chat_history": chat_history,
-        "scratchpad": dict(agent.context.scratchpad._data) if getattr(agent.context, 'scratchpad', None) else {}
+        # export_state(): lock-held, namespace-preserving snapshot — the
+        # raw _data read raced live mutation and lost scope tags. Falls
+        # back to the legacy flat read for scratchpad-like test doubles
+        # that only carry `_data`.
+        "scratchpad": _scratchpad_snapshot(getattr(agent.context, 'scratchpad', None))
     }
     sandbox_dir = agent.context.sandbox_dir
 
@@ -809,8 +834,10 @@ async def load_workspace(request: Request, file: UploadFile = File(...)):
                 if getattr(agent.context, 'scratchpad', None):
                     agent.context.scratchpad.clear()
                     if isinstance(scratchpad_data, dict):
-                        for k, v in scratchpad_data.items():
-                            agent.context.scratchpad.set(k, v)
+                        # Namespace-preserving restore (handles the legacy
+                        # flat shape too — those land in the GLOBAL scope,
+                        # not whatever namespace is currently active).
+                        agent.context.scratchpad.restore_state(scratchpad_data)
 
             # 3. Extract files.
             for zip_info in zip_ref.infolist():

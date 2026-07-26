@@ -112,6 +112,10 @@
   </ul>
   <p>Macros persist to <code>composed_skills.json</code> under <code>memory_dir</code>, so they survive sandbox wipes (same rationale as acquired skills).</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Mint safety:</strong> <code>compile_from_pattern</code> now sanitizes names into legal identifiers (graduation-minted names arrived DOTTED — live: <code>auto.generic.…c73e69</code> reached the registry in violation of this module's own contract) and NO-OPs when the name already exists — re-graduation of the same candidate used to re-register unconditionally, demoting an operator-APPROVED macro back to "proposed" (vanishing from the tool list) and wiping its stats. <code>register()</code> itself merges-not-demotes as belt-and-braces. <strong>Shadowing both directions:</strong> composed defs now shadow against the FULL acquired-skill registry, not just the defs routed this turn (routing could filter the acquired def out, advertising the composed schema while dispatch ran the acquired runner). <strong>Approve message tells the truth about params:</strong> graduation-minted macros carry EMPTY templates (tool order only) — the blanket "params were mined from past calls" claim now only appears when templates exist. Tests: <code>::TestComposedMintSafety</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

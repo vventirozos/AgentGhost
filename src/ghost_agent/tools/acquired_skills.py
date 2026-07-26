@@ -24,10 +24,13 @@ _SAFE_SKILL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 
 
 def _list_composed_skills(memory_dir) -> list:
-    """(name, description) for each composed skill (a named macro), read from
-    the ComposedSkillRegistry's JSON so a single ``manage_skills(action=list)``
-    returns the COMPLETE custom-skill inventory (acquired + composed), not just
-    acquired (2026-07-15). Best-effort: returns [] on any problem."""
+    """(name, description, status) for each composed skill (a named macro),
+    read from the ComposedSkillRegistry's JSON so a single
+    ``manage_skills(action=list)`` returns the COMPLETE custom-skill
+    inventory (acquired + composed), not just acquired (2026-07-15).
+    Status is included so proposed (non-dispatchable) macros aren't
+    presented as callable in the authoritative inventory. Best-effort:
+    returns [] on any problem."""
     if not memory_dir:
         return []
     try:
@@ -41,7 +44,8 @@ def _list_composed_skills(memory_dir) -> list:
                 continue
             out.append((str(name),
                         str(sd.get("trigger_description")
-                            or sd.get("description") or "")))
+                            or sd.get("description") or ""),
+                        str(sd.get("status") or "active")))
         return out
     except Exception:
         return []
@@ -156,6 +160,32 @@ class AcquiredSkillManager:
                     f"Acquired-skills migration failed (non-fatal): "
                     f"{type(e).__name__}: {e}"
                 )
+
+    # Process-wide shared instances, one per base directory. Every call
+    # site used to construct a FRESH manager — each with its own RLock —
+    # so the lock never actually serialized anything across callers and
+    # two concurrent telemetry writes could interleave load→mutate→save,
+    # losing a failure_count increment (§4B). Keyed by resolved base path
+    # so tests with distinct tmp dirs stay isolated.
+    _SHARED: dict = {}
+    _SHARED_LOCK = threading.Lock()
+
+    @classmethod
+    def get_shared(cls, base_dir, memory_system=None, legacy_sandbox_dir=None):
+        """Return the process-wide manager for ``base_dir`` (creating it on
+        first use). A later caller supplying a real ``memory_system`` when
+        the cached instance has none upgrades it in place — boot ordering
+        means some early callers pass None."""
+        key = str(Path(base_dir).resolve())
+        with cls._SHARED_LOCK:
+            inst = cls._SHARED.get(key)
+            if inst is None:
+                inst = cls(base_dir, memory_system,
+                           legacy_sandbox_dir=legacy_sandbox_dir)
+                cls._SHARED[key] = inst
+            elif memory_system is not None and inst.memory_system is None:
+                inst.memory_system = memory_system
+            return inst
 
     def _migrate_from_legacy_sandbox(self, legacy_sandbox_dir: Path):
         """Move skills from ``<legacy_sandbox_dir>/acquired_skills/``
@@ -295,8 +325,15 @@ class AcquiredSkillManager:
                     "description": description,
                     "parameters_schema": parameters_schema,
                     "usage_count": existing.get("usage_count", 0),
-                    "failure_count": existing.get("failure_count", 0),
-                    "status": existing.get("status", "active"),
+                    # A REWRITE (changed content) that reached this point
+                    # passed TDD — it must start clean. Carrying the old
+                    # status/streak forward made "re-create it via
+                    # create_skill" a lie: the rebuilt skill reported
+                    # success yet stayed degraded (invisible) forever.
+                    "failure_count": (existing.get("failure_count", 0)
+                                      if content_unchanged else 0),
+                    "status": (existing.get("status", "active")
+                               if content_unchanged else "active"),
                     "content_hash": new_hash,
                 }
 
@@ -316,9 +353,11 @@ class AcquiredSkillManager:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to drop stale embedding for skill '{name}': {e}")
+                from ..utils.helpers import get_utc_timestamp
                 self.memory_system.add(
                     description,
-                    {"type": "acquired_skill", "name": name}
+                    {"type": "acquired_skill", "name": name,
+                     "timestamp": get_utc_timestamp()}
                 )
                 
             logger.info(f"Successfully saved acquired skill: {name}")
@@ -346,6 +385,16 @@ class AcquiredSkillManager:
                 
                 if success:
                     skill["failure_count"] = 0
+                    # A success must also clear "degraded" — resetting only
+                    # the counter left the status flag set forever: the
+                    # skill vanished from defs AND runners, yet could never
+                    # retire (retirement keyed on the now-zero counter) —
+                    # a permanent zombie no path could revive.
+                    if skill.get("status") == "degraded":
+                        skill["status"] = "active"
+                        pretty_log("Skill Recovered",
+                                   f"Acquired tool '{name}' succeeded — degraded flag cleared.",
+                                   icon=Icons.OK)
                     logger.debug(f"Telemetry success logged for skill '{name}'")
                 else:
                     skill["failure_count"] += 1
@@ -363,14 +412,15 @@ class AcquiredSkillManager:
         """Auto-archive skills that are degraded and underused.
 
         A skill qualifies for retirement when EITHER condition holds:
-        * ``failure_count >= 3`` AND ``failure_count`` represents the
-          CURRENT consecutive-failure streak (we use the same counter that
-          ``log_telemetry`` resets to 0 on success, so any nonzero value
-          IS a consecutive streak — the old "5 + <10 uses" rule was too
-          permissive and let chronically-broken skills linger).
-        * OR ``failure_count >= 5`` AND ``usage_count < 10`` (legacy rule:
-          tool has been failing repeatedly AND isn't valuable enough to
-          warrant manual fixing).
+        * ``failure_count >= 3`` — the CURRENT consecutive-failure streak
+          (``log_telemetry`` resets the counter to 0 on success, so any
+          nonzero value IS a streak). The old second rule
+          (``failure_count >= 5 and usage_count < 10``) was dead code —
+          ``>= 3`` always fired first — and has been dropped.
+        * OR ``status == "degraded"`` — belt-and-braces for legacy
+          registry entries whose flag was set while the counter was later
+          reset (the pre-2026-07-26 zombie state); current code clears the
+          flag on success, so this only matches genuinely stuck entries.
 
         Retired skills are moved to a ``retired/`` subdirectory and removed
         from the active registry and vector store, but their code is
@@ -384,13 +434,10 @@ class AcquiredSkillManager:
             to_retire = []
             for name, info in registry.items():
                 failure_count = info.get("failure_count", 0)
-                usage_count = info.get("usage_count", 0)
                 # `failure_count` resets to 0 on every successful call (see
                 # `log_telemetry`), so a nonzero value here is the current
                 # consecutive-failure streak.
-                consecutive_streak = failure_count >= 3
-                low_value_chronic = failure_count >= 5 and usage_count < 10
-                if consecutive_streak or low_value_chronic:
+                if failure_count >= 3 or info.get("status") == "degraded":
                     to_retire.append(name)
 
             if not to_retire:
@@ -620,6 +667,33 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         return "SYSTEM ERROR: 'name', 'description', 'parameters_schema', 'python_code', and 'test_payload' are MANDATORY."
     import json
     from .execute import tool_execute
+
+    # Cross-namespace shadow check (the composed-skill `define` path has
+    # had the mirror-image check for months — this side was missing). A
+    # builtin-named skill is persisted fine but permanently shadow-skipped
+    # on both defs and runners, while the tool reports "It is now LIVE" —
+    # false; a macro-named skill silently steals the macro's dispatch.
+    try:
+        from .registry import TOOL_DEFINITIONS as _BUILTIN_DEFS
+        _builtin = {d.get("function", {}).get("name") for d in _BUILTIN_DEFS}
+        if name in _builtin:
+            return (f"Skill creation failed: '{name}' is a BUILT-IN tool name. "
+                    f"A skill with this name would never be advertised or "
+                    f"dispatched. Pick a distinct name.")
+        from .composed_skills import _registry_from_context as _creg
+        class _Ctx:  # minimal context shim for the registry cache helper
+            pass
+        _c = _Ctx()
+        _c.memory_dir = memory_dir
+        _c.sandbox_dir = sandbox_dir
+        _reg = _creg(_c)
+        if _reg is not None and name in getattr(_reg, "skills", {}):
+            return (f"Skill creation failed: '{name}' is an existing COMPOSED "
+                    f"skill (macro). Creating an acquired skill with the same "
+                    f"name would advertise one tool and execute another. Pick "
+                    f"a distinct name or delete the macro first.")
+    except Exception as _shadow_err:
+        logger.debug("skill shadow check skipped: %s", _shadow_err)
     
     try:
         schema_dict = json.loads(parameters_schema)
@@ -673,7 +747,15 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
         args=[test_payload]
     )
     
-    if "EXIT CODE: 0" not in execution_result or "(Process executed successfully, but no output was printed to stdout" in execution_result:
+    # Parse the FIRST exit-code banner (the harness's own), not a substring:
+    # a failing test whose stdout happens to echo "EXIT CODE: 0" (e.g. a
+    # skill that wraps subprocess runs and prints their banners) passed the
+    # old `"EXIT CODE: 0" in result` check despite exiting 1. Mirrors the
+    # regex classification in registry._acquired_skill_result_class.
+    import re as _re
+    _exit_m = _re.search(r"EXIT CODE:\s*(\d+)", str(execution_result))
+    _tdd_passed = bool(_exit_m and _exit_m.group(1) == "0")
+    if not _tdd_passed or "(Process executed successfully, but no output was printed to stdout" in execution_result:
         try:
             test_file.unlink()
         except Exception:
@@ -707,7 +789,7 @@ async def tool_create_skill(sandbox_dir: Path = None, memory_dir: Path = None, m
     # for very old callers that never threaded `memory_dir` in — that
     # keeps legacy tests passing while new code uses the safe path.
     storage_base = Path(memory_dir) if memory_dir is not None else Path(sandbox_dir)
-    mgr = AcquiredSkillManager(storage_base, memory_system, legacy_sandbox_dir=sandbox_dir)
+    mgr = AcquiredSkillManager.get_shared(storage_base, memory_system, legacy_sandbox_dir=sandbox_dir)
     # Persist the NORMALIZED body (CDATA-stripped, entities decoded)
     # rather than the raw LLM input, so the canonical .py file on
     # disk always parses. Future loaders that read the skill back
@@ -743,7 +825,7 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
         return "SYSTEM ERROR: The 'action' parameter is MANDATORY. You must specify it."
     action = str(action).strip().lower()
     storage_base = Path(memory_dir) if memory_dir is not None else Path(sandbox_dir)
-    mgr = AcquiredSkillManager(storage_base, memory_system, legacy_sandbox_dir=sandbox_dir)
+    mgr = AcquiredSkillManager.get_shared(storage_base, memory_system, legacy_sandbox_dir=sandbox_dir)
     # Close the degraded-skill retirement loop: a skill that failed 3× is
     # flagged "degraded" but then excluded from advertising/dispatch, so
     # log_telemetry can never fire for it again and nothing else called
@@ -767,11 +849,19 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
         if skills:
             parts.append("Acquired skills (custom Python tools):")
             for name, info in skills.items():
-                parts.append(f"- {name}: {info.get('description', '')}")
+                # Status marker: this listing is the AUTHORITATIVE inventory
+                # the model answers from — presenting a degraded (not
+                # advertised, not dispatchable) skill as callable made the
+                # model invoke names that have no runner.
+                _status = info.get("status", "active")
+                _tag = "" if _status == "active" else f" [{_status.upper()} — not callable]"
+                parts.append(f"- {name}{_tag}: {info.get('description', '')}")
         if composed:
             parts.append("Composed skills (named macros):")
-            for name, desc in composed:
-                parts.append(f"- {name}: {desc}")
+            for name, desc, cstatus in composed:
+                _tag = ("" if cstatus == "active"
+                        else " [PROPOSED — approve via manage_composed_skills before use]")
+                parts.append(f"- {name}{_tag}: {desc}")
         if not parts:
             body = "No custom skills have been acquired or composed yet."
         else:

@@ -70,6 +70,28 @@ class _NullCM:
     def __enter__(self): return self
     def __exit__(self, *a): return False
 
+
+# Types the `forget` sweeps must NEVER delete as collateral: ingested
+# document chunks (deleting one guts a manual the library index still
+# lists) and episode/skill/acquired-skill twins (deleting one orphans its
+# JSON-side record and breaks that store's semantic recall). Conversational
+# fact types (auto/identity/manual/synthesis/…) remain forgettable — that
+# is the tool's job.
+_FORGET_PROTECTED_TYPES = ["document", "episode", "skill", "acquired_skill"]
+
+
+def _bus_write_failures(report) -> list:
+    """Subsystem entries in a `publish_fact` report that actually FAILED
+    (skip/dedup are normal outcomes). The bus swallows exceptions into the
+    report by design; callers that then discard the report turn a total
+    write failure into 'SUCCESS' — the legacy path's PARTIAL contract must
+    survive the bus migration."""
+    if not isinstance(report, dict):
+        return []
+    return sorted(
+        f"{k}: {v}" for k, v in report.items()
+        if isinstance(v, str) and v.startswith("error"))
+
 async def tool_remember(text: str = None, memory_system=None, graph_memory=None, llm_client=None, model_name="default", memory_bus=None):
     """Insert a new fact. When a `memory_bus` is supplied the commit is
     dispatched through `publish_fact("insert_fact", ...)` so the tool stays
@@ -115,11 +137,15 @@ async def tool_remember(text: str = None, memory_system=None, graph_memory=None,
             # extract-and-add-triplets in a background task (where
             # is_background=True is finally correct — a fire-and-forget task,
             # not something the turn awaits, so it can't self-deadlock).
-            await memory_bus.publish_fact("insert_fact", {
+            _report = await memory_bus.publish_fact("insert_fact", {
                 "text": text,
                 "metadata": {"timestamp": get_utc_timestamp(), "type": "manual"},
                 "triplets": [],
             })
+            _fails = _bus_write_failures(_report)
+            if _fails:
+                return (f"PARTIAL: memory write had failures — "
+                        f"{'; '.join(_fails)}. The fact may not be retrievable.")
 
             graph = getattr(memory_bus, "graph", None) or graph_memory
             if llm_client is not None and graph is not None:
@@ -279,6 +305,15 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
                     file_path = resolved_file_path
                     filename = str(file_path.relative_to(sandbox_dir))
                     pretty_log("KB Auto-Resolve", filename, icon=Icons.OK)
+                    # Re-check the library under the RESOLVED name: the
+                    # pre-check above ran on the raw argument, so
+                    # ingest_document('postgresql-manual') sailed past it,
+                    # resolved to 'postgresql-manual.pdf', and re-extracted
+                    # + re-embedded an already-ingested 3k-page manual
+                    # (hours of CPU; content-hashed ids mean no duplication,
+                    # just pure wasted work).
+                    if filename in current_library:
+                        return f"Skipped: '{filename}' is already in KB."
                 else:
                     return f"Error: File '{filename}' not found. Check list_files to see the exact name."
             except:
@@ -416,7 +451,8 @@ async def tool_gain_knowledge(filename: str = None, sandbox_dir: Path = None, me
     except Exception as e: return f"Embedding Error: {e}"
 
     try: await asyncio.to_thread(memory_system._update_library_index, filename, "add")
-    except: pass
+    except asyncio.CancelledError: raise
+    except Exception as e: logger.warning("library-index add failed for %s: %s", filename, e)
 
     # Generate a document-level summary for broad retrieval.
     # When users ask "what's in document X?" or "summarize the report",
@@ -507,7 +543,10 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
     try:
         # Use a higher limit for initial search, then filter strictly
         results = await asyncio.to_thread(memory_system.search_advanced, query, limit=10)
-    except: return "Error: Memory retrieval failed."
+    except asyncio.CancelledError:
+        raise  # a cancelled turn must propagate, not read as "recall failed"
+    except Exception:
+        return "Error: Memory retrieval failed."
 
     valid_chunks = []
     for res in results:
@@ -555,7 +594,10 @@ async def tool_recall(query: str = None, memory_system=None, graph_memory=None, 
                 edges = await asyncio.to_thread(graph_memory.get_neighborhood, words, 15)
                 if edges:
                     valid_chunks.insert(0, "### TOPOLOGICAL GRAPH EDGES:\n" + "\n".join(edges))
-            except: pass
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug("recall graph tier skipped: %s", e)
             
     if valid_chunks:
         out = f"SYSTEM: Found {len(valid_chunks)} highly relevant memories.\n\n" + "\n\n".join(valid_chunks)
@@ -750,7 +792,16 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
 
         def _semantic_sweep():
             with memory_system._get_lock() if hasattr(memory_system, "_get_lock") else _NullCM():
-                cand = memory_system.collection.query(query_texts=[target], n_results=20)
+                # Scope the sweep to CONVERSATIONAL fact types. Unscoped,
+                # the top-20 nearest pool is ~97% ingested document chunks
+                # (live store), and the literal-mention override below
+                # deletes regardless of distance — forgetting a word that
+                # appears in a manual silently gutted the document (library
+                # index still listed it; dedup then refused re-ingest), and
+                # episode/skill twins deleted here orphan their JSON side.
+                cand = memory_system.collection.query(
+                    query_texts=[target], n_results=20,
+                    where={"type": {"$nin": _FORGET_PROTECTED_TYPES}})
                 deleted_local = 0
                 hits = []
                 if cand.get('ids'):
@@ -759,6 +810,8 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
                         mem_id = cand['ids'][0][i]
                         meta = cand['metadatas'][0][i] or {}
                         m_type = meta.get('type', 'auto')
+                        if m_type in _FORGET_PROTECTED_TYPES:
+                            continue  # belt-and-braces vs the where scope
                         semantic_threshold = 0.8 if m_type == 'auto' else 0.6
                         # LITERAL-MENTION OVERRIDE: the distance threshold
                         # silently missed facts that name the target outright
@@ -878,12 +931,19 @@ async def tool_unified_forget(target: str = None, sandbox_dir: Path = None, memo
         try:
             def _literal_sweep(_t=extra):
                 with memory_system._get_lock() if hasattr(memory_system, "_get_lock") else _NullCM():
-                    cand = memory_system.collection.query(query_texts=[_t], n_results=20)
+                    # Same type scope as the primary sweep — see
+                    # _FORGET_PROTECTED_TYPES above.
+                    cand = memory_system.collection.query(
+                        query_texts=[_t], n_results=20,
+                        where={"type": {"$nin": _FORGET_PROTECTED_TYPES}})
                     n = 0
                     if cand.get('ids'):
                         for i in range(len(cand['ids'][0])):
                             doc_text = cand['documents'][0][i]
                             mem_id = cand['ids'][0][i]
+                            meta = (cand.get('metadatas') or [[]])[0][i] or {}
+                            if meta.get('type') in _FORGET_PROTECTED_TYPES:
+                                continue
                             if _value_mentions_target(doc_text, str(_t).strip().lower()):
                                 memory_system.collection.delete(ids=[mem_id])
                                 n += 1
@@ -1029,7 +1089,7 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
     # --- BUS-AWARE PATH ---
     if memory_bus is not None:
         clean_key = str(key).upper().replace(" ", "_")
-        await memory_bus.publish_fact("update_profile", {
+        _report = await memory_bus.publish_fact("update_profile", {
             "text": f"User {key} is {value}",
             "metadata": {"timestamp": get_utc_timestamp(), "type": "identity"},
             "profile_update": {"category": category, "key": key, "value": value},
@@ -1039,6 +1099,10 @@ async def tool_update_profile(category: str = None, key: str = None, value: str 
                 "object": str(value).lower(),
             }],
         })
+        _fails = _bus_write_failures(_report)
+        if _fails:
+            return (f"PARTIAL: Profile update had failures — "
+                    f"{'; '.join(_fails)}. Retrieval may not reflect the change.")
         return f"SUCCESS: Profile updated."
 
     # --- LEGACY DIRECT PATH ---
@@ -1114,9 +1178,13 @@ async def tool_learn_skill(task: str = None, mistake: str = None, solution: str 
 
     # --- BUS-AWARE PATH ---
     if memory_bus is not None:
-        await memory_bus.publish_fact("learn_skill", {
+        _report = await memory_bus.publish_fact("learn_skill", {
             "skill": {"task": task, "mistake": mistake, "solution": solution},
         })
+        _fails = _bus_write_failures(_report)
+        if _fails:
+            return (f"PARTIAL: lesson write had failures — "
+                    f"{'; '.join(_fails)}. It may not be in the playbook.")
         return "SUCCESS: Lesson learned and saved to the Skill Playbook and Vector Memory."
 
     # --- LEGACY DIRECT PATH ---

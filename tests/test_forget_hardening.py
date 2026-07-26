@@ -37,7 +37,11 @@ class FakeCollection:
         # docs: list of (id, text, meta)
         self.docs = {d[0]: (d[1], d[2]) for d in docs}
 
-    def query(self, query_texts=None, n_results=10):
+    def query(self, query_texts=None, n_results=10, where=None):
+        # `where` accepted to mirror real Chroma (the 2026-07-26 sweep
+        # scoping passes {"type": {"$nin": [...]}}); this fake's docs are
+        # all conversational types, so the filter is a no-op here — the
+        # per-row belt check in the sweep covers type exclusion tests.
         ids = list(self.docs.keys())[:n_results]
         # Deliberately HIGH distance so only the literal-mention override can
         # trigger a delete — proves we're not just riding the threshold.

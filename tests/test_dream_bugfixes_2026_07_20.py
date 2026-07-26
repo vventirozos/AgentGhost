@@ -161,14 +161,22 @@ class TestReadOnlySkillMemoryWhitelist:
         real = context.skill_memory
         real.get_playbook_context.reset_mock()
         real.get_playbook_context.return_value = "PLAYBOOK"
-        real.last_playbook_triggers = ["lesson-a", "lesson-b"]
+        # 2026-07-26: unstamped calls publish on the SIM side-channel
+        # (last_sim_triggers) so the operator turn's last_playbook_triggers
+        # attribution record is never touched mid-turn.
+        real.last_sim_triggers = ["lesson-a", "lesson-b"]
+        real.last_playbook_triggers = ["operator-turn-record"]
 
         assert sm.get_playbook_context("query") == "PLAYBOOK"
         # Reads must stay pure: the real method bumps retrieval
-        # counters unless the keyword-only flag is off.
+        # counters unless the keyword-only flag is off, and must not
+        # stamp the operator attribution side-channel.
         assert real.get_playbook_context.call_args.kwargs.get(
             "record_retrievals") is False
+        assert real.get_playbook_context.call_args.kwargs.get(
+            "stamp_triggers") is False
         assert sm.hydrated_triggers == ["lesson-a", "lesson-b"]
+        assert real.last_playbook_triggers == ["operator-turn-record"]
 
         # The bus path surfaces post-fusion triggers via
         # record_retrievals_bulk — captured (deduped), not written.

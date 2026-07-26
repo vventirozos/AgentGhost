@@ -876,7 +876,18 @@ class VectorMemory:
         None (an explicit "what do you know about X" stays best-effort)."""
         selection = self._search_selection(query, inject_identity)
         if min_relevance_dist is not None and selection:
-            best = min((it.get("dist", 99.0) for it in selection), default=99.0)
+            # Gate on QUERY-batch distances only. Identity-batch items carry
+            # distance to the canned profile probe ("User's profile. User's
+            # name. …"), not to the user's query — with them in the min(),
+            # any query containing an identity trigger word (" i ", "my ",
+            # "who"…) defeated the off-topic gate and the whole 0.44-0.58
+            # noise tail got injected. No query-batch candidates at all =
+            # no on-topic match = inject nothing.
+            best = min(
+                (it.get("dist", 99.0) for it in selection
+                 if not it.get("from_identity_probe")),
+                default=99.0,
+            )
             if best > min_relevance_dist:
                 return []
         return [
@@ -1005,11 +1016,17 @@ class VectorMemory:
                         is_identity_type = m_type == "identity"
                         is_synthesis = m_type == "synthesis"
 
+                        # Genuine NAME statements only. The old net also
+                        # matched "user's" / "user is" — ordinary prose
+                        # across ALL types (live: 28 rows incl. skill,
+                        # synthesis and auto), each handed p_score -20
+                        # (effectively absolute rank over a dist-0.1 exact
+                        # match), the loosest gate (1.5 relaxed) and a false
+                        # **[MASTER SUMMARY]** render label. Identity-typed
+                        # prose still ranks via is_identity_type (-10).
                         is_name_memory = (
                             "name is" in doc_lower or
-                            "call me" in doc_lower or
-                            "user's" in doc_lower or
-                            "user is" in doc_lower
+                            "call me" in doc_lower
                         )
 
                         if is_name_memory:
@@ -1056,7 +1073,13 @@ class VectorMemory:
                                 "dist": dist,
                                 "type": m_type,
                                 "p_score": priority_score,
-                                "timestamp": timestamp
+                                "timestamp": timestamp,
+                                # Which probe produced this distance: batch 0
+                                # under identity injection measures distance
+                                # to the CANNED identity string, not to the
+                                # user's query — the bus's off-topic gate
+                                # must not treat that as query relevance.
+                                "from_identity_probe": is_identity_batch,
                             })
                             seen_docs.add(doc)
 

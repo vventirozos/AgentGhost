@@ -673,12 +673,29 @@ async def advance_once(
     # advancer's round-robin can now sequence project chains.
     _deps = ((proj.get("metadata") or {}).get("depends_on_projects") or [])
     for _dep in _deps:
-        _dp = store.get_project(_dep) or {}
-        if str(_dp.get("status", "")).upper() not in ("DONE", "RELEASED"):
-            return AdvanceResult(
-                True, None, "blocked",
-                f"waiting on dependency project "
-                f"'{_dp.get('title') or _dep}' ({_dp.get('status') or 'missing'})")
+        _dp = store.get_project(_dep)
+        _dep_status = str((_dp or {}).get("status", "")).upper()
+        if _dep_status in ("DONE", "RELEASED"):
+            continue
+        # A dependency that can NEVER become DONE must not block forever
+        # (the inter-project mirror of the intra-project rule that treats an
+        # unknown dep id as satisfied "so a bad reference can't deadlock the
+        # whole plan", planning.deps_satisfied). Missing (deleted), ARCHIVED
+        # and FAILED are terminal-unsatisfiable — clear the block and warn
+        # loudly rather than freezing the dependent's autoadvance silently.
+        if _dp is None or _dep_status in ("ARCHIVED", "FAILED"):
+            logger.warning(
+                "project %s depends on %s which is %s — treating the stale "
+                "dependency as cleared so autoadvance is not deadlocked; "
+                "remove it via set_dependency if intentional.",
+                project_id, _dep, _dep_status or "missing")
+            continue
+        # Recoverable states (PAUSED / NEEDS_USER / BLOCKED / ACTIVE /
+        # PENDING) legitimately still block — the dependency may complete.
+        return AdvanceResult(
+            True, None, "blocked",
+            f"waiting on dependency project "
+            f"'{(_dp or {}).get('title') or _dep}' ({_dep_status or 'missing'})")
 
     budget = _get_budget(store, project_id)
     if budget["used"] >= budget["cap"]:
@@ -1042,6 +1059,19 @@ async def advance_once(
 
     plan.update_status(nxt.id, TaskStatus.DONE,
                        result=result_summary, actual_tool=tool_name)
+    # update_status(DONE) silently DEMOTES the leaf to FAILED when a
+    # postcondition isn't satisfied (planning.py). Read the resulting
+    # status so the event log / work_log / dream digest record what
+    # actually happened — logging "completed" on a postcondition-failed
+    # task corrupted the operator's "what did I do last night" ledger.
+    _final_status = TaskStatus.DONE
+    try:
+        _node_after = plan.tree.nodes.get(nxt.id)
+        if _node_after is not None:
+            _final_status = _node_after.status
+    except Exception:
+        pass
+    _step_ok = _final_status == TaskStatus.DONE
     _metacog_set_task(context, None)  # node finished → don't replan a done task
     _increment_budget(store, project_id)
     _tool_tick_secs = max(0.0, time.time() - _tick_started_at)
@@ -1056,13 +1086,20 @@ async def advance_once(
                                      "classification": classification}
     if research_path:
         step_payload["research_path"] = research_path
-    store.log_event(project_id, nxt.id, "autoadvance_step", step_payload)
-    _work_log_step(store, project_id, nxt, outcome="completed",
+    if not _step_ok:
+        step_payload["postcondition_failed"] = True
+    store.log_event(project_id, nxt.id,
+                    "autoadvance_step" if _step_ok else "autoadvance_step_failed",
+                    step_payload)
+    _work_log_step(store, project_id, nxt,
+                   outcome="completed" if _step_ok else "had_failures",
                    files=([research_path] if research_path else []),
                    tools=({tool_name: 1} if tool_name else {}),
                    note=str(result_summary or "")[:280])
-    summary = (f"advanced via {tool_name}"
-               + (f"; saved research to {research_path}" if research_path else ""))
+    summary = (
+        (f"advanced via {tool_name}" if _step_ok
+         else f"task ran via {tool_name} but a postcondition FAILED")
+        + (f"; saved research to {research_path}" if research_path else ""))
     return AdvanceResult(True, nxt.id, classification, summary, artifact_id)
 
 

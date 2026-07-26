@@ -769,6 +769,16 @@ class FrontierTracker:
                 # Per-template outcome history (proposal H): rotate out
                 # individual templates that the agent has saturated even
                 # if the parent cluster still has un-saturated siblings.
+                # Duplicate detection must precede the per-template stat
+                # block: a byte-identical re-roll (deterministic templates
+                # hash stably, live: 6/8 clusters' latest outcome is
+                # duplicate) used to inflate `templates[*].runs` — the exact
+                # mastery inflation the M7 dedup below exists to prevent,
+                # displaced one level. Duplicates still append to
+                # recent_outcomes (the saturation/decay view must see them).
+                _is_dup_run = bool(
+                    challenge_hash
+                    and challenge_hash in cluster.get("recent_hashes", []))
                 if template_key:
                     templates = cluster.setdefault("templates", {})
                     tstats = templates.setdefault(
@@ -786,7 +796,8 @@ class FrontierTracker:
                     # "Frontier record_run failed: 'runs'" (recurring on old
                     # templates only; the CLUSTER is already back-filled by
                     # _ensure_cluster, the template was the gap).
-                    tstats["runs"] = int(tstats.get("runs", 0)) + 1
+                    if not _is_dup_run:
+                        tstats["runs"] = int(tstats.get("runs", 0)) + 1
                     tstats["recent_outcomes"] = (
                         tstats.get("recent_outcomes", []) + [{
                             "passed": bool(passed),

@@ -83,8 +83,21 @@ def _engine_timeout(engine: str) -> int:
 # trip each time. Keyed on the normalized (sanitized, lower-cased) query.
 # Only SUCCESSFUL results are cached — never error strings.
 _SEARCH_CACHE_TTL = 300.0  # seconds
-_SEARCH_CACHE_MAX = 64
+# 128 (was 64): a research-heavy task fans out many queries; a small cap let
+# it evict its OWN recent results and re-pay the Tor lottery mid-task.
+_SEARCH_CACHE_MAX = 128
 _SEARCH_CACHE: Dict[str, Tuple[float, str]] = {}
+
+
+def _norm_cache_key(query: str) -> str:
+    """Normalize a query into a cache key that collapses TRIVIAL variation
+    so near-duplicate queries within a task hit the cache instead of
+    re-paying the ~10%-per-exit Tor search lottery. Lower-cases, collapses
+    internal whitespace, strips surrounding punctuation, and drops a
+    trailing '?' — so 'python asyncio', 'Python  asyncio' and 'python
+    asyncio?' share one entry. Meaning-bearing tokens are untouched."""
+    q = re.sub(r"\s+", " ", (query or "").strip().lower())
+    return q.strip(" \t\n?.!,;:\"'")
 
 
 def _sanitize_query(query: str) -> str:
@@ -171,7 +184,15 @@ def _proxy_for_attempt(base_proxy: Optional[str], query: str, attempt: int,
             return base_proxy
         bare = urlunparse((p.scheme, f"{p.hostname}:{p.port or 9050}", "", "", "", ""))
         qh = hashlib.md5((query or "").encode("utf-8", "ignore")).hexdigest()[:8]
-        tbucket = int(time.monotonic() // 60)
+        # 100ms time bucket (was per-MINUTE). Per-minute meant two same-query
+        # searches fired seconds apart inside one minute (a common immediate
+        # model retry) got identical SOCKS-auth tags → the same Tor circuits
+        # → the same blocked exits, partially defeating the "fresh exits beat
+        # a block" design. 100ms is coarse enough that a synchronous wave's
+        # back-to-back calls stay on one circuit (the determinism the
+        # per-URL fetch relies on) but fine enough that a retry seconds later
+        # rides a fresh circuit.
+        tbucket = int(time.monotonic() * 10)
         return socks_url_with_identity(
             bare, f"{qh}{salt}a{attempt}n{_PROC_NONCE}t{tbucket}") or base_proxy
     except Exception:
@@ -231,10 +252,16 @@ _RACE_WAVE_GRACE = 4
 # asyncio wrapper — the thread runs its ddgs call to completion (up to the
 # full 18s timeout) — so a few concurrent waves of 6 engines saturated the
 # loop's shared to_thread pool (min(32, cpu+4)) and stalled every OTHER
-# to_thread user in the process (found 2026-07-15). Sized for 4 concurrent
-# waves; excess waves queue here instead of starving unrelated work.
+# to_thread user in the process (found 2026-07-15). This pool is ISOLATED
+# (only search-race threads), so sizing it generously can't starve
+# unrelated work. Sized for 8 concurrent waves (was 4): deep_research fans
+# out AND swarm/delegation workers each fire searches, so >4 concurrent
+# waves is realistic, and an over-subscribed wave sits QUEUED here while
+# its own 22s deadline ticks down — returning [] having made zero network
+# requests. (The deeper fix is a cancellable racer so losers don't linger
+# up to 18s each; until then, headroom is the mitigation.)
 from concurrent.futures import ThreadPoolExecutor as _TPE
-_RACE_POOL = _TPE(max_workers=len(_RACE_ENGINES) * 4,
+_RACE_POOL = _TPE(max_workers=len(_RACE_ENGINES) * 8,
                   thread_name_prefix="search-race")
 
 # Fresh per process AND per ~minute: an identical SOCKS-auth tag maps to
@@ -499,7 +526,7 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
     pretty_log("DDGS Search", query, icon=Icons.TOOL_SEARCH)
 
     # Cache hit: the model fires many near-identical queries per turn.
-    _cache_key = (query or "").strip().lower()
+    _cache_key = _norm_cache_key(query)
     _cached = _cache_get(_cache_key)
     if _cached is not None:
         return _cached
@@ -507,9 +534,14 @@ async def tool_search_ddgs(query: str, tor_proxy: str):
     def format_search_results(results: List[Dict]) -> str:
         formatted = []
         for i, res in enumerate(results, 1):
-            title = _clean_for_cpp(res.get('title', 'No Title'))
-            body = _clean_for_cpp(res.get('body', res.get('content', 'No content')))
-            link = res.get('href', res.get('url', '#'))
+            # `or` not `.get(k, default)`: a row can carry an explicit
+            # key=None (the href=None shape _filter_junk guards against),
+            # and `.get('href', …)` returns that None instead of the
+            # fallback — dropping the source link / rendering the string
+            # "None" as the body.
+            title = _clean_for_cpp(res.get('title') or 'No Title')
+            body = _clean_for_cpp(res.get('body') or res.get('content') or 'No content')
+            link = res.get('href') or res.get('url') or '#'
             formatted.append(f"### {i}. {title}\n{body}\n[Source: {link}]")
         return "\n\n".join(formatted)
 

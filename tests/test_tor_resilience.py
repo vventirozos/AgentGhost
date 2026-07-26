@@ -70,17 +70,19 @@ async def test_helper_fetch_url_content_403_no_tor_renewal():
 
 
 @pytest.mark.asyncio
-async def test_helper_fetch_url_content_retry_503_renews_tor():
+async def test_helper_fetch_url_content_retry_503_rotates_circuit():
     """503 is a network/gateway-level signal — the Tor exit node may be
-    being rate-limited or filtered. Rotation IS appropriate here.
+    rate-limited or filtered. The fetch retries on a fresh SOCKS-isolated
+    CIRCUIT (no control-port NEWNYM / daemon restart), then succeeds.
     """
+    from tests.conftest import make_streaming_resp
     mock_curl = MagicMock()
     mock_requests = MagicMock()
     mock_curl.requests = mock_requests
 
     with patch.dict("sys.modules", {"curl_cffi": mock_curl, "curl_cffi.requests": mock_requests}), \
          patch("src.ghost_agent.utils.helpers.request_new_tor_identity") as mock_renew, \
-         patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep, \
+         patch("asyncio.sleep", new_callable=AsyncMock), \
          patch("os.getenv") as mock_getenv:
 
         mock_getenv.return_value = "socks5://127.0.0.1:9050"
@@ -88,19 +90,16 @@ async def test_helper_fetch_url_content_retry_503_renews_tor():
         mock_session_instance = AsyncMock()
         mock_requests.AsyncSession.return_value.__aenter__.return_value = mock_session_instance
 
-        resp_503 = MagicMock()
-        resp_503.status_code = 503
-        resp_503.text = "Service Unavailable"
-        resp_200 = MagicMock()
-        resp_200.status_code = 200
-        resp_200.text = "<html><body>Some content</body></html>"
+        resp_503 = make_streaming_resp(503, "Service Unavailable")
+        resp_200 = make_streaming_resp(200, "<html><body>Some content</body></html>")
         mock_session_instance.get.side_effect = [resp_503, resp_200]
 
         result = await helper_fetch_url_content("http://example.com")
 
         assert "Some content" in result
-        assert mock_renew.call_count == 1
-        mock_sleep.assert_called_with(5)
+        # No daemon restart; the retry rode a rotated circuit.
+        mock_renew.assert_not_called()
+        assert mock_session_instance.get.call_count == 2
 
 @pytest.mark.asyncio
 async def test_tool_search_ddgs_retry():

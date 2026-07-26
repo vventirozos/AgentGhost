@@ -134,6 +134,10 @@
     </tbody>
   </table>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Attribution side-channel hygiene:</strong> <code>get_playbook_context</code> resets <code>last_playbook_triggers</code> UP FRONT (the empty branches returned before the stamp, so a turn with empty retrieval inherited the previous turn's lesson set — the outcome arms then booked success/failure against lessons never in its prompt), and grew <code>stamp_triggers=False</code> for non-turn callers: the dream sim and the read-only sub-agent façade now publish to a separate <code>last_sim_triggers</code> channel instead of contaminating the operator turn's record mid-turn. <strong>Credit idempotency both orderings:</strong> <code>record_helpful_retrieval</code> (async judge, lands seconds AFTER the inline pass) now honors <code>last_credited_at ≥ last_retrieved_at</code> — the guard existed only in the inline direction, so production's judge-second order double-credited (+2 helpful/turn, hit_rate inflation past the stale/prune gates). Tests: <code>::TestTriggerStampHygiene</code>, <code>::TestHelpfulCreditIdempotency</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
   <h2>Lesson quarantine + hydration side-channel (2026-07-17)</h2>
   <p><code>quarantine_lesson(trigger, reason)</code> marks matching playbook entries

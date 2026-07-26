@@ -11,6 +11,7 @@ Persisted as a JSON file alongside the other memory stores.
 import json
 import logging
 import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -47,7 +48,12 @@ class ContradictionLog:
             )
             return
         tmp = self.file_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(entries, indent=2))
+        # fsync before rename — rename alone can publish a torn/empty file
+        # on power loss (journal.py's rationale, applied to all siblings).
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(entries, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, self.file_path)
 
     def _quarantine_corrupt(self, why: str) -> list:
@@ -177,13 +183,36 @@ class ContradictionLog:
             entries = self._load()
         return entries[:limit]
 
-    def explain_belief_change(self, query: str) -> str:
-        """Search the log for contradictions related to a query term.
+    # Interrogative / filler tokens that would match every entry — the
+    # overlap matcher below must key on CONTENT words only.
+    _QUERY_STOPWORDS = frozenset({
+        "what", "whats", "when", "where", "which", "whose", "who", "whom",
+        "does", "did", "have", "has", "had", "that", "this", "these",
+        "those", "with", "about", "know", "tell", "show", "give", "still",
+        "then", "than", "them", "they", "there", "here", "will", "would",
+        "could", "should", "your", "yours", "mine", "please", "anymore",
+        "currently", "right",
+    })
 
-        Returns a human-readable explanation if found, empty string otherwise."""
+    def explain_belief_change(self, query: str) -> str:
+        """Search the log for contradictions related to a query.
+
+        Matching is significant-token overlap, not whole-string
+        containment: the production caller passes the ENTIRE user message,
+        and `"what car do i drive now?" in "user drives a bmw"` is never
+        True — the whole-substring form made this surface inert for any
+        multi-word message (it shipped 2026-07-20 precisely because it had
+        no live caller, and then never fired through the one it got).
+
+        Returns a human-readable explanation if found, empty string
+        otherwise."""
         if not query:
             return ""
         query_lower = query.lower()
+        query_tokens = {
+            t for t in re.findall(r"[a-z0-9]+", query_lower)
+            if len(t) > 3 and t not in self._QUERY_STOPWORDS
+        }
         with self._lock:
             entries = self._load()
         matches = []
@@ -192,8 +221,22 @@ class ContradictionLog:
             old_texts = " ".join(
                 s.get("text", "").lower() for s in entry.get("superseded", [])
             )
-            if query_lower in new_fact or query_lower in old_texts:
+            hay = f"{new_fact} {old_texts}"
+            # Legacy exact containment still wins (single-word queries);
+            # otherwise any significant content token shared with the
+            # revision entry counts as related.
+            if query_lower in hay:
                 matches.append(entry)
+                continue
+            if query_tokens:
+                hay_tokens = {
+                    t for t in re.findall(r"[a-z0-9]+", hay) if len(t) > 3}
+                # Prefix-tolerant overlap ("drive" ↔ "drives", "car" is
+                # too short but "coding" ↔ "code" isn't) — exact-set
+                # intersection missed trivial inflections.
+                if any(qt == ht or qt.startswith(ht) or ht.startswith(qt)
+                       for qt in query_tokens for ht in hay_tokens):
+                    matches.append(entry)
         if not matches:
             return ""
 

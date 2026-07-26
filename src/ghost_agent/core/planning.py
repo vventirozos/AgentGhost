@@ -935,16 +935,46 @@ class ProjectPlan:
                 cur = parent
             return False
 
+        def _in_dep_cycle(start_id: str) -> bool:
+            """True when following depends_on edges from start_id loops back
+            to it — i.e. start_id is part of a dependency cycle."""
+            stack = list(self.tree.nodes.get(start_id).depends_on or [])
+            seen = set()
+            while stack:
+                cur = stack.pop()
+                if cur == start_id:
+                    return True
+                if cur in seen:
+                    continue
+                seen.add(cur)
+                nd = self.tree.nodes.get(cur)
+                if nd is not None:
+                    stack.extend(nd.depends_on or [])
+            return False
+
         def deps_satisfied(node: TaskNode) -> bool:
             """Every declared prerequisite must be DONE before this task is
             eligible. Unknown dep ids (stale/typo'd) are treated as
             satisfied so a bad reference can't deadlock the whole plan;
-            a known dep in any non-DONE state holds this task back."""
+            a known dep in any non-DONE state holds this task back.
+
+            A depends_on CYCLE (A→B→A — unlike set_dependency, add_task /
+            decompose don't reject these) would leave every task in the
+            cycle permanently ineligible, so next_ready_leaf returns None
+            and advance_many reports "project_done" on a plan that still
+            holds open PENDING work. When the node is in a cycle, treat its
+            cyclic deps as satisfied (same 'a bad reference can't deadlock
+            the plan' philosophy as unknown ids) so the cycle can drain."""
+            _cyclic = _in_dep_cycle(node.id)
             for dep_id in node.depends_on or []:
                 dep = self.tree.nodes.get(dep_id)
                 if dep is None:
                     continue
                 if dep.status != TaskStatus.DONE:
+                    if _cyclic:
+                        # The dep is itself part of the cycle blocking this
+                        # node — don't let it deadlock the plan.
+                        continue
                     return False
             return True
 

@@ -157,13 +157,26 @@ class AdaptiveThreshold:
                 "window": list(self.window),
             }
             tmp = self.file_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2))
+            # fsync before rename (torn-write window; journal.py rationale).
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(json.dumps(data, indent=2))
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, self.file_path)
         except Exception as e:
             logger.warning(f"Adaptive threshold save failed: {e}")
 
-    def record(self, score: float, was_useful: bool):
-        """Record an observation: a memory with this score was (not) useful."""
+    def record(self, score: float, was_useful: bool,
+               effective_threshold: float = None):
+        """Record an observation: a memory with this score was (not) useful.
+
+        ``effective_threshold`` is the bar acceptance ACTUALLY gated on
+        (``max(cli, learned)`` at the call site). Without it, cleared_bar
+        was computed against the learned value alone — under a CLI bar of
+        0.9 with learned ≈ 0.6, scores in (0.6, 0.9) are score-rejects yet
+        were labelled "cleared the bar" and excluded from the
+        median-useless clamp, blinding it to exactly the band that should
+        raise the bar once the CLI value is lowered."""
         with self._lock:
             # Third element: the score CLEARED the bar at record time. A
             # useless observation that cleared the bar was rejected by the
@@ -173,7 +186,9 @@ class AdaptiveThreshold:
             # high-scoring content-rejects pushed median_useless ~0.9,
             # the gate snapped up, and everything after was recorded as
             # high-score useless, sustaining the lock near CEILING.)
-            cleared_bar = score >= self.threshold
+            _bar = (float(effective_threshold)
+                    if effective_threshold is not None else self.threshold)
+            cleared_bar = score >= _bar
             self.window.append((score, was_useful, cleared_bar))
             _old = self.threshold
             self._recalculate()

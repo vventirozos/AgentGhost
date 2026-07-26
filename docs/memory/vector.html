@@ -120,6 +120,10 @@ time_penalty = age_days / (30 · log(retrieval_count + e))</code></pre>
   </ul>
   <p>Covered by <code>tests/test_game_move_api.py::TestCorrectFragmentUnit</code> and <code>tests/test_vector_memory_dataloss.py</code>.</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Name-memory rank pathology:</strong> the <code>is_name_memory</code> net also matched "user's" / "user is" — ordinary prose across ALL types (28 live rows incl. skill/synthesis/auto), each granted p_score −20 (absolute rank over a dist-0.1 exact match), the loosest gate, and a false <code>[MASTER SUMMARY]</code> label. The net is now genuine name statements only ("name is" / "call me"); identity prose still ranks via its type (−10). <strong>Off-topic gate vs identity probe:</strong> <code>search_items</code>' relevance gate took <code>min()</code> over ALL candidates, but identity-batch items carry distance to the canned profile probe, not the query — any query containing " i "/"my "/"who" defeated the 0.42 floor and injected the noise tail. Candidates now carry <code>from_identity_probe</code> and the gate mins over query-batch distances only. Also: <code>search_advanced</code> callers that are probes, not retrievals (belief-revision engine, project-lookup miss) pass <code>record_retrievals=False</code>, and the belief-revision engine's deletes are scoped by type AND restricted to the ids actually offered to the judge. Tests: <code>::TestIdentityProbeGate</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

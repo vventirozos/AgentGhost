@@ -146,7 +146,11 @@ class TestMutatorListsMatchRealStores:
     _WRITE_HINTS = ("add", "delete", "remove", "insert", "update", "save",
                     "learn", "record", "bump", "prune", "wipe", "forget",
                     "correct", "ingest", "smart_update", "mark_", "retract",
-                    "credit", "execute_graph", "process_batch", "initialize")
+                    "credit", "execute_graph", "process_batch", "initialize",
+                    # quarantine_lesson slipped through the façade for 9 days
+                    # because this hint list had no matching prefix — the
+                    # guard can only catch writers it can NAME.
+                    "quarantine")
 
     def _mutating_methods(self, cls):
         out = set()

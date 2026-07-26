@@ -87,6 +87,10 @@
   <h2>Concurrency</h2>
   <p><code>threading.RLock</code> guards both SQLite and the networkx mirror. <code>initialize_graph()</code> rebuilds the entire mirror from disk.</p>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Malformed triplets can't abort the batch:</strong> <code>t.get("subject")</code> ran OUTSIDE the per-triplet try, so one list/tuple-shaped LLM triplet raised out of <code>add_triplets</code> — at the smart-memory call site that aborted the whole consolidation INCLUDING the turn's fact embed and profile write (graph runs first). Non-dicts are now skipped with a debug log; <code>relation</code> is accepted as a predicate-key fallback; the per-triplet except logs instead of <code>pass</code>. <strong>Generic-subject expiry guard:</strong> functional-predicate expiry (HAS_STATUS/STATUS/HAS_PID) is skipped for aggregate subjects (<code>_EXPIRY_GENERIC_SUBJECTS</code>: project/task/app/service/…) — live rows like <code>project HAS_STATUS done|active|needs_user</code> are three DIFFERENT projects' facts, and a new write would have expired every sibling. Same rationale that kept HAS_NAME out of the functional set. Tests: <code>::TestGraphTripletRobustness</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

@@ -76,6 +76,10 @@
     </tbody>
   </table>
 
+
+  <h2>Audit fixes (2026-07-26)</h2>
+  <p><strong>Undecodable ≠ empty.</strong> Both <code>_read_inflight</code> and <code>_read_overflow</code> turned a <code>UnicodeDecodeError</code> into "empty file" — recovery then unlinked the in-flight batch (no sidecar, no log) and the next spill atomically overwrote corrupt overflow bytes, contradicting the "never silently lost" contract. Both now route through the shared <code>_preserve_corrupt()</code> sidecar helper, which also logs LOUDLY when even the preserve fails (the old <code>_quarantine_corrupt</code> stayed silent in that case). <strong>Dedup vs retries:</strong> crash-recovery dedup keyed on an exact <code>json.dumps</code> of the entry, but the transient-retry path re-queues a copy with a mutated <code>retries</code> counter — a kill in that window folded both twins back in (double consolidation). <code>_dedup_key()</code> now strips <code>retries</code> before comparing. Tests: <code>tests/test_memory_audit_fixes_2026_07_26.py::TestJournalCorruptionHandling</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

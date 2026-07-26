@@ -54,6 +54,19 @@ class ConfidenceReading:
     threshold: float
     below_threshold: bool
     uncertainty_pressure: float = 0.0
+    # The composite BEFORE the outcome_penalty multiply — i.e. the model's
+    # confidence prediction that does NOT know the turn's outcome. The
+    # calibration spine records THIS (calibration measures how well a
+    # pre-outcome prediction matches reality; folding the outcome into the
+    # stored prediction made Brier/ECE read optimistically on exactly the
+    # negative samples the loop exists to catch). The `below_threshold`
+    # decision still uses the penalized `composite`. Defaults to composite
+    # for positionally-built readings / no-penalty calls.
+    pre_penalty_composite: float = -1.0
+
+    def __post_init__(self):
+        if self.pre_penalty_composite < 0.0:
+            object.__setattr__(self, "pre_penalty_composite", self.composite)
 
 
 class CompositeConfidence:
@@ -158,6 +171,9 @@ class CompositeConfidence:
         # penalty (defaults to no-op at λ = 0).
         pressure = _clamp_unit(uncertainty_pressure)
         composite = composite * (1.0 - self.lambda_uncertainty * pressure)
+        # Snapshot the prediction BEFORE the outcome penalty — this is what
+        # calibration records (a prediction must not know its own outcome).
+        pre_penalty = _clamp_unit(composite)
         # Apply the objective outcome penalty LAST and un-discounted: a
         # verifier REFUTED / unverified-mutation verdict is ground truth
         # about this specific answer and must pull the reading below
@@ -171,6 +187,7 @@ class CompositeConfidence:
             threshold=self.threshold,
             below_threshold=composite < self.threshold,
             uncertainty_pressure=pressure,
+            pre_penalty_composite=pre_penalty,
         )
 
 
