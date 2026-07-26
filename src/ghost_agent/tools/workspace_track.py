@@ -38,6 +38,25 @@ async def tool_workspace_track(
     # str() so a non-string action can't raise AttributeError on .strip().
     raw_action = str(action or "").strip().lower()
     if raw_action not in _VALID_ACTIONS:
+        # Read-intent steer (2026-07-26): this is the WRITE tool, but the
+        # model reaches for it wanting to READ recent events / changes —
+        # then, with no action or a read-verb, gets a bare "action is
+        # mandatory" and REPEATS the same wrong call (live req 30: two
+        # fatal strikes on "what's new today?"). When the call looks like a
+        # read (no action, or a read verb), point at the `workspace` tool.
+        _READ_VERBS = {"recent", "list", "summary", "changes", "read",
+                       "view", "show", "get", "check", "status", "activity",
+                       "tasks", "research", "commands", "files", "narrative",
+                       "search"}
+        if not raw_action or raw_action in _READ_VERBS:
+            return (
+                "SYSTEM ERROR: 'workspace_track' is the WRITE tool (it only "
+                "AUTHORS the watchlist / notes / dedup markers; actions: "
+                f"{sorted(_VALID_ACTIONS)}). To READ workspace state — recent "
+                "events, changes, tasks, research, what's new — call the "
+                "`workspace` tool instead (e.g. workspace(action='recent') or "
+                "workspace(action='changes'))."
+            )
         return (
             "SYSTEM ERROR: 'action' is mandatory and must be one of "
             f"{sorted(_VALID_ACTIONS)}."

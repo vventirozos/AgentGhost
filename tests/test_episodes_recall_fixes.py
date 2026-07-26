@@ -63,7 +63,13 @@ class FakeCollection:
     def get(self, where=None, include=None):
         self.gets.append({"where": where, "include": include})
         rows = self._matching(where)
-        return {"ids": [r[0] for r in rows], "metadatas": [r[1] for r in rows]}
+        # A row may carry a 4th element = its document text; default None so
+        # existing 3-tuple rows keep working (documents omitted).
+        return {
+            "ids": [r[0] for r in rows],
+            "metadatas": [r[1] for r in rows],
+            "documents": [(r[3] if len(r) > 3 else None) for r in rows],
+        }
 
 
 class VectorStub:
@@ -345,6 +351,46 @@ def test_reconcile_is_a_noop_when_everything_is_indexed(em):
     vec = VectorStub(collection=col)
     assert em.reconcile_vector_index(vec) == 0
     assert vec.added == []
+
+
+def test_reconcile_skips_dedup_covered_episodes(em):
+    """Two episodes with the SAME trigger share ONE vector entry (the store
+    dedups on document text). The second lacks an own-id twin but is STILL
+    reachable via the shared entry — the reconcile must NOT re-ingest it
+    every boot (the number that never dropped, live req)."""
+    ep1 = em.record_episode(trigger="hello ghost what is new today",
+                            success=True)
+    ep2 = em.record_episode(trigger="hello ghost what is new today",
+                            success=True)   # identical trigger → dedup twin
+    # Only ep1 has a twin; its DOCUMENT is the trigger text.
+    doc = em._episode_document("hello ghost what is new today", "")
+    col = FakeCollection([
+        ("v1", {"type": "episode", "episode_id": ep1}, 0.1, doc)])
+    vec = VectorStub(collection=col)
+
+    n = em.reconcile_vector_index(vec)
+
+    assert n == 0                 # ep2 is dedup-covered → not re-ingested
+    assert vec.added == []
+
+
+def test_reconcile_reingests_genuine_and_skips_dedup(em):
+    """A genuinely-missing episode (unique trigger) IS re-ingested even when
+    a dedup-covered sibling is also present."""
+    ep1 = em.record_episode(trigger="shared trigger text here", success=True)
+    ep2 = em.record_episode(trigger="shared trigger text here",
+                            success=True)   # dedup of ep1
+    ep3 = em.record_episode(trigger="a totally unique missing episode",
+                            success=True)   # genuinely missing
+    doc1 = em._episode_document("shared trigger text here", "")
+    col = FakeCollection([
+        ("v1", {"type": "episode", "episode_id": ep1}, 0.1, doc1)])
+    vec = VectorStub(collection=col)
+
+    n = em.reconcile_vector_index(vec)
+
+    assert n == 1                                   # only ep3
+    assert [a["meta"]["episode_id"] for a in vec.added] == [ep3]
 
 
 # ---------------------------------------------------------------------------

@@ -200,3 +200,17 @@ class TestActionRobustness:
         # Non-string action must return a string, not raise AttributeError.
         assert isinstance(await tool_workspace(action=5, workspace_model=None), str)
         assert isinstance(await tool_workspace_track(action=5, workspace_model=None), str)
+
+    async def test_workspace_track_read_intent_steers_to_workspace(self):
+        """Live req 30: the model called workspace_track (WRITE) wanting to
+        READ 'what's new today' — no action → two fatal strikes because the
+        error never pointed at the read tool. A read-shaped call now steers
+        to `workspace`."""
+        from ghost_agent.tools.workspace_track import tool_workspace_track
+        for act in (None, "recent", "changes", "list"):
+            out = await tool_workspace_track(action=act, workspace_model=None)
+            assert "workspace" in out.lower() and "read" in out.lower()
+            assert "workspace(action=" in out            # concrete redirect
+        # A genuine bad WRITE action (typo) still gets the plain error.
+        out = await tool_workspace_track(action="trakc", workspace_model=None)
+        assert "must be one of" in out and "READ" not in out

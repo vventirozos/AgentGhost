@@ -331,20 +331,32 @@ class EpisodicMemory:
                 "semantic recall until reconciled: %s", episode_id, exc,
             )
 
+    @staticmethod
+    def _episode_document(trigger: str, lesson: str) -> str:
+        """The exact document text `_ingest_episode_vector` embeds — kept in
+        sync so the reconcile can tell a dedup-covered episode from a
+        genuinely-missing one."""
+        text = (trigger or "").strip()
+        if lesson:
+            text = f"{text} :: {lesson}".strip(" :")
+        return text
+
     def reconcile_vector_index(self, vector_memory, limit: int = None) -> int:
-        """Re-ingest episodes that have no vector twin. Returns the count of
-        re-ingest attempts.
+        """Re-ingest episodes whose vector twin GENUINELY failed to embed —
+        and, crucially, SKIP episodes that only lack an own-id twin because
+        the vector store dedup'd their (identical) trigger onto another
+        episode's entry. Returns the number of genuine re-ingests.
 
-        Cheap anti-join at ≤ MAX_EPISODES rows: read the ``episode_id`` set the
-        vector index knows about, diff it against the newest *limit* episode
-        rows, and re-`add` the missing ones. Repairs the silent hole left by a
-        failed embed (the episode row exists but is invisible to semantic
-        recall — 9 live episodes are in that state).
-
-        Note: the vector store dedups on document text, so two episodes with an
-        identical trigger legitimately share ONE entry; the second will keep
-        showing as "missing" on every pass. That is a no-op `add`, so the cost
-        is bounded, but it means the return value is attempts, not repairs.
+        The store dedups on document text (md5), so N episodes with the same
+        trigger share ONE entry carrying ONE episode_id; the other N-1 have
+        no own-id twin but are STILL reachable by semantic recall via the
+        shared entry. The old reconcile counted those as "missing" and
+        re-`add`d them every boot — the add() no-op'd, so the number never
+        dropped (and ticked up as new same-trigger episodes accrued),
+        alarming the operator and doing pointless work. Now we compare each
+        episode's would-be document against the documents ALREADY indexed:
+        present → dedup-covered (skip, report separately); absent → a real
+        hole (re-ingest).
 
         Not called from inside this module — intended for a boot / maintenance
         hook owned by the caller (agent.py).
@@ -358,18 +370,20 @@ class EpisodicMemory:
         if not callable(get_fn):
             return 0
         try:
-            existing = get_fn(where={"type": "episode"}, include=["metadatas"])
+            existing = get_fn(where={"type": "episode"},
+                              include=["metadatas", "documents"])
         except Exception as exc:
             logger.warning("Episode vector reconcile: index read failed: %s", exc)
             return 0
         if not isinstance(existing, dict):
             return 0
-        indexed = set()
+        indexed_ids = set()
         for meta in (existing.get("metadatas") or []):
             try:
-                indexed.add(int((meta or {}).get("episode_id")))
+                indexed_ids.add(int((meta or {}).get("episode_id")))
             except (TypeError, ValueError):
                 continue
+        indexed_docs = {str(d).strip() for d in (existing.get("documents") or []) if d}
         with self._lock:
             with closing(sqlite3.connect(self.db_path)) as conn:
                 rows = conn.execute(
@@ -377,18 +391,33 @@ class EpisodicMemory:
                        ORDER BY timestamp DESC LIMIT ?""",
                     (int(limit),),
                 ).fetchall()
-        missing = [r for r in rows if int(r[0]) not in indexed]
-        if not missing:
+        no_own_twin = [r for r in rows if int(r[0]) not in indexed_ids]
+        genuine, dedup_covered = [], 0
+        for ep_id, trigger, lesson in no_own_twin:
+            doc = self._episode_document(trigger or "", lesson or "")
+            # A too-short doc is never embedded (see _ingest_episode_vector's
+            # len<5 guard), so it's not a repairable hole either.
+            if len(doc) < 5 or doc in indexed_docs:
+                dedup_covered += 1
+            else:
+                genuine.append((ep_id, trigger, lesson))
+        if not genuine:
+            if dedup_covered:
+                logger.info(
+                    "Episode vector reconcile: all %d without an own-id twin "
+                    "are dedup-covered (reachable via a shared-trigger entry) "
+                    "— nothing to re-ingest.", dedup_covered)
             return 0
         logger.warning(
-            "Episode vector reconcile: %d of %d episodes have no vector twin "
-            "(invisible to semantic recall) — re-ingesting.",
-            len(missing), len(rows),
+            "Episode vector reconcile: %d of %d episodes are genuinely "
+            "missing a vector twin (invisible to semantic recall) — "
+            "re-ingesting (%d others are dedup-covered).",
+            len(genuine), len(rows), dedup_covered,
         )
-        for ep_id, trigger, lesson in missing:
+        for ep_id, trigger, lesson in genuine:
             self._ingest_episode_vector(
                 ep_id, trigger or "", lesson or "", vector_memory)
-        return len(missing)
+        return len(genuine)
 
     def search_similar(self, trigger: str, limit: int = 5,
                        vector_memory=None) -> List[Dict]:

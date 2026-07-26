@@ -1109,6 +1109,34 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-26 (later 9) — Episode reconcile made dedup-aware (the "N of M missing twin" that never dropped)
+
+Operator asked about the boot line "Episode vector reconcile: 25 of 167 episodes have no vector twin —
+re-ingesting." Read-only classification of the live stores: 167 episodes, 142 have a twin, 25 missing — and
+ALL 25 are DEDUP-COVERED (share their trigger text with an episode that DOES have a twin), 0 genuinely invisible.
+Root cause: the vector store dedups on document text (md5 of trigger), so same-trigger episodes share ONE entry;
+the others have no own-id twin but ARE reachable via the shared entry. The old reconcile counted them as
+"missing" and re-add()'d every boot (each a no-op) → number never dropped, ticked up over time, false alarm on
+the operator's stream. FIX: reconcile_vector_index now reads include=["metadatas","documents"] and compares each
+episode's would-be document against the already-indexed documents — present → dedup-covered (skip, INFO log);
+absent → genuine hole (re-ingest). Live effect: 0 genuine re-ingests, 25 correctly recognized as dedup-covered,
+zero wasted work. Tests: test_episodes_recall_fixes.py (+2 dedup cases; FakeCollection.get now returns documents).
+Doc: memory/episodes.html. Deploy pending full-suite.
+
+### 2026-07-26 (later 8) — Fresh-log eval: fixes confirmed live + workspace_track read-intent steer
+
+Re-read ghost-agent.log post-deploy. GOOD: boot clean; the later-3 EPISODE BOOT RECONCILE fired in prod ("24 of
+165 episodes have no vector twin — re-ingesting" → "re-embedded 24"); metacog calib loaded threshold=0.71
+w_entropy=0.00 (confirms the degenerate-entropy state the new telemetry flags — will diversify as streamed
+real-entropy samples accrue). ACTIONABLE: live req 30 ("what's new today?") FAILED — the model called
+workspace_track (the WRITE tool) twice with NO action, wanting to READ recent events, and burned 2 fatal strikes
+because the "'action' is mandatory" error never pointed at the READ tool → it repeated the same wrong call. Fixed:
+workspace_track now detects a read-shaped call (no action, or a read verb like recent/changes/list/status) and
+steers to `workspace(action='recent'/'changes')` instead of just listing write actions; a genuine bad-write typo
+still gets the plain error. Test: test_bughunt_unit5_fs_exec.py::test_workspace_track_read_intent_steers_to_workspace.
+DEPLOYED (listener 81458→82452, health ok). (Same turn also over-claimed the JJ Calendar API status and the
+verifier correctly LATE-REFUTED it 90% — that's the verifier working, not a bug.)
+
 ### 2026-07-26 (later 7) — Improvements batch: 7 deferred LOWs + learning-health telemetry (#1) + Tor cache (#4) + wire-or-retire observability (#5)
 
 Operator: "do all improvements except pg re-ingest and GAIA including the deferred lows."
