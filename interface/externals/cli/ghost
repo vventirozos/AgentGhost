@@ -17,6 +17,9 @@ agent's real feature surface:
 
 * **Rendered replies** — the stream is rendered live as Markdown (rich):
   headers, lists, tables, bold/italic, and syntax-highlighted code blocks.
+  While streaming, the live region shows only the reply's TAIL (cropped to
+  the viewport — a taller Live region can't be repainted and shreds the
+  transcript); the full reply is printed once when the stream settles.
 * **Inline images** — after a reply settles, ``![…](file.png)`` references
   are fetched from the agent sandbox (``/api/download``) and drawn in the
   terminal: iTerm2/WezTerm inline-image escape, kitty graphics protocol,
@@ -70,10 +73,11 @@ from prompt_toolkit.completion import NestedCompleter, PathCompleter
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
-from rich.console import Console, Group
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.prompt import Confirm
+from rich.segment import Segment
 from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
@@ -193,6 +197,36 @@ def _table(headers: list[str], rows: list[list[str]]) -> None:
 def _reply_renderable(text: str) -> Group:
     """The ghost's reply as it renders in the transcript: label + Markdown."""
     return Group(Text("👻", style="ghost"), Markdown(text, code_theme=CODE_THEME))
+
+
+class _TailCrop:
+    """Stream-safe live view: the last rendered lines that fit the screen.
+
+    A Live region taller than the terminal cannot be repainted — the cursor
+    can't move above the top row, so each refresh erases only the top
+    screenful, reprints the whole reply from the clamp point, and pushes a
+    stale partial frame into scrollback (the "erratic / half-screen"
+    transcripts on long replies; mid-stream markdown aggravates it — an
+    unclosed ``` fence transiently renders everything after it as one tall
+    code block). Cropping the live view to the tail keeps the region
+    repaintable at any reply length; the FULL reply is printed once after
+    the stream settles. rich's own crop/ellipsis overflow modes keep the
+    TOP lines — the wrong end for chat."""
+
+    def __init__(self, renderable: Any):
+        self.renderable = renderable
+
+    def __rich_console__(self, console: Console,
+                         options: ConsoleOptions) -> RenderResult:
+        lines = console.render_lines(self.renderable, options, pad=False)
+        max_h = max(4, options.size.height - 2)   # margin: cursor + safety
+        if len(lines) > max_h:
+            lines = lines[-max_h:]
+        new_line = Segment.line()
+        for i, line in enumerate(lines):
+            if i:
+                yield new_line
+            yield from line
 
 
 # --- inline terminal images -------------------------------------------------
@@ -822,7 +856,11 @@ class GhostCLI:
         def _settle() -> None:
             """Idempotent screen hand-off: whoever is drawing, stop them.
             Called from every exit branch BEFORE printing a notice, so the
-            notice never lands inside a live-render region."""
+            notice never lands inside a live-render region. The live view is
+            transient (erases itself on stop) and shows only the reply's
+            tail — the settled reply is printed here ONCE, full-height, at
+            the current terminal width (so an abort mid-stream still leaves
+            the partial reply on screen)."""
             nonlocal waiting, live
             if waiting:
                 status_spin.stop()
@@ -830,6 +868,8 @@ class GhostCLI:
             if live is not None:
                 live.stop()
                 live = None
+                if out:
+                    console.print(_reply_renderable("".join(out)))
 
         try:
             with self.api.chat_stream(self.history, self.session_id,
@@ -867,10 +907,10 @@ class GhostCLI:
                         status_spin.stop()
                         waiting = False
                         live = Live(console=console, refresh_per_second=12,
-                                    vertical_overflow="visible")
+                                    transient=True)
                         live.start()
                     out.append(chunk)
-                    live.update(_reply_renderable("".join(out)))
+                    live.update(_TailCrop(_reply_renderable("".join(out))))
         except KeyboardInterrupt:
             _settle()
             self._abort_turn(request_id)
@@ -1354,6 +1394,18 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
     render = sys.stdout.isatty()
     out: list[str] = []
     live: Live | None = None
+
+    def _finish() -> None:
+        """Stop the transient live view and print the settled reply once,
+        full-height. Reached from the normal path AND from ``finally``, so
+        an abort/error mid-stream still leaves the partial reply visible."""
+        nonlocal live
+        if live is not None:
+            live.stop()
+            live = None
+            if out:
+                console.print(Markdown("".join(out), code_theme=CODE_THEME))
+
     try:
         with api.http.post(api._url("/v1/chat/completions"), json=body,
                            headers={"X-Request-ID": uuid.uuid4().hex[:16]},
@@ -1390,16 +1442,15 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
                 if render:
                     if live is None:
                         live = Live(console=console, refresh_per_second=12,
-                                    vertical_overflow="visible")
+                                    transient=True)
                         live.start()
                     out.append(chunk)
-                    live.update(Markdown("".join(out), code_theme=CODE_THEME))
+                    live.update(_TailCrop(
+                        Markdown("".join(out), code_theme=CODE_THEME)))
                 else:
                     sys.stdout.write(chunk)
                     sys.stdout.flush()
-            if live is not None:
-                live.stop()
-                live = None
+            _finish()
             if not render:
                 sys.stdout.write("\n")
             elif out:
@@ -1409,8 +1460,7 @@ def one_shot(api: GhostAPI, prompt: str, session_id: str | None) -> int:
         print(f"ghost: {type(e).__name__}: cannot reach the agent", file=sys.stderr)
         return 1
     finally:
-        if live is not None:
-            live.stop()
+        _finish()
 
 
 def main() -> int:

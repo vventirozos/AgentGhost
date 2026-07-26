@@ -4,12 +4,15 @@ Moved into the repo 2026-07-17 (was ~/Data/AI/bin/ghost, now a symlink
 there — ~/Data/AI/bin is on PATH). The script is a PEP-723 single file
 with no extension, so tests load it by path. Coverage: import-cleanness
 on a non-tty (PromptSession is deliberately lazy), the pure formatting
-helpers, error-shape extraction, and base-URL normalization — the parts
-that break silently when refactored. Network paths are not exercised.
+helpers, error-shape extraction, base-URL normalization, the inline-image
+stack, and the stream-render path (tail-cropped transient Live + settled
+full print — the half-screen live-repaint regression, 2026-07-26) against
+a faked SSE stream. Real network paths are not exercised.
 """
 
 import importlib.machinery
 import importlib.util
+import io
 import os
 import stat
 import time
@@ -381,3 +384,103 @@ class TestSixelTmuxGeometry:
         out = capsys.readouterr().out
         # Raster attributes carry the scaled width: 50 cells × 8px = 400.
         assert '"1;1;400;' in out
+
+
+class TestTailCrop:
+    """A Live region taller than the terminal can't be repainted (the
+    cursor can't move above the top row) — each refresh then duplicates
+    partial frames into scrollback: the operator-reported "erratic /
+    half-screen" transcripts. _TailCrop bounds the live view to the
+    viewport tail so the region stays repaintable at any reply length."""
+
+    def _render(self, renderable, height):
+        buf = io.StringIO()
+        con = cli.Console(file=buf, width=20, height=height,
+                          color_system=None)
+        con.print(renderable)
+        return buf.getvalue().splitlines()
+
+    def test_short_content_passes_through(self):
+        from rich.text import Text
+        lines = self._render(
+            cli._TailCrop(Text("\n".join(f"L{i}" for i in range(5)))), 20)
+        assert lines == [f"L{i}" for i in range(5)]
+
+    def test_tall_content_crops_to_viewport_tail(self):
+        """30 lines into a 10-row console → the LAST height-2 lines (rich's
+        own crop/ellipsis modes keep the TOP — wrong end for chat)."""
+        from rich.text import Text
+        lines = self._render(
+            cli._TailCrop(Text("\n".join(f"L{i}" for i in range(30)))), 10)
+        assert lines == [f"L{i}" for i in range(22, 30)]
+
+
+class _FakeSSE:
+    """Minimal stand-in for a streaming requests.Response."""
+    status_code = 200
+
+    def __init__(self, lines):
+        self._lines = lines
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+
+class TestStreamRender:
+    def _cli_with_stream(self, monkeypatch, sse_lines):
+        """GhostCLI wired to a fake SSE stream, console swapped for a
+        capturing terminal-mode Console, Live spied for kwargs/updates."""
+        captured = io.StringIO()
+        monkeypatch.setattr(cli, "console", cli.Console(
+            file=captured, force_terminal=True, width=60, height=24))
+        seen = {"kwargs": None, "updates": []}
+        real_live = cli.Live
+
+        class SpyLive(real_live):
+            def __init__(self, *a, **kw):
+                seen["kwargs"] = kw
+                super().__init__(*a, **kw)
+
+            def update(self, renderable, **kw):
+                seen["updates"].append(renderable)
+                super().update(renderable, **kw)
+
+        monkeypatch.setattr(cli, "Live", SpyLive)
+        api = cli.GhostAPI("http://localhost:9", "k")
+        monkeypatch.setattr(api, "chat_stream",
+                            lambda *a, **kw: _FakeSSE(sse_lines))
+        return cli.GhostCLI(api), captured, seen
+
+    def test_transient_tailcrop_live_and_settled_full_print(self, monkeypatch):
+        g, captured, seen = self._cli_with_stream(monkeypatch, [
+            b'data: {"choices":[{"delta":{"content":"hello "}}]}',
+            b'data: {"choices":[{"delta":{"content":"world"}}]}',
+            b"data: [DONE]",
+        ])
+        assert g.stream_reply("req1") == "hello world"
+        # Regression guard: vertical_overflow="visible" is what shredded
+        # long-reply transcripts; the live view must be transient + cropped.
+        assert seen["kwargs"].get("transient") is True
+        assert "vertical_overflow" not in seen["kwargs"]
+        assert seen["updates"]
+        assert all(isinstance(u, cli._TailCrop) for u in seen["updates"])
+        # The settled reply is printed full-height after the live view.
+        assert "hello world" in captured.getvalue()
+
+    def test_partial_reply_printed_on_midstream_error(self, monkeypatch):
+        """The transient live erases itself — without the settled print in
+        _settle(), an abort would eat the partial reply entirely."""
+        g, captured, seen = self._cli_with_stream(monkeypatch, [
+            b'data: {"choices":[{"delta":{"content":"partial text"}}]}',
+            b'data: {"error": {"message": "boom mid-stream"}}',
+        ])
+        assert g.stream_reply("req2") == "partial text"
+        out = captured.getvalue()
+        assert "partial text" in out
+        assert "boom mid-stream" in out          # notice AFTER the reply

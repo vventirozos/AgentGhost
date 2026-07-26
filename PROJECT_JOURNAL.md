@@ -1109,6 +1109,30 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-26 (later 10) — Web-search turns falsely REFUTED: the judge is a 4B model, not a bad prompt
+
+Operator: "web searches cause the verifier to refute … how can we fix this elegantly?" (cases: B3 "latest postgresql
+version" LATE REFUTED 90%; req 7779fe10 PDF-ingest LATE REFUTED 100% for stats the tool literally printed).
+DIAGNOSIS (measured, not guessed): built a 3-case A/B repro from the REAL trajectory (entailed superlative /
+fabricated version control / unit-conversion) and ran it against BOTH judges. Worker route = nova = **Gemma 4 E4B
+(4B)** scored 1/3 — refuted the correct PG answer, and asserted "49152 bytes is not exactly 48 KB" (wrong
+arithmetic). Main = Qwen3.6-35B scored **3/3**, incl. correctly refuting the fabrication. The prompt was never the
+root cause — I iterated it first and got only partial improvement, which is what prompted measuring the model.
+FIX (screen cheap, confirm expensive — the gate discipline already used elsewhere here): the 4B still screens
+every turn (no added latency / no main-slot contention on the common path), but a REFUTED verdict is
+re-adjudicated on the MAIN model before it can act — `_escalate_refute` + `force_main` routing that bypasses the
+critic pool AND the worker route. Strong model wins on disagreement; ANY error keeps the original verdict, so
+escalation can only reduce false refutes, never reduce availability. Cost: one main call on the rare refute path.
+Why it matters: REFUTED scrubs the turn's lessons, files follow-ups, shows the user a correction banner and marks
+the trajectory FAILED (corpus poisoning for every downstream learner) — and all of those are gated on REFUTED
+specifically, so an overturn to CONFIRMED *or* UNCERTAIN is safe. Also hardened both adjudication prompts with a
+DERIVED-facts rule (arithmetic/unit-conversion, ordering/superlatives, evidence-marked classification "19 is Beta
+⇒ newest stable is 18.4", counts) + "you cannot know today's date, so 'not verifiable as current' is never
+grounds for REFUTED". LIVE A/B AFTER: PG REFUTED(0.9)→UNCERTAIN, unit-conversion REFUTED→CONFIRMED(1.0),
+fabrication control still REFUTED(0.95). Kill switch GHOST_VERIFY_ESCALATE_REFUTE=0. Tests:
+test_verifier_refute_escalation.py (8, deterministic). Doc: core/verifier.html. NOTE for later: the standing
+`--critic-nodes` slot is the permanent home for this if a mid-size judge ever lands on a spare box.
+
 ### 2026-07-26 (later 9) — Episode reconcile made dedup-aware (the "N of M missing twin" that never dropped)
 
 Operator asked about the boot line "Episode vector reconcile: 25 of 167 episodes have no vector twin —

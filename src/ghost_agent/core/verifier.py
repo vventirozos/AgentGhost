@@ -113,6 +113,14 @@ def _two_stage_enabled() -> bool:
         "0", "false", "no")
 
 
+def _escalate_refute_enabled() -> bool:
+    """Re-adjudicate a CHEAP judge's REFUTED verdict on the main model
+    before acting on it. Read per call so it can be flipped without a
+    restart. Kill switch: GHOST_VERIFY_ESCALATE_REFUTE=0."""
+    return os.getenv("GHOST_VERIFY_ESCALATE_REFUTE", "1").strip().lower() \
+        not in ("0", "false", "no")
+
+
 # Suspect hygiene caps: a runaway stage-1 response must not blow the
 # stage-2 prompt (which re-embeds claim + evidence + suspects).
 _MAX_SUSPECTS = 3
@@ -159,6 +167,9 @@ class VerifyResult:
     confidence: float  # 0.0 – 1.0
     reasoning: str = ""
     issues: List[str] = field(default_factory=list)
+    # True when a cheap judge's REFUTED verdict was overturned by the
+    # main-model escalation (see verify_claim). Diagnostic only.
+    escalated_overturn: bool = False
     # Two-stage path only: the forced-identification suspects that stage 2
     # adjudicated ([{"quote","check","reason"}, ...]). None on the classic
     # single-stage path so downstream dict shapes are unchanged there.
@@ -199,6 +210,8 @@ Check, in order:
 2. **Evidence support.** Given that the CLAIM is on-topic, is it actually supported by the EVIDENCE? Flag silent errors (empty output, truncated results, wrong columns, "succeeded" claims when the tool actually failed).
    - Judge the CLAIM against ALL the tool outputs TOGETHER. One tool failing (403/timeout/empty) does NOT refute the parts of the CLAIM that are supported by OTHER tool outputs — refute on lack of support only when NO output supports the disputed part.
    - Specific facts in the CLAIM (names, dates, awards, rankings, prices) that appear in NO tool output are fabrications — REFUTED, no matter how plausible they sound.
+   - But DERIVED facts are SUPPORTED — the evidence need not restate them word-for-word. Paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"); ordering and superlatives ("latest"/"largest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts over listed items are all supported. Only a fact with NO basis in any output is a fabrication.
+   - You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now" / "that date is in the future" / "may be stale" are NEVER grounds for REFUTED — the tool output is a fresh snapshot from this turn.
 3. **Constraint satisfaction.** If the user's wording included explicit constraints on the form of the answer ("just the code", "in one sentence", "as JSON", "list only the names"), does the CLAIM satisfy them?
 
 Bookkeeping is not a verdict: the state of any project/task ledger appearing in the EVIDENCE ("all tasks done", "project complete", "nothing left to do") is NEVER by itself grounds for REFUTED. If the USER REQUEST is an operational ask (restart/check/fix/show/run something) and the CLAIM reports doing exactly that with evidence support, it is on-topic and confirmable regardless of what the ledger says about completion. (Live failure this rule pins: user asked to restart a service; the agent restarted it; the judge refuted with "the project is already complete" — wrong.)
@@ -258,7 +271,9 @@ SUSPECTS (from the forced identification pass, most-suspicious first):
 {suspects}
 
 For EACH suspect, decide against the EVIDENCE whether it is a REAL problem or a FALSE ALARM:
-- "support" suspects are REAL only if the fact appears in NO tool output (fabrication) or directly contradicts one. Judge against ALL tool outputs TOGETHER: one tool failing (403/timeout/empty) does NOT make a fact wrong when ANOTHER output supports it. Paraphrase, rounding, and unit conversion of what the evidence says are NOT fabrications.
+- "support" suspects are REAL only if the fact appears in NO tool output (fabrication) or directly contradicts one. Judge against ALL tool outputs TOGETHER: one tool failing (403/timeout/empty) does NOT make a fact wrong when ANOTHER output supports it.
+- DERIVED facts are SUPPORTED — the evidence does NOT have to restate them word-for-word. Before calling a "support" suspect real, ask: can I reach it from the evidence by ordinary reasoning? If yes it is a FALSE ALARM. This covers: paraphrase; arithmetic, rounding and unit conversion (49152 bytes → "48 KB"; 3600s → "1 hour"); ordering and superlatives ("latest"/"newest"/"largest"/"highest" = the max of what the evidence lists); a classification the evidence itself marks ("19 is Beta" ⇒ the newest STABLE is 18.4); and counts or totals over listed items. Only a fact with NO basis in any output — an invented number, version, name or date — is a fabrication.
+- You do NOT know today's date and cannot judge whether the evidence is CURRENT. "Not verifiable as the latest right now", "that date is in the future", or "the evidence may be stale" are NEVER grounds for REFUTED: the agent's tool output is by definition a fresh snapshot taken this turn. Judge the claim only against what the EVIDENCE says.
 - "alignment" suspects are REAL only if the reply as a whole answers a different question than the USER REQUEST. If the USER REQUEST is empty or whitespace, alignment suspects are automatically FALSE ALARMS. A reply that answers the request and adds extra detail is NOT misaligned.
 - "constraint" suspects are REAL only if the USER REQUEST explicitly states that constraint in its own wording.
 - "artifact" suspects are REAL only if the quoted noise is actually present in the CLAIM text.
@@ -409,7 +424,8 @@ class Verifier:
 
     async def _call_llm(self, prompt: str, temperature: float = 0.1,
                         max_tokens: int = 2048,
-                        json_only: bool = False) -> dict:
+                        json_only: bool = False,
+                        force_main: bool = False) -> dict:
         """Make a verification LLM call, preferring worker nodes for cost.
 
         Default token budget is sized for thinking models (Qwen/DeepSeek-R1
@@ -474,7 +490,11 @@ class Verifier:
         # for the full 600s ceiling. A bounded timeout keeps a stalled or
         # unreachable critic node from blocking the turn: on timeout the
         # call raises and we fall through to the worker/direct path.
-        if getattr(self.llm_client, "critic_clients", None):
+        # force_main: skip BOTH cheap pools and adjudicate on the main
+        # model. Used by the refute-escalation (see verify_claim): the
+        # cheap judge screens, the strong model confirms before a REFUTED
+        # verdict is allowed to do damage.
+        if getattr(self.llm_client, "critic_clients", None) and not force_main:
             # Build a critic-specific payload: thinking off + a small token
             # cap so the verdict is just the JSON, not a multi-second
             # <think> essay. Kept separate from `payload` so the worker /
@@ -514,7 +534,7 @@ class Verifier:
         # full chat-completion dict — the previous `isinstance(result, dict)`
         # check was always False, so the worker path was effectively dead
         # and every verify always fell through to the foreground model.
-        route_fn = getattr(self.llm_client, "route", None)
+        route_fn = getattr(self.llm_client, "route", None) if not force_main else None
         if route_fn:
             try:
                 result = await route_fn(
@@ -687,7 +707,8 @@ class Verifier:
         return "\n".join(lines)
 
     async def _verify_claim_two_stage(self, claim: str, evidence: str,
-                                      context: str
+                                      context: str,
+                                      force_main: bool = False
                                       ) -> Optional[VerifyResult]:
         """Forced identification (stage 1) → adjudication (stage 2).
 
@@ -698,7 +719,7 @@ class Verifier:
         """
         enum_prompt = _VERIFY_ENUMERATE_PROMPT.format(
             claim=claim, evidence=evidence, context=context)
-        stage1 = await self._call_llm(enum_prompt, temperature=0.1,
+        stage1 = await self._call_llm(enum_prompt, temperature=0.1, force_main=force_main,
                                       max_tokens=_STAGE_MAX_TOKENS,
                                       json_only=True)
         suspects = self._sanitize_suspects((stage1 or {}).get("suspects"))
@@ -712,7 +733,7 @@ class Verifier:
         adj_prompt = _VERIFY_ADJUDICATE_PROMPT.format(
             claim=claim, evidence=evidence, context=context,
             suspects=self._format_suspects_block(suspects))
-        stage2 = await self._call_llm(adj_prompt, temperature=0.1,
+        stage2 = await self._call_llm(adj_prompt, temperature=0.1, force_main=force_main,
                                       max_tokens=_STAGE_MAX_TOKENS,
                                       json_only=True)
         result = self._build_verify_result(stage2)
@@ -732,22 +753,86 @@ class Verifier:
         then per-suspect adjudication against the evidence. Falls back to
         the classic single-prompt verdict when either stage fails, so the
         worst case matches the old behavior (plus one bounded extra call).
+
+        REFUTE ESCALATION (2026-07-26): a REFUTED verdict from a CHEAP
+        judge is re-adjudicated on the MAIN model before it is allowed to
+        do damage. The cheap route is a small worker model (live: Gemma 4
+        E4B) and it false-refutes DERIVED facts — measured on the real
+        "latest PostgreSQL version" turn it refuted a correct answer at
+        90%, and called 49152 bytes "not exactly 48 KB"; the main 35B got
+        the same three cases right 3/3. A false REFUTE is expensive
+        (scrubs the turn's lessons, files follow-up tasks, shows the user
+        a correction, marks the trajectory failed → poisons the corpus
+        every downstream learner trains on), while the escalation costs
+        one main-model call on the RARE refute path only. Screen cheap,
+        confirm expensive — the same gate discipline used elsewhere here.
+        Kill switch: GHOST_VERIFY_ESCALATE_REFUTE=0.
         """
         claim_t = claim[:2000]
         evidence_t = evidence[:4000]
         context_t = context[:1000]
+        result = None
         if _two_stage_enabled():
             result = await self._verify_claim_two_stage(
                 claim_t, evidence_t, context_t)
-            if result is not None:
-                return result
-        prompt = _VERIFY_CLAIM_PROMPT.format(
-            claim=claim_t,
-            evidence=evidence_t,
-            context=context_t,
-        )
-        data = await self._call_llm(prompt, temperature=0.1)
-        return self._build_verify_result(data)
+        if result is None:
+            prompt = _VERIFY_CLAIM_PROMPT.format(
+                claim=claim_t,
+                evidence=evidence_t,
+                context=context_t,
+            )
+            data = await self._call_llm(prompt, temperature=0.1)
+            result = self._build_verify_result(data)
+        return await self._escalate_refute(result, claim_t, evidence_t, context_t)
+
+    async def _escalate_refute(self, result: Optional[VerifyResult],
+                               claim: str, evidence: str,
+                               context: str) -> Optional[VerifyResult]:
+        """Confirm a REFUTED verdict on the MAIN model before returning it.
+
+        No-op unless the verdict is REFUTED, escalation is enabled, and a
+        cheap route (critic pool / worker) was actually available to
+        produce it — when the main model already IS the judge there is
+        nothing to escalate to. On disagreement the main model's verdict
+        wins (it is the stronger judge); on any error the original
+        verdict stands, so escalation can only ever reduce false refutes,
+        never make the gate less available."""
+        if result is None or result.verdict != VerifyVerdict.REFUTED:
+            return result
+        if not _escalate_refute_enabled():
+            return result
+        client = self.llm_client
+        cheap_route = bool(getattr(client, "critic_clients", None)) or bool(
+            getattr(client, "worker_clients", None))
+        if not cheap_route:
+            return result  # main model already judged it
+        try:
+            strong = None
+            if _two_stage_enabled():
+                strong = await self._verify_claim_two_stage(
+                    claim, evidence, context, force_main=True)
+            if strong is None:
+                prompt = _VERIFY_CLAIM_PROMPT.format(
+                    claim=claim, evidence=evidence, context=context)
+                data = await self._call_llm(prompt, temperature=0.1,
+                                            force_main=True)
+                strong = self._build_verify_result(data)
+        except Exception as exc:
+            logger.debug("Verifier refute-escalation failed (keeping "
+                         "original verdict): %s", exc)
+            return result
+        if strong is None:
+            return result
+        if strong.verdict == VerifyVerdict.REFUTED:
+            logger.info("Verifier escalation: main model CONFIRMED the "
+                        "refute — verdict stands.")
+            return strong
+        logger.warning(
+            "Verifier escalation OVERTURNED a cheap-judge refute: main "
+            "model says %s. Original issues: %s",
+            strong.verdict.value, "; ".join(result.issues or [])[:160])
+        strong.escalated_overturn = True
+        return strong
 
     async def verify_code_output(self, code: str, output: str,
                                  intent: str,

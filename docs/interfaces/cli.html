@@ -57,6 +57,26 @@
     </tbody>
   </table>
 
+  <h2>Streaming render — tail-cropped live view (2026-07-26)</h2>
+  <p>Replies stream into a rich <code>Live</code> region re-rendered as Markdown ~12×/s. The
+  original implementation used <code>vertical_overflow="visible"</code>, which breaks
+  structurally once the rendered reply is <strong>taller than the terminal</strong>: rich
+  repositions by emitting <em>content-height</em> cursor-up ops, but a terminal can't move the
+  cursor above the top row, so each refresh erased only the top screenful, reprinted the whole
+  reply from the clamp point, and pushed a stale partial frame into scrollback — the
+  operator-reported "erratic, half-screen" transcripts (worst in small panes/tmux; mid-stream
+  markdown aggravates it, e.g. an unclosed <code>```</code> fence transiently renders everything
+  after it as one tall code block, and a resize mid-stream reflows narrower → taller).</p>
+  <p>Fix: while streaming, the live view renders only the reply's <strong>tail</strong>
+  (<code>_TailCrop</code>: last <code>height−2</code> rendered lines — rich's own
+  <code>crop</code>/<code>ellipsis</code> overflow modes keep the TOP lines, the wrong end for
+  chat), and the <code>Live</code> is <code>transient</code>; when the stream settles the full
+  reply is printed once, at the current terminal width. The region stays repaintable at any
+  reply length, so the glitch is structurally impossible, and an abort/error mid-stream still
+  leaves the partial reply on screen (the settled print rides <code>_settle()</code> /
+  <code>_finish()</code>, reached from every exit path). Applies to both the interactive loop
+  (<code>stream_reply</code>) and one-shot mode (<code>one_shot</code>).</p>
+
   <h2>Inline images (2026-07-17)</h2>
   <p>After a reply settles, <code>![…](name.png)</code> references are fetched from the agent
   sandbox (<code>GET /api/download/{name}</code>, in-memory, 25&nbsp;MB cap, ≤4 per reply,
@@ -101,7 +121,10 @@
   → <code>scheme://netloc</code>), header key wiring, env-vs-file key precedence, and the
   inline-image stack (ref extraction/dedupe/caps, mode detection incl. ambient
   <code>LC_TERMINAL</code> scrub, iTerm2/kitty escape shapes, kitty PNG-only guard,
-  half-block render, fetch-failure resilience). Live network paths are exercised manually
+  half-block render, fetch-failure resilience), and the stream-render path against a faked
+  SSE stream (<code>_TailCrop</code> pass-through vs. tail-crop; transient Live + no
+  <code>vertical_overflow</code> regression guard; settled full print incl. the
+  partial-reply-on-error case). Live network paths are exercised manually
   (verified 2026-07-17: upload → reference → fetch → half-block render against the running
   agent).</p>
 </main>
