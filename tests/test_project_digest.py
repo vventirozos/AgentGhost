@@ -162,3 +162,20 @@ def test_watermark_save_never_raises(tmp_path):
     bad = tmp_path / "afile"
     bad.write_text("x")
     save_watermark(bad / "wm.json", 7)  # must not raise
+
+
+def test_failed_then_done_reports_final_state_only(store):
+    """One line per project — the FINAL state (2026-07-25, req 92a968fc):
+    a project that rolled FAILED mid-batch and then recovered to DONE
+    used to show BOTH '→ DONE' and '→ FAILED' in the same digest."""
+    pid = store.create_project("Flip Flop")
+    t1 = store.add_task(pid, "step 1")
+    store.update_task(t1, status="FAILED")       # rolls project → FAILED
+    assert store.get_project(pid)["status"] == "FAILED"
+    store.update_task(t1, status="DONE")         # recovers → DONE
+    assert store.get_project(pid)["status"] == "DONE"
+    res = summarize_since(store, 0)
+    entries = [f for f in res.finished if f[0] == "Flip Flop"]
+    assert entries == [("Flip Flop", "DONE")]
+    out = render_digest(res)
+    assert "FAILED" not in out

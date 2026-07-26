@@ -145,7 +145,7 @@ class TestLateVerdictHandlerPublishesTask:
         assert agent._deferred_verdict_task is None
         agent._record_late_verdict.assert_called_once_with(
             "vr", "traj-1", "conv-1", last_tool="lt",
-            force_correction=False)
+            force_correction=False, project_id=None)
 
     async def test_cancelled_verdict_still_clears_handle(self):
         agent = GhostAgent.__new__(GhostAgent)

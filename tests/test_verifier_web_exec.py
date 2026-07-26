@@ -415,3 +415,104 @@ async def test_duplicate_candidates_probed_once(tmp_path, monkeypatch):
     res = await agent._execute_web_artifact(["index.html", "index.html"])
     assert res == ("index.html", "")
     assert browser.await_count == 1
+
+
+# ── fetch-backed pages probed via the RUNNING service (2026-07-25) ────
+# reqs 92a968fc & 646e9b7e: both turns skipped here ("calls the network")
+# while the project's service was up on its port the whole time — broken
+# JS shipped and the operator found it in their browser.
+
+FETCH_PAGE = "<html><script>fetch('/api/items').then(r=>r.json())</script></html>"
+
+
+def _fake_supervisor(monkeypatch, entries, alive=True):
+    sup = MagicMock()
+    sup.list_entries.return_value = entries
+    sup._entry_alive.return_value = alive
+    sup._port_listening.return_value = alive
+    monkeypatch.setattr(
+        "ghost_agent.sandbox.services.get_service_supervisor",
+        lambda sm: sup,
+    )
+    return sup
+
+
+async def test_fetch_page_probed_via_running_service(tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(FETCH_PAGE)
+    agent, browser = _bare_agent(
+        tmp_path, "SUCCESS: navigated. Title: 'x'", monkeypatch)
+    _fake_supervisor(monkeypatch, [
+        {"name": "app", "port": 8101, "workdir": "/workspace"}])
+    res = await agent._execute_web_artifact(["index.html"])
+    assert res == ("index.html", "")
+    assert browser.await_count == 1
+    assert browser.call_args.kwargs["url"] == "http://127.0.0.1:8101/index.html"
+
+
+async def test_fetch_page_service_exception_refutes_via_http(
+        tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(FETCH_PAGE)
+    agent, browser = _bare_agent(
+        tmp_path,
+        "Navigated.\nUNCAUGHT JS EXCEPTIONS\nTypeError: DataStore.ready "
+        "is not a function", monkeypatch)
+    _fake_supervisor(monkeypatch, [
+        {"name": "app", "port": 8101, "workdir": "/workspace"}])
+    res = await agent._execute_web_artifact(["index.html"])
+    assert res is not None
+    page_rel, block = res
+    assert page_rel == "index.html"
+    assert "DataStore.ready" in block
+
+
+async def test_fetch_page_without_service_stays_inconclusive(
+        tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(FETCH_PAGE)
+    agent, browser = _bare_agent(tmp_path, "SUCCESS", monkeypatch)
+    monkeypatch.setattr(
+        "ghost_agent.sandbox.services.get_service_supervisor",
+        lambda sm: None,
+    )
+    res = await agent._execute_web_artifact(["index.html"])
+    assert res is None                 # inconclusive, conf cap applies
+    assert browser.await_count == 0
+
+
+async def test_fetch_page_dead_service_stays_inconclusive(
+        tmp_path, monkeypatch):
+    (tmp_path / "index.html").write_text(FETCH_PAGE)
+    agent, browser = _bare_agent(tmp_path, "SUCCESS", monkeypatch)
+    _fake_supervisor(monkeypatch, [
+        {"name": "app", "port": 8101, "workdir": "/workspace"}],
+        alive=False)
+    res = await agent._execute_web_artifact(["index.html"])
+    assert res is None
+    assert browser.await_count == 0
+
+
+async def test_fetch_page_longest_workdir_service_wins(tmp_path, monkeypatch):
+    proj = tmp_path / "projects" / "abc123"
+    proj.mkdir(parents=True)
+    (proj / "index.html").write_text(FETCH_PAGE)
+    agent, browser = _bare_agent(
+        tmp_path, "SUCCESS: navigated.", monkeypatch)
+    _fake_supervisor(monkeypatch, [
+        {"name": "root", "port": 8000, "workdir": "/workspace"},
+        {"name": "app", "port": 8101,
+         "workdir": "/workspace/projects/abc123"},
+    ])
+    res = await agent._execute_web_artifact(["projects/abc123/index.html"])
+    assert res is not None and res[1] == ""
+    assert browser.call_args.kwargs["url"] == "http://127.0.0.1:8101/index.html"
+
+
+async def test_plain_page_still_uses_file_url(tmp_path, monkeypatch):
+    # No fetch/XHR → the file:// probe is sufficient; no service lookup.
+    (tmp_path / "index.html").write_text("<html><body>static</body></html>")
+    agent, browser = _bare_agent(
+        tmp_path, "SUCCESS: navigated.", monkeypatch)
+    _fake_supervisor(monkeypatch, [
+        {"name": "app", "port": 8101, "workdir": "/workspace"}])
+    res = await agent._execute_web_artifact(["index.html"])
+    assert res == ("index.html", "")
+    assert browser.call_args.kwargs["url"].startswith("file://")

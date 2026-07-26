@@ -42,6 +42,12 @@ ToolRunner = Callable[[str, Dict[str, Any]], Awaitable[str]]
 # overflow. The task tree still does the coarse decomposition, so this only
 # bounds runaway specs, not normal multi-file work.
 MAX_FILES = 16
+# Reasoning ceiling for the streamed spec call: chain-of-thought still
+# running with ZERO content at this size is the budget-burn shape (live
+# failures ran 40-75K chars before eating the whole 16384-token budget);
+# normal spec planning lands in 3-15K. Cutting at 30K saves ~3 minutes per
+# runaway while never touching a legitimate think phase.
+SPEC_REASONING_ABORT_CHARS = 30_000
 # Upper bound on a written file. Must comfortably exceed a fully-accreted
 # single-file app: with append, the result is old+new, and old can be ~200 KB
 # (the gather cap). A tight 60 KB truncated the growing index.html mid-JS,
@@ -360,6 +366,172 @@ def _render_research(research_context: Optional[Dict[str, str]]) -> str:
         "or contradict them; these are NOT files to edit):\n" + body + "\n")
 
 
+def _repair_json_string_newlines(text: str) -> str:
+    """Escape literal control characters inside JSON string literals.
+
+    The dominant malformed-spec shape in the live logs (reqs 92a968fc,
+    8ec512cf — three occurrences in one afternoon): the model emits an
+    otherwise-valid files spec whose ``find``/``append``/``content``
+    string values contain RAW newlines/tabs instead of ``\\n``/``\\t``,
+    which is invalid JSON, so every parse attempt fails and the whole
+    generation is retried with feedback (~30-60s each). A simple
+    in-string state walk (quote toggling, backslash escapes honoured)
+    turns the literal control chars into their escape sequences; other
+    defects (unescaped inner quotes) are left alone — this is a
+    best-effort last resort reached only after normal parsing failed."""
+    out: List[str] = []
+    in_str = False
+    esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+                out.append(ch)
+                continue
+            if ch == "\\":
+                esc = True
+                out.append(ch)
+                continue
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                continue
+            if ch == "\n":
+                out.append("\\n")
+                continue
+            if ch == "\r":
+                out.append("\\r")
+                continue
+            if ch == "\t":
+                out.append("\\t")
+                continue
+            out.append(ch)
+        else:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+    return "".join(out)
+
+
+def _recover_spec_escaping_newlines(channels, extract, usable) -> dict:
+    """Re-parse each raw channel after escaping literal control chars
+    inside string literals, over the JSON candidate region (first ``{``
+    to last ``}`` — leading prose would desync the quote walk).
+    Returns the first usable spec, else ``{}``."""
+    for raw in channels:
+        if not raw or "{" not in raw:
+            continue
+        start, end = raw.find("{"), raw.rfind("}")
+        if end <= start:
+            continue
+        cand = extract(_repair_json_string_newlines(raw[start:end + 1]),
+                       repair_truncated=True) or {}
+        if usable(cand):
+            logger.info(
+                "coding_executor: spec recovered by escaping literal "
+                "newlines inside JSON string values")
+            return cand
+    return {}
+
+
+async def _stream_spec_completion(llm, payload: Dict[str, Any],
+                                  is_background: bool):
+    """Stream the build-spec generation, accumulating the content and
+    reasoning channels, and ABORT a runaway think phase early.
+
+    The non-streaming call this replaces could not see a think-loop until
+    the full 16384-token budget was burned (~4 minutes on the live box,
+    observed twice in one request, 92a968fc 2026-07-25) — the guard then
+    fired on the corpse. Streaming lets the abort land while the loop is
+    still forming. Two abort conditions, both evaluated ONLY while the
+    content channel is still empty (once the JSON spec starts, reasoning
+    is done and generated code repeats lines legitimately):
+
+      * ``_detect_thinking_loop`` — the exact-n-gram detector the main
+        turn loop uses. Deliberately the ONLY heuristic here: the first
+        deploy also ran the paragraph-repeat detector and it aborted the
+        thinking of EVERY coding leaf in the first live autoadvance run
+        (one at just 3,019 chars) — spec planning legitimately restates
+        the task and field lists, so that detector stays out of this
+        path (2026-07-25 second deploy).
+      * ``SPEC_REASONING_ABORT_CHARS`` ceiling — reasoning still going
+        with zero content at 30K chars is the budget-burn shape (the
+        live failures ran 40-75K); cutting there saves ~3 minutes
+        without touching normal 3-15K planning.
+
+    Returns ``(content, reasoning, abort_reason)`` where ``abort_reason``
+    is ``None`` (clean), ``"loop"`` or ``"ceiling"``. Stall/mid-stream
+    errors surface as an SSE error event from the llm layer — the
+    accumulator stops there and the caller's existing no-spec
+    diagnostics handle the partial output."""
+    import json as _json
+    from .stream_guards import (
+        THINKING_LOOP_PROBE_EVERY,
+        _detect_thinking_loop,
+    )
+    import inspect as _inspect
+    streamer = getattr(llm, "stream_chat_completion", None)
+    if streamer is None or not _inspect.isasyncgenfunction(streamer):
+        # Non-streaming client (test doubles — including MagicMocks whose
+        # auto-attributes would otherwise masquerade as a streamer — and
+        # alternate backends): degrade to the single-shot call — correct
+        # output, no early loop abort.
+        resp = await llm.chat_completion(
+            {**payload, "stream": False}, is_background=is_background)
+        msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
+        return (msg.get("content") or "",
+                msg.get("reasoning_content") or "", None)
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    c_len = r_len = 0
+    next_probe = THINKING_LOOP_PROBE_EVERY
+    aborted = None
+    agen = streamer(payload, is_background=is_background)
+    try:
+        async for raw in agen:
+            line = (raw.decode("utf-8", "replace") if isinstance(raw, bytes)
+                    else str(raw)).strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = _json.loads(data)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("error"):
+                # Stall / mid-stream break — already logged upstream.
+                break
+            delta = (((obj.get("choices") or [{}])[0]) or {}).get("delta") or {}
+            rc = delta.get("reasoning_content") or ""
+            cc = delta.get("content") or ""
+            if rc:
+                reasoning_parts.append(rc)
+                r_len += len(rc)
+            if cc:
+                content_parts.append(cc)
+                c_len += len(cc)
+            if c_len == 0 and r_len >= next_probe:
+                next_probe = r_len + THINKING_LOOP_PROBE_EVERY
+                buf = "".join(reasoning_parts)
+                reasoning_parts = [buf]  # keep the join amortised
+                if _detect_thinking_loop(buf):
+                    aborted = "loop"
+                    break
+                if r_len >= SPEC_REASONING_ABORT_CHARS:
+                    aborted = "ceiling"
+                    break
+    finally:
+        try:
+            await agen.aclose()
+        except Exception:  # noqa: BLE001 — closing a broken stream
+            pass
+    return "".join(content_parts), "".join(reasoning_parts), aborted
+
+
 async def _generate_build_spec(llm, model: str, description: str, ledger: str, *,
                                existing_files: Optional[Dict[str, str]] = None,
                                single_file: bool = False,
@@ -396,7 +568,10 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         "Pick by INTENT: adding → append; changing existing code → edits.\n"
         "Rules: complete runnable code (no TODOs/stubs); BARE project-relative "
         "paths (no /workspace, sandbox/, projects/<id>/); only the files THIS "
-        "task needs; prefer a runnable verify that exercises what you built."
+        "task needs; prefer a runnable verify that exercises what you built. "
+        "The verify must NOT kill or restart processes/services (no fuser -k, "
+        "pkill, kill) — if a service is involved, probe the one already "
+        "running (e.g. curl its port)."
     )
     user = f"TASK: {description}\n"
     if constraints:
@@ -422,21 +597,20 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     if feedback:
         user += (f"\nYOUR PREVIOUS ATTEMPT FAILED: {feedback}\n"
                  "Produce a corrected spec that fixes exactly this.\n")
-    resp = await llm.chat_completion({
+    # STREAMED (2026-07-25) so a thinking loop is aborted within a probe
+    # interval instead of burning the whole token budget first — see
+    # _stream_spec_completion. max_tokens rationale unchanged: 16384
+    # (raised from 8192, itself raised from 4096) because the output is a
+    # JSON spec with a COMPLETE file embedded as `content` — a cut
+    # mid-string yields invalid JSON and a truncated file, and a reasoning
+    # model spends part of the budget in `reasoning_content` before the
+    # JSON even starts.
+    content, reasoning, loop_aborted = await _stream_spec_completion(llm, {
         "model": model,
         "messages": [{"role": "system", "content": sys_hint},
                      {"role": "user", "content": user}],
-        # 16384 (raised from 8192, itself raised from 4096). The output is a
-        # JSON spec with a COMPLETE file embedded as `content` — a cut mid-string
-        # yields invalid JSON and a truncated file. 8192 (~24-32 KB) was far
-        # below the 400 KB this module permits a file to be, and a reasoning
-        # model spends part of the budget in `reasoning_content` before the JSON
-        # even starts — so a brand-new full file plus a think preamble could
-        # still truncate. Give complete files real room.
-        "temperature": 0.3, "max_tokens": 16384, "stream": False,
-    }, is_background=is_background)
-    msg = ((resp or {}).get("choices", [{}])[0].get("message", {})) or {}
-    content = msg.get("content") or ""
+        "temperature": 0.3, "max_tokens": 16384,
+    }, is_background)
     # Reasoning models (Qwen via llama.cpp) emit their chain-of-thought in a
     # separate `reasoning_content` field. When the think block consumes the
     # whole token budget without closing, the parser routes EVERYTHING there
@@ -445,7 +619,6 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
     # the task with "model produced no file spec" (observed live: 5 coding
     # leaves in one project killed this way). Fall back to the reasoning
     # channel, mirroring core/agent.py (~2973) and project_research.py.
-    reasoning = msg.get("reasoning_content") or ""
     from .agent import extract_json_from_text
 
     def _usable(s) -> bool:
@@ -459,20 +632,37 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
             # across the closing </think> boundary).
             spec = extract_json_from_text(
                 f"{reasoning}\n{content}", repair_truncated=True) or spec
+    if not _usable(spec):
+        # Raw-newline-in-string repair (see _repair_json_string_newlines).
+        spec = _recover_spec_escaping_newlines(
+            (content, reasoning), extract_json_from_text, _usable) or spec
     if not _usable(spec) and not content.strip() and reasoning.strip():
-        # The think block consumed the whole max_tokens budget before the
-        # JSON ever started: content is empty and everything sits in the
-        # reasoning channel as prose (observed live 2026-07-06: content=0,
-        # reasoning=40-62k chars, twice in one project — each a ~5-minute
-        # generation lost). Thinking earns its cost on attempt 1, but once
-        # it has eaten the budget the only productive move is ONE retry with
-        # thinking off — same recipe as project_research._llm_call and
+        # The think phase produced no JSON: the stream guard aborted it
+        # (exact n-gram loop or the 30K reasoning ceiling — the reason is
+        # named in the log so live tuning has data), or the think block
+        # consumed the whole max_tokens budget before the JSON ever
+        # started (observed live 2026-07-06: content=0, reasoning=40-62k
+        # chars, twice in one project — each a ~5-minute generation
+        # lost). Thinking earns its cost on attempt 1, but once it has
+        # looped or eaten the budget the only productive move is ONE retry
+        # with thinking off — same recipe as project_research._llm_call and
         # dream.py: /no_think soft-switch + enable_thinking=False
         # hard-switch + a system nudge.
-        logger.warning(
-            "coding_executor: think block consumed the whole budget "
-            "(content=0, reasoning=%d chars) — retrying once with thinking "
-            "disabled", len(reasoning.strip()))
+        if loop_aborted == "loop":
+            logger.warning(
+                "coding_executor: exact n-gram thinking loop aborted "
+                "mid-stream (content=0, reasoning=%d chars) — retrying "
+                "once with thinking disabled", len(reasoning.strip()))
+        elif loop_aborted == "ceiling":
+            logger.warning(
+                "coding_executor: reasoning ceiling (%d chars) hit with no "
+                "content — aborted mid-stream, retrying once with thinking "
+                "disabled", SPEC_REASONING_ABORT_CHARS)
+        else:
+            logger.warning(
+                "coding_executor: think block consumed the whole budget "
+                "(content=0, reasoning=%d chars) — retrying once with "
+                "thinking disabled", len(reasoning.strip()))
         resp = await llm.chat_completion({
             "model": model,
             "messages": [
@@ -489,6 +679,9 @@ async def _generate_build_spec(llm, model: str, description: str, ledger: str, *
         spec = extract_json_from_text(content, repair_truncated=True) or {}
         if not _usable(spec) and reasoning:
             spec = extract_json_from_text(reasoning, repair_truncated=True) or spec
+        if not _usable(spec):
+            spec = _recover_spec_escaping_newlines(
+                (content, reasoning), extract_json_from_text, _usable) or spec
     was_empty = not content.strip() and not reasoning.strip()
     if not _usable(spec):
         # Diagnostic: the model returned no usable file spec. Log a window of
@@ -725,6 +918,21 @@ async def _apply_file(tool_runner: ToolRunner, fspec: dict,
     return (path, None)
 
 
+# Kill-shaped fragments in a spec's `verify` command. A verify must TEST,
+# not manage processes: the live 2026-07-25 incident (req 8ec512cf) ran
+# `fuser -k 8101/tcp; node server.js &` as its verify — it murdered the
+# SUPERVISED jj-calendar service, left an orphan node that died with the
+# shell, and the operator's browser hit a dead port two turns later.
+# `kill -0` (pure liveness probe, signals nothing) stays allowed.
+_VERIFY_KILL_RE = re.compile(
+    r"\bfuser\s+-[a-zA-Z]*k"          # fuser -k / -km <port>/tcp
+    r"|\bpkill\b"
+    r"|\bkillall\b"
+    r"|\bkill\s+(?!-0\b)\S"           # kill <pid>, kill -9 …, kill $(…)
+    r"|xargs\s+(?:-\S+\s+)*kill\b"
+)
+
+
 async def _run_verify(tool_runner: ToolRunner, spec: dict,
                       written: List[str]) -> Optional[str]:
     """Gate the build with the model's shell ``verify`` command, if any.
@@ -743,6 +951,18 @@ async def _run_verify(tool_runner: ToolRunner, spec: dict,
     every tick."""
     verify = (spec.get("verify") or "").strip() if isinstance(spec, dict) else ""
     if not verify:
+        return None
+    if _VERIFY_KILL_RE.search(verify):
+        # Skip, don't fail: the FILES may be perfectly good — only the
+        # verify command is malformed intent. Degrades to the no-verify
+        # path; the request-level gates (WEB-EXEC via the running
+        # service, unverified-mutation cap) still stand between an
+        # untested build and a confident success.
+        logger.warning(
+            "coding_executor: verify command wants to kill processes — "
+            "SKIPPED (a verify must test, not manage services; probe the "
+            "already-running service instead). Command: %s",
+            _short(verify, 160))
         return None
     try:
         vout = await tool_runner("execute", {"command": verify})

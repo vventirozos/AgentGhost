@@ -213,6 +213,21 @@ _EXTENDED_THINK_KEYWORDS = {
 _DEFECT_REOPEN_CAP = 2
 _DEFECT_REOPEN_WINDOW_S = 86_400.0
 
+# Edit-churn brake (2026-07-25, req 646e9b7e): N successive successful
+# mutations of the SAME file with no intervening run/render is the
+# "16 blind edits before the first browser load" anti-pattern — the turn
+# burned half its 40-turn budget stacking unverified patches. After
+# _EDIT_CHURN_STEER_AFTER consecutive unverified edits of one target, a
+# steer demands verification before further edits; execute/browser/
+# manage_services success resets the counters. Bounded to
+# _EDIT_CHURN_MAX_STEERS injections per request so an ignoring model
+# doesn't get an ever-growing message tail.
+_EDIT_CHURN_STEER_AFTER = 3
+_EDIT_CHURN_MAX_STEERS = 2
+_EDIT_CHURN_VERIFY_TOOLS = frozenset({
+    "execute", "browser", "manage_services", "managed_services",
+})
+
 _BOOKKEEPING_TOOL_NAMES = frozenset({
     "manage_projects", "manage_tasks", "manage_skills",
     "scratchpad", "learn_skill", "update_profile",
@@ -416,6 +431,7 @@ def _collect_verifier_evidence(tools_run: Optional[list],
     # (≥2 significant tokens) is the evidence the claim leans on — add the
     # best such item as a 4th slot rather than letting a failed retry or a
     # bookkeeping-adjacent tail displace it.
+    claim_pulled = None
     if claim_text and len(candidates) > max_items:
         ct = _claim_tokens(claim_text)
         if ct:
@@ -427,6 +443,7 @@ def _collect_verifier_evidence(tools_run: Optional[list],
                     best, best_score = tool, overlap
             if best is not None and len(picked) < len(_EVIDENCE_BUDGET_WEIGHTS):
                 picked.append(best)
+                claim_pulled = best
     if not picked:
         return ""
     picked.reverse()  # chronological: oldest → newest
@@ -449,6 +466,22 @@ def _collect_verifier_evidence(tools_run: Optional[list],
     # items #5–#10 as "not in the evidence". Unused chars go to
     # still-truncated items, newest first.
     spare = sum(c - g for c, g in zip(caps, granted))
+    # Claim-pulled slot drinks first (2026-07-25, req f59a793d false LATE
+    # REFUTED): that slot exists BECAUSE its content overlaps the claim, yet
+    # newest-first redistribution gave ~1.2KB of slack to a boilerplate
+    # server.js head while the fork-provenance keys at the TAIL of the
+    # claim-relevant briefing sat just past its 580-char cap — the judge
+    # then truthfully called the claim unsubstantiated. Newest-first still
+    # applies to whatever slack remains.
+    if claim_pulled is not None and spare > 0:
+        for i, t in enumerate(picked):
+            if t is claim_pulled:
+                need = len(bodies[i]) - granted[i]
+                if need > 0:
+                    take = min(need, spare)
+                    granted[i] += take
+                    spare -= take
+                break
     for i in reversed(range(len(picked))):
         if spare <= 0:
             break
@@ -1473,8 +1506,10 @@ def _tool_call_truncated(content: str) -> bool:
 from .stream_guards import (  # noqa: E402
     THINKING_LOOP_PROBE_EVERY, THINKING_LOOP_WINDOW, THINKING_LOOP_THRESHOLD,
     TOOL_CALL_LOOP_THRESHOLD, TOOL_CALL_LOOP_PROBE_EVERY,
+    PARAGRAPH_LOOP_MIN_LINE, PARAGRAPH_LOOP_THRESHOLD,
     _STREAM_STOP_MARKERS,
     _detect_thinking_loop, _tail_has_stop_marker, _detect_tool_call_loop,
+    _detect_paragraph_loop,
 )
 
 
@@ -4748,13 +4783,16 @@ class GhostAgent:
             "_agent_ref", "_profile_str", "_profile_loaded",
             "_active_tool_defs_cache", "_xml_schema_cache",
             "_skill_playbook_cache", "_sandbox_state",
-            "_stable_tool_query",
+            "_stable_tool_query", "_edit_churn",
         )
 
         def __init__(self, agent_ref):
             self._agent_ref = agent_ref
             self._profile_str = None
             self._profile_loaded = False
+            # Edit-churn brake state ({target: consecutive-unverified-edit
+            # count} + steer budget) — request-scoped by riding this object.
+            self._edit_churn = None
             # Cache by (intent_query) so a query-shift between turns still
             # benefits when the same query repeats.
             self._active_tool_defs_cache: Dict[str, list] = {}
@@ -5324,6 +5362,63 @@ class GhostAgent:
     # turning the async verify pass into a browser marathon.
     _WEB_EXEC_MAX_PAGES = 4
 
+    def _service_url_for_page(self, host_path, sbx):
+        """``http://127.0.0.1:<port>/<rel>`` when a RUNNING registered
+        service's workdir covers ``host_path``, else ``None``.
+
+        SYNC (shells into the container for liveness) — call via
+        ``asyncio.to_thread`` from the async probe. Longest-workdir match
+        wins so a project-scoped service beats a root-scoped one. Liveness
+        is entry-alive OR port-listening: a service restarted outside the
+        supervisor still serves the page, and the SSRF allowlist the
+        browser applies is registry-driven either way."""
+        try:
+            from ..sandbox.services import get_service_supervisor
+            from ..tools.file_system import _to_container_path
+            sup = get_service_supervisor(
+                getattr(self.context, "sandbox_manager", None))
+            if sup is None:
+                return None
+            cpath = _to_container_path(sbx, Path(host_path))
+            best = None
+            for e in sup.list_entries():
+                port, wd = e.get("port"), str(e.get("workdir") or "")
+                try:
+                    port = int(port)
+                except (TypeError, ValueError):
+                    continue
+                wdn = wd.rstrip("/")
+                if not wdn or not (cpath == wdn
+                                   or cpath.startswith(wdn + "/")):
+                    continue
+                if best is None or len(wdn) > len(best[1]):
+                    best = (e, wdn, port)
+            if best is None:
+                return None
+            entry, wdn, port = best
+            if not (self._service_entry_reachable(sup, entry, port)):
+                return None
+            rel = cpath[len(wdn):].lstrip("/")
+            return f"http://127.0.0.1:{port}/{rel}"
+        except Exception as exc:
+            logger.debug("service-url resolve skipped: %s: %s",
+                         type(exc).__name__, exc)
+            return None
+
+    @staticmethod
+    def _service_entry_reachable(sup, entry, port) -> bool:
+        """Registry entry looks alive, or SOMETHING is listening on its
+        port. Split out so tests can stub liveness without a container."""
+        try:
+            if sup._entry_alive(entry):
+                return True
+        except Exception:
+            pass
+        try:
+            return bool(sup._port_listening(port))
+        except Exception:
+            return False
+
     async def _execute_web_artifact(self, written: list):
         """Headless-load EVERY html page written/edited this turn (cap
         ``_WEB_EXEC_MAX_PAGES``), not just one entry page.
@@ -5371,24 +5466,41 @@ class GhostAgent:
         # broken persistence migration was LATE CONFIRMED at 90% off a
         # file:// load — the page's /api/ calls can never run there, and
         # fetch rejections don't even trip the uncaught-exception marker).
-        # A page that calls the network is only verifiable SERVED, so the
-        # probe declares itself inconclusive — the existing
+        # A page that calls the network is only verifiable SERVED — so serve
+        # it: when a RUNNING registered service's workdir covers the page,
+        # probe http://127.0.0.1:<port>/<rel> instead of skipping. Skipping
+        # here was the 92a968fc → 646e9b7e cascade (both turns skipped, the
+        # service was up on its port the whole time, and broken JS shipped
+        # to the operator's browser). Only when NO live service covers the
+        # page does the probe stay inconclusive — the existing
         # _WEB_EXEC_SKIP_CONF_CAP (0.6) then caps any text-only CONFIRMED
         # below every consumption gate.
+        served_urls: dict = {}
         for host in hosts:
             try:
                 _head = host.read_text(encoding="utf-8", errors="replace")[:60000]
                 if re.search(r"\bfetch\s*\(|XMLHttpRequest|axios[.(]|[\"'`]/api/",
                              _head):
+                    _surl = await asyncio.to_thread(
+                        self._service_url_for_page, host, sbx)
+                    if _surl is None:
+                        pretty_log(
+                            "Verifier",
+                            f"WEB-EXEC inconclusive: '{host.name}' calls the "
+                            "network (fetch/XHR/api) and no RUNNING service "
+                            "covers it — a file:// load can't exercise it. "
+                            "Confidence will be capped.",
+                            icon=Icons.VERIFIER_LAB,
+                        )
+                        return None
+                    served_urls[str(host)] = _surl
                     pretty_log(
                         "Verifier",
-                        f"WEB-EXEC inconclusive: '{host.name}' calls the "
-                        "network (fetch/XHR/api) — a file:// load can't "
-                        "exercise it; verify via the RUNNING service URL "
-                        "instead. Confidence will be capped.",
+                        f"WEB-EXEC probing '{host.name}' via its running "
+                        f"service ({_surl}) — fetch-backed page, file:// "
+                        "can't exercise it",
                         icon=Icons.VERIFIER_LAB,
                     )
-                    return None
             except Exception:
                 pass
         clean_pages: list = []
@@ -5402,7 +5514,10 @@ class GhostAgent:
             # never loads — that was the WEB-EXEC reliability bug: the probe
             # "skipped" on every build because the URL pointed nowhere, so a
             # page that throws on load still got a text-only CONFIRMED.
-            url = "file://" + _to_container_path(sbx, host)
+            # Fetch-backed pages resolved to a live service above use the
+            # HTTP URL instead — same navigation, same JS-exception marker.
+            url = served_urls.get(str(host)) \
+                or "file://" + _to_container_path(sbx, host)
             res = await browser(
                 operation="navigate",
                 url=url,
@@ -6057,6 +6172,7 @@ class GhostAgent:
             task, trajectory_id,
             conv_fp if conv_fp is not None
             else self._conversation_fingerprint(messages),
+            project_id=getattr(self.context, "current_project_id", None),
         )
         return None, last_tool
 
@@ -6090,7 +6206,8 @@ class GhostAgent:
             return ""
 
     def _attach_late_verdict_handler(self, task, trajectory_id, conv_fp="",
-                                     force_correction=False):
+                                     force_correction=False,
+                                     project_id=None):
         """Apply the safety-critical side effects of a verdict that lands
         AFTER its response already shipped.
 
@@ -6135,7 +6252,8 @@ class GhostAgent:
                 return
             self._record_late_verdict(v_result, trajectory_id, conv_fp,
                                       last_tool=_lt,
-                                      force_correction=force_correction)
+                                      force_correction=force_correction,
+                                      project_id=project_id)
 
         # Published so _judge_hydration_safe can serialise the finalize
         # burst behind the in-flight verdict (both used to hit the single
@@ -6292,8 +6410,106 @@ class GhostAgent:
         except Exception as e:
             logger.debug("flush stashed lesson outcome skipped: %s", e)
 
+    # Late-refute follow-up filing bounds: at most N tasks per verdict, and
+    # only issues substantial enough to be actionable (a bare "unsupported"
+    # is a verdict, not a work item).
+    _REFUTE_TASK_MAX = 2
+    _REFUTE_TASK_MIN_CHARS = 25
+
+    def _file_refute_followup_tasks(self, v_result, project_id):
+        """File a late refute's concrete leftovers as tasks on the project
+        the refuted turn was working on, so the next turn / autoadvance
+        picks them up instead of the operator rediscovering them (req
+        646e9b7e 2026-07-25: the refute named 'line 1981 still passes
+        count' and the knowledge went nowhere but a banner).
+
+        Bounded and braked: max ``_REFUTE_TASK_MAX`` tasks, only
+        substantial issue strings, deduped against existing tasks, never
+        on RELEASED/ARCHIVED projects, and a DONE project shares the
+        defect-reopen churn budget (``defect_reopens``) so verdict-driven
+        reopens can't grind past the same cap user reports respect.
+        ``GHOST_REFUTE_FOLLOWUP_TASKS=0`` kills the feature."""
+        if os.getenv("GHOST_REFUTE_FOLLOWUP_TASKS", "1").strip().lower() in (
+                "0", "false", "no"):
+            return
+        if not project_id:
+            return
+        store = getattr(self.context, "project_store", None)
+        if store is None:
+            return
+        try:
+            proj = store.get_project(project_id) or {}
+        except Exception:
+            return
+        status = str(proj.get("status", "")).upper()
+        if not proj or status in ("RELEASED", "ARCHIVED"):
+            return
+        issues = [str(i).strip() for i in (getattr(v_result, "issues", None)
+                                           or [])]
+        issues = [i for i in issues if len(i) >= self._REFUTE_TASK_MIN_CHARS]
+        if not issues:
+            return
+        if status == "DONE":
+            # Same rolling-window budget as the user-report reopen path —
+            # a refute-driven reopen is still a reopen.
+            _now_ts = time.time()
+            _reopen_ok = {"ok": False}
+
+            def _reopen_gate(meta):
+                raw = meta.get("defect_reopens") or []
+                recent = [float(t) for t in raw
+                          if _now_ts - float(t) < _DEFECT_REOPEN_WINDOW_S]
+                if len(recent) < _DEFECT_REOPEN_CAP:
+                    recent.append(_now_ts)
+                    _reopen_ok["ok"] = True
+                meta["defect_reopens"] = recent
+                return meta
+
+            try:
+                store._atomic_metadata_update(project_id, _reopen_gate)
+            except Exception:
+                return
+            if not _reopen_ok["ok"]:
+                pretty_log(
+                    "Verifier",
+                    f"late refute named leftovers on DONE project "
+                    f"'{project_id}' but the reopen cap is hit — surfacing "
+                    "via the correction banner only",
+                    icon=Icons.WARN, level="WARNING",
+                )
+                return
+        try:
+            existing = [str(t.get("description", "")).lower()
+                        for t in store.list_tasks(project_id)]
+        except Exception:
+            existing = []
+        filed = 0
+        for issue in issues:
+            if filed >= self._REFUTE_TASK_MAX:
+                break
+            key = issue[:80].lower()
+            if any(key in e for e in existing):
+                continue
+            try:
+                store.add_task(
+                    project_id, f"Verifier follow-up: {issue[:240]}")
+                filed += 1
+            except Exception as exc:
+                logger.debug("refute follow-up task filing failed: %s: %s",
+                             type(exc).__name__, exc)
+                break
+        if filed:
+            pretty_log(
+                "Verifier",
+                f"filed {filed} follow-up task(s) from the late refute on "
+                f"project {project_id} — next turn / autoadvance picks "
+                "them up",
+                icon=Icons.IDEA,
+            )
+
     def _record_late_verdict(self, v_result, trajectory_id, conv_fp="",
-                             last_tool=None, force_correction=False):
+                             last_tool=None, force_correction=False,
+                             project_id=None):
         """Apply the side effects of a verdict that lands AFTER its
         response shipped. Extracted from the done-callback so it is
         unit-testable. On a high-confidence REFUTED: log it, scrub any
@@ -6378,6 +6594,13 @@ class GhostAgent:
                         self.context, "memory_system", None
                     ),
                 ), name="late-verdict-lesson-retraction")
+            # Concrete leftovers the refute named become project tasks —
+            # the banner tells the USER, this puts the work on the books.
+            try:
+                self._file_refute_followup_tasks(v_result, project_id)
+            except Exception as _fexc:
+                logger.debug("refute follow-up filing skipped: %s: %s",
+                             type(_fexc).__name__, _fexc)
             # Async mode: stash a correction to surface on the next turn OF
             # THE SAME CONVERSATION, since the response is already out and
             # can't be repaired. Tagged with the conversation fingerprint and
@@ -8044,6 +8267,59 @@ class GhostAgent:
                             f"constraint(s))",
                             icon=Icons.CONSTRAINT,
                         )
+
+                    # Edit-churn brake: consecutive successful mutations
+                    # of the SAME file without an intervening run/render
+                    # get a verify-now steer (see the module constants
+                    # for the incident this encodes). Counters live on
+                    # request_state — per-request, no TurnState churn.
+                    if fname == "file_system" and is_mutating and not _res_is_error:
+                        _churn = getattr(request_state, "_edit_churn", None)
+                        # isinstance, not None-check: a mocked request_state
+                        # auto-fabricates attributes, and the counters must
+                        # be a real dict before arithmetic touches them.
+                        if not isinstance(_churn, dict):
+                            _churn = {"counts": {}, "steers": 0}
+                            try:
+                                request_state._edit_churn = _churn
+                            except Exception:
+                                pass
+                        _churn_t = str(ptarget or "?")
+                        _churn["counts"][_churn_t] = \
+                            _churn["counts"].get(_churn_t, 0) + 1
+                        if (_churn["counts"][_churn_t] >= _EDIT_CHURN_STEER_AFTER
+                                and _churn["steers"] < _EDIT_CHURN_MAX_STEERS):
+                            _churn["counts"][_churn_t] = 0
+                            _churn["steers"] += 1
+                            messages.append({
+                                "role": "user",
+                                "content": (
+                                    "SYSTEM ALERT (edit-churn check): "
+                                    f"you have now edited '{_churn_t}' "
+                                    f"{_EDIT_CHURN_STEER_AFTER} times in a "
+                                    "row without running or rendering "
+                                    "ANYTHING. Blind edit stacks ship "
+                                    "broken code. STOP editing and VERIFY "
+                                    "now: execute the file or its tests — "
+                                    "or, for a web page, load it in the "
+                                    "browser (use its running service URL "
+                                    "if it calls fetch/api) and check for "
+                                    "errors. Continue only from what the "
+                                    "verification shows."
+                                ),
+                            })
+                            pretty_log(
+                                "Edit Churn",
+                                f"{_EDIT_CHURN_STEER_AFTER} unverified "
+                                f"edits on '{_churn_t}' — steering to "
+                                "verify before further edits",
+                                icon=Icons.WARN, level="WARNING",
+                            )
+                    elif (fname in _EDIT_CHURN_VERIFY_TOOLS
+                            and not _res_is_error):
+                        _churn = getattr(request_state, "_edit_churn", None)
+                        if isinstance(_churn, dict):
+                            _churn["counts"].clear()
 
                     # Metacog per-tool outcome (roadmap phase 2.3):
                     # record THIS result's tool keyed on its OWN
@@ -12380,6 +12656,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 thinking_loop_detected = True
                                                 pretty_log("Thinking Loop", f"Detected n-gram repetition at {len(guard_buf)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
                                                 break
+                                            # Paraphrase loops (verbatim
+                                            # paragraphs with varied filler
+                                            # between) dodge the exact-tail
+                                            # n-gram probe for tens of KB —
+                                            # req f59a793d ran to 19.5K chars.
+                                            # Whole-line repetition fires much
+                                            # earlier. THINKING channel only:
+                                            # generated code/data repeats
+                                            # lines legitimately.
+                                            if reasoning_content and _detect_paragraph_loop(reasoning_content):
+                                                thinking_loop_detected = True
+                                                pretty_log("Thinking Loop", f"Detected repeated-paragraph loop at {len(reasoning_content)} chars. Aborting turn.", level="WARNING", icon=Icons.STOP)
+                                                break
 
                                         if "tool_calls" in delta and delta["tool_calls"]:
                                             if not msg.get("tool_calls"):
@@ -13117,6 +13406,10 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                                 self._attach_late_verdict_handler(
                                                     _vtask, current_trajectory_id,
                                                     _stable_conv_fp,
+                                                    project_id=getattr(
+                                                        self.context,
+                                                        "current_project_id",
+                                                        None),
                                                 )
                                                 _verifier_verdict_cache = (None, _lt)
                                                 _verdict_is_fresh = True
@@ -13189,10 +13482,27 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 messages.append({"role": "user", "content": _directive})
                                 repair_round += 1
                                 force_final_response = False
-                                # Discard exactly this turn's text contribution
-                                # so the repaired answer replaces (not appends to)
-                                # the refuted one.
-                                final_ai_content = (final_ai_content or "")[:_final_len_at_turn_start]
+                                if _refuted:
+                                    # REFUTED: discard the WHOLE accumulated
+                                    # narration, not just this turn's tail.
+                                    # The wrong claim often entered in an
+                                    # EARLIER turn's working narration (req
+                                    # 92a968fc: turn 6 said "All 7 tasks
+                                    # completed", turn 7 got refuted — the
+                                    # turn-start rewind kept turn 6's line
+                                    # and the shipped reply contradicted
+                                    # itself, 7 vs 6/6). The directive
+                                    # already demands a clean STANDALONE
+                                    # reply, so the repair turn restates
+                                    # whatever still matters.
+                                    final_ai_content = ""
+                                else:
+                                    # UNVERIFIED: prior narration isn't
+                                    # wrong, just untested — discard exactly
+                                    # this turn's contribution so the
+                                    # verified answer replaces the
+                                    # unverified one.
+                                    final_ai_content = (final_ai_content or "")[:_final_len_at_turn_start]
                                 _verdict_is_fresh = False
                                 _verifier_verdict_cache = None
                                 pretty_log(
@@ -14568,7 +14878,9 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     self._attach_late_verdict_handler(
                         _sv_task, current_trajectory_id,
                         stream_conv_fp,
-                        force_correction=True)
+                        force_correction=True,
+                        project_id=getattr(
+                            self.context, "current_project_id", None))
                     pretty_log(
                         "Verifier",
                         "stream gate: verdict deferred — "

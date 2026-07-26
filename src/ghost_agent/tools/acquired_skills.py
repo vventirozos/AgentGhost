@@ -306,6 +306,16 @@ class AcquiredSkillManager:
             # if the content actually changed. Re-embedding identical skill
             # text was bloating the vector store on every replan.
             if self.memory_system and not content_unchanged:
+                # Drop any previous embedding for this name first — re-saving
+                # a skill with edited content used to stack a fresh embedding
+                # on top of the old one, so semantic routing counted the same
+                # skill once per historical edit. No-op for brand-new skills.
+                try:
+                    self.memory_system.collection.delete(
+                        where={"$and": [{"name": name}, {"type": "acquired_skill"}]}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to drop stale embedding for skill '{name}': {e}")
                 self.memory_system.add(
                     description,
                     {"type": "acquired_skill", "name": name}
@@ -400,14 +410,17 @@ class AcquiredSkillManager:
                     except Exception as e:
                         logger.warning(f"Failed to move skill {name} to retired: {e}")
 
-                # Remove from vector store
+                # Remove from vector store. Chroma requires multi-key
+                # filters to be wrapped in $and; a flat two-key dict is
+                # rejected with "Expected where to have exactly one
+                # operator".
                 if self.memory_system:
                     try:
                         self.memory_system.collection.delete(
-                            where={"name": name, "type": "acquired_skill"}
+                            where={"$and": [{"name": name}, {"type": "acquired_skill"}]}
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning(f"Failed to remove retired skill '{name}' from vector memory: {e}")
 
                 # Remove from active registry
                 del registry[name]
@@ -421,6 +434,80 @@ class AcquiredSkillManager:
 
             self._save_registry(registry)
         return retired_names
+
+    def purge_orphaned_skill_embeddings(self) -> int:
+        """Remove stale acquired-skill embeddings: orphans AND duplicates.
+
+        Two historical leak sources (both closed 2026-07-26, this sweep
+        back-fills what they left behind):
+
+        * **Orphans** — the vector-store cleanup in ``delete_skill`` and
+          ``retire_degraded_skills`` passed Chroma a flat multi-key
+          ``where`` filter, which Chroma rejects, so every skill ever
+          deleted or retired left its embedding behind.
+        * **Duplicates** — ``save_skill`` stacked a fresh embedding on
+          every content edit without dropping the previous one, so one
+          skill could hold several routing slots (and the "injected N"
+          log counted it N times).
+
+        Neither can advertise phantom/double tools (routing filters
+        against the live registry and the advertising loop iterates the
+        registry), but both crowd the routing query's ``n_results``
+        slots. Orphans are swept by id; duplicates are collapsed to one
+        embedding per name — preferring the one whose document matches
+        the registry's current description, else the newest insert.
+
+        The vector store is snapshotted BEFORE the registry so a skill
+        saved concurrently (registry write precedes its embed in
+        ``save_skill``) is always seen as registered, never as an orphan.
+
+        Returns the number of embeddings removed. Never raises.
+        """
+        if not self.memory_system:
+            return 0
+        try:
+            res = self.memory_system.collection.get(
+                where={"type": "acquired_skill"},
+                include=["metadatas", "documents"],
+            )
+            with self._lock:
+                registry = self._load_registry()
+            ids = res.get("ids") or []
+            metas = res.get("metadatas") or []
+            docs = res.get("documents") or []
+            if len(docs) < len(ids):
+                docs = list(docs) + [None] * (len(ids) - len(docs))
+
+            by_name = {}
+            stale_ids = []
+            for id_, meta, doc in zip(ids, metas, docs):
+                skill_name = (meta or {}).get("name")
+                if skill_name not in registry:
+                    stale_ids.append(id_)
+                else:
+                    by_name.setdefault(skill_name, []).append((id_, doc))
+
+            for skill_name, entries in by_name.items():
+                if len(entries) <= 1:
+                    continue
+                current_desc = registry[skill_name].get("description")
+                keep = next(
+                    (e for e in reversed(entries) if e[1] == current_desc),
+                    entries[-1],
+                )
+                stale_ids.extend(e[0] for e in entries if e is not keep)
+
+            if stale_ids:
+                self.memory_system.collection.delete(ids=stale_ids)
+                logger.info(
+                    "Purged %d stale acquired-skill embedding(s) "
+                    "(orphaned or duplicate) from vector memory",
+                    len(stale_ids),
+                )
+            return len(stale_ids)
+        except Exception as e:
+            logger.warning(f"Stale-skill-embedding sweep failed: {e}")
+            return 0
 
     def delete_skill(self, name: str) -> bool:
         with self._lock:
@@ -437,10 +524,13 @@ class AcquiredSkillManager:
                     except Exception as e:
                         logger.error(f"Failed to delete file {skill_path}: {e}")
                 
-                # Delete from semantic vector memory
+                # Delete from semantic vector memory. Chroma requires
+                # multi-key filters to be wrapped in $and.
                 if self.memory_system:
                     try:
-                        self.memory_system.collection.delete(where={"name": name, "type": "acquired_skill"})
+                        self.memory_system.collection.delete(
+                            where={"$and": [{"name": name}, {"type": "acquired_skill"}]}
+                        )
                     except Exception as e:
                         logger.warning(f"Failed to remove skill '{name}' from vector memory: {e}")
                         
@@ -665,6 +755,10 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
             logger.info("Retired %d degraded skill(s): %s", len(_retired), _retired)
     except Exception as _re:
         logger.debug("retire_degraded_skills skipped: %s", _re)
+    # Also sweep embeddings orphaned by the pre-2026-07-26 broken vector
+    # deletes (flat multi-key where) — their registry entries are gone, so
+    # no other path can ever clean them. Self-guarding, never raises.
+    mgr.purge_orphaned_skill_embeddings()
     if action == "list":
         skills = mgr.get_all_skills()
         composed = _list_composed_skills(memory_dir)

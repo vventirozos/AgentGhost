@@ -23,6 +23,69 @@ THINKING_LOOP_THRESHOLD = 3         # window appearing >= N times = loop
 # / loop invariant / repeated code pattern) now outweighs the benefit. The
 # tool-call-collapse probe + the 200K char ceiling remain as fast backstops.
 
+# --- paragraph-repeat detector (thinking channel only) ----------------------
+# The n-gram probe needs the EXACT current 200-char tail to have occurred 3×,
+# so a paraphrase loop that interleaves varied text between verbatim blocks
+# evades it for a long time: the live 2026-07-25 planning loop (req f59a793d)
+# repeated "Let me write this now."-style paragraphs dozens of times and ran
+# to 19,586 chars (~3 minutes) before a probe finally landed inside a
+# repeated block. Whole-line repetition is a much earlier signature of that
+# shape: the same non-trivial LINE recurring several times in prose reasoning
+# is a loop long before an exact 200-char window repeats.
+#
+# THINKING CHANNEL ONLY — callers must pass reasoning text, never content:
+# generated code/data legitimately repeats identical lines (table rows,
+# closing tags, fixture entries); prose reasoning does not.
+#
+# CONSERVATIVE by hard-won necessity (2026-07-25 second deploy): the first
+# cut (min-line 30, threshold 4, no floor) fired on EVERY coding-leaf spec
+# generation of the first live autoadvance run — one abort at just 3,019
+# chars of reasoning — because legitimate spec planning restates the task
+# description and field lists several times. That made the guard a thinking
+# suppressor (every leaf built no-think). Current calibration: lines under
+# 48 chars ("Let me check the file.") never count, six verbatim occurrences
+# required, and buffers under 6K chars are never judged at all — a real
+# runaway (dozens of repeats over tens of KB) still dies far earlier than
+# the n-gram/extended-cap backstops, but multi-restatement planning passes.
+PARAGRAPH_LOOP_MIN_LINE = 48       # ignore shorter lines (common phrases)
+PARAGRAPH_LOOP_THRESHOLD = 6       # same line appearing >= N times = loop
+PARAGRAPH_LOOP_SCAN_LINES = 3      # newest completed long lines checked/probe
+PARAGRAPH_LOOP_MIN_BUF = 6_000     # never judge a buffer smaller than this
+
+
+def _detect_paragraph_loop(reasoning_buf: str) -> bool:
+    """True when one of the newest completed non-trivial LINEs of the
+    thinking stream has already appeared ``PARAGRAPH_LOOP_THRESHOLD``
+    times.
+
+    Scans backwards from the tail for the ``PARAGRAPH_LOOP_SCAN_LINES``
+    most recent lines of at least ``PARAGRAPH_LOOP_MIN_LINE`` chars
+    (skipping the final, possibly still-streaming fragment) and counts
+    each one's occurrences over the whole buffer — a few O(buffer)
+    substring counts, same cost class as ``_detect_thinking_loop``, and
+    intended to run on the same probe cadence. Checking a small window
+    (not just the single newest line) keeps a novel interleaved line
+    from masking the repeats around it."""
+    if not reasoning_buf or len(reasoning_buf) < PARAGRAPH_LOOP_MIN_BUF:
+        return False
+    lines = reasoning_buf.splitlines()
+    if len(lines) < 2:
+        return False
+    # The last element may be a mid-line streaming fragment — check only
+    # COMPLETED lines (everything before it), newest first.
+    checked = 0
+    for line in reversed(lines[:-1]):
+        line = line.strip()
+        if len(line) < PARAGRAPH_LOOP_MIN_LINE:
+            continue
+        if reasoning_buf.count(line) >= PARAGRAPH_LOOP_THRESHOLD:
+            return True
+        checked += 1
+        if checked >= PARAGRAPH_LOOP_SCAN_LINES:
+            break
+    return False
+
+
 # --- tool-call generation-collapse detector ---------------------------------
 # Qwen has been observed emitting 8000+ consecutive `<tool_call>` tokens with
 # zero `</tool_call>` / `<function>` / `<parameter>`, burning 300+ s of decoder

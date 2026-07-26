@@ -1109,6 +1109,45 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-26 (later) — Duplicate skill embeddings: "injected 3" vs 2 registered skills
+
+Operator: routing log said `injected 3: news_headlines, news_headlines,…` while `manage_skills` listed 2 skills.
+Registry (one entry per name) is authoritative; the routing line counts vector HITS. Read-only sqlite scan of the
+live chroma.sqlite3 confirmed: `news_headlines`×2 (07:23:07 and 07:26:08 — re-save with edited description) +
+`generate_password`×1 = 3. Root cause: `save_skill` embeds on content change but never removed the name's previous
+embedding — the content-hash dedup only stops re-embedding IDENTICAL content, so every edit added one embedding
+forever. (Also confirmed the morning's orphan sweep worked live: `naftemporiki_headlines` gone from the store.)
+Impact beyond logs: each duplicate wastes one of the routing query's n_results=15 slots; the advertising loop
+itself was safe (registry iteration + membership check → never offered a tool twice). Three-part fix, DEPLOYED:
+(1) `save_skill` delete-before-add with the now-working `$and` filter — an edited skill holds exactly one slot;
+(2) `purge_orphaned_skill_embeddings` extended to collapse same-name duplicates (keep the embedding whose document
+matches the registry's current description, else newest insert; orphan handling unchanged, snapshot-order guard
+kept) — back-fills historical dupes on the next manage_skills call; (3) routing candidate list in `registry.py`
+deduped order-preserving so "injected N" counts distinct skills. Tests: 5 new (save replace/no-churn, purge
+collapse ×2, routing dedupe) + 4 older tests re-pinned (save_skill's own delete now precedes theirs — reset_mock
+after save). Docs: `docs/tools/acquired_skills.html` (new "Duplicate embeddings per skill" section).
+
+### 2026-07-26 — Acquired-skill vector deletes never worked (flat multi-key where) + orphan-embedding sweep
+
+Operator hit `Failed to remove skill 'naftemporiki_headlines' from vector memory: Expected where to have exactly
+one operator` on a manual delete. Root cause: both `delete_skill` and `retire_degraded_skills` in
+`tools/acquired_skills.py` passed Chroma `where={"name": ..., "type": "acquired_skill"}` — Chroma rejects flat
+multi-key filters (must be `{"$and": [...]}`, the pattern `memory/skills.py:519` already used with a comment
+saying exactly this). So the vector-store leg of skill deletion has NEVER worked: manual deletes warned (the line
+the operator saw), the retirement path swallowed it silently (`except: pass` — now logs a warning). Every skill
+ever deleted/retired left its embedding behind. Orphans never advertised phantom skills (semantic routing in
+`registry.py` filters candidates against the live registry) but crowded the routing query's `n_results=15` slots.
+Two-part fix, DEPLOYED (listener 12024→50896, health ok): (1) both call sites → `$and` form; (2) new
+`AcquiredSkillManager.purge_orphaned_skill_embeddings()` — reconciles type=acquired_skill embeddings against the
+registry, deletes orphans by id, vector snapshot taken BEFORE registry read so a concurrent save (registry write
+precedes embed) can't be misread as an orphan; wired into `tool_manage_skills` beside the retirement sweep
+(back-fills the strays whose registry entries are long gone — no per-skill path could ever reach them). Watch for
+`Purged N orphaned acquired-skill embedding(s)` on the next skill list/delete. Regression guard: tests capture the
+`where` passed to the mock collection and run it through `chromadb.api.types.validate_where`, so a mock can never
+again bless a shape real Chroma rejects (that mock/real gap is how this shipped). Tests:
+`test_acquired_skills.py` (delete shape + 5 purge tests incl. manage_skills wiring), `test_acquired_skill_retirement.py`
+(retirement now asserts exact `$and` shape, was only `assert_called`). Docs: `docs/tools/acquired_skills.html`.
+
 ### 2026-07-25 (later 5) — notes.info refill closed: workflow-cue backstop + sink-write guard + sink log level
 
 Operator: "i still got 'profile capped — notes.info hit the 3-value cap'". Real recurrence, not stale code: the

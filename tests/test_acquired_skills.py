@@ -147,10 +147,15 @@ def test_acquired_skill_manager_delete(temp_dirs):
     assert "test_del_skill" not in manager.get_all_skills()
     assert not (sandbox_dir / "acquired_skills" / "test_del_skill.py").exists()
     
-    # Verify memory system deletion
+    # Verify memory system deletion. Chroma rejects flat multi-key where
+    # dicts ("Expected where to have exactly one operator"), so the filter
+    # must use $and — and we run the captured filter through chromadb's own
+    # validator so a mock can never accept a shape real Chroma rejects.
     memory_sys_mock.collection.delete.assert_called_once_with(
-        where={"name": "test_del_skill", "type": "acquired_skill"}
+        where={"$and": [{"name": "test_del_skill"}, {"type": "acquired_skill"}]}
     )
+    from chromadb.api.types import validate_where
+    validate_where(memory_sys_mock.collection.delete.call_args.kwargs["where"])
     
     # Delete non-existent
     success = manager.delete_skill("non_existent")
@@ -213,3 +218,166 @@ async def test_tool_manage_skills_delete(temp_dirs):
     
     result_err2 = await tool_manage_skills(sandbox_dir=sandbox_dir, memory_system=memory, action="delete", skill_name=None)
     assert "skill_name is required" in result_err2
+
+
+def test_purge_orphaned_skill_embeddings(temp_dirs):
+    """Embeddings whose skill is gone from the registry are deleted by id;
+    registered skills' embeddings are kept. Orphans exist in live stores
+    because pre-2026-07-26 vector deletes used a flat multi-key where that
+    Chroma rejected."""
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+    manager.save_skill("kept_skill", "desc", {}, "code")
+    memory.reset_mock()
+
+    memory.collection.get.return_value = {
+        "ids": ["id-kept", "id-orphan", "id-nameless"],
+        "metadatas": [
+            {"type": "acquired_skill", "name": "kept_skill"},
+            {"type": "acquired_skill", "name": "naftemporiki_headlines"},
+            None,
+        ],
+    }
+
+    purged = manager.purge_orphaned_skill_embeddings()
+
+    assert purged == 2
+    memory.collection.delete.assert_called_once_with(ids=["id-orphan", "id-nameless"])
+    # The get filter must be a shape real Chroma accepts.
+    from chromadb.api.types import validate_where
+    validate_where(memory.collection.get.call_args.kwargs["where"])
+
+
+def test_purge_orphaned_skill_embeddings_no_orphans(temp_dirs):
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+    manager.save_skill("kept_skill", "desc", {}, "code")
+    memory.reset_mock()
+
+    memory.collection.get.return_value = {
+        "ids": ["id-kept"],
+        "metadatas": [{"type": "acquired_skill", "name": "kept_skill"}],
+    }
+
+    assert manager.purge_orphaned_skill_embeddings() == 0
+    memory.collection.delete.assert_not_called()
+
+
+def test_purge_orphaned_skill_embeddings_no_memory_system(temp_dirs):
+    manager = AcquiredSkillManager(temp_dirs["sandbox"], None)
+    assert manager.purge_orphaned_skill_embeddings() == 0
+
+
+def test_purge_orphaned_skill_embeddings_never_raises(temp_dirs):
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    memory.collection.get.side_effect = RuntimeError("vector store down")
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+    assert manager.purge_orphaned_skill_embeddings() == 0
+
+
+@pytest.mark.asyncio
+async def test_tool_manage_skills_sweeps_orphaned_embeddings(temp_dirs):
+    """tool_manage_skills runs the orphan sweep best-effort on every call
+    (same pattern as the degraded-skill retirement sweep)."""
+    from ghost_agent.tools.acquired_skills import tool_manage_skills
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+    manager.save_skill("live_skill", "desc", {}, "code")
+    memory.reset_mock()
+
+    memory.collection.get.return_value = {
+        "ids": ["id-live", "id-orphan"],
+        "metadatas": [
+            {"type": "acquired_skill", "name": "live_skill"},
+            {"type": "acquired_skill", "name": "deleted_long_ago"},
+        ],
+    }
+
+    await tool_manage_skills(sandbox_dir=sandbox_dir, memory_system=memory, action="list")
+    memory.collection.delete.assert_called_once_with(ids=["id-orphan"])
+
+
+def test_save_skill_replaces_previous_embedding(temp_dirs):
+    """Editing a skill re-embeds its description; the previous embedding for
+    that name must be dropped first (with a Chroma-valid $and filter), or the
+    skill holds one routing slot per historical edit."""
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+
+    manager.save_skill("news_headlines", "v1 desc", {}, "code v1")
+    manager.save_skill("news_headlines", "v2 desc", {}, "code v2")
+
+    assert memory.collection.delete.call_count == 2
+    from chromadb.api.types import validate_where
+    for call in memory.collection.delete.call_args_list:
+        validate_where(call.kwargs["where"])
+    assert memory.add.call_count == 2
+    # Each embed must be preceded by the delete of its stale twin.
+    ops = [c[0] for c in memory.method_calls if c[0] in ("collection.delete", "add")]
+    assert ops == ["collection.delete", "add", "collection.delete", "add"]
+
+
+def test_save_skill_unchanged_content_skips_embedding_churn(temp_dirs):
+    """Identical re-save (same content hash) must touch the vector store
+    neither with an add NOR with a delete."""
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+
+    manager.save_skill("stable_skill", "same desc", {}, "same code")
+    manager.save_skill("stable_skill", "same desc", {}, "same code")
+
+    assert memory.add.call_count == 1
+    assert memory.collection.delete.call_count == 1
+
+
+def test_purge_collapses_duplicate_embeddings_prefers_current_description(temp_dirs):
+    """Same-name duplicates collapse to the embedding matching the registry's
+    current description (the live 'injected 3 with 2 skills' shape)."""
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+    manager.save_skill("news_headlines", "v2 desc", {}, "code")
+    memory.reset_mock()
+
+    memory.collection.get.return_value = {
+        "ids": ["id-old", "id-new"],
+        "metadatas": [
+            {"type": "acquired_skill", "name": "news_headlines"},
+            {"type": "acquired_skill", "name": "news_headlines"},
+        ],
+        "documents": ["v1 desc", "v2 desc"],
+    }
+
+    purged = manager.purge_orphaned_skill_embeddings()
+    assert purged == 1
+    memory.collection.delete.assert_called_once_with(ids=["id-old"])
+
+
+def test_purge_collapses_duplicates_without_desc_match_keeps_newest(temp_dirs):
+    """If no duplicate's document matches the registry description (e.g. the
+    description changed without a content-hash change), keep the newest
+    insert and drop the rest."""
+    sandbox_dir = temp_dirs["sandbox"]
+    memory = MagicMock()
+    manager = AcquiredSkillManager(sandbox_dir, memory)
+    manager.save_skill("drifty_skill", "current desc", {}, "code")
+    memory.reset_mock()
+
+    memory.collection.get.return_value = {
+        "ids": ["id-a", "id-b"],
+        "metadatas": [
+            {"type": "acquired_skill", "name": "drifty_skill"},
+            {"type": "acquired_skill", "name": "drifty_skill"},
+        ],
+        "documents": ["old a", "old b"],
+    }
+
+    purged = manager.purge_orphaned_skill_embeddings()
+    assert purged == 1
+    memory.collection.delete.assert_called_once_with(ids=["id-a"])

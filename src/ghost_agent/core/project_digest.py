@@ -95,6 +95,7 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
             continue
         candidates.extend(projs if cap is None else projs[:cap])
     touched = set()
+    finished_pids = set()
     for p in candidates:
         pid = p.get("id")
         title = str(p.get("title") or pid or "project")[:40]
@@ -119,10 +120,18 @@ def summarize_since(store, last_event_id: int, *, per_project_limit: int = 50) -
             elif etype in _ROLLUP_EVENTS:
                 # Only terminal rollups are digest-worthy; a NEEDS_USER
                 # rollup already surfaces via its needs-user event.
+                # ONE line per project — the FINAL state. Events arrive
+                # newest-first (list_events ORDER BY id DESC), so the first
+                # terminal rollup seen is the state the project ended in;
+                # a project that FAILED mid-batch and then recovered to DONE
+                # used to show BOTH ("→ DONE" and "→ FAILED" for the same
+                # project, observed live req 92a968fc 2026-07-25).
                 new_status = str(
                     (ev.get("payload") or {}).get("new_status") or ""
                 ).upper()
-                if new_status in ("DONE", "FAILED"):
+                if new_status in ("DONE", "FAILED") \
+                        and pid not in finished_pids:
+                    finished_pids.add(pid)
                     touched.add(pid)
                     res.finished.append((title, new_status))
             elif etype in _MILESTONE_EVENTS:

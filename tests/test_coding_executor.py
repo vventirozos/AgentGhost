@@ -492,3 +492,133 @@ async def test_advance_once_failed_build_marks_failed(store):
     )
     assert store.get_task(tid)["status"] == "FAILED"
     assert "failed" in res.summary.lower()
+
+
+# ---------------------------------------------------------------------------
+# Verify must TEST, not manage processes (2026-07-25, req 8ec512cf: the
+# spec's verify ran `fuser -k 8101/tcp; node server.js &`, murdered the
+# supervised service, and the operator's browser hit a dead port).
+# ---------------------------------------------------------------------------
+
+from ghost_agent.core.coding_executor import _VERIFY_KILL_RE
+
+
+@pytest.mark.parametrize("cmd", [
+    "fuser -k 8101/tcp; sleep 1; node server.js & sleep 2; curl -s localhost:8101",
+    "pkill -f 'node server.js' && node server.js &",
+    "killall node; node server.js",
+    "kill $(lsof -ti:8101); curl -s localhost:8101",
+    "lsof -ti:8101 | xargs kill -9",
+])
+def test_kill_shaped_verifies_are_detected(cmd):
+    assert _VERIFY_KILL_RE.search(cmd)
+
+
+@pytest.mark.parametrize("cmd", [
+    "kill -0 42 && curl -s http://localhost:8101/api/health",
+    "curl -s http://localhost:8101/api/sessions | grep -q '\\['",
+    "python3 -c 'import ast; ast.parse(open(\"app.py\").read())'",
+    "node -e \"require('./server.js')\"",
+])
+def test_test_shaped_verifies_are_not_detected(cmd):
+    assert not _VERIFY_KILL_RE.search(cmd)
+
+
+@pytest.mark.asyncio
+async def test_kill_shaped_verify_is_skipped_not_run():
+    spec = json.dumps({
+        "files": [{"path": "server.js", "content": "console.log('hi')\n"}],
+        "verify": "fuser -k 8101/tcp; node server.js & sleep 2; "
+                  "curl -s localhost:8101",
+        "summary": "s", "ledger": "",
+    })
+    runner = FakeRunner()
+    res = await build_coding_task(_ctx(FakeLLM(spec)), "build the server",
+                                  tool_runner=runner)
+    assert res.ok                                   # files still land
+    executed = [a for (n, a) in runner.calls if n == "execute"]
+    assert executed == []                           # the kill never ran
+
+
+@pytest.mark.asyncio
+async def test_liveness_probe_verify_still_runs():
+    spec = json.dumps({
+        "files": [{"path": "server.js", "content": "console.log('hi')\n"}],
+        "verify": "kill -0 42 && curl -s http://localhost:8101/api/health",
+        "summary": "s", "ledger": "",
+    })
+    runner = FakeRunner()
+    res = await build_coding_task(_ctx(FakeLLM(spec)), "build the server",
+                                  tool_runner=runner)
+    assert res.ok
+    executed = [a for (n, a) in runner.calls if n == "execute"]
+    assert len(executed) == 1
+
+
+def test_spec_prompt_forbids_process_kills():
+    # The rule must reach the model, not only the guard.
+    import inspect
+    from ghost_agent.core import coding_executor as ce
+    src = inspect.getsource(ce._generate_build_spec)
+    assert "must NOT kill or restart" in src
+
+
+# ---------------------------------------------------------------------------
+# Raw-newline-in-JSON-string repair (2026-07-25: three malformed-spec
+# retries in one afternoon, all the same shape — literal newlines inside
+# find/append/content string values).
+# ---------------------------------------------------------------------------
+
+from ghost_agent.core.coding_executor import (
+    _repair_json_string_newlines,
+    _recover_spec_escaping_newlines,
+)
+
+
+def test_repair_escapes_only_inside_strings():
+    good = {"files": [{"path": "a.js",
+                       "content": "line1\nline2\ttabbed\n"}],
+            "verify": "", "summary": "s", "ledger": ""}
+    dumped = json.dumps(good)
+    # Simulate the model's defect: the value's \n become LITERAL newlines.
+    broken = dumped.replace("\\n", "\n").replace("\\t", "\t")
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(broken)
+    repaired = _repair_json_string_newlines(broken)
+    assert json.loads(repaired) == good
+    # Structural whitespace OUTSIDE strings is untouched.
+    pretty = json.dumps(good, indent=2).replace("\\n", "\n")
+    assert json.loads(_repair_json_string_newlines(pretty)) == good
+
+
+def test_recover_helper_skips_leading_prose():
+    from ghost_agent.core.agent import extract_json_from_text
+
+    def usable(s):
+        return bool(isinstance(s, dict) and s.get("files"))
+
+    broken = ('The user wants a "modal" so let me write it.\n\n'
+              + json.dumps({"files": [{"path": "a.js", "content": "x\ny"}],
+                            "verify": "", "summary": "s",
+                            "ledger": ""}).replace("\\n", "\n"))
+    spec = _recover_spec_escaping_newlines(
+        (broken,), extract_json_from_text, usable)
+    assert usable(spec)
+    assert spec["files"][0]["content"] == "x\ny"
+
+
+@pytest.mark.asyncio
+async def test_malformed_multiline_spec_recovers_without_retry():
+    good = {"files": [{"path": "modal.js",
+                       "content": "function m() {\n  return 1;\n}\n"}],
+            "verify": "", "summary": "modal", "ledger": ""}
+    broken = json.dumps(good).replace("\\n", "\n")
+    llm = FakeLLM(broken)
+    runner = FakeRunner()
+    res = await build_coding_task(_ctx(llm), "build the modal",
+                                  tool_runner=runner)
+    assert res.ok and res.files == ["modal.js"]
+    assert llm.calls == 1              # recovered in-place, no retry burned
+    # The written content carries REAL newlines (unescaped after parse).
+    write_args = runner.writes()[0]
+    assert write_args["content"] == "function m() {\n  return 1;\n}\n"

@@ -2596,6 +2596,17 @@ async def tool_manage_projects(
             for tid, desc in pairs:
                 _link_task_in_graph(context, project_id, tid, desc)
             return _ok({"created": ids,
+                        # id+description pairs (2026-07-25, req f59a793d):
+                        # bare ids made this output unverifiable — the
+                        # verifier's "task tree" evidence slot held nothing
+                        # but hex ids + the STOP boilerplate, so it refuted
+                        # a plan reply's contents as "not confirmed in the
+                        # task tree". Echoing what was created also lets
+                        # later turns reference tasks without a task_list
+                        # round-trip. `created` keeps its shape (bare ids)
+                        # for existing consumers.
+                        "tasks": [{"id": tid, "description": desc}
+                                  for tid, desc in pairs],
                         "parent_id": target_id,
                         "sequential": bool(sequential),
                         "constraints": decompose_constraints,
@@ -3075,7 +3086,21 @@ async def tool_manage_projects(
                        icon=Icons.BRAIN_PLAN)
             _b = _briefing(store, new_pid)
             if isinstance(_b, dict):
-                _b = {**_b, "workspace": f"projects/{new_pid}",
+                # Action result FIRST (2026-07-25, req f59a793d): the fork
+                # provenance used to live only in the tail keys + a
+                # pretty_log line, so any head-truncation of this payload
+                # (the verifier's evidence packer caps items at a few
+                # hundred chars) dropped exactly the facts that prove what
+                # this call DID — the late verifier then refuted a correct
+                # "created v3 from v2" claim as unsubstantiated.
+                _b = {"result": (
+                          f"Forked {base_title} v{new_version - 1} → "
+                          f"{base_title} v{new_version} ({new_pid}): "
+                          f"{copied} file(s) copied from parent "
+                          f"{project_id}; v{new_version - 1} stays "
+                          f"RELEASED and running."),
+                      **_b,
+                      "workspace": f"projects/{new_pid}",
                       "note": _workspace_note(new_pid),
                       "version": new_version,
                       "parent_project_id": project_id,

@@ -675,7 +675,12 @@ def get_active_tool_definitions(context, query: str = None):
                         where={"type": "acquired_skill"}
                     )
                     if results and results.get("metadatas") and results["metadatas"][0]:
-                        raw_names = [m.get("name") for m in results["metadatas"][0] if m.get("name")]
+                        # Dedupe (order-preserving): duplicate embeddings of
+                        # one skill otherwise make the "injected N" log count
+                        # the same skill several times.
+                        raw_names = list(dict.fromkeys(
+                            m.get("name") for m in results["metadatas"][0] if m.get("name")
+                        ))
 
                         if raw_names:
                             active_skills = manager.get_all_skills()

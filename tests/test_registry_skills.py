@@ -77,3 +77,31 @@ def test_get_active_tool_definitions_without_query(temp_dirs, mock_context):
     
     tool_names = [d["function"]["name"] for d in definitions]
     assert "skill_one" in tool_names
+
+def test_get_active_tool_definitions_query_dedupes_duplicate_embeddings(temp_dirs, mock_context):
+    """Duplicate embeddings of one skill (pre-2026-07-26 save_skill stacked a
+    new embedding per content edit) must not make 'injected N' count the same
+    skill twice — live symptom: log said 'injected 3' while the registry
+    held 2 skills."""
+    from ghost_agent.tools.acquired_skills import AcquiredSkillManager
+
+    manager = AcquiredSkillManager(temp_dirs["sandbox"], mock_context.memory_system)
+    manager.save_skill("skill_one", "desc 1", "{}", "code")
+    manager.save_skill("skill_two", "desc 2", "{}", "code")
+
+    mock_collection = MagicMock()
+    mock_collection.query.return_value = {
+        "metadatas": [[{"name": "skill_two"}, {"name": "skill_two"}, {"name": "skill_one"}]]
+    }
+    mock_context.memory_system.collection = mock_collection
+
+    with patch("ghost_agent.tools.registry.pretty_log") as mock_pretty_log:
+        definitions = get_active_tool_definitions(mock_context, query="find skill two")
+        routing_calls = [c for c in mock_pretty_log.call_args_list if c[0][0] == "Semantic Routing"]
+        assert len(routing_calls) == 1
+        line = routing_calls[0][0][1]
+        assert line.startswith("injected 2:")
+        assert line.count("skill_two") == 1
+
+    tool_names = [d["function"]["name"] for d in definitions]
+    assert tool_names.count("skill_two") == 1

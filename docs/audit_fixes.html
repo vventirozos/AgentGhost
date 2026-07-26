@@ -895,6 +895,57 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
     <li><strong>Orphaned-symbol guard</strong> — a replace that removes a function/def whose references survive appends a named warning to the tool result (the <code>Router.init()</code> nav-regression class).</li>
   </ul>
 
+  <h2>Round 13 — live-incident cluster: verify-late, narration drift, think-loop economics (2026-07-25)</h2>
+  <p>Driven by three live requests in one afternoon: <code>f59a793d</code> (false LATE REFUTED on a correct
+  version-fork, traced by replaying the packer against the trajectory), <code>92a968fc</code> (autoadvance shipped a
+  self-contradicting reply and two 4-minute think-budget burns), and <code>646e9b7e</code> (16 blind edits before the
+  first browser load; 40/40 turns; honest fail). Eight fixes; tests in
+  <code>tests/test_edit_churn_and_refute_followups.py</code>, <code>tests/test_coding_executor_stream_guard.py</code>,
+  and extensions to the web-exec / evidence-window / auto-repair / digest / stream-guards suites.</p>
+  <ul>
+    <li><strong>WEB-EXEC probes fetch-backed pages via the RUNNING service</strong> — when a registered service's
+    workdir covers the page and it is alive (entry-alive or port-listening), the probe navigates
+    <code>http://127.0.0.1:&lt;port&gt;/&lt;rel&gt;</code> instead of declaring itself inconclusive. Longest-workdir
+    match wins; no live service → inconclusive + conf cap, as before. Validated live the same evening
+    (<code>WEB-EXEC probing 'index.html' via its running service … clean → CONFIRMED</code>).</li>
+    <li><strong>Edit-churn brake</strong> — 3 consecutive successful mutations of the SAME file with no intervening
+    execute/browser/manage_services success injects a verify-now steer (max 2 steers/request; counters on
+    <code>_RequestState._edit_churn</code>).</li>
+    <li><strong>REFUTED repair discards the whole accumulated narration</strong> — the wrong claim often entered in an
+    EARLIER turn's working narration ("All 7 tasks completed"), which the old turn-start rewind kept; the repair
+    directive already demands a standalone reply. UNVERIFIED repair keeps prior narration (not a wrongness verdict).</li>
+    <li><strong>Digest reports one line per project — the final state</strong> (was: both <q>→ DONE</q> and
+    <q>→ FAILED</q> for a project that failed mid-batch and recovered).</li>
+    <li><strong>Evidence packer, three fixes from the f59a793d replay</strong> — (a) <code>create_version</code> now
+    front-loads a <code>result</code> line (fork provenance survives head-truncation; it lived in the TAIL keys and
+    the 15%-slot cap cut exactly it); (b) redistribution slack satisfies the claim-pulled slot FIRST (1.2KB had gone
+    to server.js boilerplate while the claim's evidence stayed cut); (c) <code>task_decompose</code> echoes
+    <code>{id, description}</code> pairs (bare ids gave the judge a content-free "task tree").</li>
+    <li><strong>Late-refute leftovers become project tasks</strong> — a high-confidence LATE REFUTED naming concrete
+    unfinished work files up to 2 deduped <q>Verifier follow-up:</q> tasks on the turn's project (captured at
+    handler-attach time); DONE projects share the defect-reopen churn budget; RELEASED/ARCHIVED never touched;
+    <code>GHOST_REFUTE_FOLLOWUP_TASKS=0</code> kills.</li>
+    <li><strong>Streamed build-spec generation with early abort</strong> — <code>coding_executor</code>'s spec call now
+    streams; while content is still empty it runs the exact-n-gram loop detector plus a 30K-char reasoning ceiling,
+    then falls into the existing one-shot no-think retry. Both live burns were full 16384-token generations
+    (~4 min each) whose guard could only fire on the corpse.</li>
+    <li><strong>Paragraph-repeat detector (main turn loop only), calibrated by a live regression</strong> — the first
+    deploy (min-line 30 / threshold 4 / no floor) aborted the thinking of EVERY coding leaf in its first autoadvance
+    run (one at 3,019 chars): spec planning legitimately restates the task and field lists. Recalibrated to
+    min-line 48 / threshold 6 / 6K-char floor, and REMOVED from the coding-executor path entirely (the n-gram
+    detector + ceiling own that path). Abort logs now name which guard fired so the next tuning has data.</li>
+    <li><strong>Verify commands can no longer kill processes</strong> — req 8ec512cf's coding-leaf verify ran
+    <code>fuser -k 8101/tcp; node server.js &amp;</code>, murdering the SUPERVISED service (the orphan died with the
+    shell; the operator's browser hit a dead port two turns later). <code>_run_verify</code> now skips kill-shaped
+    commands (<code>fuser -k</code>/<code>pkill</code>/<code>killall</code>/<code>kill</code>-with-target;
+    <code>kill -0</code> liveness probes stay allowed) with a WARNING, degrading to the no-verify path — the
+    request-level gates still stand — and the spec prompt states the rule up front.</li>
+    <li><strong>Raw-newline JSON-spec repair</strong> — the dominant malformed-spec shape (three retries in one
+    afternoon: literal newlines inside <code>find</code>/<code>append</code>/<code>content</code> string values) is
+    now repaired by an in-string escape walk over the JSON candidate region and re-parsed, on both the primary parse
+    and the no-think retry — recovering the spec in place instead of burning a 30-60s regeneration.</li>
+  </ul>
+
   <h2>Remaining by design</h2>
   <ul>
     <li><strong>Sandbox host-networking</strong> — remains the Linux default (the in-sandbox Tor proxy needs host loopback); isolation is opt-in via <code>GHOST_SANDBOX_NETWORK</code>. Not a bug; left as a deliberate, documented trade-off.</li>

@@ -280,3 +280,61 @@ async def test_no_repair_on_trivial_chat(agent):
     agent.context.verifier = verifier
     result = await _run(agent, "hi", [_final("Hello!")])
     assert vmock.await_count == 0  # gate never engaged
+
+
+# --------------------------------------------------------------------------
+# REFUTED repair discards STALE INTERIM NARRATION from earlier turns
+# --------------------------------------------------------------------------
+
+async def test_refuted_repair_discards_stale_interim_narration(agent):
+    """req 92a968fc (2026-07-25): an EARLIER turn's working narration said
+    "All 7 tasks completed"; the refuted final turn's rewind only dropped
+    the final turn's text, so the shipped reply said 7 in one paragraph
+    and 6/6 in the next. A REFUTED repair now discards the WHOLE
+    accumulated narration — the standalone corrected answer ships alone."""
+    agent.available_tools["execute"] = AsyncMock(return_value="OUTPUT: 6 tasks total")
+    verifier, _ = _make_verifier([
+        _verdict(VerifyVerdict.REFUTED, issues=["claims 7 tasks, evidence lists 6"]),
+        _verdict(VerifyVerdict.CONFIRMED),
+    ])
+    agent.context.verifier = verifier
+
+    result = await _run(agent, "finish the tasks and report status", [
+        # Turn 1: tool call whose preamble narration carries the WRONG count.
+        {"choices": [{"message": {
+            "content": "All 7 tasks completed. Starting the service now.",
+            "tool_calls": [{"id": "t1", "function": {
+                "name": "execute", "arguments": '{"content": "ls"}'}}]}}]},
+        _final("Summary: all 7 tasks are complete."),   # REFUTED
+        _final("All 6 tasks completed (6/6)."),          # repaired
+    ])
+
+    assert "6/6" in result
+    # The stale turn-1 narration must be gone, not just the refuted turn.
+    assert "7 tasks" not in result
+
+
+async def test_unverified_repair_keeps_prior_narration(agent):
+    """UNVERIFIED (untested write) is not a wrongness verdict — earlier
+    narration stays; only the finalising turn's text is replaced."""
+    agent.context.verifier = None
+    agent.available_tools["file_system"] = AsyncMock(
+        return_value="SUCCESS: wrote 120 bytes to 'app.py'.")
+    agent.available_tools["execute"] = AsyncMock(return_value="OUTPUT: ok, ran clean")
+
+    result = await _run(agent, "write app.py and confirm", [
+        {"choices": [{"message": {
+            "content": "Writing the app file first.",
+            "tool_calls": [{"id": "t1", "function": {
+                "name": "file_system",
+                "arguments": '{"operation": "write", "path": "app.py", "content": "x"}'}}]}}]},
+        _final("Done — app.py written."),                   # unverified mutation
+        {"choices": [{"message": {
+            "content": "Running it to verify.",
+            "tool_calls": [{"id": "t2", "function": {
+                "name": "execute", "arguments": '{"content": "python app.py"}'}}]}}]},
+        _final("Verified: app.py runs clean."),
+    ])
+
+    assert "Verified: app.py runs clean." in result
+    assert "Writing the app file first." in result   # earlier narration kept

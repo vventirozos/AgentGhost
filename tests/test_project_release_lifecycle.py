@@ -264,3 +264,44 @@ def test_tool_briefing_carries_release_key(store, released):
     b = _briefing(store, released)
     assert b["release"]["directions"].startswith("Open report.html")
     assert b["project"]["status"] == "RELEASED"
+
+
+# ── verifier-legible payloads (2026-07-25, req f59a793d false refute) ──────
+
+
+@pytest.mark.asyncio
+async def test_create_version_result_note_leads_the_payload(context, store,
+                                                            released):
+    """The fork provenance must be the FIRST thing in the payload: the
+    verifier's evidence packer head-truncates tool outputs, and with the
+    provenance keys at the tail a correct "created v3 from v2" claim was
+    LATE REFUTED as unsubstantiated."""
+    res = await tool_manage_projects(context, action="create_version",
+                                     project_id=released,
+                                     description="restructure sessions")
+    data = json.loads(res)
+    new_pid = data["project"]["id"]
+    assert "result" in data
+    assert list(data.keys())[0] == "result"          # survives head-truncation
+    assert "Forked" in data["result"]
+    assert released in data["result"]                # parent id named
+    assert new_pid in data["result"]                 # child id named
+    assert "file(s) copied" in data["result"]
+    # JSON-serialised head carries the provenance within the first ~300
+    # chars — the evidence packer's smallest slot still shows it.
+    assert "Forked" in res[:300]
+
+
+@pytest.mark.asyncio
+async def test_task_decompose_echoes_id_description_pairs(context, store):
+    pid = store.create_project("Sessions App", kind="CODING", goal="build it")
+    context.current_project_id = pid
+    res = json.loads(await tool_manage_projects(
+        context, action="task_decompose", project_id=pid,
+        subtasks=["Update server.js API: sessions gain start_time/end_time",
+                  "Update index.html calendar to show time ranges"]))
+    assert len(res["created"]) == 2                  # legacy shape intact
+    assert [t["id"] for t in res["tasks"]] == res["created"]
+    descs = [t["description"] for t in res["tasks"]]
+    assert "Update server.js API: sessions gain start_time/end_time" in descs
+    assert "Update index.html calendar to show time ranges" in descs

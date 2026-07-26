@@ -110,6 +110,10 @@ class TestSkillRetirement:
 
         mgr = AcquiredSkillManager(tmp_path, mock_memory)
         mgr.save_skill("vec_tool", "Vector tool", {}, "print('vec')")
+        # save_skill itself deletes the stale embedding before re-embedding
+        # (2026-07-26); clear that call so the assertion below pins the
+        # RETIREMENT path's delete.
+        mock_memory.reset_mock()
 
         registry = mgr._load_registry()
         registry["vec_tool"]["failure_count"] = 5
@@ -118,5 +122,11 @@ class TestSkillRetirement:
 
         mgr.retire_degraded_skills()
 
-        # Vector store delete should have been called
-        mock_memory.collection.delete.assert_called()
+        # Vector store delete should have been called with a filter shape
+        # real Chroma accepts (flat multi-key dicts are rejected with
+        # "Expected where to have exactly one operator").
+        mock_memory.collection.delete.assert_called_once_with(
+            where={"$and": [{"name": "vec_tool"}, {"type": "acquired_skill"}]}
+        )
+        from chromadb.api.types import validate_where
+        validate_where(mock_memory.collection.delete.call_args.kwargs["where"])

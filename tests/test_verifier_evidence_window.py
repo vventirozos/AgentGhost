@@ -332,3 +332,46 @@ def test_prompt_one_failed_tool_does_not_refute_supported_parts():
     assert "does not refute" in lowered
     # Fabrications stay refutable: specifics appearing in NO output.
     assert "fabrication" in lowered
+
+
+# ---------- claim-pulled slot drinks slack first (2026-07-25, f59a793d) ----
+
+
+def test_claim_pulled_slot_drinks_slack_first():
+    """F5 false-refute shape: the newest slot (bookkeeping ids) leaves ~1.2K
+    of its weighted budget unused, the claim-relevant 4th slot's provenance
+    sits at its TAIL past the 15% cap. Slack must satisfy the claim-pulled
+    slot BEFORE topping up newest-first, so the tail marker survives."""
+    claim = ("I created version three of the jitsu journal as a fork "
+             "from version two of the project")
+    briefing = ("HEADER " + "j" * 1200 +
+                " PROVENANCE: jitsu journal version fork three from two")
+    tools = [
+        {"name": "manage_projects", "content": briefing},      # oldest
+        {"name": "file_system", "content": "A" * 10000},
+        {"name": "file_system", "content": "B" * 10000},
+        # newest: informational bookkeeping (12-hex id) but tiny — its
+        # 40% weighted slice is mostly slack.
+        {"name": "manage_projects",
+         "content": '{"created": ["abcdefabcdef01"], "note": "'
+                    + "x" * 260 + '"}'},
+    ]
+    out = _collect_verifier_evidence(tools, claim_text=claim)
+    assert len(out) <= 4000
+    # The briefing was claim-pulled AND fully granted: its tail marker
+    # is in the packed evidence (pre-fix, newest-first slack gave the
+    # spare chars to the B-file head and the marker was cut).
+    assert "PROVENANCE" in out
+
+
+def test_slack_still_flows_newest_first_without_claim_pull():
+    """No claim text → no 4th slot; the redistribution stays newest-first
+    (the 2026-07-17 naftemporiki behaviour is unchanged)."""
+    tools = [
+        {"name": "file_system", "content": "OLD " + "o" * 5000},
+        {"name": "execute", "content": "tiny newest output"},
+    ]
+    out = _collect_verifier_evidence(tools)
+    assert "tiny newest output" in out
+    # The old item absorbs the newest item's unused slice.
+    assert out.count("o") > 3000
