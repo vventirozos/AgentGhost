@@ -306,3 +306,172 @@ def test_activity_in_tool_definition_enum():
         "properties"]["action"]["enum"]
     assert "hours" in intro["function"]["parameters"]["properties"]
     assert "while I was away" in intro["function"]["description"]
+
+
+def test_learning_action_is_described_not_just_enumerated():
+    """'learning' was in the enum but absent from the description text, so
+    the model could never discover it (tool selection is description-
+    driven). The stale 'All reads route through your SelfModel' claim was
+    false for activity/learning."""
+    from ghost_agent.tools.registry import TOOL_DEFINITIONS
+    intro = next(d for d in TOOL_DEFINITIONS
+                 if d["function"]["name"] == "introspect")
+    desc = intro["function"]["description"]
+    assert "learning" in intro["function"]["parameters"][
+        "properties"]["action"]["enum"]
+    assert "'learning'" in desc
+    assert "All reads route through your SelfModel" not in desc
+
+
+async def test_activity_never_raises_even_when_render_blows_up(tmp_path: Path,
+                                                               monkeypatch):
+    """The activity branch returns BEFORE the selfhood try-block; it must
+    carry its own guard so the tool's never-raises contract holds."""
+    ctx, log = _ctx_with_ledger(tmp_path)
+    log.record("dream", "REM cycle ran")
+    import ghost_agent.core.autonomous_activity as aa
+
+    def _boom(*a, **k):
+        raise RuntimeError("render exploded")
+
+    monkeypatch.setattr(aa, "render_activity_report", _boom)
+    out = await tool_introspect(action="activity", context=ctx)
+    assert "Activity report failed" in out
+    assert "RuntimeError" in out
+
+
+async def test_activity_read_failure_is_not_reported_as_quiet(tmp_path: Path,
+                                                              monkeypatch):
+    """A dead ledger read must render as a read error — NOT as the calm
+    'No background activity recorded' a genuinely quiet window produces."""
+    ctx, log = _ctx_with_ledger(tmp_path)
+    log.record("dream", "REM cycle ran")
+    monkeypatch.setattr(log, "read_since",
+                        MagicMock(side_effect=OSError("disk gone")))
+    out = await tool_introspect(action="activity", context=ctx)
+    assert "read error" in out
+    assert "No background activity" not in out
+
+
+async def test_activity_notes_a_window_the_tail_scan_cannot_cover(
+        tmp_path: Path, monkeypatch):
+    """The tail scan is byte/record-capped; when the requested window
+    reaches further back than the scan, the report must say so instead of
+    silently under-reporting (no silent caps)."""
+    import ghost_agent.tools.introspect as intro_mod
+    monkeypatch.setattr(intro_mod, "_ACTIVITY_TAIL_BYTES", 512)
+    ctx, log = _ctx_with_ledger(tmp_path)
+    for i in range(60):  # ~6KB of records — far past the 512-byte cap
+        log.record("dream", f"REM cycle {i} ran with a reasonably long summary")
+    out = await tool_introspect(action="activity", context=ctx, hours=24)
+    assert "scan capped at the ledger tail" in out
+
+
+async def test_activity_no_truncation_note_when_window_is_covered(
+        tmp_path: Path):
+    ctx, log = _ctx_with_ledger(tmp_path)
+    for i in range(5):
+        log.record("dream", f"REM cycle {i} ran")
+    out = await tool_introspect(action="activity", context=ctx)
+    assert "scan capped" not in out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# action='learning' — the learning-health telemetry hookup
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def test_learning_renders_report(tmp_path: Path):
+    md = tmp_path / "memory"
+    md.mkdir()
+    (md / "skills_playbook.json").write_text("[]")
+    out = await tool_introspect(action="learning",
+                                context=SimpleNamespace(memory_dir=md))
+    assert "LEARNING HEALTH" in out
+
+
+async def test_learning_works_without_self_model(tmp_path: Path):
+    """Like 'activity', 'learning' reads stores, not the SelfModel — a
+    disabled selfhood must not block it."""
+    md = tmp_path / "memory"
+    md.mkdir()
+    out = await tool_introspect(action="learning", self_model=None,
+                                context=SimpleNamespace(memory_dir=md))
+    assert "LEARNING HEALTH" in out
+
+
+async def test_learning_without_memory_dir_degrades():
+    out = await tool_introspect(action="learning",
+                                context=SimpleNamespace(memory_dir=None))
+    assert "memory_dir unavailable" in out
+
+
+async def test_learning_render_failure_degrades(tmp_path: Path, monkeypatch):
+    import ghost_agent.core.learning_health as lh
+
+    def _boom(*a, **k):
+        raise RuntimeError("report exploded")
+
+    monkeypatch.setattr(lh, "render_learning_health", _boom)
+    out = await tool_introspect(action="learning",
+                                context=SimpleNamespace(memory_dir=tmp_path))
+    assert "Learning health unavailable" in out
+    assert "RuntimeError" in out
+
+
+# ──────────────────────────────────────────────────────────────────────
+# principles + experience ages in the selfhood renders (2026-07-27)
+# ──────────────────────────────────────────────────────────────────────
+
+
+async def test_stats_reports_principle_count(tmp_path: Path):
+    sm = SelfModel(root=tmp_path)
+    await _populate(sm)
+    sm.note_principle("Prefer reversible actions over clever ones.")
+    out = await tool_introspect(action="stats", self_model=sm)
+    assert "Operating principles: 1" in out
+
+
+async def test_summary_surfaces_principles(tmp_path: Path):
+    """The values layer is behaviour-shaping by design — 'tell me about
+    yourself' must render it, not hide it."""
+    sm = SelfModel(root=tmp_path)
+    await _populate(sm)
+    sm.note_principle("Prefer reversible actions over clever ones.")
+    out = await tool_introspect(self_model=sm)
+    assert "My operating principles:" in out
+    assert "reversible actions" in out
+
+
+async def test_recent_lines_carry_an_age(tmp_path: Path):
+    """Selfhood views were time-blind; each experience line now carries a
+    compact age like the activity report does."""
+    sm = SelfModel(root=tmp_path)
+    await _populate(sm)
+    out = await tool_introspect(action="recent", self_model=sm)
+    assert "(just now)" in out
+
+
+def test_exp_age_is_defensive():
+    from ghost_agent.tools.introspect import _exp_age
+    assert _exp_age("not-a-timestamp") == ""
+    assert _exp_age("") == ""
+    assert _exp_age(None) == ""
+
+
+def test_count_and_clusters_track_appends(tmp_path: Path):
+    """count()/cluster_counts() now ride the (mtime,size)-cached search
+    index — a fresh append must still be reflected (cache invalidation),
+    and corrupt lines must not count as experiences."""
+    sm = SelfModel(root=tmp_path)
+    sm.capture_turn(trajectory_id="t-1", user_request="fix the parser",
+                    tool_names=[], outcome="passed", final_response="done")
+    assert sm.autobio.count() == 1
+    sm.capture_turn(trajectory_id="t-2", user_request="write sql migration",
+                    tool_names=[], outcome="passed", final_response="done")
+    assert sm.autobio.count() == 2
+    # A corrupt line is not an experience.
+    with sm.autobio.path.open("a", encoding="utf-8") as fh:
+        fh.write("{not json}\n")
+    assert sm.autobio.count() == 2
+    assert sum(sm.autobio.cluster_counts().values()) <= 2

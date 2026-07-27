@@ -394,8 +394,9 @@ class TestActivityReporting:
         from ghost_agent.core.autonomous_activity import ActivityLog
         from ghost_agent.tools.introspect import _read_activity_tail
         path = self._ledger(tmp_path, 900)
-        recs = _read_activity_tail(ActivityLog(str(path)))
+        recs, _truncated, failed = _read_activity_tail(ActivityLog(str(path)))
         assert recs, "tail read returned nothing"
+        assert failed is False
         summaries = {r.summary for r in recs}
         assert "record 899" in summaries, "newest record missing"
         assert "record 0" not in summaries or len(recs) >= 900
@@ -404,13 +405,17 @@ class TestActivityReporting:
         from ghost_agent.core.autonomous_activity import ActivityLog
         from ghost_agent.tools.introspect import _read_activity_tail
         path = self._ledger(tmp_path, 5)
-        recs = _read_activity_tail(ActivityLog(str(path)))
+        recs, truncated, failed = _read_activity_tail(ActivityLog(str(path)))
         assert len(recs) == 5
+        assert truncated is False and failed is False
 
     def test_activity_read_handles_a_missing_ledger(self, tmp_path):
         from ghost_agent.core.autonomous_activity import ActivityLog
         from ghost_agent.tools.introspect import _read_activity_tail
-        assert _read_activity_tail(ActivityLog(str(tmp_path / "nope.jsonl"))) == []
+        recs, truncated, failed = _read_activity_tail(
+            ActivityLog(str(tmp_path / "nope.jsonl")))
+        assert recs == []
+        assert failed is False  # a missing ledger is empty, not broken
 
     def test_learning_health_counts_by_phase(self, tmp_path):
         """`to_dict` serializes the kind as `phase`; keying on

@@ -21,6 +21,7 @@ degrades to a clear message instead of crashing.
 from __future__ import annotations
 
 import logging
+import time
 from typing import List, Optional
 
 from ..utils.logging import Icons, pretty_log
@@ -45,11 +46,29 @@ _DEFAULT_ACTIVITY_LIMIT = 30
 _MAX_ACTIVITY_LIMIT = 100
 
 
+def _exp_age(ts_iso) -> str:
+    """Compact age ("3.2h ago") from an Experience's ISO-Z timestamp.
+    Empty string when unparseable — a malformed stamp must not break a
+    render. Rides ``autonomous_activity._age_str`` so the selfhood views
+    and the activity report speak the same time language."""
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(ts_iso or "").rstrip("Z"))
+        epoch = dt.replace(tzinfo=timezone.utc).timestamp()
+        from ..core.autonomous_activity import _age_str
+        return _age_str(epoch)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _format_experience(exp) -> str:
     line = f"  - {exp.summary}"
     outcome = getattr(exp, "outcome", "") or ""
     if outcome and outcome != "unknown":
         line += f" [{outcome}]"
+    age = _exp_age(getattr(exp, "timestamp", ""))
+    if age:
+        line += f" ({age})"
     return line
 
 
@@ -86,6 +105,11 @@ def _render_stats(stats: dict) -> str:
         ranked = sorted(clusters.items(), key=lambda kv: kv[1], reverse=True)
         top = ", ".join(f"{k}={v}" for k, v in ranked[:5])
         lines.append(f"Topic clusters: {top}")
+    # The values layer is "behaviour-shaping" by design — it must not be
+    # invisible to introspection (it was, until 2026-07-27).
+    pc = stats.get("principle_count")
+    if pc is not None:
+        lines.append(f"Operating principles: {pc}")
     return "\n".join(lines)
 
 
@@ -101,6 +125,17 @@ def _render_summary(self_model) -> str:
     if narrative:
         parts.append("\nMy running first-person diary:")
         parts.append(narrative)
+
+    # Operating principles — the normative substrate. "Tell me about
+    # yourself" is exactly where these belong.
+    principles = ""
+    try:
+        principles = (self_model.principles_text() or "").strip()
+    except Exception as e:  # noqa: BLE001 — summary must render without them
+        logger.debug("introspect principles render skipped: %s", e)
+    if principles:
+        parts.append("\nMy operating principles:")
+        parts.append(principles)
 
     recent = []
     if self_model.autobio is not None:
@@ -152,7 +187,8 @@ _ACTIVITY_SCAN_KEEP = 1000
 
 
 def _read_activity_tail(log):
-    """Return the most RECENT records in the ledger.
+    """Return ``(records, truncated, failed)`` — the most RECENT records
+    in the ledger, oldest-first.
 
     ``read_since`` caps each call at ``limit=200`` records, so the previous
     single ``read_since(0)`` returned the 200 OLDEST lines and the report
@@ -160,11 +196,21 @@ def _read_activity_tail(log):
     — live, that meant every 'what did you do while I was away' answer was
     built from records that stopped on 2026-07-13 (verified 2026-07-27).
     Seek near the end and drain forward instead.
+
+    ``truncated`` is True when the scan did NOT start at byte 0 (or the
+    record cap trimmed) — the caller uses it to annotate a window the tail
+    doesn't fully cover instead of silently under-reporting. ``failed`` is
+    True when the read died mid-scan; a failed read must render as a read
+    error, never as "no background activity" (a broken instrument reading
+    as a calm 'nothing ran' is the exact defect class this subsystem keeps
+    growing).
     """
     records = []
+    truncated = False
     try:
         size = log.current_offset()
         off = max(0, size - _ACTIVITY_TAIL_BYTES)
+        truncated = off > 0
         # A tail seek can land mid-line; that partial line fails to parse and
         # is skipped by read_since (one boundary record lost, by design).
         for _ in range(1000):  # hard stop — never spin on a pathological file
@@ -173,12 +219,14 @@ def _read_activity_tail(log):
                 records.extend(chunk)
                 if len(records) > _ACTIVITY_SCAN_KEEP:
                     records = records[-_ACTIVITY_SCAN_KEEP:]
+                    truncated = True
             if new_off <= off:
                 break
             off = new_off
-    except Exception:  # noqa: BLE001 — a report must never break the tool
-        pass
-    return records
+    except Exception as e:  # noqa: BLE001 — a report must never break the tool
+        logger.debug("activity tail read failed: %s: %s", type(e).__name__, e)
+        return records, truncated, True
+    return records, truncated, False
 
 
 def _render_activity(context, *, hours=None, limit=None) -> str:
@@ -203,10 +251,36 @@ def _render_activity(context, *, hours=None, limit=None) -> str:
     except (TypeError, ValueError):
         n = _DEFAULT_ACTIVITY_LIMIT
     n = max(1, min(n, _MAX_ACTIVITY_LIMIT))
-    records = _read_activity_tail(log)
+    records, truncated, failed = _read_activity_tail(log)
+    if failed and not records:
+        # A dead read must NOT render as a calm "no background activity".
+        return ("Could not read the background-activity ledger — the tail "
+                "scan failed (see the debug log). This is a read error, "
+                "not \"nothing ran\".")
     pretty_log("Introspect", f"activity report requested ({h:g}h window)",
                icon=Icons.BRAIN_SUM)
-    return render_activity_report(records, hours=h, limit=n)
+    report = render_activity_report(records, hours=h, limit=n)
+    notes = []
+    if failed:
+        notes.append("the ledger read was interrupted mid-scan — records "
+                     "may be missing (see the debug log)")
+    if truncated and records:
+        # records are oldest-first: if even the oldest scanned record is
+        # newer than the window start, the capped tail scan did not reach
+        # the whole requested window — say so instead of silently
+        # under-reporting ("no silent caps").
+        cutoff = time.time() - h * 3600.0
+        oldest = records[0].ts
+        if oldest > cutoff:
+            covered_h = max(0.0, (time.time() - oldest) / 3600.0)
+            notes.append(
+                f"scan capped at the ledger tail "
+                f"(~{_ACTIVITY_TAIL_BYTES // 1024}KB/{_ACTIVITY_SCAN_KEEP} "
+                f"records) — it reaches back only ~{covered_h:.1f}h of the "
+                f"requested {h:g}h window")
+    if notes:
+        report += "\n  (note: " + "; ".join(notes) + ")"
+    return report
 
 
 async def tool_introspect(
@@ -229,13 +303,29 @@ async def tool_introspect(
             f"{sorted(_VALID_ACTIONS)}."
         )
 
+    # One log line per introspection, whatever the action — the operator
+    # monitors the live stream ('activity' logs itself, with the clamped
+    # window it actually used).
+    if raw_action != "activity":
+        pretty_log("Introspect", f"{raw_action} requested",
+                   icon=Icons.BRAIN_SUM)
+
     # 'activity' reads the autonomous-activity ledger, not the SelfModel —
     # it must keep working when selfhood is disabled, so it branches before
     # the self_model gate. This is the on-demand home of the maintenance
     # records the finalize banner no longer auto-surfaces (2026-07-17):
     # "what did you do while I was away?" lands here.
     if raw_action == "activity":
-        return _render_activity(context, hours=hours, limit=limit)
+        # Guarded here (it returns before the selfhood try below): this
+        # branch previously escaped the tool's never-raises contract — an
+        # exception in the ledger render surfaced as a raw invocation error
+        # instead of a graceful message.
+        try:
+            return _render_activity(context, hours=hours, limit=limit)
+        except Exception as e:  # noqa: BLE001 — never break the turn
+            logger.warning("introspect activity failed: %s: %s",
+                           type(e).__name__, e)
+            return f"Activity report failed: {type(e).__name__}: {e}"
 
     # 'learning' reads the learning-loop stores (lessons, competence,
     # episodes, calibration), not the SelfModel — it branches before the
@@ -282,7 +372,6 @@ async def tool_introspect(
             )
 
         # Default: summary.
-        pretty_log("Introspect", "snapshot requested", icon=Icons.BRAIN_SUM)
         return _render_summary(self_model)
     except Exception as e:  # noqa: BLE001 — never break the turn
         logger.warning("introspect tool failed: %s: %s", type(e).__name__, e)

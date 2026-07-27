@@ -64,8 +64,13 @@ def test_collect_sections(tmp_path):
     assert r["lessons"]["present_on_failure_only"] == 1
     assert r["lessons"]["present_on_pass_only"] == 1
     assert r["lessons"]["stale_prune_candidates"] == 2   # b and c: ret≥5, low hit-rate
-    assert r["competence"]["domains_injecting"] == ["shell"]   # sql below gate
+    # The inject gate is on TOTAL observations across domain rollups
+    # (mirrors agent.py, which then renders EVERY domain — there is no
+    # per-domain gate): shell 100 + sql 4 = 104 >= 20.
+    assert r["competence"]["total_observations"] == 104
+    assert r["competence"]["min_obs_gate"] == 20
     assert r["competence"]["injects_into_prompt"] is True
+    assert "domains_injecting" not in r["competence"]  # mirrored no mechanism
     assert r["episodes"]["total"] == 2
     assert r["episodes"]["with_context"] == 1
     assert r["calibration"]["entropy_learnable"] is False       # degenerate
@@ -80,6 +85,80 @@ def test_render_is_a_string(tmp_path):
     assert "LEARNING HEALTH" in out
     assert "COMPETENCE" in out
     assert "CALIBRATION" in out
+
+
+def test_competence_gate_is_total_not_per_domain(tmp_path):
+    """The live divergence case (bug found 2026-07-27): several domains all
+    below the per-domain count, but the TOTAL crosses the gate — agent.py
+    injects the block every turn, so the instrument must say INJECTING.
+    The old per-domain mirror reported 'NONE (block not injecting yet)'."""
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    comp = {f"d{i}|*": {"alpha": 5, "beta": 5, "n": 8} for i in range(4)}
+    (md / "competence_profile.json").write_text(json.dumps(comp))
+    r = collect_learning_health(md)
+    assert r["competence"]["total_observations"] == 32
+    assert r["competence"]["injects_into_prompt"] is True
+    assert "INJECTING" in render_learning_health(md)
+
+
+def test_competence_below_total_gate_not_injecting(tmp_path):
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    (md / "competence_profile.json").write_text(json.dumps(
+        {"shell|*": {"alpha": 5, "beta": 5, "n": 10}}))
+    r = collect_learning_health(md)
+    assert r["competence"]["injects_into_prompt"] is False
+    assert "not injecting yet" in render_learning_health(md)
+
+
+def test_competence_gate_reads_the_mechanisms_constant():
+    """The gate must come from GhostAgent._COMPETENCE_MIN_OBS (the code
+    that actually gates injection), not a hand-copied literal."""
+    from ghost_agent.core.learning_health import _live_competence_gate
+    from ghost_agent.core.agent import GhostAgent
+    assert _live_competence_gate() == GhostAgent._COMPETENCE_MIN_OBS
+
+
+def test_entropy_learnable_mirrors_the_fit_gate(tmp_path):
+    """calibration.py fits w_entropy only when >= _MIN_ENTROPY_SAMPLES
+    observed samples exist AND both outcome classes are represented among
+    them. 40 observed one-class samples must NOT read as LEARNABLE (the
+    old distinct>=3 formula said it was)."""
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    calib = md.parent / "calibration"
+    calib.mkdir(parents=True)
+    with (calib / "calibration.jsonl").open("w") as fh:
+        for i in range(40):  # varied entropy, all positive-class
+            fh.write(json.dumps({
+                "entropy_component": 0.3 + (i % 10) / 20.0,
+                "entropy_observed": True, "outcome": 1.0}) + "\n")
+    r = collect_learning_health(md)
+    cal = r["calibration"]
+    assert cal["entropy_observed_samples"] == 40
+    assert cal["entropy_observed_pos"] == 40
+    assert cal["entropy_observed_neg"] == 0
+    assert cal["entropy_learnable"] is False  # one-class → fit pins w_e=0
+
+
+def test_entropy_learnable_true_with_both_classes(tmp_path):
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    calib = md.parent / "calibration"
+    calib.mkdir(parents=True)
+    with (calib / "calibration.jsonl").open("w") as fh:
+        for i in range(35):
+            fh.write(json.dumps({
+                "entropy_component": 0.2 + (i % 7) / 10.0,
+                "entropy_observed": True,
+                "outcome": 1.0 if i % 5 else 0.0}) + "\n")
+    cal = collect_learning_health(md)["calibration"]
+    assert cal["entropy_observed_pos"] > 0 and cal["entropy_observed_neg"] > 0
+    assert cal["entropy_learnable"] is True
+    # And the floor itself is the mechanism's constant, not a copy.
+    from ghost_agent.core.calibration import _MIN_ENTROPY_SAMPLES
+    assert cal["entropy_min_samples_gate"] == _MIN_ENTROPY_SAMPLES
 
 
 def test_failure_arm_inert_warning(tmp_path):

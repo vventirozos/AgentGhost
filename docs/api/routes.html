@@ -97,6 +97,34 @@
     <p class="caption">Figure 9 — End-to-end chat request.</p>
   </div>
 
+
+  <h2>2026-07-27 — auth-rejection log noise: re-levelled, never suppressed</h2>
+  <p>The agent's own <code>functional_live_test.py</code> deliberately probes with a missing key and a wrong
+  key to prove auth is enforced, so every run emitted <code>auth rejected</code> at WARNING —
+  indistinguishable from a real intruder. That is how a security signal gets learned-ignored.</p>
+  <p>The obvious fix (downgrade when the User-Agent says "it's the test") is <strong>wrong</strong>: headers
+  are attacker-controlled, so keying on one alone hands anyone a switch to mute their own probes. The rule
+  requires BOTH conditions and only ever changes a LEVEL:</p>
+  <ul>
+    <li>the marker <code>ghost-functional-test</code> is honoured <strong>only from loopback</strong> — an
+    attacker must already be on this host;</li>
+    <li>the line is <strong>always emitted</strong>; only WARNING → INFO changes, so nothing can be made to
+    disappear;</li>
+    <li>the 403 is untouched;</li>
+    <li><code>ip</code> and <code>ua</code> are now always recorded, so a genuine hit stays identifiable
+    instead of being a bare path.</li>
+  </ul>
+  <p><strong>Residual risk, stated rather than hidden:</strong> a local non-owner user could lower their own
+  probes to INFO. They are still logged, and anyone with local access is already past the boundary the key
+  protects.</p>
+  <p>One iteration mattered: the first version appended <code>[own functional suite]</code> at the END of the
+  message and the log's width cap truncated it away — leaving the single field that marks a line self-inflicted
+  invisible, losing the entire point of the change. The tag now leads the message.</p>
+  <pre>auth rejected  [own functional suite] path=/api/health ip=127.0.0.1      &lt;- INFO
+auth rejected  path=/api/game/move ip=127.0.0.1 ua=curl/8.0-intruder    &lt;- WARNING</pre>
+  <p>Tests: <code>tests/test_auth_rejection_logging.py</code> (18), including that the marker sent from a
+  REMOTE host still logs at WARNING.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

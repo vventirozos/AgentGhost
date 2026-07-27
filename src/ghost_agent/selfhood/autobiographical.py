@@ -676,9 +676,17 @@ class AutobiographicalMemory:
 
     def cluster_counts(self) -> Dict[str, int]:
         """How many experiences fall into each derived cluster. Lets the
-        narrative / stats layer report self-patterns ("I keep doing X")."""
+        narrative / stats layer report self-patterns ("I keep doing X").
+
+        Served from the (mtime, size)-cached search index instead of a
+        per-call full parse — ``stats()`` calls this on the introspect
+        summary path, which previously cost a whole-log scan per call."""
         counts: Dict[str, int] = {}
-        for exp in self.iter_experiences():
+        try:
+            experiences, _, _ = self._search_index()
+        except Exception:  # noqa: BLE001 — stats must never raise
+            return counts
+        for exp in experiences:
             c = (exp.cluster or "").strip()
             if c:
                 counts[c] = counts.get(c, 0) + 1
@@ -750,17 +758,15 @@ class AutobiographicalMemory:
             return dict(self._load_ref_counts())
 
     def count(self) -> int:
-        if not self.path.exists():
-            return 0
-        n = 0
+        """Number of parseable experiences on file — served from the
+        cached search index (was a per-call full line scan). Corrupt
+        lines no longer count; every caller reports this number as
+        "experiences", which is what the index holds."""
         try:
-            with self.path.open("r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        n += 1
-        except OSError:
+            experiences, _, _ = self._search_index()
+        except Exception:  # noqa: BLE001
             return 0
-        return n
+        return len(experiences)
 
 
 _STOPWORDS = frozenset({

@@ -415,13 +415,14 @@ class SelfModel:
         scripts and for log-line summaries."""
         if not self.enabled:
             return {"enabled": False}
+        _mood = self.state.mood() if self.state else None
         return {
             "enabled": True,
             "root": str(self.root),
             "experience_count": self.autobio.count() if self.autobio else 0,
             "open_questions": len(self.state.open_questions()) if self.state else 0,
             "unfinished_threads": len(self.state.unfinished_threads()) if self.state else 0,
-            "last_mood": (self.state.mood().label if self.state and self.state.mood() else ""),
+            "last_mood": _mood.label if _mood else "",
             "narrative_present": bool(self.narrative.latest()) if self.narrative else False,
             "last_session_at": (self.state.state.last_session_at if self.state else ""),
             "clusters": (self.autobio.cluster_counts() if self.autobio else {}),

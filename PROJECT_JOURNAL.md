@@ -1167,6 +1167,86 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 (later 12) — Introspect-subsystem review: 5 bugs (2 instrument≠mechanism) + 8 improvements
+
+Operator asked for a dedicated review of the introspect subsystem (tools/introspect.py, core/learning_health.py,
+the selfhood read path, registry wiring). 5 bugs + 8 improvements, all fixed/applied same session.
+
+BUGS FIXED:
+• Competence inject-gate mis-mirrored the mechanism (learning_health): the report gated per-domain (n≥20 each)
+  and could print "NONE (block not injecting yet)" while agent.py — which gates on the TOTAL observation count
+  across domain rollups and then renders EVERY domain — injected the block every turn (e.g. 4 domains at n=8,
+  total 32). Now mirrors the real rule (total_observations ≥ gate) and reads the gate from
+  GhostAgent._COMPETENCE_MIN_OBS itself. This is the keep/kill instrument — a wrong "not injecting" here
+  triggers a wrong verdict at exactly the decision it exists for.
+• entropy_learnable used a different formula than the fit: report said distinct≥3 & observed≥30;
+  calibration.py's gate is observed ≥ _MIN_ENTROPY_SAMPLES AND both outcome classes among the OBSERVED
+  samples. 40 one-class observed samples read "LEARNABLE" while the fit pinned w_entropy=0. Now mirrors the
+  fit exactly and reports entropy_observed_pos/neg + the live floor.
+• action='learning' was in the enum but ABSENT from the tool description → undiscoverable by the model (tool
+  selection is description-driven; it was effectively operator-only). The description's closing "All reads
+  route through your SelfModel" was false for activity/learning. Fixed in registry.py; the same stale claim
+  sat in docs/tools/registry.html (patch one sibling → grep for the others).
+• Activity report silently truncated its window: the tail scan is capped (512KB / 1000 records) but the header
+  claims "last N h" up to 336h — and _read_activity_tail's bare `except: pass` rendered a FAILED read as the
+  calm "No background activity recorded in the last Xh", instrument failure indistinguishable from a quiet
+  fortnight. Now: a truncation note when the oldest scanned record is newer than the window start, and a read
+  failure logs + renders as an explicit read error ("not \"nothing ran\"").
+• The activity branch returned BEFORE the tool's try-block — it escaped the docstring's never-raises contract
+  (upstream gather(return_exceptions=True) saved the turn, but as a raw invocation error). Now guarded in-branch.
+
+IMPROVEMENTS: operating principles rendered in stats (count) + summary (full list) — the "behaviour-shaping"
+values layer was invisible to introspection; recent/recall lines age-stamped ("3.2h ago", same time language
+as the activity report); AutobiographicalMemory.count()/cluster_counts() served from the (mtime,size)-cached
+search index — stats() previously cost two whole-log scans per call on the summary path; every mirrored gate
+constant now imported LIVE from its owning module (agent / calibration / memory.skills — skills' stale gates
+got named constants _STALE_MIN_RETRIEVALS/_STALE_HIT_RATE) with last-known fallbacks; _load_jsonl bounded via
+deque(maxlen=limit) and honours the limit on mid-read failure; pass/fail/mixed lesson bucketing single O(n)
+pass (was O(n²) dict-equality membership, misclassified duplicate lessons); pretty_log on every introspect
+action (only summary/activity announced themselves before); tests for action='learning' end-to-end + all of
+the above.
+
+The recurring theme, again: instruments disagreeing with their mechanism (both gate bugs were hand-copied
+mirrors that drifted) and reports that render their own failure as "quiet". Constants now flow FROM the
+mechanism; failure states are worded as failures.
+
+Tests: test_learning_health.py grew the divergence cases (per-domain vs total, one-class entropy corpus +
+mechanism-constant assertions); test_selfhood_introspect_tool.py grew learning/activity-guard/truncation/
+read-error/principles/age/cache-invalidation coverage; tail-read tuple signature updated in
+test_bughunt_fixes_2026_07_27.py. FULL SUITE: 9621 passed, 13 skipped (3:48).
+Docs: docs/tools/introspect.html (actions/params tables now include activity+learning, failure semantics,
+full review section), docs/tools/registry.html (stale introspect blurb corrected).
+
+### 2026-07-27 (later 11) — Auth-rejection log noise: re-levelled, never suppressed
+
+Operator spotted `auth rejected path=/api/health` ×2, then `path=/api/game/move`. Traced: the agent's OWN
+`functional_live_test.py` deliberately probes with a missing key and a wrong key to prove auth is enforced, so
+every run emitted WARNING lines indistinguishable from a real intruder. That is how a security signal gets
+learned-ignored — the noise was ~2-3 lines per run, on the one log line that should always mean something.
+
+FIXED without creating a suppression mechanism. The obvious approach — downgrade when the User-Agent says
+"it's the test" — is WRONG: headers are attacker-controlled, so it hands anyone a switch to mute their own
+probes. The rule is therefore BOTH conditions, and re-levelling only:
+• the marker `ghost-functional-test` is honoured ONLY from LOOPBACK (an attacker must already be on this host);
+• the line is ALWAYS emitted — only WARNING→INFO changes. Nothing can be made to disappear;
+• the 403 is untouched;
+• `ip` and `ua` are now always logged, so a real hit stays identifiable instead of being a bare path.
+Residual risk, stated rather than hidden: a local non-owner user could lower their probes to INFO. They remain
+logged, and anyone with local access is already past the boundary the key protects.
+
+One iteration mattered: my first version appended `[own functional suite]` at the END of the message, and the
+log's width cap TRUNCATED it away — leaving the one field that says "self-inflicted" invisible, i.e. the whole
+point of the change silently lost. Tag moved to the FRONT.
+
+Tests: test_auth_rejection_logging.py (18) — pinning that a bad key is always 403, that a line is always
+emitted, that key bytes never appear, and specifically that the marker from a REMOTE host stays WARNING.
+Ran the auth/API-relevant suites only (186 passed) rather than the full 9602 — a log-format change does not
+warrant a 4-minute full run (operator's call, and correct).
+DEPLOYED (57358→57574, health ok); functional_live_test 32/32.
+LIVE-VERIFIED both branches:
+  `auth rejected  [own functional suite] path=/api/health ip=127.0.0.1`   ← INFO, self-inflicted
+  `auth rejected  path=/api/game/move ip=127.0.0.1 ua=curl/8.0-intruder`  ← WARNING, real shape
+
 ### 2026-07-27 (later 10) — Tier 2 REDESIGNED from evidence: failure reports, not correction phrases
 
 Operator: "what do we need to proceed with tiers 2-4?" → I measured the SUPPLY of each before writing code,

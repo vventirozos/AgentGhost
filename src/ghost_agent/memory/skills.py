@@ -396,6 +396,13 @@ _OUTCOME_UTILITY_ENABLED = (
     not in ("0", "false", "no", "off")
 )
 
+# Stale-lesson demotion signal: retrieved at least this often with a
+# hit-rate below the floor → halve the utility score. Named so the
+# learning-health telemetry can import the LIVE values instead of
+# hand-copying them (hand-copied gate mirrors drifted twice, 2026-07-27).
+_STALE_MIN_RETRIEVALS = 5
+_STALE_HIT_RATE = 0.35
+
 
 def compute_lesson_utility(lesson: dict) -> float:
     """Utility score used for ranking + prune decisions.
@@ -424,7 +431,7 @@ def compute_lesson_utility(lesson: dict) -> float:
     score += min(math.log1p(freq) * 0.1, 0.3)
     # Stale penalty: if a lesson has been retrieved many times but never
     # helped, demote it harder than a never-retrieved one.
-    if r >= 5 and hit_rate < 0.35:
+    if r >= _STALE_MIN_RETRIEVALS and hit_rate < _STALE_HIT_RATE:
         score *= 0.5
     # Outcome-gated adjustment: fold in the verified-outcome arm once enough
     # decisive outcomes have accrued. out_rate is the Beta(1,1)-smoothed

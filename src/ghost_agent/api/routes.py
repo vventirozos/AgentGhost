@@ -128,10 +128,15 @@ async def verify_api_key(request: Request, api_key: str = Security(api_key_heade
                 _ip = ""
             _loopback = _ip in ("127.0.0.1", "::1", "localhost")
             _self_test = _loopback and _SELF_TEST_UA in _ua
+            # The self-test tag goes FIRST: the log truncates long messages,
+            # and a marker appended at the end was cut off — leaving the one
+            # field that says "this is self-inflicted" invisible, which is
+            # the whole point of the line.
             pretty_log(
                 "Auth Rejected",
-                f"path={request.url.path} ip={_ip or '?'} ua={_ua or '?'}"
-                + (" [own functional suite]" if _self_test else ""),
+                (f"[own functional suite] path={request.url.path} ip={_ip}"
+                 if _self_test else
+                 f"path={request.url.path} ip={_ip or '?'} ua={_ua or '?'}"),
                 icon=Icons.SHIELD,
                 level="INFO" if _self_test else "WARNING",
             )
