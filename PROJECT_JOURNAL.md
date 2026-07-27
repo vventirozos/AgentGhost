@@ -1109,6 +1109,56 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 — Overnight-log eval → idle-loop yield fixes (counterfactual gate, mastery floor, curriculum balance, calibration entropy)
+
+Operator: "read the agents log that run overnight and evaluate" → "proceed with all fixes." The overnight run
+(00:52–08:11) was CLEAN on stability — 0 tracebacks, 8/8 self-play sims SUCCESS — but near-zero yield: 2 new
+lessons, 0 graduated, 6/9 idle cycles spent replaying already-solved challenges, one ~2h slot forfeited to a 3/3
+generation-rejection streak. Five fixes, all DEPLOYED same day:
+1) **Counterfactual learning-state gate** (`core/counterfactual.py`): 45/45 lifetime replays were
+   stable-pass/generalized, 0 regressions — the arm re-measured an UNCHANGED learning state on ~40% of the idle
+   budget. `should_replay()` fingerprints skills_playbook+auto_skills (SHA-1) and skips the batch when unchanged
+   since the last DECISIVE batch (inconclusive batches don't stamp; stamp is post-batch so replay-written lessons
+   re-arm honestly); the slot falls through to fresh self-play. Kill: GHOST_COUNTERFACTUAL_GATE=0.
+2) **Mastery floor waiver** (`memory/frontier.py`): `description_length` is a tool-invocation count with a
+   structural floor (~4), so C7's `any(delta>0.05)` was arithmetically unreachable at best_length=4 — concurrency
+   6/6 first-try, sql 6/6, regex_parse 5/5 pinned unmastered forever and endlessly re-picked. New
+   MASTERY_LENGTH_FLOOR=5: at/below it the 5-run first-try streak alone decides. Above the floor C7 unchanged.
+3) **Curriculum balance**: 82% of 154 runs sat in data_analysis/python_general (web_automation: 1 lifetime run).
+   `cluster_run_weights` (1/(1+runs)) now biases BOTH random-template draws
+   (`pick_random_template(cluster_weights=…)`), and `least_practiced_clusters` feeds a COVERAGE TARGET block into
+   the LLM generation prompt when the seed doesn't pin a cluster.
+4) **Generation-slot resilience** (`core/dream.py`): diversity window forward-feed widened 5→12 heads (the
+   overnight 0.91/0.93-overlap dupes sat just outside the 5-slice); a 3/3 quality-gate rejection now falls back
+   to a deterministic template (`_tpl_source="rejection_fallback"`) instead of forfeiting the slot.
+5) **Calibration entropy de-degenerated** (`core/agent.py`): 1179/1180 samples carried entropy_component=0.5 —
+   the internal upstream stream (EVERY sim/CLI turn) never requested logprobs and the finalize fallback hardcoded
+   0.5, so w_entropy was unfittable. Logprobs opt-in hoisted to the internal path, chunks observed into an
+   EntropyTracker (live MTP upstream emits logprobs ~1 chunk in 7 — verified by direct probe; sparse is fine),
+   reading stashed req-id-tagged (`_entropy_norm_pending`) and consumed by `_record_calibration_safe`. GOTCHA
+   caught on the post-deploy probe, not by the 9324-test suite: llama-server 400s `logprobs` on tools+stream
+   payloads — the opt-in is scoped to FINAL generations (which never carry tools) + a `"tools" not in payload`
+   belt-and-braces check. ROOT CAUSE of the darkness, established by live probes: with --native-tools ON
+   (default since 2026-07-17) every tool-attached turn is logprob-blind BY SERVER CONSTRAINT, and most
+   interactive answers land ON a tools-attached turn (model answers directly instead of transitioning to a
+   forced final generation — verified on 3 live probes incl. a tool-work turn). The lone real-entropy sample
+   ever is dated 2026-07-18 — the native-tools OFF/ON toggle window. So entropy coverage is now: forced final
+   generations, truncation continuations, SSE final streams — real but SPARSE. DECISION RULE for the watch:
+   if learning-health `entropy_distinct_values` is still <3 after ~2 weeks (~2026-08-10), retire w_entropy
+   (it is already 0-weighted, so no behavioral change either way); the alternative (stripping `tools` from
+   predicted-easy turn-1 payloads via the complexity router) is a routing change — decide separately.
+Also: **self_consistency RETIRED** (module deleted — learning-health had it INERT, grep confirmed zero callers
+incl. offline tooling; `optim.trainset._dedupe_self_consistency` stays for old batch_id corpora); **FAILURE-arm
+inertness warning rewritten** in learning_health — the old fail-ONLY-lesson test was a metric artifact at a ~96%
+pass rate (live: 29 failed ticks already flowing → arm was never inert; warning now requires ZERO failed ticks
+against ≥20 succeeded); launcher comment fixed (bin/start-ghost-agent.sh said frontier-selfplay "default: ON",
+actual default OFF since #27b 2026-07-09). NOT changed (watch items, not defects): slack-bot 8MB unrotated .err
+(httpx INFO noise, no leak — one poller per process confirmed); native tool_call repair fired in 4/8 overnight
+sessions (guards worked; known upstream issue). Tests: test_counterfactual.py::TestReplayGate,
+test_selfplay_curriculum_2026_07_27.py, test_calibration_entropy_wiring_2026_07_27.py, test_learning_health.py
+(rewritten arm tests). Docs: memory/frontier.html, core/dream.html, core/calibration.html, core/entropy.html,
+core/challenge_templates.html.
+
 ### 2026-07-26 (later 10) — Web-search turns falsely REFUTED: the judge is a 4B model, not a bad prompt
 
 Operator: "web searches cause the verifier to refute … how can we fix this elegantly?" (cases: B3 "latest postgresql

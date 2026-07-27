@@ -1,5 +1,5 @@
 """
-Jetson RealVision image-generation node — hardened.
+Jetson image-generation node (SD1.5, currently DreamShaper 8) — hardened.
 
 Fixes for the two failure modes we actually observed:
 
@@ -63,7 +63,7 @@ from pydantic import BaseModel
 # ---------------------------------------------------------------------------
 # Tunables — defaults measured-safe for an 8GB Jetson + SD1.5 fp16.
 # ---------------------------------------------------------------------------
-MODEL_PATH = "models/cyberrealistic_v90.safetensors"
+MODEL_PATH = "models/dreamshaper_8.safetensors"
 VAE_PATH = "models/vae/ClearVAE_V2.3_fp16.pt"
 
 DEFAULT_WIDTH = 512
@@ -72,7 +72,7 @@ MIN_DIM = 256
 MAX_DIM = 768                  # hard per-side cap
 MAX_PIXELS = 512 * 768        # area budget: 768x768 (590k px) OOM-asserts; this works
 DEFAULT_STEPS = 30
-MIN_STEPS = 15                # below this a non-LCM SD1.5 realism model looks bad
+MIN_STEPS = 15                # below this a non-LCM SD1.5 model looks bad
 MAX_STEPS = 50
 DEFAULT_GUIDANCE = 6.0
 BUSY_WAIT_TIMEOUT = 180.0     # seconds a queued request waits for the GPU before 503
@@ -127,11 +127,13 @@ def _require_key(request: Request) -> None:
 
 # Weights here are REAL now (parsed by the A1111-style layer below), and
 # chunked encoding means nothing gets truncated at 77 tokens anymore.
+# Style terms (cartoon/anime/3d render) deliberately NOT banned here —
+# DreamShaper is a general-purpose model and the caller picks the style
+# in the positive prompt.
 NEGATIVE_PROMPT_DEFAULT = (
     "(worst quality, low quality:1.3), (deformed, disfigured, bad anatomy:1.2), "
     "(extra fingers, mutated hands, extra limbs:1.2), watermark, text, signature, "
-    "jpeg artifacts, blurry, cropped, out of frame, cartoon, anime, 3d render, "
-    "oversaturated"
+    "jpeg artifacts, blurry, cropped, out of frame, oversaturated"
 )
 
 # --- runtime state (populated by the background loader) --------------------
@@ -167,9 +169,9 @@ def _load_model_blocking():
         kwargs["vae"] = AutoencoderKL.from_single_file(
             VAE_PATH, torch_dtype=torch.float16)
     else:
-        # CyberRealistic bakes its own VAE into the checkpoint — overriding
-        # it with ClearVAE (an anime-tuned VAE) washed out the realism the
-        # model is known for. Default: trust the baked one.
+        # DreamShaper 8 bakes its own VAE into the checkpoint (as did
+        # CyberRealistic before it) — don't override a baked VAE with a
+        # style-tuned external one. Default: trust the baked one.
         _log("Using the checkpoint's baked VAE (IMGGEN_VAE=baked).")
 
     _log(f"Loading model: {MODEL_PATH} ...")
@@ -241,7 +243,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Jetson RealVision Node", lifespan=lifespan)
+app = FastAPI(title="Jetson ImgGen Node", lifespan=lifespan)
 
 
 class ImageRequest(BaseModel):
@@ -253,7 +255,7 @@ class ImageRequest(BaseModel):
     height: "int | None" = None
     size: "str | None" = None     # OpenAI-style "WxH", optional
     seed: "int | None" = None     # reproducibility; None = random
-    clip_skip: int = 1            # 2 = penultimate CLIP layer (A1111 style)
+    clip_skip: int = 2            # DreamShaper 8 recommends 2 (penultimate CLIP layer)
 
 
 

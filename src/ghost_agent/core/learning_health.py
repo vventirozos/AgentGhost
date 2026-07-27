@@ -98,6 +98,15 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
             "present_on_both": len(mixed),
             "stale_prune_candidates": len(stale),
             "mean_hit_rate": round(sum(hrs) / len(hrs), 3) if hrs else None,
+            # Raw outcome-tick totals (2026-07-27): the honest FAILURE-arm
+            # liveness test. At the live ~96% turn pass rate a retrieved
+            # lesson almost surely accrues ≥1 success, so the fail-ONLY
+            # bucket is near-impossible by construction and its emptiness
+            # says nothing about the arm — total failed ticks does.
+            "succeeded_ticks_total": sum(
+                int(l.get("succeeded_retrievals") or 0) for l in pb),
+            "failed_ticks_total": sum(
+                int(l.get("failed_retrievals") or 0) for l in pb),
         }
 
     # -- Competence --------------------------------------------------------
@@ -215,9 +224,13 @@ def _cognitive_wiring() -> Dict[str, Any]:
         "metacog_arbiter": {
             "consumer_enabled": flags.get("metacog_arbiter_consumer"),
         },
-        # genuinely inert: no live caller (only its own distill export).
+        # RETIRED 2026-07-27 (operator-approved): module + export removed
+        # after the INERT flag held — no production or offline caller
+        # anywhere in the tree. Entry kept so the telemetry documents the
+        # decision instead of the subsystem silently vanishing.
         "self_consistency": {
-            "status": "INERT — no production caller; candidate for retirement",
+            "status": "RETIRED 2026-07-27 — module removed (was INERT, "
+                      "no caller)",
         },
     }
 
@@ -279,10 +292,25 @@ def render_learning_health(memory_dir) -> str:
         lines.append(
             f"  mean hit-rate: {les['mean_hit_rate']}; "
             f"stale/prune candidates: {les['stale_prune_candidates']}")
-        if les["present_on_failure_only"] == 0 and les["decisive"] > 0:
+        _fail_ticks = int(les.get("failed_ticks_total") or 0)
+        _succ_ticks = int(les.get("succeeded_ticks_total") or 0)
+        lines.append(
+            f"  outcome ticks total: {_succ_ticks} succeeded / "
+            f"{_fail_ticks} failed")
+        # Inertness test rewritten 2026-07-27: fail-ONLY lessons are
+        # near-impossible at a ~96% pass rate (any retrieved lesson
+        # accrues a success), so their absence was a metric artifact,
+        # not evidence. The arm is inert only if the success side is
+        # clearly flowing while not a single failure tick ever landed.
+        if _fail_ticks == 0 and _succ_ticks >= 20:
             lines.append(
-                "  ⚠ FAILURE arm has produced NO fail-only lessons — the "
-                "demotion loop may be inert on this model.")
+                "  ⚠ FAILURE arm has recorded ZERO failed-retrieval ticks "
+                "while the success arm flows — the demotion loop looks "
+                "inert on this model.")
+        elif _fail_ticks > 0 and les["present_on_failure_only"] == 0:
+            lines.append(
+                "  (failure ticks flow; no fail-only lesson yet — expected "
+                "at a high turn pass rate)")
 
     comp = r.get("competence")
     if comp:

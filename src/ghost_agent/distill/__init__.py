@@ -9,13 +9,12 @@ tuples. Two uses:
      pipeline builds a dataset without ever having run a data-collection
      campaign.
 
-  2. Offline-only: `self_consistency.sample()` runs the same prompt N
-     times at varied temperatures, uses the validator (when available) to
-     label each sample pass/fail, and writes the labeled batch to the
-     trajectory store. That's the rejection-sampling corpus: (failed
-     attempt, successful attempt) pairs from the same model. NOTE: this is
-     invoked by the offline GEPA/training tooling, NOT by the live agent
-     loop (the arbiter reimplements the dual-sample pattern separately).
+  2. (RETIRED 2026-07-27) `self_consistency.sample()` — the offline
+     rejection-sampling sampler. Flagged INERT by learning-health
+     telemetry (no production OR offline caller anywhere in the tree;
+     the arbiter reimplements the dual-sample pattern separately) and
+     removed. `optim.trainset._dedupe_self_consistency` stays: old
+     trajectory corpora may still carry its batch_ids.
 
 Redaction runs on every write. No trajectory leaves this machine.
 """
@@ -23,7 +22,6 @@ Redaction runs on every write. No trajectory leaves this machine.
 from .schema import Trajectory, ToolCall, Outcome
 from .redact import redact_text, redact_trajectory, RedactionConfig
 from .collector import TrajectoryCollector
-from .self_consistency import SelfConsistencySampler, Sample
 from .outcome_heuristics import (
     classify_chat_outcome,
     apply_chat_outcome_heuristics,
@@ -38,8 +36,6 @@ __all__ = [
     "redact_trajectory",
     "RedactionConfig",
     "TrajectoryCollector",
-    "SelfConsistencySampler",
-    "Sample",
     "classify_chat_outcome",
     "apply_chat_outcome_heuristics",
     "FailureClassification",

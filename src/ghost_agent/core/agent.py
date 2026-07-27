@@ -10600,10 +10600,12 @@ class GhostAgent:
         chain (2026-07-26) so the STREAMED drain can call it too — the
         streamed path returns the SSE generator before _finalize_and_return
         runs, so it recorded ZERO samples, biasing the fit to the
-        non-streaming subset AND (since only the streamed path produces
-        real logprob entropy) leaving every recorded sample at the neutral
-        0.5 entropy the finalize fallback hardcodes — making w_entropy
-        unlearnable. Never raises."""
+        non-streaming subset. Since 2026-07-27 the fallback path no longer
+        hardcodes neutral 0.5 entropy either: the internal upstream stream
+        observes logprobs and stashes a req-id-tagged reading
+        (`_entropy_norm_pending`) that this fallback consumes, so real
+        entropy reaches calibration on BOTH delivery paths. Never
+        raises."""
         try:
             _ct = getattr(self.context, "calibration_tracker", None)
             _pending = getattr(self.context, "_calib_pending", None)
@@ -10665,8 +10667,22 @@ class GhostAgent:
                                     or budget_exhausted)
                             else 0.0
                         )
+                        # Entropy: prefer the reading the internal upstream
+                        # stream stashed for THIS request (2026-07-27 —
+                        # the hardcoded 0.5 here left 1179/1180 samples
+                        # at neutral entropy and w_entropy unfittable);
+                        # neutral only when no tokens were observed.
+                        _norm_e = 0.5
+                        _ep = getattr(self.context,
+                                      "_entropy_norm_pending", None)
+                        if (isinstance(_ep, tuple) and len(_ep) == 2
+                                and _ep[0] == req_id):
+                            try:
+                                _norm_e = float(_ep[1])
+                            except (TypeError, ValueError):
+                                _norm_e = 0.5
                         _pending = _mc.confidence.score(
-                            normalised_entropy=0.5,
+                            normalised_entropy=_norm_e,
                             competence_p_success=_p,
                             n_observations=_n,
                             uncertainty_pressure=_upress,
@@ -10873,8 +10889,11 @@ class GhostAgent:
                 # handle_chat returned, so the turn-end pairing below never
                 # consumed it. Without this reset the next turn would pair
                 # that stale reading with ITS OWN outcome, systematically
-                # mispairing the calibration JSONL.
+                # mispairing the calibration JSONL. Same for the raw
+                # entropy stash (req-id-tagged, but a stale tuple should
+                # not outlive its request either).
                 self.context._calib_pending = None
+                self.context._entropy_norm_pending = None
                 # Clear turn-scoped uncertainty state from a previous
                 # request that died before its finalize (the only reset
                 # used to be at finalize-END, so an aborted turn leaked
@@ -12610,22 +12629,46 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
 
                     pretty_log("LLM Request", f"Turn {turn+1} | Temp {sampling_params['temperature']:.2f}", icon=Icons.LLM_ASK)
 
+                    # Metacog logprobs opt-in (roadmap phase 2.1). When
+                    # the bundle is wired and the operator has not opted
+                    # out via --metacog-disable-logprobs, ask upstream
+                    # for token-level top_logprobs so the streaming
+                    # consumer can compute rolling Shannon entropy.
+                    # llama.cpp + vLLM both honour the OpenAI-style
+                    # extension; servers that don't recognise it ignore
+                    # the fields. Default top_k=5 matches the entropy
+                    # tracker's K-normalisation.
+                    #
+                    # Hoisted out of the client-SSE branch (2026-07-27 log
+                    # eval): the internal upstream stream below is the path
+                    # EVERY non-client-streamed turn takes — all sim /
+                    # self-play turns and CLI turns — and it never asked
+                    # for logprobs, so 1179 of 1180 calibration samples
+                    # carried the neutral 0.5 entropy fallback and
+                    # w_entropy was degenerate (unfittable). MTP upstreams
+                    # return logprobs sparsely (target-sampled tokens
+                    # only); sparse observations are fine — the tracker's
+                    # reading is over observed tokens.
+                    #
+                    # FINAL generations only: llama-server hard-rejects
+                    # `logprobs` on `tools` + `stream` payloads (live 400,
+                    # caught on the post-deploy probe), and tools are
+                    # attached exactly when `not is_final_generation` — so
+                    # this gate both matches the original phase-2.1 scope
+                    # and avoids the conflict. Belt-and-braces `tools`
+                    # check in case a future path attaches them earlier.
+                    _mc = getattr(self.context, "metacog", None)
+                    _metacog_logprobs = bool(
+                        is_final_generation
+                        and "tools" not in payload
+                        and _mc is not None and getattr(_mc, "enabled", False)
+                        and getattr(_mc, "logprobs_enabled", False))
+                    if _metacog_logprobs:
+                        payload.setdefault("logprobs", True)
+                        payload.setdefault("top_logprobs", 5)
+
                     if is_final_generation and stream_response:
                         payload["stream"] = True
-                        # Metacog logprobs opt-in (roadmap phase 2.1). When
-                        # the bundle is wired and the operator has not opted
-                        # out via --metacog-disable-logprobs, ask upstream
-                        # for token-level top_logprobs so the streaming
-                        # consumer can compute rolling Shannon entropy.
-                        # llama.cpp + vLLM both honour the OpenAI-style
-                        # extension; servers that don't recognise it ignore
-                        # the fields. Default top_k=5 matches the entropy
-                        # tracker's K-normalisation.
-                        _mc = getattr(self.context, "metacog", None)
-                        if (_mc is not None and getattr(_mc, "enabled", False)
-                                and getattr(_mc, "logprobs_enabled", False)):
-                            payload.setdefault("logprobs", True)
-                            payload.setdefault("top_logprobs", 5)
                         # Capture outer variables to prevent NameError when finally block deletes them
                         stream_messages_snapshot = list(messages[-10:])
                         stream_tools_snapshot = list(tools_run_this_turn)
@@ -12713,6 +12756,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     thinking_loop_detected = False
                     try:
                         payload["stream"] = True
+                        # Metacog entropy over the INTERNAL upstream stream
+                        # (2026-07-27): mirror of the client-SSE tracker at
+                        # _stream_final_generation — this path previously
+                        # discarded the logprobs it now requests, leaving
+                        # the finalize calibration fallback stuck on the
+                        # neutral 0.5. One tracker per upstream turn; the
+                        # LAST turn's reading wins the stash (matches the
+                        # streamed path's "last reading of the turn wins").
+                        _turn_entropy_tracker = None
+                        if _metacog_logprobs:
+                            try:
+                                from .entropy import EntropyTracker
+                                _turn_entropy_tracker = EntropyTracker(
+                                    window=32, top_k=5)
+                            except Exception as _etix:
+                                logger.debug(
+                                    "turn entropy tracker init failed: %s",
+                                    _etix)
                         full_content = ""
                         reasoning_content = ""
                         # Last non-null `finish_reason` seen on the stream.
@@ -12820,6 +12881,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 chunk_str = chunk.decode("utf-8")
                                 if chunk_str.startswith("data: ") and chunk_str.strip() != "data: [DONE]":
                                     chunk_data = json.loads(chunk_str[6:])
+                                    # Metacog: pipe top-logprobs into the
+                                    # entropy tracker (same contract as the
+                                    # client-SSE path — a malformed logprobs
+                                    # payload only skips that chunk).
+                                    if _turn_entropy_tracker is not None:
+                                        try:
+                                            from .entropy import extract_top_logprobs
+                                            _tlp = extract_top_logprobs(chunk_data)
+                                            if _tlp:
+                                                _turn_entropy_tracker.observe(_tlp)
+                                        except Exception as _etox:
+                                            logger.debug(
+                                                "entropy observe failed: %s",
+                                                _etox)
                                     # Upstream abort frame (idle stall / mid-stream
                                     # break / connect failure) — has an "error"
                                     # key, no "choices". Previously fell through
@@ -12980,6 +13055,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 logger.debug(f"XML Tool parse text stream chunk error: {type(e).__name__}")
 
                         _flush_thinking()
+                        # Stash this turn's entropy reading for the finalize
+                        # calibration record (req-id-tagged like the streamed
+                        # path's _calib_pending). Only when tokens were
+                        # actually observed — an empty window keeps the
+                        # neutral-0.5 fallback semantics.
+                        if _turn_entropy_tracker is not None:
+                            try:
+                                _te_reading = _turn_entropy_tracker.reading()
+                                if (_te_reading is not None
+                                        and getattr(_te_reading, "n", 0) > 0):
+                                    self.context.last_entropy_reading = _te_reading
+                                    self.context._entropy_norm_pending = (
+                                        req_id, float(_te_reading.norm))
+                            except Exception as _terx:
+                                logger.debug(
+                                    "entropy reading stash failed: %s", _terx)
                         thinking_duration = time.monotonic() - thinking_started
                         if thinking_token_count > 0 or reasoning_content or full_content:
                             reasoning_chars = len(reasoning_content)

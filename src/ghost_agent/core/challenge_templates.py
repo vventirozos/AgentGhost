@@ -1767,6 +1767,7 @@ _LAST_TEMPLATE_KEY: str = ""
 def pick_random_template(
     exclude_clusters=None,
     tier_resolver: Optional[Callable[[str], Optional[str]]] = None,
+    cluster_weights: Optional[Dict[str, float]] = None,
 ) -> ChallengeTriple | None:
     """Return a random template challenge. Used as the cold-start
     fallback when the frontier tracker has no seed — production trace
@@ -1789,6 +1790,14 @@ def pick_random_template(
     at — typically ``FrontierTracker.get_difficulty_tier``. When
     omitted, templates render at basic tier (preserving pre-tier
     behaviour for callers that don't know the frontier state).
+
+    ``cluster_weights`` (2026-07-27 log eval) optionally biases the
+    draw — typically ``FrontierTracker.cluster_run_weights``'s
+    inverse-frequency weights, so under-practiced clusters
+    (web_automation had 1 run vs data_analysis's 66) actually get
+    airtime instead of a uniform 1-in-8 roll. Keys absent from the
+    dict get the mean weight of the present ones; when every weight is
+    non-positive the draw falls back to uniform.
     """
     global _LAST_TEMPLATE_KEY
     if not TEMPLATES:
@@ -1804,7 +1813,24 @@ def pick_random_template(
     if _LAST_TEMPLATE_KEY and _LAST_TEMPLATE_KEY in pool and len(pool) > 1:
         pool = {k: fn for k, fn in pool.items() if k != _LAST_TEMPLATE_KEY}
 
-    key = random.choice(list(pool.keys()))
+    keys = list(pool.keys())
+    weights = None
+    if cluster_weights:
+        try:
+            present = [float(cluster_weights[k]) for k in keys
+                       if k in cluster_weights
+                       and float(cluster_weights[k]) > 0.0]
+            default_w = (sum(present) / len(present)) if present else 1.0
+            weights = [max(0.0, float(cluster_weights.get(k, default_w)))
+                       for k in keys]
+            if sum(weights) <= 0.0:
+                weights = None
+        except (TypeError, ValueError):
+            weights = None
+    if weights is not None:
+        key = random.choices(keys, weights=weights, k=1)[0]
+    else:
+        key = random.choice(keys)
     fn = pool[key]
     tier: Optional[str] = None
     if tier_resolver is not None:

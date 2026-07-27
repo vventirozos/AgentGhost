@@ -7,7 +7,7 @@ from ..utils.logging import Icons, pretty_log
 
 # Diffusion models are happiest at their training buckets — an arbitrary
 # size produces stretched or mode-collapsed output. The live node
-# (ghost, Jetson Orin) runs SD1.5 CyberRealistic with a VRAM-safe pixel
+# (ghost, Jetson Orin) runs SD1.5 DreamShaper 8 with a VRAM-safe pixel
 # budget of 512x768 (393k px) and a 768 per-side cap; the old SDXL
 # buckets (1024², 640x1536, …) all exceeded it, so the node scaled them
 # down and the per-side clamp DISTORTED the extreme aspect ratios the
@@ -57,10 +57,11 @@ async def tool_generate_image(prompt: str = "", llm_client=None, sandbox_dir=Non
     if not prompt:
         return "SYSTEM ERROR: The 'prompt' parameter is MANDATORY for image generation. You must provide a description of the image."
 
-    # Steps: 0/absent = defer to the NODE's tuned default (30 for the
-    # SD1.5 realism model). The old 4-8 clamp was for the long-gone
-    # DreamShaper LCM node — against the current model it forced every
-    # image down to the server's 15-step floor, half the tuned quality.
+    # Steps: 0/absent = defer to the NODE's tuned default (30 for a
+    # non-LCM SD1.5 model). The old 4-8 clamp was for the long-gone
+    # DreamShaper *LCM* node — against a standard checkpoint it forced
+    # every image down to the server's 15-step floor, half the tuned
+    # quality. (The current DreamShaper 8 is the standard, non-LCM one.)
     try:
         steps = int(steps)
     except (TypeError, ValueError):

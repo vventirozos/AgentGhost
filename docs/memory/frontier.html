@@ -58,7 +58,8 @@
   <div class="kv">
     <dt>MAX_RUNS</dt><dd>200 (tail evict)</dd>
     <dt>DEDUP_WINDOW</dt><dd>20 challenge hashes — used to detect duplicate challenge texts (common on deterministic templates)</dd>
-    <dt>MASTERED_STREAK</dt><dd>5 consecutive first-try wins + ≥1 run with delta &gt; 0.05</dd>
+    <dt>MASTERED_STREAK</dt><dd>5 consecutive first-try wins + ≥1 run with delta &gt; 0.05 <em>or</em> best_length at the floor (see MASTERY_LENGTH_FLOOR)</dd>
+    <dt>MASTERY_LENGTH_FLOOR</dt><dd>5 — when <code>best_length</code> (a tool-invocation count; minimal solve ≈ 3-4 calls) is at/below this, the delta&gt;0.05 requirement is arithmetically unreachable and the first-try streak alone decides mastery (2026-07-27: concurrency 6/6, sql 6/6, regex_parse 5/5 were pinned unmastered forever at best_length=4)</dd>
     <dt>BRITTLE_WINDOW</dt><dd>3 — rolling window for brittleness scoring</dd>
     <dt>SATURATION_WINDOW</dt><dd>2 — last N runs all first-try wins with near-zero delta (lowered from 3 after a 13-cycle loop produced 0 net lessons; at 2 the cluster rotates out one clean cycle after a struggle)</dd>
     <dt>SATURATION_DELTA_EPSILON</dt><dd>0.001</dd>
@@ -142,8 +143,22 @@
       <tr><td><code>pick_frontier_seed(uncertainty_by_cluster, rarity_by_cluster, uniform_sample_prob=0.2, random_explore_prob=0.35)</code></td><td>Frontier-weighted alternative. Combines PRM uncertainty + trajectory rarity, excludes saturated clusters, falls back to <code>pick_seed</code> on empty signals / sanity-sample roll / all-zero weights. Returns the same dict shape as <code>pick_seed</code> with <code>mode="frontier_weighted"</code>.</td></tr>
       <tr><td><code>record_run(cluster_key, challenge, attempts_used, passed, description_length, mistake) → dict</code></td><td>Log a run; returns <code>{compression_delta, mastered, is_new_cluster, …}</code>.</td></tr>
       <tr><td><code>adaptive_cooldown(base, floor, ceiling, cluster_key)</code></td><td>Cooldown seconds based on recent progress. Used by both the biological watchdog (minutes–hours) and <code>self_play_loop</code> (5–180 s clamped).</td></tr>
+      <tr><td><code>cluster_run_weights(candidates) → dict</code></td><td>2026-07-27: inverse-frequency weights <code>1/(1+runs)</code> per candidate cluster (unseen = top weight 1.0). Passed by the dream loop into <code>pick_random_template(cluster_weights=…)</code> so template draws favour under-practiced clusters.</td></tr>
+      <tr><td><code>least_practiced_clusters(limit=3, extra_candidates=None) → list</code></td><td>2026-07-27: <code>[(cluster, runs)]</code> ascending over tracked ∪ extra candidates, mastered clusters excluded. Feeds the LLM generator's COVERAGE TARGET prompt block.</td></tr>
     </tbody>
   </table>
+
+  <h2>Curriculum-balance fixes (2026-07-27 log eval)</h2>
+  <p>The overnight eval found 82% of 154 recorded runs in the two most-practiced clusters
+  (data_analysis 66, python_general 61) while web_automation had 1 lifetime run — and the
+  mastery gate structurally unable to fire once <code>best_length</code> reached the
+  tool-invocation floor (delta &gt; 0.05 unreachable at best=4, so concurrency 6/6 first-try,
+  sql 6/6, regex_parse 5/5 were re-served forever). Three changes: the
+  <strong>MASTERY_LENGTH_FLOOR waiver</strong> (streak alone decides at the floor), the
+  <strong>inverse-run-count weights</strong> for random template draws, and the
+  <strong>COVERAGE TARGET</strong> generation-prompt steer (only when the seed doesn't pin a
+  cluster — a frontier/reflection hint always wins).
+  Tests: <code>tests/test_selfplay_curriculum_2026_07_27.py</code>.</p>
 
   <h2>Reflection-driven curriculum targeting</h2>
   <p>New methods <code>note_reflection_failure(cluster_key, diagnosis)</code> and <code>get_reflection_hot_clusters(limit, within_days)</code>. Reflection biological phase 2.5 now records which cluster each reflected interactive-turn failure belongs to (stored under <code>clusters[key].reflection_failures</code>, bounded at 20 per cluster).</p>

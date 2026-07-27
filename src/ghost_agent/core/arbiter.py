@@ -13,8 +13,10 @@ This module wires four pieces:
 
   1. ``DualSolverArbiter`` — orchestrates two candidate generations
      using an injected ``runner`` callable. Re-uses the temperature-
-     variation pattern from ``distill/self_consistency.py`` but with
-     a hard ``n=2`` and a tight per-sample timeout.
+     variation pattern from the retired ``distill/self_consistency.py``
+     (module removed 2026-07-27 — no caller; this arbiter is its
+     surviving reimplementation) but with a hard ``n=2`` and a tight
+     per-sample timeout.
   2. ``SemanticDivergence`` — cosine-similarity check between the two
      candidates. Embedding source is injected: production passes
      ``LLMClient.get_embeddings``; tests pass a deterministic stub.

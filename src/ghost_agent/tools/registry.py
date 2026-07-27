@@ -620,13 +620,13 @@ def get_active_tool_definitions(context, query: str = None):
             "type": "function",
             "function": {
                 "name": "image_generation",
-                "description": "Generate a photorealistic image on the external GPU node (SD1.5 realism model). Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append photographic style/quality enhancements, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. LONG prompts are fully used (no truncation), and A1111 attention weights work — (sharp focus:1.2) emphasises, [background] de-emphasises. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong.",
+                "description": "Generate an image on the external GPU node (SD1.5 DreamShaper — versatile: photorealistic, fantasy, surreal, cartoon/illustration; pick the style in the prompt). Follow 3 modes: 1) EXACT: use prompt exactly as-is, 2) ENHANCED: append style/quality enhancements matching the intended look, 3) IMAGINATION: create a high-entropy prompt. Preserve the user's exact subject description in modes 1 and 2. LONG prompts are fully used (no truncation), and A1111 attention weights work — (sharp focus:1.2) emphasises, [background] de-emphasises. CRITICAL: If the user says the generated image is WRONG or needs fixing, DO NOT blind-guess what to change. You MUST use the `vision_analysis` tool first on the previously generated image to explicitly 'see' what went wrong.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "The final image generation prompt. 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append comma-separated photographic style tags; attention weights like (cinematic lighting:1.2) are supported. 3) IMAGINATION: Generate a high-entropy prompt. Detail is rewarded — the full prompt is used however long it is."
+                            "description": "The final image generation prompt. 1) EXACT: Provide the user's requested subject EXACTLY as they described it, without filtering or altering it. 2) ENHANCED: Append comma-separated style tags matching the intended look (photographic, painterly, cartoon, …); attention weights like (cinematic lighting:1.2) are supported. 3) IMAGINATION: Generate a high-entropy prompt. Detail is rewarded — the full prompt is used however long it is."
                         },
                         "steps": {
                             "type": "integer",

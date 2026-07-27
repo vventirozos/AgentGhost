@@ -226,6 +226,39 @@
   (the playbook triggers actually injected that turn). Tests:
   <code>tests/test_counterfactual.py</code>.</p>
 
+  <h3>Learning-state replay gate (2026-07-27)</h3>
+  <p>A replay measures the CURRENT lessons against a past outcome — when nothing changed,
+  the verdict is a guaranteed repeat. The live ledger proved it: 45/45 replays returned
+  stable-pass/generalized with 0 regressions while the arm consumed ~40% of the idle
+  self-play budget. <code>run_counterfactual_batch</code> now consults
+  <code>should_replay()</code>: a SHA-1 fingerprint over <code>skills_playbook.json</code> +
+  <code>auto_skills.json</code> (quarantine flags live inside the playbook, so quarantines
+  re-arm it too) is stamped to <code>counterfactual/replay_gate.json</code> after each
+  <em>decisive</em> batch — inconclusive-only batches (infra aborts) measure nothing and do
+  not stamp, keeping their retries eligible. An unchanged fingerprint skips the batch and
+  the idle slot falls through to FRESH self-play at the phase-3 call site.
+  Kill switch: <code>GHOST_COUNTERFACTUAL_GATE=0</code>. Tests:
+  <code>tests/test_counterfactual.py::TestReplayGate</code>.</p>
+
+  <h2>Generation-slot fixes (2026-07-27 log eval)</h2>
+  <ul>
+    <li><strong>Diversity window feeds the full retained head set</strong> (12, was 5):
+    the overnight run generated 0.91/0.93-overlap duplicates of a theme sitting just
+    outside the 5-head slice, burned all 3 generation attempts on it, and forfeited a ~2h
+    idle slot.</li>
+    <li><strong>Rejection fallback</strong>: a 3/3 quality-gate rejection no longer forfeits
+    the slot — it falls back to a deterministic template
+    (<code>_tpl_source="rejection_fallback"</code>, saturated clusters excluded, inverse-run
+    weighted). Templates are well-formed by construction and the frontier M7 dedup keeps a
+    repeated shape from inflating mastery counters, so a slightly-redundant run strictly
+    beats no run.</li>
+    <li><strong>Weighted template draws + coverage steer</strong>: both random-template
+    sites pass <code>cluster_weights=FrontierTracker.cluster_run_weights(…)</code>, and the
+    LLM generation prompt gains a COVERAGE TARGET block naming the least-practiced clusters
+    when the seed doesn't pin one (see <a href="../memory/frontier.html">memory/frontier</a>).</li>
+  </ul>
+  <p>Tests: <code>tests/test_selfplay_curriculum_2026_07_27.py</code>.</p>
+
   <h3>Delta-aware idempotency guard (2026-07-20)</h3>
   <p>The fragment-set guard skipped only on <em>exact equality</em>, which was the overnight
   churn engine (log eval 07-19→20): each hourly idle self-play run minted ONE new

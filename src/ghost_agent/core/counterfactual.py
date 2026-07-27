@@ -32,13 +32,14 @@ at sim conclusion) and ``results.jsonl`` (one line per replay).
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import logging
 import os
 import threading
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("GhostAgent")
 
@@ -53,6 +54,83 @@ DEFAULT_BATCH_LIMIT = 2
 # Inconclusive replays (infra aborts, solver aborts, empty status) may be
 # retried, but only this many times before the challenge is dropped quietly.
 MAX_INCONCLUSIVE_ATTEMPTS = 3
+
+# --- Learning-state replay gate (2026-07-27 log eval) ---------------------
+# A replay measures the CURRENT lessons/skills state against a past
+# outcome. When that state has not changed since the last decisive batch,
+# the replay re-measures the identical state and the verdict is a
+# guaranteed repeat (modulo solver noise): the live ledger showed 45/45
+# replays returning stable-pass/generalized with 0 regressions while the
+# arm consumed ~40% of the idle self-play budget. The gate below skips a
+# batch when the fingerprint of the learning stores is unchanged since the
+# last decisive batch, so the idle slot falls through to FRESH self-play
+# at the call site (`_ran_cf` stays False in core.agent's phase 3).
+# `GHOST_COUNTERFACTUAL_GATE=0` restores the ungated behaviour.
+_GATE_FILENAME = "replay_gate.json"
+# The stores a replay's outcome can actually depend on: hydrated lessons
+# (playbook) and graduated auto-skills. Quarantine flags live inside the
+# playbook file, so quarantine changes re-arm the gate too.
+_LEARNING_STATE_FILES = ("skills_playbook.json", "auto_skills.json")
+
+
+def learning_fingerprint() -> str:
+    """SHA-1 over the learning stores a replay measures against.
+    Empty string when GHOST_HOME is unset (gate cannot resolve paths —
+    callers treat that as 'allow')."""
+    home = os.getenv("GHOST_HOME", "").strip()
+    if not home:
+        return ""
+    mem = Path(home) / "system" / "memory"
+    h = hashlib.sha1()
+    for name in _LEARNING_STATE_FILES:
+        h.update(name.encode("utf-8"))
+        try:
+            h.update((mem / name).read_bytes())
+        except OSError:
+            h.update(b"<absent>")
+    return h.hexdigest()
+
+
+def _gate_enabled() -> bool:
+    return os.getenv("GHOST_COUNTERFACTUAL_GATE", "1").strip().lower() not in (
+        "0", "false", "off")
+
+
+def _read_gate_fingerprint(root: Path) -> str:
+    try:
+        d = json.loads((root / _GATE_FILENAME).read_text(encoding="utf-8"))
+        return str(d.get("fingerprint") or "")
+    except Exception:
+        return ""
+
+
+def _write_gate_fingerprint(root: Path, fingerprint: str) -> None:
+    try:
+        with _LOCK:
+            root.mkdir(parents=True, exist_ok=True)
+            (root / _GATE_FILENAME).write_text(json.dumps({
+                "fingerprint": fingerprint,
+                "ts": datetime.datetime.utcnow().isoformat() + "Z",
+            }), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        logger.debug("counterfactual gate write skipped: %s", e)
+
+
+def should_replay() -> Tuple[bool, str]:
+    """(allowed, reason). Allowed unless the gate is on AND the learning
+    fingerprint matches the one stamped by the last decisive batch."""
+    if not _gate_enabled():
+        return True, "gate disabled (GHOST_COUNTERFACTUAL_GATE=0)"
+    root = _root()
+    if root is None:
+        return True, "no GHOST_HOME"
+    fp = learning_fingerprint()
+    if not fp:
+        return True, "no learning-state fingerprint"
+    if fp == _read_gate_fingerprint(root):
+        return False, ("learning state unchanged since last replay batch — "
+                       "a replay would re-measure an identical state")
+    return True, "learning state changed since last replay batch"
 
 
 def _normalize_status(status: Any) -> Optional[str]:
@@ -205,10 +283,20 @@ async def run_counterfactual_batch(dreamer, context,
     summary = {"replayed": 0, "generalized": 0, "regressions": 0,
                "stable": 0, "inconclusive": 0, "quarantined": []}
     try:
+        from ..utils.logging import Icons, pretty_log
+        allowed, gate_reason = should_replay()
+        if not allowed:
+            summary["skipped"] = gate_reason
+            pretty_log(
+                "Counterfactual",
+                f"replay batch skipped — {gate_reason}; idle slot falls "
+                "through to fresh self-play",
+                icon=Icons.SKIP,
+            )
+            return summary
         candidates = load_replay_candidates(limit)
         if not candidates:
             return summary
-        from ..utils.logging import Icons, pretty_log
         for cand in candidates:
             pretty_log(
                 "Counterfactual",
@@ -262,6 +350,16 @@ async def run_counterfactual_batch(dreamer, context,
                           replay=replay_status, verdict=verdict,
                           quarantined=quarantined)
             _report(context, cand, replay_status, verdict, quarantined)
+        # Stamp the gate only after a DECISIVE replay: an inconclusive-only
+        # batch (infra aborts) measured nothing, so its retries must stay
+        # eligible regardless of whether lessons changed. Fingerprint is
+        # recomputed POST-batch — a lesson written during the batch (replay
+        # analysis) is new state the next batch may legitimately measure.
+        if summary["replayed"] - summary["inconclusive"] > 0:
+            root = _root()
+            fp = learning_fingerprint()
+            if root is not None and fp:
+                _write_gate_fingerprint(root, fp)
     except Exception as e:  # noqa: BLE001
         logger.debug("counterfactual batch skipped: %s", e)
     return summary

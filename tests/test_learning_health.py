@@ -83,15 +83,44 @@ def test_render_is_a_string(tmp_path):
 
 
 def test_failure_arm_inert_warning(tmp_path):
-    """A decisive corpus with zero fail-only lessons must flag the inert
-    FAILURE arm — the live signal that motivated this instrument."""
+    """The arm is flagged inert only when the success side clearly flows
+    (≥20 ticks) while not a single failure tick ever landed. (Rewritten
+    2026-07-27: the old fail-ONLY-lesson test was a metric artifact — at
+    a ~96% turn pass rate any retrieved lesson accrues a success, so the
+    bucket was near-impossible by construction.)"""
     md = tmp_path / "memory"
     md.mkdir(parents=True)
     (md / "skills_playbook.json").write_text(json.dumps([
         {"trigger": f"t{i}", "succeeded_retrievals": 5, "failed_retrievals": 0,
          "retrievals": 5, "helpful_retrievals": 4} for i in range(6)]))
     out = render_learning_health(md)
-    assert "FAILURE arm has produced NO fail-only lessons" in out
+    assert "ZERO failed-retrieval ticks" in out
+
+
+def test_failure_arm_flowing_is_not_flagged(tmp_path):
+    """Failure ticks on mixed lessons = the arm is alive; the report must
+    say so instead of warning (the live 2026-07-27 state: 29 failed ticks,
+    0 fail-only lessons)."""
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    (md / "skills_playbook.json").write_text(json.dumps([
+        {"trigger": f"t{i}", "succeeded_retrievals": 4, "failed_retrievals": 2,
+         "retrievals": 6, "helpful_retrievals": 3} for i in range(5)]))
+    out = render_learning_health(md)
+    assert "ZERO failed-retrieval ticks" not in out
+    assert "failure ticks flow" in out
+
+
+def test_failure_arm_thin_corpus_not_flagged(tmp_path):
+    """Zero failure ticks with a THIN success side (<20 ticks) is 'not
+    enough signal', not inertness — no warning either way."""
+    md = tmp_path / "memory"
+    md.mkdir(parents=True)
+    (md / "skills_playbook.json").write_text(json.dumps([
+        {"trigger": "t0", "succeeded_retrievals": 5, "failed_retrievals": 0,
+         "retrievals": 5, "helpful_retrievals": 4}]))
+    out = render_learning_health(md)
+    assert "ZERO failed-retrieval ticks" not in out
 
 
 def test_missing_stores_degrade_gracefully(tmp_path):
@@ -109,4 +138,6 @@ def test_cognitive_wiring_section(tmp_path):
     cw = r["cognitive_wiring"]
     assert "selfhood" in cw and "calibration" in cw
     assert cw["calibration"]["write_only"] is False
-    assert "INERT" in cw["self_consistency"]["status"]
+    # 2026-07-27: retired (module removed); the entry stays to document
+    # the decision.
+    assert "RETIRED" in cw["self_consistency"]["status"]

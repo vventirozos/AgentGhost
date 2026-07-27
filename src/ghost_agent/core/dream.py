@@ -3046,9 +3046,14 @@ Return ONLY a JSON object with:
         # first generation attempt already avoids recent themes instead
         # of burning a regen on the similarity reject below. (The reject
         # gate stays — this is the cheap first line, that is the backstop.)
+        # limit: the FULL retained window (12), not 5 — the 2026-07-27
+        # overnight run generated 0.91/0.93-overlap duplicates of a theme
+        # that sat just outside the 5-head slice, burned all 3 generation
+        # attempts on it, and forfeited a ~2h idle slot.
         if frontier_tracker is not None:
             try:
-                _recent_heads = frontier_tracker.recent_generated_challenges(limit=5)
+                _recent_heads = frontier_tracker.recent_generated_challenges(
+                    limit=frontier_tracker.RECENT_CHALLENGE_KEEP)
             except Exception:
                 _recent_heads = []
             if _recent_heads:
@@ -3061,6 +3066,30 @@ Return ONLY a JSON object with:
                     "new challenge MUST differ from ALL of them in domain, "
                     "mock-file name AND analytical goal — a reworded copy "
                     "will be rejected:\n" + _themes
+                )
+
+        # Coverage steer (2026-07-27 log eval): when the seed doesn't pin a
+        # cluster, tell the generator which clusters are starved. 82% of
+        # all recorded runs landed in data_analysis/python_general because
+        # the LLM's unconstrained output mode-collapses into CSV shapes
+        # that classify there; web_automation had 1 lifetime run. Skipped
+        # when the seed targets a specific cluster — that hint wins.
+        if frontier_tracker is not None and not seed.get("cluster_key"):
+            try:
+                from .challenge_templates import TEMPLATES as _cov_templates
+                _cov = frontier_tracker.least_practiced_clusters(
+                    limit=3, extra_candidates=_cov_templates.keys())
+            except Exception:
+                _cov = []
+            if _cov:
+                _cov_names = ", ".join(
+                    f"'{k}' ({n} run{'s' if n != 1 else ''})" for k, n in _cov)
+                system_message += (
+                    "\n\n### COVERAGE TARGET (curriculum balance)\n"
+                    f"The agent has barely practiced these clusters: "
+                    f"{_cov_names}. STRONGLY prefer generating this "
+                    "challenge in one of those domains — pick whichever "
+                    "fits a fresh, novel task."
                 )
 
         # When the frontier is saturated, the LLM falls back to open-
@@ -3188,6 +3217,18 @@ Return ONLY a JSON object with:
                 return frontier_tracker.get_difficulty_tier(cluster)
             except Exception:
                 return None
+
+        def _template_weights() -> Optional[dict]:
+            """Inverse-run-count weights for the random-template draws
+            (2026-07-27 log eval) — under-practiced clusters get real
+            airtime instead of a uniform roll. None = uniform."""
+            if frontier_tracker is None:
+                return None
+            try:
+                return frontier_tracker.cluster_run_weights(
+                    list(_ct_mod.TEMPLATES.keys()))
+            except Exception:
+                return None
         _resolved_tier = _resolve_tier(_cluster_key) if _cluster_key else None
         _tpl = try_template(_cluster_key, tier=_resolved_tier)
         _tpl_source = "cluster"
@@ -3240,7 +3281,8 @@ Return ONLY a JSON object with:
         #     through to LLM-gen for genuinely novel shapes.
         if _tpl is None and not gen_ok and not _cluster_key and not _saturated:
             _tpl = pick_random_template(
-                exclude_clusters=_saturated, tier_resolver=_resolve_tier
+                exclude_clusters=_saturated, tier_resolver=_resolve_tier,
+                cluster_weights=_template_weights(),
             )
             _tpl_source = "cold_start_random"
             if _tpl is not None:
@@ -3263,7 +3305,8 @@ Return ONLY a JSON object with:
             import random as _rnd
             if _rnd.random() < 0.2:
                 _tpl = pick_random_template(
-                    exclude_clusters=_saturated, tier_resolver=_resolve_tier
+                    exclude_clusters=_saturated, tier_resolver=_resolve_tier,
+                    cluster_weights=_template_weights(),
                 )
                 _tpl_source = "saturation_template_rotation"
                 if _tpl is not None:
@@ -3918,12 +3961,42 @@ Return ONLY a JSON object with:
             rejection_feedback = reason.replace("<", "&lt;").replace(">", "&gt;")
 
         if not gen_ok:
-            return (
-                f"Synthetic challenge generation failed the quality gate after "
-                f"{gen_attempt_limit} attempts. Last rejection: {rejection_feedback}\n\n"
-                "SYSTEM INSTRUCTION: The self-play tool could not produce a "
-                "winnable challenge. Do not retry automatically."
+            # Last-resort deterministic fallback (2026-07-27 log eval): a
+            # 3/3 quality-gate rejection used to forfeit the ENTIRE idle
+            # slot — the overnight trace lost a ~2h window to one
+            # near-duplicate streak. A template is well-formed by
+            # construction, and the frontier tracker's M7 dedup keeps a
+            # repeated shape from inflating mastery counters, so a
+            # slightly-redundant run strictly beats no run at all.
+            _tpl = pick_random_template(
+                exclude_clusters=_saturated, tier_resolver=_resolve_tier,
+                cluster_weights=_template_weights(),
             )
+            if _tpl is not None:
+                challenge, setup_script, validation_script = _tpl
+                validation_script, _ = sanitize_code(
+                    validation_script, ".validator.py")
+                setup_script, _ = sanitize_code(setup_script, ".setup.py")
+                reference_solution = ""  # templates skip the consistency gate
+                _tpl_source = "rejection_fallback"
+                _used_template_cluster = str(
+                    getattr(_ct_mod, "_LAST_TEMPLATE_KEY", "") or "")
+                gen_ok = True
+                pretty_log(
+                    "Self-Play Template",
+                    f"Generation failed the quality gate {gen_attempt_limit}x "
+                    f"— falling back to a deterministic template "
+                    f"(cluster='{_used_template_cluster or 'none'}') instead "
+                    "of forfeiting the idle slot.",
+                    level="WARNING", icon=Icons.WARN,
+                )
+            else:
+                return (
+                    f"Synthetic challenge generation failed the quality gate after "
+                    f"{gen_attempt_limit} attempts. Last rejection: {rejection_feedback}\n\n"
+                    "SYSTEM INSTRUCTION: The self-play tool could not produce a "
+                    "winnable challenge. Do not retry automatically."
+                )
 
         pretty_log("Synthetic Challenge", challenge[:80] + "...", icon=Icons.TOOL_CODE)
 

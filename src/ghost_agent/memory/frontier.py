@@ -80,6 +80,15 @@ class FrontierTracker:
     # with at least one positive compression delta is a much stronger
     # signal: both length & streak count, not just streak.
     MASTERED_STREAK = 5
+    # ...but the compression requirement is unsatisfiable once best_length
+    # sits at the structural floor: `description_length` is a tool-invocation
+    # count and the minimal viable solve (read → write → run) is 3-4 calls,
+    # so a cluster whose best is already ≤ this floor can never produce a
+    # delta > 0.05 and was permanently pinned unmastered (2026-07-27 log
+    # eval: concurrency 6/6 first-try, sql 6/6, regex_parse 5/5 — all at
+    # best_length=4, none mastered, all endlessly re-picked). At/below the
+    # floor the streak alone carries the mastery decision.
+    MASTERY_LENGTH_FLOOR = 5
     BRITTLE_WINDOW = 3
     # Saturation: last N runs in the cluster are all first-try-passes with
     # effectively zero compression gain. The cluster is "done" for the
@@ -292,6 +301,52 @@ class FrontierTracker:
     def get_cluster_stats(self, cluster_key: str) -> dict:
         with self._lock:
             return self._load().get("clusters", {}).get(cluster_key, {})
+
+    # -- curriculum-balance helpers (2026-07-27 log eval) -----------------
+    #
+    # 82% of the 154 recorded runs targeted the two most-practiced
+    # clusters (data_analysis 66, python_general 61) while web_automation
+    # had 1 run and algo 3 — uniform template picks plus the LLM
+    # generator's CSV mode-collapse starved the rest of the curriculum.
+    # These two helpers give the pick sites an inverse-frequency signal.
+
+    def cluster_run_weights(self, candidates) -> dict:
+        """``{cluster_key: 1/(1+runs)}`` over ``candidates`` — inverse-
+        frequency weights for template/exploration sampling. A cluster
+        the tracker has never seen counts as 0 runs (top weight)."""
+        with self._lock:
+            clusters = self._load().get("clusters", {})
+        out = {}
+        for key in candidates or ():
+            stats = clusters.get(key) or {}
+            try:
+                runs = int(stats.get("runs", 0) or 0)
+            except (TypeError, ValueError):
+                runs = 0
+            out[key] = 1.0 / (1.0 + max(0, runs))
+        return out
+
+    def least_practiced_clusters(self, *, limit: int = 3,
+                                 extra_candidates=None) -> list:
+        """``[(cluster_key, runs)]`` ascending by run count over the union
+        of tracked clusters and ``extra_candidates`` (never-seen candidates
+        count as 0 runs). Mastered clusters are excluded — under-visited
+        but already-mastered material is not a coverage gap."""
+        with self._lock:
+            clusters = self._load().get("clusters", {})
+        keys = set(clusters.keys()) | set(extra_candidates or ())
+        scored = []
+        for key in keys:
+            stats = clusters.get(key) or {}
+            if stats.get("mastered"):
+                continue
+            try:
+                runs = int(stats.get("runs", 0) or 0)
+            except (TypeError, ValueError):
+                runs = 0
+            scored.append((key, runs))
+        scored.sort(key=lambda kv: (kv[1], kv[0]))
+        return scored[:max(0, int(limit))]
 
     @classmethod
     def _cluster_is_saturated(cls, stats: dict) -> bool:
@@ -929,13 +984,26 @@ class FrontierTracker:
                 # (at least one delta > 0.05). A brand-new cluster with
                 # delta=0 on every run can no longer self-master in 3
                 # trivial first-try wins.
+                #
+                # Floor waiver (2026-07-27): when best_length is already at
+                # the MASTERY_LENGTH_FLOOR, the progress requirement is
+                # vacuous — delta > 0.05 is arithmetically unreachable — so
+                # the first-try streak alone decides. Without this, floor
+                # clusters could never master and the brittle pool kept
+                # re-serving material the agent aces (see constant above).
                 recent = cluster["recent_outcomes"][-self.MASTERED_STREAK:]
                 if len(recent) >= self.MASTERED_STREAK:
                     all_first_try = all(
                         r["passed"] and r["attempts_used"] == 1 for r in recent
                     )
                     any_real_progress = any(r["delta"] > 0.05 for r in recent)
-                    cluster["mastered"] = bool(all_first_try and any_real_progress)
+                    _best_now = cluster.get("best_length")
+                    at_floor = (
+                        isinstance(_best_now, int)
+                        and 0 < _best_now <= self.MASTERY_LENGTH_FLOOR
+                    )
+                    cluster["mastered"] = bool(
+                        all_first_try and (any_real_progress or at_floor))
                 else:
                     cluster["mastered"] = False
 

@@ -63,6 +63,31 @@
 
   <h2>Observability</h2>
   <p>Refits emit <code>metacog calib</code> log lines (📐 icon) with the fitted threshold/weights/λ/Brier. <code>tracker.stats()</code> exposes <code>{samples, brier, ece, fitted, threshold, w_entropy, lambda_uncertainty}</code> for introspection.</p>
+
+  <h2>Entropy de-degeneration (2026-07-27)</h2>
+  <p>1179 of 1180 recorded samples carried <code>entropy_component=0.5</code> — the finalize
+  fallback hardcoded neutral entropy, and the only path observing real logprobs (the
+  client-SSE stream) rarely runs: every sim/self-play/CLI turn takes the agent's INTERNAL
+  upstream stream, which never requested logprobs. With 2 distinct entropy values,
+  <code>w_entropy</code> was unfittable (the fit's own DEGENERATE flag). The logprobs opt-in
+  is now hoisted to cover the internal stream — FINAL generations only: llama-server
+  hard-rejects <code>logprobs</code> on <code>tools</code>+<code>stream</code> payloads (live
+  400 caught on the post-deploy probe), and tools are attached exactly on non-final turns,
+  so tool turns keep neutral entropy by design. The final-generation stream observes chunks
+  into an <code>EntropyTracker</code> (sparse MTP logprobs — ~1 chunk in 7 on the live
+  upstream — are fine; the reading averages observed tokens) and stashes a req-id-tagged
+  <code>_entropy_norm_pending</code> that <code>_record_calibration_safe</code> consumes in
+  place of the old hardcoded 0.5.</p>
+  <p><strong>Coverage is structurally sparse — root cause established by live probes:</strong>
+  with <code>--native-tools</code> ON (default since 2026-07-17) the server withholds logprobs
+  on every tool-attached turn, and most interactive answers land ON a tools-attached turn
+  (the model answers directly rather than transitioning to a forced final generation). The
+  lone real-entropy sample in the corpus is dated 2026-07-18 — the native-tools toggle
+  window. Real entropy therefore flows only on forced final generations, truncation
+  continuations and SSE final streams. Watch <code>entropy_distinct_values</code>; if still
+  &lt;3 by ~2026-08-10, retire <code>w_entropy</code> (already 0-weighted — no behavioral
+  change either way). Tests:
+  <code>tests/test_calibration_entropy_wiring_2026_07_27.py</code>.</p>
 </main>
 </body>
 </html>

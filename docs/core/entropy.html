@@ -45,6 +45,14 @@
 
   <h2>Why no library?</h2>
   <p>SciPy's <code>entropy</code> would force a numpy dependency on every chunk parse — too expensive on edge. The pure-Python implementation is sub-microsecond per token and dependency-free.</p>
+
+  <h2>Consumers (updated 2026-07-27)</h2>
+  <p>Two trackers now feed the confidence/calibration spine: the client-SSE stream's (since
+  phase 2.2) and one on the agent's INTERNAL upstream stream — the path every
+  sim/self-play/CLI turn takes, previously logprob-blind, which left calibration entropy
+  degenerate at 0.5 (see <a href="calibration.html">calibration</a>). The live MTP upstream
+  emits logprobs only on target-sampled tokens (~1 chunk in 7); both consumers observe
+  whatever arrives and read the mean over observed tokens.</p>
 </main>
 </body>
 </html>

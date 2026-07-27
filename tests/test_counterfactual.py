@@ -321,3 +321,73 @@ class TestWiringPins:
                / "src" / "ghost_agent" / "core" / "agent.py").read_text()
         assert "run_counterfactual_batch" in src
         assert "load_replay_candidates(1)" in src
+
+
+class TestReplayGate:
+    """Learning-state gate (2026-07-27): a batch only runs when the
+    lessons/skills state changed since the last decisive batch — 45/45
+    live replays of an unchanged state returned stable-pass and taught
+    nothing, while consuming ~40% of the idle self-play budget."""
+
+    def _playbook(self, home, content="[]"):
+        mem = home / "system" / "memory"
+        mem.mkdir(parents=True, exist_ok=True)
+        (mem / "skills_playbook.json").write_text(content)
+
+    def test_fingerprint_tracks_playbook_content(self, home):
+        self._playbook(home, "[]")
+        fp1 = cf.learning_fingerprint()
+        fp2 = cf.learning_fingerprint()
+        assert fp1 and fp1 == fp2  # stable on unchanged state
+        self._playbook(home, '[{"trigger": "new lesson"}]')
+        assert cf.learning_fingerprint() != fp1
+
+    def test_fingerprint_empty_without_home(self, monkeypatch):
+        monkeypatch.delenv("GHOST_HOME", raising=False)
+        assert cf.learning_fingerprint() == ""
+
+    async def test_decisive_batch_stamps_gate_and_second_skips(
+            self, home, tmp_path):
+        self._playbook(home)
+        _persist("SUCCESS", challenge="first")
+        ctx, _ = _ctx(tmp_path)
+        s1 = await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
+        assert s1["replayed"] == 1 and "skipped" not in s1
+        # Same learning state + a fresh pending challenge → gate skips.
+        _persist("SUCCESS", challenge="second")
+        s2 = await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
+        assert s2["replayed"] == 0
+        assert "unchanged" in s2.get("skipped", "")
+
+    async def test_learning_change_rearms_gate(self, home, tmp_path):
+        self._playbook(home)
+        _persist("SUCCESS", challenge="first")
+        ctx, _ = _ctx(tmp_path)
+        await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
+        _persist("SUCCESS", challenge="second")
+        self._playbook(home, '[{"trigger": "fresh lesson"}]')
+        s2 = await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
+        assert s2["replayed"] == 1 and "skipped" not in s2
+
+    async def test_kill_switch_disables_gate(self, home, tmp_path,
+                                             monkeypatch):
+        self._playbook(home)
+        monkeypatch.setenv("GHOST_COUNTERFACTUAL_GATE", "0")
+        _persist("SUCCESS", challenge="first")
+        ctx, _ = _ctx(tmp_path)
+        await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
+        _persist("SUCCESS", challenge="second")
+        s2 = await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
+        assert s2["replayed"] == 1  # ungated legacy behaviour
+
+    async def test_inconclusive_batch_does_not_stamp(self, home, tmp_path):
+        self._playbook(home)
+        _persist("SUCCESS", challenge="first")
+        ctx, _ = _ctx(tmp_path)
+        s1 = await cf.run_counterfactual_batch(
+            _FakeDreamer("ABORTED_BY_SOLVER"), ctx)
+        assert s1["inconclusive"] == 1
+        # Nothing decisive was measured → the retry stays eligible even
+        # though the learning state is unchanged.
+        s2 = await cf.run_counterfactual_batch(_FakeDreamer("SUCCESS"), ctx)
+        assert s2["replayed"] == 1 and "skipped" not in s2
