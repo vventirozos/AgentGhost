@@ -3708,7 +3708,40 @@ class GhostAgent:
                 # ``iter_trajectories`` an extra time and inflating
                 # any call-count assertion in unrelated phases.
                 from ..prm.scorer import PRMScorer as _PRMScorer
+                # Don't train a model nothing reads. The PRM has exactly two
+                # consumers and BOTH can be off:
+                #   * `.score()`  → the MCTS turn-start hint, hard-gated by
+                #     `_MCTS_TURNSTART_ENABLED` (no flag can enable it);
+                #   * `.uncertainty()` → frontier self-play seed selection,
+                #     gated by `--frontier-selfplay` (default False since
+                #     2026-07-09, and absent from the live launcher).
+                # With both off this phase burned an idle slot every cooldown
+                # producing a checkpoint no code path ever read — 41 such
+                # retrains in one recent ledger window (2026-07-27) — while
+                # logging "value model refit", which reads like learning
+                # progress. Skip instead, and say why. This is deliberately a
+                # runtime check, not a deletion: flip either consumer on and
+                # training resumes on the next idle pass with no code change.
+                _prm_consumer_live = bool(
+                    _MCTS_TURNSTART_ENABLED
+                    or getattr(getattr(ctx, 'args', None),
+                               'frontier_selfplay', False) is True
+                )
                 if (
+                    traj_collector is not None
+                    and isinstance(prm_scorer, _PRMScorer)
+                    and not _prm_consumer_live
+                ):
+                    self._last_prm_train_at = datetime.datetime.now()
+                    pretty_log(
+                        "PRM Retrain",
+                        "skipped — no live consumer (MCTS turn-start hint is "
+                        "module-gated off and --frontier-selfplay is not "
+                        "enabled). Training would produce a checkpoint "
+                        "nothing reads; enable either consumer to resume.",
+                        icon=Icons.SKIP,
+                    )
+                elif (
                     traj_collector is not None
                     and isinstance(prm_scorer, _PRMScorer)
                 ):
@@ -10638,19 +10671,48 @@ class GhostAgent:
             # entropy term, competence + verbalised uncertainty drive it
             # — so calibration records on EVERY full-loop metacog turn
             # (and the arbiter bundle gets a reading via record_confidence).
+            # Resolve the turn's domain up front so it is defined on BOTH
+            # paths — the compute-now fallback below AND the streamed path,
+            # where `_pending` arrives pre-built from the stash and none of
+            # that block runs. It depends only on `tools_run`.
+            _last_tool = ""
+            for _t in reversed(tools_run or []):
+                if isinstance(_t, dict) and _t.get("name"):
+                    _last_tool = _t["name"]
+                    break
+            try:
+                from .metacog import _domain_for_tool
+                _dom = _domain_for_tool(_last_tool or "")
+            except Exception:  # noqa: BLE001 — labelling must never break the record
+                _dom = ""
+
+            # Turn-EFFORT feature: the first confidence input that varies per
+            # TURN. Competence is a per-domain historical average, so it was
+            # near-constant within a domain and the composite had no
+            # discrimination at all (leak-free AUC 0.473). Turn shape does:
+            # measured over 296 labelled trajectories, passed turns averaged
+            # 2.4 tool calls / longest same-tool run 1.4, failed turns 11.7 /
+            # 5.8 — AUC 0.670, separation +0.232.
+            _effort = None
+            try:
+                from .confidence import effort_component as _effort_fn
+                _names = [t.get("name") for t in (tools_run or [])
+                          if isinstance(t, dict) and t.get("name")]
+                # None (not 0.5) when the turn ran no tools: "no tools" is
+                # absence of evidence about effort, not a measured value, and
+                # recording it as observed would poison the weight fit the
+                # same way fabricated entropy neutrals did.
+                if _names:
+                    _effort = _effort_fn(_names)
+            except Exception:  # noqa: BLE001
+                _effort = None
+
             if _pending is None and _ct is not None:
                 try:
                     _mc = getattr(self.context, "metacog", None)
                     if (_mc is not None and getattr(_mc, "enabled", False)
                             and getattr(_mc, "confidence", None) is not None
                             and getattr(_mc, "competence", None) is not None):
-                        _last_tool = ""
-                        for _t in reversed(tools_run or []):
-                            if isinstance(_t, dict) and _t.get("name"):
-                                _last_tool = _t["name"]
-                                break
-                        from .metacog import _domain_for_tool
-                        _dom = _domain_for_tool(_last_tool or "")
                         _p = _mc.competence.estimate(_dom, _last_tool or None)
                         _n = _mc.competence.observations(_dom, _last_tool or None)
                         _upress = 0.0
@@ -10686,7 +10748,12 @@ class GhostAgent:
                         # the hardcoded 0.5 here left 1179/1180 samples
                         # at neutral entropy and w_entropy unfittable);
                         # neutral only when no tokens were observed.
-                        _norm_e = 0.5
+                        # None = NOT OBSERVED. The score() call treats it as
+                        # neutral 0.5 for the composite (unchanged) but marks
+                        # the reading so calibration can exclude it from the
+                        # entropy-weight fit rather than recording a
+                        # fabricated measurement.
+                        _norm_e = None
                         _ep = getattr(self.context,
                                       "_entropy_norm_pending", None)
                         if (isinstance(_ep, tuple) and len(_ep) == 2
@@ -10694,13 +10761,14 @@ class GhostAgent:
                             try:
                                 _norm_e = float(_ep[1])
                             except (TypeError, ValueError):
-                                _norm_e = 0.5
+                                _norm_e = None
                         _pending = _mc.confidence.score(
                             normalised_entropy=_norm_e,
                             competence_p_success=_p,
                             n_observations=_n,
                             uncertainty_pressure=_upress,
                             outcome_penalty=_outcome_penalty,
+                            effort=_effort,
                         )
                         self.context.last_confidence = _pending
                         try:
@@ -10752,6 +10820,22 @@ class GhostAgent:
                     competence_component=_pending.competence_component,
                     uncertainty_pressure=getattr(_pending, "uncertainty_pressure", 0.0),
                     outcome=_calib_outcome,
+                    # Carry the observed/fabricated distinction into the
+                    # store — the entropy weight is fit only on real ones.
+                    entropy_observed=bool(
+                        getattr(_pending, "entropy_observed", False)),
+                    effort_component=float(
+                        getattr(_pending, "effort_component", 0.5)),
+                    effort_observed=bool(
+                        getattr(_pending, "effort_observed", False)),
+                    # The domain was computed right above (it is what the
+                    # competence estimate was looked up under) and then
+                    # dropped: every one of the 1208 stored samples carried
+                    # domain="". That made per-domain reliability impossible
+                    # — the whole corpus looked like one undifferentiated
+                    # population, which is precisely the wrong shape for a
+                    # signal whose only varying input is per-DOMAIN.
+                    domain=_dom or "",
                 )
                 # Stash the components keyed by this response's
                 # fingerprint so a NEXT-turn user-correction can record
@@ -10769,6 +10853,14 @@ class GhostAgent:
                         "entropy_component": _pending.entropy_component,
                         "competence_component": _pending.competence_component,
                         "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
+                        # Carry the observation flag: a user-correction
+                        # negative on a turn that DID observe logprobs is the
+                        # single most valuable sample the loop can get
+                        # (negatives are ~4% of the corpus and observed
+                        # samples are rarer still). Dropping it here silently
+                        # downgraded that sample to "unobserved".
+                        "entropy_observed": bool(
+                            getattr(_pending, "entropy_observed", False)),
                     }
                     while len(_cc) > 32:
                         _cc.popitem(last=False)
@@ -12671,10 +12763,20 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # this gate both matches the original phase-2.1 scope
                     # and avoids the conflict. Belt-and-braces `tools`
                     # check in case a future path attaches them earlier.
+                    #
+                    # The gate is `"tools" not in payload`, NOT
+                    # `is_final_generation`. Re-verified against the live
+                    # server 2026-07-27: `logprobs` + `tools` + `stream`
+                    # → HTTP 400 "logprobs is not supported with tools +
+                    # stream", but `logprobs` + `stream` (no tools) is fine.
+                    # The old extra `is_final_generation` term was strictly
+                    # narrower than the real constraint and cost coverage:
+                    # a generation can carry no tools without being a
+                    # forced-final one (native-tools off, tool-free replans),
+                    # and those turns silently skipped entropy collection.
                     _mc = getattr(self.context, "metacog", None)
                     _metacog_logprobs = bool(
-                        is_final_generation
-                        and "tools" not in payload
+                        "tools" not in payload
                         and _mc is not None and getattr(_mc, "enabled", False)
                         and getattr(_mc, "logprobs_enabled", False))
                     if _metacog_logprobs:
@@ -14439,6 +14541,22 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as _cnx:
             logger.debug("calibration correction-negative skipped: %s", _cnx)
 
+        # Lesson-outcome negative. The same user-correction is the strongest
+        # FAILED signal the loop can get, but it only ever reached
+        # CALIBRATION — the outcome-gated lesson arm never saw it. Those
+        # turns are exactly the ones the arm exists for: the turn looked
+        # clean (no execution error, no verifier refute, so it was stashed
+        # "awaiting a late verdict"), the surfaced lessons did NOT prevent a
+        # wrong answer, and with no verdict ever landing the stash entry was
+        # evicted UNCOUNTED. Draining it as a failure is the whole point of
+        # the stash. Uses the existing flush helper, so a turn that already
+        # recorded inline is a no-op.
+        try:
+            if getattr(traj, "id", None):
+                self._flush_stashed_lesson_outcome(traj.id, False)
+        except Exception as _lox:
+            logger.debug("lesson correction-negative skipped: %s", _lox)
+
         # Scrub any lessons the just-failed trajectory produced
         # before the user could push back. The dominant case is the
         # Perfection-Protocol writing an "Optimization Analysis"
@@ -15022,12 +15140,32 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # the score on logprob-starved
                                 # upstreams instead of suppressing
                                 # the whole reading.
-                                _norm = _reading.norm if _reading.n > 0 else 0.5
+                                # None when the window observed no tokens —
+                                # scored as neutral, but flagged unobserved
+                                # so it can't poison the entropy-weight fit.
+                                _norm = _reading.norm if _reading.n > 0 else None
+                                # Turn-effort feature (see the finalize path
+                                # for the measurement behind it). None when
+                                # the turn ran no tools — absence of evidence
+                                # about effort, not a measured 0.5.
+                                _eff = None
+                                try:
+                                    from .confidence import (
+                                        effort_component as _eff_fn)
+                                    _enames = [
+                                        t.get("name")
+                                        for t in (stream_tools_snapshot or [])
+                                        if isinstance(t, dict) and t.get("name")]
+                                    if _enames:
+                                        _eff = _eff_fn(_enames)
+                                except Exception:  # noqa: BLE001
+                                    _eff = None
                                 _cr = _mc_conf.confidence.score(
                                     normalised_entropy=_norm,
                                     competence_p_success=_p,
                                     n_observations=_n,
                                     uncertainty_pressure=_upress,
+                                    effort=_eff,
                                 )
                                 self.context.last_confidence = _cr
                                 # Stash for the turn-end calibration

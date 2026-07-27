@@ -108,6 +108,26 @@
   <h2>Reconcile is dedup-aware (2026-07-26d)</h2>
   <p>The boot log's <em>"N of M episodes have no vector twin — re-ingesting"</em> never dropped (and ticked UP over time), which looked like a persistent failure. It wasn't: the vector store dedups on document text (md5 of the trigger), so several episodes with an identical trigger share ONE entry — the others lack an own-id twin but are STILL reachable by semantic recall via the shared entry. The old reconcile counted those as "missing" and re-<code>add</code>'d them every boot (each a no-op), so the number never fell and the operator saw a false alarm. <code>reconcile_vector_index</code> now compares each episode's would-be document against the documents ALREADY indexed: present → dedup-covered (skipped, reported at INFO); absent → a genuine hole (re-ingested). Live: all 25 "missing" episodes were dedup-covered, 0 genuinely invisible — so the reconcile now does zero wasted work and stops crying wolf. Tests: <code>tests/test_episodes_recall_fixes.py::test_reconcile_skips_dedup_covered_episodes</code> + <code>::test_reconcile_reingests_genuine_and_skips_dedup</code>.</p>
 
+
+  <h2>2026-07-27 — context/cluster backfill (5.2% → 96.6% coverage)</h2>
+  <p><code>_record_episode_safe</code> populates <code>context</code> and <code>cluster_id</code>
+  from the turn's tool actions, but that wiring only landed 2026-07-26. Episodes recorded before it
+  had empty values — live coverage was <strong>9 of 174 (5.2%)</strong>, so
+  <code>get_episodes_by_cluster</code> and <code>search_recoveries</code> (which greps
+  <code>context</code> for FAILED markers) were blind to almost the entire corpus.</p>
+  <p>The actions themselves were always persisted to <code>episode_actions</code>, so both fields
+  could be reconstructed EXACTLY as the live path would have written them — a replay of the same
+  derivation, not a guess:</p>
+  <pre>cluster_id = _domain_for_tool(&lt;first substantive tool&gt;)
+context    = "tools: a → b(FAILED) → c ; recovered after failures in: b"</pre>
+  <p><code>scripts/backfill_episode_context.py</code> performs it: dry-run by default, idempotent
+  (only touches rows where BOTH fields are empty), and it refuses to invent data for episodes with
+  no stored actions (6 of them) rather than writing a placeholder. Applied 2026-07-27 after a DB
+  backup: 159 episodes updated, coverage 168/174 (96.6%). Cluster retrieval went from ~9 episodes
+  total to 41 <code>fs</code> / 40 <code>memory</code> / 22 <code>fetch</code> / 19
+  <code>shell</code>, and <code>search_recoveries</code> began returning real recoveries. Tests:
+  <code>tests/test_episode_context_backfill.py</code> (11).</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

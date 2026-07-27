@@ -206,6 +206,35 @@
   <h2>Audit fixes (2026-07-26)</h2>
   <p><strong>Macro miner:</strong> support now counts <code>outcome == "passed"</code> trajectories ONLY (skip-failed let UNKNOWN/never-validated turns underwrite "proven" sequences), and steps whose tool is in <code>_MACRO_UNSAFE_PARAM_TOOLS</code> (execute, file_system, manage_projects, …) get EMPTY param templates — the most-common-args bake replayed a stale one-off WRITE verbatim (live: a proposed macro carried a hardcoded <code>manage_projects task_update status=DONE</code> with old project/task ids). <strong>Syntheses carry timestamps:</strong> stored without one, they sorted as OLDEST in the prune tiebreak and were the first eviction victims — despite their merged sources being deleted right after storage. <strong>Sim purity:</strong> the self-play skill wrapper passes <code>stamp_triggers=False</code> and reads the sim side-channel (idle-sim lesson sets leaked into the next user turn's outcome attribution); the self-play report is written with <code>namespace=None</code>; REM fetch no longer materializes 150×384 unused embeddings per cycle. Tests: <code>::TestMinerSupportAndParams</code>.</p>
 
+
+  <h2>2026-07-27 — lesson graduation could never fire</h2>
+  <p>Measured against the live 50-lesson playbook: 3 lessons met the reusability gate, 17 met the
+  mechanizability gate, and <strong>zero met both</strong>. <code>graduate_skills</code> had no
+  candidate to consider, ever, and "0 graduated" gave no hint why. Both gates were wrong, in
+  opposite directions:</p>
+  <ul>
+    <li><strong>Reusability</strong> required <code>frequency &gt;= 5</code>. Only 3 of 50 lessons
+    ever reached it (38 sat at 1). A lesson the verifier independently CONFIRMED is at least as
+    trustworthy as one seen five times, so <code>verified</code> now qualifies as an alternative
+    signal, and the floor dropped to <code>_GRADUATION_MIN_FREQUENCY</code> (3).</li>
+    <li><strong>Mechanizability</strong> was a substring scan whose indicators included
+    <code>"with "</code> and <code>"return "</code> — ordinary English. Prose such as "joining all
+    results <em>with</em> the exact delimiter" registered as code, flagging 17 of 50 lessons,
+    nearly all of them prose. <code>_looks_mechanizable</code> now requires structural syntax
+    (fenced blocks, <code>def</code>/<code>import</code> at line start, shell invocations, call
+    assignment), which finds 2.</li>
+  </ul>
+  <p>Candidates are also sorted by strength (verified, then frequency, then confidence) so the
+  2-per-cycle budget is spent on the best ones rather than whichever sit earliest in the file.</p>
+  <p><strong>The honest outcome is still a small number</strong>, and that is correct: this
+  playbook is mostly behavioural heuristics ("correlate each command's output before proceeding")
+  which are not convertible into Python tools and should never graduate. The filter was calibrated
+  to admit the genuinely mechanizable ones, NOT to force graduations — the TDD gate in
+  <code>tool_create_skill</code> remains the backstop, and a lesson is marked graduated only when
+  creation succeeds. Eligibility is now reported by
+  <a href="../tools/introspect.html">learning-health telemetry</a> so "0 graduated" is
+  explainable. Tests: <code>tests/test_lesson_graduation_gates.py</code> (19).</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
   <h2>Counterfactual replay — regression-of-learning, phase 1 (2026-07-17)</h2>
   <p><code>core/counterfactual.py</code>. Every concluded self-play sim now persists its

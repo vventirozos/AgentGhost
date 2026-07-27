@@ -81,6 +81,79 @@ if r.below_threshold:
   <h2>Calibration composite-leak (bug-hunt 2026-07-26b)</h2>
   <p><code>ConfidenceReading</code> gained <code>pre_penalty_composite</code>: the composite BEFORE the <code>outcome_penalty</code> multiply. The calibration spine records THAT, not the penalized composite — the penalty is a function of the turn's outcome label, so recording the penalized value made Brier/ECE read optimistically on exactly the negative samples the loop exists to catch (a refuted turn's stored confidence was pulled to ~0.18, so its Brier contribution looked tiny). The <code>below_threshold</code> DECISION still uses the penalized composite. Defaults to <code>composite</code> for positionally-built readings. Tests: <code>tests/test_bughunt_fixes_2026_07_26b.py::TestConfidencePrePenalty</code>.</p>
 
+
+  <h2>2026-07-27 — <code>entropy_observed</code> and missing-feature renormalisation</h2>
+  <p><code>ConfidenceReading</code> gained <code>entropy_observed</code>. Passing
+  <code>normalised_entropy=None</code> to <code>score()</code> means "no logprobs were observed":
+  the reading is still produced (neutral entropy term, unchanged behaviour) but is FLAGGED, so
+  <a href="calibration.html">calibration</a> can exclude it from the entropy-weight fit instead of
+  recording a fabricated measurement.</p>
+  <p>The composite is now computed per-sample according to what is actually available:</p>
+  <ul>
+    <li><strong>entropy observed</strong> → <code>w_entropy·entropy + w_competence·competence</code>;</li>
+    <li><strong>not observed</strong> → <code>competence</code> alone (the weights sum to 1, so this
+    is the renormalised form).</li>
+  </ul>
+  <p>Blending in the 0.5 stand-in dragged every logprob-less reading toward 0.5 in exact proportion
+  to <code>w_entropy</code> — which is precisely why the weight could only ever be fit to 0 while
+  those turns dominated. Splitting the cases lets the weight be learned from turns that DO carry
+  entropy without degrading the ones that don't.</p>
+
+
+  <h2>2026-07-27 (later 5) — turn-effort: the first per-TURN feature</h2>
+  <p>Every input to the composite was dead (see the section above): entropy had 2 distinct values,
+  uncertainty pressure had 1, and competence — the only one that varied — separated success from
+  failure by −0.0008. Competence is a per-DOMAIN historical average, so it is near-constant within
+  a domain and <em>structurally</em> cannot discriminate individual turns. The fix is not better
+  calibration; it is an input that varies per turn.</p>
+
+  <h3>What was measured first</h3>
+  <p>296 labelled trajectories (246 passed / 50 failed) were scanned for turn-shape signals before
+  any code was written:</p>
+  <table>
+    <thead><tr><th>Signal</th><th>mean (passed)</th><th>mean (failed)</th><th>AUC</th></tr></thead>
+    <tbody>
+      <tr><td>tool calls in the turn</td><td>2.39</td><td>11.70</td><td>0.334</td></tr>
+      <tr><td>longest same-tool run</td><td>1.35</td><td>5.82</td><td>0.321</td></tr>
+      <tr><td>distinct tools</td><td>1.39</td><td>2.08</td><td>0.377</td></tr>
+      <tr><td><em>any tool errored</em></td><td><em>0.10</em></td><td><em>0.64</em></td><td><em>0.229</em></td></tr>
+    </tbody>
+  </table>
+  <p>The last row is the strongest raw correlate and is <strong>deliberately excluded</strong>: "a
+  tool errored" is literally a term of the calibration label
+  (<code>execution_failure_count &gt; 0</code>), so feeding it back would predict the label from
+  the label and add no information — the same circularity that made the earlier AUC 0.679
+  measurement an artefact.</p>
+
+  <h3>The feature</h3>
+  <p><code>confidence.effort_component(tool_names)</code> averages two saturating struggle signals
+  — <em>sprawl</em> (call count, saturating at 12) and <em>spin</em> (longest same-tool run,
+  saturating at 6) — into <code>[0, 1]</code> where 1.0 is a short, clean turn. Averaged rather
+  than <code>min()</code>'d so one extreme signal cannot slam the term to zero alone; the measured
+  AUC is within noise of the best single signal (0.670 vs 0.678) while depending on both.</p>
+  <p><strong>Result end-to-end:</strong> replaying the labelled corpus through the real feature and
+  the real fit, <code>w_effort</code> is earned at 0.5, the probability map is adopted
+  (a = 5.91), and Brier lands at 0.123 against a base rate of 0.140 — the model <strong>beats the
+  base-rate predictor by 12%</strong>, where before it lost to it by 75%. This is the first time
+  the confidence score carries information.</p>
+
+  <h3>Design rules carried over</h3>
+  <ul>
+    <li><strong>No fabricated neutrals.</strong> A turn that ran no tools passes
+    <code>effort=None</code>, not 0.5 — absence of evidence about effort, not a measurement.
+    Recording it as observed would poison the weight fit exactly as fabricated entropy neutrals
+    did.</li>
+    <li><strong>Weight earned, not assumed.</strong> <code>w_effort</code> stays 0 until at least
+    <code>_MIN_EFFORT_SAMPLES</code> (30) samples measured turn shape with BOTH outcome classes
+    present — the same evidence gate as <code>w_entropy</code>.</li>
+    <li><strong>Renormalisation generalised to three components.</strong> Only observed components
+    contribute and the blend is divided by their weights, so a missing feature never spends its
+    weight on a stand-in. With entropy absent and effort present, competence + effort renormalise
+    to 1 instead of leaving 40% of the mass on a neutral.</li>
+    <li><code>_composite_for</code> in the fit mirrors <code>score()</code> exactly, including the
+    three-way renormalisation — the fit must optimise the formula the agent actually evaluates.</li>
+  </ul>
+
 </main>
 </body>
 </html>

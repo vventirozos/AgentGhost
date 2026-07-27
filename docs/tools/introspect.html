@@ -113,6 +113,36 @@
     <li>The report now reads the ledger <strong>tail</strong> (<code>_read_activity_tail</code>): it seeks to <code>size - _ACTIVITY_TAIL_BYTES</code> and drains forward, keeping a bounded record window. This also bounds the scan cost, which a from-byte-0 replay grew linearly forever.</li>
   </ul>
 
+
+  <h2>2026-07-27 — learning-health telemetry corrections</h2>
+  <ul>
+    <li><strong>Calibration entropy is reported as COVERAGE, not degeneracy.</strong> The report
+    said "entropy distinct values: 2 (DEGENERATE — w_entropy cannot be fit)", which read like a
+    mysterious numerical failure. It is a plain coverage fact: the upstream refuses
+    <code>logprobs</code> on <code>tools + stream</code> payloads, so most turns observe none. The
+    section now reports how many samples actually OBSERVED entropy and counts distinct values over
+    those only — conflating "no logprobs came back" with "the model was 50/50" is what made the
+    metric unreadable. See <a href="../core/calibration.html">calibration</a>.</li>
+    <li><strong>Graduation eligibility is broken out.</strong> "0 graduated" alone cannot
+    distinguish a stuck pipeline from a playbook with nothing tool-shaped in it. The report now
+    shows <em>eligible (reusable ∩ mechanizable)</em>, so the operator can see which gate is
+    binding. See <a href="../core/dream.html">dream</a>.</li>
+    <li><strong>PRM wiring is reported in full.</strong> The line named only
+    <code>.score()</code> (MCTS turn-start, module-gated off) and omitted
+    <code>.uncertainty()</code> → frontier self-play seed selection
+    (<code>--frontier-selfplay</code>, default off and absent from the live launcher). With BOTH
+    off the idle retrain wrote a checkpoint nothing read — 41 such retrains in one recent ledger
+    window — while logging "value model refit", which reads like learning progress. The idle phase
+    now SKIPS with an explicit reason when no consumer is live. This is a runtime check, not a
+    deletion: enabling either consumer resumes training on the next idle pass with no code
+    change.</li>
+    <li><strong>Background-activity counts carry a comparability warning.</strong> Reflection
+    appeared to run ~10x less than dream, which looks like a starved loop but is a recording
+    artifact — reflection logs only outcome-producing runs and deliberately skips ticks whose
+    trajectory corpus is unchanged since an all-duplicate pass, while dream logs every cycle. The
+    counts are per-phase event records, not a workload budget.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

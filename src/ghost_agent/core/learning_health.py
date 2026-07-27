@@ -108,6 +108,13 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
                 int(l.get("succeeded_retrievals") or 0) for l in pb),
             "failed_ticks_total": sum(
                 int(l.get("failed_retrievals") or 0) for l in pb),
+            # Why nothing graduates. "0 graduated" alone is unreadable — it
+            # could mean the pipeline is broken, or simply that no lesson is
+            # tool-shaped. Both gates are reported so the operator can tell
+            # which. (Measured 2026-07-27: 0 eligible, because the frequent
+            # lessons are behavioural guidance and the mechanizable ones are
+            # rare — a real property of the corpus, not a stuck pipeline.)
+            **_graduation_eligibility(pb),
         }
 
     # -- Competence --------------------------------------------------------
@@ -151,7 +158,12 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
     params = _load_json(calib_dir / "calibration_params.json", {}) or {}
     samples = _load_jsonl(calib_dir / "calibration.jsonl")
     if params or samples:
-        ent = [s.get("entropy_component") for s in samples
+        # Count entropy variety over OBSERVED samples only. Counting all of
+        # them conflated "the model was 50/50" with "no logprobs came back",
+        # which is what made this metric read as a mysterious degeneracy
+        # instead of the plain coverage problem it is.
+        obs = [s for s in samples if s.get("entropy_observed")]
+        ent = [s.get("entropy_component") for s in obs
                if s.get("entropy_component") is not None]
         ent_distinct = len(set(round(float(e), 3) for e in ent)) if ent else 0
         outs = [s.get("outcome") for s in samples if "outcome" in s]
@@ -162,10 +174,20 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
             "w_entropy": params.get("w_entropy"),
             "w_competence": params.get("w_competence"),
             "threshold": params.get("threshold"),
+            "entropy_observed_samples": len(obs),
+            "entropy_observed_pct": (round(100.0 * len(obs) / len(samples), 1)
+                                     if samples else 0.0),
             "entropy_distinct_values": ent_distinct,
-            "entropy_learnable": ent_distinct >= 3,
+            "entropy_learnable": ent_distinct >= 3 and len(obs) >= 30,
             "outcome_neg": sum(1 for o in outs if o == 0.0),
             "outcome_pos": sum(1 for o in outs if o == 1.0),
+            "platt_a": params.get("platt_a"),
+            "brier_raw": params.get("brier_raw"),
+            "brier_base_rate": params.get("brier_base_rate"),
+            "w_effort": params.get("w_effort"),
+            "effort_observed_samples": sum(
+                1 for s in samples if s.get("effort_observed")),
+            **_feature_health(samples),
         }
 
     # -- Graduated auto-skills --------------------------------------------
@@ -217,10 +239,17 @@ def _cognitive_wiring() -> Dict[str, Any]:
             "consumers": ["idle Brier refit", "introspect learning telemetry"],
             "write_only": False,
         },
-        # retrained idle-only; .score() gated on MCTS turn-start.
+        # Retrained idle-only. TWO consumers, and the earlier report named
+        # only the first, which understated how dead it was:
+        #   .score()       → MCTS turn-start hint  (module-gated OFF)
+        #   .uncertainty() → frontier self-play seed selection
+        #                    (runtime --frontier-selfplay, default False)
+        # With both off the retrain writes a checkpoint nothing reads; the
+        # idle phase now SKIPS in that case (see agent.py phase 2.7).
         "prm": {
-            "producer": "idle retrain (~3h cooldown)",
+            "producer": "idle retrain (~3h cooldown), skipped with no live consumer",
             "score_consumer_enabled": flags.get("mcts_turnstart_consumer"),
+            "uncertainty_consumer": "frontier self-play (--frontier-selfplay)",
         },
         "metacog_arbiter": {
             "consumer_enabled": flags.get("metacog_arbiter_consumer"),
@@ -264,6 +293,109 @@ def _episode_stats(db_path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _feature_health(samples: List[dict]) -> Dict[str, Any]:
+    """Per-feature liveness for the confidence composite.
+
+    A feature is only useful if it (a) VARIES and (b) SEPARATES successes
+    from failures. Measured 2026-07-27, all three inputs failed at least one
+    test — entropy had 2 distinct values, uncertainty_pressure had 1 (always
+    0.0), and competence, the only one that varied, separated the classes by
+    −0.0008. That is why the composite's leak-free AUC was 0.473, i.e. no
+    discrimination, and why no amount of recalibration can help. Surfacing
+    per-feature separation makes a dead input obvious instead of leaving it
+    to be inferred from a bad Brier months later.
+    """
+    out: Dict[str, Any] = {}
+    if not samples:
+        return out
+
+    def _outcome(s) -> float:
+        # Corrupt/hand-edited rows must not take down the report.
+        try:
+            return float(s.get("outcome", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ok = [s for s in samples if _outcome(s) >= 0.5]
+    bad = [s for s in samples if _outcome(s) < 0.5]
+    feats = {}
+    for name in ("entropy_component", "competence_component",
+                 "uncertainty_pressure", "effort_component"):
+        vals = []
+        for s in samples:
+            try:
+                v = s.get(name)
+                if v is not None:
+                    vals.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        if not vals:
+            continue
+
+        def _mean(rows):
+            got = []
+            for s in rows:
+                try:
+                    v = s.get(name)
+                    if v is not None:
+                        got.append(float(v))
+                except (TypeError, ValueError):
+                    continue
+            return (sum(got) / len(got)) if got else None
+
+        m_ok, m_bad = _mean(ok), _mean(bad)
+        sep = (round(m_ok - m_bad, 4)
+               if (m_ok is not None and m_bad is not None) else None)
+        distinct = len(set(round(v, 3) for v in vals))
+        # "Dead" = constant (nothing to learn from), or varying but with no
+        # measurable ability to tell the two outcome classes apart. Note the
+        # rule is NOT "few distinct values": a two-valued feature that splits
+        # the classes cleanly is perfectly useful, while the live
+        # competence signal has 270 distinct values and separates by
+        # −0.0008. Separation is what matters; distinctness alone only
+        # catches the fully-constant case.
+        feats[name] = {
+            "distinct": distinct,
+            "separation": sep,
+            "dead": distinct < 2 or (sep is not None and abs(sep) < 0.02),
+        }
+    out["feature_health"] = feats
+    out["live_features"] = [k for k, v in feats.items() if not v["dead"]]
+    return out
+
+
+def _graduation_eligibility(pb: List[dict]) -> Dict[str, int]:
+    """Break the graduation gates down so "0 graduated" is explainable.
+
+    Mirrors the candidate filter in :mod:`core.dream` — reusable (repeated
+    or verified) AND mechanizable (real code structure). Imported lazily so
+    this stays a pure reporting helper with no import cycle.
+    """
+    try:
+        from .dream import _GRADUATION_MIN_FREQUENCY, _looks_mechanizable
+    except Exception:  # noqa: BLE001 — telemetry must never break on import
+        return {}
+    def _freq(lesson) -> int:
+        # A corrupt/hand-edited frequency must not take down the whole
+        # report — this module's contract is that it never raises.
+        try:
+            return int(lesson.get("frequency") or 1)
+        except (TypeError, ValueError):
+            return 1
+
+    live = [l for l in pb if not l.get("graduated")]
+    reusable = [l for l in live
+                if _freq(l) >= _GRADUATION_MIN_FREQUENCY
+                or bool(l.get("verified"))]
+    mech = [l for l in live if _looks_mechanizable(l.get("solution", ""))]
+    eligible = [l for l in reusable if _looks_mechanizable(l.get("solution", ""))]
+    return {
+        "graduation_reusable": len(reusable),
+        "graduation_mechanizable": len(mech),
+        "graduation_eligible": len(eligible),
+    }
+
+
 def _activity_counts(ledger_path: Path, *, window_hours: float = 168.0) -> Dict[str, int]:
     """Count ledger records by phase over a recent window.
 
@@ -300,6 +432,13 @@ def render_learning_health(memory_dir) -> str:
             f"\nLESSONS: {les['total']} total "
             f"({les['graduated']} graduated, {les['verified']} verified, "
             f"{les['quarantined']} quarantined)")
+        if "graduation_eligible" in les:
+            lines.append(
+                f"  graduation: {les['graduation_eligible']} eligible "
+                f"({les['graduation_reusable']} reusable ∩ "
+                f"{les['graduation_mechanizable']} mechanizable) — a lesson "
+                f"must be BOTH repeated/verified AND expressible as a tool; "
+                f"behavioural heuristics never qualify by design")
         lines.append(
             f"  outcome ticks on {les['with_outcome_ticks']} lessons; "
             f"decisive (≥4 obs): {les['decisive']} "
@@ -356,17 +495,46 @@ def render_learning_health(memory_dir) -> str:
             f"\nCALIBRATION: {cal['samples_on_disk']} samples, "
             f"Brier {cal['brier']}, threshold {cal['threshold']}")
         lines.append(
-            f"  weights: entropy {cal['w_entropy']}, competence {cal['w_competence']}; "
-            f"outcomes {cal['outcome_pos']}+/{cal['outcome_neg']}-")
+            f"  weights: entropy {cal['w_entropy']}, competence {cal['w_competence']}"
+            + (f", effort {cal['w_effort']}" if cal.get("w_effort") is not None else "")
+            + f"; outcomes {cal['outcome_pos']}+/{cal['outcome_neg']}-")
+        if cal.get("effort_observed_samples") is not None:
+            lines.append(
+                f"  turn-effort measured on {cal['effort_observed_samples']}/"
+                f"{cal['samples_on_disk']} samples")
         if cal["entropy_learnable"]:
-            _ent_note = "LEARNABLE"
+            _ent_note = "LEARNABLE — w_entropy is fit on these"
         else:
-            _ent_note = ("DEGENERATE — w_entropy cannot be fit; streamed "
-                         "real-entropy samples should diversify this now "
-                         "that the streamed path records calibration")
+            _ent_note = (
+                "w_entropy pinned to 0 until >=30 observed samples of both "
+                "outcome classes accumulate. The upstream refuses logprobs "
+                "on tools+stream payloads and the loop attaches tools on "
+                "every non-final generation, so most turns observe none — "
+                "this is COVERAGE, not degeneracy")
         lines.append(
-            f"  entropy distinct values: {cal['entropy_distinct_values']} "
-            f"({_ent_note})")
+            f"  entropy observed on {cal['entropy_observed_samples']}/"
+            f"{cal['samples_on_disk']} samples ({cal['entropy_observed_pct']}%), "
+            f"{cal['entropy_distinct_values']} distinct values")
+        lines.append(f"  → {_ent_note}")
+        _br, _bb = cal.get("brier_raw"), cal.get("brier_base_rate")
+        if isinstance(_br, (int, float)) and _br >= 0 and isinstance(_bb, (int, float)) and _bb >= 0:
+            _verdict = ("beats" if cal["brier"] < _bb else "LOSES TO")
+            lines.append(
+                f"  Brier {cal['brier']} {_verdict} the base-rate predictor "
+                f"({_bb}); raw composite {_br}"
+                + ("" if cal.get("platt_a") not in (None, 1.0)
+                   else " · probability map not applied"))
+        fh = cal.get("feature_health") or {}
+        if fh:
+            live = cal.get("live_features") or []
+            lines.append(
+                f"  features: {len(live)}/{len(fh)} live"
+                + (f" ({', '.join(live)})" if live else " — NONE discriminate"))
+            for name, st in fh.items():
+                _flag = "DEAD" if st["dead"] else "live"
+                lines.append(
+                    f"    {name}: distinct={st['distinct']} "
+                    f"separation={st['separation']} [{_flag}]")
 
     au = r.get("auto_skills")
     if au:
@@ -377,6 +545,18 @@ def render_learning_health(memory_dir) -> str:
         top = sorted(act.items(), key=lambda kv: -kv[1])[:8]
         lines.append("\nBACKGROUND ACTIVITY (recent ledger): "
                      + ", ".join(f"{k}={v}" for k, v in top))
+        # These counts are NOT comparable across phases, and reading them as
+        # a workload budget is a live trap: reflection appeared to run ~10x
+        # less than dream, which looks like a starved loop but is a recording
+        # artifact. Reflection only writes a ledger event when it produced
+        # OUTCOMES, and it deliberately skips ticks whose trajectory corpus
+        # is unchanged since an all-duplicate pass; dream records every
+        # cycle. A low count here means "little new material", not
+        # "under-scheduled" — check the cooldown constants for scheduling.
+        lines.append(
+            "  (per-phase recording policies differ — reflection logs only "
+            "outcome-producing runs and skips unchanged-corpus ticks, dream "
+            "logs every cycle; do NOT read these as a workload budget)")
 
     cw = r.get("cognitive_wiring")
     if cw:
@@ -388,8 +568,10 @@ def render_learning_health(memory_dir) -> str:
             f"also read by introspect (bounded store)")
         prm = cw.get("prm", {})
         lines.append(
-            f"  PRM: idle retrain; .score() "
-            f"{'ON' if prm.get('score_consumer_enabled') else 'OFF (MCTS turn-start disabled)'}")
+            f"  PRM: .score() "
+            f"{'ON' if prm.get('score_consumer_enabled') else 'OFF (MCTS turn-start module-gated)'}"
+            f"; .uncertainty() → {prm.get('uncertainty_consumer', 'frontier self-play')}"
+            f" — idle retrain SKIPS when neither is live")
         lines.append("  calibration: per-turn → idle refit + this telemetry (live)")
         sc = cw.get("self_consistency", {})
         if sc.get("status"):

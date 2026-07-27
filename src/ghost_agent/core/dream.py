@@ -16,6 +16,39 @@ from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
 
+# ── Lesson graduation gates ───────────────────────────────────────────
+# A lesson graduates into an acquired skill only when it is both REUSABLE
+# (worth encapsulating) and MECHANIZABLE (expressible as a Python tool).
+#
+# Reusability floor. Was 5, which only 3/50 live lessons ever reached —
+# and those three were behavioural guidance, not procedures. `verified`
+# is accepted as an alternative signal (see the call site).
+_GRADUATION_MIN_FREQUENCY = 3
+
+# Mechanizability: STRUCTURAL code signals only. The previous check was a
+# substring scan that included `"with "` and `"return "` — ordinary English
+# — so plain prose registered as code. These patterns require syntax that
+# does not occur in normal sentences.
+_CODE_SIGNAL_PATTERNS = (
+    re.compile(r"```"),                                        # fenced block
+    re.compile(r"^\s*(?:def|class|import|from)\s+\w", re.M),   # a definition
+    re.compile(r"^\s*(?:\$|>>>|sudo |python3?\s+\S|pip\s+install)", re.M),
+    re.compile(r"\b(?:subprocess|sys\.argv|json\.loads|json\.dumps|os\.path)\b"),
+    re.compile(r"^\s*\w+\s*=\s*\w+\(", re.M),                  # x = f(...)
+)
+
+
+def _looks_mechanizable(solution: str) -> bool:
+    """True when a lesson's solution carries real code structure.
+
+    Deliberately strict: a false positive costs an idle LLM call that the
+    TDD gate then rejects, and — worse — trains the operator to ignore
+    "graduation attempted" noise. A false negative just leaves a lesson in
+    the playbook, where it still gets retrieved and used.
+    """
+    s = str(solution or "")
+    return any(p.search(s) for p in _CODE_SIGNAL_PATTERNS)
+
 
 # File extensions we consider "mock data files" for the quality gate.
 _MOCK_FILE_EXTS = (
@@ -2454,20 +2487,48 @@ Return ONLY valid JSON:
             except Exception:
                 return "Failed to load playbook."
 
-        # Find graduation candidates
+        # Find graduation candidates.
+        #
+        # Both gates were miscalibrated (measured against the live 50-lesson
+        # playbook, 2026-07-27 — zero lessons could EVER qualify):
+        #
+        #  * REUSABILITY was `frequency >= 5`. Only 3/50 lessons ever reached
+        #    it (38 sat at 1), and all three were behavioural guidance. A
+        #    lesson the verifier independently CONFIRMED is at least as
+        #    trustworthy as one seen five times, so `verified` now also
+        #    qualifies.
+        #  * MECHANIZABILITY used substring checks including `"with "` and
+        #    `"return "` — ordinary English words. "joining all results with
+        #    the exact delimiter" matched as code. It flagged 17/50 lessons,
+        #    nearly all prose. Structural patterns (fenced blocks, def/import
+        #    at line start, call syntax, shell invocations) find 2.
+        #
+        # The intersection was empty, which is why nothing ever graduated.
+        # Note the honest outcome: this playbook is mostly behavioural
+        # heuristics ("correlate each command's output before proceeding"),
+        # which are NOT convertible into Python tools and should not be. The
+        # goal here is a filter that admits the genuinely mechanizable ones
+        # and explains the rest — not one tuned to force graduations.
         candidates = []
-        code_indicators = ["def ", "import ", "return ", "print(", "open(", "with ", ".py", "subprocess"]
         for i, lesson in enumerate(playbook):
-            freq = lesson.get("frequency", 1)
-            solution = lesson.get("solution", "")
-            already_graduated = lesson.get("graduated", False)
-            if freq >= 5 and not already_graduated:
-                has_code = any(ind in solution for ind in code_indicators)
-                if has_code:
-                    candidates.append((i, lesson))
+            if lesson.get("graduated", False):
+                continue
+            freq = int(lesson.get("frequency") or 1)
+            reusable = freq >= _GRADUATION_MIN_FREQUENCY or bool(lesson.get("verified"))
+            if reusable and _looks_mechanizable(lesson.get("solution", "")):
+                candidates.append((i, lesson))
 
         if not candidates:
             return "No lessons ready for graduation."
+
+        # Spend the per-cycle budget on the STRONGEST candidates rather than
+        # whichever happen to sit earliest in the file.
+        candidates.sort(
+            key=lambda c: (bool(c[1].get("verified")),
+                           int(c[1].get("frequency") or 1),
+                           float(c[1].get("confidence") or 0.0)),
+            reverse=True,
+        )
 
         graduated = 0
         for idx, lesson in candidates[:2]:  # Max 2 per cycle to avoid LLM overload

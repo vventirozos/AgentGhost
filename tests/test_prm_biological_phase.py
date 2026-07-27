@@ -75,6 +75,16 @@ def _make_ctx(*, idle_secs: float, prm_scorer=None,
         args.model = "test-model"
         # Use the static cooldown by default.
         args.prm_train_cooldown = None
+    # Phase 2.7 now SKIPS when the PRM has no live consumer (2026-07-27):
+    # both `.score()` (MCTS turn-start, module-gated off) and
+    # `.uncertainty()` (frontier self-play) were dead in production, so the
+    # retrain was writing a checkpoint nothing read. These tests exercise
+    # the training path, so give them a live consumer explicitly — a
+    # MagicMock attribute would NOT satisfy the `is True` check by design
+    # (that strictness is what stops mocked contexts from silently
+    # re-enabling the phase everywhere).
+    if not isinstance(getattr(args, "frontier_selfplay", None), bool):
+        args.frontier_selfplay = True
     ctx.args = args
 
     ctx.frontier_tracker = None
@@ -334,3 +344,72 @@ async def test_phase_27_plugs_scorer_into_mcts_on_first_fit(tmp_path: Path):
     await _tick(ctx)
     assert scorer.has_model is True
     assert mcts.prm_scorer is scorer
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Wire-or-retire: don't train a model nothing reads (2026-07-27)
+# ──────────────────────────────────────────────────────────────────────
+
+async def test_phase_27_skips_when_no_consumer_is_live(tmp_path: Path):
+    """The PRM's two consumers can BOTH be off in production: `.score()`
+    is behind the module-gated MCTS turn-start hint, and `.uncertainty()`
+    behind `--frontier-selfplay` (default False, absent from the live
+    launcher). In that state the retrain burned an idle slot every
+    cooldown to write a checkpoint no code path read — 41 such retrains
+    in one recent ledger window — while logging "value model refit",
+    which reads like learning progress."""
+    collector = MagicMock()
+    collector.iter_trajectories = MagicMock(
+        side_effect=lambda **kw: iter(_balanced_corpus())
+    )
+    scorer = PRMScorer()
+    args = MagicMock()
+    args.model = "test-model"
+    args.prm_train_cooldown = None
+    args.frontier_selfplay = False          # consumer OFF
+    ctx = _make_ctx(
+        idle_secs=1200, prm_scorer=scorer, collector=collector, args=args,
+        checkpoint_path=tmp_path / "prm.json",
+    )
+    await _tick(ctx)
+    assert scorer.has_model is False, "trained despite having no consumer"
+    assert not (tmp_path / "prm.json").exists()
+
+
+async def test_phase_27_resumes_when_frontier_consumer_enabled(tmp_path: Path):
+    """The skip is a runtime check, not a deletion — enabling either
+    consumer must resume training with no code change."""
+    collector = MagicMock()
+    collector.iter_trajectories = MagicMock(
+        side_effect=lambda **kw: iter(_balanced_corpus())
+    )
+    scorer = PRMScorer()
+    args = MagicMock()
+    args.model = "test-model"
+    args.prm_train_cooldown = None
+    args.frontier_selfplay = True           # consumer ON
+    ctx = _make_ctx(
+        idle_secs=1200, prm_scorer=scorer, collector=collector, args=args,
+        checkpoint_path=tmp_path / "prm.json",
+    )
+    await _tick(ctx)
+    assert scorer.has_model is True
+
+
+async def test_phase_27_skip_still_advances_the_cooldown(tmp_path: Path):
+    """A skip must consume the cooldown anchor; otherwise the phase
+    re-evaluates on every single idle tick."""
+    collector = MagicMock()
+    collector.iter_trajectories = MagicMock(
+        side_effect=lambda **kw: iter(_balanced_corpus())
+    )
+    args = MagicMock()
+    args.model = "test-model"
+    args.prm_train_cooldown = None
+    args.frontier_selfplay = False
+    ctx = _make_ctx(
+        idle_secs=1200, prm_scorer=PRMScorer(), collector=collector, args=args,
+        checkpoint_path=tmp_path / "prm.json",
+    )
+    agent = await _tick(ctx)
+    assert agent._last_prm_train_at > datetime.datetime.min

@@ -88,6 +88,111 @@
   &lt;3 by ~2026-08-10, retire <code>w_entropy</code> (already 0-weighted — no behavioral
   change either way). Tests:
   <code>tests/test_calibration_entropy_wiring_2026_07_27.py</code>.</p>
+
+  <h2>2026-07-27 — the entropy signal was structurally unfittable</h2>
+  <p><strong>Measured live:</strong> 1200 of 1201 stored samples had
+  <code>entropy_component</code> exactly 0.5 and the fitted <code>w_entropy</code> was 0.0 — the
+  confidence composite had been running on competence alone.</p>
+  <p><strong>Root cause</strong> (confirmed by instrumenting the running agent): llama-server
+  rejects <code>logprobs</code> on <code>tools + stream</code> payloads (HTTP 400, re-confirmed
+  against the live server), and the turn loop attaches tools on every non-final generation. The
+  probe showed <code>final=False tools_in_payload=True → request_logprobs=False</code> for an
+  ordinary turn, so the overwhelming majority of turns observed no token logprobs at all. Those
+  turns recorded the neutral 0.5 <em>stand-in</em> as though it were a measurement. With zero
+  variance in the entropy column, any <code>w_e &gt; 0</code> could only drag composites toward
+  0.5 — so the grid search was guaranteed to pick 0 forever. It was not a tuning problem; the
+  data made the parameter unlearnable.</p>
+  <ul>
+    <li><strong>Readings and samples now carry <code>entropy_observed</code></strong>, separating
+    "the model was genuinely 50/50" from "no logprobs came back". Legacy records default to
+    <code>False</code>, which is the truthful reading of what they were.</li>
+    <li><strong>Missing-feature renormalisation.</strong> A sample with no observed entropy is
+    scored on competence ALONE rather than blended with the stand-in — see
+    <code>_composite_for</code>, which mirrors <code>CompositeConfidence.score</code> exactly so
+    the fit optimises the same formula the agent evaluates. This is what lets a weight learned
+    from the observed minority coexist with a logprob-less majority: an earlier version that fit
+    on the subset and applied it to everything drove Brier from 0.075 to 0.219.</li>
+    <li><strong>The weight only moves with evidence.</strong> Below <code>_MIN_ENTROPY_SAMPLES</code>
+    observed samples of both outcome classes, <code>w_entropy</code> stays pinned at 0 and the
+    reason is logged, rather than a weight being "fit" on fiction. <code>FittedParams</code>
+    gained <code>n_entropy_observed</code> so the state is visible.</li>
+    <li>Logprobs are now requested whenever the payload carries no tools — the previous gate also
+    required <code>is_final_generation</code>, which is strictly narrower than the server's real
+    constraint and cost coverage for tool-free non-final generations.</li>
+  </ul>
+  <p>Verified across four regimes: all-neutral → w_e=0 (no regression); observed+informative →
+  w_e=1.0 (previously impossible); observed-but-noise → w_e=0 (declines to use noise);
+  mixture → w_e=1.0 with Brier 0.093 instead of 0.219. Tests:
+  <code>tests/test_calibration_entropy_observed.py</code> (15).</p>
+
+
+  <h2>2026-07-27 (later 4) — probability recalibration, and the diagnosis it produced</h2>
+  <p>The composite was measured against the only baseline that matters — always predicting the
+  base rate:</p>
+  <table>
+    <thead><tr><th>Predictor</th><th>Brier</th></tr></thead>
+    <tbody>
+      <tr><td>Raw composite</td><td>0.0656</td></tr>
+      <tr><td>Always predict the base rate (0.961)</td><td><strong>0.0374</strong></td></tr>
+    </tbody>
+  </table>
+  <p>As a probability, the confidence number was <em>worse than a constant</em>. The weight search
+  decides how to COMBINE signals but cannot set their level, so a two-parameter Platt stage
+  (<code>p = sigmoid(a·composite + b)</code>) now runs after the weight fit, with the raw and
+  base-rate Briers persisted alongside it so the comparison can never be lost again.</p>
+
+  <h3>On the live corpus the map is REJECTED — and that is the finding</h3>
+  <p>An initial measurement suggested the composite had real ranking ability (AUC 0.679) and that
+  recalibration would beat the baseline by 18%. That was an artefact: it was computed on the
+  <em>stored</em> composite, which mixes two scoring regimes. Recomputed leak-free from the stored
+  components, <strong>AUC is 0.473</strong> — below chance. The optimiser therefore converges to
+  <code>a ≈ −0.08</code>: a negative slope that would INVERT the agent's confidence ordering, and
+  a near-flat one that would collapse every turn onto the base rate, leaving
+  <code>below_threshold</code> permanently inert. Calibrating noise is not an improvement, so the
+  guard refuses any fit with slope below 0.5 and logs why. The machinery engages the moment a
+  predictive feature exists — pinned by a test using an informative-but-compressed corpus, where
+  it is adopted and beats the base rate.</p>
+
+  <h3>Feature health: 0 of 3 inputs are alive</h3>
+  <p>Recalibration cannot fix a score with nothing in it. Measuring each input for whether it
+  <em>varies</em> AND <em>separates</em> the outcome classes:</p>
+  <table>
+    <thead><tr><th>Feature</th><th>Distinct values</th><th>Separation (success − failure)</th><th></th></tr></thead>
+    <tbody>
+      <tr><td><code>entropy_component</code></td><td>2</td><td>+0.0002</td><td>DEAD — upstream refuses logprobs on tools+stream</td></tr>
+      <tr><td><code>competence_component</code></td><td>270</td><td><strong>−0.0008</strong></td><td>DEAD — varies plenty, predicts nothing</td></tr>
+      <tr><td><code>uncertainty_pressure</code></td><td>1</td><td>0.0</td><td>DEAD — the tracker logged 2 records in 20 days</td></tr>
+    </tbody>
+  </table>
+  <p>This is now reported every run by <a href="../tools/introspect.html">learning-health
+  telemetry</a> (<code>features: 0/3 live — NONE discriminate</code>), so a dead input is visible
+  immediately rather than inferred from a bad Brier months later. Note that "few distinct values"
+  is NOT the death test — a two-valued feature that splits the classes cleanly is useful, whereas
+  competence has 270 values and separates by −0.0008. Separation is what counts.</p>
+  <p><strong>Consequence:</strong> the binding constraint on this subsystem is feature quality, not
+  label supply and not calibration. Competence is a per-DOMAIN historical average, so it is nearly
+  constant within a domain and cannot discriminate individual turns. A useful confidence score
+  needs an input that varies per TURN.</p>
+
+  <h3>Fitting notes</h3>
+  <ul>
+    <li><strong>Newton/IRLS, not gradient descent.</strong> GD was still at <code>a = 1.28</code>
+    after 4000 steps and only reached its optimum near <code>a = −0.08</code> after ~60000 — values
+    on opposite sides of the safety guard, so an under-converged run would have adopted a map the
+    converged fit rejects. The answer must not depend on the iteration budget. IRLS converges in
+    under 20 iterations (0.04 s on 1208 samples).</li>
+    <li><strong>Unweighted.</strong> Class-balancing was tried first, on the theory that 96%
+    positives would drown the minority; but balancing optimises a reweighted distribution, so the
+    probabilities describe a 50/50 world that does not exist and the unweighted Brier got worse.
+    Imbalance is handled by the threshold search (Youden's J), which weights sensitivity and
+    specificity equally regardless of prevalence.</li>
+    <li>The threshold is selected on the CALIBRATED scores, so it lives on the same scale
+    <code>below_threshold</code> compares against.</li>
+    <li><code>domain</code> is finally recorded on each sample — it was computed for the competence
+    lookup and then dropped, so all 1208 stored samples carried <code>domain=""</code> and
+    per-domain reliability was impossible.</li>
+  </ul>
+
 </main>
 </body>
 </html>

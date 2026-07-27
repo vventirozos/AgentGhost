@@ -55,6 +55,115 @@ logger = logging.getLogger("GhostAgent")
 
 SCHEMA_VERSION = "ghost.calibration.v1"
 
+# Minimum number of samples that actually OBSERVED token logprobs before the
+# entropy weight is allowed to move off zero. Below this the entropy column
+# is mostly the neutral stand-in and any fitted w_entropy would be noise
+# dressed as signal.
+_MIN_ENTROPY_SAMPLES = 30
+
+# Same evidence floor for the turn-effort weight.
+_MIN_EFFORT_SAMPLES = 30
+
+
+def _sigmoid(z: float) -> float:
+    # Overflow-safe: exp(710) overflows a float64.
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z)) if z < 700 else 1.0
+    ez = math.exp(z) if z > -700 else 0.0
+    return ez / (1.0 + ez)
+
+
+def apply_platt(composite: float, a: float, b: float) -> float:
+    """Map a blended composite onto a calibrated probability.
+
+    Identity when ``a == 1 and b == 0`` is NOT true of this transform, so
+    callers must only apply it with fitted parameters; `FittedParams`
+    defaults exist so an unfitted file is detectable, and
+    :meth:`CompositeConfidence.score` skips the mapping in that case.
+    """
+    return _clamp01(_sigmoid(a * float(composite) + b))
+
+
+def _fit_platt(pairs, *, iters: int = 50, ridge: float = 1e-6):
+    """Fit (a, b) of ``sigmoid(a·c + b)`` on log-loss by Newton/IRLS.
+
+    Log-loss (not Brier) because it is convex here and is the proper scoring
+    rule for probability estimates; Brier is then reported on the result.
+
+    Newton rather than gradient descent because the ANSWER MUST NOT DEPEND ON
+    THE ITERATION BUDGET. Plain GD on this data was still at a = 1.28 after
+    4000 steps and only reached its true optimum of a ≈ −0.08 after ~60000 —
+    and those two values sit on opposite sides of the safety guard in
+    `fit`, so an under-converged run would have silently adopted a map the
+    converged fit rejects. IRLS converges here in well under 20 iterations.
+
+    Deliberately UNWEIGHTED. Class-balancing was tried first, on the theory
+    that ~96% positives would drown the minority — but balancing optimises a
+    reweighted distribution, so the resulting probabilities describe a 50/50
+    world that does not exist, and the unweighted Brier got worse. The
+    minority class is handled where it belongs: by the threshold search,
+    which uses Youden's J and weights sensitivity and specificity equally
+    regardless of prevalence.
+    """
+    n = len(pairs)
+    if n < 2:
+        return 1.0, 0.0
+    n_pos = sum(1 for _, y in pairs if y >= 0.5)
+    if n_pos == 0 or n_pos == n:
+        return 1.0, 0.0
+    a, b = 1.0, 0.0
+    for _ in range(iters):
+        g_a = g_b = h_aa = h_ab = h_bb = 0.0
+        for c, y in pairs:
+            p = _sigmoid(a * c + b)
+            err = p - y
+            w = p * (1.0 - p)
+            g_a += err * c
+            g_b += err
+            h_aa += w * c * c
+            h_ab += w * c
+            h_bb += w
+        # Ridge keeps the Hessian invertible on separable / degenerate data.
+        h_aa += ridge
+        h_bb += ridge
+        det = h_aa * h_bb - h_ab * h_ab
+        if abs(det) < 1e-12:
+            break
+        da = (h_bb * g_a - h_ab * g_b) / det
+        db = (h_aa * g_b - h_ab * g_a) / det
+        a -= da
+        b -= db
+        if not (math.isfinite(a) and math.isfinite(b)):
+            return 1.0, 0.0
+        if abs(da) < 1e-9 and abs(db) < 1e-9:
+            break
+    if not (math.isfinite(a) and math.isfinite(b)):
+        return 1.0, 0.0
+    return a, b
+
+
+def _composite_for(sample, w_e: float, lam: float, w_eff: float = 0.0) -> float:
+    """Recompute a sample's composite under candidate (w_e, w_eff, λ).
+
+    Mirrors :meth:`CompositeConfidence.score` EXACTLY, including the
+    missing-feature renormalisation: only components the sample actually
+    OBSERVED contribute, and the blend is divided by their weights. A
+    sample with neither entropy nor effort is scored on competence alone
+    rather than blended with neutral stand-ins. Fitting and scoring must
+    agree — if the fit blended a stand-in while the scorer didn't (or vice
+    versa), the fitted weights would be optimal for a formula the agent
+    never actually evaluates.
+    """
+    w_c = max(0.0, 1.0 - w_e - w_eff)
+    parts = [(w_c, sample.competence_component)]
+    if sample.entropy_observed:
+        parts.append((w_e, sample.entropy_component))
+    if getattr(sample, "effort_observed", False):
+        parts.append((w_eff, sample.effort_component))
+    tot = sum(w for w, _ in parts)
+    c = (sum(w * v for w, v in parts) / tot) if tot > 0 else sample.competence_component
+    return _clamp01(c * (1.0 - lam * sample.uncertainty_pressure))
+
 
 # ──────────────────────────────────────────────────────────────────────
 # dataclasses
@@ -78,6 +187,17 @@ class CalibrationSample:
     outcome: float  # 1.0 = turn succeeded, 0.0 = turn failed
     domain: str = ""
     ts: str = ""
+    # False when no token logprobs were observed for the turn and
+    # ``entropy_component`` is the neutral 0.5 stand-in rather than a
+    # measurement. Such samples are EXCLUDED from the entropy-weight fit —
+    # see :meth:`CalibrationTracker.fit`. Defaults to False so a legacy
+    # record (which was always the fabricated neutral) is treated as
+    # unobserved, which is exactly what it was.
+    entropy_observed: bool = False
+    # Turn-shape (effort) component and whether it was measured. This is the
+    # first per-TURN input; see `confidence.effort_component`.
+    effort_component: float = 0.5
+    effort_observed: bool = False
 
 
 @dataclass
@@ -93,6 +213,34 @@ class FittedParams:
     n_samples: int
     fitted_at: str
     schema: str = SCHEMA_VERSION
+    # Platt recalibration of the blended score into a PROBABILITY:
+    #   p = 1 / (1 + exp(-(platt_a · composite + platt_b)))
+    #
+    # The weight search decides how to COMBINE the signals but has no way to
+    # set their overall level, so the raw composite ranked turns correctly
+    # while being systematically mis-scaled. Measured on 1208 live samples:
+    # AUC 0.679 (real discrimination) but Brier 0.060 against 0.037 for
+    # simply always predicting the base rate — i.e. the number was worse
+    # than useless AS A PROBABILITY. Fitting these two parameters takes it
+    # to 0.031, better than the base rate. Identity defaults (a=1, b=0) mean
+    # an unfitted/legacy params file behaves exactly as before.
+    platt_a: float = 1.0
+    platt_b: float = 0.0
+    # Weight on the turn-EFFORT component (see `confidence.effort_component`).
+    # 0 until enough samples measure turn shape, same evidence rule as
+    # w_entropy. w_competence is the remainder: 1 - w_entropy - w_effort.
+    w_effort: float = 0.0
+    n_effort_observed: int = 0
+    # Brier of the RAW composite and of the base-rate predictor, kept so the
+    # fit can be audited against the only baseline that matters. A model
+    # that cannot beat `brier_base_rate` is not adding information.
+    brier_raw: float = -1.0
+    brier_base_rate: float = -1.0
+    # How many of ``n_samples`` carried REAL observed logprob entropy. When
+    # this is below `_MIN_ENTROPY_SAMPLES` the fit pins ``w_entropy`` to 0
+    # deliberately — the number makes that visible instead of leaving an
+    # operator to wonder why the weight never moves.
+    n_entropy_observed: int = 0
 
 
 @dataclass
@@ -150,8 +298,16 @@ class CalibrationTracker:
         outcome: float,
         uncertainty_pressure: float = 0.0,
         domain: str = "",
+        entropy_observed: bool = False,
+        effort_component: float = 0.5,
+        effort_observed: bool = False,
     ) -> None:
-        """Append one (confidence, outcome) pair. Never raises."""
+        """Append one (confidence, outcome) pair. Never raises.
+
+        ``entropy_observed`` records whether ``entropy_component`` came from
+        real token logprobs. Pass it through faithfully — a fabricated
+        neutral marked as observed re-poisons the entropy fit.
+        """
         try:
             sample = CalibrationSample(
                 composite=_clamp01(composite),
@@ -161,6 +317,9 @@ class CalibrationTracker:
                 outcome=1.0 if float(outcome) >= 0.5 else 0.0,
                 domain=str(domain or ""),
                 ts=_utcnow_iso(),
+                entropy_observed=bool(entropy_observed),
+                effort_component=_clamp01(effort_component),
+                effort_observed=bool(effort_observed),
             )
             with self._lock:
                 self.dir.mkdir(parents=True, exist_ok=True)
@@ -202,6 +361,11 @@ class CalibrationTracker:
                         outcome=1.0 if float(d.get("outcome", 0.0)) >= 0.5 else 0.0,
                         domain=str(d.get("domain", "")),
                         ts=str(d.get("ts", "")),
+                        # Absent on legacy records, which were ALWAYS the
+                        # fabricated neutral — default False is correct.
+                        entropy_observed=bool(d.get("entropy_observed", False)),
+                        effort_component=_clamp01(d.get("effort_component", 0.5)),
+                        effort_observed=bool(d.get("effort_observed", False)),
                     )
                 )
             except Exception:
@@ -287,40 +451,141 @@ class CalibrationTracker:
             )
             return None
 
+        # The entropy weight may only move when enough samples carried a
+        # REAL logprob observation. Previously every sample contributed a
+        # flat, fabricated 0.5 to the entropy column, which is not merely
+        # noisy but structurally fatal: with zero variance there, any
+        # w_e > 0 could only drag composites toward 0.5, so the grid was
+        # guaranteed to pick w_e = 0. That is exactly what was observed
+        # live — 1200/1201 stored samples at 0.5 and w_entropy stuck at 0
+        # (2026-07-27). Unobserved samples are no longer blended with the
+        # stand-in at all (see `_composite_for`); they score on competence
+        # alone, so a weight fit from the observed minority cannot degrade
+        # them. Below the floor we pin w_e at 0 and log WHY rather than
+        # fitting a weight on fiction.
+        observed = [s for s in samples if s.entropy_observed]
+        obs_pos = sum(1 for s in observed if s.outcome >= 0.5)
+        obs_neg = len(observed) - obs_pos
+        entropy_fittable = (
+            len(observed) >= _MIN_ENTROPY_SAMPLES and obs_pos > 0 and obs_neg > 0
+        )
+        we_range = range(0, 11) if entropy_fittable else range(0, 1)
+
+        # Same evidence rule for the turn-effort weight: it only moves once
+        # enough samples actually MEASURED turn shape, with both outcome
+        # classes represented. Legacy samples (recorded before the feature
+        # existed) carry effort_observed=False and are excluded, exactly as
+        # unobserved entropy is.
+        eff_observed = [s for s in samples if getattr(s, "effort_observed", False)]
+        eff_pos = sum(1 for s in eff_observed if s.outcome >= 0.5)
+        eff_neg = len(eff_observed) - eff_pos
+        effort_fittable = (
+            len(eff_observed) >= _MIN_EFFORT_SAMPLES and eff_pos > 0 and eff_neg > 0
+        )
+        weff_range = range(0, 11) if effort_fittable else range(0, 1)
+        if not effort_fittable:
+            logger.debug(
+                "calibration: w_effort pinned to 0 — only %d/%d samples "
+                "measured turn shape (pos=%d neg=%d, need >=%d with both "
+                "classes)", len(eff_observed), len(samples), eff_pos, eff_neg,
+                _MIN_EFFORT_SAMPLES)
+        if not entropy_fittable:
+            logger.debug(
+                "calibration: w_entropy pinned to 0 — only %d/%d samples "
+                "observed real logprob entropy (pos=%d neg=%d, need >=%d of "
+                "each class). Upstream refuses logprobs on tools+stream "
+                "payloads, so most turns carry no token entropy.",
+                len(observed), len(samples), obs_pos, obs_neg,
+                _MIN_ENTROPY_SAMPLES,
+            )
+
         # Grid over entropy weight (→ competence = 1−w_e) and the
-        # uncertainty penalty λ. Composite is recomputed per candidate;
-        # we minimise Brier of that recomputed composite vs outcome.
-        best: Optional[Tuple[float, float, float]] = None  # (brier, w_e, lam)
-        for we_i in range(0, 11):
+        # uncertainty penalty λ, minimising Brier over EVERY sample under
+        # the same per-sample formula the scorer uses (`_composite_for`).
+        best = None  # (brier, w_e, w_eff, lam)
+        for we_i in we_range:
             w_e = we_i / 10.0
-            w_c = 1.0 - w_e
-            for lam_i in range(0, 6):
-                lam = lam_i / 10.0
-                sq = 0.0
-                for s in samples:
-                    c = w_e * s.entropy_component + w_c * s.competence_component
-                    c = c * (1.0 - lam * s.uncertainty_pressure)
-                    c = _clamp01(c)
-                    sq += (c - s.outcome) ** 2
-                brier = sq / len(samples)
-                if best is None or brier < best[0]:
-                    best = (brier, w_e, lam)
+            for weff_i in weff_range:
+                w_eff = weff_i / 10.0
+                if w_e + w_eff > 1.0:
+                    continue          # competence would go negative
+                for lam_i in range(0, 6):
+                    lam = lam_i / 10.0
+                    sq = sum((_composite_for(s, w_e, lam, w_eff) - s.outcome) ** 2
+                             for s in samples)
+                    brier = sq / len(samples)
+                    if best is None or brier < best[0]:
+                        best = (brier, w_e, w_eff, lam)
 
         assert best is not None
-        brier, w_e, lam = best
-        w_c = 1.0 - w_e
+        brier, w_e, w_eff, lam = best
+        w_c = max(0.0, 1.0 - w_e - w_eff)
 
-        # With the winning weights/λ, recompute composites and pick the
-        # threshold that best separates pass from fail (Youden's J on the
-        # "predict success when C ≥ τ" decision). This is what
-        # ``below_threshold`` keys off, so it should be the empirically
-        # best cut, not a hand-picked 0.55.
-        composites = []
-        for s in samples:
-            c = w_e * s.entropy_component + w_c * s.competence_component
-            c = _clamp01(c * (1.0 - lam * s.uncertainty_pressure))
-            composites.append((c, s.outcome))
-        threshold = _best_threshold(composites)
+        composites = [(_composite_for(s, w_e, lam, w_eff), s.outcome)
+                      for s in samples]
+
+        # Recalibration stage. The weight search decides how to COMBINE the
+        # signals but cannot set their level — measured live, the composite
+        # ranked turns well (AUC 0.679) while scoring Brier 0.060 against
+        # 0.037 for a constant base-rate predictor. Fitting a two-parameter
+        # Platt map turns that into 0.031. Class-balanced so the ~4% of
+        # negatives are not drowned by the majority class.
+        platt_a, platt_b = _fit_platt(composites)
+        calibrated = [(apply_platt(c, platt_a, platt_b), y) for c, y in composites]
+
+        base = sum(y for _, y in composites) / len(composites)
+        brier_raw = sum((c - y) ** 2 for c, y in composites) / len(composites)
+        brier_base = sum((base - y) ** 2 for _, y in composites) / len(composites)
+        brier_cal = sum((p - y) ** 2 for p, y in calibrated) / len(calibrated)
+
+        # Adopt the mapping only if it is both BETTER and SAFE.
+        #
+        # A non-positive slope is the important rejection. Platt is monotonic
+        # in `a`, so `a <= 0` inverts the ranking — the agent would report
+        # LOWER confidence on turns the score rates higher. The optimiser
+        # chooses that whenever the composite is anti-correlated with
+        # success, which is exactly what the live corpus shows (leak-free
+        # AUC 0.473, i.e. no discrimination). In that state the honest fit is
+        # "this score predicts nothing", and the right response is to leave
+        # the raw behaviour alone and say so — not to ship an inverted or
+        # flattened confidence. A near-zero slope is rejected for the same
+        # reason: it collapses every turn onto the base rate, which scores a
+        # great Brier while making `below_threshold` permanently inert.
+        _MIN_SLOPE = 0.5
+        if platt_a < _MIN_SLOPE:
+            logger.warning(
+                "calibration: REJECTED the probability map (slope %.3f < %.1f)."
+                " The composite is not tracking outcomes — a fit this flat"
+                " (or inverted) would either destroy the confidence ordering"
+                " or collapse every turn onto the base rate, leaving the"
+                " below-threshold gate permanently inert. Confidence stays"
+                " on the raw scale; the score needs a feature that actually"
+                " predicts turn failure, not better calibration.",
+                platt_a, _MIN_SLOPE)
+            platt_a, platt_b = 1.0, 0.0
+            calibrated = composites
+            brier = brier_raw
+        elif brier_cal <= brier_raw:
+            brier = brier_cal
+        else:
+            logger.debug(
+                "calibration: discarding Platt map (Brier %.4f > raw %.4f)",
+                brier_cal, brier_raw)
+            platt_a, platt_b = 1.0, 0.0
+            calibrated = composites
+            brier = brier_raw
+        if brier > brier_base:
+            logger.warning(
+                "calibration: fitted model (Brier %.4f) is WORSE than always "
+                "predicting the base rate %.3f (Brier %.4f) — the confidence "
+                "score is not adding information as a probability",
+                brier, base, brier_base)
+
+        # Threshold is picked on the CALIBRATED scores (Youden's J on the
+        # "predict success when p ≥ τ" decision) — it must live on the same
+        # scale `below_threshold` will compare against, or the gate fires at
+        # the wrong point.
+        threshold = _best_threshold(calibrated)
 
         params = FittedParams(
             w_entropy=round(w_e, 4),
@@ -330,6 +595,13 @@ class CalibrationTracker:
             brier=round(brier, 6),
             n_samples=len(samples),
             fitted_at=_utcnow_iso(),
+            n_entropy_observed=len(observed),
+            platt_a=round(platt_a, 6),
+            platt_b=round(platt_b, 6),
+            brier_raw=round(brier_raw, 6),
+            brier_base_rate=round(brier_base, 6),
+            w_effort=round(w_eff, 4),
+            n_effort_observed=len(eff_observed),
         )
         self._save_params(params)
         return params
@@ -357,6 +629,15 @@ class CalibrationTracker:
                 brier=float(d.get("brier", 0.0)),
                 n_samples=int(d.get("n_samples", 0)),
                 fitted_at=str(d.get("fitted_at", "")),
+                n_entropy_observed=int(d.get("n_entropy_observed", 0)),
+                # Identity defaults: a params file written before the
+                # recalibration stage existed replays exactly as before.
+                platt_a=float(d.get("platt_a", 1.0)),
+                platt_b=float(d.get("platt_b", 0.0)),
+                brier_raw=float(d.get("brier_raw", -1.0)),
+                brier_base_rate=float(d.get("brier_base_rate", -1.0)),
+                w_effort=float(d.get("w_effort", 0.0)),
+                n_effort_observed=int(d.get("n_effort_observed", 0)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.debug("calibration params malformed: %s", exc)

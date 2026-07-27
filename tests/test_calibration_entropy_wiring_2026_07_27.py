@@ -90,12 +90,17 @@ class TestAgentWiringPins:
 
     def test_logprobs_never_requested_alongside_tools(self):
         """llama-server hard-rejects logprobs on tools+stream payloads
-        (live 400 caught on the 2026-07-27 post-deploy probe) — the
-        opt-in must stay scoped to final generations, which never carry
-        tools, with a belt-and-braces payload check."""
+        (live 400, re-confirmed against the running server 2026-07-27).
+
+        The no-tools check IS the safety property; it must never be
+        removed. The gate previously also required `is_final_generation`,
+        which is strictly narrower than the server constraint — a
+        tool-free generation that isn't a forced-final one is perfectly
+        safe to request logprobs on, and excluding it only cost entropy
+        coverage. That extra term was dropped deliberately; this test
+        pins the invariant that actually matters."""
         gate = SRC[SRC.index("_metacog_logprobs = bool("):]
         gate = gate[:gate.index(")")]
-        assert "is_final_generation" in gate
         assert '"tools" not in payload' in gate
 
     def test_internal_stream_has_tracker_observe_and_stash(self):

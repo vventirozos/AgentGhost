@@ -1109,6 +1109,194 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 (later 5) — Turn-effort: the confidence score finally carries information
+
+Operator: "give confidence a per-turn feature." Prerequisite finding from later-4: ALL THREE inputs were dead,
+and competence — the only one that varied — is a per-DOMAIN historical average, so it is near-constant within a
+domain and STRUCTURALLY cannot discriminate individual turns (separation −0.0008, leak-free AUC 0.473).
+
+**MEASURED BEFORE BUILDING** (296 labelled trajectories, 246 passed / 50 failed):
+| signal | mean(passed) | mean(failed) | AUC |
+|---|---|---|---|
+| tool calls in turn | 2.39 | 11.70 | 0.334 |
+| longest same-tool run | 1.35 | 5.82 | 0.321 |
+| distinct tools | 1.39 | 2.08 | 0.377 |
+| *any tool errored* | *0.10* | *0.64* | *0.229* ← **EXCLUDED, see below** |
+
+**`has_tool_error` deliberately NOT used** despite being the strongest correlate: it is literally a term of the
+calibration label (`execution_failure_count > 0`), so it would predict the label FROM the label and add zero
+information — the same circularity that made later-4's AUC 0.679 an artefact. Ruling it out was the main design
+decision here.
+
+SHIPPED — `confidence.effort_component(tool_names)`: averages two saturating struggle signals, SPRAWL (call
+count, saturates at 12) and SPIN (longest same-tool run, saturates at 6), into [0,1] where 1.0 = short clean
+turn. Averaged not min()'d so one extreme can't slam it to 0; measured AUC 0.670 vs 0.678 for the best single
+signal, i.e. within noise while depending on both. Wired on BOTH scoring paths (finalize + streamed).
+**END-TO-END RESULT** (replaying the labelled corpus through the real feature + real fit): `w_effort` earned at
+0.5, Platt map ADOPTED (a=5.91 — passes the slope guard that rejected it on the old featureless data),
+**Brier 0.123 vs base rate 0.140 → BEATS the baseline by 12%, where it previously LOST by 75%.** First time the
+confidence score adds information.
+
+Design rules carried from the earlier fixes (all three were load-bearing):
+• **No fabricated neutrals** — a turn with no tools passes `effort=None`, not 0.5. Absence of evidence ≠ a
+  measurement; recording it as observed would poison the fit exactly as fabricated entropy neutrals did.
+• **Weight earned, not assumed** — `w_effort` pinned to 0 until `_MIN_EFFORT_SAMPLES`(30) observed samples with
+  BOTH outcome classes, same gate as w_entropy. So live behaviour is unchanged today and engages on evidence.
+• **Renormalisation generalised to 3 components** — only observed components contribute, divided by their
+  weights. With entropy absent and effort present, competence+effort renormalise to 1 instead of leaving 40% of
+  the mass on a neutral stand-in. `_composite_for` mirrors `score()` exactly (the fit must optimise the formula
+  the agent actually evaluates).
+
+LIVE-VERIFIED: a multi-tool turn recorded `"effort_component": 0.625, "effort_observed": true, "domain": "fs"`.
+learning_health now reads **`features: 1/4 live (effort_component)`** — separation −0.25 — up from 0/4.
+(Sign is negative because the probe turns so far were successful long turns; it will settle as samples accrue.)
+Tests: test_confidence_turn_effort.py (17). FULL SUITE 9477 passed / 0 failed. Docs: core/confidence.html.
+DEPLOYED (42775→43167, health ok).
+WATCH: once ≥30 effort-observed samples of both classes exist (~1 day at ~60 samples/day), the idle refit should
+raise `w_effort` off 0 and the base-rate comparison line should flip from "LOSES TO" to "beats". If it does not,
+the feature is not transferring from the trajectory corpus to live turns and should be re-measured, not re-tuned.
+
+### 2026-07-27 (later 4) — Self-learning review: the confidence score has NO live input (measured)
+
+Operator: "any other improvements to the self-learning subsystem?" → "proceed with everything."
+I measured instead of guessing, and the headline **corrects a claim I made earlier in the same session**.
+
+**⚠️ SELF-CORRECTION — my first read was wrong.** I reported AUC 0.679 and "Platt recalibration beats
+the baseline by 18%". That was computed on the STORED `composite` field, which mixes two scoring regimes
+(early records were scored with the pre-fit default w_e=0.5). Recomputed LEAK-FREE from the stored components,
+**AUC = 0.473 — below chance**. The composite has no discrimination. Lesson: recompute a metric from raw
+components before trusting it; a stored score reflects whatever formula was live when it was written.
+
+**THE DIAGNOSIS: 0 of 3 confidence inputs are alive.** Measured over 1208 samples (varies? separates?):
+| feature | distinct | separation (succ−fail) | verdict |
+|---|---|---|---|
+| entropy_component | 2 | +0.0002 | DEAD (upstream refuses logprobs on tools+stream) |
+| competence_component | 270 | **−0.0008** | DEAD — varies plenty, predicts NOTHING |
+| uncertainty_pressure | 1 | 0.0 | DEAD (tracker logged 2 records in 20 days) |
+So the binding constraint is **feature quality — not label supply and not calibration**. Competence is a
+per-DOMAIN historical average: near-constant within a domain, therefore structurally unable to discriminate
+individual turns. A useful confidence score needs an input that varies per TURN. Deliberately NOT invented one
+here — that is a design decision for the operator, and inventing features to make a number move is exactly the
+verification-theater this project fights.
+
+SHIPPED:
+• **Probability recalibration stage** (Platt `sigmoid(a·c+b)` after the weight fit; raw + base-rate Briers
+  persisted so the comparison can never be lost). On live data it is **REJECTED by design** — the optimum is
+  `a≈−0.08`, a NEGATIVE slope that would invert the agent's confidence ordering, and near-flat enough to
+  collapse every turn onto the base rate leaving `below_threshold` inert. Guard: reject any slope < 0.5 and
+  WARN. Verified it engages correctly on an informative-but-compressed corpus (adopted, beats base rate).
+  Newton/IRLS not gradient descent: GD was still at a=1.28 after 4000 steps and only reached a≈−0.08 after
+  ~60000 — opposite sides of the guard, so an under-converged run would have adopted a map the converged fit
+  rejects. The answer must not depend on the iteration budget (IRLS: <20 iters, 0.04s).
+  UNWEIGHTED after trying class-balancing: balancing optimises a reweighted distribution, so the probabilities
+  describe a 50/50 world that doesn't exist and unweighted Brier got WORSE. Imbalance belongs to the threshold
+  search (Youden's J), which is prevalence-independent.
+• **`domain` was never recorded** (BUG): computed for the competence lookup, then dropped — all 1208 samples
+  carried `domain=""`, making per-domain reliability impossible. Now recorded (live-verified `"domain": "fs"`).
+  Hoisted the derivation so it's defined on the streamed path too (it would have been a NameError there).
+• **User corrections now tick the LESSON arm negative**, not just calibration. A correction is the strongest
+  FAILED signal available, and those turns are exactly what the outcome-gated arm exists for: the turn looked
+  clean, so it was stashed "awaiting a late verdict", no verdict ever landed, and the stash entry was evicted
+  UNCOUNTED. Reuses the existing flush helper (no-op when the turn recorded inline).
+• **Correction negatives carry `entropy_observed`** — an observed negative is the single most valuable sample
+  type (negatives ~4%, observed ~0%); the stash was silently downgrading it. (Gap I introduced in later-3.)
+• **Feature-health telemetry**: per-feature distinct/separation/dead, `features: 0/3 live — NONE discriminate`.
+  Death test is SEPARATION, not distinctness — a 2-valued feature that splits cleanly is useful, while
+  competence has 270 values and separates by −0.0008.
+
+INVESTIGATED, NOT A BUG: the outcome-gated arm sees only ~5% of retrievals (2288 retrievals → 120 ticks). That
+is verdict-gating working as designed — a clean turn with no verdict is deliberately evicted UNCOUNTED so the
+arms never fill from mere absence-of-failure. Loosening it would manufacture unverified successes. Note the two
+arms use DIFFERENT success definitions (calibration books clean turns as success → 96% positives; the lesson arm
+refuses to) — the lesson arm's conservatism is the better design.
+Also: negative supply is already mined from every available source (execution failures, verifier refutes,
+budget exhaustion, user corrections); 4% is the agent's real recorded failure rate, not a collection gap.
+
+Tests: test_calibration_probability_map.py (31). Two of my own new tests caught real never-raises violations in
+the telemetry helpers (corrupt `frequency`, non-numeric `outcome`) — both fixed.
+FULL SUITE 9460 passed / 0 failed. Docs: core/calibration.html. DEPLOYED (39274→41264, health ok).
+NEXT (operator decision): give confidence a per-TURN feature — candidates already computed at scoring time are
+tool-count, whether a repair/steer fired, and context pressure. Until then the honest state is "no signal", and
+the telemetry now says so out loud.
+
+### 2026-07-27 (later 3) — The five measured improvements: entropy unfittable, PRM unread, graduation impossible, episodes blind
+
+Operator: "fix the calibration entropy, drop PG-manual re-ingest (done), then proceed with the rest of your
+suggestions, implement them all." All five items from the later-2 measured eval. THEME: four of the five were
+**instruments or loops that could not possibly work**, and in three cases the metric that should have shown it
+was itself broken — measure the mechanism, not the summary number.
+
+**#1 CALIBRATION ENTROPY — structurally unfittable, now fixed.** Live: 1200/1201 samples had
+`entropy_component` EXACTLY 0.5, fitted `w_entropy` 0.0. ROOT CAUSE found by instrumenting the running agent
+(temporary ENTPROBE log, since removed): `final=False tools_in_payload=True → request_logprobs=False`.
+llama-server 400s on `logprobs`+`tools`+`stream` (re-confirmed live), and the loop attaches tools on every
+NON-final generation — and a normal turn answers on the first pass, so `is_final_generation` is almost never
+true. The logprob-bearing generation essentially never happens. Those turns then recorded the neutral 0.5
+STAND-IN as if it were a measurement → zero variance → any w_e>0 could only drag composites toward 0.5 → the
+grid was GUARANTEED to pick 0. Not a tuning problem: the data made the parameter unlearnable.
+FIX (3 parts): (a) `entropy_observed` on ConfidenceReading + CalibrationSample (legacy records default False —
+truthful, they WERE fabricated); (b) **missing-feature renormalisation** — an unobserved sample scores on
+competence ALONE, via `_composite_for` which mirrors `score()` exactly so fit and scorer optimise the same
+formula. This is load-bearing: my first attempt (fit w_e on the observed subset, apply to all) drove Brier
+0.075 → 0.219 because unobserved samples got blended with the stand-in. Caught it by testing 4 regimes before
+committing; (c) w_entropy stays pinned at 0 below `_MIN_ENTROPY_SAMPLES`(30) observed samples of both classes,
+with the reason logged + `n_entropy_observed` persisted. Also widened the request gate to `"tools" not in
+payload` (dropping the redundant `is_final_generation` term — strictly narrower than the server constraint).
+VERIFIED across 4 regimes: all-neutral → w_e 0 (no regression); observed+informative → **w_e 1.0 (previously
+impossible)**; observed-but-noise → w_e 0 (declines noise); mixture → w_e 1.0 @ Brier 0.093 (vs 0.219 naive).
+LIVE: new samples carry `entropy_observed: false` and `composite == competence_component` exactly.
+
+**#2 PRM — trained every idle cycle, read by NOTHING.** Both consumers off: `.score()` → MCTS turn-start
+(module-gated, no flag can enable) and `.uncertainty()` → frontier self-play (`--frontier-selfplay`, default
+False since 07-09 AND absent from the live exec line — I checked the launcher, not the docs). 41 `prm_train`
+events in one ledger window writing a checkpoint nothing read, while logging "value model refit" — reads like
+learning progress. Phase 2.7 now SKIPS with an explicit reason when no consumer is live. Deliberately a RUNTIME
+check, not a deletion: flip either consumer and training resumes next idle pass, no code change.
+NOTE the earlier telemetry named only `.score()` — it understated how dead this was; now reports both.
+
+**#3 LESSON GRADUATION — could never fire.** Measured against the live 50-lesson playbook: 3 lessons met
+`frequency>=5`, 17 met the code gate, **ZERO met both** → no candidate, ever. Both gates wrong in opposite
+directions: (a) freq>=5 unreachable (38/50 sat at 1) and the 3 that reached it are behavioural guidance;
+(b) the code detector was a substring scan including `"with "` and `"return "` — ORDINARY ENGLISH. "joining all
+results *with* the exact delimiter" registered as code (17/50 false positives). Structural detection finds 2.
+FIX: reusability = `freq>=3 OR verified` (a verifier-confirmed lesson is at least as trustworthy as one seen
+5×); `_looks_mechanizable` requires real syntax; candidates sorted by strength so the 2/cycle budget goes to the
+best. HONEST OUTCOME: 1 eligible, and that is CORRECT — this playbook is mostly behavioural heuristics that
+should never become Python tools. Tuned to admit the genuinely mechanizable, NOT to force graduations; TDD gate
+still the backstop. learning_health now reports `eligible (reusable ∩ mechanizable)` so "0 graduated" is
+explainable. (My own new test caught a real defect while writing it: `_graduation_eligibility` crashed on a
+corrupt `frequency`, violating the module's never-raises contract.)
+
+**#4 EPISODE CONTEXT/CLUSTER BACKFILL — 5.2% → 96.6%.** 165 pre-07-26 episodes had empty `context`/`cluster_id`,
+so `get_episodes_by_cluster` and `search_recoveries` (greps context for FAILED markers) were blind to ~95% of
+the corpus. The ACTIONS were always persisted to `episode_actions`, so both fields were reconstructed by
+REPLAYING the same derivation the live path uses — not guessed. `scripts/backfill_episode_context.py`: dry-run
+default, idempotent, and REFUSES to invent data for the 6 action-less episodes rather than writing placeholders.
+Applied after a DB backup (`episodic_memory.db.pre_context_backfill.bak`): 159 updated, 168/174 (96.6%).
+Cluster retrieval went from ~9 total to fs=41 / memory=40 / fetch=22 / shell=19; `search_recoveries` now returns
+real recoveries.
+
+**#5 IDLE-LOOP "IMBALANCE" — WAS A MEASUREMENT ARTIFACT; no rebalance made.** My later-2 note flagged
+dream 231 vs reflection 21 as a starved loop. WRONG: reflection only writes a ledger event `if report.outcomes`,
+AND deliberately skips ticks whose trajectory corpus is unchanged since an all-duplicate pass (a correct 07-18
+fix); dream records every cycle. I verified the skip gate re-arms properly (arms only on a do-nothing pass,
+clears when it reflected or errored). So the counts are per-phase event records with different recording
+policies, NOT a workload budget — the same artifact class as the FAILURE-arm "inert" false alarm. Changed the
+telemetry to say so rather than "fixing" a non-problem. The one GENUINE idle waste (PRM, #2) is fixed.
+
+**BACKLOG CORRECTION CONFIRMED:** PG-manual re-ingest formally dropped (later-2 measured the corpus healthy —
+1.2% "fusion" hits were all legitimate PostgreSQL C-API camelCase; docs excluded from recall at 4 sites).
+
+Tests: test_calibration_entropy_observed.py (15) + test_lesson_graduation_gates.py (19) +
+test_episode_context_backfill.py (11) + 3 PRM wire-or-retire tests. Two pre-existing tests updated to the
+corrected behaviour (the logprobs gate pin — the no-tools check IS the safety property, the
+`is_final_generation` term was redundant; and the PRM phase fixtures now grant a live consumer).
+FULL SUITE 9429 passed / 0 failed. Docs: calibration/confidence/dream/episodes/introspect.
+DEPLOYED (listener 37161→39274, health ok); functional_live_test 32/32.
+WATCH: `entropy observed on N/1205` should start climbing only if tool-free generations occur; if it stays at 0
+the honest conclusion is that this upstream+tool-mode combination cannot supply token entropy at all, and the
+entropy term should be retired rather than carried as a permanently-pinned zero.
+
 ### 2026-07-27 (later 2) — Dead-code deletion (qwen variant) + honest cognitive-layer telemetry
 
 Operator: "delete qwen_bridge and fix mcts/arbiter in the logs." Both were the DEFERRED items from the
