@@ -116,6 +116,14 @@
   <h2>Audit fixes (2026-07-26)</h2>
   <p><strong>Mint safety:</strong> <code>compile_from_pattern</code> now sanitizes names into legal identifiers (graduation-minted names arrived DOTTED — live: <code>auto.generic.…c73e69</code> reached the registry in violation of this module's own contract) and NO-OPs when the name already exists — re-graduation of the same candidate used to re-register unconditionally, demoting an operator-APPROVED macro back to "proposed" (vanishing from the tool list) and wiping its stats. <code>register()</code> itself merges-not-demotes as belt-and-braces. <strong>Shadowing both directions:</strong> composed defs now shadow against the FULL acquired-skill registry, not just the defs routed this turn (routing could filter the acquired def out, advertising the composed schema while dispatch ran the acquired runner). <strong>Approve message tells the truth about params:</strong> graduation-minted macros carry EMPTY templates (tool order only) — the blanket "params were mined from past calls" claim now only appears when templates exist. Tests: <code>::TestComposedMintSafety</code>.</p>
 
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong>Failed steps reported "FAILED — unknown error" (MED, closed).</strong> Tools in this codebase signal failure by <em>returning an error string</em>, which <code>_execute_sequential</code> records under <code>result</code> with <code>success=False</code> and no <code>error</code> key — so the formatter's <code>r.get('error', 'unknown error')</code> discarded the actual diagnostic and the model could neither recover nor re-route. The failure branch now falls back to the result body.</li>
+    <li><strong>Invalid macro names could reach the LLM function catalogue (MED, closed).</strong> <code>_load</code> and the <code>approve</code> action skipped <code>_validate_composed_name</code>, and the live registry still held a dotted legacy entry (<code>auto.generic.…</code>, status <code>proposed</code>). Approving it would have emitted a dotted function name, violating the module's naming contract and risking native-tools parse corruption for the whole catalogue. Names are now validated on load (invalid entries quarantined with a warning) and re-validated on approve.</li>
+    <li><code>save()</code>'s <code>mkdir</code> moved inside its <code>try</code>: on a read-only or full volume it raised through <code>record_usage</code> → <code>execute()</code>, discarding a successful macro run's results, contradicting the method's own swallow-and-warn design.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

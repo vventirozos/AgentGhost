@@ -60,9 +60,16 @@ def extract_move_text(reply: str) -> Optional[str]:
 
 
 def extract_labeled(reply: str, label: str) -> str:
-    """First ``LABEL: <rest of line>`` value in ``reply`` (stripped), or ""."""
-    m = re.search(re.escape(label) + r":\s*(.+)", reply or "")
-    return m.group(1).strip() if m else ""
+    """LAST ``LABEL: <rest of line>`` value in ``reply`` (stripped), or "".
+
+    Last-wins to MATCH ``extract_move_text``. With first-wins, a thinking
+    model (the live one) that drafts a move inside <think>, rejects it, and
+    commits to another had its move taken from the final answer but its
+    EXPLANATION from the discarded draft — the client taught the user the
+    reasoning for a move that was never played.
+    """
+    matches = re.findall(re.escape(label) + r":\s*(.+)", reply or "")
+    return matches[-1].strip() if matches else ""
 
 
 def extract_comment(reply: str) -> str:

@@ -2,7 +2,8 @@
 
 Coverage map:
   CRITICAL-1  sandbox output cap (head+tail truncation)
-  CRITICAL-2  qwen_bridge GLOBAL_CONTEXT → ContextVar isolation
+  CRITICAL-2  qwen_bridge ContextVar isolation (module DELETED 2026-07-27 —
+              the agent_qwen variant was unreachable dead code)
   CRITICAL-3  interface/server.py proxy auth + path traversal guard
   HIGH-4      swarm failure surfaced synchronously (no fake SUCCESS)
   HIGH-5      database activity query has LIMIT 50 + ORDER BY
@@ -81,29 +82,6 @@ def test_sandbox_execute_small_output_unchanged():
     output, exit_code = sb.execute("echo hi")
     assert output == "hello world\n"
     assert "truncated" not in output.lower()
-
-
-# =====================================================================
-# CRITICAL-2 — qwen_bridge context isolation
-# =====================================================================
-
-
-def test_qwen_bridge_uses_contextvar_not_global():
-    """The bridge must expose `_CTX` as a ContextVar — not a plain module
-    global. Reading via the back-compat `GLOBAL_CONTEXT` attribute returns
-    whatever the current context binds."""
-    src = Path("src/ghost_agent/tools/qwen_bridge.py").read_text()
-    code_only = "\n".join(
-        line for line in src.splitlines()
-        if not line.strip().startswith("#")
-    )
-    assert "import contextvars" in code_only
-    assert "ContextVar" in code_only
-    assert "_CTX" in code_only
-    # The old bare global assignment must be gone from CODE (comments fine).
-    assert "GLOBAL_CONTEXT = None" not in code_only
-    # The public API is still `set_context` (same name, new body).
-    assert "def set_context" in code_only
 
 
 # =====================================================================

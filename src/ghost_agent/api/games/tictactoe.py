@@ -46,16 +46,33 @@ class TicTacToeAdapter(GameAdapter):
                 f"Got: {state!r}")
         cells = list(grid)
         nx, no = cells.count("X"), cells.count("O")
-        # X moves first, so X's count is equal to or one more than O's.
-        if nx - no not in (0, 1):
+        # Either side may OPEN (the caller picks via the side-to-move field,
+        # e.g. "......... O" for "agent opens as O"), so the counts may
+        # differ by one in either direction. The old rule allowed only
+        # nx - no in (0, 1) while `load` happily accepted "......... O" — the
+        # agent then played O, producing "....O.... X" (0 X vs 1 O), which
+        # this very method rejected on the next request. The game bricked
+        # with a 422 after exactly one move.
+        if abs(nx - no) > 1:
             raise GameStateError(
                 f"Impossible tic-tac-toe position: {nx} X vs {no} O "
-                "(X moves first, so counts differ by at most one).")
+                "(sides alternate, so counts differ by at most one).")
+        # When the counts DIFFER, the side to move is forced — whoever has
+        # fewer marks is up. Only an even board is ambiguous (it depends on
+        # who opened), and there X is the default. Enforcing this closes the
+        # turn-enforcement hole where an explicit field let one side move
+        # twice in a row.
+        forced = None if nx == no else ("O" if nx > no else "X")
         if turn is None:
-            turn = "X" if nx == no else "O"      # infer from parity
+            turn = forced or "X"
         elif turn not in ("X", "O"):
             raise GameStateError(
                 f"Bad side to move {turn!r}: expected 'X' or 'O'.")
+        elif forced is not None and turn != forced:
+            raise GameStateError(
+                f"Side to move {turn!r} contradicts the board: {nx} X vs "
+                f"{no} O means it is {forced}'s turn. Omit the side-to-move "
+                "field to have it inferred.")
         return _Board(cells, turn)
 
     def serialize(self, b: _Board) -> str:

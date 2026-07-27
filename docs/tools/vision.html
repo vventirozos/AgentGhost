@@ -28,7 +28,6 @@
     <a href="swarm.html">swarm</a>
     <a href="tasks.html">tasks</a>
     <a href="projects.html">projects</a>
-    <a href="qwen_bridge.html">qwen_bridge</a>
     <a href="acquired_skills.html">acquired_skills</a>
     <a href="composed_skills.html">composed_skills</a>
     <a href="tool_failure.html">tool_failure</a>
@@ -65,6 +64,14 @@
     <li>50 MB cap on both local files and URL downloads (streamed with a byte cap, so a lying Content-Length can't OOM the host).</li>
     <li>Path-traversal guard via <a href="file_system.html"><code>_get_safe_path</code></a>, with the read-only sandbox-root fallback for project-scoped sessions.</li>
     <li><strong>SSRF-on-redirect closed (2026-07-14).</strong> URL fetches used <code>follow_redirects=True</code> while validating only the ORIGINAL url — a public page 302-redirecting to <code>127.0.0.1</code>/<code>169.254.169.254</code>/a LAN host bypassed the guard (the exact hole closed in <a href="file_system.html">tool_download_file</a> on 2026-07-07; vision never got that fix). Auto-redirect is now OFF; every hop's <code>Location</code> is re-validated via the shared <code>_download_redirect_target</code>, bounded at 5 hops. Covered by <code>tests/test_vision_hardening.py</code>.</li>
+  </ul>
+
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong>PDF rasterisation was unbounded by page DIMENSIONS (HIGH, closed).</strong> The 50 MB file-size cap — whose comment claimed it prevented OOM — cannot bound <code>get_pixmap</code>. A KB-sized vector PDF declaring large pages (poster/blueprint/CAD, or a crafted one fetched via the URL branch) allocated <code>page_w×2 · page_h×2 · 3</code> bytes per page: a 788-byte PDF with a 10000×10000 pt page produced a <strong>1.2 GB</strong> pixmap, ×10 pages on a host that runs the LLM pinned in RAM. Zoom is now derived per page from a pixel budget (<code>_MAX_PDF_PAGE_PIXELS</code>), so A4 keeps full 2× quality while an oversized page scales down.</li>
+    <li><strong>The URL branch trusted <code>Content-Type</code> (MED, closed).</strong> It defaulted to <code>image/jpeg</code> when the header was absent and never magic-sniffed the bytes — resurrecting for remote files the exact hallucination bug that magic-byte sniffing was added to kill for local ones: an HTML error page was base64-shipped to the vision model, which duly "analysed" it and returned a <code>VISION ANALYSIS RESULT:</code>. Content is now sniffed first; a header claiming a sniffable raster type whose bytes carry no matching signature is refused.</li>
+    <li>PDFs are also detected by the <code>%PDF-</code> magic prefix (not only the extension/header), and <code>_process_pdf</code> closes the <code>fitz</code> document in a <code>finally</code> so a mid-loop failure can't leak it.</li>
   </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>

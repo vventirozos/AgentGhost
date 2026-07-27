@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -263,10 +264,26 @@ def _episode_stats(db_path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _activity_counts(ledger_path: Path) -> Dict[str, int]:
+def _activity_counts(ledger_path: Path, *, window_hours: float = 168.0) -> Dict[str, int]:
+    """Count ledger records by phase over a recent window.
+
+    ``ActivityRecord.to_dict`` serializes the kind as ``phase`` — keying on
+    kind/type/category matched NOTHING, so this always returned {} and the
+    "BACKGROUND ACTIVITY" section silently never rendered against a ledger
+    with 1500+ real records (2026-07-27: indistinguishable from "nothing
+    ran", in the very report meant to answer whether the loops fire).
+    """
     counts: Dict[str, int] = {}
+    cutoff = time.time() - max(0.0, float(window_hours)) * 3600.0
     for rec in _load_jsonl(ledger_path, limit=2000):
-        kind = str(rec.get("kind") or rec.get("type") or rec.get("category") or "").strip()
+        try:
+            ts = float(rec.get("ts") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
+        if ts and ts < cutoff:
+            continue
+        kind = str(rec.get("phase") or rec.get("kind") or rec.get("type")
+                   or rec.get("category") or "").strip()
         if kind:
             counts[kind] = counts.get(kind, 0) + 1
     return counts

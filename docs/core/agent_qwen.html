@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>core.agent_qwen — Ghost Agent</title>
+<title>core / agent_qwen.py — REMOVED — Ghost Agent</title>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -11,26 +11,36 @@
   <h1>Ghost Agent</h1>
   <nav>
     <a href="../index.html">← Home</a>
-    <h3>Core</h3>
-    <a href="agent.html">agent</a>
-    <a class="current" href="agent_qwen.html">agent_qwen</a>
-    <a href="prompts.html">prompts</a>
-    <a href="../tools/qwen_bridge.html">qwen_bridge</a>
   </nav>
 </aside>
 <main>
-  <h1>core / agent_qwen.py — GhostQwenAgent</h1>
-  <p class="subtitle">Thin <code>qwen_agent.agents.ReActChat</code> wrapper specialised for Qwen3.6 with native file_system / execute / knowledge_base tools.</p>
+  <h1>core / agent_qwen.py <span style="opacity:.6">— REMOVED</span></h1>
+  <p class="subtitle">Deleted 2026-07-27. This page is kept only so existing links don't 404.</p>
 
-  <h2>Class</h2>
-  <pre><code>class GhostQwenAgent(qwen_agent.agents.ReActChat):
-    def __init__(self, context, llm_cfg): ...
-    def _run(self, messages, lang='en', **kwargs) -&gt; Iterator[List[Dict[str, Any]]]:
-        ...</code></pre>
-  <p>Constructor binds the active <code>GhostContext</code> via <a href="../tools/qwen_bridge.html">qwen_bridge.set_context()</a> so the bridged tools have access to sandbox / memory / scratchpad. Registers a tool list of <code>file_system</code>, <code>execute</code>, <code>knowledge_base</code> via the qwen-agent registry, then delegates the chat loop to <code>ReActChat._run()</code>.</p>
+  <h2>What was here</h2>
+  <p>A <code>GhostQwenAgent(ReActChat)</code> subclass that ran the conversation through qwen-agent's own ReAct loop instead of the agent's turn loop, with tools supplied by <code>tools/qwen_bridge.py</code>.</p>
 
-  <h2>When used</h2>
-  <p>Activated when the upstream LLM is Qwen and the agent runs in Qwen's native ReAct mode (XML tool-call syntax handled by the Qwen library rather than the agent's own parser). The tool bridge is documented in <a href="../tools/qwen_bridge.html">tools / qwen_bridge</a>.</p>
+  <h2>Why it was removed</h2>
+  <p>The pair was <strong>unreachable dead code</strong>: nothing in the repository ever
+  constructed <code>GhostQwenAgent</code> — no import, no instantiation, in
+  <code>src/</code>, <code>scripts/</code>, <code>bin/</code> or <code>interface/</code>. The live
+  agent runs <code>core/agent.py</code>, which talks to llama-server over the
+  OpenAI-compatible API and never touched this path.</p>
+  <p>Keeping it was not free. It carried two latent defects that a future user of the
+  variant would have hit immediately — <code>_run_coro_blocking</code> ran each coroutine on a
+  <em>fresh</em> event loop while blocking the caller's loop in <code>join()</code> (freezing the
+  whole agent, and raising cross-loop errors for any loop-bound client), and the
+  system-injected kwargs were not excluded from the model-param pass-through, so a
+  hallucinated <code>sandbox_dir</code> crashed the call with a duplicate-keyword
+  <code>TypeError</code>. It also pulled the heavy <code>qwen-agent</code> dependency tree into
+  every install. Deleting the variant closed all of it at once; <code>qwen-agent</code> was
+  dropped from <code>requirements.txt</code> in the same change.</p>
+
+  <h2>What replaced it</h2>
+  <p>Nothing — the functionality was never in use. Note that the main agent's handling of
+  Qwen-dialect <code>&lt;tool_call&gt;</code> tags is <em>unrelated</em> to this module and is
+  still very much live: see the syntax healer in <a href="agent.html">core / agent</a>
+  (<code>tests/test_agent_tool_calling_logic.py::test_agent_qwen_syntax_healer</code>).</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

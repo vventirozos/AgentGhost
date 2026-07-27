@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>tools.qwen_bridge — Ghost Agent</title>
+<title>tools / qwen_bridge.py — REMOVED — Ghost Agent</title>
 <link rel="stylesheet" href="../assets/style.css">
 </head>
 <body>
@@ -11,49 +11,36 @@
   <h1>Ghost Agent</h1>
   <nav>
     <a href="../index.html">← Home</a>
-    <h3>Tools</h3>
-    <a href="registry.html">registry</a>
-    <a href="execute.html">execute</a>
-    <a href="browser.html">browser</a>
-    <a href="file_system.html">file_system</a>
-    <a class="current" href="qwen_bridge.html">qwen_bridge</a>
-    <a href="../core/agent_qwen.html">agent_qwen</a>
   </nav>
 </aside>
 <main>
-  <h1>tools / qwen_bridge.py</h1>
-  <p class="subtitle">Adapts Ghost Agent's async tools to Qwen Agent's synchronous <code>BaseTool</code> interface, threading the runtime context through ContextVars.</p>
+  <h1>tools / qwen_bridge.py <span style="opacity:.6">— REMOVED</span></h1>
+  <p class="subtitle">Deleted 2026-07-27. This page is kept only so existing links don't 404.</p>
 
-  <h2>Why</h2>
-  <p>Qwen Agent's ReAct loop calls tools synchronously. Ghost Agent's tools are async and need access to live context (sandbox, memory, scratchpad). The bridge:</p>
-  <ol>
-    <li>Detects whether an event loop is already running and, if so, runs the coroutine in a worker thread with a fresh loop (<code>_run_coro_blocking</code>, line 14-55).</li>
-    <li>Threads the active <code>GhostContext</code> via <code>contextvars.ContextVar</code> (<code>_CTX</code>), so sibling async tasks each see their own context (line 58-88).</li>
-  </ol>
+  <h2>What was here</h2>
+  <p>A qwen-agent <code>BaseTool</code> bridge that exposed <code>file_system</code>, <code>execute</code> and <code>knowledge_base</code> to the Qwen ReAct runtime, translating its synchronous <code>call()</code> into the agent's async tool handlers. Used only by the <code>core/agent_qwen.py</code> variant.</p>
 
-  <h2>Bridged tools</h2>
-  <table>
-    <thead><tr><th>Qwen tool class</th><th>Backend</th></tr></thead>
-    <tbody>
-      <tr><td><code>GhostFileSystem.call()</code></td><td><a href="file_system.html"><code>tool_file_system</code></a></td></tr>
-      <tr><td><code>GhostExecute.call()</code></td><td><a href="execute.html"><code>tool_execute</code></a></td></tr>
-      <tr><td><code>GhostKnowledgeBase.call()</code></td><td><a href="memory_tools.html"><code>tool_knowledge_base</code></a></td></tr>
-    </tbody>
-  </table>
-  <p>Named parameters are extracted from the Qwen call; unknown extras are passed via <code>**extra</code>.</p>
-  <p><strong>Context plumbing parity with the registry path (2026-07-14).</strong> <code>GhostFileSystem.call()</code> now forwards <code>sandbox_manager</code>, <code>max_context</code>, and <code>read_budget</code> from the bridge context, matching what the main registry passes. Previously <code>operation='search'</code>/<code>'find'</code> on this runtime always died with <q>'NoneType' object has no attribute 'execute'</q> (no sandbox manager), and reads used the minimum byte budget regardless of the configured context window. The <code>operation</code> enum also gained the <code>find</code> value the dispatcher already supported.</p>
+  <h2>Why it was removed</h2>
+  <p>The pair was <strong>unreachable dead code</strong>: nothing in the repository ever
+  constructed <code>GhostQwenAgent</code> — no import, no instantiation, in
+  <code>src/</code>, <code>scripts/</code>, <code>bin/</code> or <code>interface/</code>. The live
+  agent runs <code>core/agent.py</code>, which talks to llama-server over the
+  OpenAI-compatible API and never touched this path.</p>
+  <p>Keeping it was not free. It carried two latent defects that a future user of the
+  variant would have hit immediately — <code>_run_coro_blocking</code> ran each coroutine on a
+  <em>fresh</em> event loop while blocking the caller's loop in <code>join()</code> (freezing the
+  whole agent, and raising cross-loop errors for any loop-bound client), and the
+  system-injected kwargs were not excluded from the model-param pass-through, so a
+  hallucinated <code>sandbox_dir</code> crashed the call with a duplicate-keyword
+  <code>TypeError</code>. It also pulled the heavy <code>qwen-agent</code> dependency tree into
+  every install. Deleting the variant closed all of it at once; <code>qwen-agent</code> was
+  dropped from <code>requirements.txt</code> in the same change.</p>
 
-  <h2>Back-compat</h2>
-  <p><code>GLOBAL_CONTEXT</code> is exposed as a property that returns <code>_CTX.get()</code>, so older callsites continue to work without per-task isolation.</p>
-
-  <h2>Transitive <code>soundfile</code> dependency</h2>
-  <p><code>qwen-agent</code>'s <code>utils/utils.py</code> does <code>import soundfile</code> at module load, so importing anything under <code>qwen_agent.*</code> (including <code>qwen_agent.tools.base</code> used by this module) fails with <code>ModuleNotFoundError: No module named 'soundfile'</code> unless the transitive dep is installed. The default agent path (<code>ghost_agent.main</code>) does NOT touch <code>qwen_bridge</code>; only the <code>core/agent_qwen.py</code> variant does.</p>
-  <ul>
-    <li><code>soundfile&gt;=0.12.0</code> is pinned in <code>requirements.txt</code> so fresh installs never hit the bug.</li>
-    <li>The module wraps the <code>from qwen_agent.tools.base import ...</code> line in a <code>try/except</code> that re-raises as <code>ImportError</code> with an actionable message (pip install instruction, Linux <code>libsndfile1</code> note, clarification that the default path is unaffected).</li>
-    <li>On Linux the system package <code>libsndfile1</code> is also required: <code>sudo apt-get install libsndfile1</code>. macOS / Windows wheels ship libsndfile bundled.</li>
-  </ul>
-  <p>Covered by <code>tests/test_qwen_bridge_import_error.py</code>.</p>
+  <h2>What replaced it</h2>
+  <p>Nothing — the functionality was never in use. Note that the main agent's handling of
+  Qwen-dialect <code>&lt;tool_call&gt;</code> tags is <em>unrelated</em> to this module and is
+  still very much live: see the syntax healer in <a href="../core/agent.html">core / agent</a>
+  (<code>tests/test_agent_tool_calling_logic.py::test_agent_qwen_syntax_healer</code>).</p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

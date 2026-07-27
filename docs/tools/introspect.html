@@ -29,7 +29,6 @@
     <a href="swarm.html">swarm</a>
     <a href="tasks.html">tasks (scheduler)</a>
     <a href="projects.html">projects</a>
-    <a href="qwen_bridge.html">qwen_bridge</a>
     <a href="acquired_skills.html">acquired_skills</a>
     <a href="composed_skills.html">composed_skills</a>
     <a href="tool_failure.html">tool_failure</a>
@@ -106,6 +105,13 @@
 
   <h2>Learning-health action (2026-07-26 improvement #1)</h2>
   <p><code>introspect action='learning'</code> renders the LEARNING-HEALTH report — the instrument for the "watch/keep-or-kill in ~2 weeks" criteria the 2026-07 loop-closing work left pending. Read-only aggregation of the on-disk learning stores (via <code>core/learning_health.py</code>, also runnable headless as <code>scripts/learning_health.py</code>): lesson outcome-arm distribution (pass-only / fail-only / both) + hit-rate + stale/prune candidates; per-domain competence with which domains cross the 20-obs inject gate; episode field coverage; calibration Brier + entropy-distinctness; graduated auto-skills; and a COGNITIVE WIRING section (which producers run, which consumers are gated OFF — the observability for the wire-or-retire question, improvement #5). Branches before the self_model gate so it works with selfhood disabled. Live signals it already surfaced: the outcome-gated FAILURE arm has produced ZERO fail-only lessons (demotion loop may be inert on this model), and calibration entropy has only 2 distinct values (w_entropy=0 — unlearnable until the streamed-path fix lets real logprob entropy flow). Tests: <code>tests/test_learning_health.py</code>.</p>
+
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong><code>introspect action='activity'</code> had been dark for two weeks (HIGH, closed).</strong> The renderer called <code>log.read_since(0)</code>, which inherits <code>limit=200</code> — so it read the 200 <em>oldest</em> lines of a ledger that never rotates. Reproduced against the live ledger (1518 records, newest 2026-07-27): the call returned records ending <strong>2026-07-13</strong>, and the report printed "No background activity recorded in the last 24 hours" — even at the 336-hour maximum window. The tool went blind at exactly the point the 2026-07-17 chat-noise decision made it the only home of routine-maintenance records. Existing tests passed because their fixtures build sub-200-line ledgers.</li>
+    <li>The report now reads the ledger <strong>tail</strong> (<code>_read_activity_tail</code>): it seeks to <code>size - _ACTIVITY_TAIL_BYTES</code> and drains forward, keeping a bounded record window. This also bounds the scan cost, which a from-byte-0 replay grew linearly forever.</li>
+  </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

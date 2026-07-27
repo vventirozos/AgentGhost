@@ -144,6 +144,7 @@ def _add_job(scheduler, job_id: str, task_name: str, prompt: str,
         scheduler.add_job(
             run_watch_condition_fn, 'interval', seconds=secs,
             args=[job_id], id=job_id, name=task_name, replace_existing=True,
+            misfire_grace_time=300, coalesce=True,
         )
         return None
     if cron_expression.startswith("interval:"):
@@ -170,18 +171,30 @@ def _add_job(scheduler, job_id: str, task_name: str, prompt: str,
             args=[job_id, prompt],
             id=job_id,
             name=task_name,
-            replace_existing=True
+            replace_existing=True,
+            # APScheduler's default misfire grace is 1s — a fire landing in
+            # any >1s event-loop stall (prompt assembly, sync memory work)
+            # was silently SKIPPED with nothing in the activity ledger.
+            misfire_grace_time=300,
+            coalesce=True,
         )
         return None
     if CronTrigger is None:
         return "Error: cron-style schedules require apscheduler. Use 'interval:SECONDS' instead."
     scheduler.add_job(
         run_proactive_task_fn,
-        CronTrigger.from_crontab(cron_expression),
+        # timezone MUST be explicit: a pre-built trigger instance never
+        # inherits the scheduler's UTC — from_crontab() alone defaults to
+        # the LOCAL zone, so every cron task fired hours off the UTC time
+        # the tool contract tells the model to convert to (and drifted
+        # with DST).
+        CronTrigger.from_crontab(cron_expression, timezone="UTC"),
         args=[job_id, prompt],
         id=job_id,
         name=task_name,
-        replace_existing=True
+        replace_existing=True,
+        misfire_grace_time=300,
+        coalesce=True,
     )
     return None
 
@@ -372,7 +385,17 @@ async def tool_list_tasks(scheduler):
     # local time and the operator concludes the task fired 3 hours late.
     lines = ["ACTIVE SCHEDULED TASKS (times in UTC):"]
     for job in visible_jobs:
-        lines.append(f"- ID: {job.id} | Name: {job.name} | Next Run: {job.next_run_time}")
+        # Convert explicitly: next_run_time carries the TRIGGER's zone, and
+        # printing a local-zone datetime under a "times in UTC" header
+        # misleads the operator.
+        _nrt = job.next_run_time
+        try:
+            if _nrt is not None and getattr(_nrt, "tzinfo", None) is not None:
+                from datetime import timezone as _tz
+                _nrt = _nrt.astimezone(_tz.utc)
+        except Exception:  # noqa: BLE001
+            pass
+        lines.append(f"- ID: {job.id} | Name: {job.name} | Next Run: {_nrt}")
     return "\n".join(lines)
 
 async def tool_manage_tasks(action: str = None, scheduler=None, memory_system=None, task_name: str = None, cron_expression: str = None, prompt: str = None, task_identifier: str = None, check_command: str = None, interval_secs=None, **kwargs):

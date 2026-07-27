@@ -1109,6 +1109,186 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 (later 2) — Dead-code deletion (qwen variant) + honest cognitive-layer telemetry
+
+Operator: "delete qwen_bridge and fix mcts/arbiter in the logs." Both were the DEFERRED items from the
+same-day hunt (see later-1).
+
+DELETED (verified unreachable first): `core/agent_qwen.py` + `tools/qwen_bridge.py`. Nothing in src/, scripts/,
+bin/ or interface/ ever imported or constructed `GhostQwenAgent` — the only inbound references were tests.
+Removing the pair also retires two latent defects that would have bitten the first real user of the variant
+(`_run_coro_blocking` ran each coroutine on a FRESH loop while blocking the caller's loop in `join()` → whole-agent
+freeze + cross-loop errors; system-injected kwargs not excluded from the model-param pass-through → duplicate-kwarg
+TypeError on a hallucinated `sandbox_dir`). `qwen-agent` dropped from requirements.txt with it.
+KEPT deliberately: `soundfile` (its requirements comment claimed it was a qwen-agent transitive dep, but
+`interface/externals/tts_stt/voice_server.py` imports it — comment retargeted, pin stays) and
+`test_agent_qwen_syntax_healer` (despite the name it tests the MAIN agent's Qwen-DIALECT `<tool_call>` healer,
+which is very much live — nothing to do with the deleted variant).
+Test surgery: deleted `test_qwen_bridge_import_error.py`; excised the qwen sections from `test_deep_audit_fixes.py`,
+`test_tools_audit_fixes.py` (Fix #10) and `test_open_audit_fixes.py` (CRITICAL-2), leaving their other tests intact;
+docstring corrected in `test_bughunt_unit18_agent.py`.
+
+TELEMETRY HONESTY (the "dead consumer announced as live" class):
+• main.py boot: "MCTS + Hypothesis testing enabled (opt-in via --deep-reason)" → now reports the EFFECTIVE state
+  per module constant: "hypothesis testing ENABLED · MCTS turn-start hint OFF (module toggle — attached but never
+  invoked)". Hypothesis grounding is the part that actually runs (System-3 pivot); MCTS is hard-gated by
+  `_MCTS_TURNSTART_ENABLED = False`, which no flag can flip.
+• main.py "PRM ↔ MCTS … LLM simulation bypassed" and agent.py's idle-retrain " · MCTS now scoring via PRM" both
+  announced an upgrade to that never-invoked consumer — the agent.py string also landed in the OPERATOR-FACING
+  activity ledger. The wiring is kept (free, correct the moment the gate flips); only the CLAIMS are now gated.
+• Arbiter: the metacog BOOT log already reported `arbiter="off (module toggle)"` honestly (earlier fix), so nothing
+  to correct there. I tried also SKIPPING arbiter construction when the gate is off — REVERTED: it broke 32 tests
+  that exercise arbiter mechanics directly, and the construction is only a pair of closures over the ALREADY-loaded
+  embedder (no model load, no network), so there was no waste to reclaim. Documented in-place so the next reader
+  doesn't re-litigate it.
+
+Docs: `tools/qwen_bridge.html` + `core/agent_qwen.html` replaced with TOMBSTONE pages (what was here / why removed /
+what replaced it) so existing links don't 404; nav entries stripped from 15 pages; installation.html dependency row
+rewritten (qwen-agent gone, soundfile retargeted to the voice server); architecture.html tree line corrected.
+Docs link-check: 3 broken links remain repo-wide, all PRE-EXISTING and unrelated (`core/registry.html`,
+`distill/collector.html`, `workspace/activity.html` — targets that never existed).
+FULL SUITE: 9381 passed / 0 failed / 13 skipped. DEPLOYED (listener 33467→35513, health ok); new boot line confirmed
+in the live log, and the false "PRM ↔ MCTS" line is absent from that boot.
+
+IMPROVEMENT EVAL — MEASURED, not estimated (operator asked "which are most impactful"). Two BACKLOG CORRECTIONS
+came out of measuring instead of trusting the catalogue:
+• ⚠️ **"PG-manual re-ingest (96.7% of vector store, 100% corrupt)" — ranked #3 in the 07-26 eval — IS A
+  NON-ISSUE. DROP IT.** Measured the live store: 8438 embeddings, 8280 (98.1%) from `postgresql-19-A4.pdf`.
+  Sampled + scanned for the splitter's word-fusion signature: only 96 chunks (1.2%) match, and every one is a
+  legitimate PostgreSQL C-API camelCase identifier (`paramTypes`, `grantMask`, `forRead`) — NOT fusion. Avg chunk
+  1157 chars, prose reads clean. The corpus is HEALTHY. It also does not pollute recall: the ambient paths filter
+  `{"type": {"$ne": "document"}}` at 4 sites in vector.py (docs reach the model only via the doc-scoped
+  `knowledge_base(action='query')`). Nothing to re-ingest; the missing source PDF no longer blocks anything.
+• ❌ **The 07-26 WATCH ITEM RESOLVED NEGATIVE: streamed calibration entropy still never lands.** The fix note said
+  "verify the streamed calibration samples now carry real (non-0.5) entropy and w_entropy actually moves." Measured
+  `calibration.jsonl` (1201 samples, 07-07 → 07-27): **1200 of 1201 have `entropy_component` exactly 0.5** (the
+  neutral default) — ONE sample in three weeks carries a real value (0.7253). Hence `entropy distinct values: 2
+  (DEGENERATE)` and the fitted weights `entropy 0.0 / competence 1.0`. The confidence composite is running on
+  competence ALONE; the entropy half is structurally dead, not merely under-weighted. This is the #1 open item.
+Other measured signals (from the now-working learning-health telemetry): PRM retrains on every idle cycle (41
+`prm_train` events in the recent ledger window) while its ONLY consumer is gated off — `.score()` OFF because MCTS
+turn-start is disabled — so it is pure idle-time cost producing a checkpoint nothing reads (wire-or-retire, §3
+names the intended grounded replacement); 0 of 50 lessons GRADUATED (9 verified, 2 stale/prune candidates,
+mean hit-rate 0.611); episode context/cluster coverage 9/174 (5.2%) because the 07-26 field-population fix only
+applies to NEW episodes — the 165 older ones need a one-shot backfill for cluster retrieval to see them; idle-loop
+budget is lopsided (dream 231 vs self_play 133 vs reflection 21) and reflection is the arm that mints lessons.
+
+### 2026-07-27 (later) — Least-audited-systems bug hunt: the SQL guard that never ran + two reports that went dark
+
+Operator: "locate systems that we haven't swept for bugs and improvements, analyze them and fix/improve."
+Journal-driven target selection: every deep review since 07-20 hit the same core stacks (memory, LLM/routing,
+sandbox, metacog, turn-loop, verifier, project-autonomy), so the five clusters chosen were the ones with the
+LEAST attention since the generic 07-03/04 sweep — and two of them (`core/sessions.py`, `tools/composed_skills.py`)
+shipped 2026-07-11, AFTER that sweep, so they had NEVER been audited. Five parallel read-only agents:
+tasks/scheduling · media+bridge tools · database+games · sessions/interface/composed-skills · deep-reason+introspect.
+Agents were pre-loaded with the §4B known-deferred items so they didn't re-report them. Every HIGH re-verified at
+source by the orchestrator (several were reproduced against LIVE data/DB before fixing).
+
+CROSS-CUTTING THEME: **a guard/report that was never actually running.** Four of the five HIGHs are not logic
+errors — they are subsystems that LOOK wired and report success while doing nothing. Two were invisible because
+their tests build fixtures too small to cross the threshold that breaks them.
+
+FIXED (all verified at source; HIGH first):
+• **SQL destructive-statement guard was INOPERATIVE in prod** (validators.py). `validate_sql` delegated
+  multi-statement splitting to `sqlparse` — never in requirements.txt, NOT installed — so the `ImportError`
+  fallback (all `^`-anchored regexes) was the only path that ever ran. Live-verified clean-validating:
+  `SELECT 1; DROP TABLE web_order_line_options;`, `WITH d AS (DELETE FROM t RETURNING *) …`, `DO $$ … EXECUTE
+  'DROP TABLE t' … $$`, `/* c */ DROP TABLE t`. psycopg2 on the autocommit connection runs the whole batch, and
+  the default DB holds real tables → live data loss, no confirm, no guard message. REWRITTEN self-contained:
+  `_mask_sql` blanks literals/`--`/nested `/* */`/dollar-quoted bodies (length-preserving), splitting + paren
+  balance + verb detection all run on the mask, verbs match at STATEMENT level (not position 0) with the WHERE
+  test scoped to the match's own paren group, dollar-quoted bodies require `confirm`. No new dependency.
+• **Vision could OOM the host from a KB-sized PDF** (vision.py). The 50 MB *file* cap cannot bound `get_pixmap`;
+  a 788-byte PDF declaring a 10000×10000pt page → 1.2 GB pixmap at the fixed 2× zoom, ×10 pages, on the box that
+  runs the LLM pinned in RAM. Zoom now derived per page from `_MAX_PDF_PAGE_PIXELS` (A4 keeps full 2×).
+• **Cron tasks fired in LOCAL time** (tasks.py). A pre-built trigger instance never inherits the scheduler's
+  `timezone="UTC"` — `from_crontab(expr)` defaulted to `get_localzone()` (verified: Europe/Athens), while
+  registry.py tells the model "cron times are UTC — convert first". Every cron task fired 3h early and drifted
+  with DST. Also: all three add_job sites inherited APScheduler's 1s misfire grace, and the loop stalls >1s
+  routinely → fires SKIPPED silently, nothing in the ledger. Now `timezone="UTC"` + `misfire_grace_time=300` +
+  `coalesce=True`; `list` converts next_run_time to UTC explicitly.
+• **`introspect action='activity'` blind since ~2026-07-13** (introspect.py). `log.read_since(0)` inherits
+  `limit=200` → it read the 200 OLDEST lines of a never-rotating ledger. Reproduced against the live ledger
+  (1518 records, newest that day): returned records ending 07-13, so the report said "No background activity"
+  even at the 336h max window — dead from exactly the point the 07-17 chat-noise decision made it the ONLY home
+  of routine-maintenance records. Tests passed because fixtures are <200 lines. Now reads the TAIL.
+• **Fat-client session replay compounded the conversation** (sessions.py). `merge_history` required an EXACT
+  stored-prefix match; any divergence fell through to `stored + incoming`, re-appending the whole conversation
+  every turn (measured 5→11→19→29, quadratic) until the 400-cap filled with duplicates. Two permanent triggers:
+  an aborted stream (server persists the full reply before streaming, client keeps a partial one) and the cap
+  itself (stored loses its oldest → client replay can never prefix-match again). Now tolerates divergence at any
+  offset — the replay is authoritative and REPLACES stored; thin clients unaffected.
+• Learning-health background section never rendered (learning_health.py): `_activity_counts` keyed on
+  kind/type/category but the record serialises `phase` → always `{}` against 1500+ real records, in the very
+  instrument built for the keep/kill watch. Now keyed on `phase` + honest recent-window filter.
+• Postgres pool/session (database.py): pool keyed on the RAW URI (`postgres://` vs `postgresql://`, added query
+  params → a permanent extra connection each, walking toward max_connections) → now keyed on the resolved
+  endpoint + bounded with close-on-evict; only `statement_timeout` was reset between calls, so a `SET search_path`
+  silently changed which tables later unqualified queries resolved to (and an uncommitted batch left the pooled
+  conn idle-in-transaction holding locks) → now `rollback()` + `DISCARD ALL` per action; the 200k-char cap ran
+  AFTER fetch+tabulate each built a full copy (300 × multi-MB cells ≈ GB resident → OOM not truncation) → cells
+  clipped at 4k before render.
+• report_pdf: ATX headers matched INSIDE fenced code blocks → `# install deps` in a ```bash block became an h2
+  and the fence markers were stranded across two sections (very common in this agent's own reports); splitter now
+  tracks ```/~~~ fences. Also moved `_sections_from_files` / `_available_files_hint` / `_build_html` off the event
+  loop (25 MB/file reads + full `sorted(rglob("*"))` + 200k-char markdown parse were inline), short-circuit once
+  the report cap is blown, and `_md_to_html` degrades on ANY exception (caught only ImportError).
+• Games: tic-tac-toe bricked after one move — `load` accepted a side-to-move contradicting the parity invariant
+  it enforced two lines earlier, so "agent opens as O" produced a state the endpoint itself then 422'd forever.
+  Either side may now open (|nx-no| ≤ 1) and the turn is FORCED when counts differ (closes the double-move hole).
+  Blank `state=""` silently started a new game (chess 422'd — the two disagreed) → 422. `extract_labeled` was
+  first-wins while `extract_move_text` is last-wins → with the live THINKING model the played move and its stated
+  reasoning came from different candidates; now last-wins. NOTE: games auth was NOT forgotten in the 07-13
+  rollout (router-level `Security(verify_api_key)`, mounted before the catch-all) — verified, clean.
+• Triggers/metacog: `RepetitionCounter.observe(fname)` keyed on tool NAME and counted SUCCESSES → three reads of
+  DIFFERENT files tripped LoopDetected, and each trip burned one of the executing task's MAX_REVISIONS via the
+  ReplanBridge (after 3 benign trips a REAL failure could no longer revise). Now keyed tool+args-hash.
+  `ReplanBridge._revisions` was an unbounded list fed by every event incl. the 300s degraded-telemetry heartbeat
+  → `deque(maxlen=256)`.
+• Interface: upstream chat failure was recorded in `task["error"]` but never EMITTED → agent down = HTTP 200 +
+  empty SSE + bare "No response", no diagnostic (live stream and resume both); now an `event: error` frame, and
+  resume replays terminal truncation/error too. `GHOST_API_KEY=""` passed the presence check but can never match
+  `compare_digest` → every route incl. `/` 401s while launchd KeepAlive keeps the dead service "up" (and the
+  agent treats "" as auth-OFF, so the two diverged) → now raises at import. `stream_generator` null-checks its
+  task (janitor can pop it before the first iteration → TypeError instead of the intended marker).
+• Composed skills: a step whose tool RETURNED an error string (the codebase norm — no `error` key) rendered as
+  "FAILED — unknown error", so the model had zero diagnostic to recover from; now falls back to the result body.
+  `_load`/`approve` skipped name validation and the live registry still holds a dotted legacy entry
+  (`auto.generic.…`) → approving it would emit a dotted LLM function name; now validated on both paths.
+  `save()`'s mkdir moved inside its try (raised through record_usage → discarded a successful macro's results).
+• agent.py hypothesis adjudication: survivor indices parsed with bare `int(_i)`, but the prompt renders
+  hypotheses as "H0:/H1:" and models reply with labels → ValueError → the silent `except: pass` skipped the whole
+  promote/demote block, reinstating the "survivors = the hypotheses the evidence did NOT confirm" bug the
+  surrounding comment claims was fixed. Now tolerant per-item coercion.
+• main.py watch runner: the edge was persisted (`set_watch_state(True)`) BEFORE dispatch, and the inner defer
+  check then discarded the reaction FOREVER while the condition stayed true (next tick sees no edge) — same loss
+  on a kill mid-reaction, i.e. every deploy. Edge is now consumed only on a real dispatch (`_run_proactive_task`
+  returns dispatched/deferred). A deferred CRON job is nudged to retry in 60s rather than losing the whole period
+  ("will retry next tick" was only ever true for interval jobs).
+
+Tests: tests/test_bughunt_fixes_2026_07_27.py (64 new). Two pre-existing tests updated to match corrected
+behaviour (both asserted the OLD literal shape, not the intent): test_recent_fixes' DB-timeout test (DISCARD ALL
+now precedes the SET) and the report_pdf hint-wiring source assertion (now called via to_thread).
+FULL SUITE: 9389 passed / 0 failed / 13 skipped. Docs: 11 pages (audit_fixes + database/vision/report_pdf/tasks/
+introspect/composed_skills/sessions/triggers/game_routes/web_server).
+
+VERIFIED-CLEAN (worth NOT re-auditing): chess rules delegate correctly to python-chess (castling/en-passant/
+promotion/repetition/fifty-move all covered); games are stateless per request (no shared-state race, no growth);
+`table_name`/`timeout_ms` injection closed; DB host-redirect guard resolves libpq query-param overrides incl.
+keyword/value DSNs; connection lifecycle closes on every exception path; vision SSRF hop-revalidation + streamed
+byte caps hold; image_gen error paths (empty-b64, content-filter, data-URI, coercions) all sound; composed-skill
+recursion blocked three ways + dataflow validation correct; session persistence atomic with corrupt-file
+tolerance; interface auth covers every proxy route (only /static and /sw.js open); JobRegistry lock discipline
+and task-ref retention correct; TriggerBus subscriber isolation + capped history.
+
+DEFERRED (logged, lower value): `qwen_bridge` kwarg-collision + `_run_coro_blocking` cross-loop hazard (the
+GhostQwenAgent variant has ZERO instantiation sites — best closed by deleting the variant, as §4B already notes);
+MCTS + arbiter are dead-by-design (hardcoded `_MCTS_TURNSTART_ENABLED=False` / `_METACOG_ARBITER_ENABLED=False`)
+yet the boot log still prints "MCTS + Hypothesis testing enabled" and the PRM idle-retrain keeps wiring scorers
+into the never-invoked reasoner — misleading operator telemetry only, worth gating the log lines; tic-tac-toe
+double-winner boards still accepted; `_available_files_hint`/activity-ledger rotation; per-cell clip means a
+genuinely huge single cell is now summarised rather than partially shown.
+
 ### 2026-07-27 — Overnight-log eval → idle-loop yield fixes (counterfactual gate, mastery floor, curriculum balance, calibration entropy)
 
 Operator: "read the agents log that run overnight and evaluate" → "proceed with all fixes." The overnight run

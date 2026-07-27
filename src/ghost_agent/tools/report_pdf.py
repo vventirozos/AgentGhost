@@ -81,6 +81,7 @@ def _split_markdown_into_sections(md: str) -> list[dict]:
     split on (< 2 top-level headers), so single-section reports are left
     to the plain single-string fallback."""
     header_re = re.compile(r"^\s{0,3}(#{1,2})\s+(.+?)\s*#*\s*$")
+    fence_re = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
     sections: list[dict] = []
     heading = ""
     body_lines: list[str] = []
@@ -90,8 +91,22 @@ def _split_markdown_into_sections(md: str) -> list[dict]:
             sections.append({"heading": heading, "body": "\n".join(body_lines).strip()})
 
     found = False
+    in_fence = ""  # opening marker ("```"/"~~~") while inside a fenced block
     for ln in md.splitlines():
-        m = header_re.match(ln)
+        # `# comment` lines inside a fenced code block are CODE, not headers —
+        # splitting on them tore fences apart (comments rendered as h2s, the
+        # stranded fence markers as literal text). Track fence state and only
+        # match headers outside a fence.
+        fm = fence_re.match(ln)
+        if fm:
+            marker = fm.group(1)[0] * 3
+            if not in_fence:
+                in_fence = marker
+            elif marker == in_fence:
+                in_fence = ""
+            body_lines.append(ln)
+            continue
+        m = None if in_fence else header_re.match(ln)
         if m:
             found = True
             _flush()
@@ -125,11 +140,19 @@ def _available_files_hint(sandbox_dir: Path) -> str:
         if not root.is_dir():
             return ""
         rels = []
-        for p in sorted(root.rglob("*")):
-            if len(rels) >= _HINT_MAX_FILES:
+        # Collect matches first, sort after: sorted(root.rglob(...)) would
+        # materialize EVERY path in the tree (node_modules-scale sandboxes)
+        # before the 40-file break could fire.
+        matches = []
+        for p in root.rglob("*"):
+            if len(matches) >= 10_000:  # pathological-tree scan bound
                 break
             if not p.is_file() or p.suffix.lower() not in (".md", ".txt", ".rst"):
                 continue
+            matches.append(p)
+        for p in sorted(matches):
+            if len(rels) >= _HINT_MAX_FILES:
+                break
             # Check the SANDBOX-RELATIVE parts for a dot-prefix, not p.parts:
             # p.parts includes every ancestor of the sandbox, so if the
             # sandbox root itself lives under a dot-dir (e.g. ~/.ghost/…),
@@ -187,7 +210,15 @@ def _sections_from_files(sandbox_dir: Path, files: Any) -> tuple[list[dict], lis
     # GUESS filenames across three PDF regenerations)
     _MAX_SOURCE_FILE_BYTES = 25 * 1024 * 1024  # 25 MB per source file
     _sb_root = Path(sandbox_dir).resolve()
+    _acc_chars = 0
     for p in paths:
+        # Stop READING once the per-report cap is already blown — without
+        # this, N files x 25 MB were all buffered before the downstream cap
+        # rejected the report (a transient multi-hundred-MB spike for a call
+        # that then fails anyway).
+        if _acc_chars > _MAX_BODY_CHARS:
+            missing.append(f"{p} (skipped: {_MAX_BODY_CHARS:,}-char report cap already exceeded)")
+            continue
         try:
             if _get_safe_path is not None:
                 fp = _get_safe_path(Path(sandbox_dir), p)
@@ -213,6 +244,7 @@ def _sections_from_files(sandbox_dir: Path, files: Any) -> tuple[list[dict], lis
             continue
         if not text.strip():
             continue
+        _acc_chars += len(text)
         split = _split_markdown_into_sections(text)
         if split:
             out.extend(split)
@@ -299,6 +331,12 @@ def _md_to_html(md_text: str) -> str:
             output_format="html5",
         )
     except ImportError:
+        return f"<pre>{html.escape(md_text)}</pre>"
+    except Exception as e:
+        # A markdown-lib parse failure must degrade like the missing-lib
+        # path (escaped <pre>), not escape the tool as a raw exception.
+        pretty_log("PDF Report", f"markdown render failed, using <pre> fallback: {e}",
+                   level="WARNING", icon=Icons.REPORT_PDF)
         return f"<pre>{html.escape(md_text)}</pre>"
 
 
@@ -424,7 +462,9 @@ async def tool_generate_pdf(
     )
     file_missing: list[str] = []
     if source_files and sandbox_dir is not None:
-        file_secs, file_missing = _sections_from_files(Path(sandbox_dir), source_files)
+        # Off the event loop: this reads up to 25 MB per file.
+        file_secs, file_missing = await asyncio.to_thread(
+            _sections_from_files, Path(sandbox_dir), source_files)
         secs = secs + file_secs
 
     if not title:
@@ -441,7 +481,7 @@ async def tool_generate_pdf(
         # source_file names, so nothing rendered and it would otherwise
         # guess again). Previously the hint only fired on the SUCCESS path,
         # which required at least one section to have rendered.
-        _exist_hint = (_available_files_hint(Path(sandbox_dir))
+        _exist_hint = (await asyncio.to_thread(_available_files_hint, Path(sandbox_dir))
                        if (file_missing and sandbox_dir is not None) else "")
         return (
             "SYSTEM ERROR: 'sections' is REQUIRED for report_pdf. Pass a "
@@ -494,8 +534,11 @@ async def tool_generate_pdf(
 
     pretty_log("PDF Report", f"Title: {title[:60]} | sections={len(secs)}", icon=Icons.REPORT_PDF)
 
-    full_html = _build_html(title, subtitle, author, secs)
     try:
+        # Markdown parsing over up to 200k chars — off the event loop, and
+        # inside the try so an unexpected _build_html failure surfaces as a
+        # SYSTEM ERROR string rather than a raw exception.
+        full_html = await asyncio.to_thread(_build_html, title, subtitle, author, secs)
         pages, _pdf_truncated = await asyncio.to_thread(_render_to_pdf, full_html, out_path)
     except ImportError as e:
         return (
@@ -521,7 +564,7 @@ async def tool_generate_pdf(
     _miss_note = (
         f"\n\n(Note: {len(file_missing)} source file(s) could not be read and "
         f"were skipped: {file_missing}.)"
-        + _available_files_hint(Path(sandbox_dir))
+        + await asyncio.to_thread(_available_files_hint, Path(sandbox_dir))
         if file_missing else ""
     )
     _trunc_note = (

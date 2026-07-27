@@ -85,6 +85,16 @@ async def game_move(req: GameMoveRequest, request: Request):
     # `state` is canonical; `fen` is the chess back-compat alias; missing
     # state means "start a new game from the initial position".
     state = req.state if req.state is not None else req.fen
+    if state is not None and not str(state).strip():
+        # Same failure class as the empty `user_move` guard below: a client
+        # that cleared its state field sent "", which tic-tac-toe's `load`
+        # silently reinterpreted as "new game" — discarding the user's
+        # in-progress board and returning 200. Chess 422s on the same input,
+        # so the two games disagreed. Omission must be EXPLICIT.
+        raise HTTPException(
+            status_code=422,
+            detail="Empty 'state'. Send the current position, or OMIT the "
+                   "'state' field entirely to start a new game.")
     try:
         if state is None:
             state = adapter.initial_state()

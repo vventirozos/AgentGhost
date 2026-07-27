@@ -35,10 +35,26 @@ def _sniff_image_mime(head: bytes):
     return None
 
 
+# Types the sniffer CAN detect: a server header claiming one of these while
+# the bytes carry no matching signature is mislabeled (error page served as
+# image/jpeg) and must be refused, while sniff-blind types (SVG, AVIF, ICO)
+# still pass on the header alone.
+_SNIFFABLE_MIMES = frozenset(
+    {mime for _, mime in _IMAGE_MAGIC} | {"image/webp"}
+)
+
+# Raster budget for PDF pages: the 50 MB *file* cap cannot bound get_pixmap —
+# a KB-sized vector PDF declaring a 10000x10000pt page allocates
+# (w*zoom)·(h*zoom)·3 bytes (1.2 GB at 2x) per page. Cap pixels instead and
+# derive the zoom per page; A4 at 2x is ~2M px, so normal documents keep the
+# full 2x quality.
+_MAX_PDF_PAGE_PIXELS = 4_000_000
+
+
 async def tool_vision_analysis(action: str = None, target: str = None, llm_client=None, sandbox_dir: Path = None, tor_proxy: str = None, prompt: str = None, **kwargs):
     if not action or not target:
         return "SYSTEM ERROR: The 'action' and 'target' parameters are MANDATORY."
-    pretty_log("Vision AI", f"{action} -> {target[:30]}", icon=Icons.TOOL_DEEP)
+    pretty_log("Vision AI", f"{action} -> {str(target)[:30]}", icon=Icons.TOOL_DEEP)
 
     # Accept the aliases the model reaches for (same healing policy as
     # file_system): the custom instruction usually lands in one of these.
@@ -79,7 +95,7 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
             # (resp.content buffers the whole body regardless of size).
             MAX_VISION_BYTES = 50 * 1024 * 1024
             file_bytes = None
-            content_type = "image/jpeg"
+            content_type = ""
             # follow_redirects OFF + manual hop loop: every redirect Location
             # is re-validated against the SSRF guard before it is fetched. The
             # previous auto-follow meant a public URL 302-redirecting to
@@ -110,16 +126,30 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                             if len(_buf) > MAX_VISION_BYTES:
                                 return f"Error: '{target}' exceeds the {MAX_VISION_BYTES//(1024*1024)} MB vision cap (server omitted/exceeded Content-Length)."
                         file_bytes = bytes(_buf)
-                        content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].lower()
+                        content_type = resp.headers.get("content-type", "").split(";")[0].strip().lower()
                         break
                 else:
                     return "Error: too many redirects while fetching the image (possible redirect loop)."
-            is_pdf = content_type == "application/pdf" or target.lower().split('?')[0].endswith('.pdf')
+            is_pdf = (content_type == "application/pdf"
+                      or target.lower().split('?')[0].endswith('.pdf')
+                      or (file_bytes or b"")[:5] == b"%PDF-")
             if not is_pdf:
-                # Don't forward a non-image 200 (HTML error/login page) as an
-                # "image" — the vision model would just hallucinate over it.
-                if not content_type.startswith("image/"):
-                    return f"Error: '{target}' returned content-type '{content_type}', not an image or PDF."
+                # Type from CONTENT first, header second — same policy the
+                # local branch got in the hardening pass but the URL branch
+                # never did: a server answering with a wrong/absent
+                # Content-Type used to ship arbitrary bytes (HTML error page)
+                # to the vision model to hallucinate over.
+                _sniffed = _sniff_image_mime(file_bytes[:16] if isinstance(file_bytes, (bytes, bytearray)) else b"")
+                if _sniffed:
+                    content_type = _sniffed
+                elif not content_type.startswith("image/"):
+                    return f"Error: '{target}' returned content-type '{content_type or 'unknown'}', not an image or PDF."
+                elif content_type in _SNIFFABLE_MIMES:
+                    # Header claims a sniffable raster type but the bytes carry
+                    # no image signature — mislabeled response, refuse it.
+                    return (f"Error: '{target}' claims content-type '{content_type}' but the "
+                            f"downloaded bytes carry no image signature — refusing to send "
+                            f"non-image data to the vision model.")
                 b64_images.append((content_type, base64.b64encode(file_bytes).decode("utf-8")))
         else:
             path = _get_safe_path(sandbox_dir, target)
@@ -148,7 +178,8 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 # Mocked paths in tests, missing stat, or non-numeric mock — skip the cap.
                 pass
             file_bytes = await asyncio.to_thread(path.read_bytes)
-            is_pdf = str(path).lower().endswith('.pdf')
+            is_pdf = (str(path).lower().endswith('.pdf')
+                      or (file_bytes or b"")[:5] == b"%PDF-")
             if not is_pdf:
                 # Type from CONTENT first (magic bytes), the ORIGINAL target
                 # name second — sniffing catches images with a wrong/absent
@@ -179,14 +210,21 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                 import fitz # PyMuPDF
                 def _process_pdf():
                     doc = fitz.open(stream=file_bytes, filetype="pdf")
-                    total = len(doc)
-                    imgs = []
-                    for i in range(min(total, 10)): # 10 pages max to protect context
-                        page = doc.load_page(i)
-                        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                        imgs.append(("image/jpeg", base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')))
-                    doc.close()
-                    return imgs, total
+                    try:
+                        total = len(doc)
+                        imgs = []
+                        for i in range(min(total, 10)): # 10 pages max to protect context
+                            page = doc.load_page(i)
+                            # Zoom from a PIXEL budget, not a fixed 2x (see
+                            # _MAX_PDF_PAGE_PIXELS): caps the raster allocation
+                            # per page regardless of declared page size.
+                            _pts = max(1.0, float(page.rect.width) * float(page.rect.height))
+                            _zoom = min(2.0, (_MAX_PDF_PAGE_PIXELS / _pts) ** 0.5)
+                            pix = page.get_pixmap(matrix=fitz.Matrix(_zoom, _zoom))
+                            imgs.append(("image/jpeg", base64.b64encode(pix.tobytes("jpeg")).decode('utf-8')))
+                        return imgs, total
+                    finally:
+                        doc.close()
                 b64_images, pdf_total_pages = await asyncio.to_thread(_process_pdf)
                 pdf_pages_analyzed = len(b64_images)
             except ImportError:

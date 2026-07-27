@@ -30,6 +30,17 @@ except KeyError as _e:
         "GHOST_API_KEY environment variable is required. "
         "Set it to the shared secret the agent's main API also uses."
     ) from _e
+if not GHOST_API_KEY.strip():
+    # An EMPTY/whitespace key passed the presence check above but made
+    # `compare_digest` unmatchable, so every route — including `/` — answered
+    # 401 while launchd's KeepAlive kept the dead service "up". The agent
+    # treats an empty key as auth-OFF, so the two also disagreed. Fail loudly
+    # at import instead of booting into a silent all-401 outage.
+    raise RuntimeError(
+        "GHOST_API_KEY is set but EMPTY. An empty key cannot authenticate any "
+        "request — the interface would answer 401 to everything. Set the real "
+        "shared secret (see ~/Data/AI/.ghost_api_key)."
+    )
 PI_VOICE_URL = os.environ.get("PI_VOICE_URL", "http://raspberrypi.local:8000")
 
 # Hard limit on inbound request body sizes for upload paths. The previous
@@ -74,6 +85,15 @@ async def verify_interface_key(x_ghost_key: str | None = Header(default=None)) -
         x_ghost_key.encode("utf-8"), GHOST_API_KEY.encode("utf-8")
     ):
         raise HTTPException(status_code=401, detail="Missing or invalid X-Ghost-Key header.")
+
+
+def _upstream_error_frame(msg: str) -> bytes:
+    """SSE error frame for an upstream chat failure, shaped like the buffer-
+    cap marker the UI already understands."""
+    import json as _json
+    payload = _json.dumps({"error": {"message": f"upstream chat failed: {str(msg)[:300]}",
+                                     "type": "UpstreamError"}})
+    return b"event: error\ndata: " + payload.encode("utf-8") + b"\n\n"
 
 
 def _err_json(status: int, msg: str) -> JSONResponse:
@@ -428,6 +448,16 @@ async def chat_proxy(request: Request):
 
             async def stream_generator():
                 task = active_chat_tasks.get(task_id)
+                if task is None:
+                    # The janitor's hard-cap path can cancel+pop a live task
+                    # before this generator's first iteration; dereferencing
+                    # None then aborted the stream with a TypeError instead
+                    # of the intended error marker.
+                    yield (
+                        b"event: error\n"
+                        b"data: {\"error\": {\"message\": \"stream evicted before it started (server at capacity)\", \"type\": \"TaskEvicted\"}}\n\n"
+                    )
+                    return
                 offset = 0  # CHUNK index, NOT byte index. task["buffer"]
                 # is a list of bytes objects; yielding `task["buffer"][i]`
                 # ships an entire HTTP chunk per iteration. The previous
@@ -453,6 +483,12 @@ async def chat_proxy(request: Request):
                                 b"event: error\n"
                                 b"data: {\"error\": {\"message\": \"stream truncated: per-task buffer cap exceeded\", \"type\": \"BufferCapExceeded\"}}\n\n"
                             )
+                        # An upstream failure (agent down, 5xx) was recorded
+                        # in task["error"] but never emitted: the client got
+                        # HTTP 200 with an EMPTY stream and rendered a bare
+                        # "No response" with no diagnostic.
+                        elif task.get("error"):
+                            yield _upstream_error_frame(task["error"])
                         break
                     await task["new_data_event"].wait()
                     
@@ -515,6 +551,16 @@ async def chat_resume_proxy(task_id: str, offset: int = 0):
                 yield task["buffer"][client_offset]
                 client_offset += 1
             if task["done"]:
+                # Replay the TERMINAL status too — a resumed stream that
+                # dropped the truncation/error marker looked like a clean
+                # completion to the client.
+                if task.get("truncated"):
+                    yield (
+                        b"event: error\n"
+                        b"data: {\"error\": {\"message\": \"stream truncated: per-task buffer cap exceeded\", \"type\": \"BufferCapExceeded\"}}\n\n"
+                    )
+                elif task.get("error"):
+                    yield _upstream_error_frame(task["error"])
                 break
             await task["new_data_event"].wait()
             

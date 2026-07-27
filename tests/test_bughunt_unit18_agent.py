@@ -1,4 +1,7 @@
-"""Regression tests for bug-hunt unit 18 (core-agent: agent.py + agent_qwen.py).
+"""Regression tests for bug-hunt unit 18 (core-agent: agent.py).
+
+(The unit originally also covered `agent_qwen.py`; that variant and its
+`tools/qwen_bridge.py` were deleted 2026-07-27 as unreachable dead code.)
 
 See BUGHUNT.md. Fixed bugs pinned here:
 

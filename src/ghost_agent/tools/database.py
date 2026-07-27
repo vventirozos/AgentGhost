@@ -22,20 +22,49 @@ _conn_locks: dict = {}
 _pool_lock = threading.Lock()  # guards the two module dicts above
 
 
+# Max distinct cached connections. Each entry is a real server-side
+# connection held for the daemon's lifetime; without a bound, cosmetically
+# different URIs for the SAME database ("postgres://" vs "postgresql://",
+# an added ?application_name=) each opened another one and walked toward
+# PostgreSQL's max_connections until every DB call failed.
+_MAX_POOLED_CONNECTIONS = 8
+
+
+def _pool_key(connection_string: str) -> str:
+    """Normalise a URI to its resolved endpoint so cosmetically different
+    strings for the same database share ONE cached connection."""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        p = urlparse(connection_string)
+        q = parse_qs(p.query)
+
+        def _last(key):
+            vals = q.get(key)
+            return vals[-1] if vals else ""
+        host = (_last("hostaddr") or _last("host") or (p.hostname or "")).lower()
+        port = str(_last("port") or (p.port or 5432))
+        dbname = _last("dbname") or (p.path or "").lstrip("/")
+        user = (_last("user") or (p.username or "")).lower()
+        return f"{user}@{host}:{port}/{dbname}"
+    except Exception:  # noqa: BLE001 — an unparseable URI keys on itself
+        return str(connection_string)
+
+
 def _get_uri_lock(connection_string: str) -> threading.Lock:
     """Return the per-URI lock serializing use of that URI's connection."""
+    key = _pool_key(connection_string)
     with _pool_lock:
-        lk = _conn_locks.get(connection_string)
+        lk = _conn_locks.get(key)
         if lk is None:
             lk = threading.Lock()
-            _conn_locks[connection_string] = lk
+            _conn_locks[key] = lk
         return lk
 
 
 def _evict_connection(connection_string: str):
     """Drop the cached connection for a URI (after a connection error)."""
     with _pool_lock:
-        _connection_pool.pop(connection_string, None)
+        _connection_pool.pop(_pool_key(connection_string), None)
 
 
 def _get_connection(connection_string: str):
@@ -45,8 +74,9 @@ def _get_connection(connection_string: str):
     function reads/writes the shared connection for the URI.
     """
     import psycopg2
+    key = _pool_key(connection_string)
     with _pool_lock:
-        conn = _connection_pool.get(connection_string)
+        conn = _connection_pool.get(key)
     if conn is not None:
         try:
             # Check if connection is still alive
@@ -59,8 +89,52 @@ def _get_connection(connection_string: str):
         conn = psycopg2.connect(connection_string)
         conn.autocommit = True
         with _pool_lock:
-            _connection_pool[connection_string] = conn
+            # Bound the pool: close and drop the oldest entry rather than
+            # accumulating server-side connections forever.
+            while len(_connection_pool) >= _MAX_POOLED_CONNECTIONS:
+                _old_key = next(iter(_connection_pool))
+                _old = _connection_pool.pop(_old_key, None)
+                try:
+                    if _old is not None and not getattr(_old, "closed", 0):
+                        _old.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            _connection_pool[key] = conn
     return conn
+
+
+# Per-cell display cap. A few KB is far more than a model can use from a
+# single field, and it keeps the rendered table proportional to the row
+# count instead of to the widest blob in the table.
+_MAX_CELL_CHARS = 4000
+
+
+def _clip_row_cells(rows):
+    """Clip oversized cell values before rendering. Accepts psycopg2
+    RealDictRow (dict-like) or plain tuples; anything unexpected is passed
+    through untouched (a display helper must never break a query)."""
+    def _clip(v):
+        if isinstance(v, (bytes, bytearray, memoryview)):
+            b = bytes(v)
+            if len(b) > _MAX_CELL_CHARS:
+                return f"<{len(b)} bytes, truncated> " + repr(b[:200])
+            return v
+        if isinstance(v, str) and len(v) > _MAX_CELL_CHARS:
+            return v[:_MAX_CELL_CHARS] + f"… [cell truncated, {len(v)} chars]"
+        return v
+
+    out = []
+    try:
+        for r in rows:
+            if hasattr(r, "keys"):
+                out.append({k: _clip(r[k]) for k in r.keys()})
+            elif isinstance(r, (list, tuple)):
+                out.append(type(r)(_clip(v) for v in r))
+            else:
+                out.append(r)
+        return out
+    except Exception:  # noqa: BLE001
+        return rows
 
 
 async def tool_postgres_admin(action: str = None, connection_string: Optional[str] = None, query: Optional[str] = None, table_name: Optional[str] = None, default_uri: Optional[str] = None, timeout_ms: Optional[int] = None, confirm: bool = False, **kwargs):
@@ -197,7 +271,24 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
         effective_timeout = 15000
     effective_timeout = max(100, min(effective_timeout, 600000))
 
-    def _run_action(cur):
+    def _run_action(cur, conn=None):
+        # The cached connection carries SESSION state across independent tool
+        # calls. `statement_timeout` was reset below, but every OTHER session
+        # setting leaked too — a `SET search_path TO staging` in one call
+        # silently changed which tables unqualified names resolved to many
+        # calls later (the model then reports the wrong table's data as fact),
+        # and a batch that opened a transaction without committing left the
+        # pooled connection idle-in-transaction holding locks. Roll back and
+        # DISCARD ALL first so every call starts from a clean session.
+        try:
+            if conn is not None:
+                conn.rollback()
+        except Exception:  # noqa: BLE001 — best-effort session reset
+            pass
+        try:
+            cur.execute("DISCARD ALL")
+        except Exception:  # noqa: BLE001 — not fatal (e.g. inside a pooler)
+            pass
         # Statement timeout is SESSION-scoped on the cached autocommit
         # connection, so a prior call's `SET statement_timeout=100` would
         # leak into THIS call and cause spurious cancellations on a healthy
@@ -268,7 +359,13 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
                 rows = cur.fetchmany(301)
                 if not rows: return "Query executed successfully. No rows returned."
                 truncated = len(rows) > 300
-                output = tabulate(rows[:300], headers="keys", tablefmt="pipe")
+                # Clip each CELL before tabulate builds a second full copy of
+                # the result set as one string. The char cap below bounds what
+                # reaches the model but not host memory: 300 rows x multi-MB
+                # bytea/jsonb cells materialised ~GB resident (fetch + table)
+                # before it could fire, OOMing the agent instead of truncating.
+                rows = _clip_row_cells(rows[:300])
+                output = tabulate(rows, headers="keys", tablefmt="pipe")
                 # Byte cap: the 300-ROW limit gives no protection against a
                 # single huge cell (e.g. SELECT repeat('x', 1e8)) — the whole
                 # value would materialise into the model context / host memory.
@@ -320,7 +417,7 @@ async def tool_postgres_admin(action: str = None, connection_string: Optional[st
                 try:
                     conn = _get_connection(connection_string)
                     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                        return _run_action(cur)
+                        return _run_action(cur, conn)
                 except Exception as e:
                     # Always discard the (possibly broken) connection.
                     last_err = e

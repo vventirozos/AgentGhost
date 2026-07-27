@@ -585,11 +585,16 @@ async def lifespan(app):
 
         _sched = AsyncIOScheduler(timezone="UTC")
 
-        async def _run_proactive_task(job_id: str, prompt: str):
+        async def _run_proactive_task(job_id: str, prompt: str) -> bool:
             """Dispatch a scheduled prompt back through the agent's chat
             handler. Any exception here is logged but not re-raised — a
             single failing scheduled job must not kill the scheduler
             thread and take down every other job with it.
+
+            Returns True when the prompt was actually DISPATCHED (whether it
+            then succeeded or failed) and False when it was deferred behind a
+            live user request — callers that consume a one-shot edge (the
+            watch runner) must only consume it on True.
 
             Outcomes (success or failure) are also sunk into the
             workspace activity log so the user can query
@@ -616,7 +621,20 @@ async def lifespan(app):
                         f"{job_id} — a user request is active; will retry next tick.",
                         icon=Icons.SKIP,
                     )
-                    return
+                    # "Next tick" is only true for interval jobs. For a CRON
+                    # job the next occurrence may be a day away — the fire
+                    # would be silently lost. Nudge a short-delay retry.
+                    try:
+                        from apscheduler.triggers.cron import CronTrigger as _CT
+                        _j = _sched.get_job(job_id) if _sched else None
+                        if _j is not None and isinstance(getattr(_j, "trigger", None), _CT):
+                            from datetime import datetime as _dtt, timedelta as _tdl, timezone as _tzz
+                            _sched.modify_job(
+                                job_id,
+                                next_run_time=_dtt.now(_tzz.utc) + _tdl(seconds=60))
+                    except Exception:  # noqa: BLE001 — retry nudge is best-effort
+                        pass
+                    return False
                 pretty_log(
                     "Scheduled Task Fire",
                     f"{job_id} | prompt={prompt[:80]!r}",
@@ -659,6 +677,7 @@ async def lifespan(app):
                         )
                 except Exception:  # noqa: BLE001
                     pass
+                return True
             except Exception as e:
                 pretty_log(
                     "Scheduled Task Failed",
@@ -687,6 +706,9 @@ async def lifespan(app):
                         )
                 except Exception:  # noqa: BLE001
                     pass
+                # Dispatched-and-failed still consumed the fire (the failure
+                # is recorded above) — only the DEFER path returns False.
+                return True
 
         async def _run_watch_condition(job_id: str):
             """Reactive-watch tick (2026-07-16): poll the watch's shell
@@ -720,7 +742,6 @@ async def lifespan(app):
                 return
             condition_met = (code == 0)
             if condition_met and not last_fired:
-                _tools_tasks.set_watch_state(job_id, True)   # edge → armed
                 pretty_log("Watch Fired",
                            f"{job_id} ({task_name}): condition became TRUE — reacting",
                            icon=Icons.BRAIN_PLAN)
@@ -729,7 +750,20 @@ async def lifespan(app):
                     f"{reaction_prompt}\n\n[This was triggered by your watch "
                     f"'{task_name}': the condition `{check_command}` just became "
                     f"true (exit 0). Its output:\n{ctx_out}\n]")
-                await _run_proactive_task(job_id, full_prompt)
+                # Consume the edge ONLY after a real dispatch. Persisting
+                # last_fired=True first meant a deferral (user became active
+                # during the check window) or a kill mid-reaction discarded
+                # the reaction FOREVER while the condition stayed true —
+                # next tick saw no edge. A duplicate reaction after a crash
+                # is the acceptable side; a lost one is not.
+                dispatched = await _run_proactive_task(job_id, full_prompt)
+                if dispatched:
+                    _tools_tasks.set_watch_state(job_id, True)   # edge → armed
+                else:
+                    pretty_log("Watch Reaction Deferred",
+                               f"{job_id} ({task_name}): user active — edge kept, "
+                               "will re-fire next tick",
+                               icon=Icons.SKIP)
             elif not condition_met and last_fired:
                 _tools_tasks.set_watch_state(job_id, False)  # cleared → re-armable
                 pretty_log("Watch Reset",
@@ -878,9 +912,21 @@ async def lifespan(app):
             context.hypothesis_tester = HypothesisTester(
                 llm_client=context.llm_client,
             )
+            # Report the EFFECTIVE state, not the wiring. The MCTS
+            # turn-start hint is hard-gated by a module constant in
+            # core/agent.py (§3 cognitive-layer toggle) — no flag can turn
+            # it on — so announcing "MCTS enabled" told the operator a
+            # never-invoked consumer was live. Hypothesis grounding IS live
+            # (System-3 pivot), and it is the part that earns its keep.
+            from .core import agent as _agent_mod
+            _mcts_live = bool(getattr(_agent_mod, "_MCTS_TURNSTART_ENABLED", False))
+            _hyp_live = bool(getattr(_agent_mod, "_HYPOTHESIS_GROUNDING_ENABLED", True))
             pretty_log(
                 "Deep Reasoning",
-                "MCTS + Hypothesis testing enabled (opt-in via --deep-reason)",
+                "hypothesis testing "
+                + ("ENABLED" if _hyp_live else "off (GHOST_HYPOTHESIS_GROUNDING=0)")
+                + " · MCTS turn-start hint "
+                + ("enabled" if _mcts_live else "OFF (module toggle — attached but never invoked)"),
                 icon=Icons.MCTS_TREE,
             )
         except Exception as e:
@@ -950,11 +996,17 @@ async def lifespan(app):
     # backtrack stack and any in-flight state intact.
     if context.mcts_reasoner is not None and context.prm_scorer.has_model:
         context.mcts_reasoner.prm_scorer = context.prm_scorer
-        pretty_log(
-            "PRM ↔ MCTS",
-            "MCTS reasoner now uses PRM for candidate scoring (LLM simulation bypassed)",
-            icon=Icons.BRAIN_PLAN,
-        )
+        # Only ANNOUNCE it when the reasoner can actually run — the
+        # turn-start call site is hard-gated off, so this line was telling
+        # the operator a dead consumer had been upgraded. The wiring itself
+        # is kept (free, and correct the moment the gate flips).
+        from .core import agent as _agent_mod
+        if getattr(_agent_mod, "_MCTS_TURNSTART_ENABLED", False):
+            pretty_log(
+                "PRM ↔ MCTS",
+                "MCTS reasoner now uses PRM for candidate scoring (LLM simulation bypassed)",
+                icon=Icons.BRAIN_PLAN,
+            )
 
     # Persist the resolved checkpoint path so the biological retrain
     # phase knows where to write the next checkpoint. When --prm-model

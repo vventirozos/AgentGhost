@@ -169,6 +169,14 @@ class MetacogBundle:
         )
         bundle.bridge.attach()
 
+        # NOTE on the §3 module toggle: the dual-solver CALL SITE is
+        # hard-gated by `_METACOG_ARBITER_ENABLED` in core/agent.py, so with
+        # that constant False the arbiter can never actually fire. The
+        # object is still built here deliberately — it is a pair of closures
+        # over the already-loaded embedder (no model load, no network), the
+        # test suite exercises its mechanics directly, and it is ready the
+        # moment the gate flips. The BOOT log reports the EFFECTIVE state
+        # ("off (module toggle)"), so this costs no operator confusion.
         if bundle.arbiter_enabled:
             # Candidate sampling is a real LLM completion over Tor; the
             # per-sample timeout has to clear that latency or both

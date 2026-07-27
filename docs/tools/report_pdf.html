@@ -79,6 +79,14 @@ exact markdown so the file is offered for download:
     <li>The hint's hidden-directory filter checks the SANDBOX-RELATIVE path parts, not the absolute <code>p.parts</code> — so a sandbox root that itself lives under a dot-directory (e.g. <code>~/.ghost/sandbox/</code>) no longer makes the hint silently return empty. Covered by <code>tests/test_tools_batch_audit_fixes.py</code>.</li>
   </ul>
 
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong>ATX headers were matched inside fenced code blocks (MED, closed).</strong> <code>_split_markdown_into_sections</code> had no fence state, so a <code>```bash</code> block containing <code>#&nbsp;install deps</code> / <code>#&nbsp;start the server</code> — extremely common in this agent's own reports — split into sections headed by those comments, with the opening fence stranded in one section's body and the closing fence in another. The rendered PDF showed comment lines as <code>h2</code> headings and the code as broken literal text. The splitter now tracks <code>```</code>/<code>~~~</code> fences and only matches headers outside them.</li>
+    <li><strong>Heavy I/O and CPU ran on the event loop (MED, closed).</strong> <code>_sections_from_files</code> read up to 25 MB per source file, <code>_available_files_hint</code> materialised the entire sandbox tree (<code>sorted(root.rglob("*"))</code> consumes the whole generator before the 40-file break), and <code>_build_html</code> parsed up to 200k chars of markdown — all inline, stalling every conversation and background loop. These now run via <code>asyncio.to_thread</code>; the hint collects matches before sorting; and <code>_sections_from_files</code> short-circuits once the per-report char cap is exceeded instead of buffering N×25 MB for a call that then fails.</li>
+    <li><code>_md_to_html</code> now degrades to escaped <code>&lt;pre&gt;</code> on any markdown-library exception (it previously caught only <code>ImportError</code>, so a parse failure escaped the tool as a raw exception), and <code>_build_html</code> moved inside the error-handling <code>try</code>.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

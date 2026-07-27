@@ -61,10 +61,15 @@ async def test_database_statement_timeout():
         
         # Verify execute was called with SET statement_timeout — now
         # PARAMETERIZED (int-clamped) instead of f-string-interpolated.
+        # The session reset (`DISCARD ALL`) runs first, so locate the SET
+        # rather than assuming it is call 0.
         calls = mock_cur.execute.call_args_list
-        assert calls[0][0][0] == "SET statement_timeout = %s"
-        assert calls[0][0][1] == (15000,)
-        assert "SELECT 1" in calls[1][0][0]
+        stmts = [c[0][0] for c in calls]
+        assert "DISCARD ALL" in stmts, "session state must be reset per call"
+        _i = stmts.index("SET statement_timeout = %s")
+        assert calls[_i][0][1] == (15000,)
+        # The timeout is applied BEFORE the query runs.
+        assert any("SELECT 1" in s for s in stmts[_i + 1:])
 
 @pytest.mark.asyncio
 async def test_execute_stubbornness_large_file():

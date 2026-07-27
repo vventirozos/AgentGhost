@@ -45,6 +45,15 @@
   <h2>Timezone</h2>
   <p>The scheduler runs on <strong>UTC</strong> (<code>AsyncIOScheduler(timezone="UTC")</code>): cron expressions are interpreted in UTC and <code>list</code> output is labelled accordingly — a <q>Next Run: 06:00</q> read as local time would make a correctly-firing task look 2-3 hours late (or early) from Athens. The <code>manage_tasks</code> schema now tells the model to convert local-time requests to UTC when building the expression. (Deliberately NOT switched to the host timezone: existing expressions were authored under UTC semantics, and silently shifting their firing times on upgrade would be its own invisible bug.)</p>
 
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong>Cron tasks fired in LOCAL time, not the UTC the contract promises (HIGH, closed).</strong> The tool description tells the model "cron times are UTC — convert first (09:00 Athens summer = <code>'0 6 * * *'</code>)" and the scheduler is built with <code>timezone="UTC"</code> — but a <em>pre-built trigger instance</em> never inherits the scheduler's timezone (APScheduler returns instances from <code>_create_trigger</code> as-is), so <code>CronTrigger.from_crontab(expr)</code> defaulted to <code>get_localzone()</code>. Verified against the installed venv: the trigger's timezone was <code>Europe/Athens</code>. Every cron task fired hours early, silently, and drifted with DST. The trigger is now built with an explicit <code>timezone="UTC"</code>.</li>
+    <li><strong>Misfires were silently skipped (MED, closed).</strong> All three <code>add_job</code> sites inherited APScheduler's default <code>misfire_grace_time=1s</code>; the agent's event loop stalls longer than that routinely (large prompt assembly, synchronous memory work), and the executor <em>skips</em> the run with only a logger warning — nothing reaches the activity ledger, so a lost daily run was invisible. Jobs now register with <code>misfire_grace_time=300</code> and <code>coalesce=True</code>.</li>
+    <li><code>list</code> now converts <code>next_run_time</code> to UTC explicitly rather than printing a trigger-zone datetime under a "times in UTC" header.</li>
+    <li><strong>Deferred cron fires are rescheduled, not dropped</strong> (see <code>main.py</code>): a scheduled task that lands while a user request is in flight is deferred with "will retry next tick" — true for interval jobs, but for a cron job the next tick could be a day away, so the run was silently lost. A deferred cron job is now nudged to retry in 60 s.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

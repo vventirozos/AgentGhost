@@ -3757,9 +3757,16 @@ class GhostAgent:
                                 mcts_note = ""
                                 if mcts is not None and getattr(mcts, 'prm_scorer', None) is None:
                                     mcts.prm_scorer = prm_scorer
-                                    mcts_note = " · MCTS now scoring via PRM"
                                 elif mcts is not None and getattr(mcts, 'prm_scorer', None) is prm_scorer:
-                                    mcts_note = " · MCTS weights refreshed"
+                                    pass
+                                # Keep the wiring, drop the CLAIM: the MCTS
+                                # turn-start call site is hard-gated off, so
+                                # "MCTS now scoring via PRM" advertised an
+                                # upgrade to a consumer that is never invoked
+                                # — and this string also lands in the
+                                # operator-facing activity ledger.
+                                if mcts is not None and _MCTS_TURNSTART_ENABLED:
+                                    mcts_note = " · MCTS scoring via PRM"
                                 pretty_log(
                                     "PRM Retrain",
                                     f"value model refit on idle: {report.summary()}{mcts_note}",
@@ -8457,7 +8464,14 @@ class GhostAgent:
                             # ReplanBridge can revise the active task), reset.
                             _rep = getattr(_mc, "repetition", None)
                             if _rep is not None and _bus is not None and hasattr(_rep, "observe"):
-                                _streak = _rep.observe(fname)
+                                # Key on tool + args-hash, not the bare tool
+                                # name: three reads of DIFFERENT files in a
+                                # row are normal work, and name-only keying
+                                # tripped LoopDetected on every such stretch
+                                # — each trip burned one of the active
+                                # task's MAX_REVISIONS via the ReplanBridge.
+                                # Only an identically-argued repeat counts.
+                                _streak = _rep.observe(f"{fname}|{a_hash}")
                                 if _rep.tripped():
                                     from .triggers import loop_event as _loop_event
                                     await _bus.publish(_loop_event(
@@ -15965,10 +15979,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                             _eval = await tester.evaluate_results(
                                 task_context, hypotheses)
                             try:
-                                _surv_idx = {
-                                    int(_i) for _i in
-                                    (_eval or {}).get("surviving_hypotheses", [])
-                                }
+                                # Tolerant per-item coercion: the prompt shows
+                                # hypotheses as "H0:/H1:" and models reply with
+                                # labels ("H0") as often as bare indices. A
+                                # bare int() over the whole set threw on the
+                                # FIRST such label, the except below swallowed
+                                # it, and the entire promote/demote block was
+                                # skipped — resurrecting the very bug the
+                                # comment above says was fixed (survivors =
+                                # the hypotheses the evidence did NOT confirm).
+                                _surv_idx = set()
+                                for _i in (_eval or {}).get("surviving_hypotheses", []):
+                                    try:
+                                        _digits = re.sub(r"\D", "", str(_i))
+                                        if _digits:
+                                            _surv_idx.add(int(_digits))
+                                    except (TypeError, ValueError):
+                                        continue
                                 if _surv_idx or (_eval or {}).get("conclusion"):
                                     for _hi, _h in enumerate(hypotheses):
                                         if _hi in _surv_idx:

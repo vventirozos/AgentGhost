@@ -28,7 +28,6 @@
     <a href="swarm.html">swarm</a>
     <a href="tasks.html">tasks</a>
     <a href="projects.html">projects</a>
-    <a href="qwen_bridge.html">qwen_bridge</a>
     <a href="acquired_skills.html">acquired_skills</a>
     <a href="composed_skills.html">composed_skills</a>
     <a href="tool_failure.html">tool_failure</a>
@@ -68,6 +67,15 @@
 
   <h2>DSN</h2>
   <p>Default DSN comes from <code>--default-db</code> / <code>GHOST_DEFAULT_DB</code>. The tool can be invoked with an alternative DSN per-call.</p>
+
+
+  <h2>2026-07-27 audit fixes (least-audited-systems bug hunt)</h2>
+  <ul>
+    <li><strong>The destructive-SQL guard was INOPERATIVE in production (HIGH, closed).</strong> <code>validate_sql</code> used <code>sqlparse</code> to split multi-statement bundles and fell through to regex-only checks on <code>ImportError</code> — but <code>sqlparse</code> was never a declared dependency and is <em>not installed</em>, so the fallback was the only path that ever ran. Since the remaining regexes were <code>^</code>-anchored, <code>SELECT 1; DROP TABLE web_order_line_options;</code> validated clean and psycopg2's autocommit connection executed the whole batch. Statement splitting is now done in-module against a masked copy of the SQL, with no optional import — see <code>tools/validators.py</code>.</li>
+    <li><strong>Pool keyed on the raw URI (MED, closed).</strong> <code>postgres://…</code> and <code>postgresql://…</code> for the same database (both accepted by the host guard, which compares only host/port/dbname) each opened a <em>permanent</em> connection, as did any added query parameter; <code>_conn_locks</code> grew alongside. Repeated over a long-lived process this walks toward PostgreSQL's <code>max_connections</code> until every DB call fails. Entries are now keyed on the resolved endpoint (<code>_pool_key</code>) and the pool is bounded at <code>_MAX_POOLED_CONNECTIONS</code>, closing the evicted connection.</li>
+    <li><strong>Session state leaked across independent calls (MED, closed).</strong> Only <code>statement_timeout</code> was reset. A <code>SET search_path TO staging</code> in one call silently changed which tables unqualified names resolved to many calls later — the model then reports the wrong table's data as fact — and a batch that opened a transaction without committing left the pooled connection idle-in-transaction holding locks. Every action now begins with <code>rollback()</code> + <code>DISCARD ALL</code>.</li>
+    <li><strong>The 200k-char output cap bounded context, not host memory (MED, closed).</strong> It was applied <em>after</em> <code>fetchmany(301)</code> and <code>tabulate</code> had each materialised a full copy, so 300 rows of multi-MB <code>bytea</code>/<code>jsonb</code> cells reached ~GB resident and OOM'd the agent rather than truncating. Cells are now clipped at <code>_MAX_CELL_CHARS</code> before rendering.</li>
+  </ul>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

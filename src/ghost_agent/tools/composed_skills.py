@@ -295,6 +295,16 @@ class ComposedSkillRegistry:
         # defined after it (single outer try aborted the whole load).
         for name, skill_data in (data or {}).items():
             try:
+                # Validate on LOAD as well as on define: a legacy/hand-edited
+                # entry with a dotted name (live registry still holds one)
+                # would otherwise reach to_tool_definitions and emit an
+                # invalid LLM function name for the whole catalogue.
+                try:
+                    _validate_composed_name(name)
+                except ValueError as _nerr:
+                    logger.warning("Quarantining composed skill with invalid "
+                                   "name %r: %s", name, _nerr)
+                    continue
                 steps = [
                     SkillStep(**{k: v for k, v in s.items() if k in SkillStep.__dataclass_fields__})
                     for s in skill_data.get("steps", [])
@@ -326,9 +336,12 @@ class ComposedSkillRegistry:
         can't interleave and truncate/corrupt the registry file."""
         if not self.storage_dir:
             return
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
         path = self._registry_path()
         try:
+            # mkdir INSIDE the try: on a read-only/full volume it raised
+            # through record_usage → execute(), discarding a macro run's real
+            # results, contradicting this method's swallow-and-warn design.
+            self.storage_dir.mkdir(parents=True, exist_ok=True)
             data = {name: skill.to_dict() for name, skill in self.skills.items()}
             with self._save_lock:
                 tmp = path.with_suffix(".json.tmp")
@@ -860,7 +873,12 @@ def _format_execution_result(skill_name: str, result: Dict[str, Any]) -> str:
             blocks.append(f"{head}:\n{r.get('result', '')}")
         else:
             opt = " (optional)" if r.get("optional") else ""
-            blocks.append(f"{head}: FAILED{opt} — {r.get('error', 'unknown error')}")
+            # Fall back to the RESULT body: a step whose tool returned an
+            # error STRING (the codebase norm) carries no "error" key, so the
+            # model saw "FAILED — unknown error" with zero diagnostic and
+            # could not recover or re-route.
+            detail = r.get("error") or r.get("result") or "unknown error"
+            blocks.append(f"{head}: FAILED{opt} — {detail}")
     return "\n\n".join(blocks)
 
 
@@ -1016,6 +1034,15 @@ async def tool_manage_composed_skills(context=None, action: str = None,
         sk = reg.skills[name]
         if sk.status == "active":
             return f"Composed skill '{name}' is already active."
+        # Re-validate before activation: `define` validates, but a macro that
+        # entered the registry another way (skills-auto mint, hand-edited
+        # file) could otherwise be flipped active with a name that is illegal
+        # as an LLM function name.
+        try:
+            _validate_composed_name(name)
+        except ValueError as ve:
+            return (f"Error: cannot approve '{name}' — {ve} Delete it and "
+                    f"re-define it under a valid name.")
         sk.status = "active"
         reg.save()
         pretty_log("Macro Approved", f"Activated proposed macro: {name}", icon=Icons.OK)

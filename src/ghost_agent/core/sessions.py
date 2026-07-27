@@ -127,17 +127,40 @@ def merge_history(stored: List[dict], incoming: List[dict]) -> List[dict]:
 
     Detection compares (role, content) pairs over the stored prefix — this
     is what stops a fat client from doubling the conversation on every turn.
+
+    The prefix compare must tolerate DIVERGENCE, not just exact equality. A
+    fat client whose stored copy differs by a single message — an aborted
+    stream leaves the server holding the full reply while the client kept a
+    partial one, and a session at ``MAX_MESSAGES_PER_SESSION`` has its oldest
+    messages dropped server-side — used to fall through to ``stored +
+    incoming``, re-appending the ENTIRE conversation every turn (5 → 11 → 19
+    → 29 messages, quadratic, until the cap filled with duplicates). When
+    incoming is recognisably the same conversation replayed, it is
+    authoritative and simply replaces the stored copy.
     """
     stored = stored or []
     incoming = incoming or []
     if not stored:
         return list(incoming)
+
+    def _key(m):
+        return (m.get("role"), str(m.get("content") or ""))
+
     if len(incoming) >= len(stored):
-        def _key(m):
-            return (m.get("role"), str(m.get("content") or ""))
         if all(_key(a) == _key(b)
                for a, b in zip(stored, incoming[:len(stored)])):
             return list(incoming)   # fat client — already carries the history
+        # Same conversation, slightly diverged: look for an alignment of the
+        # stored messages inside incoming that matches everywhere except (at
+        # most) the final stored message. `delta > 0` covers the cap-eviction
+        # case, where stored lost its oldest messages but incoming still has
+        # them.
+        for _delta in range(0, len(incoming) - len(stored) + 1):
+            _matched = sum(
+                1 for _i, _s in enumerate(stored)
+                if _key(_s) == _key(incoming[_i + _delta]))
+            if _matched >= 1 and _matched >= len(stored) - 1:
+                return list(incoming)   # fat replay wins — do NOT concatenate
     # A thin client re-sends its system prompt every turn; appending it each
     # time grew an unbounded run of duplicate system messages (and eventually
     # bypassed append_turn's history cap). Keep only system messages we don't

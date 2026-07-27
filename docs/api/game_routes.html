@@ -91,6 +91,15 @@
   <h2>Tests</h2>
   <p>Chess rules: <code>tests/test_game_move_api.py</code>. Game dispatch, tic-tac-toe, and the adapter registry: <code>tests/test_game_adapters.py</code>.</p>
 
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong>Tic-tac-toe bricked after one move when the agent opened as O (MED, closed).</strong> <code>load</code> accepted an explicit side-to-move that contradicted the X-first parity invariant it enforced two lines earlier: <code>"......... O"</code> (the natural "agent opens as O, human plays X" request) was accepted, the agent played O, and the resulting <code>"....O.... X"</code> — 0 X vs 1 O — was then rejected by that same invariant with HTTP 422, forever. Either side may now open (counts may differ by one in <em>either</em> direction), and when the counts differ the side to move is <strong>forced</strong>, which also closes the turn-enforcement hole where the explicit field let one side move twice.</li>
+    <li><strong>A blank <code>state</code> silently started a new game (LOW, closed).</strong> <code>state=""</code> is not <code>None</code>, so it bypassed the "no state → initial position" branch and reached <code>load</code>, which reinterpreted it as a fresh board — discarding the user's in-progress game and returning HTTP 200. Chess 422'd on the same input, so the two games disagreed. This is the same failure class as the 2026-07-05 empty-<code>user_move</code> incident guarded a few lines below; a blank <code>state</code> is now rejected with 422.</li>
+    <li><strong>Explanations came from the model's discarded draft (MED, closed).</strong> <code>extract_move_text</code> takes the LAST <code>MOVE:</code> line (correct for thinking models that restate their choice) but <code>extract_labeled</code> took the FIRST match — so with the live thinking model, a reply that drafts a move inside <code>&lt;think&gt;</code>, rejects it, and commits to another had its move taken from the final answer and its <code>EXPLANATION</code> from the abandoned one, teaching the user the reasoning for a move that was never played. <code>extract_labeled</code> is now last-wins, matching <code>extract_move_text</code>.</li>
+    <li>Confirmed NOT an issue: the games endpoints <em>were</em> included in the 2026-07-13 API-key rollout — <code>game_router</code> carries a router-level <code>Security(verify_api_key)</code> and is mounted before the catch-all proxy.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

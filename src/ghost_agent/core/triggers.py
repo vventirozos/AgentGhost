@@ -356,7 +356,11 @@ class ReplanBridge:
         # behaviour identical to before the hook existed.
         self.counter_hook = counter_hook
         self._attached = False
-        self._revisions: List[Dict[str, Any]] = []
+        # Bounded: every published event (incl. recurring host-telemetry
+        # heartbeats) appends a record here — an unbounded list grows for
+        # the daemon's whole uptime. The bus's own history is capped at 64;
+        # keep this audit log capped too.
+        self._revisions: Deque[Dict[str, Any]] = deque(maxlen=256)
 
     def attach(self) -> None:
         if self._attached:

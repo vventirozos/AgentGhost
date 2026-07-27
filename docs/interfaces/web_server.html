@@ -140,6 +140,14 @@
   </ul>
   <p>Both code paths share <code>_toAuthedBlobUrl</code> and the same blob cache, so an artefact opened once doesn't refetch. Because a <code>MutationObserver</code> only reports future mutations, the same processing (<code>_processChatLogArtifacts</code>) is also run once on startup against the chat history restored from <code>localStorage</code>, so restored images/PDF links get the authed-blob treatment instead of 401-ing. Auto-opening the visualizer is suppressed while history is being restored (live replies still auto-open).</p>
 
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong>Upstream chat failures were recorded but never emitted (MED, closed).</strong> <code>background_stream_worker</code> stored the exception in <code>task["error"]</code> and set <code>done</code>, but <code>stream_generator</code> surfaced only <code>truncated</code> — so when the agent on :8000 was down or returned 4xx/5xx the browser received HTTP 200 with a zero-event SSE stream and rendered a bare "No response" with no diagnostic. Both the live stream and <code>/api/chat/resume/{id}</code> now emit an <code>event: error</code> frame shaped like the existing buffer-cap marker, and resume replays the terminal truncation/error status too.</li>
+    <li><strong>An empty <code>GHOST_API_KEY</code> booted into a silent all-401 outage (MED, closed).</strong> The import guard only checked that the variable <em>exists</em>, so a whitespace-only key file (rotation mishap) produced <code>""</code> — which passes the presence check but can never match under <code>compare_digest</code>, making every route including <code>/</code> return 401 while launchd's KeepAlive kept the dead service "up". The agent, meanwhile, treats an empty key as auth-OFF, so the two diverged. An empty key now raises at import.</li>
+    <li><code>stream_generator</code> null-checks its task: the janitor's hard-cap path can cancel and pop a live task before the generator's first iteration, which previously raised <code>TypeError</code> and aborted the stream instead of yielding the intended error marker.</li>
+  </ul>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

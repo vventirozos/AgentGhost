@@ -179,4 +179,7 @@ class TestAvailableFilesHint:
     def test_wired_into_the_skipped_files_note(self):
         src = (Path(__file__).resolve().parents[1] / "src" / "ghost_agent"
                / "tools" / "report_pdf.py").read_text()
-        assert "_available_files_hint(Path(sandbox_dir))" in src
+        # Called via to_thread (it walks the sandbox tree — off the event
+        # loop), so match the call by name + argument rather than by the
+        # exact literal spelling.
+        assert "_available_files_hint, Path(sandbox_dir)" in src

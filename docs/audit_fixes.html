@@ -73,6 +73,34 @@
     label leakage). Everything else preserves documented behaviour while fixing a latent bug.
   </div>
 
+  <h2>Least-audited-systems bug hunt (2026-07-27): the SQL guard that never ran, and two reports that went dark</h2>
+  <p>Five parallel read-only agents were pointed at the subsystems that had gone longest
+  without a deep review — tasks/scheduling, media &amp; bridge tools, database + games,
+  sessions/interface/composed-skills, and the deep-reason/introspection stack. Two of
+  those files (<code>core/sessions.py</code>, <code>tools/composed_skills.py</code>) shipped
+  <em>after</em> the last full static sweep and had never been audited at all. Every
+  finding below was reproduced at source before it was fixed.</p>
+  <table>
+    <thead><tr><th>Defect</th><th>Why it mattered</th><th>Sev</th></tr></thead>
+    <tbody>
+      <tr><td>The destructive-SQL guard was inoperative in production</td><td><code>validate_sql</code> delegated multi-statement splitting to <code>sqlparse</code>, which was never a declared dependency and is not installed — so the <code>ImportError</code> fallback (all <code>^</code>-anchored regexes) was the only path that ever ran. <code>SELECT 1; DROP TABLE …</code>, a CTE-wrapped <code>DELETE</code>, a <code>DO $$…$$</code> block and <code>/* c */ DROP TABLE t</code> all validated clean, and psycopg2's autocommit connection executes the whole batch. Rewritten self-contained: structural checks now run against a masked copy of the SQL (literals, comments and dollar-quoted bodies blanked), verbs are matched at statement level rather than position 0, and dollar-quoted bodies require <code>confirm</code>.</td><td>high</td></tr>
+      <tr><td>Vision could OOM the host from a KB-sized PDF</td><td>The 50 MB <em>file</em> cap cannot bound <code>get_pixmap</code>: a 788-byte PDF declaring a 10000&times;10000 pt page rasterised to a 1.2 GB pixmap at the fixed 2&times; zoom, &times;10 pages, on a host that runs the LLM pinned in RAM. Zoom is now derived per page from a pixel budget.</td><td>high</td></tr>
+      <tr><td>Cron tasks fired in local time, not UTC</td><td>A pre-built <code>CronTrigger</code> instance never inherits the scheduler's UTC, so <code>from_crontab()</code> defaulted to <code>Europe/Athens</code> while the tool contract tells the model to convert to UTC first — every cron task fired hours early and drifted with DST. Misfires were also skipped silently under APScheduler's 1 s default grace.</td><td>high</td></tr>
+      <tr><td><code>introspect action='activity'</code> had been blind since 2026-07-13</td><td><code>read_since(0)</code> inherits <code>limit=200</code>, so the operator-facing "what did you do while I was away" report replayed the 200 <em>oldest</em> lines of a ledger that never rotates. Against the live 1518-record ledger it reported "no background activity" at every window size. Now reads the tail.</td><td>high</td></tr>
+      <tr><td>Fat-client session replay compounded the conversation</td><td><code>merge_history</code> required an exact stored-prefix match; any divergence — an aborted stream, or the message cap evicting the oldest messages — fell through to <code>stored + incoming</code>, re-appending the whole conversation every turn (5 &rarr; 11 &rarr; 19 &rarr; 29, quadratic) until the cap filled with duplicates.</td><td>high</td></tr>
+      <tr><td>Learning-health's background section never rendered</td><td><code>_activity_counts</code> keyed on <code>kind</code>/<code>type</code>/<code>category</code>, but the record serialises the field as <code>phase</code> — so it always returned <code>{}</code> against 1500+ real records, indistinguishable from "nothing ran", in the very instrument built for the keep/kill watch.</td><td>med</td></tr>
+      <tr><td>Postgres pool keyed on the raw URI; session state leaked</td><td>Equivalent DSNs each opened a permanent connection (walking toward <code>max_connections</code>), and only <code>statement_timeout</code> was reset between calls — so a <code>SET search_path</code> silently changed which tables later queries resolved to. Now keyed on the resolved endpoint, bounded, and reset with <code>rollback()</code> + <code>DISCARD ALL</code>.</td><td>med</td></tr>
+      <tr><td>Report PDFs tore code blocks apart</td><td><code>_split_markdown_into_sections</code> matched ATX headers inside fenced blocks, so <code>#&nbsp;install deps</code> in a <code>```bash</code> block became an <code>h2</code> and the fence markers were stranded across two sections. The same tool also ran multi-MB file reads and markdown parsing on the event loop.</td><td>med</td></tr>
+      <tr><td>Tic-tac-toe bricked after one move</td><td><code>load</code> accepted a side-to-move that contradicted the parity invariant it enforced two lines earlier, so "agent opens as O" produced a state the endpoint itself then rejected forever with 422.</td><td>med</td></tr>
+      <tr><td>LoopDetected fired on benign work</td><td>The repetition counter keyed on tool NAME and counted successes, so three reads of different files tripped it — and each trip burned one of the executing project task's three revisions via the ReplanBridge.</td><td>med</td></tr>
+      <tr><td>Upstream chat failures rendered as "No response"</td><td>The interface recorded the error in the task but emitted only truncation markers, so an agent outage reached the browser as HTTP 200 with an empty SSE stream and no diagnostic.</td><td>med</td></tr>
+      <tr><td>Composed-skill failures reported "unknown error"</td><td>Tools signal failure by returning an error string (no <code>error</code> key), so the formatter discarded the real diagnostic and the model could not recover or re-route. Invalid legacy macro names could also reach the LLM function catalogue via <code>approve</code>.</td><td>med</td></tr>
+      <tr><td>Game explanations came from the discarded draft</td><td><code>extract_move_text</code> is last-wins but <code>extract_labeled</code> was first-wins, so with the live thinking model the played move and its stated reasoning came from different candidate moves.</td><td>med</td></tr>
+    </tbody>
+  </table>
+  <p>Regression tests: <code>tests/test_bughunt_fixes_2026_07_27.py</code> (64). Full suite
+  9389 passed / 0 failed.</p>
+
   <h2>Never-reviewed cohorts sweep (2026-07-15): the memory upgrade, search racing, web UI, and ablation harnesses</h2>
   <p>The 2026-07-14 memory-system upgrade, the 2026-07-08 Tor search-racing core, the
   2026-07-13 web-face rewrite, and the post-hunt GAIA/ablation scripts had all shipped

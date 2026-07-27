@@ -28,17 +28,20 @@ tiktoken>=0.5.0
 sentencepiece>=0.2.0
 huggingface-hub>=0.20.0
 psutil>=5.9.0
-qwen-agent>=0.0.30
-# Transitive dependency of qwen-agent: `qwen_agent/utils/utils.py` does
-# `import soundfile` at module load time. Without it, importing anything
-# under `qwen_agent.*` (including `qwen_agent.tools.base` used by
-# `tools/qwen_bridge.py`) fails with ModuleNotFoundError on the first
-# call. The default agent path doesn't touch qwen_bridge, so the bug
-# was dormant until someone used the `agent_qwen.py` Qwen variant or
-# ran `tests/test_qwen*_bridge.py`. Pinned here so installs never
-# leave the transitive dep unsatisfied. macOS / Windows: pip ships a
-# prebuilt wheel with libsndfile bundled. Linux: also needs the
-# system `libsndfile1` package (apt-get install libsndfile1).
+# `qwen-agent` was REMOVED 2026-07-27 along with the `agent_qwen.py` /
+# `tools/qwen_bridge.py` variant it existed for. That variant had zero
+# instantiation sites — nothing ever constructed GhostQwenAgent — so the
+# dependency (and its heavy transitive tree) was pure install cost, while
+# the bridge itself carried two latent defects (a cross-loop
+# `_run_coro_blocking` that would freeze the whole agent, and unguarded
+# kwarg collisions). The live agent runs `core/agent.py`, which speaks to
+# llama-server over the OpenAI-compatible API and needs none of it.
+#
+# Read audio/waveform I/O. Now required only by the TTS/STT voice-server
+# external (`interface/externals/tts_stt/voice_server.py`), NOT by
+# qwen-agent — keep it pinned for that deploy. macOS / Windows: pip ships a
+# prebuilt wheel with libsndfile bundled. Linux: also needs the system
+# `libsndfile1` package (apt-get install libsndfile1).
 soundfile>=0.12.0
 # Chess move legality + FEN handling for the participant-mode game endpoint
 # (api: POST /v1/game/move) — the agent plays the user itself; python-chess

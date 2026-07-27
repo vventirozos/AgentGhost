@@ -163,6 +163,13 @@
   semaphore free; the handle_chat wiring points; and every endpoint, including
   that a request WITHOUT <code>session_id</code> stores nothing and behaves
   exactly as before.</p>
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong><code>merge_history</code> compounded the whole conversation every turn (HIGH, closed).</strong> The fat-client detection required the stored history to be an <em>exact</em> prefix of the client's replay; on any divergence it fell through to <code>stored + incoming</code>, so the entire replay was appended again — and <code>append_turn</code> stored it. Measured: 5 &rarr; 11 &rarr; 19 &rarr; 29 messages over four turns (quadratic), until the 400-message cap filled with duplicates and the LLM context was dominated by repeated history.</li>
+    <li>Two realisable triggers, both permanent once hit: (a) an <strong>aborted stream</strong> — the server persists the full reply before streaming, so a client that disconnects mid-reply keeps a truncated copy and every subsequent turn diverges; (b) the <strong>message cap</strong> — once a session exceeds <code>MAX_MESSAGES_PER_SESSION</code> the stored copy loses its oldest messages, so the client's replay can never prefix-match again.</li>
+    <li>Detection now tolerates divergence: when the incoming replay aligns with the stored messages everywhere except (at most) the final one — at any offset, which covers the cap-eviction case — the replay is treated as authoritative and <em>replaces</em> the stored copy instead of being concatenated onto it. Thin clients (which send only new messages) are unaffected. Regression tests: <code>tests/test_bughunt_fixes_2026_07_27.py::TestSessionMerge</code>.</li>
+  </ul>
 </main>
 </body>
 </html>

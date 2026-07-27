@@ -54,6 +54,12 @@
     <li><b>warning</b> — triggers a replan if a current task id is known.</li>
     <li><b>critical</b> — same as warning, but caller policies may also halt new tool dispatch until the trigger clears.</li>
   </ul>
+
+  <h2>2026-07-27 audit fixes</h2>
+  <ul>
+    <li><strong>LoopDetected fired on benign work and burned the active task's revision budget (MED, closed).</strong> The dispatch loop called <code>RepetitionCounter.observe(fname)</code> — keyed on the tool NAME alone, and counting successes — so three consecutive reads of <em>different</em> files tripped the detector. Each trip published a loop event, and with metacog live the <code>ReplanBridge</code> knocked the IN_PROGRESS task back to PENDING, stamped a spurious failure reason and incremented <code>revision_count</code>; after three benign trips the <code>MAX_REVISIONS</code> cap was exhausted and a <em>real</em> failure could no longer request a revision. Observation is now keyed on tool + args-hash, so only an identically-argued repeat counts.</li>
+    <li><strong><code>ReplanBridge._revisions</code> was unbounded (LOW, closed).</strong> Every published event — including the host-telemetry heartbeat re-emitted every 300 s while degraded — appended a record dict, with no cap, for the daemon's entire uptime (the bus's own history is capped at 64). It is now a <code>deque(maxlen=256)</code>; the <code>revisions</code> property still returns a list.</li>
+  </ul>
 </main>
 </body>
 </html>

@@ -143,12 +143,49 @@ def _render_recall(self_model, query: str, limit: int) -> str:
     return "\n".join(lines)
 
 
+# Bytes of ledger TAIL scanned for the activity report. The ledger never
+# rotates, so a from-byte-0 replay grows without bound; the report only ever
+# renders a recent window, so scanning the tail is both sufficient and O(1).
+_ACTIVITY_TAIL_BYTES = 512 * 1024
+# Records kept while scanning (the render caps output well below this).
+_ACTIVITY_SCAN_KEEP = 1000
+
+
+def _read_activity_tail(log):
+    """Return the most RECENT records in the ledger.
+
+    ``read_since`` caps each call at ``limit=200`` records, so the previous
+    single ``read_since(0)`` returned the 200 OLDEST lines and the report
+    went permanently blind once the never-rotated ledger passed 200 entries
+    — live, that meant every 'what did you do while I was away' answer was
+    built from records that stopped on 2026-07-13 (verified 2026-07-27).
+    Seek near the end and drain forward instead.
+    """
+    records = []
+    try:
+        size = log.current_offset()
+        off = max(0, size - _ACTIVITY_TAIL_BYTES)
+        # A tail seek can land mid-line; that partial line fails to parse and
+        # is skipped by read_since (one boundary record lost, by design).
+        for _ in range(1000):  # hard stop — never spin on a pathological file
+            chunk, new_off = log.read_since(off)
+            if chunk:
+                records.extend(chunk)
+                if len(records) > _ACTIVITY_SCAN_KEEP:
+                    records = records[-_ACTIVITY_SCAN_KEEP:]
+            if new_off <= off:
+                break
+            off = new_off
+    except Exception:  # noqa: BLE001 — a report must never break the tool
+        pass
+    return records
+
+
 def _render_activity(context, *, hours=None, limit=None) -> str:
     """Full-ledger view (ALL severities) over a bounded recent window.
-    Reads from byte 0 — the ledger is small (≈100KB/week) and the render
-    caps output, so a full replay is cheaper than tracking a second
-    watermark; the finalize banner's watermark is deliberately NOT
-    consumed (this is a read, not an ack)."""
+    Reads the ledger TAIL (see ``_read_activity_tail``); the finalize
+    banner's watermark is deliberately NOT consumed (this is a read, not
+    an ack)."""
     from ..core.autonomous_activity import (
         get_activity_log, render_activity_report,
     )
@@ -166,7 +203,7 @@ def _render_activity(context, *, hours=None, limit=None) -> str:
     except (TypeError, ValueError):
         n = _DEFAULT_ACTIVITY_LIMIT
     n = max(1, min(n, _MAX_ACTIVITY_LIMIT))
-    records, _off = log.read_since(0)
+    records = _read_activity_tail(log)
     pretty_log("Introspect", f"activity report requested ({h:g}h window)",
                icon=Icons.BRAIN_SUM)
     return render_activity_report(records, hours=h, limit=n)
