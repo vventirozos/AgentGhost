@@ -1197,6 +1197,12 @@ Tests: tests/test_uncertainty_pressure_wiring.py (new — behavioral hedge→pre
 both paths + single-scan-site + drain reset) and test_calibration_probability_map.py feature-health cases
 (stand-ins→insufficient, observed-minority-not-drowned, tiny-corpus-withheld). Docs: docs/core/uncertainty.html
 (ordering-bug section), docs/tools/introspect.html (verdict semantics).
+FULL SUITE: 9638 passed, 13 skipped. DEPLOYED (70152→70508); functional_live_test 32/32 (one warm-up soft on
+the first run right after restart, clean on rerun). LIVE-VERIFIED the mechanism: a hedged live turn recorded
+uncertainty_pressure=0.0667 — the FIRST nonzero in the corpus's history (unhedged turn before it: 0.0; risk
+footer rendered, durable log accruing hedges incl. from background turns). Live feature table now honest:
+entropy n=14 [insufficient — one outcome class so far], uncertainty_pressure distinct=2 (was 1 forever),
+effort live. Watch both via introspect action='learning' as observed failed-class samples accrue.
 
 ### 2026-07-27 (later 13) — w_entropy un-pinned: native n_probs sidesteps the tools+stream logprobs 400
 
