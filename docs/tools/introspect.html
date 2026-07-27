@@ -170,6 +170,19 @@
     <li>Test coverage added for <code>action='learning'</code> end-to-end, the truncation note, the read-error path, the never-raises guard, principles/ages rendering, and index-cache invalidation.</li>
   </ul>
 
+  <h2>2026-07-27 (later) — feature-liveness verdicts made honest</h2>
+  <p>The learning report's per-feature table (<code>_feature_health</code>) blended entropy's
+  neutral 0.5 <em>stand-ins</em> (unobserved samples) with real observations — ~1300 stand-ins
+  drowned the handful of post-n_probs-fix real values and branded the feature DEAD with
+  separation ~0 <em>by construction</em> (the same "no signal" vs "neutral measurement"
+  conflation fixed earlier for <code>entropy_distinct_values</code>). Entropy is now judged over
+  OBSERVED samples only, every feature row carries <code>n</code>, and the verdict is three-way:
+  <code>live</code> / <code>dead</code> / <code>insufficient</code> (fewer than 10 eligible rows
+  or a single outcome class — no honest verdict yet, and critically NOT "live" either: 5
+  one-class observations must not read as a working feature). Same session:
+  <code>uncertainty_pressure</code>'s constant 0.0 was root-caused as an ordering bug in the turn
+  loop, not a dead concept — see <a href="../core/uncertainty.html">uncertainty</a>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

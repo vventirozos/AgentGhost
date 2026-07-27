@@ -418,6 +418,13 @@ def _label_health(samples: List[dict]) -> Dict[str, Any]:
     return out
 
 
+# Reporting floor for a feature-liveness verdict: below this many eligible
+# samples, separation is statistical noise and the honest verdict is
+# "insufficient", not live/dead. A reporting constant, not a mechanism
+# mirror — no fit gates on it.
+_FEATURE_MIN_SAMPLES = 10
+
+
 def _feature_health(samples: List[dict]) -> Dict[str, Any]:
     """Per-feature liveness for the confidence composite.
 
@@ -429,6 +436,16 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
     discrimination, and why no amount of recalibration can help. Surfacing
     per-feature separation makes a dead input obvious instead of leaving it
     to be inferred from a bad Brier months later.
+
+    Entropy is judged over OBSERVED samples only (2026-07-27, later):
+    unobserved samples carry the neutral 0.5 stand-in, and blending ~1300
+    stand-ins with a handful of real observations forced separation to ~0
+    by construction — the report branded the feature DEAD hours after the
+    n_probs fix started producing real values. Same "no signal" vs
+    "neutral measurement" conflation as the entropy_distinct_values fix.
+    Verdicts: "live" | "dead" | "insufficient" (fewer than
+    ``_FEATURE_MIN_SAMPLES`` eligible rows, or only one outcome class
+    among them — nothing honest can be said yet).
     """
     out: Dict[str, Any] = {}
     if not samples:
@@ -441,25 +458,27 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
         except (TypeError, ValueError):
             return 0.0
 
-    ok = [s for s in samples if _outcome(s) >= 0.5]
-    bad = [s for s in samples if _outcome(s) < 0.5]
     feats = {}
     for name in ("entropy_component", "competence_component",
                  "uncertainty_pressure", "effort_component"):
+        if name == "entropy_component":
+            rows = [s for s in samples if s.get("entropy_observed")]
+        else:
+            rows = samples
         vals = []
-        for s in samples:
+        for s in rows:
             try:
                 v = s.get(name)
                 if v is not None:
                     vals.append(float(v))
             except (TypeError, ValueError):
                 continue
-        if not vals:
-            continue
+        if not vals and not any(name in s for s in samples):
+            continue  # feature never recorded at all — nothing to report
 
-        def _mean(rows):
+        def _mean(subset):
             got = []
-            for s in rows:
+            for s in subset:
                 try:
                     v = s.get(name)
                     if v is not None:
@@ -468,6 +487,8 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
                     continue
             return (sum(got) / len(got)) if got else None
 
+        ok = [s for s in rows if _outcome(s) >= 0.5]
+        bad = [s for s in rows if _outcome(s) < 0.5]
         m_ok, m_bad = _mean(ok), _mean(bad)
         sep = (round(m_ok - m_bad, 4)
                if (m_ok is not None and m_bad is not None) else None)
@@ -479,13 +500,22 @@ def _feature_health(samples: List[dict]) -> Dict[str, Any]:
         # competence signal has 270 distinct values and separates by
         # −0.0008. Separation is what matters; distinctness alone only
         # catches the fully-constant case.
+        if len(vals) < _FEATURE_MIN_SAMPLES or sep is None:
+            verdict = "insufficient"
+        elif distinct < 2 or abs(sep) < 0.02:
+            verdict = "dead"
+        else:
+            verdict = "live"
         feats[name] = {
+            "n": len(vals),
             "distinct": distinct,
             "separation": sep,
-            "dead": distinct < 2 or (sep is not None and abs(sep) < 0.02),
+            "verdict": verdict,
+            "dead": verdict == "dead",
         }
     out["feature_health"] = feats
-    out["live_features"] = [k for k, v in feats.items() if not v["dead"]]
+    out["live_features"] = [k for k, v in feats.items()
+                            if v["verdict"] == "live"]
     return out
 
 
@@ -687,10 +717,17 @@ def render_learning_health(memory_dir) -> str:
                 f"  features: {len(live)}/{len(fh)} live"
                 + (f" ({', '.join(live)})" if live else " — NONE discriminate"))
             for name, st in fh.items():
-                _flag = "DEAD" if st["dead"] else "live"
+                _flag = str(st.get("verdict") or
+                            ("DEAD" if st.get("dead") else "live"))
+                _flag = "DEAD" if _flag == "dead" else _flag
                 lines.append(
-                    f"    {name}: distinct={st['distinct']} "
+                    f"    {name}: n={st.get('n')} distinct={st['distinct']} "
                     f"separation={st['separation']} [{_flag}]")
+            if any(v.get("verdict") == "insufficient" for v in fh.values()):
+                lines.append(
+                    "    (insufficient = <10 eligible samples or one outcome "
+                    "class — no honest verdict yet; entropy is judged over "
+                    "OBSERVED samples only)")
 
     au = r.get("auto_skills")
     if au:

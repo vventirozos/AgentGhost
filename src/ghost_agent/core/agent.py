@@ -10169,6 +10169,30 @@ class GhostAgent:
         except Exception:
             pass
 
+        # Hedge auto-scan MUST run BEFORE the calibration record
+        # below (2026-07-27): _record_calibration_safe's fallback
+        # reads uncertainty_tracker.pressure(), and this scan is the
+        # tracker's load-bearing feeder (the flag_uncertainty tool
+        # has never been called live — 0 records in the durable
+        # log). It used to live in the surfacing block AFTER the
+        # record, so every calibration sample read the pre-scan
+        # tracker and uncertainty_pressure was a constant 0.0
+        # across the whole corpus (1 distinct value — a dead
+        # feature by construction, found by learning-health
+        # feature-liveness telemetry).
+        try:
+            _hs_tracker = getattr(self.context, 'uncertainty_tracker', None)
+            if _hs_tracker is not None:
+                for _hedge in _hs_tracker.scan_text_for_uncertainty(
+                    final_ai_content or ""
+                ):
+                    _hs_tracker.flag_assumption(
+                        _hedge, confidence=0.4,
+                        basis="auto-detected hedge in response",
+                    )
+        except Exception:
+            pass
+
         # Calibration spine (roadmap phase 2.5): pair THIS turn's
         # last composite-confidence reading with the realized
         # outcome (clean turn → 1.0; any structural tool failure
@@ -10199,21 +10223,14 @@ class GhostAgent:
         try:
             tracker = getattr(self.context, 'uncertainty_tracker', None)
             if tracker is not None:
-                # Auto-populate from the agent's own output: any
-                # explicit first-person hedge ("I'm assuming…",
-                # "I couldn't verify…") becomes a tracked, persisted
-                # assumption — so the tracker is load-bearing even
-                # when the LLM never calls flag_uncertainty.
-                try:
-                    for _hedge in tracker.scan_text_for_uncertainty(
-                        final_ai_content or ""
-                    ):
-                        tracker.flag_assumption(
-                            _hedge, confidence=0.4,
-                            basis="auto-detected hedge in response",
-                        )
-                except Exception:
-                    pass
+                # NOTE: the hedge auto-scan that populates the tracker
+                # from the agent's own output now runs EARLIER in this
+                # method — before _record_calibration_safe — so the
+                # calibration sample's uncertainty_pressure sees it
+                # (2026-07-27; it used to run here, after the record,
+                # which left the feature a constant 0.0). This block
+                # reads the already-populated tracker for the footer /
+                # verify / reset lifecycle.
                 # Resolve unknowns the agent answered for ITSELF this
                 # turn: when an info-gathering tool ran successfully and
                 # an unknown's resolution pointed at that path, mark it
@@ -15278,12 +15295,27 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # Verbalised-uncertainty pressure
                                 # (core.uncertainty) — fuses the
                                 # "agent said it was unsure" track
-                                # into the composite. No-op until
-                                # the calibration spine fits λ > 0.
+                                # into the composite. The streamed
+                                # path never ran the finalize-side
+                                # hedge auto-scan at all (2026-07-27
+                                # root-cause: with the flag tool
+                                # never called live, pressure was
+                                # structurally 0.0 here) — scan the
+                                # streamed answer before reading.
                                 _upress = 0.0
                                 try:
                                     _utk = getattr(self.context, "uncertainty_tracker", None)
                                     if _utk is not None:
+                                        try:
+                                            for _hedge in _utk.scan_text_for_uncertainty(
+                                                full_content or ""
+                                            ):
+                                                _utk.flag_assumption(
+                                                    _hedge, confidence=0.4,
+                                                    basis="auto-detected hedge in response",
+                                                )
+                                        except Exception:  # noqa: BLE001
+                                            pass
                                         _upress = _utk.pressure()
                                 except Exception:
                                     _upress = 0.0
@@ -15544,6 +15576,19 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                 budget_exhausted=False,
                 final_ai_content=full_content,
             )
+
+            # Streamed-turn tracker reset (2026-07-27): the finalize
+            # surfacing block (footer/verify/reset) never runs on this
+            # path, so hedge assumptions scanned into the tracker for
+            # THIS turn's pressure reading would leak into the next
+            # turn's — reset here, after the calibration record consumed
+            # the state. The durable persisted log is untouched.
+            try:
+                _utk_reset = getattr(self.context, "uncertainty_tracker", None)
+                if _utk_reset is not None:
+                    _utk_reset.reset()
+            except Exception:  # noqa: BLE001
+                pass
 
             # --- VERIFIER GATE (STREAM), 2026-07-18 ---
             # The gated verdict was historically invoked only

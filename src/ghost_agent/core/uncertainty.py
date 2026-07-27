@@ -62,8 +62,10 @@ class Assumption:
 # tracker from the agent's own output, so uncertainty is load-bearing
 # even when the LLM never calls the flag_uncertainty tool explicitly.
 _HEDGE_RE = re.compile(
-    r"\b(i(?:'m| am) (?:assuming|not sure|not certain|unsure)|i assume\b|"
-    r"assuming that|i (?:can(?:no|')?t|could not|couldn't) verify|"
+    r"\b(i(?:'m| am) (?:assuming|not sure|not certain|unsure|uncertain)|i assume\b|"
+    r"assuming that|i (?:can(?:no|')?t|could not|couldn'?t) (?:verify|confirm)|"
+    r"i (?:was|am) unable to (?:verify|confirm)|"
+    r"i have no way to (?:verify|confirm|check|know)|"
     r"i don'?t have access to|it'?s unclear|i'?m guessing|"
     r"without (?:more|further) (?:info|information|context))",
     re.IGNORECASE,

@@ -1167,6 +1167,37 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 (later 14) — uncertainty_pressure de-zeroed (ordering bug) + feature-health verdicts made honest
+
+Follow-up to the operator's learning-report evaluation: the two real to-dos it surfaced.
+
+UNCERTAINTY_PRESSURE ≡ 0.0 — ROOT-CAUSED, an ordering bug, not a dead concept. Evidence: the durable
+uncertainty_log.jsonl has 2 records EVER (both hedge-scan) and the flag_uncertainty tool has never been called
+live. Three arms:
+• Non-streamed finalize: _record_calibration_safe reads tracker.pressure() ~20 lines BEFORE the hedge
+  auto-scan populated the tracker (the scan lived in the surfacing block, after the record) — every sample
+  recorded the pre-scan empty state. The scan — designed to be "load-bearing even when the LLM never calls
+  flag_uncertainty" — fed only the user-facing footer, never calibration. Scan hoisted above the record;
+  surfacing block keeps footer/verify/reset on the already-populated tracker.
+• Streamed path: NO scan ran at all before the end-of-stream pressure read. Scan added on full_content before
+  the read; drain now resets the tracker after its calibration record (finalize's reset never runs on the
+  stream path — without it, hedge state would leak into the NEXT turn's reading).
+• Feeder volume: hedge regex broadened conservatively (unable to verify/confirm, can't confirm, I'm
+  uncertain, no way to verify/check/know). Deliberately narrow — false pressure on confident turns poisons λ
+  the other way. Expected post-fix shape: sparse-but-real (nonzero only on verbally-hedged turns).
+
+FEATURE-HEALTH VERDICTS: _feature_health blended entropy's neutral 0.5 stand-ins with real observations —
+~1300 stand-ins forced separation≈0 by construction and branded entropy DEAD hours after the n_probs fix
+started producing real values (same "no signal" vs "neutral measurement" conflation as the
+entropy_distinct_values fix). Entropy now judged over OBSERVED rows only; every feature row carries n; verdict
+is three-way live/dead/insufficient (<10 eligible rows or one outcome class → withheld, and critically NOT
+"live": 5 one-class observations must not read as a working feature).
+
+Tests: tests/test_uncertainty_pressure_wiring.py (new — behavioral hedge→pressure + source-pinned ordering on
+both paths + single-scan-site + drain reset) and test_calibration_probability_map.py feature-health cases
+(stand-ins→insufficient, observed-minority-not-drowned, tiny-corpus-withheld). Docs: docs/core/uncertainty.html
+(ordering-bug section), docs/tools/introspect.html (verdict semantics).
+
 ### 2026-07-27 (later 13) — w_entropy un-pinned: native n_probs sidesteps the tools+stream logprobs 400
 
 Operator asked how to fix the streamed-path logprobs issue (entropy coverage 0/1280, w_entropy pinned).
@@ -1198,6 +1229,11 @@ Tests: test_calibration_entropy_wiring_2026_07_27.py rewritten around the new in
 behavioral tests: OAI-flag-never-with-tools, n_probs path, rejection latch, env kill, chunk-shape parse;
 latch wired on both paths). Docs: docs/core/calibration.html (n_probs sidestep section; the "structurally
 sparse" watch flips expectation), docs/core/entropy.html (request_logprobs API row + consumers note).
+FULL SUITE: 9626 passed, 13 skipped. DEPLOYED (68659→69009, health ok); functional_live_test 32/32.
+LIVE-VERIFIED the mechanism, not the logs: the 3 newest calibration samples (post-deploy live turns) carry
+entropy_observed=True with REAL varying entropy (0.999/0.965/0.977 vs the corpus-wide neutral 0.5) — the
+first observed entropy on tool-attached turns ever recorded. Watch entropy_observed_pos/neg via
+introspect action='learning'; w_entropy unpins once ≥30 observed samples span both outcome classes.
 
 ### 2026-07-27 (later 12) — Introspect-subsystem review: 5 bugs (2 instrument≠mechanism) + 8 improvements
 

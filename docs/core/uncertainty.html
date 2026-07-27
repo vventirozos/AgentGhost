@@ -71,6 +71,31 @@ tracker.verify_assumption(a, was_correct=True)
   </ul>
   <div class="note"><strong>Tests:</strong> covered by <code>tests/test_uncertainty_persistence.py</code>.</div>
 
+  <h2>2026-07-27 — pressure() was a constant 0.0 in calibration (ordering bug)</h2>
+  <p>Learning-health feature-liveness flagged <code>uncertainty_pressure</code> as 1-distinct-value
+  (always 0.0) across the whole calibration corpus. Root cause, established against the live
+  durable log (2 records ever, both hedge-scan; the <code>flag_uncertainty</code> tool has never
+  been called by the model):</p>
+  <ul>
+    <li><strong>Non-streamed finalize read pressure BEFORE the feeder ran.</strong>
+    <code>_record_calibration_safe</code> (which reads <code>pressure()</code>) ran ~20 lines
+    <em>above</em> the hedge auto-scan in the surfacing block — so every calibration sample saw
+    the pre-scan, empty tracker. The scan is hoisted before the record; the surfacing block keeps
+    footer/verify/reset on the already-populated tracker.</li>
+    <li><strong>The streamed path never scanned at all.</strong> The end-of-stream confidence
+    reading now scans <code>full_content</code> before reading pressure, and the drain resets the
+    tracker after its calibration record (finalize's reset never runs on the stream path, so
+    hedge state would otherwise leak into the next turn's reading).</li>
+    <li><strong>Hedge regex broadened conservatively:</strong> adds <em>"unable to
+    verify/confirm"</em>, <em>"can't confirm"</em>, <em>"I'm uncertain"</em>, <em>"no way to
+    verify/confirm/check/know"</em>. Deliberately narrow — false pressure on confident turns
+    poisons the λ fit in the other direction.</li>
+  </ul>
+  <p>Expectation after the fix: pressure is a <em>sparse-but-real</em> signal (nonzero only on
+  turns whose reply verbalises a hedge, or where the model calls <code>flag_uncertainty</code>).
+  Watch it via the learning-health feature table (<code>n</code>/distinct/separation). Tests:
+  <code>tests/test_uncertainty_pressure_wiring.py</code>.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

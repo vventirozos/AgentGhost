@@ -197,11 +197,50 @@ class TestScorerIntegration:
 class TestFeatureHealth:
     def test_constant_feature_is_dead(self):
         s = [{"entropy_component": 0.5, "competence_component": 0.5,
-              "uncertainty_pressure": 0.0, "outcome": float(i % 2)}
+              "uncertainty_pressure": 0.0, "outcome": float(i % 2),
+              "entropy_observed": True}
              for i in range(50)]
         fh = _feature_health(s)["feature_health"]
         assert fh["uncertainty_pressure"]["dead"] is True
+        # Constant OBSERVED entropy is genuinely dead.
         assert fh["entropy_component"]["dead"] is True
+
+    def test_entropy_standins_are_not_judged(self):
+        """Unobserved samples carry the neutral 0.5 stand-in; a corpus of
+        stand-ins says NOTHING about the entropy feature — the verdict is
+        'insufficient', not DEAD (the pre-fix report branded entropy dead
+        hours after the n_probs fix started producing real values,
+        because ~1300 stand-ins drowned the handful of observations)."""
+        s = [{"entropy_component": 0.5, "outcome": float(i % 2)}
+             for i in range(50)]  # no entropy_observed anywhere
+        fh = _feature_health(s)["feature_health"]
+        assert fh["entropy_component"]["verdict"] == "insufficient"
+        assert fh["entropy_component"]["n"] == 0
+        assert fh["entropy_component"]["dead"] is False
+
+    def test_observed_entropy_judged_over_observed_rows_only(self):
+        """A separating OBSERVED minority must not be drowned by
+        stand-ins: 30 observed rows that split the classes cleanly →
+        live, even with 1000 neutral stand-ins alongside."""
+        standins = [{"entropy_component": 0.5, "outcome": 1.0}
+                    for _ in range(1000)]
+        observed = ([{"entropy_component": 0.9, "entropy_observed": True,
+                      "outcome": 1.0}] * 15
+                    + [{"entropy_component": 0.2, "entropy_observed": True,
+                        "outcome": 0.0}] * 15)
+        fh = _feature_health(standins + observed)["feature_health"]
+        ent = fh["entropy_component"]
+        assert ent["n"] == 30
+        assert ent["verdict"] == "live"
+        assert ent["separation"] == pytest.approx(0.7, abs=0.01)
+
+    def test_tiny_eligible_corpus_is_insufficient_not_live(self):
+        """5 observed one-class samples must not read as 'live' (nor
+        'dead') — below the reporting floor the verdict is withheld."""
+        s = [{"entropy_component": 0.3 + i / 10.0, "entropy_observed": True,
+              "outcome": 1.0} for i in range(5)]
+        fh = _feature_health(s)["feature_health"]
+        assert fh["entropy_component"]["verdict"] == "insufficient"
 
     def test_varying_but_non_separating_feature_is_dead(self):
         """The live competence case: many distinct values, separation
