@@ -10814,8 +10814,12 @@ class GhostAgent:
                     # know the outcome — recording the penalized composite
                     # made Brier/ECE read optimistically on the negative
                     # class (the penalty is a function of the label).
-                    composite=getattr(_pending, "pre_penalty_composite",
-                                      _pending.composite),
+                    # RAW pre-penalty (pre-Platt): the stored column must
+                    # keep one stable scale across refits, or the reliability
+                    # table / ECE / Brier mix raw and mapped rows.
+                    composite=getattr(_pending, "raw_pre_penalty_composite",
+                                      getattr(_pending, "pre_penalty_composite",
+                                              _pending.composite)),
                     entropy_component=_pending.entropy_component,
                     competence_component=_pending.competence_component,
                     uncertainty_pressure=getattr(_pending, "uncertainty_pressure", 0.0),
@@ -10848,20 +10852,42 @@ class GhostAgent:
                     if _cc is None:
                         _cc = _OD()
                         self.context._recent_calib_for_correction = _cc
-                    _cc[self._response_fingerprint(final_ai_content or "")] = {
-                        "composite": _pending.composite,
-                        "entropy_component": _pending.entropy_component,
-                        "competence_component": _pending.competence_component,
-                        "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
-                        # Carry the observation flag: a user-correction
-                        # negative on a turn that DID observe logprobs is the
-                        # single most valuable sample the loop can get
-                        # (negatives are ~4% of the corpus and observed
-                        # samples are rarer still). Dropping it here silently
-                        # downgraded that sample to "unobserved".
-                        "entropy_observed": bool(
-                            getattr(_pending, "entropy_observed", False)),
-                    }
+                    # Only stash turns recorded as a SUCCESS. A turn already
+                    # booked at outcome=0.0 (execution failure / REFUTED /
+                    # budget exhausted) would otherwise be recorded a SECOND
+                    # time as 0.0 when the user then corrects it, double-
+                    # weighting one turn in the Brier, the ECE and the weight
+                    # fit. The stash exists to catch turns that looked CLEAN
+                    # and were nonetheless wrong.
+                    if _calib_outcome >= 1.0:
+                        _cc[self._response_fingerprint(final_ai_content or "")] = {
+                            # pre_penalty, matching the inline record above: the
+                            # outcome penalty is a function of the label, so
+                            # storing the penalized value makes the negative
+                            # class read optimistically — the exact bug the
+                            # inline path documents and avoids.
+                            "composite": getattr(
+                                _pending, "raw_pre_penalty_composite",
+                                getattr(_pending, "pre_penalty_composite",
+                                        _pending.composite)),
+                            "entropy_component": _pending.entropy_component,
+                            "competence_component": _pending.competence_component,
+                            "uncertainty_pressure": getattr(_pending, "uncertainty_pressure", 0.0),
+                            # Carry the observation flags: a user-correction
+                            # negative on a turn that DID observe logprobs or
+                            # turn shape is the single most valuable sample the
+                            # loop can get (negatives are ~4% of the corpus and
+                            # observed samples rarer still), and the fit filters
+                            # on exactly these flags. Dropping them silently
+                            # downgraded that sample to "unobserved" and
+                            # excluded it from the weight fits.
+                            "entropy_observed": bool(
+                                getattr(_pending, "entropy_observed", False)),
+                            "effort_component": float(
+                                getattr(_pending, "effort_component", 0.5)),
+                            "effort_observed": bool(
+                                getattr(_pending, "effort_observed", False)),
+                        }
                     while len(_cc) > 32:
                         _cc.popitem(last=False)
                 except Exception:
@@ -16126,12 +16152,25 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # skipped — resurrecting the very bug the
                                 # comment above says was fixed (survivors =
                                 # the hypotheses the evidence did NOT confirm).
+                                # Take the FIRST digit run only, and discard
+                                # out-of-range values. Stripping all
+                                # non-digits instead concatenated separate
+                                # numbers — "H2: retry after 30s" became
+                                # index 230 — and since a non-empty set is
+                                # truthy, the block below then demoted every
+                                # genuine hypothesis to consistent=False.
+                                # That inverts the model's verdict, which is
+                                # strictly worse than the hard int() failure
+                                # this coercion replaced (that one at least
+                                # left the list untouched).
                                 _surv_idx = set()
                                 for _i in (_eval or {}).get("surviving_hypotheses", []):
                                     try:
-                                        _digits = re.sub(r"\D", "", str(_i))
-                                        if _digits:
-                                            _surv_idx.add(int(_digits))
+                                        _m = re.match(r"\D*(\d+)", str(_i))
+                                        if _m:
+                                            _ix = int(_m.group(1))
+                                            if 0 <= _ix < len(hypotheses):
+                                                _surv_idx.add(_ix)
                                     except (TypeError, ValueError):
                                         continue
                                 if _surv_idx or (_eval or {}).get("conclusion"):

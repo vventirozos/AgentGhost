@@ -84,7 +84,7 @@ def apply_platt(composite: float, a: float, b: float) -> float:
     return _clamp01(_sigmoid(a * float(composite) + b))
 
 
-def _fit_platt(pairs, *, iters: int = 50, ridge: float = 1e-6):
+def _fit_platt(pairs, *, iters: int = 50, ridge: float = 1e-2):
     """Fit (a, b) of ``sigmoid(a·c + b)`` on log-loss by Newton/IRLS.
 
     Log-loss (not Brier) because it is convex here and is the proper scoring
@@ -96,6 +96,17 @@ def _fit_platt(pairs, *, iters: int = 50, ridge: float = 1e-6):
     and those two values sit on opposite sides of the safety guard in
     `fit`, so an under-converged run would have silently adopted a map the
     converged fit rejects. IRLS converges here in well under 20 iterations.
+
+    ``ridge`` is a REAL L2 penalty (it enters the gradient as well as the
+    Hessian), making this a MAP estimate rather than an MLE. That is what
+    bounds the slope on linearly SEPARABLE data, where the unpenalised
+    likelihood has its optimum at infinity: with damping applied only to
+    the Hessian — the earlier form — the fixed point was still that
+    infinite optimum, and the slope simply grew with the iteration budget
+    (a = 51 → 207 → 233 at 5 → 50 → 200 iterations on a separable corpus),
+    contradicting the guarantee in the paragraph above. A separable batch
+    is entirely reachable here: 40 samples split cleanly by competence is
+    all it takes.
 
     Deliberately UNWEIGHTED. Class-balancing was tried first, on the theory
     that ~96% positives would drown the minority — but balancing optimises a
@@ -123,7 +134,11 @@ def _fit_platt(pairs, *, iters: int = 50, ridge: float = 1e-6):
             h_aa += w * c * c
             h_ab += w * c
             h_bb += w
-        # Ridge keeps the Hessian invertible on separable / degenerate data.
+        # L2 penalty on BOTH the gradient and the Hessian. Adding it to the
+        # Hessian alone is Levenberg damping — it changes the step size but
+        # not the fixed point, so it cannot bound a separable fit.
+        g_a += ridge * a
+        g_b += ridge * b
         h_aa += ridge
         h_bb += ridge
         det = h_aa * h_bb - h_ab * h_ab
@@ -551,17 +566,47 @@ class CalibrationTracker:
         # flattened confidence. A near-zero slope is rejected for the same
         # reason: it collapses every turn onto the base rate, which scores a
         # great Brier while making `below_threshold` permanently inert.
-        _MIN_SLOPE = 0.5
-        if platt_a < _MIN_SLOPE:
+        # Reject only what is actually unsafe.
+        #
+        # INVERSION (slope <= 0): the map would report lower confidence on
+        # turns the score rates higher. The optimiser picks this whenever the
+        # composite is anti-correlated with success, which is what the live
+        # corpus shows (leak-free AUC 0.473). Calibrating noise is not an
+        # improvement — leave the raw scale alone and say so.
+        #
+        # DIVERGENCE (slope enormous): a separable batch drives the fit to a
+        # near-step function, which reports ~0 or ~1 for every turn and makes
+        # `below_threshold` a hair-trigger on one competence value. The L2
+        # penalty above bounds this in normal use; the cap is a backstop.
+        #
+        # A SMALL POSITIVE slope is NOT rejected. An earlier version demanded
+        # slope >= 0.5 on the theory that a flat map would leave the gate
+        # inert — that reasoning was wrong. Platt is strictly monotone for
+        # a > 0 and the threshold is refit on the SAME scale, so the
+        # below-threshold decision set is bit-identical before and after; the
+        # map changes only calibration quality. Rejecting a = 0.30 discarded
+        # a measured 0.069 Brier improvement and changed no decision at all.
+        # Slope also cannot be judged without the composite's spread: a = 3.0
+        # over a 0.02-wide range moves probabilities less than a = 0.3 over
+        # the full unit interval.
+        _MAX_SLOPE = 50.0
+        if platt_a <= 0.0:
             logger.warning(
-                "calibration: REJECTED the probability map (slope %.3f < %.1f)."
-                " The composite is not tracking outcomes — a fit this flat"
-                " (or inverted) would either destroy the confidence ordering"
-                " or collapse every turn onto the base rate, leaving the"
-                " below-threshold gate permanently inert. Confidence stays"
-                " on the raw scale; the score needs a feature that actually"
-                " predicts turn failure, not better calibration.",
-                platt_a, _MIN_SLOPE)
+                "calibration: REJECTED the probability map (slope %.3f <= 0)."
+                " The composite is anti-correlated with outcomes, so the map"
+                " would INVERT the confidence ordering. Confidence stays on"
+                " the raw scale; the score needs a feature that actually"
+                " predicts turn failure, not better calibration.", platt_a)
+            platt_a, platt_b = 1.0, 0.0
+            calibrated = composites
+            brier = brier_raw
+        elif platt_a > _MAX_SLOPE:
+            logger.warning(
+                "calibration: REJECTED the probability map (slope %.1f > %.1f)."
+                " That is a near-step function — almost certainly a linearly"
+                " separable batch fitted in-sample — and would make the"
+                " below-threshold gate a hair-trigger on a single composite"
+                " value.", platt_a, _MAX_SLOPE)
             platt_a, platt_b = 1.0, 0.0
             calibrated = composites
             brier = brier_raw
@@ -665,7 +710,13 @@ class CalibrationTracker:
         return {
             "samples": len(samples),
             "brier": round(brier, 4) if brier is not None else None,
-            "ece": round(self.ece() or 0.0, 4) if samples else None,
+            # Same window as `brier` above. Calling `self.ece()` with no
+            # argument scored the ENTIRE file while brier scored only the
+            # max_history tail, so the two numbers sat side by side
+            # describing different populations (measured: 0.0478 vs 0.1593
+            # on the same report).
+            "ece": (round(self.ece(window=self.max_history) or 0.0, 4)
+                    if samples else None),
             "fitted": params is not None,
             "threshold": params.threshold if params else None,
             "w_entropy": params.w_entropy if params else None,
@@ -697,12 +748,26 @@ def _best_threshold(pairs: List[Tuple[float, float]]) -> float:
     into "below threshold → arbitrate"). Falls back to 0.5 when J never
     beats the trivial classifier.
     """
+    # Degenerate-input fallbacks return the MEDIAN of the supplied scores
+    # rather than a hardcoded constant. The caller may be on the raw
+    # composite scale or on the Platt-mapped probability scale, and a fixed
+    # 0.55 is only meaningful on the former — returning it into a mapped
+    # caller put the gate at an arbitrary point of a different distribution.
+    # The median is scale-free and always sits inside the observed range.
+    def _median_conf(default=0.55):
+        vals = sorted(c for c, _ in pairs)
+        if not vals:
+            return default
+        mid = len(vals) // 2
+        return (vals[mid] if len(vals) % 2
+                else (vals[mid - 1] + vals[mid]) / 2.0)
+
     if not pairs:
         return 0.55
     n_pos = sum(1 for _, o in pairs if o >= 0.5)
     n_neg = len(pairs) - n_pos
     if n_pos == 0 or n_neg == 0:
-        return 0.55
+        return _median_conf()
     confs = sorted({round(c, 4) for c, _ in pairs})
     candidates = [0.0]
     for i in range(len(confs) - 1):
@@ -723,9 +788,11 @@ def _best_threshold(pairs: List[Tuple[float, float]]) -> float:
     # classifier (Youden J <= 0 — the composite is uncorrelated with outcome,
     # i.e. the miscalibrated case this exists to catch), the loop would pick a
     # DEGENERATE rail (τ=1.0 via the higher-tie-break → "below" ALWAYS True, or
-    # τ=0.0 → always False). Return the neutral 0.5 instead.
+    # τ=0.0 → always False). Return the median of the observed scores — a
+    # neutral cut that is valid on WHICHEVER scale the caller passed, unlike
+    # the hardcoded 0.5 this used to return.
     if best_j <= 1e-9:
-        return 0.5
+        return _clamp01(_median_conf(0.5))
     return _clamp01(best_tau)
 
 

@@ -64,6 +64,8 @@ class ConfidenceReading:
     # decision still uses the penalized `composite`. Defaults to composite
     # for positionally-built readings / no-penalty calls.
     pre_penalty_composite: float = -1.0
+    # Same value BEFORE the Platt map — the scale calibration persists.
+    raw_pre_penalty_composite: float = -1.0
     # Whether ``entropy_component`` reflects REAL observed token logprobs
     # or is the neutral 0.5 stand-in used when the upstream returned none.
     #
@@ -96,6 +98,9 @@ class ConfidenceReading:
     def __post_init__(self):
         if self.pre_penalty_composite < 0.0:
             object.__setattr__(self, "pre_penalty_composite", self.composite)
+        if self.raw_pre_penalty_composite < 0.0:
+            object.__setattr__(self, "raw_pre_penalty_composite",
+                               self.pre_penalty_composite)
 
 
 class CompositeConfidence:
@@ -156,8 +161,14 @@ class CompositeConfidence:
             )
             self.w_entropy = we
             self.w_competence = wc
+            # Bound is INCLUSIVE of 1.0: the fit's grid legitimately reaches
+            # w_effort = 1.0 (w_entropy 0 + w_effort 1.0 is not skipped), and
+            # an exclusive bound silently left `self.w_effort` at the PREVIOUS
+            # fit's value while w_entropy/w_competence took the new one — the
+            # scorer then evaluated a formula the fit never saw, with a Platt
+            # map fitted on different composites.
             _weff = float(getattr(params, "w_effort", 0.0))
-            if math.isfinite(_weff) and 0.0 <= _weff < 1.0:
+            if math.isfinite(_weff) and 0.0 <= _weff <= 1.0:
                 # Re-normalise the trio: the fit reports w_entropy/w_effort
                 # and leaves competence as the remainder, so honour that
                 # rather than letting the pair-normaliser above win.
@@ -264,24 +275,27 @@ class CompositeConfidence:
         # Snapshot the prediction BEFORE the outcome penalty — this is what
         # calibration records (a prediction must not know its own outcome).
         pre_penalty = _clamp_unit(composite)
-        # Apply the objective outcome penalty LAST and un-discounted: a
-        # verifier REFUTED / unverified-mutation verdict is ground truth
-        # about this specific answer and must pull the reading below
-        # threshold regardless of how strong the historical priors are.
-        composite = composite * (1.0 - _clamp_unit(outcome_penalty))
-        composite = _clamp_unit(composite)
-        # Map the blended score onto a calibrated PROBABILITY as the last
-        # step. The weights decide how to combine the signals but cannot set
-        # their level: measured live, the raw composite ranked turns well
-        # (AUC 0.679) yet scored a worse Brier than always predicting the
-        # base rate. Platt is monotonic, so this preserves every ordering
-        # and every relative decision — it only fixes the scale. Both
-        # outputs are mapped so the recorded prediction and the
-        # threshold-compared value live on the same scale as the fitted
-        # threshold. Skipped entirely until a fit has run.
+        raw_pre_penalty = pre_penalty
+        # Map the blended score onto a calibrated PROBABILITY. The weights
+        # decide how to COMBINE the signals but cannot set their level, and
+        # Platt is strictly monotone for a > 0, so this preserves every
+        # ordering and every relative decision — it only fixes the scale.
+        # Skipped entirely until a fit has run.
         if self._has_platt:
             composite = _apply_platt(composite, self.platt_a, self.platt_b)
             pre_penalty = _apply_platt(pre_penalty, self.platt_a, self.platt_b)
+        # The objective outcome penalty applies AFTER the map, un-discounted:
+        # a verifier REFUTED / unverified-mutation verdict is ground truth
+        # about this specific answer and must pull the reading below
+        # threshold regardless of how strong the historical priors are.
+        #
+        # Order matters. Applying it before the map let the map's intercept
+        # put a FLOOR under the result — sigmoid(b) — that no penalty could
+        # cross: with a fitted b = 0.27, even outcome_penalty = 1.0 bottomed
+        # out at 0.566, so `below_threshold` was unreachable for every
+        # possible input and the guarantee in this comment was false.
+        # Multiplying on the probability scale can always reach 0.
+        composite = _clamp_unit(composite * (1.0 - _clamp_unit(outcome_penalty)))
         return ConfidenceReading(
             composite=composite,
             entropy_component=entropy_component,
@@ -290,6 +304,14 @@ class CompositeConfidence:
             below_threshold=composite < self.threshold,
             uncertainty_pressure=pressure,
             pre_penalty_composite=pre_penalty,
+            # The RAW (pre-Platt) pre-penalty score. Calibration records this
+            # so the stored column keeps ONE stable meaning across refits:
+            # storing the mapped value mixed scales in a single file (raw for
+            # pre-fit turns, mapped for post-fit ones, re-scaled again at
+            # every refit), which silently corrupted the reliability table,
+            # the ECE and the reported Brier. The fit recomputes from the
+            # components anyway; diagnostics apply the current map themselves.
+            raw_pre_penalty_composite=raw_pre_penalty,
             entropy_observed=bool(entropy_observed),
             effort_component=eff,
             effort_observed=bool(effort_observed),

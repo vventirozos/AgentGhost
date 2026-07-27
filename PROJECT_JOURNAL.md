@@ -1109,6 +1109,101 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 (later 7) — Second review pass: 6 MORE defects in the same day's calibration work
+
+The re-review of `confidence.py`/`calibration.py` (the first attempt died on an API error) found six more,
+ALL introduced earlier the same session and ALL invisible to a 142-green calibration suite — each needs a corpus
+shape the tests never built (linearly separable, single-valued, or a fit that actually gets adopted).
+THEME: **guards written from intuition instead of measurement.** Every one of my safety mechanisms was wrong in
+a way that only a numeric probe reveals.
+
+**D1 — the "ridge" was not a regulariser.** I added it to the Hessian diagonal only, which is Levenberg damping:
+it changes the STEP SIZE but not the fixed point. On linearly separable data the unpenalised optimum is at
+infinity, so the slope just grew with the iteration budget — a = 51 → 207 → 233 at 5 → 50 → 200 iters —
+directly falsifying my own docstring guarantee that the answer must not depend on the budget. FIXED: the L2
+penalty now enters the GRADIENT as well (`g_a += ridge*a`), making it a true MAP estimate; ridge 1e-6 → 1e-2.
+Verified budget-independent: a = 20.76 at 5, 50 and 200 iterations.
+**D2 — and that diverged map was then ADOPTED**, because `brier_cal <= brier_raw` is computed IN-SAMPLE on the
+same points the 2-parameter map was fitted to, so it is essentially always true. Result: confidence collapsed to
+the step predicate `competence < 0.5499`, reporting a perfect Brier 0.0. FIXED via a `_MAX_SLOPE = 50` backstop.
+**D3 — my `_MIN_SLOPE = 0.5` floor was scale-blind AND justified by a false claim.** I wrote that a flat map
+"would leave the gate inert"; measured, that is wrong — Platt is strictly monotone for a>0 and τ is refit on the
+SAME scale, so the below-threshold decision set is bit-identical (verified: |below| 412 vs 412). Rejecting
+a = 0.296 discarded a real 0.069 Brier improvement and changed NO decision. Slope also can't be judged without
+the composite's spread (a=3.0 over a 0.02-wide range moves probabilities less than a=0.3 over the unit
+interval). FIXED: reject only what is genuinely unsafe — INVERSION (a<=0, flips the ordering) and DIVERGENCE
+(a>50, near-step). Small positive slopes are kept.
+**D4 — `w_effort == 1.0` was silently dropped** (bound was `< 1.0`, but the grid reaches exactly 1.0), leaving
+`self.w_effort` at the PREVIOUS fit's value while the other two weights updated — the scorer then evaluated a
+formula the fit never saw, with a Platt map fitted on different composites. FIXED to `<= 1.0`.
+**D5 — the map's intercept FLOORED the composite so a REFUTED verdict could never cross the threshold.** I
+applied Platt after the outcome penalty, making `sigmoid(b)` an absolute floor: with a fitted b = 0.27, even
+`outcome_penalty=1.0` bottomed out at 0.566 and `below_threshold` was unreachable for EVERY possible input —
+while the comment two lines above promised the penalty "must pull the reading below threshold regardless".
+FIXED: penalty now applies AFTER the map, on the probability scale, so it always reaches 0 (verified 0.0/below
+at penalty=1.0). Also `_best_threshold`'s degenerate fallbacks returned hardcoded 0.5/0.55 — raw-scale constants
+handed to a caller on the mapped scale — now the MEDIAN of the supplied scores, which is scale-free.
+**D6 — the stored `composite` column mixed scales.** It held raw values for pre-fit turns and Platt-mapped ones
+after, re-scaled again at every refit, so the reliability table / ECE / reported Brier silently compared
+different populations (same turn binned [0.2,0.3) pre-fit and [0.6,0.7) post-fit). `fit()` was immune (it
+recomputes from components) but every diagnostic was not. FIXED: `ConfidenceReading` now carries
+`raw_pre_penalty_composite` and BOTH record sites persist that, so the column has one stable meaning.
+**D7 — `stats()` mixed windows**: Brier over the max_history tail, ECE over the entire file (measured 0.0478 vs
+0.1593 on the same report). FIXED to share the window.
+
+Two pre-existing tests updated to the corrected behaviour (the 0.55 threshold constant is now a scale-free
+median; a source-window assertion widened). Tests: test_calibration_review_fixes.py (19).
+FULL SUITE 9511 passed / 0 failed. DEPLOYED (45989→46146, health ok); functional_live_test 32/32.
+NOTE none of D2/D3/D5 were ACTIVE in prod — the map is currently rejected on live data, so they were latent —
+but they would have activated the moment the effort feature earns its weight (~1 day), which is exactly when
+nobody would have been looking.
+
+### 2026-07-27 (later 6) — Reviewing the same day's own changes: 4 defects, 3 self-inflicted
+
+Operator: "are we done? do we need to scan the files you just changed? more functional tests?" — YES on both,
+and the review paid for itself. Two read-only agents re-reviewed today's confidence/calibration/agent.py edits.
+Every defect below is on a path the 9477-green suite never constructed, which is precisely why they survived.
+
+**D4 (WORST — a fix that made things worse). Hypothesis survivor-index coercion inverted the verdict.**
+Earlier today I replaced a hard `int(_i)` with a "tolerant" `re.sub(r"\D","",label)`. But stripping ALL
+non-digits CONCATENATES separate numbers: `"H2: retry after 30s"` → `"230"` → index 230. A non-empty set is
+TRUTHY, so the promote/demote block then ran and set `consistent=False` on every genuine hypothesis — the model
+said H2 survived, the code concluded all were refuted. That is strictly worse than the hard failure it replaced
+(which at least left the list untouched). FIXED: anchored `re.match(r"\D*(\d+)")` (first digit run only) plus a
+range check `0 <= ix < len(hypotheses)`, so an out-of-range or prose label yields NO phantom survivor.
+LESSON: making a parser "tolerant" without bounding what it may produce converts a loud failure into a silent
+wrong answer. Verify the OUTPUT domain, not just that parsing succeeds.
+
+**D1. Calibration negatives could be double-counted.** The correction stash was written unconditionally,
+including for turns already recorded at outcome=0.0 (execution failure / REFUTED / budget exhausted). A later
+user correction then recorded a SECOND 0.0 for the same turn — double-weighting it in Brier, ECE and the weight
+fit. FIXED: stash only when `_calib_outcome >= 1.0`. The stash exists for turns that looked CLEAN and were
+nonetheless wrong; a turn already booked as a failure has nothing to add.
+
+**D2. The stash stored the POST-penalty composite** while the inline record deliberately stores
+`pre_penalty_composite` (the penalty is a function of the label, so storing it makes the negative class read
+optimistically — a bug the inline path documents and avoids). On a penalised-then-corrected turn the stashed
+value was ~5x below the prediction actually made. FIXED to match the inline path.
+
+**D3. The stash omitted `effort_component`/`effort_observed`** — so the fit, which filters on those flags,
+excluded correction negatives from the effort-weight fit entirely. Same class as the `entropy_observed` gap I
+fixed hours earlier; I patched one sibling and missed the other. FIXED (both flags + the value now carried).
+
+FUNCTIONAL TESTS RUN LIVE (paths changed today that had never been exercised end-to-end):
+• **User-correction path** — needed BOTH classifier signals (correction phrase AND a high-Jaccard rephrase of
+  the ORIGINAL request; my first attempt had only the phrase and correctly did nothing). With both:
+  "trajectory promoted — prior turn marked FAILED via user-correction" and calibration negatives 48→49. ✅
+• **Streamed path records turn-effort** — `effort_observed: true`. Note the value was exactly 0.5, which is ALSO
+  the unobserved default: 4 identical `file_system` calls → sprawl 0.333 + spin 0.667 → 0.5. A measured 0.5 is
+  indistinguishable from the default BY VALUE, which is exactly why the `_observed` flag is the load-bearing
+  part of the design. ✅
+• **Games** — agent opening as O returns `....O.... X` and replaying it now gives HTTP 200 (used to 422 =
+  bricked after one move); blank state 422; count-contradicting turn 422; no-key 403. ✅
+• Non-streamed effort + `domain` recording, SQL multi-statement guard, health — all re-verified. ✅
+
+Tests: test_review_fixes_2026_07_27.py (15). FULL SUITE 9492 passed / 0 failed. DEPLOYED (43896→44746, health
+ok); functional_live_test 32/32.
+
 ### 2026-07-27 (later 5) — Turn-effort: the confidence score finally carries information
 
 Operator: "give confidence a per-turn feature." Prerequisite finding from later-4: ALL THREE inputs were dead,

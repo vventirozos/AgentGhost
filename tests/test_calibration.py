@@ -230,7 +230,15 @@ def test_best_threshold_separable():
 
 
 def test_best_threshold_single_class():
-    assert _best_threshold([(0.9, 1.0)] * 5) == 0.55  # neutral fallback
+    # Scale-free fallback (2026-07-27): the degenerate cases return the
+    # MEDIAN of the supplied scores, not a hardcoded 0.55. The caller may be
+    # on the raw composite scale or the Platt-mapped probability scale, and a
+    # fixed constant is only meaningful on the former — returning it into a
+    # mapped caller put the gate at an arbitrary point of a different
+    # distribution. The median always sits inside the observed range.
+    assert _best_threshold([(0.9, 1.0)] * 5) == 0.9
+    assert _best_threshold([(0.2, 0.0)] * 5) == 0.2
+    assert _best_threshold([]) == 0.55  # nothing to take a median of
 
 
 # ──────────────────────────────────────────────────────────────────────

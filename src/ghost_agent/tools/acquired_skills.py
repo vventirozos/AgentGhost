@@ -520,6 +520,18 @@ class AcquiredSkillManager:
             with self._lock:
                 registry = self._load_registry()
             ids = res.get("ids") or []
+            # Fail-safe: an empty registry alongside existing embeddings is
+            # far more likely to be a transient read failure (or a
+            # mid-write file) than a genuine "every skill was deleted". With
+            # no guard, that reading classifies EVERY embedding as an orphan
+            # and wipes the whole routing index in one pass — unrecoverable,
+            # because nothing re-embeds an unchanged skill.
+            if not registry and ids:
+                logger.warning(
+                    "Skill-embedding sweep SKIPPED: registry read as empty "
+                    "while %d embedding(s) exist — refusing to treat that as "
+                    "'all skills deleted'.", len(ids))
+                return 0
             metas = res.get("metadatas") or []
             docs = res.get("documents") or []
             if len(docs) < len(ids):
@@ -554,6 +566,70 @@ class AcquiredSkillManager:
             return len(stale_ids)
         except Exception as e:
             logger.warning(f"Stale-skill-embedding sweep failed: {e}")
+            return 0
+
+    def backfill_missing_skill_embeddings(self) -> int:
+        """Re-embed ACTIVE registry skills that have no vector entry.
+
+        The index could previously only LOSE entries. ``save_skill`` embeds
+        only when the content hash CHANGES, so once an embedding went
+        missing nothing ever rebuilt it — and semantic routing filters the
+        advertised tool schema by exactly that query. The skill stayed
+        `active` and dispatchable while being invisible to the model: the
+        "invisible-but-callable drift" the routing degrade paths elsewhere
+        in this file are written to avoid, arrived at from the other side.
+
+        Observed live 2026-07-27: 3 active skills, 1 embedding. Every
+        request logged `injected 1: format_results_to_csv` regardless of the
+        query, so a user asking for `news_headlines` got a model that could
+        not see the tool — it called `manage_skills` twice, tried to shell
+        out to an inline script, tripped the loop-breaker, and finally had
+        its answer eaten by the stream scrub.
+
+        Returns the number re-embedded. Never raises.
+        """
+        if not self.memory_system:
+            return 0
+        try:
+            res = self.memory_system.collection.get(
+                where={"type": "acquired_skill"}, include=["metadatas"],
+            )
+            embedded = {
+                (m or {}).get("name")
+                for m in (res.get("metadatas") or [])
+                if (m or {}).get("name")
+            }
+            with self._lock:
+                registry = self._load_registry()
+            missing = [
+                (n, info) for n, info in registry.items()
+                if info.get("status") == "active" and n not in embedded
+            ]
+            if not missing:
+                return 0
+            from ..utils.helpers import get_utc_timestamp
+            done = 0
+            for name, info in missing:
+                try:
+                    self.memory_system.add(
+                        info.get("description") or name,
+                        {"type": "acquired_skill", "name": name,
+                         "timestamp": get_utc_timestamp()},
+                    )
+                    done += 1
+                except Exception as e:  # noqa: BLE001 — per-skill isolation
+                    logger.warning(
+                        "Failed to backfill embedding for skill '%s': %s", name, e)
+            if done:
+                pretty_log(
+                    "Skill Index Repair",
+                    f"re-embedded {done} active skill(s) that were missing from "
+                    f"semantic routing: {', '.join(n for n, _ in missing)}",
+                    icon=Icons.MEM_SAVE,
+                )
+            return done
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Skill-embedding backfill failed: {e}")
             return 0
 
     def delete_skill(self, name: str) -> bool:
@@ -841,6 +917,10 @@ async def tool_manage_skills(sandbox_dir: Path = None, memory_dir: Path = None, 
     # deletes (flat multi-key where) — their registry entries are gone, so
     # no other path can ever clean them. Self-guarding, never raises.
     mgr.purge_orphaned_skill_embeddings()
+    # ...and the inverse: re-embed any ACTIVE skill that has no embedding.
+    # Without this the index can only ever lose entries (see the method's
+    # docstring for how a skill goes permanently invisible).
+    mgr.backfill_missing_skill_embeddings()
     if action == "list":
         skills = mgr.get_all_skills()
         composed = _list_composed_skills(memory_dir)

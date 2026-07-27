@@ -72,6 +72,15 @@ def _acquired_skill_result_ok(result) -> bool:
 
 logger = logging.getLogger("GhostAgent")
 
+# Advertise EVERY active acquired skill while the catalogue is at or below
+# this size; only apply per-query semantic routing above it. Keeping the
+# advertised set constant keeps the rendered prompt prefix byte-identical
+# across requests, which is what the upstream KV cache (and the boot
+# prefix-warmup) depend on. A handful of extra tool schemas costs a few
+# hundred tokens once; a per-query schema costs a full re-prefill of the
+# whole head on every request.
+_SKILL_ROUTING_MIN_SKILLS = 25
+
 TOOL_DEFINITIONS = [
     {
         "type": "function",
@@ -681,7 +690,24 @@ def get_active_tool_definitions(context, query: str = None):
             # skill from the schema the model sees while they stay
             # dispatchable (invisible-but-callable drift).
             target_skill_names = None
-            if query:
+            # Semantic routing exists to keep the advertised schema small
+            # when there are many skills. Below the threshold it costs more
+            # than it saves: filtering makes the tool block vary PER QUERY,
+            # which changes the rendered prompt prefix and destroys the
+            # upstream KV cache.
+            #
+            # That is not theoretical. The boot warmup prefills the request
+            # head with `query=""` (→ advertise all), while every live
+            # request routes (→ a subset), so the ~22k-token warmup prefill
+            # never matched a single real request and each one re-prefilled
+            # from scratch — the prefix was effectively loaded twice
+            # (observed 2026-07-27). Advertising all skills below the
+            # threshold makes the block byte-identical across requests AND
+            # equal to what the warmup primed.
+            _active_count = sum(
+                1 for s in manager.get_all_skills().values()
+                if s.get("status") == "active")
+            if query and _active_count > _SKILL_ROUTING_MIN_SKILLS:
                 try:
                     results = context.memory_system.collection.query(
                         query_texts=[query],

@@ -193,6 +193,51 @@
     per-domain reliability was impossible.</li>
   </ul>
 
+
+  <h2>2026-07-27 (later 7) — second review pass: six defects in the same day's work</h2>
+  <p>All six were introduced the same session and all were invisible to a 142-green calibration
+  suite, because each needs a corpus shape the tests never built. The theme is worth keeping:
+  <strong>every one of these safety mechanisms was written from intuition rather than
+  measurement, and every one was wrong in a way only a numeric probe reveals.</strong></p>
+  <ul>
+    <li><strong>The "ridge" was not a regulariser.</strong> Added to the Hessian diagonal only, it
+    is Levenberg damping — it changes the step size but not the fixed point. On linearly separable
+    data the unpenalised optimum is at infinity, so the slope grew with the iteration budget
+    (a = 51 → 207 → 233 at 5 → 50 → 200 iterations), directly falsifying the docstring's own
+    guarantee. The L2 penalty now enters the GRADIENT too, making it a MAP estimate; verified
+    budget-independent at a = 20.76.</li>
+    <li><strong>And that diverged map was adopted.</strong> <code>brier_cal &lt;= brier_raw</code> is
+    computed in-sample on the very points the two-parameter map was fitted to, so it is nearly
+    always true. Confidence collapsed to the step predicate <code>competence &lt; 0.5499</code> with
+    a reported Brier of 0.0. A <code>_MAX_SLOPE</code> backstop now rejects it.</li>
+    <li><strong>The slope floor was scale-blind and justified by a false claim.</strong> The comment
+    said a flat map "would leave the gate inert"; measured, the below-threshold decision set is
+    bit-identical before and after (412 vs 412), because Platt is strictly monotone for
+    <code>a &gt; 0</code> and τ is refit on the same scale. Rejecting <code>a = 0.296</code> threw
+    away a real 0.069 Brier improvement and changed no decision. Only INVERSION
+    (<code>a &lt;= 0</code>) and DIVERGENCE (<code>a &gt; 50</code>) are rejected now.</li>
+    <li><strong><code>w_effort == 1.0</code> was silently dropped</strong> (the bound was exclusive
+    while the grid reaches exactly 1.0), leaving the scorer on the previous fit's effort weight —
+    evaluating a formula the fit never saw, under a Platt map fitted on different composites.</li>
+    <li><strong>The map's intercept floored the composite.</strong> Applying Platt AFTER the outcome
+    penalty made <code>sigmoid(b)</code> an absolute floor: with a fitted <code>b = 0.27</code>,
+    even <code>outcome_penalty = 1.0</code> bottomed out at 0.566, so <code>below_threshold</code>
+    was unreachable for every possible input — while the comment directly above promised a REFUTED
+    verdict "must pull the reading below threshold regardless". The penalty now applies after the
+    map, on the probability scale, and reaches 0.</li>
+    <li><strong>The stored <code>composite</code> column mixed scales</strong> (raw before a fit,
+    mapped after, re-scaled at every refit), so the reliability table, ECE and reported Brier
+    compared different populations — the same turn binned [0.2,0.3) pre-fit and [0.6,0.7) post-fit.
+    <code>ConfidenceReading</code> now carries <code>raw_pre_penalty_composite</code> and both
+    record sites persist that, giving the column one stable meaning. <code>_best_threshold</code>'s
+    degenerate fallbacks likewise returned raw-scale constants into a mapped caller; they now
+    return the median of the supplied scores, which is scale-free.</li>
+  </ul>
+  <p>None of these were ACTIVE in production — the map is currently rejected on live data, so they
+  were latent — but they would have activated the moment the turn-effort feature earns its weight,
+  which is exactly when nobody would have been watching. Tests:
+  <code>tests/test_calibration_review_fixes.py</code> (19).</p>
+
 </main>
 </body>
 </html>
