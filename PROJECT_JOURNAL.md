@@ -336,7 +336,12 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 > below. The detailed §4A–§4D catalogues below are kept as the historical record; their per-item
 > "FIXED"/"RESOLVED" markers are current.
 >
-> **What genuinely remains is NOT pending hunt-work — it is two buckets, both by decision:**
+> **What genuinely remains is NOT pending hunt-work — it is three buckets:**
+>
+> **(0) ⏳ ACTIVE DESIGNED WORK — negative-label supply Tiers 2-4 (§4E, added 2026-07-27).** Tier 1
+> (graded labels + sample provenance) is DONE and deployed; Tiers 2-4 are designed, ranked, and
+> deliberately not started so Tier 1's effect stays attributable on live data. This is the only bucket
+> here that is genuinely actionable headless — start at §4E Tier 2.
 >
 > **(1) Blocked on operator action** (cannot be done headless):
 > - **Earn-your-keep / synthetic-ablation route — CLOSED as INCONCLUSIVE-for-this-model (operator decision
@@ -367,8 +372,54 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 > Next cycle, if reopened, the stalest un-hunted surfaces are the web-facing `interface/server.py` + CLI
 > and the mid-July tool cohorts. **╚════════════════════════════════════════════╝**
 
-The detailed catalogue follows. Grouped: (A) improvement-review partials/blocked, (B) static-hunt
+The detailed catalogue follows. **§4E is placed FIRST deliberately — it is the only ACTIVE, headless-
+actionable item; A-D are historical record whose per-item FIXED/RESOLVED markers are current.** Grouped:
+(E) negative-label-supply tiers 2-4 (PENDING), (A) improvement-review partials/blocked, (B) static-hunt
 deferred findings, (C) functional-hunt deferred findings, (D) the B4 outcome-battery design.
+
+### 4E. Negative-label supply — Tiers 2-4 ⏳ PENDING (designed + ranked 2026-07-27, later 9)
+
+**Tier 1 is DONE and deployed** (graded labels + `source` provenance — §6 "later 9"). Tiers 2-4 are
+designed, ranked, and deliberately NOT started: Tier 1's effect must be observable on live data first, or
+a second signal source makes attribution ambiguous. Do them in order; each is independently shippable.
+
+**Why any of this:** the label is ~96% one class. Two distinct problems hide in that — (a) too few
+negatives (49 of 1226, no statistical power) and (b) the label measured "did anything visibly break"
+rather than "was the answer good". Tier 1 fixed (b). Tiers 2-3 attack (a) with signals that ALREADY OCCUR
+but are discarded.
+
+- **⏳ TIER 2 — implicit user signals (highest remaining value, low risk).** The correction classifier
+  (`distill/user_correction.py`) requires BOTH a correction phrase AND a high-Jaccard rephrase of the
+  original request. That conservatism is right for a GOLD-STANDARD tier, but everything in the ambiguous
+  middle is discarded — live-confirmed 2026-07-27: a genuine correction of mine was correctly rejected for
+  low rephrase overlap. ADD a second, lower-confidence tier at a FRACTIONAL outcome (~0.3, not a hard 0.0):
+  phrase-only corrections, and a repeated/rephrased request with no correction phrase (an implicit
+  negative — the machinery for rephrase detection already exists). MUST land under its own `source` tag
+  (e.g. `user_correction_weak`) so it can be audited, reweighted, or dropped without touching the corpus.
+  DO NOT loosen the existing strict tier — add beside it.
+- **⏳ TIER 3 — retroactive negatives from reopened work.** A task/defect REOPENED after a turn closed it
+  DONE is a delayed negative on that turn. Both the reopening and the turn→task linkage already exist
+  (project work_log, defect reopening — §6 2026-07-18). Nothing new needs observing, only connecting.
+  Source tag: `task_reopened`.
+- **⏳ TIER 4 — generated labelled probes. HOLD — this exact idea has already failed here once.** Self-play /
+  counterfactual / GAIA give checkable outcomes and could be balanced by construction (~50% difficulty).
+  BUT the earn-keep harness was CLOSED 2026-07-23 precisely because synthetic batteries ceilinged on this
+  35B and could not discriminate (see the §4 header). If revisited: difficulty must be deliberately targeted
+  at the 40-60% band, and results kept in a SEPARATE store from production calibration or distribution shift
+  corrupts the live fit. Lowest priority; do not start before Tiers 2-3 have measured effects.
+
+**Success criterion (already instrumented):** the fitted model beating `brier_base_rate` on the LIVE corpus —
+the `learning_health` line that currently reads "matches the base-rate predictor". Label variance and
+per-source counts are reported beside it.
+
+**Two standing hazards, both already bitten once:**
+- **Proxy drift.** The Tier-1 graded label scores PROCESS health, not correctness. If the ground-truth tier
+  (user corrections) stops flowing, the agent calibrates purely against its own notion of a tidy turn — what
+  it already over-indexes on. Keep ≥1 ground-truth source live and separately tracked.
+- **Label leakage.** Any new label component must stay DISJOINT from what the feature side uses. Already hit
+  twice: `has_tool_error` was the strongest correlate available and useless (it IS a label term), and the
+  binary label turned out partly circular with the turn-effort feature — which is why Tier 1 *reduced* the
+  apparent edge from 33% to 11% (the 33% was flattering, not lost).
 
 ### 4A. Improvement-review items not fully closed (from the 6-agent review)
 
@@ -1108,6 +1159,64 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-27 (later 9) — Graded outcome labels + sample provenance (negative-supply Tier 1)
+
+Operator asked how I'd widen the negative-label supply, then "proceed". Shipped the two pieces I proposed to
+do FIRST — provenance, then grading — deliberately stopping before the implicit-signal tiers so the effect of
+this change is attributable on its own.
+
+**The reframing that drove it:** "too few negatives" (49 of 1226) is the visible problem, but the BINDING one is
+that the label was near-constant AND measured the wrong thing. `0.0 if (exec failure | verifier REFUTED | budget
+exhausted) else 1.0` asks "did anything visibly break", not "was the answer good" — so a turn that hit one tool
+error, RECOVERED, and answered correctly scored 0.0, identical to a refuted answer. That is a mislabel, not a
+harsh label.
+
+SHIPPED:
+• **`source` on every calibration sample** (`turn` = the graded proxy, `user_correction` = ground truth), added
+  BEFORE any new signal tier. Without provenance, mixing tiers is irreversible: you can never audit which tier
+  is noisy, nor drop one, without discarding the whole corpus. Legacy rows default to `turn` (what they were).
+• **Graded label in [0,1]** (`grade_turn_outcome`) replacing the binary one. Constants are MEASURED, not
+  chosen: across 302 verdict-bearing trajectories the agent passed 251, so an unverified-but-clean turn scores
+  **0.83 = the observed P(good | checkable)** rather than an asserted 1.0 — asserting 1.0 for a turn nothing
+  checked is the verification theatre this project keeps rediscovering. Verifier PASSED/FAILED stay the hard
+  1.0/0.0 anchors; exec failures subtract 0.15 each to a 0.15 floor (0.0 is reserved for "checked and WRONG");
+  budget exhaustion = 0.2 (the agent itself flags the reply PARTIAL).
+• **Stopped binarising on BOTH the write and read paths** — `1.0 if outcome >= 0.5 else 0.0` would have crushed
+  every graded label straight back to two values, i.e. re-created the exact constant column the grading exists
+  to remove. Now clamped only.
+• **Class-presence gates generalised to VARIANCE** in `fit()` and `_fit_platt`. "Are both binary classes
+  present?" is the wrong question once labels are continuous: a graded corpus can carry real signal with every
+  sample above 0.5, and the old gate would have refused to fit it at all. For 0/1 labels the two tests are
+  identical (variance is 0 exactly when one class is missing), so binary corpora behave bit-for-bit as before.
+• Telemetry: label variance / distinct values / mean / per-source counts, plus a warning when the label is
+  binary-or-flat. Fixed my own wording bug: it reported "LOSES TO the base-rate predictor" when the two were
+  EQUAL — equality is a tie, not a regression.
+
+**MEASURED, AND IT CONTRADICTS MY HYPOTHESIS — recorded honestly.** Replaying the real production mix (1028
+turns, 726 unverified) through the real feature + real fit:
+| label | distinct | variance | class split | brier vs base |
+|---|---|---|---|---|
+| BINARY | 2 | 0.0986 | 914/114 | 0.0666 vs 0.0986 → **beats by 33%** |
+| GRADED | 8 | 0.0446 | 969/59 | 0.0395 vs 0.0446 → **beats by 11%** |
+So grading gives a far richer target (8 values vs 2) but a SMALLER edge over the baseline. Why: the binary
+label is partly CIRCULAR with the effort feature — effort counts tool calls/repeats, tool errors drive both the
+effort signal and the binary label, so the model was partly predicting itself. Grading weakens that
+near-tautology, which lowers the apparent win. The 33% was flattering; 11% is the honest number.
+I shipped it anyway because the binary label is factually WRONG about recoveries, and a correct label with a
+smaller flattering-metric is worth more than an incorrect one with a bigger one. Noting the trade explicitly so
+nobody later reads the drop as a regression.
+Caveat also recorded in-code: the graded label is a PROXY for process health, not correctness. If the
+ground-truth tier (user corrections) ever stops flowing, the agent is calibrating purely against its own notion
+of a tidy turn — which is exactly what it already over-indexes on. Provenance is what keeps that checkable.
+
+LIVE-VERIFIED: unverified chat turn → `outcome=0.83 source=turn`; verified tool turn → `outcome=1.0`.
+Telemetry: `labels: variance 0.03797 over 3 distinct values (mean 0.9603) · sources turn=1240`.
+One pre-existing test updated (it pinned the binarisation by name). Tests: test_calibration_graded_labels.py (18).
+FULL SUITE 9539 passed / 0 failed. DEPLOYED (49604→50192, health ok); functional_live_test 32/32.
+NEXT: **Tiers 2-4 are logged as PENDING in §4E** (designed, ranked, with the two standing hazards — proxy drift
+and label leakage — written down). Not started deliberately: measure Tier 1's effect on live data first, or a
+second signal source makes attribution ambiguous.
 
 ### 2026-07-27 (later 8) — Operator log report: news_headlines invisible + the prefix cache primed twice
 

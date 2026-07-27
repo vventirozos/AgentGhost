@@ -64,6 +64,79 @@ _MIN_ENTROPY_SAMPLES = 30
 # Same evidence floor for the turn-effort weight.
 _MIN_EFFORT_SAMPLES = 30
 
+# ── Graded outcome labels ─────────────────────────────────────────────
+# The label used to be binary: 0.0 if (any execution failure OR verifier
+# REFUTED OR budget exhausted) else 1.0. That produced 1177 positives to 49
+# negatives — 96.1% one class — and it measured the wrong thing. "Nothing
+# visibly broke" is not "the answer was good", and a turn that hit one tool
+# error, recovered, and answered correctly was labelled a FAILURE.
+#
+# A graded label in [0, 1] fixes both at once: it carries information on
+# EVERY turn instead of on the 4% that break, and it stops mislabelling
+# recoveries. Brier and log-loss both accept soft targets unchanged.
+#
+# The constants are measured, not chosen. Across 302 verdict-bearing
+# trajectories the agent passed 251 — so a clean turn that no verifier
+# could check is scored at the observed P(good | checkable) rather than an
+# asserted 1.0. Claiming 1.0 for an unverified turn is precisely the
+# verification theatre this project keeps finding.
+_UNVERIFIED_PRIOR = 0.83
+# Each execution failure the turn had to absorb costs this much. A turn that
+# recovered from one error is materially worse than a clean one, but nothing
+# like a refuted answer.
+_EXEC_FAILURE_PENALTY = 0.15
+# Floor for a turn that answered at all — reserve 0.0 for a verdict of WRONG.
+_DEGRADED_FLOOR = 0.15
+# Budget exhaustion: the reply is explicitly flagged working-state/PARTIAL,
+# i.e. the agent itself reports it did not finish.
+_BUDGET_EXHAUSTED_GRADE = 0.2
+
+
+def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 0,
+                       budget_exhausted: bool = False) -> float:
+    """Map a finished turn's observable signals onto a quality label in [0, 1].
+
+    IMPORTANT — this is a PROXY, not ground truth. Only the verifier arms
+    are checked facts; everything else is a prior over "did this go well",
+    and calibrating against it teaches the agent about *process health*, not
+    correctness. Keep at least one ground-truth source (user corrections)
+    flowing and tracked separately, or the score drifts toward rewarding
+    "did not visibly break" — which is what the agent already over-indexes
+    on. Sample provenance (`CalibrationSample.source`) exists so the two can
+    always be told apart.
+
+    Pure and total: never raises, always returns a value in [0, 1].
+    """
+    try:
+        verdict = str(verifier_verdict or "").strip().lower()
+        if verdict == "failed":
+            return 0.0            # checked and WRONG — the one hard negative
+        if verdict == "passed":
+            return 1.0            # checked and RIGHT
+        if budget_exhausted:
+            return _BUDGET_EXHAUSTED_GRADE
+        try:
+            fails = max(0, int(execution_failure_count or 0))
+        except (TypeError, ValueError):
+            fails = 0
+        grade = _UNVERIFIED_PRIOR - (_EXEC_FAILURE_PENALTY * fails)
+        return _clamp01(max(_DEGRADED_FLOOR, grade))
+    except Exception:  # noqa: BLE001 — labelling must never break a turn
+        return _UNVERIFIED_PRIOR
+
+
+def _outcome_variance(samples) -> float:
+    """Population variance of the outcome column. Replaces "are both binary
+    classes present?" as the has-this-data-any-information test, which is
+    the same question once labels are continuous (for 0/1 labels the
+    variance is 0 exactly when one class is missing, so binary corpora keep
+    their previous behaviour bit-for-bit)."""
+    if not samples:
+        return 0.0
+    vals = [s.outcome for s in samples]
+    mean = sum(vals) / len(vals)
+    return sum((v - mean) ** 2 for v in vals) / len(vals)
+
 
 def _sigmoid(z: float) -> float:
     # Overflow-safe: exp(710) overflows a float64.
@@ -119,8 +192,11 @@ def _fit_platt(pairs, *, iters: int = 50, ridge: float = 1e-2):
     n = len(pairs)
     if n < 2:
         return 1.0, 0.0
-    n_pos = sum(1 for _, y in pairs if y >= 0.5)
-    if n_pos == 0 or n_pos == n:
+    # Variance test, not class-presence — see `fit`. Soft targets in [0, 1]
+    # are valid for log-loss (cross-entropy with a soft label), so a graded
+    # corpus is fittable; a CONSTANT one is not.
+    _ymean = sum(y for _, y in pairs) / n
+    if sum((y - _ymean) ** 2 for _, y in pairs) / n < 1e-9:
         return 1.0, 0.0
     a, b = 1.0, 0.0
     for _ in range(iters):
@@ -213,6 +289,15 @@ class CalibrationSample:
     # first per-TURN input; see `confidence.effort_component`.
     effort_component: float = 0.5
     effort_observed: bool = False
+    # PROVENANCE of the label. Without it, mixing signal tiers is
+    # irreversible: you can never audit which tier is noisy, nor drop one,
+    # without discarding the whole corpus. Every future source (implicit
+    # rephrase-negatives, reopened-task negatives, generated probes) must
+    # carry its own tag so the mix stays visible and separable.
+    #   "turn"            — the graded end-of-turn label (a PROXY)
+    #   "user_correction" — the user said the answer was wrong (ground truth)
+    # Legacy records predate the field and were all end-of-turn labels.
+    source: str = "turn"
 
 
 @dataclass
@@ -316,6 +401,7 @@ class CalibrationTracker:
         entropy_observed: bool = False,
         effort_component: float = 0.5,
         effort_observed: bool = False,
+        source: str = "turn",
     ) -> None:
         """Append one (confidence, outcome) pair. Never raises.
 
@@ -329,12 +415,18 @@ class CalibrationTracker:
                 entropy_component=_clamp01(entropy_component),
                 competence_component=_clamp01(competence_component),
                 uncertainty_pressure=_clamp01(uncertainty_pressure),
-                outcome=1.0 if float(outcome) >= 0.5 else 0.0,
+                # Clamped, NOT binarised. The old `1.0 if >= 0.5 else 0.0`
+                # crushed every graded label back to two values, which is
+                # exactly the constant-column problem the grading exists to
+                # remove. Binary inputs are unaffected (0.0/1.0 clamp to
+                # themselves).
+                outcome=_clamp01(outcome),
                 domain=str(domain or ""),
                 ts=_utcnow_iso(),
                 entropy_observed=bool(entropy_observed),
                 effort_component=_clamp01(effort_component),
                 effort_observed=bool(effort_observed),
+                source=str(source or "turn"),
             )
             with self._lock:
                 self.dir.mkdir(parents=True, exist_ok=True)
@@ -373,7 +465,9 @@ class CalibrationTracker:
                         uncertainty_pressure=_clamp01(
                             d.get("uncertainty_pressure", 0.0)
                         ),
-                        outcome=1.0 if float(d.get("outcome", 0.0)) >= 0.5 else 0.0,
+                        # Preserve graded values on read too (legacy 0.0/1.0
+                        # records clamp to themselves).
+                        outcome=_clamp01(d.get("outcome", 0.0)),
                         domain=str(d.get("domain", "")),
                         ts=str(d.get("ts", "")),
                         # Absent on legacy records, which were ALWAYS the
@@ -381,6 +475,7 @@ class CalibrationTracker:
                         entropy_observed=bool(d.get("entropy_observed", False)),
                         effort_component=_clamp01(d.get("effort_component", 0.5)),
                         effort_observed=bool(d.get("effort_observed", False)),
+                        source=str(d.get("source") or "turn"),
                     )
                 )
             except Exception:
@@ -459,10 +554,16 @@ class CalibrationTracker:
             return None
         n_pos = sum(1 for s in samples if s.outcome >= 0.5)
         n_neg = len(samples) - n_pos
-        if n_pos == 0 or n_neg == 0:
+        # Bail on "no information in the labels", measured as variance rather
+        # than as "both binary classes present". For 0/1 labels the two tests
+        # are identical (variance is 0 exactly when one class is missing), so
+        # binary corpora behave as before — but a GRADED corpus can carry
+        # plenty of signal while every sample sits above 0.5, and the old
+        # test would have refused to fit it at all.
+        if _outcome_variance(samples) < 1e-9:
             logger.debug(
-                "calibration fit bail: single outcome class (pos=%d neg=%d)",
-                n_pos, n_neg,
+                "calibration fit bail: outcome column has no variance "
+                "(pos=%d neg=%d)", n_pos, n_neg,
             )
             return None
 

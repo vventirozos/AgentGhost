@@ -238,6 +238,59 @@
   which is exactly when nobody would have been watching. Tests:
   <code>tests/test_calibration_review_fixes.py</code> (19).</p>
 
+
+  <h2>2026-07-27 (later 9) — graded outcome labels and sample provenance</h2>
+  <p>The binary label — <code>0.0 if (exec failure | verifier REFUTED | budget exhausted) else 1.0</code> —
+  had two defects. It was 96.1% one class, and it asked "did anything visibly break" rather than "was the
+  answer good": a turn that hit one tool error, RECOVERED, and answered correctly scored 0.0, identical to a
+  refuted answer. That is a mislabel, not a strict label.</p>
+
+  <h3>Provenance first</h3>
+  <p>Every sample now carries <code>source</code> — <code>turn</code> for the graded proxy,
+  <code>user_correction</code> for ground truth. This landed BEFORE any new signal tier on purpose: without it,
+  mixing tiers is irreversible, because you can never audit which tier is noisy nor drop one without discarding
+  the whole corpus. Legacy rows default to <code>turn</code>, which is what they were.</p>
+
+  <h3>Grading, with measured constants</h3>
+  <p><code>grade_turn_outcome()</code> maps a finished turn onto [0, 1]. The numbers are measured rather than
+  chosen: across 302 verdict-bearing trajectories the agent passed 251, so an unverified-but-clean turn scores
+  <strong>0.83 — the observed P(good | checkable)</strong> — instead of asserting 1.0. Claiming certainty for a
+  turn nothing checked is precisely the verification theatre this project keeps rediscovering. Verifier
+  PASSED/FAILED remain the hard 1.0/0.0 anchors; execution failures subtract 0.15 each down to a 0.15 floor
+  (0.0 is reserved for "checked and WRONG"); budget exhaustion scores 0.2, since the agent itself flags that
+  reply PARTIAL.</p>
+  <p>Two supporting changes were required, and either one missing would have silently defeated the feature:</p>
+  <ul>
+    <li><strong>Binarisation removed from BOTH the write and read paths.</strong>
+    <code>1.0 if outcome &gt;= 0.5 else 0.0</code> would have crushed every graded label straight back to two
+    values — re-creating the exact constant column the grading exists to remove.</li>
+    <li><strong>Class-presence gates generalised to VARIANCE</strong> in <code>fit()</code> and
+    <code>_fit_platt</code>. "Are both binary classes present?" is the wrong question once labels are
+    continuous: a graded corpus can carry real signal with every sample above 0.5, and the old gate would have
+    refused to fit it at all. For 0/1 labels the tests are identical (variance is zero exactly when one class is
+    missing), so binary corpora behave as before.</li>
+  </ul>
+
+  <h3>Measured — and it contradicted the hypothesis</h3>
+  <p>Replaying the real production mix (1028 turns, 726 of them unverified) through the real feature and the
+  real fit:</p>
+  <table>
+    <thead><tr><th>Label</th><th>Distinct values</th><th>Variance</th><th>Brier vs base rate</th></tr></thead>
+    <tbody>
+      <tr><td>Binary</td><td>2</td><td>0.0986</td><td>0.0666 vs 0.0986 — beats by 33%</td></tr>
+      <tr><td>Graded</td><td>8</td><td>0.0446</td><td>0.0395 vs 0.0446 — beats by 11%</td></tr>
+    </tbody>
+  </table>
+  <p>Grading gives a far richer target but a <em>smaller</em> edge over the baseline. The reason is that the
+  binary label is partly CIRCULAR with the turn-effort feature: effort counts tool calls and repeats, tool
+  errors drive both the effort signal and the binary label, so the model was partly predicting itself. Grading
+  weakens that near-tautology, which lowers the apparent win — the 33% was flattering and 11% is the honest
+  number. It shipped anyway, because a correct label with a smaller flattering metric is worth more than an
+  incorrect one with a bigger one.</p>
+  <p><strong>Standing caveat:</strong> the graded label is a PROXY for process health, not correctness. If the
+  ground-truth tier (user corrections) ever stops flowing, the agent is calibrating purely against its own
+  notion of a tidy turn — which is what it already over-indexes on. Provenance is what keeps that checkable.</p>
+
 </main>
 </body>
 </html>

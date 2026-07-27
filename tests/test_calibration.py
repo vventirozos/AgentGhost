@@ -197,13 +197,20 @@ def test_record_never_raises_on_bad_dir(tmp_path):
     assert t.sample_count() == 0
 
 
-def test_record_clamps_and_binarizes(tmp_path):
+def test_record_clamps_and_preserves_graded_outcomes(tmp_path):
+    # Outcomes are CLAMPED, no longer binarised (2026-07-27). The old
+    # `1.0 if outcome >= 0.5 else 0.0` crushed every graded label back to two
+    # values — the constant-column problem that capped what any fit could
+    # learn. Components are still clamped to [0, 1].
     t = CalibrationTracker(tmp_path / "calib")
     t.record(composite=5.0, entropy_component=-1.0, competence_component=0.5, outcome=0.7)
     s = t._load_samples()[0]
     assert s.composite == 1.0
     assert s.entropy_component == 0.0
-    assert s.outcome == 1.0  # 0.7 ≥ 0.5 → success
+    assert s.outcome == 0.7, "graded label must survive the round trip"
+
+    t.record(composite=0.5, entropy_component=0.5, competence_component=0.5, outcome=42.0)
+    assert t._load_samples()[1].outcome == 1.0, "out-of-range still clamps"
 
 
 def test_stats_shape(tmp_path):

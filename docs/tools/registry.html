@@ -131,6 +131,52 @@
   </ul>
   <p>All three are registered in <code>TOOL_DEFINITIONS</code> and <code>get_available_tools</code>.</p>
 
+
+  <h2>2026-07-27 (later 8) — a skill went invisible, and the prefix cache was primed twice</h2>
+  <p>Two operator-reported symptoms, one root cause: <strong>the advertised acquired-skill set</strong>.</p>
+
+  <h3>The tell</h3>
+  <p>One log line, identical on every request regardless of query — including the request whose hydration was
+  literally "news_headlines tool usage":</p>
+  <pre>semantic routing    injected 1: format_results_to_csv</pre>
+  <p>A line that never varies with its input is a constant where a variable belongs. Measuring the two stores
+  explained it: the registry held <strong>3 active skills</strong>, the vector store held
+  <strong>1 embedding</strong>.</p>
+
+  <h3>Why the skill was invisible</h3>
+  <p>Routing queries the vector store (<code>where type=acquired_skill</code>) and filters the advertised tool
+  schema by the result, so <code>news_headlines</code> was never in the catalogue the model saw. Everything
+  after that is downstream: the model called <code>manage_skills</code> twice hunting for it, tried to shell out
+  (blocked — inline body 219 chars), tripped the loop-breaker, and had its final answer eaten by the stream
+  scrub.</p>
+  <p><strong>It could never self-heal.</strong> <code>save_skill</code> embeds only when the content hash
+  CHANGES, so once an embedding was lost — the pre-2026-07-26 broken deletes, or an orphan sweep — nothing
+  rebuilt it. The index could only ever lose entries, while the skill stayed <code>active</code> and
+  dispatchable. That is the "invisible-but-callable drift" the routing degrade-paths guard against, reached from
+  the opposite direction.</p>
+  <ul>
+    <li><code>backfill_missing_skill_embeddings()</code> re-embeds any ACTIVE registry skill with no vector
+    entry, wired into the same sweep as the orphan purge.</li>
+    <li>The purge is now fail-safe: an empty registry alongside existing embeddings is treated as a failed read,
+    not as "all skills deleted". Without that, one transient mid-write read wipes the whole routing index
+    unrecoverably.</li>
+  </ul>
+
+  <h3>Why the prefix cache loaded twice</h3>
+  <p>The boot warmup primes the request head via <code>get_active_tool_defs("")</code>. The empty string is
+  FALSY, so routing is skipped and it advertises ALL skills — while every live request passes a real query and
+  gets a SUBSET. The ~22,186-token warmup prefix therefore never matched a single real request, and each request
+  re-prefilled the entire head. (The warmup's own comment claimed it mirrored "the same neutral-query routing a
+  live request's first turn resolves to" — false the moment routing became query-dependent.)</p>
+  <p>Fixed at the design level rather than by patching the warmup: below
+  <code>_SKILL_ROUTING_MIN_SKILLS</code> (25) every active skill is advertised and per-query routing is skipped.
+  Filtering three skills saves a few hundred tokens once; it costs a full re-prefill of a 22k head on every
+  request. Above the threshold routing still applies. This also makes the tool block byte-identical ACROSS
+  requests — the per-turn stability was already correct.</p>
+  <p>Verified live: the routing line is now absent (advertise-all = what the warmup primed), and the skill
+  dispatches — <code>turn outcome verified · tools: news_headlines · 804 chars</code>, returning real RSS
+  headlines, no scrub fallback.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

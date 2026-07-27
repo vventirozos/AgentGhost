@@ -10803,10 +10803,21 @@ class GhostAgent:
                 _verifier_failed = bool(
                     verifier_backfill and verifier_backfill[0] == "failed"
                 )
-                _calib_outcome = (
-                    0.0 if (execution_failure_count > 0 or _verifier_failed
-                            or budget_exhausted)
-                    else 1.0
+                # GRADED label (2026-07-27). The binary form
+                # (`0.0 if anything broke else 1.0`) produced 96.1% one class
+                # and mislabelled recoveries: a turn that hit one tool error,
+                # recovered, and answered correctly scored the same 0.0 as a
+                # refuted answer. The graded version carries information on
+                # every turn and scores an unverified-but-clean turn at the
+                # MEASURED P(good | checkable) instead of asserting 1.0.
+                # See `calibration.grade_turn_outcome` — it is a PROXY, which
+                # is why the sample records its provenance.
+                from .calibration import grade_turn_outcome as _grade
+                _calib_outcome = _grade(
+                    verifier_verdict=(verifier_backfill[0]
+                                      if verifier_backfill else None),
+                    execution_failure_count=execution_failure_count,
+                    budget_exhausted=budget_exhausted,
                 )
                 await asyncio.to_thread(
                     _ct.record,
@@ -10840,6 +10851,7 @@ class GhostAgent:
                     # population, which is precisely the wrong shape for a
                     # signal whose only varying input is per-DOMAIN.
                     domain=_dom or "",
+                    source="turn",
                 )
                 # Stash the components keyed by this response's
                 # fingerprint so a NEXT-turn user-correction can record
@@ -14563,7 +14575,11 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             _ct = getattr(ctx, "calibration_tracker", None)
             if _cc is not None and _ct is not None and fp in _cc:
                 _comp = _cc.pop(fp)
-                _ct.record(outcome=0.0, **_comp)
+                # Ground truth (the user said it was wrong), unlike the
+                # graded end-of-turn proxy — tagged so the two can always be
+                # told apart, weighted differently, or one dropped without
+                # discarding the corpus.
+                _ct.record(outcome=0.0, source="user_correction", **_comp)
         except Exception as _cnx:
             logger.debug("calibration correction-negative skipped: %s", _cnx)
 

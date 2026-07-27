@@ -187,6 +187,7 @@ def collect_learning_health(memory_dir) -> Dict[str, Any]:
             "w_effort": params.get("w_effort"),
             "effort_observed_samples": sum(
                 1 for s in samples if s.get("effort_observed")),
+            **_label_health(samples),
             **_feature_health(samples),
         }
 
@@ -291,6 +292,41 @@ def _episode_stats(db_path: Path) -> Optional[Dict[str, Any]]:
             conn.close()
     except Exception:
         return None
+
+
+def _label_health(samples: List[dict]) -> Dict[str, Any]:
+    """Label variance and provenance mix.
+
+    Variance is the quantity that actually gates learning: the binary label
+    was 96.1% one class, and a near-constant target cannot teach a fit
+    anything no matter how many samples accumulate. Provenance is reported
+    beside it because the graded end-of-turn label is a PROXY — if the
+    ground-truth sources (user corrections) ever vanish from the mix, the
+    agent is calibrating purely against its own notion of a tidy turn.
+    """
+    out: Dict[str, Any] = {}
+    if not samples:
+        return out
+    vals = []
+    for s in samples:
+        try:
+            v = s.get("outcome")
+            if v is not None:
+                vals.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if vals:
+        mean = sum(vals) / len(vals)
+        out["label_variance"] = round(
+            sum((v - mean) ** 2 for v in vals) / len(vals), 5)
+        out["label_distinct_values"] = len(set(round(v, 3) for v in vals))
+        out["label_mean"] = round(mean, 4)
+    counts: Dict[str, int] = {}
+    for s in samples:
+        counts[str(s.get("source") or "turn")] = counts.get(
+            str(s.get("source") or "turn"), 0) + 1
+    out["label_sources"] = counts
+    return out
 
 
 def _feature_health(samples: List[dict]) -> Dict[str, Any]:
@@ -498,6 +534,17 @@ def render_learning_health(memory_dir) -> str:
             f"  weights: entropy {cal['w_entropy']}, competence {cal['w_competence']}"
             + (f", effort {cal['w_effort']}" if cal.get("w_effort") is not None else "")
             + f"; outcomes {cal['outcome_pos']}+/{cal['outcome_neg']}-")
+        if cal.get("label_variance") is not None:
+            _srcs = cal.get("label_sources") or {}
+            lines.append(
+                f"  labels: variance {cal['label_variance']} over "
+                f"{cal['label_distinct_values']} distinct values "
+                f"(mean {cal['label_mean']}) · sources "
+                + ", ".join(f"{k}={v}" for k, v in sorted(_srcs.items())))
+            if cal["label_distinct_values"] <= 2:
+                lines.append(
+                    "    → BINARY/near-constant: a label this flat caps what "
+                    "any fit can learn, regardless of sample count")
         if cal.get("effort_observed_samples") is not None:
             lines.append(
                 f"  turn-effort measured on {cal['effort_observed_samples']}/"
@@ -518,7 +565,16 @@ def render_learning_health(memory_dir) -> str:
         lines.append(f"  → {_ent_note}")
         _br, _bb = cal.get("brier_raw"), cal.get("brier_base_rate")
         if isinstance(_br, (int, float)) and _br >= 0 and isinstance(_bb, (int, float)) and _bb >= 0:
-            _verdict = ("beats" if cal["brier"] < _bb else "LOSES TO")
+            # Equality is not a loss: when the map converges to predicting the
+            # base rate (the honest outcome while no feature carries weight)
+            # the two are identical, and calling that "LOSES TO" reads as a
+            # regression that isn't there.
+            if cal["brier"] < _bb - 1e-6:
+                _verdict = "beats"
+            elif cal["brier"] > _bb + 1e-6:
+                _verdict = "LOSES TO"
+            else:
+                _verdict = "matches"
             lines.append(
                 f"  Brier {cal['brier']} {_verdict} the base-rate predictor "
                 f"({_bb}); raw composite {_br}"
