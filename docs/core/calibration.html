@@ -291,6 +291,54 @@
   ground-truth tier (user corrections) ever stops flowing, the agent is calibrating purely against its own
   notion of a tidy turn — which is what it already over-indexes on. Provenance is what keeps that checkable.</p>
 
+
+  <h2>2026-07-27 (later 10) — Tier 2 redesigned from evidence: failure reports</h2>
+  <p>The plan was to loosen this classifier's phrase-plus-rephrase requirement to phrase-only.
+  <strong>Measurement killed that design.</strong> Across 246 eligible triples in the stored session history
+  the classifier fires on <strong>zero</strong> — while 20 of them (8.1%) unmistakably report that the
+  delivered work is broken:</p>
+  <pre>"game.js:45 Failed to load frame definitions: TypeError: …"
+"Failed to load resource: the server responded with a status of 404"
+"it still does the same. the game never starts"</pre>
+  <p>There is no phrase to loosen. A pasted traceback contains no rebuttal and shares no tokens with "build me
+  a game", so neither signal can fire. The classifier is not malfunctioning — it is structurally blind to how
+  corrections actually arrive, which is roughly one turn in twelve of GROUND TRUTH.</p>
+  <p>The same measurement killed a second idea from that plan: "repeat request = implicit negative". Eleven
+  near-identical re-asks exist and they are dominated by a daily-briefing habit ("hello ghost, what's new
+  today?"). Labelling those negative would have fabricated failures.</p>
+
+  <h3><code>classify_failure_report()</code></h3>
+  <p>Single-signal by design — a pasted traceback is unambiguous in a way a bare "no" is not.</p>
+  <ul>
+    <li><strong>Diagnostic:</strong> tracebacks, exception classes, HTTP 4xx/5xx, "Failed to load",
+    "is not a function", <code>file.js:NN</code>. Bare <code>error</code>/<code>errors</code> is deliberately
+    excluded — it false-positives on "zero console errors".</li>
+    <li><strong>Breakage, split by strength.</strong> STRONG ("doesn't work", "still does the same",
+    "won't start") versus WEAK ("fix it/that/this"), which is genuinely ambiguous: a complaint in
+    "doesn't work, please fix it", but forward-looking instruction in "perfect, fix it exactly like that
+    next time".</li>
+    <li><strong>Praise veto, scoped to WEAK evidence only.</strong> This scoping is load-bearing. A first
+    version vetoed on any affirmation and silently ate <em>"the minesweeper right click doesn't work though,
+    but the rest looks good"</em> — a real defect report with a polite softener. Mixed messages are the COMMON
+    shape, and an over-aggressive guard that discards real signal is the same class of bug as a tolerant
+    parser that inverts a verdict. A softener does not cancel a named breakage; a hard diagnostic outranks any
+    amount of politeness.</li>
+  </ul>
+  <p>On the real corpus: <strong>20/246 detected, 0 false positives, 0 vetoes needed</strong> — the veto
+  guards only hypotheticals, which is what a guard should do.</p>
+
+  <h3>Wired calibration-only, on purpose</h3>
+  <p>Unlike an explicit correction this does <em>not</em> mark the trajectory FAILED, because that feeds
+  reflection → lessons → the playbook, where a false positive poisons retrieval (this module's own docstring
+  warns of exactly that). A calibration sample is numeric, provenance-tagged and filterable back out; a bad
+  lesson is not. Recorded at <code>source="failure_report"</code>, grade 0.15 — a notch above an explicit
+  correction's 0.0, since the human is reliable that something is broken and slightly less so that THIS turn
+  broke it. The fingerprint stash is consumed, so a report and a correction on one turn cannot double-count.</p>
+  <p>Two bugs surfaced only in live testing, both invisible to 9584 green tests: the tier sat behind a
+  trajectory-cache lookup that returned first (disabling it on exactly the long tool-heavy turns most likely to
+  draw a complaint), and a stash gate written for binary labels (<code>&gt;= 1.0</code>) stopped matching once
+  the graded label scored clean turns at 0.83 — neither change wrong alone, only in composition.</p>
+
 </main>
 </body>
 </html>

@@ -81,6 +81,13 @@ def _sse_delta_text(chunk) -> str:
         return ""
 
 
+# User-Agent marker the agent's own functional suite sends on its
+# deliberate auth-rejection probes. Recognised ONLY from loopback (see
+# verify_api_key) — it lowers a log level, it never grants access and never
+# suppresses a line.
+_SELF_TEST_UA = "ghost-functional-test"
+
+
 def get_agent(request: Request):
     return request.app.state.agent
 
@@ -98,8 +105,36 @@ async def verify_api_key(request: Request, api_key: str = Security(api_key_heade
         if not api_key or not secrets.compare_digest(_supplied, _expected):
             # Surface auth failures on the monitored stream (brute-force /
             # misconfigured client). Never log the key bytes.
-            pretty_log("Auth Rejected", f"path={request.url.path}",
-                       icon=Icons.SHIELD, level="WARNING")
+            #
+            # The agent's OWN functional suite deliberately probes with a
+            # missing and a wrong key to prove auth works, so every run left
+            # WARNING lines that are indistinguishable from a real intruder —
+            # which is how a security signal gets learned-ignored. Those
+            # probes are re-levelled to INFO, never suppressed, and only when
+            # BOTH conditions hold:
+            #   * the request came from LOOPBACK, and
+            #   * it carries the self-test User-Agent marker.
+            #
+            # Deliberately NOT UA-only: a header is attacker-controlled, so
+            # keying on it alone would hand anyone a switch to mute their own
+            # probes. Requiring loopback means an attacker must already be on
+            # this host to lower the level — and the line is still emitted
+            # either way, so nothing can be made to disappear. The `ua` and
+            # `ip` fields are always logged so a real hit stays identifiable.
+            _ua = (request.headers.get("user-agent") or "")[:80]
+            try:
+                _ip = request.client.host if request.client else ""
+            except Exception:  # noqa: BLE001
+                _ip = ""
+            _loopback = _ip in ("127.0.0.1", "::1", "localhost")
+            _self_test = _loopback and _SELF_TEST_UA in _ua
+            pretty_log(
+                "Auth Rejected",
+                f"path={request.url.path} ip={_ip or '?'} ua={_ua or '?'}"
+                + (" [own functional suite]" if _self_test else ""),
+                icon=Icons.SHIELD,
+                level="INFO" if _self_test else "WARNING",
+            )
             raise HTTPException(status_code=403, detail="Invalid API Key")
     return api_key
 

@@ -46,7 +46,17 @@ class Runner:
     def _req(self, method, path, body=None, timeout=30, auth=True, raw=False):
         url = self.base + path
         data = None
-        headers = {"Content-Type": "application/json"}
+        # Identify this suite on every request. The auth section below
+        # deliberately probes with a missing and a wrong key, and without a
+        # marker those rejections were logged at WARNING exactly like a real
+        # intruder's — every run added noise to a security signal, which is
+        # how such a signal gets learned-ignored. The agent re-levels a
+        # rejection to INFO only when this marker arrives FROM LOOPBACK, and
+        # still logs the line either way (see api/routes.verify_api_key).
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "ghost-functional-test",
+        }
         if auth:
             headers["X-Ghost-Key"] = self.key
         if body is not None:

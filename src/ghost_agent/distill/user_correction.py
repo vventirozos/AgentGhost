@@ -317,3 +317,159 @@ def classify_user_correction(
         signals=signals,
         reason=reason,
     )
+
+
+# ══════════════════════════════════════════════════════════════════════
+# Tier 2: FAILURE REPORTS — how this operator actually says "that's wrong"
+# ══════════════════════════════════════════════════════════════════════
+#
+# `classify_user_correction` above requires a correction PHRASE plus a
+# REPHRASE of the original request. Measured over the stored session
+# history (2026-07-27): **0 of 246 eligible triples** fired, while 20 of
+# them (8.1%) were unmistakable reports that the delivered work was
+# broken. The classifier is not malfunctioning — it is structurally blind
+# to how corrections actually arrive here:
+#
+#     "game.js:45 Failed to load frame definitions: TypeError: …"
+#     "Failed to load resource: the server responded with a status of 404"
+#     "it still does the same. the game never starts"
+#     "the pages all show, i enter data, but i have to refresh … fix that."
+#
+# None contains a rebuttal phrase, and a pasted stack trace shares almost
+# no tokens with "build me a game", so neither signal can fire. Yet each
+# is direct evidence that the previous turn's output was wrong — roughly
+# one turn in twelve, about 1/day. That is the largest untapped source of
+# GROUND-TRUTH negatives in the system.
+#
+# Unlike a correction this needs only ONE signal: pasting a traceback at
+# the agent is unambiguous in a way that a bare "no" is not.
+
+# Signal A — a pasted DIAGNOSTIC. Deliberately specific: bare "error" /
+# "errors" is excluded because it false-positives on success reports
+# ("zero console errors", "no errors now") — the exact inversion that
+# turns a compliment into a recorded failure.
+_DIAGNOSTIC_RE = re.compile(
+    r"(?:Traceback\s*\(most recent call last\)|"
+    r"\bUncaught\b|"
+    r"\b(?:Type|Reference|Syntax|Value|Key|Index|Attribute|Runtime)Error\b|"
+    r"\bException\b(?!\s*(?:handling|safety))|"
+    r"\bFailed to (?:load|fetch|start|compile|build)\b|"
+    r"\bis not a function\b|\bis not defined\b|\bundefined is not\b|"
+    r"\bstatus (?:code )?(?:of )?[45]\d\d\b|\bHTTP [45]\d\d\b|\b[45]0[0-9] \(\)|"
+    r"\b\w+\.(?:js|py|ts|tsx|jsx|go|rs|java):\d+\b|"
+    r"\bstack trace\b|\bsegmentation fault\b|\bcore dumped\b)",
+    re.IGNORECASE,
+)
+
+# Signal B is split by STRENGTH, because the praise veto must treat the
+# two differently.
+#
+# WEAK — a bare "fix it / fix that". Genuinely ambiguous: it reads as a
+# complaint in "new game doesn't work, please fix it", but as forward-
+# looking instruction in "perfect, fix it exactly like that next time".
+# Praise is allowed to veto this one.
+_BREAKAGE_WEAK_RE = re.compile(
+    r"\bfix\s+(?:that|it|this)\b", re.IGNORECASE,
+)
+
+# STRONG — an explicit statement that the delivered thing IS broken.
+# "still" carries most of the weight: it means a previous fix did not
+# take, which is precisely a negative on the turn that claimed to fix it.
+# Praise must NOT veto these. Mixed messages are the common shape —
+# "the minesweeper right click doesn't work though, but the rest looks
+# good" is a defect report with a polite softener, and an earlier version
+# of this guard silently discarded exactly that. A softener does not
+# cancel a named breakage.
+_BREAKAGE_STRONG_RE = re.compile(
+    r"(?:\bstill\s+(?:does(?:n[''"
+    r"]?t)?|doesn[''"
+    r"]?t|not|the same|broken|fails?|crash)|"
+    r"\b(?:does|did|do)(?:n[''"
+    r"]?t| not)\s+work\b|"
+    r"\bwo(?:n[''"
+    r"]?t|uld not)\s+(?:start|work|run|load|open|launch)\b|"
+    r"\bnot\s+working\b|\bnothing\s+happens\b|\bnever\s+(?:starts?|loads?|runs?)\b|"
+    r"\bis\s+broken\b|\bbroke\s+(?:it|the)\b|"
+    r"\bi\s+(?:have|need)\s+to\s+refresh\b|"
+    r"\bneeds?\s+(?:a\s+)?manual\s+reload\b)",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class FailureReportVerdict:
+    """Result of :func:`classify_failure_report`.
+
+    ``is_failure_report`` is True iff the user's message reports that the
+    agent's delivered work is broken. ``signals`` lists which detectors
+    fired (audit), ``reason`` is a short string for the sample record.
+    """
+
+    is_failure_report: bool
+    confidence: float
+    signals: List[str] = field(default_factory=list)
+    reason: str = ""
+
+
+def classify_failure_report(current_user_text: str) -> FailureReportVerdict:
+    """Decide whether ``current_user_text`` reports broken delivered work.
+
+    Single-signal by design (see the module note above): either a pasted
+    diagnostic OR an explicit breakage statement is sufficient.
+
+    **Direction guard.** The praise veto is the load-bearing part, not the
+    matching. A real session message reads:
+
+        "menu-bounce fix works — START GAME now clears all overlays, the
+         loop runs at 60fps with zero console errors."
+
+    That contains "fix" and "errors" and is *praise*. Recording it as a
+    negative would invert the label — the same class of bug as a tolerant
+    parser that silently produces a wrong answer instead of failing loudly.
+    An affirmation therefore vetoes the verdict UNLESS a hard diagnostic is
+    present (a pasted traceback alongside "works" still means something
+    broke).
+
+    Pure: never raises, no I/O.
+    """
+    cu = current_user_text if isinstance(current_user_text, str) else ""
+    if not cu.strip():
+        return FailureReportVerdict(False, 0.0, [], "")
+
+    signals: List[str] = []
+    confidence = 0.0
+    has_diagnostic = bool(_DIAGNOSTIC_RE.search(cu))
+    has_strong = bool(_BREAKAGE_STRONG_RE.search(cu))
+    has_weak = bool(_BREAKAGE_WEAK_RE.search(cu))
+    if has_diagnostic:
+        signals.append("diagnostic")
+        confidence += 0.6
+    if has_strong:
+        signals.append("breakage")
+        confidence += 0.5
+    elif has_weak:
+        signals.append("breakage-weak")
+        confidence += 0.3
+
+    is_failure = bool(signals)
+
+    # Praise veto. It applies ONLY when the evidence is weak — a bare
+    # "fix it" that praise recasts as forward-looking instruction. A hard
+    # diagnostic or a named breakage outranks any amount of politeness:
+    # "the right click doesn't work though, but the rest looks good" is a
+    # defect report with a softener, and vetoing it discards exactly the
+    # ground truth this tier exists to capture.
+    if is_failure and not has_diagnostic and not has_strong \
+            and _AFFIRMATION_RE.search(cu):
+        signals.append("affirmation-veto")
+        is_failure = False
+        confidence = 0.0
+
+    if confidence > 1.0:
+        confidence = 1.0
+    return FailureReportVerdict(
+        is_failure_report=is_failure,
+        confidence=confidence if is_failure else 0.0,
+        signals=signals,
+        reason=("user-reported failure: " + " + ".join(signals)) if is_failure else "",
+    )

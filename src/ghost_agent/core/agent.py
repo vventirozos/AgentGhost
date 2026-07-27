@@ -10864,14 +10864,22 @@ class GhostAgent:
                     if _cc is None:
                         _cc = _OD()
                         self.context._recent_calib_for_correction = _cc
-                    # Only stash turns recorded as a SUCCESS. A turn already
-                    # booked at outcome=0.0 (execution failure / REFUTED /
-                    # budget exhausted) would otherwise be recorded a SECOND
-                    # time as 0.0 when the user then corrects it, double-
-                    # weighting one turn in the Brier, the ECE and the weight
-                    # fit. The stash exists to catch turns that looked CLEAN
-                    # and were nonetheless wrong.
-                    if _calib_outcome >= 1.0:
+                    # Only stash turns recorded as broadly SUCCESSFUL. A turn
+                    # already booked as a failure (REFUTED / budget exhausted
+                    # / repeated execution failures) would otherwise be
+                    # recorded a SECOND time when the user then complains,
+                    # double-weighting one turn in the Brier, the ECE and the
+                    # weight fit. The stash exists to catch turns that looked
+                    # CLEAN and were nonetheless wrong.
+                    #
+                    # Threshold is 0.5, NOT 1.0. Under the graded label a
+                    # clean-but-unverified turn scores the measured prior
+                    # (0.83) and never reaches 1.0, so a `>= 1.0` gate —
+                    # correct when labels were binary — silently stopped
+                    # populating the stash for almost every turn, which in
+                    # turn disabled BOTH the user-correction negative and the
+                    # failure-report tier that consume it.
+                    if _calib_outcome >= 0.5:
                         _cc[self._response_fingerprint(final_ai_content or "")] = {
                             # pre_penalty, matching the inline record above: the
                             # outcome penalty is a function of the label, so
@@ -14410,6 +14418,41 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         except Exception as e:
             logger.debug("reflected-ids persist failed: %s", e)
 
+    def _record_failure_report_negative(self, fp: str, verdict, *,
+                                        source: str = "failure_report",
+                                        grade: float = None) -> bool:
+        """File a Tier-2 weak negative for a user-reported failure.
+
+        Consumes the same fingerprint-keyed stash the correction path uses,
+        so at most ONE negative is ever filed per prior turn — a report and
+        a correction on the same turn cannot double-count it.
+
+        Tagged `source="failure_report"` at a fractional grade rather than
+        the 0.0 an explicit correction earns: the human is reliable that
+        something is broken, slightly less so that THIS turn broke it.
+        Returns True when a sample was recorded. Never raises.
+        """
+        try:
+            ctx = self.context
+            _cc = getattr(ctx, "_recent_calib_for_correction", None)
+            _ct = getattr(ctx, "calibration_tracker", None)
+            if _cc is None or _ct is None or fp not in _cc:
+                return False
+            from .calibration import _FAILURE_REPORT_GRADE
+            _grade = _FAILURE_REPORT_GRADE if grade is None else grade
+            _comp = _cc.pop(fp)
+            _ct.record(outcome=_grade, source=source, **_comp)
+            pretty_log(
+                "Failure Report" if source == "failure_report" else "User Correction",
+                f"user reported broken work ({', '.join(verdict.signals)}) — "
+                f"filed a calibration negative (grade {_grade}) on the prior turn",
+                icon=Icons.WARN, level="INFO",
+            )
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.debug("failure-report negative skipped: %s", e)
+            return False
+
     def _maybe_promote_prior_turn_via_user_correction(
         self,
         messages,
@@ -14487,9 +14530,6 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
         fp = self._response_fingerprint(prev_assistant)
         if not fp:
             return
-        traj = cache.get(fp)
-        if traj is None:
-            return
 
         try:
             from ..distill.user_correction import classify_user_correction
@@ -14502,7 +14542,45 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
             prev_assistant_response=prev_assistant,
             current_user_text=current_user_text or "",
         )
+        # The TRAJECTORY lookup is deliberately AFTER the classification and
+        # after the Tier-2 branch below. It used to sit above both, so a turn
+        # whose trajectory was never cached (or was LRU-evicted) returned
+        # before anything could be classified — which silently disabled the
+        # failure-report tier on exactly the long, tool-heavy turns most
+        # likely to draw a complaint. Tier 2 needs only the fingerprint and
+        # the calibration stash; only the correction PROMOTION needs `traj`.
+        traj = cache.get(fp)
         if not verdict.is_correction:
+            # TIER 2 (2026-07-27): the correction classifier needs a rebuttal
+            # PHRASE plus a REPHRASE of the original request, and measured
+            # over the stored sessions it fired on 0 of 246 eligible turns —
+            # while 20 of them reported the delivered work was broken. This
+            # operator corrects by pasting a traceback or saying "it still
+            # doesn't work", which neither signal can see. Harvest those.
+            #
+            # Deliberately CALIBRATION-ONLY: unlike an explicit correction
+            # this does NOT mark the trajectory FAILED, because that feeds
+            # reflection → lessons → the playbook, where a false positive
+            # poisons retrieval (this module's own docstring warns about
+            # exactly that). A calibration sample is numeric, tagged with its
+            # provenance, and can be filtered back out; a bad lesson cannot.
+            try:
+                from ..distill.user_correction import classify_failure_report
+                _fr = classify_failure_report(current_user_text or "")
+                if _fr.is_failure_report:
+                    self._record_failure_report_negative(fp, _fr)
+            except Exception as _fre:  # noqa: BLE001 — never break a turn
+                logger.debug("failure-report tier skipped: %s", _fre)
+            return
+
+        # From here the correction PROMOTION needs the cached trajectory.
+        # Without it there is nothing to mark FAILED — but the calibration
+        # negative below keys off the fingerprint, so it is still worth
+        # filing. (Previously an uncached trajectory returned before any of
+        # this, losing the strongest label the loop can get.)
+        if traj is None:
+            self._record_failure_report_negative(
+                fp, verdict, source="user_correction", grade=0.0)
             return
 
         # Persist the correction. The sidecar is durable; the in-

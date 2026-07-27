@@ -338,10 +338,11 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 >
 > **What genuinely remains is NOT pending hunt-work — it is three buckets:**
 >
-> **(0) ⏳ ACTIVE DESIGNED WORK — negative-label supply Tiers 2-4 (§4E, added 2026-07-27).** Tier 1
-> (graded labels + sample provenance) is DONE and deployed; Tiers 2-4 are designed, ranked, and
-> deliberately not started so Tier 1's effect stays attributable on live data. This is the only bucket
-> here that is genuinely actionable headless — start at §4E Tier 2.
+> **(0) ⏳ ACTIVE DESIGNED WORK — negative-label supply (§4E, added 2026-07-27).** Tiers 1-2 (graded
+> labels + provenance; failure-report detection) are DONE and deployed. Tier 3 (reopened work) is
+> pending but MARGINAL — measured supply is ~7 events/20 days; Tier 4 stays on HOLD pending a
+> different instrument. Measure a signal's SUPPLY before designing its detector: doing so already
+> killed two of my own designs (see §4E).
 >
 > **(1) Blocked on operator action** (cannot be done headless):
 > - **Earn-your-keep / synthetic-ablation route — CLOSED as INCONCLUSIVE-for-this-model (operator decision
@@ -377,26 +378,32 @@ actionable item; A-D are historical record whose per-item FIXED/RESOLVED markers
 (E) negative-label-supply tiers 2-4 (PENDING), (A) improvement-review partials/blocked, (B) static-hunt
 deferred findings, (C) functional-hunt deferred findings, (D) the B4 outcome-battery design.
 
-### 4E. Negative-label supply — Tiers 2-4 ⏳ PENDING (designed + ranked 2026-07-27, later 9)
+### 4E. Negative-label supply — Tier 3 ⏳ PENDING, Tier 4 ⛔ HOLD (Tiers 1-2 DONE 2026-07-27)
 
-**Tier 1 is DONE and deployed** (graded labels + `source` provenance — §6 "later 9"). Tiers 2-4 are
-designed, ranked, and deliberately NOT started: Tier 1's effect must be observable on live data first, or
-a second signal source makes attribution ambiguous. Do them in order; each is independently shippable.
+**Tiers 1 and 2 are DONE and deployed** (§6 "later 9" and "later 10"). Tier 3 remains pending; Tier 4 is
+on HOLD. Measured supply per tier — do this BEFORE designing any further detector, it has already killed
+two of my own designs:
+| tier | measured supply | status |
+|---|---|---|
+| 1 graded label | every turn | ✅ done |
+| 2 failure reports | 20/246 turns (8.1%), ~1/day | ✅ done (redesigned from evidence) |
+| 3 reopened work | 7 project_reopened events / 20 days | ⏳ pending, marginal |
+| 4 generated probes | n/a — instrument failed before | ⛔ hold |
 
 **Why any of this:** the label is ~96% one class. Two distinct problems hide in that — (a) too few
 negatives (49 of 1226, no statistical power) and (b) the label measured "did anything visibly break"
 rather than "was the answer good". Tier 1 fixed (b). Tiers 2-3 attack (a) with signals that ALREADY OCCUR
 but are discarded.
 
-- **⏳ TIER 2 — implicit user signals (highest remaining value, low risk).** The correction classifier
-  (`distill/user_correction.py`) requires BOTH a correction phrase AND a high-Jaccard rephrase of the
-  original request. That conservatism is right for a GOLD-STANDARD tier, but everything in the ambiguous
-  middle is discarded — live-confirmed 2026-07-27: a genuine correction of mine was correctly rejected for
-  low rephrase overlap. ADD a second, lower-confidence tier at a FRACTIONAL outcome (~0.3, not a hard 0.0):
-  phrase-only corrections, and a repeated/rephrased request with no correction phrase (an implicit
-  negative — the machinery for rephrase detection already exists). MUST land under its own `source` tag
-  (e.g. `user_correction_weak`) so it can be audited, reweighted, or dropped without touching the corpus.
-  DO NOT loosen the existing strict tier — add beside it.
+- **✅ TIER 2 — DONE 2026-07-27 (later 10), but NOT as designed here.** The original plan (loosen
+  phrase+rephrase to phrase-only) was **killed by measurement**: scanning 246 eligible session triples, the
+  correction classifier fires on **0**, while 20 (8.1%) report broken work as a pasted traceback or "it still
+  doesn't work" — neither of which contains a phrase to loosen. Shipped `classify_failure_report()` instead
+  (diagnostic OR breakage signal, praise-veto scoped to WEAK evidence only), wired calibration-ONLY at
+  `source="failure_report"` grade 0.15. **The "repeat request = implicit negative" idea from this same plan
+  was also killed**: the 11 near-identical re-asks are dominated by the daily-briefing habit, and labelling
+  them negative would fabricate failures. Lesson worth keeping: measure the SUPPLY of a signal before
+  designing the detector for it.
 - **⏳ TIER 3 — retroactive negatives from reopened work.** A task/defect REOPENED after a turn closed it
   DONE is a delayed negative on that turn. Both the reopening and the turn→task linkage already exist
   (project work_log, defect reopening — §6 2026-07-18). Nothing new needs observing, only connecting.
@@ -1159,6 +1166,73 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-27 (later 10) — Tier 2 REDESIGNED from evidence: failure reports, not correction phrases
+
+Operator: "what do we need to proceed with tiers 2-4?" → I measured the SUPPLY of each before writing code,
+which killed my own design. Then "run the scan" → "proceed".
+
+**THE SCAN THAT OVERTURNED THE DESIGN.** Over the stored sessions (56 sessions, 246 eligible triples after
+excluding 23 single-turn ones): the live correction classifier fires on **0**. Not one, ever. But 20 of those
+246 (8.1%) unmistakably report the delivered work is broken. So the question "does the operator rarely correct,
+or can the classifier not see it?" resolved decisively to the SECOND — and my proposed Tier 2 (loosen
+phrase+rephrase to phrase-only) would have caught NOTHING, because the phrase is exactly what's absent:
+    "game.js:45 Failed to load frame definitions: TypeError: …"
+    "Failed to load resource: the server responded with a status of 404"
+    "it still does the same. the game never starts"
+A pasted traceback contains no rebuttal phrase and shares no tokens with "build me a game", so neither of the
+classifier's two signals can fire. It is not malfunctioning; it is structurally blind to how corrections
+actually arrive here (~1/day of GROUND TRUTH, the largest untapped negative source in the system).
+**ALSO KILLED: "repeat request = implicit negative"**, which I had proposed two messages earlier. 11 near-
+identical re-asks exist and they are dominated by "hello ghost, what's new today?" — a daily-briefing habit.
+Treating those as negatives would have poisoned the corpus with fabricated failures.
+
+SHIPPED — `classify_failure_report()` (distill/user_correction.py), single-signal by design (a pasted traceback
+is unambiguous in a way a bare "no" is not):
+• DIAGNOSTIC: tracebacks, exception classes, HTTP 4xx/5xx, "Failed to load", "is not a function", file.js:NN.
+  Bare "error"/"errors" deliberately EXCLUDED — it false-positives on "zero console errors"/"no errors now".
+• BREAKAGE, split by STRENGTH — this split is the load-bearing part:
+  - STRONG ("doesn't work", "still does the same", "won't start", "nothing happens", "needs manual reload")
+  - WEAK ("fix it/that/this") — ambiguous: a complaint in "doesn't work, please fix it", but forward-looking
+    instruction in "perfect, fix it exactly like that next time".
+• PRAISE VETO scoped to WEAK evidence only. My first version vetoed on any affirmation, and it silently ate
+  "the minesweeper right click doesn't work though, but the rest looks good" — a real defect report with a
+  polite softener. **Mixed messages are the COMMON shape**; an over-aggressive guard discarding real signal is
+  the same class of bug as the tolerant parser that inverted a verdict earlier today. A softener does not
+  cancel a named breakage; a hard diagnostic outranks any amount of politeness.
+RESULT on the real corpus: **20/246 detected (8.1%), 0 false positives, 0 vetoes needed** — the veto guards
+only hypotheticals, which is what a guard should do.
+
+WIRED calibration-ONLY, deliberately: unlike an explicit correction this does NOT mark the trajectory FAILED,
+because that feeds reflection → lessons → playbook where a false positive poisons retrieval (the module's own
+docstring warns of exactly this). A calibration sample is numeric, provenance-tagged, and filterable back out;
+a bad lesson is not. Recorded at `source="failure_report"`, grade 0.15 (a notch above an explicit correction's
+0.0 — the human is reliable that something is broken, slightly less so that THIS turn broke it). The
+fingerprint stash is consumed, so a report and a correction on one turn can never double-count.
+
+**TWO BUGS FOUND BY THE LIVE TEST — both mine, both invisible to 9584 green tests:**
+1. **Tier 2 sat behind the TRAJECTORY-cache lookup.** `traj = cache.get(fp); if traj is None: return` ran BEFORE
+   any classification, so a turn whose trajectory was never cached (or was LRU-evicted) returned before Tier 2
+   could run — silently disabling it on exactly the long, tool-heavy turns most likely to draw a complaint.
+   Moved the lookup AFTER classification; Tier 2 needs only the fingerprint + calibration stash. An uncached
+   trajectory now still files the correction negative instead of losing the strongest label available.
+2. **An interaction between two of my OWN same-day changes.** The D1 fix (later-6) gated the stash on
+   `_calib_outcome >= 1.0`, correct when labels were binary. The graded label (later-9) scores a clean turn
+   0.83 — never 1.0 — so the stash stopped being populated for almost every turn, disabling BOTH the
+   user-correction negative AND Tier 2. Threshold → 0.5. **Neither change is wrong alone; the composition is.**
+
+**INCIDENT (self-inflicted, resolved):** rapid deploy cycling raced — a new process could not bind :8000 while
+the old one still held it, and it kept running WITHOUT a listener while launchd reported "running". Symptom:
+`HTTP 000` connection-refused with a live pid. Fix: kill + wait for an actual bind (took 168s). Lesson: the
+deploy check must verify a LISTENER, not process liveness — `launchctl print` saying "running" is not service.
+Also noted: a synthetic probe citing a nonexistent `app.js:12` sent the agent on a 20-turn/856s hunt. Probes
+for this tier must bound the agent's response ("do not investigate, reply exactly X").
+
+Tests: test_failure_report_tier.py (45) — the corpus is the 20 VERBATIM session messages plus the real praise
+traps, so it is a regression corpus rather than invented examples. One pinned test updated (the 1.0→0.5 gate).
+FULL SUITE 9584 passed / 0 failed. DEPLOYED (54109→55713 after the incident, health ok); functional_live_test
+32/32. LIVE-VERIFIED: `outcome=0.15 source=failure_report`.
+REMAINING: §4E Tier 3 (reopened work, ~7 events/20d) and Tier 4 (HOLD — needs a different instrument).
 
 ### 2026-07-27 (later 9) — Graded outcome labels + sample provenance (negative-supply Tier 1)
 

@@ -90,6 +90,11 @@ _DEGRADED_FLOOR = 0.15
 # Budget exhaustion: the reply is explicitly flagged working-state/PARTIAL,
 # i.e. the agent itself reports it did not finish.
 _BUDGET_EXHAUSTED_GRADE = 0.2
+# A user-reported failure ("it still doesn't work", a pasted traceback).
+# Strong — the human is telling you the delivered work is broken — but a
+# notch above an explicit correction's 0.0, because attribution is slightly
+# looser: the report might name a defect the previous turn did not cause.
+_FAILURE_REPORT_GRADE = 0.15
 
 
 def grade_turn_outcome(*, verifier_verdict=None, execution_failure_count: int = 0,

@@ -78,7 +78,11 @@ class TestCorrectionStash:
         double-weighting it in the Brier/ECE/weight fit."""
         i = SRC.index("_recent_calib_for_correction")
         window = SRC[i:i + 3400]
-        assert "if _calib_outcome >= 1.0:" in window
+        # 0.5, not 1.0: under the graded label a clean turn scores the
+        # measured prior (0.83) and never reaches 1.0, so a `>= 1.0`
+        # gate stops populating the stash entirely — which disables
+        # every downstream tier that consumes it.
+        assert "if _calib_outcome >= 0.5:" in window
 
     def test_stash_records_the_pre_penalty_composite(self):
         """D2: the inline record deliberately stores `pre_penalty_composite`
