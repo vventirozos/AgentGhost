@@ -651,10 +651,12 @@ def render_learning_health(memory_dir) -> str:
         else:
             _ent_note = (
                 f"w_entropy pinned to 0 until >={cal['entropy_min_samples_gate']} "
-                "observed samples of both outcome classes accumulate. The "
-                "upstream refuses logprobs on tools+stream payloads and the "
-                "loop attaches tools on every non-final generation, so most "
-                "turns observe none — this is COVERAGE, not degeneracy")
+                "observed samples of both outcome classes accumulate. Most "
+                "stored samples predate the 2026-07-27 n_probs fix "
+                "(tool-attached streamed generations now request "
+                "llama.cpp-native n_probs; the OAI logprobs flag is a hard "
+                "400 on tools+stream) — coverage should climb from here. If "
+                "it stays at 0 the probe is broken again, not the corpus")
         lines.append(
             f"  entropy observed on {cal['entropy_observed_samples']}/"
             f"{cal['samples_on_disk']} samples ({cal['entropy_observed_pct']}%), "

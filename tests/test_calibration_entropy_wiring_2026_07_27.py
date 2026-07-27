@@ -82,26 +82,67 @@ class TestAgentWiringPins:
     counterfactual/dream wiring tests)."""
 
     def test_logprobs_optin_hoisted_out_of_sse_branch(self):
-        assert "_metacog_logprobs = bool(" in SRC
+        assert "_metacog_logprobs = request_logprobs(" in SRC
         # The opt-in must precede the SSE branch split, covering the
         # internal path too.
-        assert (SRC.index("_metacog_logprobs = bool(")
+        assert (SRC.index("_metacog_logprobs = request_logprobs(")
                 < SRC.index("if is_final_generation and stream_response:"))
 
-    def test_logprobs_never_requested_alongside_tools(self):
-        """llama-server hard-rejects logprobs on tools+stream payloads
-        (live 400, re-confirmed against the running server 2026-07-27).
+    def test_oai_logprobs_flag_never_set_alongside_tools(self):
+        """llama-server hard-rejects the OAI `logprobs` flag on
+        tools+stream payloads (live 400, re-confirmed 2026-07-27) — that
+        combination breaks the GENERATION, not just entropy. The safety
+        property moved into entropy.request_logprobs (2026-07-27, later):
+        with tools attached it must use the llama.cpp-native `n_probs`
+        sidestep and never the OAI flag."""
+        from ghost_agent.core.entropy import request_logprobs
+        p = {"model": "m", "messages": [], "tools": [{"x": 1}]}
+        added = request_logprobs(p, top_k=5)
+        assert "logprobs" not in p and "top_logprobs" not in p
+        assert added is True and p.get("n_probs") == 5
 
-        The no-tools check IS the safety property; it must never be
-        removed. The gate previously also required `is_final_generation`,
-        which is strictly narrower than the server constraint — a
-        tool-free generation that isn't a forced-final one is perfectly
-        safe to request logprobs on, and excluding it only cost entropy
-        coverage. That extra term was dropped deliberately; this test
-        pins the invariant that actually matters."""
-        gate = SRC[SRC.index("_metacog_logprobs = bool("):]
-        gate = gate[:gate.index(")")]
-        assert '"tools" not in payload' in gate
+    def test_no_tools_payload_uses_portable_oai_fields(self):
+        from ghost_agent.core.entropy import request_logprobs
+        p = {"model": "m", "messages": []}
+        assert request_logprobs(p, top_k=5) is True
+        assert p.get("logprobs") is True and p.get("top_logprobs") == 5
+        assert "n_probs" not in p
+
+    def test_nprobs_rejection_latch_falls_back(self):
+        """When the upstream rejected n_probs once this session, later
+        tool-attached generations must not keep sending it — one broken
+        generation, not every one."""
+        from ghost_agent.core.entropy import request_logprobs
+        p = {"model": "m", "messages": [], "tools": [{"x": 1}]}
+        added = request_logprobs(p, top_k=5, native_nprobs_ok=False)
+        assert added is False
+        assert "n_probs" not in p and "logprobs" not in p
+
+    def test_nprobs_env_kill_switch(self, monkeypatch):
+        import ghost_agent.core.entropy as ent
+        monkeypatch.setattr(ent, "_NPROBS_WITH_TOOLS_ENABLED", False)
+        p = {"model": "m", "messages": [], "tools": [{"x": 1}]}
+        assert ent.request_logprobs(p, top_k=5) is False
+        assert "n_probs" not in p
+
+    def test_nprobs_rejection_latch_wired_in_agent(self):
+        """The stream-abort handlers must set the session latch when the
+        upstream rejects n_probs, on BOTH stream paths."""
+        assert SRC.count("self.context._nprobs_rejected = True") >= 2
+        assert "_nprobs_rejected" in SRC[
+            SRC.index("_metacog_logprobs = request_logprobs("):][:400]
+
+    def test_nprobs_streamed_chunk_parses_through_extractor(self):
+        """The live n_probs+tools+stream chunk shape (captured from the
+        running b10090 server 2026-07-27) must flow through
+        extract_top_logprobs → EntropyTracker unchanged."""
+        chunk = _mtp_chunk(True)
+        tracker = EntropyTracker(window=32, top_k=5)
+        tlp = extract_top_logprobs(chunk)
+        assert tlp
+        tracker.observe(tlp)
+        r = tracker.reading()
+        assert r is not None and r.n >= 1
 
     def test_internal_stream_has_tracker_observe_and_stash(self):
         assert SRC.count("_turn_entropy_tracker") >= 4  # init/observe/stash

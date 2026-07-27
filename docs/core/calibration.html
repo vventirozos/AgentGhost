@@ -87,7 +87,36 @@
   continuations and SSE final streams. Watch <code>entropy_distinct_values</code>; if still
   &lt;3 by ~2026-08-10, retire <code>w_entropy</code> (already 0-weighted — no behavioral
   change either way). Tests:
-  <code>tests/test_calibration_entropy_wiring_2026_07_27.py</code>.</p>
+  <code>tests/test_calibration_entropy_wiring_2026_07_27.py</code>.
+  <em>Superseded the same day — see the n_probs sidestep below: the tools-attached gap is
+  closed, so the ~2026-08-10 check flips its expectation: coverage should CLIMB
+  (<code>entropy_observed_pos/neg</code> in the learning-health report), and a flat 0 now
+  means the probe broke again, not that the corpus can't produce entropy.</em></p>
+
+  <h2>2026-07-27 (later) — n_probs sidestep: tool-attached generations observe entropy</h2>
+  <p>The server constraint was re-read at the source (llama.cpp master
+  <code>server-common.cpp</code> / <code>server-task.cpp</code>, matching the live b10090
+  build): the 400 guard fires only on the <em>OAI</em> <code>logprobs</code> flag, while the
+  streamed chat formatter attaches OAI-shaped logprobs to a chunk's last delta whenever the
+  slot sampled with <code>n_probs &gt; 0</code> — it never re-checks the request flag. The
+  llama.cpp-native <code>n_probs</code> field rides the server's pass-through parameter copy
+  straight to the sampler, so <code>n_probs + tools + stream</code> streams logprobs chunks.
+  Verified against the live server: the chunks parse through
+  <code>extract_top_logprobs</code> → <code>EntropyTracker</code> unchanged (probs/delta
+  alignment is imperfect under tool parsing — irrelevant for entropy, which needs only the
+  top-K distributions, not their text alignment).</p>
+  <ul>
+    <li><code>entropy.request_logprobs(payload, top_k=5, native_nprobs_ok=…)</code> owns the
+    field selection: no tools → portable OAI <code>logprobs</code>/<code>top_logprobs</code>;
+    tools attached → native <code>n_probs</code>. The OAI flag is NEVER set alongside tools —
+    that 400 breaks the <em>generation</em>, not just entropy.</li>
+    <li><strong>Self-healing:</strong> if a future upstream rejects <code>n_probs</code>, the
+    stream-abort handlers on BOTH stream paths latch <code>context._nprobs_rejected</code>, so
+    it costs one generation, not every one. Kill switch:
+    <code>GHOST_ENTROPY_TOOLS_NPROBS=0</code>.</li>
+    <li>MTP sparsity is unchanged: probs arrive on target-sampled tokens only; the tracker
+    reads over observed tokens.</li>
+  </ul>
 
   <h2>2026-07-27 — the entropy signal was structurally unfittable</h2>
   <p><strong>Measured live:</strong> 1200 of 1201 stored samples had

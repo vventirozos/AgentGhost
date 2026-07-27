@@ -1167,6 +1167,38 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 (later 13) — w_entropy un-pinned: native n_probs sidesteps the tools+stream logprobs 400
+
+Operator asked how to fix the streamed-path logprobs issue (entropy coverage 0/1280, w_entropy pinned).
+Diagnosis chain: the earlier same-day hoist fix requests logprobs only when "tools" not in payload — but the
+main loop attaches tools on EVERY non-final generation, and most turns END on a tools-attached generation (the
+model answers without calling a tool), so nothing was ever observed. The llama-server constraint was then
+re-read at the SOURCE (llama.cpp master server-common.cpp / server-task.cpp, matching live b10090):
+• the 400 guard fires ONLY on the OAI `logprobs` flag (`json_value(body,"logprobs",false)`);
+• the native `n_probs` field rides the server's pass-through parameter copy straight into the sampler;
+• the streamed chat formatter attaches OAI-shaped logprobs to a chunk's last delta whenever the slot sampled
+  with n_probs > 0 — it never re-checks the request flag.
+So `n_probs + tools + stream` streams logprobs. VERIFIED live before writing code: probe against :8088
+returned logprobs-bearing chunks that parse through extract_top_logprobs → EntropyTracker unchanged (sparse
+under MTP — expected, tracker reads observed tokens). Probs/delta alignment is imperfect under tool parsing
+(why upstream guards the strict-OAI path) — irrelevant for entropy, which needs top-K distributions only.
+
+IMPLEMENTATION:
+• entropy.request_logprobs(payload, top_k, native_nprobs_ok) owns field selection: no tools → portable OAI
+  fields; tools → native n_probs. The OAI flag is NEVER set alongside tools (that 400 breaks the GENERATION).
+• agent.py metacog block now calls it (single site, covers both stream paths; tracker arming unchanged).
+• Self-healing: if a future upstream rejects n_probs, the stream-abort handlers on BOTH paths latch
+  context._nprobs_rejected → later generations fall back to the no-tools-only gate. One broken generation,
+  not every one. Kill: GHOST_ENTROPY_TOOLS_NPROBS=0 (e.g. non-llama.cpp upstream that rejects unknown fields).
+• learning_health entropy note rewritten: coverage should CLIMB from here; flat 0 = probe broken again.
+Known risk, stated: this rides llama.cpp implementation details (pass-through + formatter behavior), which is
+why the latch + kill-switch exist and why the wiring test pins the OAI-flag-never-with-tools invariant.
+
+Tests: test_calibration_entropy_wiring_2026_07_27.py rewritten around the new invariant (request_logprobs
+behavioral tests: OAI-flag-never-with-tools, n_probs path, rejection latch, env kill, chunk-shape parse;
+latch wired on both paths). Docs: docs/core/calibration.html (n_probs sidestep section; the "structurally
+sparse" watch flips expectation), docs/core/entropy.html (request_logprobs API row + consumers note).
+
 ### 2026-07-27 (later 12) — Introspect-subsystem review: 5 bugs (2 instrument≠mechanism) + 8 improvements
 
 Operator asked for a dedicated review of the introspect subsystem (tools/introspect.py, core/learning_health.py,
@@ -1216,6 +1248,9 @@ read-error/principles/age/cache-invalidation coverage; tail-read tuple signature
 test_bughunt_fixes_2026_07_27.py. FULL SUITE: 9621 passed, 13 skipped (3:48).
 Docs: docs/tools/introspect.html (actions/params tables now include activity+learning, failure semantics,
 full review section), docs/tools/registry.html (stale introspect blurb corrected).
+DEPLOYED (65219→65742, health ok); functional_live_test 32/32 (0 soft). Live-verified the corrected
+instrument against production stores: COMPETENCE "INJECTING (2630 total obs ≥ 20-total gate)" and entropy
+"0/1280 observed (0+/0-) → pinned, COVERAGE not degeneracy" — both lines now state the mechanism's truth.
 
 ### 2026-07-27 (later 11) — Auth-rejection log noise: re-levelled, never suppressed
 

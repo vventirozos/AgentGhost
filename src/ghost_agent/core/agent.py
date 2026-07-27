@@ -12802,32 +12802,34 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # only); sparse observations are fine — the tracker's
                     # reading is over observed tokens.
                     #
-                    # FINAL generations only: llama-server hard-rejects
-                    # `logprobs` on `tools` + `stream` payloads (live 400,
-                    # caught on the post-deploy probe), and tools are
-                    # attached exactly when `not is_final_generation` — so
-                    # this gate both matches the original phase-2.1 scope
-                    # and avoids the conflict. Belt-and-braces `tools`
-                    # check in case a future path attaches them earlier.
-                    #
-                    # The gate is `"tools" not in payload`, NOT
-                    # `is_final_generation`. Re-verified against the live
-                    # server 2026-07-27: `logprobs` + `tools` + `stream`
-                    # → HTTP 400 "logprobs is not supported with tools +
-                    # stream", but `logprobs` + `stream` (no tools) is fine.
-                    # The old extra `is_final_generation` term was strictly
-                    # narrower than the real constraint and cost coverage:
-                    # a generation can carry no tools without being a
-                    # forced-final one (native-tools off, tool-free replans),
-                    # and those turns silently skipped entropy collection.
+                    # Field selection lives in entropy.request_logprobs:
+                    # no tools → portable OAI `logprobs`/`top_logprobs`;
+                    # tools attached → the llama.cpp-NATIVE `n_probs`
+                    # sidestep. History: llama-server hard-rejects the OAI
+                    # flag on `tools` + `stream` (live 400, re-confirmed
+                    # 2026-07-27), and the main loop attaches tools on
+                    # every non-final generation — so entropy was observed
+                    # only on forced-final generations and calibration
+                    # coverage sat at 0/1280 observed (w_entropy pinned).
+                    # The server's guard inspects ONLY the OAI flag while
+                    # its streamed chat formatter emits logprobs whenever
+                    # the slot sampled with n_probs > 0, so `n_probs` +
+                    # `tools` + `stream` streams OAI-shaped logprobs
+                    # chunks (verified live b10090 + master source, see
+                    # entropy.py). If a future upstream rejects n_probs,
+                    # the stream-abort handler below flags
+                    # `_nprobs_rejected` and later generations fall back
+                    # to the no-tools-only gate for the rest of the
+                    # session (kill: GHOST_ENTROPY_TOOLS_NPROBS=0).
                     _mc = getattr(self.context, "metacog", None)
-                    _metacog_logprobs = bool(
-                        "tools" not in payload
-                        and _mc is not None and getattr(_mc, "enabled", False)
-                        and getattr(_mc, "logprobs_enabled", False))
-                    if _metacog_logprobs:
-                        payload.setdefault("logprobs", True)
-                        payload.setdefault("top_logprobs", 5)
+                    _metacog_logprobs = False
+                    if (_mc is not None and getattr(_mc, "enabled", False)
+                            and getattr(_mc, "logprobs_enabled", False)):
+                        from .entropy import request_logprobs
+                        _metacog_logprobs = request_logprobs(
+                            payload, top_k=5,
+                            native_nprobs_ok=not getattr(
+                                self.context, "_nprobs_rejected", False))
 
                     if is_final_generation and stream_response:
                         payload["stream"] = True
@@ -13067,6 +13069,24 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                     if "error" in chunk_data and "choices" not in chunk_data:
                                         stream_errored = True
                                         stream_error_msg = str(chunk_data.get("error"))[:200]
+                                        # A future upstream may tighten the
+                                        # logprobs guard to the native
+                                        # n_probs field too — that must cost
+                                        # ONE generation, not every one.
+                                        # Flag it so request_logprobs falls
+                                        # back to the no-tools-only gate for
+                                        # the rest of the session.
+                                        if ("n_probs" in payload
+                                                and "logprob" in stream_error_msg.lower()):
+                                            self.context._nprobs_rejected = True
+                                            pretty_log(
+                                                "Entropy Probe",
+                                                "upstream rejected the native n_probs "
+                                                "logprobs sidestep — disabled for this "
+                                                "session (GHOST_ENTROPY_TOOLS_NPROBS=0 "
+                                                "to silence permanently)",
+                                                level="WARNING", icon=Icons.WARN,
+                                            )
                                         pretty_log(
                                             "Stream Aborted",
                                             f"Upstream aborted the stream mid-answer: "
@@ -15000,10 +15020,23 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                         # partial, but log it so a truncated
                         # user-facing answer isn't a silent gap.
                         if "error" in chunk_data and "choices" not in chunk_data:
+                            _err_txt = str(chunk_data.get("error"))[:200]
+                            # Mirror of the internal path's n_probs
+                            # rejection latch (see request_logprobs).
+                            if ("n_probs" in payload
+                                    and "logprob" in _err_txt.lower()):
+                                self.context._nprobs_rejected = True
+                                pretty_log(
+                                    "Entropy Probe",
+                                    "upstream rejected the native n_probs "
+                                    "logprobs sidestep — disabled for this "
+                                    "session",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
                             pretty_log(
                                 "Stream Aborted",
                                 "Upstream aborted the FINAL answer "
-                                f"mid-stream: {str(chunk_data.get('error'))[:200]}",
+                                f"mid-stream: {_err_txt}",
                                 level="WARNING", icon=Icons.WARN,
                             )
                         if "choices" in chunk_data and len(chunk_data["choices"]) > 0:

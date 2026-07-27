@@ -32,6 +32,7 @@
       <tr><td><code>normalise_entropy(h, k=5) -&gt; float</code></td><td>Map raw entropy into [0, 1] by dividing by <code>log(K)</code>. <code>K=1</code> is coerced to 2 to avoid divide-by-zero.</td></tr>
       <tr><td><code>EntropyTracker(window=32, top_k=5)</code></td><td>Rolling-window accumulator. <code>observe(top_lps)</code> per token; <code>reading()</code> returns an <code>EntropyReading</code> (raw mean, normalised, n).</td></tr>
       <tr><td><code>extract_top_logprobs(chunk) -&gt; list[float] | None</code></td><td>Pulls top-K logprobs out of an OpenAI-compatible streaming chunk. Recognises both <code>logprobs.content[*].top_logprobs</code> and llama.cpp's flat <code>logprobs.top_logprobs</code>. Lenient on shape; returns None on mismatch.</td></tr>
+      <tr><td><code>request_logprobs(payload, top_k=5, native_nprobs_ok=True) -&gt; bool</code></td><td>Shapes a chat payload so the upstream returns token logprobs, picking the field set it will accept: no <code>tools</code> → portable OAI <code>logprobs</code>/<code>top_logprobs</code>; <code>tools</code> attached → the llama.cpp-native <code>n_probs</code> sidestep (llama-server 400s the OAI flag on tools+stream but its formatter emits logprobs whenever the slot sampled with <code>n_probs&gt;0</code> — verified live + master source, 2026-07-27). Kill: <code>GHOST_ENTROPY_TOOLS_NPROBS=0</code>; callers pass <code>native_nprobs_ok=False</code> after a live rejection (the agent latches <code>context._nprobs_rejected</code>).</td></tr>
     </tbody>
   </table>
 
@@ -52,7 +53,11 @@
   sim/self-play/CLI turn takes, previously logprob-blind, which left calibration entropy
   degenerate at 0.5 (see <a href="calibration.html">calibration</a>). The live MTP upstream
   emits logprobs only on target-sampled tokens (~1 chunk in 7); both consumers observe
-  whatever arrives and read the mean over observed tokens.</p>
+  whatever arrives and read the mean over observed tokens. Since the same day's
+  <code>request_logprobs</code> n_probs sidestep, tool-attached streamed generations — the
+  overwhelming majority of main-loop generations — observe entropy too, closing the coverage
+  gap that kept <code>w_entropy</code> pinned at 0 (details in
+  <a href="calibration.html">calibration</a>).</p>
 </main>
 </body>
 </html>

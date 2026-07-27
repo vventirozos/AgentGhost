@@ -30,9 +30,59 @@ as a parameter so the same code works for any K.
 from __future__ import annotations
 
 import math
+import os
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Iterable, List, Optional, Sequence, Tuple, Union
+
+
+# Requesting logprobs on a TOOLS + STREAM payload: llama-server rejects the
+# OAI ``logprobs`` flag on that combination (server-common.cpp: "logprobs is
+# not supported with tools + stream") because streamed tool-parsed deltas
+# don't align 1:1 with sampled tokens. But the guard inspects ONLY the OAI
+# flag: the llama.cpp-NATIVE ``n_probs`` field rides the server's
+# pass-through parameter copy straight into the sampler, and the streamed
+# chat formatter attaches OAI-shaped logprobs to a chunk's last delta
+# whenever the slot sampled with n_probs > 0 — it never re-checks the
+# request flag. Verified 2026-07-27 against BOTH the live build (b10090)
+# and master source (server-common.cpp / server-task.cpp):
+# ``n_probs`` + ``tools`` + ``stream`` streams logprobs chunks that
+# ``extract_top_logprobs`` parses unchanged. Delta/probs alignment is
+# imperfect under tool parsing — irrelevant here: entropy needs the top-K
+# distributions, not their text alignment. This is what un-pinned
+# w_entropy: the main loop attaches tools on every non-final generation,
+# so the OAI-flag path alone left calibration entropy at 0/1280 observed.
+# GHOST_ENTROPY_TOOLS_NPROBS=0 kills the native path (e.g. for a
+# non-llama.cpp upstream that rejects unknown fields).
+_NPROBS_WITH_TOOLS_ENABLED = os.environ.get(
+    "GHOST_ENTROPY_TOOLS_NPROBS", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def request_logprobs(payload: dict, *, top_k: int = 5,
+                     native_nprobs_ok: bool = True) -> bool:
+    """Shape ``payload`` in place so the upstream returns token logprobs,
+    picking the field set the upstream will accept:
+
+      * no ``tools`` attached → the portable OAI ``logprobs`` /
+        ``top_logprobs`` fields;
+      * ``tools`` attached → the llama.cpp-native ``n_probs`` sidestep
+        (see the module comment above), unless disabled by env or by the
+        caller (``native_nprobs_ok=False`` — e.g. the upstream rejected
+        it earlier this session).
+
+    The OAI flag is NEVER set alongside ``tools`` — that combination is
+    a hard 400 on llama-server and would break the generation, not just
+    skip entropy. Returns True when a logprobs request was added; the
+    caller arms the entropy tracker on this."""
+    if "tools" not in payload:
+        payload.setdefault("logprobs", True)
+        payload.setdefault("top_logprobs", top_k)
+        return True
+    if _NPROBS_WITH_TOOLS_ENABLED and native_nprobs_ok:
+        payload.setdefault("n_probs", top_k)
+        return True
+    return False
 
 
 # ──────────────────────────────────────────────────────────────────────
