@@ -20,7 +20,13 @@ def test_get_available_tools_binds_acquired_skills(temp_dirs, mock_context):
     assert "test_dyn_skill" in tools
     assert callable(tools["test_dyn_skill"])
 
-def test_get_active_tool_definitions_with_query(temp_dirs, mock_context):
+def test_get_active_tool_definitions_with_query(temp_dirs, mock_context, monkeypatch):
+    # Routing is skipped below `_SKILL_ROUTING_MIN_SKILLS` (2026-07-27:
+    # a per-query tool block breaks the prompt-prefix KV cache, so small
+    # catalogues advertise everything). These tests exercise the ROUTING
+    # regime, so force the threshold down rather than registering 25 skills.
+    monkeypatch.setattr(
+        'ghost_agent.tools.registry._SKILL_ROUTING_MIN_SKILLS', 0)
     from ghost_agent.tools.acquired_skills import AcquiredSkillManager
     
     manager = AcquiredSkillManager(temp_dirs["sandbox"], mock_context.memory_system)
@@ -78,7 +84,13 @@ def test_get_active_tool_definitions_without_query(temp_dirs, mock_context):
     tool_names = [d["function"]["name"] for d in definitions]
     assert "skill_one" in tool_names
 
-def test_get_active_tool_definitions_query_dedupes_duplicate_embeddings(temp_dirs, mock_context):
+def test_get_active_tool_definitions_query_dedupes_duplicate_embeddings(temp_dirs, mock_context, monkeypatch):
+    # Routing is skipped below `_SKILL_ROUTING_MIN_SKILLS` (2026-07-27:
+    # a per-query tool block breaks the prompt-prefix KV cache, so small
+    # catalogues advertise everything). These tests exercise the ROUTING
+    # regime, so force the threshold down rather than registering 25 skills.
+    monkeypatch.setattr(
+        'ghost_agent.tools.registry._SKILL_ROUTING_MIN_SKILLS', 0)
     """Duplicate embeddings of one skill (pre-2026-07-26 save_skill stacked a
     new embedding per content edit) must not make 'injected N' count the same
     skill twice — live symptom: log said 'injected 3' while the registry

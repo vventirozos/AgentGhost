@@ -1109,6 +1109,51 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-27 (later 8) — Operator log report: news_headlines invisible + the prefix cache primed twice
+
+Operator: "1. something is wrong with kv cache, it seems to be loading ~24k tokens twice. 2. news_headlines
+custom skill stopped working." BOTH ROOT-CAUSED FROM THE LOG — and they turned out to be the SAME root cause
+wearing two hats: the advertised acquired-skill set.
+
+**#2 news_headlines — the skill was INVISIBLE, not broken.** The log's tell was one line repeated on EVERY
+request regardless of query: `semantic routing injected 1: format_results_to_csv` — even on the request whose
+hydration was literally "news_headlines tool usage". Measured the stores: **registry has 3 active skills, the
+vector store had 1 embedding.** Routing queries the vector store (`where type=acquired_skill`, n_results=15) and
+filters the advertised tool schema by the result, so news_headlines was never in the catalogue the model saw.
+The whole failure cascade in the log follows from that: model calls `manage_skills` twice looking for it →
+tries to shell out (`inline script blocked — body 219 chars >= 120`) → `loop breaker: 'manage_skills' repeated
+2x` → forced-final turn → `Scrub consumed entire response (intended=news_headlines); emitted fallback`.
+WHY IT COULD NEVER SELF-HEAL: `save_skill` embeds ONLY when the content hash CHANGES, so once an embedding was
+lost (the pre-07-26 broken deletes, or an orphan sweep) nothing ever rebuilt it. The index could only LOSE
+entries. The skill stayed `active` and dispatchable while being invisible — "invisible-but-callable drift"
+arrived at from the opposite side to the one the routing degrade-paths were written to guard.
+FIXED: `backfill_missing_skill_embeddings()` re-embeds any ACTIVE registry skill with no vector entry, wired
+into the same sweep as the orphan purge. Also HARDENED the purge: an empty registry alongside existing
+embeddings is now treated as a failed read, not as "all skills deleted" — without that guard one transient
+mid-write read wipes the entire routing index, unrecoverably.
+LIVE REPAIR: backfilled 2 (news_headlines, generate_password); a news query now ranks news_headlines FIRST.
+
+**#1 KV cache loading ~24k twice — same cause.** The boot warmup prefills the request head via
+`get_active_tool_defs("")`. Empty string is FALSY, so routing is skipped and it advertises ALL skills. Every
+live request passes a real query → routing → a SUBSET. So the ~22186-token warmup prefix never matched a single
+real request, and each request re-prefilled the whole head from scratch — the head was loaded twice. The
+warmup's own comment claimed it used "the same neutral-query routing a live request's first turn resolves to";
+that was false the moment routing became query-dependent.
+FIXED at the design level rather than by patching the warmup: below `_SKILL_ROUTING_MIN_SKILLS` (25) the
+registry advertises EVERY active skill and skips per-query routing entirely. Filtering 3 skills saves a few
+hundred tokens once and costs a full re-prefill of a 22k head on every request — a terrible trade. Above the
+threshold routing still applies. This also makes the tool block byte-identical ACROSS requests, not just across
+the turns of one request (the per-turn stability was already correct — F3 held h=28cc7eb2 over 4 turns).
+VERIFIED LIVE: the "semantic routing injected" line is now ABSENT on live requests (= advertise-all = the same
+set the warmup primed), and `news_headlines` dispatches for real: `turn outcome verified · tools:
+news_headlines · 804 chars`, returning actual Greek RSS headlines. No scrub fallback.
+
+Three pre-existing tests updated (they assert routing FIRES; they now monkeypatch the threshold down, since
+their fixtures hold 0-3 skills). Tests: test_skill_index_and_prefix_cache.py (10).
+FULL SUITE 9521 passed / 0 failed. DEPLOYED (46905→47701, health ok); functional_live_test 32/32.
+LESSON: a log line that is IDENTICAL across every request regardless of input is not background noise — it is a
+constant where a variable belongs. That one line named both bugs.
+
 ### 2026-07-27 (later 7) — Second review pass: 6 MORE defects in the same day's calibration work
 
 The re-review of `confidence.py`/`calibration.py` (the first attempt died on an API error) found six more,

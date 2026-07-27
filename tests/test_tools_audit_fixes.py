@@ -89,7 +89,13 @@ class TestAcquiredSkillsClosure:
 # Fix #2: n_results bumped to 15 in semantic skill routing
 # ---------------------------------------------------------------------------
 class TestSemanticRoutingNResults:
-    def test_uses_n_results_15(self, tmp_path):
+    def test_uses_n_results_15(self, tmp_path, monkeypatch):
+        # See test_registry_skills.py — routing only runs above the
+        # small-catalogue threshold; this test is about the routing call.
+        # -1, not 0: this fixture registers NO real skills, so the active
+        # count is 0 and `0 > 0` would still skip routing.
+        monkeypatch.setattr(
+            'ghost_agent.tools.registry._SKILL_ROUTING_MIN_SKILLS', -1)
         from ghost_agent.tools import registry as registry_mod
 
         ctx = MagicMock()
