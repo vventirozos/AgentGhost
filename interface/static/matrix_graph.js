@@ -10,39 +10,45 @@ export const SPEEDS = {
 };
 
 // --- COLOR CONFIGURATION ---
-// Dark-but-MULTICOLOR (2026-07-13): instead of one active hue, every
-// node owns a stable position on a 5-stop jewel-tone wheel (deep violet
-// → electric blue → teal → emerald → magenta) and the whole wheel
-// drifts slowly, so the graph is iridescent rather than monochrome.
-// Lines gradient between their two endpoint hues. Additive blending +
-// bloom lift these considerably, so every stop is deliberately several
-// stops darker than it will read on screen — the theme stays dark-first
-// (no neon, no flashbang; the 2026-07-12 envelope smoothing is intact).
+// THERMAL two-pole scheme (2026-07-28, operator request — the 5-hue
+// jewel wheel read as "too colorful, attracts too much attention"):
+// the cloud lives between exactly two poles, deep ocean BLUE (cold
+// analysis) and dark arterial RED (hot intent), mutating into each
+// other through dark violet — the client chrome's own accent family,
+// so the bridge reads intentional. The ring below still has 5 stops
+// (the shader's palette() contract is unchanged) but traverses
+// blue → indigo → violet → red → plum → back to blue: as uHueDrift
+// slides and the spatial hue-wave travels, every node continuously
+// MIGRATES between the two poles — the color mutation IS the
+// animation. Additive blending + bloom lift these considerably, so
+// every stop stays several steps darker than it reads on screen
+// (dark-first; the 2026-07-12 envelope smoothing is intact).
 export const COLORS = {
     background: new THREE.Color('#000000'),
 
     // Dim floor under every hue — what a node/line reads as at the
-    // bottom of its color breath (a whisper of its jewel hue is always
-    // added on top, so even the idle graph is multicolor, not grey).
-    nodeBase: new THREE.Color('#0b0714'),
-    lineBase: new THREE.Color('#070a18'),
+    // bottom of its color breath (a whisper of hue is always added on
+    // top, so even the idle graph is tinted, not grey).
+    nodeBase: new THREE.Color('#070811'),
+    lineBase: new THREE.Color('#05060e'),
 
-    // The jewel wheel. Order matters — adjacent stops blend into each
-    // other, and the wheel wraps (last → first). Warm yellows/oranges
-    // are deliberately absent so the crimson ERROR tint stays unique.
-    // Stops dimmed ~18% on 2026-07-13 operator feedback ("a tiny bit
-    // too bright") — the dim floor, line gradients, and bloom all scale
-    // off these, so this is the one knob for overall face brightness.
+    // The thermal ring. Order matters — adjacent stops blend and the
+    // ring wraps (last → first). Two bridges (violet down, plum up)
+    // keep the blue↔red crossing dark and gradual instead of flashing
+    // through a bright mid-tone. Greens/yellows deliberately absent.
     palette: [
-        new THREE.Color('#3e187a'),  // deep violet
-        new THREE.Color('#1f39a1'),  // electric blue
-        new THREE.Color('#0a6675'),  // teal
-        new THREE.Color('#0f7143'),  // emerald
-        new THREE.Color('#80198f'),  // magenta
+        new THREE.Color('#0c1c50'),  // deep ocean blue
+        new THREE.Color('#1e2a78'),  // indigo blue
+        new THREE.Color('#4a165a'),  // violet bridge (warming)
+        new THREE.Color('#701226'),  // dark arterial red
+        new THREE.Color('#38173f'),  // plum bridge (cooling)
     ],
 
-    nodeError: new THREE.Color('#7a0f26'),   // crimson red
-    lineError: new THREE.Color('#8f1030'),   // crimson red
+    // Errors flush noticeably HOTTER than the palette's resting red —
+    // brighter and pinker than any ring stop, so the tint still reads
+    // as "wrong" now that red is part of the base scheme.
+    nodeError: new THREE.Color('#8f1226'),
+    lineError: new THREE.Color('#9c1430'),
 };
 // ---------------------------
 
@@ -86,8 +92,8 @@ let pulseT = 0.0;
 
 // Accent tint — the graph's slow "mood" color, blended toward the hue
 // of recent log activity and drained back to neutral over ~10s.
-// Neutral default = deep purple, matching the dark theme.
-const accentColor = new THREE.Color(0x3d1460);
+// Neutral default = the violet bridge between the two thermal poles.
+const accentColor = new THREE.Color(0x2a1750);
 let accentStrength = 0.0;
 
 // Hue drift — the whole jewel wheel slides slowly around its loop
@@ -200,8 +206,25 @@ vec3 palette(float t) {
 }
 `;
 
+// Spatial hue wave — shared by all three shaders. A slow sine field over
+// model-space position makes hue drift travel THROUGH the cloud as
+// coherent currents (convection), instead of every node mutating in
+// place. uOrganic damps it for reduced-motion users. NB: uses uTime but
+// deliberately does NOT declare it — the line fragment shader already
+// declares uTime for its pulse math, and GLSL forbids redeclaration, so
+// each including shader declares uTime itself exactly once.
+const hueWaveGLSL = `
+uniform float uOrganic;
+
+float hueWave(vec3 p) {
+    return uOrganic * (0.085 * sin(uTime * 0.21 + p.x * 0.5 + p.y * 0.35 + p.z * 0.3)
+                     + 0.045 * sin(uTime * 0.087 - p.y * 0.6 + p.z * 0.4));
+}
+`;
+
 const nodeVertexShader = `
 attribute float aSeed;
+uniform float uTime;
 uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
@@ -212,6 +235,7 @@ uniform vec3 uErrorColor;
 uniform vec3 uAccentColor;
 uniform float uAccentStrength;
 ${paletteGLSL}
+${hueWaveGLSL}
 varying vec3 vColor;
 varying vec2 vUv;
 varying float vDepthFade;
@@ -228,8 +252,11 @@ void main() {
 
     // Billboard logic: apply local face offset directly in view space.
     // Audio level gently inflates billboard size so the sphere feels
-    // like it's breathing with the voice during TTS playback.
-    float sizeBoost = 1.0 + uAudioLevel * 0.25 + uPulseT * 0.15;
+    // like it's breathing with the voice during TTS playback. The tiny
+    // per-node shimmer keeps every star faintly restless — organic, not
+    // frozen — at an amplitude below conscious notice.
+    float sizeBoost = 1.0 + uAudioLevel * 0.25 + uPulseT * 0.15
+        + uOrganic * 0.06 * sin(uTime * 1.7 + aSeed * 43.0);
     vec4 mvPosition = modelViewMatrix * vec4(instancePos, 1.0);
     mvPosition.xy += position.xy * scale * sizeBoost;
 
@@ -245,16 +272,18 @@ void main() {
     // rest (nothing sits within 1.4 units of the resting camera).
     vNearFade = smoothstep(0.3, 1.4, -mvPosition.z);
 
-    // Per-node jewel hue: aSeed anchors this node on the palette wheel,
-    // uHueDrift slides the whole wheel slowly. Replaces the old
-    // two-hue (dark blue <-> deep purple) position mix — the graph is
-    // now genuinely multicolor while staying inside the dark family.
-    vec3 jewel = palette(aSeed + uHueDrift);
+    // Per-node thermal hue: aSeed anchors this node on the ring (seeds
+    // are SPATIAL at init, so neighbours share a temperature region),
+    // uHueDrift slides the whole field between the poles, and hueWave
+    // sends slow currents of warmth/cold traveling through the cloud —
+    // the blue↔red mutation the theme is built around.
+    vec3 jewel = palette(aSeed + uHueDrift + hueWave(instancePos));
 
-    // Life: each node breathes between a dim floor and its full jewel
-    // hue. The floor keeps a whisper of the hue so even the idle graph
-    // reads as multicolor, not grey.
-    float colorMix = sin(instancePos.x * 2.0 + instancePos.y * 2.0 + uWorkingState) * 0.5 + 0.5;
+    // Life: each node breathes between a dim floor and its full hue.
+    // The breath itself travels as a slow luminance wave (uTime term)
+    // instead of being a frozen spatial pattern.
+    float colorMix = sin(instancePos.x * 1.3 + instancePos.y * 1.1
+        + uTime * uOrganic * 0.35 + uWorkingState) * 0.5 + 0.5;
     vec3 dimCol = uBaseColor + jewel * 0.22;
     vec3 mixCol = mix(dimCol, jewel, colorMix);
     // A busy agent saturates slightly toward the full hue.
@@ -267,7 +296,11 @@ void main() {
     // needed — we use the instancePos we already have).
     float distFromCenter = length(instancePos);
     float accentFalloff = exp(-distFromCenter * 0.35);
-    col = mix(col, uAccentColor, clamp(uAccentStrength * accentFalloff, 0.0, 0.85));
+    // Cap lowered 0.85 → 0.5 (2026-07-28): at the old strength a busy
+    // spell washed the whole field into one flat accent color, erasing
+    // the blue↔red poles the thermal scheme is built on. The mood tint
+    // should color the weather, not replace the climate.
+    col = mix(col, uAccentColor, clamp(uAccentStrength * accentFalloff, 0.0, 0.5));
     // Brightness boost during an active pulse — subtle; the bloom pass
     // amplifies this considerably.
     col *= (1.0 + uPulseT * 0.4);
@@ -303,10 +336,12 @@ varying float vLightPass;
 varying float vLineHue;
 varying float vLineDepth;
 varying float vLineNear;
+varying vec3 vLinePos;
 
 void main() {
     vLightPass = aLightPass;
     vLineHue = aLineHue;
+    vLinePos = position;
     vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
     vLineDepth = clamp((-mvPosition.z - 2.5) / 7.0, 0.0, 1.0);
     // Near fade — see the node shader; lines whose endpoint passes the
@@ -328,10 +363,12 @@ uniform vec3 uErrorColor;
 uniform vec3 uAccentColor;
 uniform float uAccentStrength;
 ${paletteGLSL}
+${hueWaveGLSL}
 varying float vLightPass;
 varying float vLineHue;
 varying float vLineDepth;
 varying float vLineNear;
+varying vec3 vLinePos;
 
 void main() {
     float gradient = fract(vLightPass * 1.5 - uTime * 2.0);
@@ -348,15 +385,16 @@ void main() {
         fract(vLightPass * 1.5 - uTime * 6.0 - (1.0 - uPulseT))
     );
 
-    // Each line is a GRADIENT between its two endpoint nodes' jewel
-    // hues (vLineHue interpolates the endpoint seeds), breathing
-    // between a dim floor and the full hue like the nodes do.
-    vec3 jewel = palette(vLineHue + uHueDrift);
-    float colorMix = sin(vLightPass * 10.0 + uWorkingState) * 0.5 + 0.5;
+    // Each line is a GRADIENT between its two endpoint nodes' thermal
+    // hues (vLineHue interpolates the endpoint seeds), riding the same
+    // traveling hue wave as the nodes so links and their endpoints stay
+    // in the same temperature current.
+    vec3 jewel = palette(vLineHue + uHueDrift + hueWave(vLinePos));
+    float colorMix = sin(vLightPass * 10.0 + uTime * uOrganic * 0.4 + uWorkingState) * 0.5 + 0.5;
     vec3 mixCol = mix(uBaseColor + jewel * 0.18, jewel, colorMix);
 
     vec3 col = mix(mixCol, uErrorColor, uErrorState * 0.8);
-    col = mix(col, uAccentColor, clamp(uAccentStrength * 0.6, 0.0, 0.7));
+    col = mix(col, uAccentColor, clamp(uAccentStrength * 0.6, 0.0, 0.45));
 
     float alpha = mix(0.4 + uWorkingState * 0.2, 1.0, pulse);
     alpha = max(alpha, burst * uPulseT);
@@ -377,6 +415,7 @@ uniform float uDive;
 uniform float uHueDrift;
 uniform float uDpr;
 ${paletteGLSL}
+${hueWaveGLSL}
 varying vec3 vMoteCol;
 varying float vMoteFade;
 
@@ -393,7 +432,7 @@ void main() {
     float near = smoothstep(0.12, 0.8, -mvPosition.z);
     float far = 1.0 - clamp((-mvPosition.z - 3.0) / 6.0, 0.0, 0.85);
     vMoteFade = near * far * uDive;
-    vMoteCol = palette(aSeed + uHueDrift);
+    vMoteCol = palette(aSeed + uHueDrift + hueWave(position));
     // Perspective size attenuation, clamped so close motes stay motes.
     gl_PointSize = min(mix(1.5, 4.5, fract(aSeed * 7.31))
         * (2.2 / max(-mvPosition.z, 0.2)) * uDpr, 9.0 * uDpr);
@@ -467,7 +506,14 @@ export function init() {
             speed: 0.15 + Math.random() * 0.4
         });
         currentPositions[i] = new THREE.Vector3();
-        nodeSeeds[i] = Math.random();
+        // SPATIAL seeds: neighbours land near each other on the thermal
+        // ring (plus jitter for texture), so the cloud forms coherent
+        // warm and cold REGIONS instead of salt-and-pepper color noise —
+        // the single biggest "too colorful" fix.
+        const bp = basePositions[i];
+        const spatial = 0.5 + bp.x * 0.11 + bp.y * 0.07 + bp.z * 0.05
+            + Math.random() * 0.16;
+        nodeSeeds[i] = ((spatial % 1) + 1) % 1;
     }
 
     // Shared palette uniforms — same THREE.Color objects on both
@@ -490,6 +536,8 @@ export function init() {
         vertexShader: nodeVertexShader,
         fragmentShader: nodeFragmentShader,
         uniforms: {
+            uTime: { value: 0.0 },
+            uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -523,6 +571,7 @@ export function init() {
         fragmentShader: lineFragmentShader,
         uniforms: {
             uTime: { value: 0 },
+            uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -563,6 +612,7 @@ export function init() {
         fragmentShader: moteFragmentShader,
         uniforms: {
             uTime: { value: 0 },
+            uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
             uDive: { value: 0 },
             uDpr: { value: Math.min(window.devicePixelRatio, dprCap) },
             ...paletteUniforms(),
@@ -665,7 +715,7 @@ export function noteActivity(weight, color) {
             _accentBlend.set(color);
             accentColor.lerp(_accentBlend, 0.18);   // drift, don't jump
         } catch (e) { /* bad color string — keep previous */ }
-        accentTarget = Math.min(0.4, accentTarget + w * 0.35);
+        accentTarget = Math.min(0.3, accentTarget + w * 0.35);
     }
 }
 
@@ -789,7 +839,10 @@ function animate() {
     // Immersion scales the whole scene UP around the viewer — combined
     // with the camera dolly below, this is what reads as "the grid
     // swallowing the camera" rather than the camera flying somewhere.
-    const breathe = 1.0 + 0.012 * Math.sin(time * 0.6);
+    // Two incommensurate frequencies: the breath never repeats exactly —
+    // a metronomic single sine is precisely what read as "not alive".
+    const breathe = 1.0 + 0.011 * Math.sin(time * 0.55)
+        + 0.006 * Math.sin(time * 0.173 + 1.7);
     // Scale boost trimmed 0.7 → 0.55: the swell is what sells the
     // swallow, but it also DILUTES local node density exactly when the
     // camera is closest — the interior looked empty at 0.7 even with
@@ -801,9 +854,15 @@ function animate() {
     // gives the network real depth and life at idle. Skipped entirely
     // under reduced-motion.
     if (!PREFERS_REDUCED_MOTION) {
-        sceneSpin += 0.0006 + workingState * 0.0010;
+        // The orbit hesitates and surges slightly (never reverses) and the
+        // tilt is a sum of slow non-repeating drifts — like something
+        // holding its attention loosely rather than a turntable.
+        sceneSpin += (0.0006 + workingState * 0.0010)
+            * (1.0 + 0.3 * Math.sin(time * 0.13));
         scene.rotation.y = sceneSpin;
-        scene.rotation.x = 0.12 * Math.sin(time * 0.25);
+        scene.rotation.x = 0.12 * Math.sin(time * 0.25)
+            + 0.03 * Math.sin(time * 0.071 + 0.9);
+        scene.rotation.z = 0.02 * Math.sin(time * 0.047);
     }
 
     // Parallax: ease camera toward target offset. Z is owned by the
@@ -883,6 +942,12 @@ function animate() {
         }
     }
 
+    // Communal current: a slow shared sway rides under every node's
+    // individual morph, so the whole cloud leans and recovers together
+    // like kelp in water — motion with a common cause reads ORGANIC in
+    // a way independent oscillators never do.
+    const swayT = shapeTime * 0.23;
+
     for (let i = 0; i < NODE_COUNT; i++) {
         const bp = basePositions[i];
 
@@ -891,9 +956,18 @@ function animate() {
         const t2 = shapeTime * bp.speed * 0.73 + bp.phaseY;
         const t3 = shapeTime * bp.speed * 1.37 + bp.phaseZ;
 
-        const dx = (Math.sin(t1) + Math.sin(t2 * 1.4) * 0.5) * morphAmp;
-        const dy = (Math.cos(t2) + Math.cos(t3 * 1.1) * 0.5) * morphAmp;
-        const dz = (Math.sin(t3) + Math.cos(t1 * 0.9) * 0.5) * morphAmp;
+        // Restlessness envelope: each node takes turns being agitated and
+        // almost-still (~±45% around its mean amplitude, on a much slower
+        // clock than the morph itself). Constant-amplitude wobble was the
+        // core of the "mechanical" feel.
+        const amp = morphAmp * (0.72 + 0.45 * Math.sin(shapeTime * 0.11 + bp.phaseY * 2.3));
+
+        const dx = (Math.sin(t1) + Math.sin(t2 * 1.4) * 0.5) * amp
+            + 0.22 * Math.sin(swayT + bp.y * 0.8);
+        const dy = (Math.cos(t2) + Math.cos(t3 * 1.1) * 0.5) * amp
+            + 0.16 * Math.cos(swayT * 0.83 + bp.x * 0.7);
+        const dz = (Math.sin(t3) + Math.cos(t1 * 0.9) * 0.5) * amp
+            + 0.14 * Math.sin(swayT * 0.61 + bp.z * 0.9 + 2.1);
 
         currentPositions[i].set(bp.x + dx, bp.y + dy, bp.z + dz);
     }
@@ -971,13 +1045,17 @@ function animate() {
     }
     instancedMesh.instanceMatrix.needsUpdate = true;
 
-    // Advance the palette wheel: ~50s per full hue cycle at idle,
-    // tightening toward ~15s when the agent is busy. Slowed under
-    // reduced-motion like every other animation.
+    // Advance the thermal field: ~50s per full blue↔red cycle at idle,
+    // tightening toward ~15s when the agent is busy — and the rate
+    // itself wanders (±35% on a ~75s LFO) so the mutation speeds and
+    // slows like weather instead of ticking. Slowed under reduced-motion
+    // like every other animation.
     hueDrift += (0.00035 + activity * 0.0009)
+        * (1.0 + 0.35 * Math.sin(time * 0.083))
         * (PREFERS_REDUCED_MOTION ? 0.3 : 1.0);
 
     const nUniforms = instancedMesh.material.uniforms;
+    nUniforms.uTime.value = time;
     nUniforms.uWorkingState.value = workingState;
     nUniforms.uErrorState.value = errorState;
     nUniforms.uPulseT.value = pulseT;
@@ -1009,7 +1087,10 @@ function animate() {
     // additive quads are already bright, and the streaming reply is
     // being read right on top of them — inside should feel vast and
     // dim, not blinding.
-    bloomPass.strength = (1.15 + workingState * 0.3 + activity * 0.35
+    // Base lowered 1.15 → 0.95 (2026-07-28): the thermal redesign is
+    // meant to sit BACK — present, not clamoring. Working/activity
+    // response unchanged, so a busy agent still visibly glows.
+    bloomPass.strength = (0.95 + workingState * 0.3 + activity * 0.35
         + errorState * 0.5) * BLOOM_SCALE * (1.0 - 0.5 * dive);
 
     composer.render();

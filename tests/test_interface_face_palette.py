@@ -1,16 +1,18 @@
-"""Regression guard for the face's dark-multicolor palette (2026-07-13).
+"""Regression guard for the face's THERMAL two-pole palette (2026-07-28).
 
-The 2026-07-12 anti-flashbang pass muted the whole graph to near-black
-tones; the operator then found it dull. The redesign keeps the dark
-theme + smoothed activity envelope but makes the graph genuinely
-multicolor: every node owns a stable position on a 5-stop jewel wheel
-(violet / blue / teal / emerald / magenta) that drifts slowly, and each
-line gradients between its endpoints' hues.
+History: the 2026-07-12 anti-flashbang pass muted the graph; 2026-07-13
+made it a 5-stop jewel wheel; on 2026-07-28 the operator found the jewel
+wheel "too colorful, attracts too much attention" and set the current
+direction — exactly two poles, dark ocean blue and dark arterial red,
+mutating into each other through dark violet bridges. The ring still has
+5 stops (the shader's palette() contract is unchanged) but every stop
+must live on the blue↔red axis: no greens, no yellows.
 
-These pins catch regressions that would quietly re-monochrome the face:
-- the palette shrinking or disappearing,
+These pins catch regressions that would quietly break the scheme:
+- the palette shrinking, brightening, or drifting off the thermal axis,
 - the per-node seed / per-line hue attributes being dropped,
 - a return to the single uActiveColor uniform,
+- the spatial hue-wave (the organic mutation) being dropped,
 - cache-bust versions not bumped together (stale-module skew).
 """
 
@@ -49,6 +51,23 @@ def test_palette_stays_dark(graph_js):
     for hexcode in re.findall(r"#([0-9a-fA-F]{6})", m.group(1)):
         channels = [int(hexcode[i:i + 2], 16) for i in (0, 2, 4)]
         assert max(channels) <= 0xD0, f"palette stop #{hexcode} too bright"
+
+
+def test_palette_stays_on_the_thermal_axis(graph_js):
+    # Two-pole scheme: every stop is a blue, a red, or a violet bridge —
+    # green must never be the dominant channel (that's the jewel wheel's
+    # teal/emerald sneaking back in).
+    m = re.search(r"palette:\s*\[(.*?)\]", graph_js, re.DOTALL)
+    for hexcode in re.findall(r"#([0-9a-fA-F]{6})", m.group(1)):
+        r, g, b = (int(hexcode[i:i + 2], 16) for i in (0, 2, 4))
+        assert g < max(r, b), f"stop #{hexcode} has a dominant green channel"
+
+
+def test_hue_wave_travels_spatially(graph_js):
+    # The organic mutation: hue drift must travel through the cloud as a
+    # spatial wave, not tick uniformly.
+    assert "hueWave(" in graph_js
+    assert "uOrganic" in graph_js
 
 
 def test_shaders_use_wheel_not_single_active_color(graph_js):

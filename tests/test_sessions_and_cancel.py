@@ -66,6 +66,72 @@ class TestMergeHistory:
         assert fat[len(stored):] == [_m("user", "c")]
 
 
+class TestMergeHistoryStaleReplay:
+    """2026-07-28 review finding: len(incoming) < len(stored) skipped fat
+    detection entirely, so a STALE fat client (tab B behind tab A on the
+    same session id) concatenated its whole prefix — permanent quadratic
+    doubling. The stored copy is a superset and must win; only the truly
+    new tail is appended."""
+
+    def _conv(self, n):
+        out = []
+        for i in range(n):
+            out.append(_m("user", f"q{i}"))
+            out.append(_m("assistant", f"a{i}"))
+        return out
+
+    def test_stale_tab_appends_only_new_message(self):
+        stored = self._conv(6)                       # 12 messages
+        inc = stored[:10] + [_m("user", "new question")]
+        merged = merge_history(stored, inc)
+        assert merged == stored + [_m("user", "new question")]
+
+    def test_stale_tab_never_doubles_across_turns(self):
+        stored = self._conv(6)
+        inc = stored[:10] + [_m("user", "new question")]
+        merged = merge_history(stored, inc)
+        # Simulate the turn persisting: stored grows by the new exchange.
+        stored2 = merged + [_m("assistant", "new answer")]
+        inc2 = inc + [_m("assistant", "new answer"), _m("user", "another")]
+        merged2 = merge_history(stored2, inc2)
+        assert len(merged2) == len(stored2) + 1, "growth must be linear"
+
+    def test_pure_stale_prefix_is_a_noop(self):
+        stored = self._conv(5)
+        merged = merge_history(stored, stored[:6])
+        assert merged == stored
+
+    def test_aborted_stub_in_stale_tail_is_dropped(self):
+        # Client kept a partial reply the server holds in full; the client
+        # can never legitimately introduce an assistant message.
+        stored = self._conv(4) + [_m("user", "q4"), _m("assistant", "FULL")]
+        inc = self._conv(4) + [_m("user", "q4"),
+                               _m("assistant", "FULL BUT CUT *[Aborted]*"),
+                               _m("user", "next")]
+        # inc is SHORTER than stored only when stored advanced further:
+        stored = stored + [_m("user", "q5"), _m("assistant", "a5")]
+        merged = merge_history(stored, inc)
+        assert merged == stored + [_m("user", "next")]
+        assert not any("Aborted" in str(m.get("content")) for m in merged)
+
+    def test_thin_client_single_message_still_appends(self):
+        # A thin client's lone new message that happens to equal stored[0]
+        # must NOT be swallowed by stale detection (aligned < 2 guard).
+        stored = [_m("user", "hello"), _m("assistant", "hi"),
+                  _m("user", "x"), _m("assistant", "y")]
+        merged = merge_history(stored, [_m("user", "hello")])
+        assert merged == stored + [_m("user", "hello")]
+
+    def test_unrelated_short_conversation_concatenates(self):
+        # Long unaligned tail = different conversation → thin behavior.
+        stored = self._conv(6)
+        inc = [_m("user", "q0"), _m("assistant", "a0"),
+               _m("user", "completely"), _m("user", "different"),
+               _m("user", "thread"), _m("user", "entirely")]
+        merged = merge_history(stored, inc)
+        assert len(merged) == len(stored) + len(inc)
+
+
 # ══════════════════════════════════════════════════════════════════════
 # SessionStore
 # ══════════════════════════════════════════════════════════════════════

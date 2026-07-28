@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=3.9';
+import * as matrixGraphFace from './matrix_graph.js?v=4.4';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -555,18 +555,20 @@ function extractIcon(logLine) {
 }
 
 // Map each class to a distinct accent color for the face's slow mood
-// tint. Jewel-tone family (2026-07-13, matching matrix_graph's palette
-// wheel): saturated but dark-mid — these BLEND into the sphere's
-// accent, so a full neon here would drag the whole theme bright again.
+// tint. THERMAL family (2026-07-28, matching matrix_graph's blue↔red
+// two-pole scheme): cold blues for memory/planning/success, hot reds
+// for external action and failure, violet for raw thought — the bridge
+// hue between the poles. These BLEND into the sphere's accent, so a
+// full neon here would drag the whole theme bright again.
 const _ICON_CLASS_COLOR = {
-    accent_ok:   '#128a52',  // ✅ emerald
-    accent_err:  '#a3123a',  // ❌ 🛑 🔥 crimson red (WARN 🔶 is routine, stays accent)
-    accent:      '#2f55d4',  // ⚡ 🚀 🎬 🏁 electric blue
-    tool:        '#6d28d9',  // vivid violet
-    memory:      '#2f7d4a',  // sea green
-    plan:        '#3644b8',  // indigo
-    think:       '#5b21b6',  // violet
-    idle:        '#232734',  // near-black slate
+    accent_ok:   '#16418c',  // ✅ settled blue — success = cooled
+    accent_err:  '#a3123a',  // ❌ 🛑 🔥 hot crimson (WARN 🔶 is routine, stays accent)
+    accent:      '#1f3fa8',  // ⚡ 🚀 🎬 🏁 electric blue (dark)
+    tool:        '#6e1530',  // dark arterial red — external action = heat
+    memory:      '#14297a',  // deep indigo — stored, cold
+    plan:        '#2a2470',  // blue-violet
+    think:       '#3a1a5e',  // violet — the bridge between the poles
+    idle:        '#10131f',  // blue-black slate
 };
 
 function getIconColor(icon) {
@@ -746,6 +748,25 @@ function decorateCodeBlocks(root) {
         });
         header.appendChild(copyBtn);
 
+        // Long outputs collapse to a scannable height with an explicit
+        // expander — a 300-line tool dump otherwise owns the whole
+        // scrollback. Threshold is generous so ordinary snippets never
+        // collapse. (Streaming rebuilds reset to collapsed; the final
+        // decorate pass after the stream settles it.)
+        const lineCount = (code.textContent.match(/\n/g) || []).length + 1;
+        if (lineCount > 34) {
+            pre.classList.add('code-collapsed');
+            const expand = document.createElement('button');
+            expand.className = 'code-expand';
+            expand.type = 'button';
+            expand.textContent = `Expand · ${lineCount} lines`;
+            expand.addEventListener('click', () => {
+                const collapsed = pre.classList.toggle('code-collapsed');
+                expand.textContent = collapsed ? `Expand · ${lineCount} lines` : 'Collapse';
+            });
+            header.appendChild(expand);
+        }
+
         pre.insertBefore(header, pre.firstChild);
     });
 }
@@ -769,7 +790,9 @@ function renderEmptyStateHero() {
     title.textContent = 'GHOST AGENT';
     const sub = document.createElement('div');
     sub.className = 'empty-hero-sub';
-    sub.textContent = 'Ask anything. Use /clear to reset the session.';
+    sub.textContent = window.matchMedia('(pointer: coarse)').matches
+        ? 'Ask anything.'
+        : 'Ask anything · ⌘K for commands';
     const chips = document.createElement('div');
     chips.className = 'empty-hero-chips';
     for (const p of EXAMPLE_PROMPTS) {
@@ -836,10 +859,31 @@ function _stripInternalTags(text) {
         .trim();
 }
 
+// Day separators: a live conversation spanning midnight gets a quiet
+// mono date rule between the two days. Live messages only — restored
+// history renders without them (no reliable per-message timestamps).
+function _maybeInsertDaySeparator(ts) {
+    if (_restoringHistory || !chatLog) return;
+    const prior = chatLog.querySelectorAll('.message[data-ts]');
+    const last = prior.length ? prior[prior.length - 1] : null;
+    const lastTs = last ? Number(last.dataset.ts || 0) : 0;
+    if (!lastTs) return;
+    if (new Date(lastTs).toDateString() !== new Date(ts).toDateString()) {
+        const sep = document.createElement('div');
+        sep.className = 'day-separator';
+        sep.textContent = new Date(ts).toLocaleDateString(undefined,
+            { weekday: 'short', month: 'short', day: 'numeric' });
+        chatLog.appendChild(sep);
+    }
+}
+
 function addMessage(role, text) {
     dismissEmptyStateHero();
+    const ts = Date.now();
+    _maybeInsertDaySeparator(ts);
     const div = document.createElement('div');
     div.className = `message ${role}`;
+    div.dataset.ts = String(ts);
     // System messages are ours (connection notices, upload progress,
     // error strings), not agent output — render them as plain text so a
     // crafted upstream error message cannot inject markup.
@@ -850,8 +894,46 @@ function addMessage(role, text) {
         if (role === 'agent') decorateCodeBlocks(div);
     }
     chatLog.appendChild(div);
+    if (role !== 'system') decorateMessageActions();
     scrollToBottom();
     return div;
+}
+
+// Per-message affordance: a small overlay row (timestamp + ⋯ menu) on
+// finished user/agent bubbles. The menu itself (copy / quote / memory
+// correction) is owned by the workspace module via GhostCore. Guarded by
+// the presence of the row, not a dataset flag — streaming rebuilds a
+// bubble's innerHTML, which wipes children while element attributes
+// survive, so a dataset guard would leave completed replies bare.
+function decorateMessageActions() {
+    if (!chatLog) return;
+    chatLog.querySelectorAll('.message.agent, .message.user').forEach(div => {
+        if (div.querySelector(':scope > .msg-actions')) return;
+        if (div.classList.contains('thinking') || div.classList.contains('streaming')) return;
+        const row = document.createElement('div');
+        row.className = 'msg-actions';
+        const time = document.createElement('span');
+        time.className = 'msg-time';
+        if (div.dataset.ts) {
+            time.textContent = new Date(Number(div.dataset.ts))
+                .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+        row.appendChild(time);
+        const menuBtn = document.createElement('button');
+        menuBtn.className = 'msg-menu-btn';
+        menuBtn.type = 'button';
+        menuBtn.textContent = '⋯';
+        menuBtn.title = 'Message actions';
+        menuBtn.setAttribute('aria-label', 'Message actions');
+        menuBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            if (window.GhostCore && window.GhostCore.openMessageMenu) {
+                window.GhostCore.openMessageMenu(div, menuBtn);
+            }
+        });
+        row.appendChild(menuBtn);
+        div.appendChild(row);
+    });
 }
 
 function scrollToBottom() {
@@ -933,38 +1015,54 @@ function saveChatState() {
     safeStorage.set('ghost_chat_history', JSON.stringify(chatHistory));
 }
 
+// Render a full message history into the (cleared) chat log. Shared by
+// the localStorage restore, workspace load, and the sessions rail
+// (server-side conversations). body.restoring suppresses the entrance
+// animations so a re-render doesn't replay every slide-in.
+function renderHistoryToLog(history) {
+    chatLog.innerHTML = '';
+    document.body.classList.add('restoring');
+    _withHistoryRestore(() => {
+        for (const msg of history) {
+            // Only conversational roles get bubbles — a stored session can
+            // carry tool/function messages (other clients), which would
+            // otherwise masquerade as USER bubbles.
+            if (!['user', 'assistant', 'system'].includes(msg.role)) continue;
+            const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
+            let displayContent = msg.content;
+
+            if (Array.isArray(displayContent)) {
+                const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
+                displayContent = texts.join(" ") + " \n*[Image Attached]*";
+            }
+            if (typeof displayContent === 'string') {
+                let cleanContent = _stripInternalTags(displayContent);
+                if (cleanContent) {
+                    const div = document.createElement('div');
+                    div.className = `message ${roleClass}`;
+                    if (roleClass === 'system') {
+                        div.textContent = cleanContent;
+                    } else {
+                        div.innerHTML = renderMarkdown(cleanContent);
+                        if (roleClass === 'agent') decorateCodeBlocks(div);
+                    }
+                    chatLog.appendChild(div);
+                }
+            }
+        }
+        decorateMessageActions();
+        scrollToBottom();
+        if (typeof attachRenderButtons === 'function') attachRenderButtons();
+    });
+    setTimeout(() => document.body.classList.remove('restoring'), 60);
+}
+
 function loadChatState() {
     const saved = safeStorage.get('ghost_chat_history');
     if (saved) {
         try {
             chatHistory = JSON.parse(saved);
-            _withHistoryRestore(() => {
-                for (const msg of chatHistory) {
-                    const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
-                    let displayContent = msg.content;
-
-                    if (Array.isArray(displayContent)) {
-                        const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
-                        displayContent = texts.join(" ") + " \n*[Image Attached]*";
-                    }
-                    if (typeof displayContent === 'string') {
-                        let cleanContent = _stripInternalTags(displayContent);
-                        if (cleanContent) {
-                            const div = document.createElement('div');
-                            div.className = `message ${roleClass}`;
-                            if (roleClass === 'system') {
-                                div.textContent = cleanContent;
-                            } else {
-                                div.innerHTML = renderMarkdown(cleanContent);
-                                if (roleClass === 'agent') decorateCodeBlocks(div);
-                            }
-                            chatLog.appendChild(div);
-                        }
-                    }
-                }
-                scrollToBottom();
-                if (typeof attachRenderButtons === 'function') attachRenderButtons();
-            });
+            renderHistoryToLog(chatHistory);
         } catch (e) {
             console.error("Failed to load chat history", e);
         }
@@ -1003,9 +1101,19 @@ async function sendMessage(isResume = false) {
         }
         _authedBlobCache.clear();
         if (typeof updateWorkspaceBtnState === 'function') updateWorkspaceBtnState();
-        renderEmptyStateHero();
+        // Let the sessions rail mint a fresh session id — /clear means
+        // "new conversation", not "amnesia inside the same session".
+        try {
+            window.GhostCore?.events?.dispatchEvent(new CustomEvent('conversation-cleared'));
+        } catch (e) { /* workspace modules not loaded */ }
         const msg = addMessage('system', 'Context cleared');
-        setTimeout(() => { msg.remove(); }, 2000);
+        // Hero AFTER the confirmation removes itself (addMessage dismisses
+        // any hero, so rendering it first left a blank log 2s later) — and
+        // only if the log is still empty by then.
+        setTimeout(() => {
+            msg.remove();
+            if (!chatLog.querySelector('.message')) renderEmptyStateHero();
+        }, 2000);
         return;
     }
 
@@ -1030,6 +1138,7 @@ async function sendMessage(isResume = false) {
         dismissEmptyStateHero();
         currentAgentMessageDiv = document.createElement('div');
         currentAgentMessageDiv.className = 'message agent thinking';
+        currentAgentMessageDiv.dataset.ts = String(Date.now());
         // Build indicator via DOM APIs (no user-supplied content, but
         // keeps the file free of innerHTML = '<...>' patterns).
         const _ind = document.createElement('span');
@@ -1078,6 +1187,11 @@ async function sendMessage(isResume = false) {
         // model (`requested_model or configured_model`), so the client
         // always tracks whatever the agent is running.
         const payload = { messages: chatHistory, stream: true };
+        // Durable sessions: when the workspace module holds an active
+        // session id, bind the turn to it. The AGENT is the source of
+        // truth for session history and merges tolerantly, so replaying
+        // the full local history here can never double it.
+        if (window.__ghostSessionId) payload.session_id = window.__ghostSessionId;
         currentChatController = new AbortController();
 
         let response;
@@ -1231,6 +1345,12 @@ async function sendMessage(isResume = false) {
             }
             currentTaskId = null;
             if (typeof saveChatState === 'function') saveChatState();
+            // The agent may have persisted the FULL reply while this client
+            // kept the aborted stub — let the sessions module re-align from
+            // the server so the next replay can't diverge.
+            try {
+                window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-aborted'));
+            } catch (err) { /* workspace modules not loaded */ }
         } else {
             if (currentThinkingInterval) { clearInterval(currentThinkingInterval); currentThinkingInterval = null; }
             
@@ -1287,6 +1407,13 @@ async function sendMessage(isResume = false) {
 
         // Attach "Visualize" buttons to any renderable code blocks
         attachRenderButtons();
+        // Timestamp + actions row for the completed reply, and let the
+        // sessions rail refresh (the agent may have just created the
+        // session / derived its title).
+        decorateMessageActions();
+        try {
+            window.GhostCore?.events?.dispatchEvent(new CustomEvent('turn-complete'));
+        } catch (e) { /* workspace modules not loaded */ }
     }
 }
 
@@ -1314,8 +1441,14 @@ if (fullscreenBtn) {
 
 // Global toggle for Zen Mode (Persistent Key)
 document.addEventListener('keydown', (e) => {
-    // Toggle with 'Z' unless user is typing in the chat input
-    if (e.key.toLowerCase() === 'z' && document.activeElement !== chatInput) {
+    // Toggle with 'Z' unless the user is typing in ANY text field (chat
+    // input, session search, palette, memory modal…) — the original
+    // check excluded only #chat-input, so typing "z" in a newer field
+    // would flip zen mode mid-word.
+    const el = document.activeElement;
+    const typing = el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA'
+        || el.isContentEditable);
+    if (e.key.toLowerCase() === 'z' && !typing && !e.metaKey && !e.ctrlKey) {
         document.body.classList.toggle('zen-mode');
     }
 });
@@ -1412,34 +1545,7 @@ if (workspaceBtn && workspaceUploadInput) {
             if (result.error) throw new Error(result.error);
             
             chatHistory = result.chat_history || [];
-            chatLog.innerHTML = '';
-
-            _withHistoryRestore(() => {
-                for (const msg of chatHistory) {
-                    const roleClass = msg.role === 'assistant' ? 'agent' : (msg.role === 'system' ? 'system' : 'user');
-                    let displayContent = msg.content;
-
-                    if (Array.isArray(displayContent)) {
-                        const texts = displayContent.filter(c => c.type === "text").map(c => c.text);
-                        displayContent = texts.join(" ") + " \n*[Image Attached]*";
-                    }
-                    if (typeof displayContent === 'string') {
-                        let cleanContent = _stripInternalTags(displayContent);
-                        if (cleanContent) {
-                            const div = document.createElement('div');
-                            div.className = `message ${roleClass}`;
-                            if (roleClass === 'system') {
-                                div.textContent = cleanContent;
-                            } else {
-                                div.innerHTML = renderMarkdown(cleanContent);
-                                if (roleClass === 'agent') decorateCodeBlocks(div);
-                            }
-                            chatLog.appendChild(div);
-                        }
-                    }
-                }
-                if (typeof attachRenderButtons === 'function') attachRenderButtons();
-            });
+            renderHistoryToLog(chatHistory);
 
             addMessage('system', 'Workspace loaded successfully.');
             updateWorkspaceBtnState();
@@ -2696,4 +2802,52 @@ if (micBtn) {
     // iOS dispatches a context menu on long-press — suppress it for the mic button.
     micBtn.addEventListener('contextmenu', (e) => e.preventDefault());
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  Workspace bridge (2026-07-28)
+//
+//  app.js predates ES-module exports; the operator-console features
+//  (sessions rail, notifications, status panel, command palette) live
+//  in separate modules that talk to this core through window.GhostCore.
+//  New functionality belongs in modules — this bridge is the seam, not
+//  a dumping ground.
+// ═══════════════════════════════════════════════════════════════
+window.GhostCore = {
+    events: new EventTarget(),
+    addMessage,
+    renderMarkdown,
+    renderHistoryToLog,
+    decorateCodeBlocks,
+    decorateMessageActions,
+    attachRenderButtons,
+    stripInternalTags: _stripInternalTags,
+    safeStorage,
+    scrollToBottom,
+    renderEmptyStateHero,
+    dismissEmptyStateHero,
+    activeFace,
+    stopTTS,
+    sendMessage,
+    getChatHistory: () => chatHistory,
+    setChatHistory: (h) => { chatHistory = Array.isArray(h) ? h : []; saveChatState(); },
+    // Reset the visible conversation WITHOUT touching the session store —
+    // the sessions module decides what happens next (new id, load, …).
+    clearConversation: () => {
+        chatLog.innerHTML = '';
+        chatHistory = [];
+        safeStorage.remove('ghost_chat_history');
+        for (const url of _authedBlobCache.values()) {
+            try { URL.revokeObjectURL(url); } catch (e) { /* ignore */ }
+        }
+        _authedBlobCache.clear();
+        updateWorkspaceBtnState();
+        renderEmptyStateHero();
+    },
+    isProcessing: () => isProcessingRequest,
+    elements: { chatLog, chatInput, logsBtn },
+    toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
+};
+
+import('./workspace.js?v=4.4').catch(e =>
+    console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
 

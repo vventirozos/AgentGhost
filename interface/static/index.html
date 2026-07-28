@@ -30,13 +30,30 @@
     <script src="/static/vendor/mermaid.min.js"></script>
     <script src="/static/vendor/papaparse.min.js"></script>
     <script src="/static/vendor/chart.umd.min.js"></script>
-    <link rel="stylesheet" href="/static/style.css?v=3.2">
+    <link rel="stylesheet" href="/static/style.css?v=4.0">
 </head>
 
 <body>
     <div id="background-layer">
         <div id="sphere-container"></div>
     </div>
+
+    <!-- Sessions rail: the agent's episodic-memory strata. Docked on wide
+         screens, off-canvas drawer on phones/portrait tablets. Rows are
+         built by sessions.js from GET /api/sessions. -->
+    <aside id="session-rail" aria-label="Sessions">
+        <div id="rail-header">
+            <span id="rail-title">SESSIONS</span>
+            <button id="new-chat-btn" class="icon-btn" title="New chat" aria-label="New chat">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+            </button>
+        </div>
+        <input id="session-search" type="search" placeholder="Filter sessions" autocomplete="off"
+               aria-label="Filter sessions" />
+        <div id="session-list" role="list"></div>
+        <div id="rail-note" class="hidden"></div>
+    </aside>
+    <div id="rail-scrim" class="hidden" aria-hidden="true"></div>
 
     <div id="ui-layer">
         <div id="render-window" class="hidden">
@@ -82,16 +99,24 @@
         </div>
 
         <header>
-            <div id="status-wrapper">
-                <div id="status-indicator">
-                    <span id="connection-dot"></span>
-                    <span id="status-text">SYSTEM ONLINE</span>
+            <div id="header-left">
+                <button id="rail-toggle" class="icon-btn" title="Sessions" aria-label="Toggle sessions rail">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="15" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+                </button>
+                <div id="status-wrapper">
+                    <div id="status-indicator" role="button" tabindex="0" title="Agent status">
+                        <span id="connection-dot"></span>
+                        <span id="status-text">SYSTEM ONLINE</span>
+                        <span id="model-pill" class="hidden"></span>
+                    </div>
+                    <div id="planner-monologue"></div>
                 </div>
-                <div id="planner-monologue"></div>
             </div>
             <div id="header-controls">
-                
-                
+                <button id="notif-btn" class="icon-btn" title="Notifications" aria-label="Notifications">
+                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
+                    <span id="notif-badge" class="hidden">0</span>
+                </button>
                 <button id="logs-btn" class="icon-btn" title="Live Log">
                     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                         <polyline points="4 17 10 11 4 5"></polyline>
@@ -106,15 +131,11 @@
                         <polyline points="7 3 7 8 15 8"></polyline>
                     </svg>
                 </button>
-                <button id="tts-toggle-btn" class="icon-btn" title="Toggle AI Voice">
-                    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                        <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"></polygon>
-                        <path d="M19.07 4.93a10 10 0 0 1 0 14.14M15.54 8.46a5 5 0 0 1 0 7.07"></path>
-                    </svg>
-                </button>
-                <button id="fullscreen-btn"
-
- class="icon-btn" title="Toggle Zen Mode">
+                <!-- TTS voice toggle removed 2026-07-28 (voice unused; frees
+                     the mobile header to a single row). The TTS engine in
+                     app.js is guarded by `if (ttsToggleBtn)` and stays
+                     dormant; restore by re-adding #tts-toggle-btn here. -->
+                <button id="fullscreen-btn" class="icon-btn" title="Toggle Zen Mode">
                     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                         stroke-linecap="round" stroke-linejoin="round">
                         <path
@@ -171,7 +192,55 @@
         </footer>
     </div>
 
-    <script type="module" src="/static/app.js?v=3.9"></script>
+    <!-- Workspace overlays (content built by the workspace modules). -->
+    <div id="notif-panel" class="hidden" aria-label="Notifications">
+        <div class="panel-header">
+            <span class="panel-title">NOTIFICATIONS</span>
+            <button id="notif-close" class="render-btn" title="Close">✕</button>
+        </div>
+        <div id="notif-list"></div>
+    </div>
+
+    <div id="status-panel" class="hidden" aria-label="Agent status">
+        <div class="panel-header">
+            <span class="panel-title">AGENT STATUS</span>
+            <button id="status-close" class="render-btn" title="Close">✕</button>
+        </div>
+        <div id="status-body"></div>
+    </div>
+
+    <div id="cmd-palette" class="hidden" role="dialog" aria-modal="true" aria-label="Command palette">
+        <div id="palette-box">
+            <input id="palette-input" type="text" placeholder="Type a command or session name…"
+                   autocomplete="off" spellcheck="false" />
+            <div id="palette-results" role="listbox"></div>
+        </div>
+    </div>
+
+    <div id="msg-menu" class="hidden" role="menu"></div>
+
+    <div id="memory-modal" class="hidden" role="dialog" aria-modal="true">
+        <div id="memory-modal-box">
+            <div class="panel-header">
+                <span class="panel-title" id="memory-modal-title">CORRECT MEMORY</span>
+                <button id="memory-modal-close" class="render-btn" title="Close">✕</button>
+            </div>
+            <p id="memory-modal-hint">Finds one stored memory fragment containing this exact text and rewrites
+                it. Trim the match down to the false part before applying.</p>
+            <label class="modal-label" for="memory-match">Stored text to find</label>
+            <textarea id="memory-match" rows="3" spellcheck="false"></textarea>
+            <label class="modal-label" for="memory-replacement" id="memory-replacement-label">Corrected text</label>
+            <textarea id="memory-replacement" rows="3" spellcheck="false"></textarea>
+            <div id="memory-modal-actions">
+                <button id="memory-modal-cancel" type="button">Cancel</button>
+                <button id="memory-modal-apply" type="button">Apply correction</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="toast-stack" aria-live="polite"></div>
+
+    <script type="module" src="/static/app.js?v=4.4"></script>
 </body>
 
 </html>

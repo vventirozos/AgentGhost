@@ -137,6 +137,18 @@ def merge_history(stored: List[dict], incoming: List[dict]) -> List[dict]:
     → 29 messages, quadratic, until the cap filled with duplicates). When
     incoming is recognisably the same conversation replayed, it is
     authoritative and simply replaces the stored copy.
+
+    A fat client can also be STALE — *behind* the stored copy rather than
+    ahead of it. With one session id shared across browser tabs, tab B
+    replays its shorter history + a new user message while tab A already
+    advanced the session. ``len(incoming) < len(stored)`` used to skip fat
+    detection entirely and concatenate, duplicating tab B's whole prefix
+    (2026-07-28 review finding). When incoming aligns with stored's prefix,
+    the STORED copy is authoritative (it is a superset) and only the
+    genuinely new tail is appended. Assistant messages in that tail are
+    dropped: assistant turns only ever originate server-side, so a client
+    can never legitimately introduce one the store hasn't seen (an aborted
+    stream's partial stub is the usual imposter).
     """
     stored = stored or []
     incoming = incoming or []
@@ -161,6 +173,40 @@ def merge_history(stored: List[dict], incoming: List[dict]) -> List[dict]:
                 if _key(_s) == _key(incoming[_i + _delta]))
             if _matched >= 1 and _matched >= len(stored) - 1:
                 return list(incoming)   # fat replay wins — do NOT concatenate
+    else:
+        # Stale fat replay: greedy SUBSEQUENCE alignment of incoming inside
+        # stored (order-preserving). A leading-prefix compare is not enough:
+        # a tab that stays stale across turns has GAPS relative to stored
+        # (whole exchanges another tab added), plus possibly an aborted-
+        # stream stub that matches nothing. Stored wins for everything it
+        # already holds; only incoming's unmatched TAIL — the newly typed
+        # message(s) after the last recognised position — is appended.
+        _s = 0
+        _last_match_i = -1
+        _matched = 0
+        for _i, _msg in enumerate(incoming):
+            _k = _key(_msg)
+            _j = _s
+            while _j < len(stored) and _key(stored[_j]) != _k:
+                _j += 1
+            if _j < len(stored):
+                _s = _j + 1
+                _last_match_i = _i
+                _matched += 1
+        # Guards: the match must be substantial (>= 2 stops a thin client's
+        # lone message coincidentally equal to an old one from being
+        # swallowed) and must account for nearly ALL of incoming (a large
+        # unmatched remainder means this is a different conversation, not a
+        # stale replay of this one).
+        if _matched >= 2 and _matched >= len(incoming) - 3:
+            _tail = incoming[_last_match_i + 1:]
+            _stored_sys = {str(m.get("content") or "") for m in stored
+                           if m.get("role") == "system"}
+            _extras = [m for m in _tail
+                       if m.get("role") != "assistant"
+                       and not (m.get("role") == "system"
+                                and str(m.get("content") or "") in _stored_sys)]
+            return list(stored) + _extras
     # A thin client re-sends its system prompt every turn; appending it each
     # time grew an unbounded run of duplicate system messages (and eventually
     # bypassed append_turn's history cap). Keep only system messages we don't

@@ -63,12 +63,14 @@ async def test_chat_proxy_adds_auth_header_non_streaming():
     assert kwargs["headers"] == {"X-Ghost-Key": GHOST_API_KEY}
 
 @pytest.mark.asyncio
-@patch("interface.server.httpx.AsyncClient")
-async def test_upload_proxy_adds_auth_header(mock_client_class):
+async def test_upload_proxy_adds_auth_header():
     # The proxy now reads the upload body via _read_capped_upload, which
     # iterates `await file.read(65536)` and requires real bytes/bytearray
     # chunks. The fixture returns the body on the first read, then empty
-    # bytes (EOF) on the second.
+    # bytes (EOF) on the second. Upload now rides the shared pooled client
+    # (_get_http_client), so patch the helper instead of the class.
+    import interface.server as server_mod
+
     mock_file = MagicMock(spec=UploadFile)
     mock_file.filename = "test.txt"
     mock_file.content_type = "text/plain"
@@ -80,12 +82,8 @@ async def test_upload_proxy_adds_auth_header(mock_client_class):
     mock_response.json = MagicMock(return_value={"response": "ok"})
     mock_client.post = AsyncMock(return_value=mock_response)
 
-    mock_context = AsyncMock()
-    mock_context.__aenter__.return_value = mock_client
-    mock_context.__aexit__.return_value = None
-    mock_client_class.return_value = mock_context
-
-    await upload_proxy(mock_file)
+    with patch.object(server_mod, "_get_http_client", return_value=mock_client):
+        await upload_proxy(mock_file)
 
     mock_client.post.assert_called_once()
     args, kwargs = mock_client.post.call_args
@@ -93,56 +91,38 @@ async def test_upload_proxy_adds_auth_header(mock_client_class):
     assert kwargs["headers"] == {"X-Ghost-Key": GHOST_API_KEY}
 
 @pytest.mark.asyncio
-@patch("interface.server.httpx.AsyncClient")
-async def test_download_proxy_adds_auth_header(mock_client_class):
-    mock_client_instances = [MagicMock(), MagicMock()]
-    mock_client_class.side_effect = mock_client_instances
-    
-    # 1st instance (the stream client)
-    mock_response_stream = AsyncMock()
-    mock_response_stream.raise_for_status = MagicMock()
-    async def fake_aiter(*args, **kwargs):
-        yield b"data"
-    mock_response_stream.aiter_bytes = MagicMock(side_effect=fake_aiter)
-    
-    mock_stream_ctx = AsyncMock()
-    mock_stream_ctx.__aenter__.return_value = mock_response_stream
-    mock_stream_ctx.__aexit__.return_value = None
-    mock_client_instances[0].send.return_value = mock_response_stream
-    mock_client_instances[0].aclose = AsyncMock()
-    
-@pytest.mark.asyncio
-@patch("interface.server.httpx.AsyncClient")
-async def test_download_proxy_adds_auth_header(mock_client_class):
+async def test_download_proxy_adds_auth_header():
+    # Download also rides the shared pooled client now.
+    import interface.server as server_mod
+
     mock_client = MagicMock()
-    mock_client_class.return_value = mock_client
-    
+
     mock_response = MagicMock()
     mock_response.raise_for_status = MagicMock()
     mock_response.headers = {"content-type": "image/jpeg", "content-disposition": "attachment"}
-    
+
     async def fake_aiter(*args, **kwargs):
         yield b"data"
     mock_response.aiter_bytes = MagicMock(side_effect=fake_aiter)
     mock_response.aclose = AsyncMock()
-    
+
     # Mock build_request and send
     mock_req = MagicMock()
     mock_client.build_request.return_value = mock_req
     mock_client.send = AsyncMock(return_value=mock_response)
-    mock_client.aclose = AsyncMock()
 
-    response = await download_proxy("test.jpg")
-    
-    if hasattr(response, "body_iterator"):
-        async for _ in response.body_iterator:
-            pass
-            
+    with patch.object(server_mod, "_get_http_client", return_value=mock_client):
+        response = await download_proxy("test.jpg")
+
+        if hasattr(response, "body_iterator"):
+            async for _ in response.body_iterator:
+                pass
+
     mock_client.build_request.assert_called_once()
     _, kwargs_build = mock_client.build_request.call_args
     assert "headers" in kwargs_build
     assert kwargs_build["headers"] == {"X-Ghost-Key": GHOST_API_KEY}
-    
+
     mock_client.send.assert_called_once()
     args_send, kwargs_send = mock_client.send.call_args
     assert args_send[0] == mock_req
