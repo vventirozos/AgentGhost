@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=4.4';
+import * as matrixGraphFace from './matrix_graph.js?v=4.9';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -1160,6 +1160,10 @@ async function sendMessage(isResume = false) {
     isProcessingRequest = true;
     toggleSendButtonUI(true);
     activeFace.setWorkingState(true);
+    // The immersion dive is gated on USER turns only — ambient log
+    // activity keeps driving speed/glow via setWorkingState, but only
+    // this lifecycle swallows the camera.
+    if (typeof activeFace.setUserTurn === 'function') activeFace.setUserTurn(true);
     // Only flip the dot to 'busy' if the WS is actually up — otherwise
     // the 'error' state should stay so the user sees the real problem.
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -1393,6 +1397,7 @@ async function sendMessage(isResume = false) {
         currentChatController = null;
         toggleSendButtonUI(false);
         activeFace.setWorkingState(false);
+        if (typeof activeFace.setUserTurn === 'function') activeFace.setUserTurn(false);
         if (ws && ws.readyState === WebSocket.OPEN) {
             setConnectionState('online', 'SYSTEM ONLINE');
         }
@@ -1437,6 +1442,18 @@ chatInput.addEventListener('keydown', (e) => {
 
 if (fullscreenBtn) {
     fullscreenBtn.addEventListener('click', () => { document.body.classList.toggle('zen-mode'); });
+}
+
+// Cycle the face between its alien forms (abyssal / horizon / cortex).
+// The choice persists in localStorage inside matrix_graph.
+const faceFormBtn = document.getElementById('face-form-btn');
+if (faceFormBtn) {
+    faceFormBtn.addEventListener('click', () => {
+        if (typeof activeFace.cycleForm !== 'function') return;
+        const name = activeFace.cycleForm();
+        const toast = window.__ghostWorkspace && window.__ghostWorkspace.toast;
+        if (toast) toast(`Face form: ${name}`);
+    });
 }
 
 // Global toggle for Zen Mode (Persistent Key)
@@ -2848,6 +2865,6 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=4.4').catch(e =>
+import('./workspace.js?v=4.9').catch(e =>
     console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
 

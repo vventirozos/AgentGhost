@@ -67,32 +67,17 @@ const PREFERS_REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduc
 const NODE_COUNT = IS_MOBILE ? 120 : 250;
 const MAX_LINES = IS_MOBILE ? 2500 : 10000;
 const BLOOM_SCALE = IS_MOBILE ? 0.6 : 1.0;
-// Tightened 2.5 → 1.7 with the medusa anatomy: the body is locally
-// dense (membrane, strands), so a wide link radius smeared the form
-// back into an undifferentiated web. Shorter links trace the anatomy.
-const PROXIMITY_SQ = 1.7;
+const PROXIMITY_SQ = 2.5;
 
 let scene, camera, renderer, composer, bloomPass;
 let instancedMesh, linesMesh;
 let lineGeometry, nodeMaterial, lineMaterial;
 let motesMesh, motesMaterial;
 let time = 0;
+let shapeTime = 0;
+let sceneSpin = 0;  // accumulated slow-orbit angle (radians)
 let currentShapeSpeed = SPEEDS.idle;
 let animationFrameId;
-
-// ── Medusa kinematics (2026-07-28) ─────────────────────────────────
-// The face is no longer an amorphous point cloud: it is a spectral
-// MEDUSA — a bell canopy, trailing tentacle strands, and a hot core —
-// because "alive" is a property of ANATOMY + intent-like motion, not
-// of timing curves layered on random scatter (operator: "it looks
-// like random lines and dots animating"). pulsePhase drives medusan
-// propulsion: a sharp contraction propagating apex→margin, then a
-// long glide — a muscle envelope, deliberately NOT a sine.
-let pulsePhase = 0.0;
-let flinch = 0.0;        // error recoil — one sharp agitated pulse, decays
-let _bob = 0.0;          // swim bob: rises on contraction, sinks on glide
-let _bobTarget = 0.0;
-let huePhase = 0.0;      // bounded thermal oscillation (see hueDrift)
 
 let errorState = 0.0;
 let targetErrorState = 0.0;
@@ -121,43 +106,10 @@ let pulseT = 0.0;
 const accentColor = new THREE.Color(0x2a1750);
 let accentStrength = 0.0;
 
-// Hue drift — a BOUNDED thermal oscillation (±0.07 of the ring, set
-// from huePhase each frame): regions warm and cool into each other
-// without the anatomical color placement ever scrambling.
+// Hue drift — the whole jewel wheel slides slowly around its loop
+// (~50s per full cycle at idle, ~15s when busy), so a node's color is
+// stable moment-to-moment but the graph's overall cast keeps evolving.
 let hueDrift = 0.0;
-
-// Reduced-motion damping for the CPU-side kinematics (sway, ripples).
-// The shader-side counterpart is the uOrganic uniform.
-const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
-
-// ── Alien forms (2026-07-28) ───────────────────────────────────────
-// Three interchangeable body plans over ONE motion engine (the
-// asymmetric _pulseShape propulsion, metachronal strand waves, hot
-// core, flinch, thermal anatomy):
-//   abyssal — asymmetric lobed mantle tilted off-axis, feelers
-//             reaching in all directions, off-center core.
-//   horizon — eccentric orbital shells collapsing toward a burning
-//             core; filament spirals falling inward, heating as
-//             they fall. DEFAULT (operator pick 2026-07-28).
-//   cortex  — asymmetric neural lobes swelling with thought-waves;
-//             dendrites radiating outward carrying signal trains.
-// The header's form button cycles these; the choice persists.
-const FORMS = ['abyssal', 'horizon', 'cortex'];
-// Default form: HORIZON (operator pick, 2026-07-28). An explicit button
-// choice still overrides via localStorage below.
-let formIndex = FORMS.indexOf('horizon');
-try {
-    const _stored = localStorage.getItem('ghost_face_form');
-    const _i = FORMS.indexOf(_stored);
-    if (_i >= 0) formIndex = _i;
-} catch (e) { /* private mode */ }
-// Reorganization blend: on a form switch the nodes visibly re-assemble
-// from their old positions into the new anatomy over ~1.4s.
-let formBlend = 1.0;
-const _blendFrom = [];
-// Abyssal fixed off-axis tilt (baked trig, applied per frame).
-const _TCX = Math.cos(0.42), _TSX = Math.sin(0.42);
-const _TCZ = Math.cos(0.18), _TSZ = Math.sin(0.18);
 
 // Immersion (2026-07-13): while a USER request is in flight the grid
 // "swallows" the camera — the scene scales up around the viewer and the
@@ -202,16 +154,12 @@ let activity = 0.0;         // smoothed envelope the visuals actually use
 let accentTarget = 0.0;     // smoothed accent-tint strength target
 const _accentBlend = new THREE.Color();
 
-function _fract(x) { return x - Math.floor(x); }
-
-// Medusan propulsion envelope over one cycle x∈[0,1): fast squeeze
-// (0→0.16), long smooth release (0.16→0.62), quiescent glide (0.62→1).
-// The asymmetry is what reads as muscle rather than oscillation.
-function _pulseShape(x) {
-    if (x < 0.16) { const s = x / 0.16; return s * s * (3 - 2 * s); }
-    if (x < 0.62) { const r = (x - 0.16) / 0.46; return 1 - r * r * (3 - 2 * r); }
-    return 0;
-}
+// Structural evolution: a few nodes at a time slowly MIGRATE to new
+// home positions, so the graph's topology genuinely evolves (proximity
+// links dissolve and re-form along the way) instead of oscillating
+// around a fixed skeleton. Rate scales gently with activity.
+let migrateCooldown = 4.0;         // seconds until the next migration starts
+const MAX_CONCURRENT_MIGRATIONS = 5;
 
 // Parallax — camera drift toward cursor / device tilt. Never more than
 // ±PARALLAX_RANGE units so the chat never visually shifts.
@@ -379,13 +327,10 @@ void main() {
     float d = distance(vUv, vec2(0.5)) * 2.0; // scaled 0 to 1
     if (d > 1.0) discard;
 
-    // Soft quadratic falloff. Dimmed 0.8→0.68 with the medusa anatomy:
-    // the body is locally DENSE (membrane, strands), so additive
-    // stacking multiplied apparent brightness — the dark-first theme is
-    // held at the fragment level, not just in the palette.
-    float intensity = pow(1.0 - d, 2.0) * 0.68;
-    // Bright core (also trimmed for the same stacking reason)
-    float core = pow(1.0 - d, 8.0) * 1.35;
+    // Soft quadratic falloff
+    float intensity = pow(1.0 - d, 2.0) * 0.8;
+    // Intense bright core
+    float core = pow(1.0 - d, 8.0) * 1.5;
 
     float alpha = (intensity + core) * vNearFade;
     // Distance dimming: far nodes glow less and fade out, near nodes pop.
@@ -461,7 +406,7 @@ void main() {
     vec3 col = mix(mixCol, uErrorColor, uErrorState * 0.8);
     col = mix(col, uAccentColor, clamp(uAccentStrength * 0.6, 0.0, 0.45));
 
-    float alpha = mix(0.30 + uWorkingState * 0.18, 1.0, pulse);
+    float alpha = mix(0.4 + uWorkingState * 0.2, 1.0, pulse);
     alpha = max(alpha, burst * uPulseT);
     alpha *= vLineNear;
     // Inside the cloud MANY lines stack additively right in front of
@@ -517,262 +462,6 @@ void main() {
 }
 `;
 
-// ── Anatomy builders ───────────────────────────────────────────────
-// Each fills basePositions + nodeSeeds for exactly NODE_COUNT nodes.
-// The thermal poles become BODY PLAN in every form: cold blue outer
-// structure, violet transitions, hot arterial strands and core.
-
-function _buildAnatomy() {
-    basePositions.length = 0;
-    const f = FORMS[formIndex];
-    if (f === 'horizon') _buildHorizon();
-    else if (f === 'cortex') _buildCortex();
-    else _buildAbyssal();
-}
-
-// Form A — ABYSSAL: an unclassifiable biomechanical mass. The mantle is
-// a lobed, UNEQUAL husk (no earthly symmetry) tilted off-axis, feelers
-// reach in all directions (down, sideways, some upward — reaching reads
-// sentient; hanging read jellyfish), and the core sits off-center.
-function _buildAbyssal() {
-    const CORE_COUNT = Math.max(8, Math.round(NODE_COUNT * 0.055));
-    const STRANDS = IS_MOBILE ? 8 : 11;
-    const PER_STRAND = Math.max(5, Math.floor((NODE_COUNT * 0.34) / STRANDS));
-    const MANTLE_COUNT = NODE_COUNT - CORE_COUNT - STRANDS * PER_STRAND;
-    const BELL_R = 1.5, BELL_SWEEP = 1.9;   // sweep past the equator — a husk, not a bell
-    const lobeP1 = Math.random() * Math.PI * 2;
-    const lobeP2 = Math.random() * Math.PI * 2;
-    const lobeOf = (theta, u) => 1 + 0.24 * Math.sin(2 * theta + lobeP1)
-        + 0.15 * Math.sin(3 * theta + lobeP2)
-        + 0.08 * Math.sin(5 * theta + u * 4.0);
-    let n = 0;
-
-    for (let b = 0; b < MANTLE_COUNT; b++, n++) {
-        const u = Math.sqrt((b + 0.5) / MANTLE_COUNT);
-        const theta = b * 2.399963;
-        const alpha = u * BELL_SWEEP;
-        basePositions.push({
-            kind: 0, u, theta,
-            cos: Math.cos(theta), sin: Math.sin(theta),
-            r0: BELL_R * Math.sin(alpha) * lobeOf(theta, u)
-                + (Math.random() - 0.5) * 0.07,
-            y0: 0.9 - BELL_R * 1.05 * (1 - Math.cos(alpha))
-                + (Math.random() - 0.5) * 0.07,
-        });
-        nodeSeeds[n] = 0.02 + u * 0.30 + Math.random() * 0.04;
-    }
-
-    for (let k = 0; k < STRANDS; k++) {
-        // Feelers emerge from random mantle latitudes with their own
-        // reach directions.
-        const thetaA = Math.random() * Math.PI * 2;
-        const uA = 0.55 + Math.random() * 0.45;
-        const aA = uA * BELL_SWEEP;
-        const rA = BELL_R * Math.sin(aA) * lobeOf(thetaA, uA);
-        const ax = rA * Math.cos(thetaA);
-        const az = rA * Math.sin(thetaA);
-        const ay = 0.9 - BELL_R * 1.05 * (1 - Math.cos(aA));
-        let dx = Math.cos(thetaA) * (0.5 + Math.random() * 0.5);
-        let dz = Math.sin(thetaA) * (0.5 + Math.random() * 0.5);
-        let dy = -1.1 + Math.random() * 1.7;          // most drift down, some reach up
-        const dl = Math.hypot(dx, dy, dz);
-        dx /= dl; dy /= dl; dz /= dl;
-        // Wave-plane perpendiculars for the metachronal sway.
-        let p1x = -dz, p1z = dx;
-        const p1l = Math.hypot(p1x, p1z) || 1;
-        p1x /= p1l; p1z /= p1l;
-        const p2x = dy * p1z, p2y = dz * p1x - dx * p1z, p2z = -dy * p1x;
-        const len = 1.7 + Math.random() * 1.1;
-        const swaySpeed = 0.5 + Math.random() * 0.4;
-        const swayPhase = Math.random() * Math.PI * 2;
-        for (let j = 0; j < PER_STRAND; j++, n++) {
-            const s = (j + 1) / PER_STRAND;
-            basePositions.push({
-                kind: 1, s, ax, ay, az, dx, dy, dz,
-                p1x, p1z, p2x, p2y, p2z,
-                len, swaySpeed, swayPhase,
-                swayAmp: 0.30 * Math.pow(s, 1.3),
-            });
-            nodeSeeds[n] = 0.40 + s * 0.28 + Math.random() * 0.05;
-        }
-    }
-
-    for (let c = 0; c < CORE_COUNT; c++, n++) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.4 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: 0.28 + rr * Math.sin(ph) * Math.cos(th),   // off-center on purpose
-            hy: 0.05 + rr * Math.cos(ph) * 0.7,
-            hz: -0.12 + rr * Math.sin(ph) * Math.sin(th),
-            jit: Math.random() * Math.PI * 2,
-        });
-        nodeSeeds[n] = 0.58 + Math.random() * 0.08;
-    }
-}
-
-// Form B — EVENT HORIZON: information falling into a mind. Eccentric
-// orbital shells collapse toward the core (outer first — the wave
-// travels inward), filament spirals stream in and HEAT as they fall.
-function _buildHorizon() {
-    const CORE_COUNT = Math.max(14, Math.round(NODE_COUNT * 0.10));
-    const STRANDS = IS_MOBILE ? 5 : 7;
-    const PER_STRAND = Math.max(6, Math.floor((NODE_COUNT * 0.30) / STRANDS));
-    const SHELL_TOTAL = NODE_COUNT - CORE_COUNT - STRANDS * PER_STRAND;
-    const SHELLS = [
-        { r: 0.85, tilt: 0.35, omega: 0.20, off: 0.10 },
-        { r: 1.45, tilt: -0.22, omega: 0.12, off: 0.18 },
-        { r: 2.05, tilt: 0.12, omega: 0.07, off: 0.26 },
-    ];
-    let n = 0;
-    const per = Math.floor(SHELL_TOTAL / SHELLS.length);
-    for (let si = 0; si < SHELLS.length; si++) {
-        const sh = SHELLS[si];
-        const count = si === SHELLS.length - 1
-            ? SHELL_TOTAL - per * (SHELLS.length - 1) : per;
-        for (let b = 0; b < count; b++, n++) {
-            const cosP = 2 * ((b + 0.5) / count) - 1;
-            basePositions.push({
-                kind: 0, shell: si,
-                r: sh.r * (0.94 + Math.random() * 0.12),
-                cosP, sinP: Math.sqrt(Math.max(0, 1 - cosP * cosP)),
-                phi0: b * 2.399963, omega: sh.omega,
-                tiltC: Math.cos(sh.tilt), tiltS: Math.sin(sh.tilt),
-                offX: sh.off, jit: Math.random() * Math.PI * 2,
-            });
-            // Inner shells run warmer — matter heats as it falls.
-            nodeSeeds[n] = 0.28 - si * 0.13 + Math.random() * 0.04;
-        }
-    }
-    for (let k = 0; k < STRANDS; k++) {
-        const phi0 = (k / STRANDS) * Math.PI * 2 + Math.random() * 0.4;
-        const pitch = (Math.random() < 0.5 ? -1 : 1) * (0.5 + Math.random() * 0.5);
-        const flow = 1.6 + Math.random() * 0.8;
-        for (let j = 0; j < PER_STRAND; j++, n++) {
-            const s = (j + 1) / PER_STRAND;             // 0 rim → 1 core
-            basePositions.push({ kind: 1, s, phi0, pitch, flow,
-                jit: Math.random() * Math.PI * 2 });
-            nodeSeeds[n] = 0.34 + s * 0.30 + Math.random() * 0.04;
-        }
-    }
-    for (let c = 0; c < CORE_COUNT; c++, n++) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.32 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: rr * Math.sin(ph) * Math.cos(th),
-            hy: rr * Math.cos(ph),
-            hz: rr * Math.sin(ph) * Math.sin(th),
-            jit: Math.random() * Math.PI * 2,
-        });
-        nodeSeeds[n] = 0.58 + Math.random() * 0.08;
-    }
-}
-
-// Form C — SYNTHETIC CORTEX: an asymmetric cluster of neural lobes.
-// Thought-waves swell the lobes in sequence; dendrites radiate outward
-// carrying displacement signal-trains toward their tips.
-function _buildCortex() {
-    const LOBE_CENTERS = [
-        [0.75, 0.35, 0.15], [-0.60, 0.45, -0.30],
-        [0.15, -0.25, 0.70], [-0.30, -0.40, -0.65],
-    ];
-    const LOBE_R = [0.78, 0.68, 0.62, 0.72];
-    const CORE_COUNT = Math.max(8, Math.round(NODE_COUNT * 0.06));
-    const STRANDS = IS_MOBILE ? 10 : 14;
-    const PER_STRAND = Math.max(4, Math.floor((NODE_COUNT * 0.30) / STRANDS));
-    const LOBE_TOTAL = NODE_COUNT - CORE_COUNT - STRANDS * PER_STRAND;
-    let n = 0;
-    const per = Math.floor(LOBE_TOTAL / LOBE_CENTERS.length);
-    for (let li = 0; li < LOBE_CENTERS.length; li++) {
-        const count = li === LOBE_CENTERS.length - 1
-            ? LOBE_TOTAL - per * (LOBE_CENTERS.length - 1) : per;
-        for (let b = 0; b < count; b++, n++) {
-            const th = Math.random() * Math.PI * 2;
-            const ph = Math.acos(2 * Math.random() - 1);
-            basePositions.push({
-                kind: 0, lobe: li,
-                cx: LOBE_CENTERS[li][0], cy: LOBE_CENTERS[li][1], cz: LOBE_CENTERS[li][2],
-                dx: Math.sin(ph) * Math.cos(th),
-                dy: Math.cos(ph),
-                dz: Math.sin(ph) * Math.sin(th),
-                r0: LOBE_R[li] * (0.88 + Math.random() * 0.28),
-                lobePhase: li * 0.18 + Math.random() * 0.05,
-                jit: Math.random() * Math.PI * 2,
-            });
-            nodeSeeds[n] = 0.04 + li * 0.055 + Math.random() * 0.03;
-        }
-    }
-    for (let k = 0; k < STRANDS; k++) {
-        const li = k % LOBE_CENTERS.length;
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const dx = Math.sin(ph) * Math.cos(th);
-        const dy = Math.cos(ph);
-        const dz = Math.sin(ph) * Math.sin(th);
-        const ax = LOBE_CENTERS[li][0] + dx * LOBE_R[li];
-        const ay = LOBE_CENTERS[li][1] + dy * LOBE_R[li];
-        const az = LOBE_CENTERS[li][2] + dz * LOBE_R[li];
-        let p1x = -dz, p1z = dx;
-        const p1l = Math.hypot(p1x, p1z) || 1;
-        p1x /= p1l; p1z /= p1l;
-        const p2x = dy * p1z, p2y = dz * p1x - dx * p1z, p2z = -dy * p1x;
-        const len = 1.4 + Math.random() * 0.9;
-        const swaySpeed = 0.9 + Math.random() * 0.5;
-        const swayPhase = Math.random() * Math.PI * 2;
-        for (let j = 0; j < PER_STRAND; j++, n++) {
-            const s = (j + 1) / PER_STRAND;
-            basePositions.push({
-                kind: 1, s, ax, ay, az, dx, dy, dz,
-                p1x, p1z, p2x, p2y, p2z,
-                len, swaySpeed, swayPhase,
-                swayAmp: 0.10 * Math.pow(s, 1.2),
-                signal: 2.2 + Math.random() * 0.9,
-            });
-            nodeSeeds[n] = 0.40 + s * 0.28 + Math.random() * 0.05;
-        }
-    }
-    for (let c = 0; c < CORE_COUNT; c++, n++) {
-        const th = Math.random() * Math.PI * 2;
-        const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.35 * Math.cbrt(Math.random());
-        basePositions.push({
-            kind: 2,
-            hx: rr * Math.sin(ph) * Math.cos(th),
-            hy: 0.05 + rr * Math.cos(ph),
-            hz: rr * Math.sin(ph) * Math.sin(th),
-            jit: Math.random() * Math.PI * 2,
-        });
-        nodeSeeds[n] = 0.58 + Math.random() * 0.08;
-    }
-}
-
-// ── Form switching ─────────────────────────────────────────────────
-export function getForm() { return FORMS[formIndex]; }
-
-export function setForm(name) {
-    const i = FORMS.indexOf(name);
-    if (i < 0 || i === formIndex) return FORMS[formIndex];
-    // Snapshot current positions so the switch reads as the creature
-    // REORGANIZING itself rather than a hard cut.
-    _blendFrom.length = 0;
-    for (let k = 0; k < NODE_COUNT; k++) {
-        _blendFrom.push(currentPositions[k] ? currentPositions[k].clone() : null);
-    }
-    formIndex = i;
-    _buildAnatomy();
-    if (instancedMesh) instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
-    formBlend = 0.0;
-    try { localStorage.setItem('ghost_face_form', FORMS[formIndex]); } catch (e) {}
-    return FORMS[formIndex];
-}
-
-export function cycleForm() {
-    return setForm(FORMS[(formIndex + 1) % FORMS.length]);
-}
-
 export function init() {
     basePositions.length = 0;
     const container = document.getElementById('sphere-container');
@@ -808,8 +497,34 @@ export function init() {
     composer.addPass(renderScene);
     composer.addPass(bloomPass);
 
-    _buildAnatomy();
-    for (let i = 0; i < NODE_COUNT; i++) currentPositions[i] = new THREE.Vector3();
+    // Initialize Base Positions
+    for (let i = 0; i < NODE_COUNT; i++) {
+        // Uniform spherical distribution
+        const u = Math.random();
+        const v = Math.random();
+        const theta = 2 * Math.PI * u;
+        const phi = Math.acos(2 * v - 1);
+        const r = 2.0 * Math.cbrt(Math.random()); // Larger radius from center than 1.8
+
+        basePositions.push({
+            x: r * Math.sin(phi) * Math.cos(theta),
+            y: r * Math.sin(phi) * Math.sin(theta),
+            z: r * Math.cos(phi),
+            phaseX: Math.random() * Math.PI * 2, // Keep independent phases!
+            phaseY: Math.random() * Math.PI * 2,
+            phaseZ: Math.random() * Math.PI * 2,
+            speed: 0.15 + Math.random() * 0.4
+        });
+        currentPositions[i] = new THREE.Vector3();
+        // SPATIAL seeds: neighbours land near each other on the thermal
+        // ring (plus jitter for texture), so the cloud forms coherent
+        // warm and cold REGIONS instead of salt-and-pepper color noise —
+        // the single biggest "too colorful" fix.
+        const bp = basePositions[i];
+        const spatial = 0.5 + bp.x * 0.11 + bp.y * 0.07 + bp.z * 0.05
+            + Math.random() * 0.16;
+        nodeSeeds[i] = ((spatial % 1) + 1) % 1;
+    }
 
     // Shared palette uniforms — same THREE.Color objects on both
     // materials, so a future live re-theme (mutating COLORS.palette)
@@ -1026,10 +741,6 @@ export function updateSphereColor(colorHex) {
 let _spikeClearTimeout;
 export function noteError() {
     targetErrorState = 0.5;
-    // Recoil: the body flinches — one sharp agitated pulse cycle — in
-    // addition to the hot tint. Motion + color together read as a
-    // startle response rather than a rendering glitch.
-    flinch = Math.min(1.0, flinch + 0.8);
     activityTarget = Math.min(1.0, activityTarget + 0.3);
     if (_spikeClearTimeout) clearTimeout(_spikeClearTimeout);
     _spikeClearTimeout = setTimeout(() => {
@@ -1063,9 +774,6 @@ export function getDebugState() {
         cameraZ: camera ? camera.position.z : null,
         sceneScale: scene ? scene.scale.x : null,
         activity,
-        pulse: _fract(pulsePhase),
-        bob: _bob,
-        anatomy: FORMS[formIndex],
     };
 }
 
@@ -1169,18 +877,15 @@ function animate() {
     // gives the network real depth and life at idle. Skipped entirely
     // under reduced-motion.
     if (!PREFERS_REDUCED_MOTION) {
-        // Heading wander: the creature holds a loose heading and lets it
-        // drift — sums of incommensurate slow sines, so it turns its
-        // attention rather than rotating on a turntable. The body also
-        // bobs with its own swimming (set below) and drifts laterally a
-        // little, like something suspended in a current.
-        scene.rotation.y = 0.38 * Math.sin(time * 0.050)
-            + 0.22 * Math.sin(time * 0.023 + 1.3);
-        scene.rotation.x = 0.10 * Math.sin(time * 0.037 + 0.7)
-            + 0.05 * Math.sin(time * 0.011);
-        scene.rotation.z = 0.05 * Math.sin(time * 0.029 + 2.1);
-        scene.position.x = 0.10 * Math.sin(time * 0.031);
-        scene.position.y = _bob;
+        // The orbit hesitates and surges slightly (never reverses) and the
+        // tilt is a sum of slow non-repeating drifts — like something
+        // holding its attention loosely rather than a turntable.
+        sceneSpin += (0.0006 + workingState * 0.0010)
+            * (1.0 + 0.3 * Math.sin(time * 0.13));
+        scene.rotation.y = sceneSpin;
+        scene.rotation.x = 0.12 * Math.sin(time * 0.25)
+            + 0.03 * Math.sin(time * 0.071 + 0.9);
+        scene.rotation.z = 0.02 * Math.sin(time * 0.047);
     }
 
     // Parallax: ease camera toward target offset. Z is owned by the
@@ -1207,144 +912,87 @@ function animate() {
         currentShapeSpeed += Math.sign(speedDiff) * Math.min(Math.abs(speedDiff), 0.011);
     }
 
-    // ── Medusan propulsion ──────────────────────────────────────────
-    // The pulse clock: ~4.5s per cycle at idle, tightening toward ~1.8s
-    // when the agent is busy (currentShapeSpeed lerps between
-    // SPEEDS.idle and SPEEDS.busy above). An error flinch briefly
-    // agitates both rate and amplitude — a recoil, not a flash.
-    pulsePhase += (1 / 60) * (0.20 + 0.105 * currentShapeSpeed)
-        * (1.0 + flinch * 1.2)
-        * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0);
-    flinch *= 0.97;
+    // Multiply by 0.0025 instead of 0.005 to halve the speed for both idle and busy
+    shapeTime += 0.0025 * currentShapeSpeed * (PREFERS_REDUCED_MOTION ? 0.3 : 1.0);
 
-    const pulseAmp = (0.16 + 0.10 * drive + 0.22 * flinch)
-        * (PREFERS_REDUCED_MOTION ? 0.45 : 1.0)
-        * (1.0 + 0.25 * audioLevel);
-    // Contraction as felt at the bell margin (drives tentacle tug + the
-    // swim bob) — the wave reaches the margin 0.16 cycles after the apex.
-    const cMargin = _pulseShape(_fract(pulsePhase - 0.16));
+    // Audio reactivity: inflate the morph amplitude subtly during TTS
+    // so the sphere visibly resonates with speech. Capped at +30% so it
+    // stays subtle — chat overlay must remain readable.
+    const morphAmp = 1.5 * (1.0 + audioLevel * 0.3);
 
-    // Slow vertical mass-drift (NOT a pulse-locked swim bob — that was
-    // the jellyfish tell). The body hovers like something suspended.
-    _bobTarget = 0.10 * Math.sin(time * 0.043 + 0.5);
-    _bob += (_bobTarget - _bob) * 0.02;
-
-    if (formIndex === 0) {
-        // ── ABYSSAL: lobed husk contraction + omnidirectional feelers,
-        //    the whole body baked onto an off-axis tilt (no "up").
+    // Structural evolution: start a slow migration for one node every
+    // few seconds (sooner when the agent is active). The node's HOME
+    // position glides to a fresh point in the volume over ~6s, so its
+    // proximity links dissolve and re-form — the graph visibly rewires
+    // itself instead of orbiting a fixed skeleton.
+    migrateCooldown -= (1 / 60) * (1.0 + activity * 3.0);
+    if (migrateCooldown <= 0) {
+        migrateCooldown = 3.5 + Math.random() * 3.0;
+        let migrating = 0;
         for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            let x, y, z;
-            if (bp.kind === 0) {
-                const local = _pulseShape(_fract(pulsePhase - bp.u * 0.16));
-                const squeeze = 1.0 - pulseAmp * local * (0.30 + 0.70 * bp.u);
-                const r = bp.r0 * squeeze
-                    + 0.025 * CALM * Math.sin(time * 1.3 + bp.theta * 3.0 + bp.u * 7.0);
-                x = r * bp.cos;
-                z = r * bp.sin;
-                y = bp.y0 + 0.20 * pulseAmp * local * bp.u
-                    + 0.02 * CALM * Math.sin(time * 0.9 + bp.theta * 2.0);
-            } else if (bp.kind === 1) {
-                // Feelers retract slightly with each contraction —
-                // reaching and recoiling, not hanging.
-                const reach = bp.len * bp.s * (1.0 - 0.22 * pulseAmp * cMargin);
-                const swayA = time * bp.swaySpeed + bp.swayPhase - bp.s * 3.3;
-                const lat = bp.swayAmp * CALM * (1.0 + 0.25 * drive) * Math.sin(swayA);
-                const lat2 = bp.swayAmp * 0.7 * CALM * Math.cos(swayA * 0.83 + 1.1);
-                x = bp.ax + bp.dx * reach + bp.p1x * lat + bp.p2x * lat2;
-                y = bp.ay + bp.dy * reach + bp.p2y * lat2;
-                z = bp.az + bp.dz * reach + bp.p1z * lat + bp.p2z * lat2;
-            } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + 0.12 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
-                x = bp.hx * g;
-                y = bp.hy * g + 0.03 * Math.sin(time * 0.6 + bp.jit * 2.0);
-                z = bp.hz * g;
-            }
-            const x1 = x * _TCZ - y * _TSZ;
-            const y1 = x * _TSZ + y * _TCZ;
-            const y2 = y1 * _TCX - z * _TSX;
-            const z2 = y1 * _TSX + z * _TCX;
-            currentPositions[i].set(x1, y2, z2);
+            if (basePositions[i]._mig) migrating++;
         }
-    } else if (formIndex === 1) {
-        // ── EVENT HORIZON: shells collapse toward the core (wave runs
-        //    inward via the shell-index lag), filaments spiral in.
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            if (bp.kind === 0) {
-                const collapse = _pulseShape(_fract(pulsePhase - bp.shell * 0.12));
-                const r = bp.r * (1.0 - pulseAmp * 0.55 * collapse)
-                    * (1.0 + 0.04 * CALM * Math.sin(time * 0.5 + bp.jit));
-                const phi = bp.phi0 + time * bp.omega * CALM;
-                const x = r * bp.sinP * Math.cos(phi)
-                    + bp.offX * Math.sin(time * 0.07 + bp.shell * 2.1);
-                const y = r * bp.cosP;
-                const z = r * bp.sinP * Math.sin(phi);
-                currentPositions[i].set(
-                    x,
-                    y * bp.tiltC - z * bp.tiltS,
-                    y * bp.tiltS + z * bp.tiltC);
-            } else if (bp.kind === 1) {
-                const phi = bp.phi0 + bp.s * 4.4 + time * 0.22 * CALM;
-                const rr = (2.3 - 1.95 * bp.s)
-                    * (1.0 + 0.06 * CALM * Math.sin(bp.s * 9.0 - time * bp.flow));
-                currentPositions[i].set(
-                    rr * Math.cos(phi),
-                    bp.pitch * (bp.s - 0.5)
-                        + 0.05 * CALM * Math.sin(time * 0.7 + bp.jit),
-                    rr * Math.sin(phi));
-            } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + 0.18 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
-                currentPositions[i].set(bp.hx * g, bp.hy * g, bp.hz * g);
-            }
-        }
-    } else {
-        // ── SYNTHETIC CORTEX: thought-waves swell the lobes in
-        //    sequence; dendrites carry displacement signal-trains.
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const bp = basePositions[i];
-            if (bp.kind === 0) {
-                const wave = _pulseShape(_fract(pulsePhase - bp.lobePhase));
-                const g = 1.0 + 0.55 * pulseAmp * wave;
-                const spread = 1.0 + 0.18 * pulseAmp * wave;
-                currentPositions[i].set(
-                    bp.cx * spread + bp.dx * bp.r0 * g
-                        + 0.02 * CALM * Math.sin(time * 0.9 + bp.jit),
-                    bp.cy * spread + bp.dy * bp.r0 * g
-                        + 0.02 * CALM * Math.sin(time * 0.7 + bp.jit * 2.0),
-                    bp.cz * spread + bp.dz * bp.r0 * g);
-            } else if (bp.kind === 1) {
-                const swayA = time * bp.swaySpeed + bp.swayPhase - bp.s * 2.8;
-                const lat = bp.swayAmp * CALM * Math.sin(swayA);
-                const lat2 = bp.swayAmp * 0.7 * CALM * Math.cos(swayA * 0.83 + 1.1);
-                const sig = 0.05 * CALM * Math.sin(bp.s * 10.0 - time * bp.signal);
-                const reach = bp.len * bp.s + sig;
-                currentPositions[i].set(
-                    bp.ax + bp.dx * reach + bp.p1x * lat + bp.p2x * lat2,
-                    bp.ay + bp.dy * reach + bp.p2y * lat2,
-                    bp.az + bp.dz * reach + bp.p1z * lat + bp.p2z * lat2);
-            } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + 0.14 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
-                currentPositions[i].set(
-                    bp.hx * g,
-                    bp.hy * g + 0.03 * Math.sin(time * 0.6 + bp.jit * 2.0),
-                    bp.hz * g);
+        if (migrating < MAX_CONCURRENT_MIGRATIONS) {
+            const bp = basePositions[Math.floor(Math.random() * NODE_COUNT)];
+            if (!bp._mig) {
+                const u = Math.random(), v = Math.random();
+                const th = 2 * Math.PI * u, ph = Math.acos(2 * v - 1);
+                const r = 2.0 * Math.cbrt(Math.random());
+                bp._mig = {
+                    sx: bp.x, sy: bp.y, sz: bp.z,
+                    tx: r * Math.sin(ph) * Math.cos(th),
+                    ty: r * Math.sin(ph) * Math.sin(th),
+                    tz: r * Math.cos(ph),
+                    p: 0,
+                };
             }
         }
     }
-
-    // Reorganization blend: after a form switch, ease from the snapshot
-    // of the old body into the freshly computed one.
-    if (formBlend < 1.0) {
-        formBlend = Math.min(1.0, formBlend + (1 / 60) / 1.4);
-        const e = formBlend * formBlend * (3.0 - 2.0 * formBlend);
-        for (let i = 0; i < NODE_COUNT; i++) {
-            const from = _blendFrom[i];
-            if (from) currentPositions[i].lerpVectors(from, currentPositions[i], e);
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const m = basePositions[i]._mig;
+        if (!m) continue;
+        m.p += (1 / 60) / 6.0;   // ~6s per migration
+        if (m.p >= 1) {
+            basePositions[i].x = m.tx;
+            basePositions[i].y = m.ty;
+            basePositions[i].z = m.tz;
+            basePositions[i]._mig = null;
+        } else {
+            const e = m.p * m.p * (3 - 2 * m.p);   // smoothstep ease
+            basePositions[i].x = m.sx + (m.tx - m.sx) * e;
+            basePositions[i].y = m.sy + (m.ty - m.sy) * e;
+            basePositions[i].z = m.sz + (m.tz - m.sz) * e;
         }
+    }
+
+    // Communal current: a slow shared sway rides under every node's
+    // individual morph, so the whole cloud leans and recovers together
+    // like kelp in water — motion with a common cause reads ORGANIC in
+    // a way independent oscillators never do.
+    const swayT = shapeTime * 0.23;
+
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const bp = basePositions[i];
+
+        // Nodes morph with independent symmetric phases across the entire screen
+        const t1 = shapeTime * bp.speed + bp.phaseX;
+        const t2 = shapeTime * bp.speed * 0.73 + bp.phaseY;
+        const t3 = shapeTime * bp.speed * 1.37 + bp.phaseZ;
+
+        // Restlessness envelope: each node takes turns being agitated and
+        // almost-still (~±45% around its mean amplitude, on a much slower
+        // clock than the morph itself). Constant-amplitude wobble was the
+        // core of the "mechanical" feel.
+        const amp = morphAmp * (0.72 + 0.45 * Math.sin(shapeTime * 0.11 + bp.phaseY * 2.3));
+
+        const dx = (Math.sin(t1) + Math.sin(t2 * 1.4) * 0.5) * amp
+            + 0.22 * Math.sin(swayT + bp.y * 0.8);
+        const dy = (Math.cos(t2) + Math.cos(t3 * 1.1) * 0.5) * amp
+            + 0.16 * Math.cos(swayT * 0.83 + bp.x * 0.7);
+        const dz = (Math.sin(t3) + Math.cos(t1 * 0.9) * 0.5) * amp
+            + 0.14 * Math.sin(swayT * 0.61 + bp.z * 0.9 + 2.1);
+
+        currentPositions[i].set(bp.x + dx, bp.y + dy, bp.z + dz);
     }
 
     // 2. Update lines and track connectivity
@@ -1420,16 +1068,14 @@ function animate() {
     }
     instancedMesh.instanceMatrix.needsUpdate = true;
 
-    // Thermal breathing: with ANATOMICAL color placement (cold crown,
-    // hot tentacles/core), a monotonic wheel drift would rotate the
-    // body's colors out of their anatomy — so the drift now OSCILLATES
-    // (±0.07 of the ring, ~18s per swing at idle, faster when busy,
-    // rate wandering like weather): regions warm and cool into each
-    // other without the body plan ever scrambling.
-    huePhase += (0.006 + activity * 0.010)
+    // Advance the thermal field: ~50s per full blue↔red cycle at idle,
+    // tightening toward ~15s when the agent is busy — and the rate
+    // itself wanders (±35% on a ~75s LFO) so the mutation speeds and
+    // slows like weather instead of ticking. Slowed under reduced-motion
+    // like every other animation.
+    hueDrift += (0.00035 + activity * 0.0009)
         * (1.0 + 0.35 * Math.sin(time * 0.083))
         * (PREFERS_REDUCED_MOTION ? 0.3 : 1.0);
-    hueDrift = 0.07 * Math.sin(huePhase);
 
     const nUniforms = instancedMesh.material.uniforms;
     nUniforms.uTime.value = time;
@@ -1464,11 +1110,10 @@ function animate() {
     // additive quads are already bright, and the streaming reply is
     // being read right on top of them — inside should feel vast and
     // dim, not blinding.
-    // Base lowered 1.15 → 0.95 → 0.88 across the 2026-07-28 passes: the
-    // medusa is meant to sit BACK — present, not clamoring — and its
-    // locally dense anatomy stacks additive light. Working/activity
+    // Base lowered 1.15 → 0.95 (2026-07-28): the thermal redesign is
+    // meant to sit BACK — present, not clamoring. Working/activity
     // response unchanged, so a busy agent still visibly glows.
-    bloomPass.strength = (0.88 + workingState * 0.3 + activity * 0.35
+    bloomPass.strength = (0.95 + workingState * 0.3 + activity * 0.35
         + errorState * 0.5) * BLOOM_SCALE * (1.0 - 0.5 * dive);
 
     composer.render();

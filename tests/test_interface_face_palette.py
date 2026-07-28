@@ -63,6 +63,32 @@ def test_palette_stays_on_the_thermal_axis(graph_js):
         assert g < max(r, b), f"stop #{hexcode} has a dominant green channel"
 
 
+def test_alien_forms_present(graph_js):
+    """2026-07-28: 'alive' is a property of anatomy + muscle-like motion.
+    Three interchangeable alien body plans (abyssal / horizon / cortex)
+    share ONE propulsion engine — the asymmetric _pulseShape envelope,
+    strand waves, hot core, flinch — and a header button cycles them."""
+    assert "_pulseShape" in graph_js
+    assert "kind: 0" in graph_js and "kind: 1" in graph_js and "kind: 2" in graph_js
+    for builder in ("_buildAbyssal", "_buildHorizon", "_buildCortex"):
+        assert builder in graph_js, f"missing {builder}"
+    assert "export function cycleForm" in graph_js
+    assert "export function setForm" in graph_js
+    assert "ghost_face_form" in graph_js, "form choice must persist"
+    assert "swayAmp" in graph_js, "strand wave params missing"
+    # The propulsion envelope must stay asymmetric (squeeze ≪ release).
+    assert "if (x < 0.16)" in graph_js and "if (x < 0.62)" in graph_js
+    # Uniform-random scatter must not come back.
+    assert "Uniform spherical distribution" not in graph_js
+
+
+def test_form_button_wired(graph_js):
+    html = (_STATIC / "index.html").read_text(encoding="utf-8")
+    assert 'id="face-form-btn"' in html
+    app_js = (_STATIC / "app.js").read_text(encoding="utf-8")
+    assert "cycleForm()" in app_js
+
+
 def test_hue_wave_travels_spatially(graph_js):
     # The organic mutation: hue drift must travel through the cloud as a
     # spatial wave, not tick uniformly.

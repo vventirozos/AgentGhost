@@ -20,11 +20,23 @@ def graph_js() -> str:
     return (_STATIC / "matrix_graph.js").read_text(encoding="utf-8")
 
 
-def test_immersion_driven_by_working_state_not_activity(graph_js):
-    # The swallow is reserved for the user's own in-flight request —
-    # ambient/background activity must NOT drive it (it would fire all
-    # night on idle-loop work and lose meaning).
-    assert "const immersionTarget = workingState * IMMERSION_CAP" in graph_js
+def test_immersion_driven_by_user_turn_only(graph_js):
+    """2026-07-28: the dive is gated on the USER-TURN state. workingState
+    is re-armed almost continuously by ambient log icons on a busy agent,
+    so driving immersion from it held the camera inside the cloud all
+    night — the swallow means "working for YOU, right now"."""
+    assert "const immersionTarget = userTurnState * IMMERSION_CAP" in graph_js
+    assert "workingState * IMMERSION_CAP" not in graph_js
+    assert "export function setUserTurn" in graph_js
+    app_js = (_STATIC / "app.js").read_text(encoding="utf-8")
+    # Only sendMessage's lifecycle may drive the dive (true + false).
+    assert app_js.count("setUserTurn(true)") == 1
+    assert app_js.count("setUserTurn(false)") == 1
+
+
+def test_immersion_not_driven_by_activity_envelope(graph_js):
+    # The other historical wrong driver: the ambient activity envelope
+    # (fires all night on idle-loop work).
     assert "activity * IMMERSION_CAP" not in graph_js
 
 

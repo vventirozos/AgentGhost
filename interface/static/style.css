@@ -2181,3 +2181,16 @@ body.restoring .message { animation: none !important; }
     }
     #model-pill { max-width: 110px; }
 }
+
+/* ── Face-form button era (2026-07-28): seven header controls must
+      still fit ONE row on phones. Slightly tighter gap + 42px targets
+      on small screens only (base stays 44px). ─────────────────────── */
+@media (max-width: 480px) {
+    #header-controls {
+        gap: 8px;
+    }
+    #header-controls .icon-btn {
+        width: 42px;
+        height: 42px;
+    }
+}
