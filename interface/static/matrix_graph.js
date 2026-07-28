@@ -93,6 +93,13 @@ let flinch = 0.0;        // error recoil — one sharp agitated pulse, decays
 let _bob = 0.0;          // swim bob: rises on contraction, sinks on glide
 let _bobTarget = 0.0;
 let huePhase = 0.0;      // bounded thermal oscillation (see hueDrift)
+// Horizon event choreography: occasional cycles run HOT (deeper
+// collapse, brighter core flare, faster infall) — variability is what
+// separates a heartbeat from a metronome. coreFlare feeds the core
+// quads' render size each frame.
+let _lastPulseFract = 0.0;
+let eventBoost = 0.0;
+let coreFlare = 1.0;
 
 let errorState = 0.0;
 let targetErrorState = 0.0;
@@ -287,6 +294,7 @@ float hueWave(vec3 p) {
 const nodeVertexShader = `
 attribute float aSeed;
 uniform float uTime;
+uniform float uCenterDim;
 uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
@@ -366,6 +374,11 @@ void main() {
     // Brightness boost during an active pulse — subtle; the bloom pass
     // amplifies this considerably.
     col *= (1.0 + uPulseT * 0.4);
+    // Center dimming: additive stacking is densest near the origin — a
+    // pile of dark-red quads sums past saturation and reads hot PINK.
+    // Dimming each contribution radially keeps the red channel dominant
+    // so the center stays CRIMSON. Strength is per-form (uCenterDim).
+    col *= mix(1.0, smoothstep(0.2, 1.3, length(instancePos)), uCenterDim);
     vColor = col;
 }
 `;
@@ -418,6 +431,7 @@ void main() {
 
 const lineFragmentShader = `
 uniform float uTime;
+uniform float uCenterDim;
 uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
@@ -469,7 +483,10 @@ void main() {
     float diveDim = 1.0 - 0.30 * uDive;
     // Distance dimming so far links recede behind near ones.
     float depthDim = mix(1.0, 0.4, vLineDepth);
-    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim * vLineNear * diveDim, alpha * diveDim * mix(1.0, 0.55, vLineDepth));
+    // Center dimming — see the node shader: the central line hairball is
+    // the main additive pile-up; keep it dark so hues stay saturated.
+    float centerFade = mix(1.0, smoothstep(0.15, 1.25, length(vLinePos)), uCenterDim);
+    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim * vLineNear * diveDim * centerFade, alpha * diveDim * centerFade * mix(1.0, 0.55, vLineDepth));
 }
 `;
 
@@ -616,7 +633,11 @@ function _buildAbyssal() {
 // orbital shells collapse toward the core (outer first — the wave
 // travels inward), filament spirals stream in and HEAT as they fall.
 function _buildHorizon() {
-    const CORE_COUNT = Math.max(14, Math.round(NODE_COUNT * 0.10));
+    // Core trimmed 10% → 7% of nodes and each core quad rendered at 0.7
+    // size (2026-07-28 operator: "too bright at its center"): additive
+    // stacking is what bleached the dark red into hot pink — fewer,
+    // smaller overlaps keep the center CRIMSON instead of washing out.
+    const CORE_COUNT = Math.max(10, Math.round(NODE_COUNT * 0.07));
     const STRANDS = IS_MOBILE ? 5 : 7;
     const PER_STRAND = Math.max(6, Math.floor((NODE_COUNT * 0.30) / STRANDS));
     const SHELL_TOTAL = NODE_COUNT - CORE_COUNT - STRANDS * PER_STRAND;
@@ -641,8 +662,12 @@ function _buildHorizon() {
                 tiltC: Math.cos(sh.tilt), tiltS: Math.sin(sh.tilt),
                 offX: sh.off, jit: Math.random() * Math.PI * 2,
             });
-            // Inner shells run warmer — matter heats as it falls.
-            nodeSeeds[n] = 0.28 - si * 0.13 + Math.random() * 0.04;
+            // Inner shells run HOT — matter heats as it falls. The inner
+            // shell sits on the arterial-red stop itself: any blue this
+            // close to the core additively mixes into magenta (the "too
+            // bright pink center" report), so the center is kept pure red
+            // and the cold blues live only in the outer shells.
+            nodeSeeds[n] = [0.58, 0.16, 0.04][si] + Math.random() * 0.03;
         }
     }
     for (let k = 0; k < STRANDS; k++) {
@@ -650,24 +675,32 @@ function _buildHorizon() {
         const pitch = (Math.random() < 0.5 ? -1 : 1) * (0.5 + Math.random() * 0.5);
         const flow = 1.6 + Math.random() * 0.8;
         for (let j = 0; j < PER_STRAND; j++, n++) {
-            const s = (j + 1) / PER_STRAND;             // 0 rim → 1 core
+            const s = (j + 1) / PER_STRAND;             // 0 rim → 1 core (r floor 0.45)
             basePositions.push({ kind: 1, s, phi0, pitch, flow,
-                jit: Math.random() * Math.PI * 2 });
-            nodeSeeds[n] = 0.34 + s * 0.30 + Math.random() * 0.04;
+                jit: Math.random() * Math.PI * 2,
+                // Inner filament ends shrink a little too — they pile up
+                // right where the core already stacks.
+                sz: s > 0.75 ? 0.85 : 1.0 });
+            // Filaments run red along most of their fall — violet only at
+            // the outermost rim — so the bright inner band reads crimson.
+            nodeSeeds[n] = 0.42 + s * 0.20 + Math.random() * 0.03;
         }
     }
     for (let c = 0; c < CORE_COUNT; c++, n++) {
         const th = Math.random() * Math.PI * 2;
         const ph = Math.acos(2 * Math.random() - 1);
-        const rr = 0.32 * Math.cbrt(Math.random());
+        const rr = 0.38 * Math.cbrt(Math.random());
         basePositions.push({
             kind: 2,
             hx: rr * Math.sin(ph) * Math.cos(th),
             hy: rr * Math.cos(ph),
             hz: rr * Math.sin(ph) * Math.sin(th),
             jit: Math.random() * Math.PI * 2,
+            sz: 0.7,
         });
-        nodeSeeds[n] = 0.58 + Math.random() * 0.08;
+        // Tight anchor dead on the arterial-red stop — a wide seed spread
+        // let half the core drift toward violet/plum and read pink.
+        nodeSeeds[n] = 0.595 + Math.random() * 0.03;
     }
 }
 
@@ -833,6 +866,7 @@ export function init() {
         uniforms: {
             uTime: { value: 0.0 },
             uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
+            uCenterDim: { value: 0.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -867,6 +901,7 @@ export function init() {
         uniforms: {
             uTime: { value: 0 },
             uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
+            uCenterDim: { value: 0.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -1066,6 +1101,8 @@ export function getDebugState() {
         pulse: _fract(pulsePhase),
         bob: _bob,
         anatomy: FORMS[formIndex],
+        eventBoost,
+        coreFlare,
     };
 }
 
@@ -1217,6 +1254,17 @@ function animate() {
         * (PREFERS_REDUCED_MOTION ? 0.5 : 1.0);
     flinch *= 0.97;
 
+    // Major infall events: on ~1 in 5 cycle wraps, the next cycle runs
+    // hot. Decays over ~2s so the event owns most of its cycle.
+    const _pf = _fract(pulsePhase);
+    if (_pf < _lastPulseFract && !PREFERS_REDUCED_MOTION
+        && Math.random() < 0.22) {
+        eventBoost = 1.0;
+    }
+    _lastPulseFract = _pf;
+    eventBoost *= 0.995;
+    if (eventBoost < 0.02) eventBoost = 0;
+
     const pulseAmp = (0.16 + 0.10 * drive + 0.22 * flinch)
         * (PREFERS_REDUCED_MOTION ? 0.45 : 1.0)
         * (1.0 + 0.25 * audioLevel);
@@ -1268,35 +1316,63 @@ function animate() {
             currentPositions[i].set(x1, y2, z2);
         }
     } else if (formIndex === 1) {
-        // ── EVENT HORIZON: shells collapse toward the core (wave runs
-        //    inward via the shell-index lag), filaments spiral in.
+        // ── EVENT HORIZON — a choreographed feeding cycle, not a beat:
+        //    filament surges race rim→core, the core FLARES as they
+        //    land, and a rebound ripple travels back out through the
+        //    shells. Collapse squeezes hardest along a slowly precessing
+        //    TIDAL AXIS (directional deformation reads gravitational;
+        //    the old uniform radial shrink read mechanical/boring).
+        const hAmp = pulseAmp * (1.0 + 0.55 * eventBoost);
+        const tideA = time * 0.16;
+        const tideY = 0.34 * Math.sin(time * 0.05);
+        const tideX = Math.cos(tideA) * (1.0 - Math.abs(tideY) * 0.5);
+        const tideZ = Math.sin(tideA) * (1.0 - Math.abs(tideY) * 0.5);
+        const flareEnv = Math.pow(_pulseShape(_fract(pulsePhase - 0.02)), 2.0);
+        coreFlare = 1.0 + (0.35 + 0.50 * eventBoost) * flareEnv;
+
         for (let i = 0; i < NODE_COUNT; i++) {
             const bp = basePositions[i];
             if (bp.kind === 0) {
-                const collapse = _pulseShape(_fract(pulsePhase - bp.shell * 0.12));
-                const r = bp.r * (1.0 - pulseAmp * 0.55 * collapse)
-                    * (1.0 + 0.04 * CALM * Math.sin(time * 0.5 + bp.jit));
                 const phi = bp.phi0 + time * bp.omega * CALM;
-                const x = r * bp.sinP * Math.cos(phi)
-                    + bp.offX * Math.sin(time * 0.07 + bp.shell * 2.1);
-                const y = r * bp.cosP;
-                const z = r * bp.sinP * Math.sin(phi);
+                const dirX = bp.sinP * Math.cos(phi);
+                const dirY = bp.cosP;
+                const dirZ = bp.sinP * Math.sin(phi);
+                const align = dirX * tideX + dirY * tideY + dirZ * tideZ;
+                const collapse = _pulseShape(_fract(pulsePhase - bp.shell * 0.12));
+                const rebound = _pulseShape(_fract(pulsePhase - 0.34 - (2 - bp.shell) * 0.10));
+                const r = bp.r
+                    * (1.0 - hAmp * collapse * (0.30 + 0.55 * align * align))
+                    * (1.0 + 0.10 * hAmp * rebound)
+                    * (1.0 + 0.04 * CALM * Math.sin(time * 0.5 + bp.jit));
+                const x = r * dirX + bp.offX * Math.sin(time * 0.07 + bp.shell * 2.1);
+                const y = r * dirY;
+                const z = r * dirZ;
                 currentPositions[i].set(
                     x,
                     y * bp.tiltC - z * bp.tiltS,
                     y * bp.tiltS + z * bp.tiltC);
             } else if (bp.kind === 1) {
                 const phi = bp.phi0 + bp.s * 4.4 + time * 0.22 * CALM;
-                const rr = (2.3 - 1.95 * bp.s)
-                    * (1.0 + 0.06 * CALM * Math.sin(bp.s * 9.0 - time * bp.flow));
+                // Infall surge: a packet races down the spiral each
+                // cycle (lag grows toward the rim), pulling the filament
+                // inward as it passes — it lands as the core flares.
+                const surge = _pulseShape(_fract(pulsePhase - (1.0 - bp.s) * 0.35));
+                const rr = (2.3 - 1.85 * bp.s)
+                    * (1.0 - 0.10 * (1.0 + eventBoost) * surge)
+                    * (1.0 + 0.05 * CALM * Math.sin(
+                        bp.s * 9.0 - time * bp.flow * (1.0 + eventBoost)));
                 currentPositions[i].set(
                     rr * Math.cos(phi),
                     bp.pitch * (bp.s - 0.5)
                         + 0.05 * CALM * Math.sin(time * 0.7 + bp.jit),
                     rr * Math.sin(phi));
             } else {
-                const c = _pulseShape(_fract(pulsePhase + 0.05));
-                const g = 1.0 + 0.18 * c + 0.05 * Math.sin(time * 0.8 + bp.jit);
+                // The core drinks: a small steady beat plus the FLARE
+                // when the surges land (size flare rides coreFlare in
+                // the instance-matrix pass below).
+                const g = 1.0 + 0.10 * _pulseShape(_fract(pulsePhase + 0.05))
+                    + 0.30 * flareEnv * (1.0 + eventBoost)
+                    + 0.05 * Math.sin(time * 0.8 + bp.jit);
                 currentPositions[i].set(bp.hx * g, bp.hy * g, bp.hz * g);
             }
         }
@@ -1406,7 +1482,13 @@ function animate() {
         const targetScale = connected[i] ? 1.0 : 0.0;
         nodeScales[i] += (targetScale - nodeScales[i]) * 0.1; // Smooth scale in and out
 
-        const s = nodeScales[i];
+        // Per-node size factor (bp.sz): anatomy builders shrink nodes in
+        // regions where additive stacking would otherwise wash out the
+        // thermal hue (e.g. the horizon core). Default 1. The horizon
+        // core additionally FLARES in size when the infall surges land.
+        const bpi = basePositions[i];
+        const s = nodeScales[i] * (bpi.sz || 1.0)
+            * (formIndex === 1 && bpi.kind === 2 ? coreFlare : 1.0);
         if (s < 0.001) {
             dummy.scale.set(0, 0, 0);
             dummy.position.set(9999, 9999, 9999);
@@ -1431,8 +1513,13 @@ function animate() {
         * (PREFERS_REDUCED_MOTION ? 0.3 : 1.0);
     hueDrift = 0.07 * Math.sin(huePhase);
 
+    // Per-form center dimming: horizon's core region is by far the
+    // densest additive pile-up; the other forms get a mild version.
+    const centerDim = formIndex === 1 ? 0.85 : 0.30;
+
     const nUniforms = instancedMesh.material.uniforms;
     nUniforms.uTime.value = time;
+    nUniforms.uCenterDim.value = centerDim;
     nUniforms.uWorkingState.value = workingState;
     nUniforms.uErrorState.value = errorState;
     nUniforms.uPulseT.value = pulseT;
@@ -1442,6 +1529,7 @@ function animate() {
 
     const lUniforms = lineMaterial.uniforms;
     lUniforms.uTime.value = time;
+    lUniforms.uCenterDim.value = centerDim;
     lUniforms.uWorkingState.value = workingState;
     lUniforms.uErrorState.value = errorState;
     lUniforms.uPulseT.value = pulseT;

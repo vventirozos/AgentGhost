@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=4.9';
+import * as matrixGraphFace from './matrix_graph.js?v=5.3';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -2865,6 +2865,6 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=4.9').catch(e =>
+import('./workspace.js?v=5.3').catch(e =>
     console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
 
