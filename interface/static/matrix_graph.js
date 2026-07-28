@@ -101,6 +101,40 @@ let _lastPulseFract = 0.0;
 let eventBoost = 0.0;
 let coreFlare = 1.0;
 
+// ── Vortex (form 'vortex') — self-similar swallow ──────────────────
+// A logarithmic cone converging at the singularity (origin), opening
+// toward the camera. Because the taper is EXPONENTIAL the funnel is
+// self-similar — the conveyor's depth wrap (fract) is an infinite
+// fractal zoom: matter streams in from beyond the screen edges, is
+// consumed at the apex, respawns at the rim, forever. THE CAMERA NEVER
+// MOVES — busy and idle are the same scene at different intensities,
+// so completion needs no reset at all: the view just morphs back as
+// the flow calms (operator: "don't pull the camera out; morph the
+// default view like an infinite fractal — the main animation is not
+// the spinning, it's the swallow").
+//   vortexTravel = eased user-turn ENGAGEMENT (0..1): drives flow
+//     surge, harmonic shape amplitude, and the singularity's appetite.
+//   tunnelFlow   = accumulated conveyor depth (the swallow itself).
+//   vortexSpin   = slow ambient swirl — deliberately NOT the star.
+// In-falling matter morphs through procedural, never-repeating shapes:
+// a drifting field of low-order harmonics deforms the cross-section.
+let vortexTravel = 0.0;
+let tunnelFlow = 0.0;
+let vortexSpin = 0.0;
+// v4 (operator): expansion flow. Contraction (matter streaming edges→
+// center) reads as moving BACKWARD; a black-hole fall needs the hole
+// AHEAD and the walls expanding outward past the viewer. The singularity
+// (dark-red shadow + accretion ring) sits deep on the view axis; stream
+// matter EMERGES from its glow (L small) and blooms outward/past the
+// camera (L grows exponentially — still a self-similar infinite fall).
+const VORTEX_APEX_Z = -2.0;   // the hole, deep on the view axis
+// Spawn AT the ring's edge, not inside it: matter emerges THROUGH the
+// accretion ring, so the shadow interior keeps only its dim embers and
+// reads as a genuinely dark hole.
+const VORTEX_LMIN = 0.55;
+const VORTEX_KOUT = 2.6;      // exponential expansion — self-similarity knob
+const VORTEX_COS = 0.60, VORTEX_SIN = 0.80;   // cone half-angle
+
 let errorState = 0.0;
 let targetErrorState = 0.0;
 let workingState = 0.0;
@@ -145,14 +179,15 @@ const CALM = PREFERS_REDUCED_MOTION ? 0.35 : 1.0;
 //             reaching in all directions, off-center core.
 //   horizon — eccentric orbital shells collapsing toward a burning
 //             core; filament spirals falling inward, heating as
-//             they fall. DEFAULT (operator pick 2026-07-28).
+//             they fall.
 //   cortex  — asymmetric neural lobes swelling with thought-waves;
 //             dendrites radiating outward carrying signal trains.
 // The header's form button cycles these; the choice persists.
-const FORMS = ['abyssal', 'horizon', 'cortex'];
-// Default form: HORIZON (operator pick, 2026-07-28). An explicit button
-// choice still overrides via localStorage below.
-let formIndex = FORMS.indexOf('horizon');
+const FORMS = ['abyssal', 'horizon', 'cortex', 'vortex', 'empty'];
+// Default form: VORTEX (operator pick, 2026-07-28 — superseded horizon
+// after the black-hole iteration). An explicit button choice still
+// overrides via localStorage below.
+let formIndex = FORMS.indexOf('vortex');
 try {
     const _stored = localStorage.getItem('ghost_face_form');
     const _i = FORMS.indexOf(_stored);
@@ -284,10 +319,12 @@ vec3 palette(float t) {
 // each including shader declares uTime itself exactly once.
 const hueWaveGLSL = `
 uniform float uOrganic;
+uniform float uWaveAmp;
 
 float hueWave(vec3 p) {
-    return uOrganic * (0.085 * sin(uTime * 0.21 + p.x * 0.5 + p.y * 0.35 + p.z * 0.3)
-                     + 0.045 * sin(uTime * 0.087 - p.y * 0.6 + p.z * 0.4));
+    return uOrganic * uWaveAmp
+        * (0.085 * sin(uTime * 0.21 + p.x * 0.5 + p.y * 0.35 + p.z * 0.3)
+         + 0.045 * sin(uTime * 0.087 - p.y * 0.6 + p.z * 0.4));
 }
 `;
 
@@ -295,6 +332,7 @@ const nodeVertexShader = `
 attribute float aSeed;
 uniform float uTime;
 uniform float uCenterDim;
+uniform float uCenterXY;
 uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
@@ -378,7 +416,11 @@ void main() {
     // pile of dark-red quads sums past saturation and reads hot PINK.
     // Dimming each contribution radially keeps the red channel dominant
     // so the center stays CRIMSON. Strength is per-form (uCenterDim).
-    col *= mix(1.0, smoothstep(0.2, 1.3, length(instancePos)), uCenterDim);
+    // uCenterXY switches the dim metric to SCREEN-radial (xy) distance —
+    // the vortex's hot zone sits on the view axis at depth, not at the
+    // 3D origin.
+    float cdist = mix(length(instancePos), length(instancePos.xy), uCenterXY);
+    col *= mix(1.0, smoothstep(0.2, 1.3, cdist), uCenterDim);
     vColor = col;
 }
 `;
@@ -432,6 +474,7 @@ void main() {
 const lineFragmentShader = `
 uniform float uTime;
 uniform float uCenterDim;
+uniform float uCenterXY;
 uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
@@ -485,7 +528,8 @@ void main() {
     float depthDim = mix(1.0, 0.4, vLineDepth);
     // Center dimming — see the node shader: the central line hairball is
     // the main additive pile-up; keep it dark so hues stay saturated.
-    float centerFade = mix(1.0, smoothstep(0.15, 1.25, length(vLinePos)), uCenterDim);
+    float ldist = mix(length(vLinePos), length(vLinePos.xy), uCenterXY);
+    float centerFade = mix(1.0, smoothstep(0.15, 1.25, ldist), uCenterDim);
     gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim * vLineNear * diveDim * centerFade, alpha * diveDim * centerFade * mix(1.0, 0.55, vLineDepth));
 }
 `;
@@ -544,7 +588,30 @@ function _buildAnatomy() {
     const f = FORMS[formIndex];
     if (f === 'horizon') _buildHorizon();
     else if (f === 'cortex') _buildCortex();
+    else if (f === 'vortex') _buildVortex();
+    else if (f === 'empty') _buildEmpty();
     else _buildAbyssal();
+}
+
+// Form E — EMPTY: no face at all. Nodes park on a sparse far sphere
+// (golden-angle spacing ≈ 2.7 units, well past the 1.3-unit link radius,
+// so nothing connects and every unlinked node scales to zero). Chosen
+// over simply hiding the meshes so the reorganization blend still works:
+// cycling INTO empty disperses the face beyond the screen edges, and
+// cycling OUT materializes the next form from the void.
+function _buildEmpty() {
+    for (let i = 0; i < NODE_COUNT; i++) {
+        const cosP = 2 * ((i + 0.5) / NODE_COUNT) - 1;
+        const sinP = Math.sqrt(Math.max(0, 1 - cosP * cosP));
+        const phi = i * 2.399963;
+        basePositions.push({
+            kind: 8,
+            hx: 12.0 * sinP * Math.cos(phi),
+            hy: 12.0 * cosP,
+            hz: 12.0 * sinP * Math.sin(phi),
+        });
+        nodeSeeds[i] = 0.3;
+    }
 }
 
 // Form A — ABYSSAL: an unclassifiable biomechanical mass. The mantle is
@@ -782,6 +849,78 @@ function _buildCortex() {
     }
 }
 
+// Form D — VORTEX: a black hole facing the viewer. Spiral arms wind
+// down a funnel whose throat holds the crimson singularity; the whole
+// structure swirls (faster with ambient work), matter heats from cold
+// blue at the mouth to arterial red at the throat, and user turns send
+// the camera traveling down the tunnel (see vortexTravel above).
+function _buildVortex() {
+    const ARMS = 5;
+    const CORE_COUNT = Math.max(8, Math.round(NODE_COUNT * 0.055));
+    const RING_COUNT = Math.round(NODE_COUNT * 0.14);
+    const HAZE_COUNT = Math.round(NODE_COUNT * 0.32);
+    const ARM_COUNT = NODE_COUNT - CORE_COUNT - RING_COUNT - HAZE_COUNT;
+    let n = 0;
+
+    const pushStream = (armLocked, count) => {
+        for (let b = 0; b < count; b++, n++) {
+            const d = Math.random();
+            // theta0 is the STATIC arm anchor — spiral wind + swirl are
+            // applied per frame from the node's FLOWING progress.
+            const theta0 = armLocked
+                ? (b % ARMS) * (Math.PI * 2 / ARMS) + (Math.random() - 0.5) * 0.20
+                : Math.random() * Math.PI * 2;
+            basePositions.push({
+                kind: armLocked ? 0 : 1, d0: d, theta0,
+                // Wide speed spread: streams genuinely SHEAR past each
+                // other instead of riding one conveyor (monotony fix).
+                flowScale: 0.6 + Math.random() * 1.0,
+                // Per-node trajectory: each grain flies its own cone
+                // angle, so the outward bloom has parallax variety.
+                sinA: VORTEX_SIN * (0.78 + Math.random() * 0.45),
+                cosA: VORTEX_COS * (0.90 + Math.random() * 0.20),
+                rJit: 0.94 + Math.random() * 0.12,
+                seedJit: Math.random() * 0.03,
+                jit: Math.random() * Math.PI * 2,
+                sz: armLocked ? 1.0 : 0.85,
+            });
+            nodeSeeds[n] = 0.60 - d * 0.56;              // overwritten per frame
+        }
+    };
+    pushStream(true, ARM_COUNT);
+    pushStream(false, HAZE_COUNT);
+
+    // The accretion ring — the black hole's icon. A dark-red band
+    // orbiting the shadow, slightly elliptic for perspective.
+    for (let k = 0; k < RING_COUNT; k++, n++) {
+        basePositions.push({
+            kind: 3,
+            th0: (k / RING_COUNT) * Math.PI * 2 + Math.random() * 0.15,
+            rRing: 0.62 * (0.92 + Math.random() * 0.16),
+            zJit: (Math.random() - 0.5) * 0.10,
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.9,
+        });
+        nodeSeeds[n] = 0.595 + Math.random() * 0.02;     // anchored dark red
+    }
+
+    // The shadow — dim crimson embers inside the ring.
+    for (let c = 0; c < CORE_COUNT; c++, n++) {
+        const th = Math.random() * Math.PI * 2;
+        const ph = Math.acos(2 * Math.random() - 1);
+        const rr = 0.18 * Math.cbrt(Math.random());
+        basePositions.push({
+            kind: 2,
+            hx: rr * Math.sin(ph) * Math.cos(th),
+            hy: rr * Math.sin(ph) * Math.sin(th),
+            hz: rr * Math.cos(ph) * 0.5,
+            jit: Math.random() * Math.PI * 2,
+            sz: 0.55,
+        });
+        nodeSeeds[n] = 0.60 + Math.random() * 0.02;
+    }
+}
+
 // ── Form switching ─────────────────────────────────────────────────
 export function getForm() { return FORMS[formIndex]; }
 
@@ -866,7 +1005,9 @@ export function init() {
         uniforms: {
             uTime: { value: 0.0 },
             uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
+            uWaveAmp: { value: 1.0 },
             uCenterDim: { value: 0.0 },
+            uCenterXY: { value: 0.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -901,7 +1042,9 @@ export function init() {
         uniforms: {
             uTime: { value: 0 },
             uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
+            uWaveAmp: { value: 1.0 },
             uCenterDim: { value: 0.0 },
+            uCenterXY: { value: 0.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -943,6 +1086,7 @@ export function init() {
         uniforms: {
             uTime: { value: 0 },
             uOrganic: { value: PREFERS_REDUCED_MOTION ? 0.25 : 1.0 },
+            uWaveAmp: { value: 1.0 },
             uDive: { value: 0 },
             uDpr: { value: Math.min(window.devicePixelRatio, dprCap) },
             ...paletteUniforms(),
@@ -1103,6 +1247,8 @@ export function getDebugState() {
         anatomy: FORMS[formIndex],
         eventBoost,
         coreFlare,
+        vortexTravel,
+        tunnelFlow,
     };
 }
 
@@ -1180,6 +1326,42 @@ function animate() {
     // Smoothstepped path so both ends of the dive are gentle.
     const dive = immersion * immersion * (3.0 - 2.0 * immersion);
 
+    // Vortex engagement + flow (see the vortexTravel declaration).
+    // Engagement eases up while a user turn runs and eases back down on
+    // completion — since the camera never moves and the cone is
+    // self-similar, that ease IS the whole transition: busy morphs into
+    // idle with no reset of any kind.
+    if (formIndex === 3) {
+        if (userTurnState > 0.5) {
+            vortexTravel += (IMMERSION_CAP - vortexTravel) * 0.010;
+        } else if (vortexTravel > 0.001) {
+            vortexTravel *= 0.985;                   // calm back down (~5s)
+        } else {
+            vortexTravel = 0.0;
+        }
+        const travelNorm = Math.min(vortexTravel / Math.max(IMMERSION_CAP, 0.001), 1.0);
+        // THE SWALLOW — the main animation. Slow accretion at idle, a
+        // touch quicker under ambient work, a strong endless in-fall
+        // while a user request executes (full emergence cycle ≈ 5s).
+        // The rate is TURBULENT, not constant: it surges and slackens on
+        // slow beats, and while feeding it GULPS in rhythm with the
+        // pulse — a constant conveyor read as monotonic.
+        const flowTurb = 1.0 + CALM * (0.35 * Math.sin(time * 0.23)
+            * Math.sin(time * 0.081 + 1.7)
+            + 0.45 * travelNorm * _pulseShape(_fract(pulsePhase)));
+        tunnelFlow += (1 / 60) * (0.008
+            + 0.014 * Math.max(workingState, activity)
+            + 0.19 * travelNorm) * flowTurb * CALM;
+        // Swirl (2026-07-28 tuning): idle raised +25% (0.10 → 0.125),
+        // and busy HALVES the rate rather than raising it — work
+        // de-emphasizes rotation entirely so the surging swallow owns
+        // the busy state without competition.
+        vortexSpin += (1 / 60) * (0.125
+            - 0.050 * Math.max(workingState, activity, travelNorm)) * CALM;
+    } else {
+        vortexTravel = 0.0;
+    }
+
     // Accumulate time for lines at steady pace — except inside the
     // cloud, where the data pulses rush a little faster: the interior
     // should feel BUSIER than the outside view, not emptier.
@@ -1200,24 +1382,37 @@ function animate() {
     // camera is closest — the interior looked empty at 0.7 even with
     // the denser web + motes compensating.
     const baseScale = 0.9 * breathe * (1.0 + dive * 0.55);
-    scene.scale.set(baseScale, baseScale, baseScale);
+    // The vortex's journey is the CAMERA's — swelling the scene under it
+    // would double-transform the funnel, so the swell is neutralized.
+    const sceneScale = formIndex === 3 ? 0.9 * breathe : baseScale;
+    scene.scale.set(sceneScale, sceneScale, sceneScale);
 
     // Slow continuous orbit (faster while working) plus a gentle tilt
     // gives the network real depth and life at idle. Skipped entirely
     // under reduced-motion.
     if (!PREFERS_REDUCED_MOTION) {
-        // Heading wander: the creature holds a loose heading and lets it
-        // drift — sums of incommensurate slow sines, so it turns its
-        // attention rather than rotating on a turntable. The body also
-        // bobs with its own swimming (set below) and drifts laterally a
-        // little, like something suspended in a current.
-        scene.rotation.y = 0.38 * Math.sin(time * 0.050)
-            + 0.22 * Math.sin(time * 0.023 + 1.3);
-        scene.rotation.x = 0.10 * Math.sin(time * 0.037 + 0.7)
-            + 0.05 * Math.sin(time * 0.011);
-        scene.rotation.z = 0.05 * Math.sin(time * 0.029 + 2.1);
-        scene.position.x = 0.10 * Math.sin(time * 0.031);
-        scene.position.y = _bob;
+        if (formIndex === 3) {
+            // Vortex: the funnel must keep facing the viewer, so no big
+            // heading wander — instead the whole scene ROLLS around the
+            // view axis (global swirl) with only a whisper of tilt.
+            scene.rotation.x = 0.06 * Math.sin(time * 0.050);
+            scene.rotation.y = 0.05 * Math.sin(time * 0.031 + 1.0);
+            scene.rotation.z = vortexSpin * 0.22;
+            scene.position.x = 0.05 * Math.sin(time * 0.031);
+            scene.position.y = _bob * 0.5;
+        } else {
+            // Heading wander: the creature holds a loose heading and lets
+            // it drift — sums of incommensurate slow sines, so it turns
+            // its attention rather than rotating on a turntable. The body
+            // also drifts a little, like something suspended in a current.
+            scene.rotation.y = 0.38 * Math.sin(time * 0.050)
+                + 0.22 * Math.sin(time * 0.023 + 1.3);
+            scene.rotation.x = 0.10 * Math.sin(time * 0.037 + 0.7)
+                + 0.05 * Math.sin(time * 0.011);
+            scene.rotation.z = 0.05 * Math.sin(time * 0.029 + 2.1);
+            scene.position.x = 0.10 * Math.sin(time * 0.031);
+            scene.position.y = _bob;
+        }
     }
 
     // Parallax: ease camera toward target offset. Z is owned by the
@@ -1225,12 +1420,20 @@ function animate() {
     // rides on top at any depth.
     camera.position.x += (parallaxTargetX - camera.position.x) * 0.04;
     camera.position.y += (parallaxTargetY - camera.position.y) * 0.04;
-    camera.position.z = CAMERA_REST_Z - (CAMERA_REST_Z - CAMERA_DIVE_Z) * dive;
-    // Look-target blend: at rest the camera studies the origin; deep in
-    // the cloud it must look FORWARD through it instead — near the
-    // origin, lookAt(0,0,0) turns tiny parallax offsets into wild
-    // rotations (the lookAt singularity).
-    camera.lookAt(0, 0, -3.5 * dive);
+    if (formIndex === 3) {
+        // Vortex: THE CAMERA NEVER MOVES — the self-similar swallow does
+        // all the traveling. It studies the hole itself.
+        camera.position.z = CAMERA_REST_Z;
+        camera.lookAt(camera.position.x * 0.35, camera.position.y * 0.35,
+            VORTEX_APEX_Z);
+    } else {
+        camera.position.z = CAMERA_REST_Z - (CAMERA_REST_Z - CAMERA_DIVE_Z) * dive;
+        // Look-target blend: at rest the camera studies the origin; deep in
+        // the cloud it must look FORWARD through it instead — near the
+        // origin, lookAt(0,0,0) turns tiny parallax offsets into wild
+        // rotations (the lookAt singularity).
+        camera.lookAt(0, 0, -3.5 * dive);
+    }
 
     // Structure changes form slowly when idle, faster when busy. "Busy"
     // is the max of an in-flight chat turn (workingState) and ambient
@@ -1376,6 +1579,94 @@ function animate() {
                 currentPositions[i].set(bp.hx * g, bp.hy * g, bp.hz * g);
             }
         }
+    } else if (formIndex === 3) {
+        // ── VORTEX: the self-similar swallow. Each wall node's depth
+        //    FLOWS (dEff advances with tunnelFlow); its distance from
+        //    the apex is L0·e^(−k·d) so the wrap is an invisible fractal
+        //    renormalization; its hue re-heats blue→red along the fall
+        //    (seeds recomputed per frame, uploaded below). A drifting
+        //    harmonic field morphs the cross-section through organic,
+        //    never-repeating shapes — the "procedurally generated
+        //    content" being consumed — swelling while a turn runs.
+        const engage = Math.min(vortexTravel / Math.max(IMMERSION_CAP, 0.001), 1.0);
+        // Idle pulsing cut to 20% (2026-07-28 tuning): at rest the hole
+        // barely breathes; the pulse returns in full with engagement or
+        // ambient drive.
+        const vPulseScale = 0.2 + 0.8 * Math.max(engage, drive);
+        const a2 = (0.10 + 0.20 * engage) * Math.sin(time * 0.110);
+        const a3 = (0.08 + 0.16 * engage) * Math.sin(time * 0.073 + 2.1);
+        const a5 = (0.05 + 0.11 * engage) * Math.sin(time * 0.047 + 0.7);
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            if (bp.kind === 2) {
+                // The shadow's embers: dim, trembling, hungrier while a
+                // request runs — the center is never static.
+                const c = _pulseShape(_fract(pulsePhase + 0.05));
+                const g = 1.0 + (0.14 * vPulseScale + 0.28 * engage) * c;
+                const tremor = 0.02 + 0.04 * engage;
+                currentPositions[i].set(
+                    bp.hx * g + tremor * CALM * Math.sin(time * 1.1 + bp.jit),
+                    bp.hy * g + tremor * CALM * Math.cos(time * 0.9 + bp.jit * 2.0),
+                    VORTEX_APEX_Z + bp.hz * g
+                        + 0.04 * CALM * Math.sin(time * 0.7 + bp.jit));
+            } else if (bp.kind === 3) {
+                // The accretion ring: the iconic slow orbit, breathing
+                // with the pulse, swelling slightly while feeding.
+                const th = bp.th0 + vortexSpin * 1.6;
+                const rr = bp.rRing
+                    * (1.0 + 0.05 * CALM * Math.sin(time * 0.5 + bp.jit)
+                        + 0.10 * engage * _pulseShape(_fract(pulsePhase)));
+                currentPositions[i].set(
+                    rr * Math.cos(th),
+                    rr * Math.sin(th) * 0.92,
+                    VORTEX_APEX_Z + bp.zJit
+                        + 0.03 * CALM * Math.sin(time * 0.8 + bp.jit));
+            } else {
+                // Stream matter: EMERGES from the hole's glow (L small,
+                // screen center) and blooms outward past the viewer —
+                // expansion optical flow = falling IN. The wrap at LMAX
+                // happens far off-screen; the respawn at LMIN hides
+                // inside the ring's glow. Hue cools as matter recedes
+                // from the hole (hottest at the center).
+                const dOut = _fract(bp.d0 + tunnelFlow * bp.flowScale);
+                const L = VORTEX_LMIN * Math.exp(VORTEX_KOUT * dOut);
+                // Spiral wind cut 4.2 → 1.2: the wind is traversed by the
+                // flow, so at busy flow rates it alone corkscrewed the
+                // whole scene ~48°/s — THIS was the "fast rotation while
+                // busy", not vortexSpin.
+                const theta = bp.theta0 + (1.0 - dOut) * 1.2
+                    + vortexSpin * (1.5 - dOut);
+                // Organic cross-section morph — the procedural content.
+                const shape = 1.0
+                    + a2 * Math.sin(2.0 * theta + dOut * 5.0)
+                    + a3 * Math.sin(3.0 * theta - dOut * 7.0)
+                    + a5 * Math.sin(5.0 * theta + dOut * 11.0);
+                // Turbulence: grains wobble off their trajectories, more
+                // while feeding, scale-relative so spawn stays calm.
+                const turb = (0.05 + 0.30 * engage)
+                    * Math.sin(time * (1.1 + bp.flowScale) + bp.jit * 3.0 + dOut * 7.0);
+                const pinch = _pulseShape(_fract(pulsePhase - dOut * 0.25));
+                const rad = L * bp.sinA * bp.rJit * shape
+                    * (1.0 - pulseAmp * 0.35 * vPulseScale * pinch)
+                    + turb * L * 0.10 * CALM;
+                currentPositions[i].set(
+                    rad * Math.cos(theta),
+                    rad * Math.sin(theta),
+                    VORTEX_APEX_Z + L * bp.cosA
+                        + turb * 0.12 * CALM
+                        + 0.05 * CALM * Math.sin(time * 0.6 + bp.jit));
+                nodeSeeds[i] = Math.max(0.02, 0.60 - dOut * 0.56) + bp.seedJit;
+            }
+        }
+        instancedMesh.geometry.attributes.aSeed.needsUpdate = true;
+    } else if (formIndex === 4) {
+        // ── EMPTY: the dispersed far sphere — static, unlinked,
+        //    invisible. (Must stay an explicit branch: the trailing
+        //    else belongs to cortex.)
+        for (let i = 0; i < NODE_COUNT; i++) {
+            const bp = basePositions[i];
+            currentPositions[i].set(bp.hx, bp.hy, bp.hz);
+        }
     } else {
         // ── SYNTHETIC CORTEX: thought-waves swell the lobes in
         //    sequence; dendrites carry displacement signal-trains.
@@ -1439,7 +1730,10 @@ function animate() {
     // up with the dive forms more links exactly when the viewer is in
     // the middle of them (the O(n²) distances are computed either way;
     // this only accepts more pairs, bounded by MAX_LINES).
-    const proximitySq = PROXIMITY_SQ * (1.0 + dive * 0.15);
+    // The vortex reads best DENSE — a 1.5× link-radius² multiplier weaves
+    // the funnel membrane much tighter (operator: "a bit more dense").
+    const proximitySq = PROXIMITY_SQ * (1.0 + dive * 0.15)
+        * (formIndex === 3 ? 1.5 : 1.0);
 
     for (let i = 0; i < NODE_COUNT; i++) {
         for (let j = i + 1; j < NODE_COUNT; j++) {
@@ -1514,35 +1808,48 @@ function animate() {
     hueDrift = 0.07 * Math.sin(huePhase);
 
     // Per-form center dimming: horizon's core region is by far the
-    // densest additive pile-up; the other forms get a mild version.
-    const centerDim = formIndex === 1 ? 0.85 : 0.30;
+    // densest additive pile-up; the vortex dims by SCREEN-radial
+    // distance (its hot zone sits on the view axis at depth) and damps
+    // the hue wave/drift so its center stays anchored DARK RED instead
+    // of swinging through the plum stop ("bright purple" report).
+    const centerDim = formIndex === 1 || formIndex === 3 ? 0.85 : 0.30;
+    const centerXY = formIndex === 3 ? 1.0 : 0.0;
+    const waveAmp = formIndex === 3 ? 0.3 : 1.0;
+    const hueDriftOut = hueDrift * (formIndex === 3 ? 0.3 : 1.0);
 
     const nUniforms = instancedMesh.material.uniforms;
     nUniforms.uTime.value = time;
     nUniforms.uCenterDim.value = centerDim;
+    nUniforms.uCenterXY.value = centerXY;
+    nUniforms.uWaveAmp.value = waveAmp;
     nUniforms.uWorkingState.value = workingState;
     nUniforms.uErrorState.value = errorState;
     nUniforms.uPulseT.value = pulseT;
     nUniforms.uAudioLevel.value = audioLevel;
     nUniforms.uAccentStrength.value = accentStrength;
-    nUniforms.uHueDrift.value = hueDrift;
+    nUniforms.uHueDrift.value = hueDriftOut;
 
     const lUniforms = lineMaterial.uniforms;
     lUniforms.uTime.value = time;
     lUniforms.uCenterDim.value = centerDim;
+    lUniforms.uCenterXY.value = centerXY;
+    lUniforms.uWaveAmp.value = waveAmp;
     lUniforms.uWorkingState.value = workingState;
     lUniforms.uErrorState.value = errorState;
     lUniforms.uPulseT.value = pulseT;
     lUniforms.uAccentStrength.value = accentStrength;
-    lUniforms.uHueDrift.value = hueDrift;
+    lUniforms.uHueDrift.value = hueDriftOut;
     lUniforms.uDive.value = dive;
 
-    // Interior motes: only rendered while actually diving.
-    motesMesh.visible = dive > 0.01;
+    // Interior motes: only rendered while actually diving — and never
+    // for the empty form (a dive there would summon motes out of a
+    // deliberately blank screen).
+    motesMesh.visible = dive > 0.01 && formIndex !== 4;
     if (motesMesh.visible) {
         motesMaterial.uniforms.uTime.value = time;
         motesMaterial.uniforms.uDive.value = dive;
-        motesMaterial.uniforms.uHueDrift.value = hueDrift;
+        motesMaterial.uniforms.uHueDrift.value = hueDriftOut;
+        motesMaterial.uniforms.uWaveAmp.value = waveAmp;
     }
 
     // Bloom breathes with the envelope. The old formula added

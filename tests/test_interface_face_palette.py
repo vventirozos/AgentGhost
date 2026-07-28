@@ -70,8 +70,10 @@ def test_alien_forms_present(graph_js):
     strand waves, hot core, flinch — and a header button cycles them."""
     assert "_pulseShape" in graph_js
     assert "kind: 0" in graph_js and "kind: 1" in graph_js and "kind: 2" in graph_js
-    for builder in ("_buildAbyssal", "_buildHorizon", "_buildCortex"):
+    for builder in ("_buildAbyssal", "_buildHorizon", "_buildCortex",
+                    "_buildVortex", "_buildEmpty"):
         assert builder in graph_js, f"missing {builder}"
+    assert "'empty'" in graph_js, "empty form missing from the cycle"
     assert "export function cycleForm" in graph_js
     assert "export function setForm" in graph_js
     assert "ghost_face_form" in graph_js, "form choice must persist"
@@ -80,6 +82,45 @@ def test_alien_forms_present(graph_js):
     assert "if (x < 0.16)" in graph_js and "if (x < 0.62)" in graph_js
     # Uniform-random scatter must not come back.
     assert "Uniform spherical distribution" not in graph_js
+
+
+def test_vortex_self_similar_swallow(graph_js):
+    """Vortex v3 (operator direction): the main animation is the SWALLOW,
+    not the spin. The cone is exponentially self-similar so the conveyor
+    wrap is an infinite fractal zoom; the CAMERA NEVER MOVES — busy and
+    idle are the same scene at different intensities, so completion is a
+    pure morph (no reset, no ascent, no cut — both earlier resets were
+    vetoed). In-falling matter morphs through a drifting harmonic field
+    (the procedurally generated content being consumed)."""
+    assert "vortexTravel" in graph_js
+    assert "tunnelFlow" in graph_js, "wall-flow accumulator missing"
+    assert "_fract(bp.d0 + tunnelFlow" in graph_js, "flowing depth missing"
+    # v4: EXPANSION flow — matter emerges at the hole and blooms OUTWARD
+    # past the viewer (contraction read as moving backward). Black-hole
+    # iconography restored: accretion ring (kind 3) + shadow embers.
+    assert "Math.exp(VORTEX_KOUT * dOut)" in graph_js, \
+        "exponential expansion (the self-similarity) missing"
+    assert "kind: 3" in graph_js, "accretion ring missing"
+    # The center stays DARK RED: damped hue wave/drift + screen-radial dim.
+    assert "uWaveAmp" in graph_js
+    assert "uCenterXY" in graph_js
+    # The camera must never travel in this form.
+    assert "camera.position.z = CAMERA_REST_Z;" in graph_js
+    assert "vortexTravel * 7.4" not in graph_js, "camera travel must stay dead"
+    assert "vortexExiting" not in graph_js, "cut-on-black must stay dead"
+    assert "1.42" not in graph_js, "cut threshold must stay dead"
+    # Procedural shape field: three incommensurate harmonics.
+    for coeff in ("a2", "a3", "a5"):
+        assert f"{coeff} = " in graph_js, f"harmonic {coeff} missing"
+    # The swallow dominates; busy HALVES the spin (2026-07-28 tuning:
+    # idle +25%, busy −50%, idle pulse cut to 20%).
+    assert "0.19 * travelNorm" in graph_js, "flow surge missing"
+    assert "0.125" in graph_js and "- 0.050 * Math.max(workingState" in graph_js, \
+        "spin tuning missing"
+    assert "vPulseScale = 0.2 + 0.8 * Math.max(engage, drive)" in graph_js, \
+        "idle pulse damping missing"
+    # Denser membrane: vortex-only link-radius multiplier.
+    assert "formIndex === 3 ? 1.5 : 1.0" in graph_js
 
 
 def test_form_button_wired(graph_js):

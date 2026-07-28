@@ -1,4 +1,4 @@
-import * as matrixGraphFace from './matrix_graph.js?v=5.3';
+import * as matrixGraphFace from './matrix_graph.js?v=6.3';
 
 // --- Voice Globals ---
 let isTTSActive = false;
@@ -720,6 +720,10 @@ function decorateCodeBlocks(root) {
 
         const lang = langClass ? langClass.replace('language-', '') : 'text';
 
+        // Header carries only the language badge; the ACTION buttons
+        // (copy, expand) live in a footer bar at the BOTTOM of the block
+        // (operator request) — which also keeps them reachable while the
+        // collapsed window is scrolled.
         const header = document.createElement('div');
         header.className = 'code-header';
 
@@ -727,6 +731,9 @@ function decorateCodeBlocks(root) {
         badge.className = 'code-lang';
         badge.textContent = lang;
         header.appendChild(badge);
+
+        const footer = document.createElement('div');
+        footer.className = 'code-footer';
 
         const copyBtn = document.createElement('button');
         copyBtn.className = 'code-copy';
@@ -746,12 +753,13 @@ function decorateCodeBlocks(root) {
                 setTimeout(() => { copyBtn.textContent = 'Copy'; }, 1400);
             }
         });
-        header.appendChild(copyBtn);
+        footer.appendChild(copyBtn);
 
-        // Long outputs collapse to a scannable height with an explicit
-        // expander — a 300-line tool dump otherwise owns the whole
-        // scrollback. Threshold is generous so ordinary snippets never
-        // collapse. (Streaming rebuilds reset to collapsed; the final
+        // Long outputs render as a fixed-height window that SCROLLS
+        // internally (right-hand scrollbar) — the old version clipped the
+        // overflow entirely until expanded. The expander still toggles to
+        // full inline height. Threshold is generous so ordinary snippets
+        // never shrink. (Streaming rebuilds reset to collapsed; the final
         // decorate pass after the stream settles it.)
         const lineCount = (code.textContent.match(/\n/g) || []).length + 1;
         if (lineCount > 34) {
@@ -764,10 +772,11 @@ function decorateCodeBlocks(root) {
                 const collapsed = pre.classList.toggle('code-collapsed');
                 expand.textContent = collapsed ? `Expand · ${lineCount} lines` : 'Collapse';
             });
-            header.appendChild(expand);
+            footer.appendChild(expand);
         }
 
         pre.insertBefore(header, pre.firstChild);
+        pre.appendChild(footer);
     });
 }
 
@@ -2865,6 +2874,6 @@ window.GhostCore = {
     toggleLogConsole: () => { if (logsBtn) logsBtn.click(); },
 };
 
-import('./workspace.js?v=5.3').catch(e =>
+import('./workspace.js?v=6.3').catch(e =>
     console.warn('[Ghost] workspace modules failed to load — core chat still works:', e));
 

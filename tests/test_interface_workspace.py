@@ -96,6 +96,13 @@ def test_long_code_collapses_with_expander():
     js = _read("app.js")
     assert "code-collapsed" in js
     assert "code-expand" in js
+    # 2026-07-28: actions live in a BOTTOM bar and the collapsed window
+    # scrolls internally instead of clipping.
+    assert "code-footer" in js
+    css = _read("style.css")
+    block = css.split(".message pre.code-collapsed code {", 1)[1].split("}", 1)[0]
+    assert "overflow-y: auto" in block, "long code must scroll, not clip"
+    assert "code-footer" in css
 
 
 # ---------------------------------------------------------------------------

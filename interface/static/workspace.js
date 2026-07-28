@@ -12,10 +12,10 @@
 //  toasts, the per-message action menu, and the memory-correction
 //  modal.
 // ═══════════════════════════════════════════════════════════════
-import { initSessions } from './sessions.js?v=5.3';
-import { initNotifications } from './notifications.js?v=5.3';
-import { initStatus } from './status.js?v=5.3';
-import { initPalette } from './palette.js?v=5.3';
+import { initSessions } from './sessions.js?v=6.3';
+import { initNotifications } from './notifications.js?v=6.3';
+import { initStatus } from './status.js?v=6.3';
+import { initPalette } from './palette.js?v=6.3';
 
 const Core = window.GhostCore;
 

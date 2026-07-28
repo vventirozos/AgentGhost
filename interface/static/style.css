@@ -2028,23 +2028,26 @@ body.zen-mode #rail-scrim {
     background: var(--hairline);
 }
 
-/* ── Collapsible long code ─────────────────────────────────────── */
+/* ── Long code: fixed-height window with an internal scrollbar ──── */
 .message pre.decorated-code { position: relative; }
 .message pre.code-collapsed code {
     max-height: 300px;
-    overflow: hidden;
+    overflow-y: auto;             /* right-hand scrollbar, not clipping */
     display: block;
+    overscroll-behavior: contain; /* don't chain-scroll the chat log */
+    -webkit-overflow-scrolling: touch;
 }
-.message pre.code-collapsed::after {
-    content: '';
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    height: 64px;
-    background: linear-gradient(transparent, rgba(5, 3, 10, 0.92));
-    pointer-events: none;
-    border-radius: 0 0 8px 8px;
+
+/* Action bar at the BOTTOM of every decorated block — stays reachable
+   while the window above it is scrolled. */
+.message pre.decorated-code .code-footer {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-top: 1px solid rgba(123, 98, 196, 0.18);
+    background: linear-gradient(90deg, rgba(123, 98, 196, 0.06), rgba(0, 0, 0, 0.45) 60%);
 }
 .message pre.decorated-code .code-expand {
     background: none;
@@ -2054,7 +2057,6 @@ body.zen-mode #rail-scrim {
     font-family: var(--font-mono);
     font-size: 0.64rem;
     padding: 3px 9px;
-    margin-left: 8px;
     cursor: pointer;
 }
 .message pre.decorated-code .code-expand:hover {
