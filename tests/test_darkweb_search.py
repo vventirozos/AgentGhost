@@ -38,17 +38,23 @@ V3_C = "c" * 56
 
 # The real onion host of the built-in `torch` engine — used only to prove the
 # self-link filter drops an engine's own address from its result page.
-TORCH_ENGINE_HOST = "torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd"
+TORCH_ENGINE_HOST = "xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd"
 
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    """Each test starts with an empty shared search cache."""
+    """Each test starts with empty shared caches.
+
+    The form-token cache is module-level and TTL'd, so without this a test
+    that primes it would silently change how many fetches a LATER test makes
+    — order-dependent failures that look like flakes."""
     from ghost_agent.tools import search as _s
 
     _s._SEARCH_CACHE.clear()
+    dw._FORM_TOKEN_CACHE.clear()
     yield
     _s._SEARCH_CACHE.clear()
+    dw._FORM_TOKEN_CACHE.clear()
 
 
 # --------------------------------------------------------------------------
@@ -130,7 +136,7 @@ def test_engine_override_rejects_stray_placeholder(monkeypatch):
 def _fetch_stub(engine_html: dict):
     """Build an async _fetch_raw_html stub keyed on which engine the URL is."""
 
-    async def _stub(url, proxy, timeout):
+    async def _stub(url, proxy, timeout, **kwargs):
         for token, html in engine_html.items():
             if token in url:
                 return 200, html
@@ -144,7 +150,7 @@ async def test_search_merges_and_ranks_by_corroboration():
     # V3_A appears in BOTH ahmia and torch -> must rank first.
     ahmia_html = f'<a href="http://{V3_A}.onion/">Shared</a><a href="http://{V3_C}.onion/">OnlyAhmia</a>'
     torch_html = f'<a href="http://{V3_A}.onion/">Shared</a><a href="http://{V3_B}.onion/">OnlyTorch</a>'
-    stub = _fetch_stub({"ahmia.fi": ahmia_html, "juhanurmi": ahmia_html, "torchdeed": torch_html, "haystak": ""})
+    stub = _fetch_stub({"ahmia.fi": ahmia_html, "juhanurmi": ahmia_html, "xmh57jrk": torch_html, "haystak": ""})
 
     with patch.object(dw, "_fetch_raw_html", side_effect=stub):
         out = await tool_darkweb_search("drugs market", tor_proxy="socks5://127.0.0.1:9050")
@@ -166,7 +172,7 @@ async def test_slow_engine_bounded_by_deadline(monkeypatch):
     slow_html = f'<a href="http://{V3_A}.onion/">Slow</a>'
     fast_html = f'<a href="http://{V3_B}.onion/">Fast</a>'
 
-    async def _stub(url, proxy, timeout):
+    async def _stub(url, proxy, timeout, **kwargs):
         if "ahmia.fi" in url:          # make the ahmia clearnet engine hang
             await _asyncio.sleep(1.0)
             return 200, slow_html
@@ -222,7 +228,7 @@ async def test_anonymous_mode_scrubs_query():
 @pytest.mark.asyncio
 async def test_research_searches_then_fetches_and_distils():
     html = f'<a href="http://{V3_A}.onion/">Target</a>'
-    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "torchdeed": html, "haystak": html})
+    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "xmh57jrk": html, "haystak": html})
 
     llm = MagicMock()
     llm.chat_completion = AsyncMock(
@@ -296,7 +302,7 @@ async def test_ahmia_endpoints_not_double_counted():
     ahmia_onion_html = f'<a href="http://{X}.onion/">X only</a>'
     torch_html = f'<a href="http://{Y}.onion/">Y</a>'
     stub = _fetch_stub(
-        {"ahmia.fi": ahmia_html, "juhanurmi": ahmia_onion_html, "torchdeed": torch_html}
+        {"ahmia.fi": ahmia_html, "juhanurmi": ahmia_onion_html, "xmh57jrk": torch_html}
     )
 
     with patch.object(dw, "_fetch_raw_html", side_effect=stub):
@@ -314,7 +320,7 @@ async def test_engine_self_links_filtered_from_results():
         f'<a href="http://{TORCH_ENGINE_HOST}.onion/">Torch Home</a>'
         f'<a href="http://{real}.onion/">Real Result</a>'
     )
-    stub = _fetch_stub({"torchdeed": torch_html})  # only torch returns anything
+    stub = _fetch_stub({"xmh57jrk": torch_html})  # only torch returns anything
 
     with patch.object(dw, "_fetch_raw_html", side_effect=stub):
         out = await tool_darkweb_search("q", tor_proxy="socks5://127.0.0.1:9050")
@@ -366,7 +372,7 @@ async def test_research_fetch_receives_socks5h_proxy():
     """The onion PAGE fetch honours the passed proxy (normalised to socks5h),
     rather than discarding it the way helper_fetch_url_content would."""
     html = f'<a href="http://{V3_A}.onion/">Target</a>'
-    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "torchdeed": html})
+    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "xmh57jrk": html})
 
     with patch.object(dw, "_fetch_raw_html", side_effect=stub):
         with patch.object(dw, "_fetch_onion_text", new_callable=AsyncMock, return_value="body") as mfetch:
@@ -380,7 +386,7 @@ async def test_research_fetch_receives_socks5h_proxy():
 @pytest.mark.asyncio
 async def test_research_uses_cache():
     html = f'<a href="http://{V3_A}.onion/">Target</a>'
-    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "torchdeed": html})
+    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "xmh57jrk": html})
     llm = MagicMock()
     llm.chat_completion = AsyncMock(
         return_value={"choices": [{"message": {"content": "Fact."}}]}
@@ -402,7 +408,7 @@ async def test_small_max_context_bounds_extract():
     """A tiny worker context window shrinks the per-source extract well below
     the 40k-char default, so the distill call can't overflow it."""
     html = f'<a href="http://{V3_A}.onion/">Target</a>'
-    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "torchdeed": html})
+    stub = _fetch_stub({"ahmia.fi": html, "juhanurmi": html, "xmh57jrk": html})
     huge = "Z" * 200000
 
     captured = {}

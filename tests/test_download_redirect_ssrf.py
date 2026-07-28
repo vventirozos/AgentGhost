@@ -119,6 +119,97 @@ async def test_download_bounds_redirect_loop(tmp_path):
         assert "too many redirects" in res.lower()
 
 
+# --------------------------------------------- curl_cffi ASYNC download path
+# (2026-07-29 sibling of the helper_fetch async-drain fix.) AsyncSession
+# streaming responses need the ASYNC close — quit_now.set() + await aclose();
+# the sync close() reaps stream_task, which async responses never set, so the
+# old code silently left every hop / reject / overflow transfer running.
+
+
+def _curl_async_module(responses):
+    """Fake `curl_requests` module whose AsyncSession.get() serves `responses`
+    in order (last one repeats)."""
+    import types
+    seq = list(responses)
+
+    class _Session:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, *a, **k):
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+    return types.SimpleNamespace(AsyncSession=_Session)
+
+
+@pytest.mark.asyncio
+async def test_curl_download_redirect_hop_uses_async_close(tmp_path):
+    from tests.conftest import make_streaming_resp
+
+    hop = make_streaming_resp(302, "")
+    hop.headers = {"location": "http://cdn.example/real"}
+    final = make_streaming_resp(200, "abcdef", content_type="application/octet-stream")
+    fake = _curl_async_module([hop, final])
+
+    with patch("ghost_agent.tools.file_system.curl_requests", fake):
+        res = await tool_download_file("http://start.example/x", tmp_path, None, "out.bin")
+
+    assert "SUCCESS" in res
+    assert (tmp_path / "out.bin").read_bytes() == b"abcdef"
+    hop.quit_now.set.assert_called()
+    assert hop.aclose.await_count >= 1
+    assert final.aclose.await_count >= 1  # closed after drain too
+
+
+@pytest.mark.asyncio
+async def test_curl_download_non200_aborts_transfer(tmp_path):
+    from tests.conftest import make_streaming_resp
+
+    resp = make_streaming_resp(404, "not here")
+    fake = _curl_async_module([resp])
+
+    with patch("ghost_agent.tools.file_system.curl_requests", fake):
+        res = await tool_download_file("http://start.example/x", tmp_path, None, "out.bin")
+
+    assert "Error 404" in res
+    resp.quit_now.set.assert_called()
+    assert resp.aclose.await_count >= 1
+    resp.aiter_content.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_curl_download_overflow_break_aborts_transfer(tmp_path):
+    """A chunked >50MB body (no Content-Length) must stop at the cap AND abort
+    the still-live transfer, not stream on until session teardown."""
+    from tests.conftest import make_streaming_resp
+
+    consumed = {"n": 0}
+
+    async def _endless():
+        for _ in range(64):
+            consumed["n"] += 1
+            yield b"x" * (8 * 1024 * 1024)
+
+    resp = make_streaming_resp(200, "", content_type="application/octet-stream")
+    resp.aiter_content = MagicMock(side_effect=_endless)
+    fake = _curl_async_module([resp])
+
+    with patch("ghost_agent.tools.file_system.curl_requests", fake):
+        res = await tool_download_file("http://start.example/x", tmp_path, None, "out.bin")
+
+    assert "50MB cap" in res
+    assert not (tmp_path / "out.bin").exists()  # partial file removed
+    assert consumed["n"] <= 8  # stopped at the cap, not all 64 chunks
+    resp.quit_now.set.assert_called()
+    assert resp.aclose.await_count >= 1
+
+
 # --------------------------------------------- onion body-cap (streaming)
 
 

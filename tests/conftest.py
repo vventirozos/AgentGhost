@@ -196,11 +196,20 @@ def mock_context(temp_dirs, mock_llm):
 # --------------------------------------------------------------------------
 def make_streaming_resp(status=200, body="", content_type="text/html",
                         content_length=None, encoding="utf-8"):
-    """MagicMock HTTP response usable by BOTH fetch paths:
-    * curl_cffi:  awaited get(stream=True) → resp.iter_content() (sync), .close()
-    * httpx:      client.stream(...) async-ctx → resp.aiter_bytes() (async)
+    """MagicMock HTTP response usable by ALL fetch paths:
+    * curl_cffi AsyncSession: awaited get(stream=True) → resp.aiter_content()
+      (async), quit_now.set() + await resp.aclose(). The real object's SYNC
+      iter_content() returns unawaited asyncio Queue.get() coroutines — async
+      callers must never touch it (that exact miswiring broke every live
+      fetch on 2026-07-28 while this mock's sync iter_content kept tests
+      green).
+    * httpx:  client.stream(...) async-ctx → resp.aiter_bytes() (async)
+    The SYNC iter_content is a TRIPWIRE, not a working drain: no async fetch
+    path may ever call it, and sync-Session tests (darkweb) build their own
+    response objects. A bytes-returning sync mock here is what kept the suite
+    green through the 2026-07-28 breakage.
     """
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, AsyncMock
     raw = body.encode(encoding) if isinstance(body, str) else body
     headers = {"content-type": content_type}
     if content_length is not None:
@@ -211,12 +220,21 @@ def make_streaming_resp(status=200, body="", content_type="text/html",
     resp.headers = headers
     resp.encoding = encoding
     resp.text = body
-    resp.iter_content = MagicMock(return_value=[raw])
+    resp.iter_content = MagicMock(side_effect=AssertionError(
+        "sync iter_content() called on a streaming-response mock — on a real "
+        "AsyncSession response this returns unawaited Queue.get() coroutines; "
+        "async fetch paths must drain via aiter_content()/aiter_bytes()"))
     resp.close = MagicMock()
 
     async def _aiter():
         yield raw
     resp.aiter_bytes = MagicMock(side_effect=_aiter)
+
+    async def _aiter_content():
+        yield raw
+    resp.aiter_content = MagicMock(side_effect=_aiter_content)
+    resp.aclose = AsyncMock()
+    resp.quit_now = MagicMock()
     return resp
 
 

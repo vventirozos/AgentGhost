@@ -1167,6 +1167,134 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-29 — Ahmia was never JS-only: a followed 302 + a one-word health check = a confidently wrong diagnosis
+
+Operator pasted a request log where `darkweb_search` returned ZERO results twice (burning a strike and 83 s)
+while every Ahmia attempt logged *"HTTP 200 but 0 parseable results — engine serves a JS-only page (no non-JS
+results; set GHOST_ONION_ENGINES to a working engine)"*. That message was wrong, and it had been wrong since
+the 2026-07-26b bug hunt wrote it into the code AND these docs.
+
+**What is actually true (measured live, clearnet + onion):** Ahmia gates its search endpoint behind a hidden
+form field. `/search/?q=…` **302-redirects to `/`** unless the query string also carries
+`<input type="hidden" name="2e636d" value="e36dd8">` scraped from its search form. Not Tor-, exit-, UA-,
+cookie-, or referer-dependent — purely the missing parameter. With it: 200, ~1.1 MB, ~2900 onion links.
+
+**Why the wrong diagnosis was so convincing.** Two independent weaknesses lined up. (1) `_fetch_raw_html`
+follows redirects, so status alone can't tell you the body came from the URL you asked for — a dead endpoint
+that 302s to a live homepage looks exactly like a live endpoint serving an unparseable page. (2) The empty-body
+branch tested for the bare substring `"javascript"`, which nearly every page contains; Ahmia's homepage carries
+a `display:none` notice reading *"we have not deployd non-JavaScript version of Ahmia yet"* aimed at
+non-Tor-Browser visitors. The 07-26b hunt's own evidence — "live-confirmed a 4727-byte page with zero result
+links" — is the homepage byte-for-byte. It never looked at the redirect chain.
+
+**Fix.** Engine entries may declare `form_token_from`; both Ahmia entries do. `_form_token` scrapes the pair
+(`_parse_form_token`, preferring a search-looking form so an unrelated CSRF field can't be mistaken for it),
+caches it 30 min, fails OPEN, and runs under a tighter 12 s budget than the search since it spends the same
+per-engine deadline. The token is stateless (no cookie), which is what makes cross-circuit caching sound; it is
+scraped rather than hard-coded because rotation is the whole point of such a token, and a still-redirected
+query drops the cached pair so the retry re-scrapes. `_fetch_raw_html` gained a `meta` out-param carrying
+`final_url`, and `_diagnose_empty_body` ranks explanations most-specific-first: redirected-away → an explicit
+needs-JavaScript sentence (`_JS_ONLY_RE`, anchored phrasing, no bare word, and deliberately NOT plain
+`<noscript>` — working pages wrap analytics pixels in one) → parser drift. **The ordering is the fix**: the
+signals are not exclusive, and a page we were redirected *to* also contains whatever notices its author wrote.
+Redirect messages name the path only, never the full onion address (operator monitors this stream).
+
+**TWO REVIEW AGENTS CAUGHT THAT THE FIRST FIX DIDN'T ACTUALLY KILL THE BUG — it relocated it.** Both
+independently found, and I then verified against a live page, that Ahmia's no-JS banner lives in its
+**site-wide template**, not just the homepage. So a healthy ZERO-HIT search (token accepted, no redirect,
+engine fine) still matched the JS wording and still told the operator to swap the engine. Three defects behind
+it: (a) NO branch existed for the most common cause — the query simply had no matches; (b) the wording test was
+**polarity-blind**, matching "works without JavaScript" and "No JavaScript required", i.e. exactly the boasts
+privacy-focused onion engines put in their footers — the false positive aimed at the population being scanned;
+(c) the sentence was allowed to carry a conclusion it can't support alone. Now: a `no-hits` branch
+(`_NO_HITS_RE`) ranked above js-only, polarity-correct patterns, and js-only additionally requires the body to
+be under 32 KB (a real JS-only page is a SHELL; Ahmia's results page is 1.1 MB). Live-verified: a real zero-hit
+Ahmia page now diagnoses `no-hits`, not "swap engines". **Lesson: tightening a heuristic ≠ bounding what it is
+allowed to conclude.** Also from the same review: `_redirected_away` over-fired on www-stripping/default-port/
+case (each false positive evicts a good token AND buys a wasted retry every query) → host normalisation; token
+eviction now gated on having actually SENT a token and on attempt 0; `_apply_form_token` puts the token before
+any `#fragment` (after one it is never sent) and skips a name already in the query (a duplicate `q=` would make
+frameworks taking the LAST value search for nothing — which reads as "no hits", so it would never be
+invalidated); redirect messages now name host+path, not path alone (a foreign host and this site's homepage
+need different responses; onion hosts are scrubbed by the log redactor anyway); and the per-engine deadline is
+extended by the token budget for token engines, since 12s token + 30s search = 42s > the 38s deadline would
+have guillotined cold-cache searches about to succeed.
+
+**Token behaviour, measured rather than assumed:** the pair ROTATES (it changed mid-session, 2e636d/e36dd8 →
+3d0920/2ae6a6) — so hard-coding it would have broken within hours, and scraping was load-bearing, not
+defensive. Old pairs keep working for at least hours, which is what makes a 30-min cache safe. Ahmia validates
+the exact name AND value: `&foo=bar` and `&3d0920=wrongvalue` both still 302, only the real pair returns
+results. The pair is site-wide and identical across cookie jars, transports and circuits, so it is NOT a
+per-visitor correlator — it does not link the per-query Tor identities anonymous mode creates.
+
+**Self-review caught one more (the 07-27 lesson again):** the first cut cached the token result unconditionally,
+so a Tor blip on the homepage fetch would be remembered as "this engine needs no token" for the full 30 min TTL
+— one transient failure stranding Ahmia on the un-tokened path, i.e. 30 minutes of zero results, the exact
+failure the token exists to end. Now only a SUCCESSFUL read is cached; non-200/timeout returns None uncached
+and logs it. Never record a failed measurement as a neutral value.
+
+**Live-validated:** the exact query from the operator's log — "anonymous communications" — went 0 → **354
+results** through the real `_query_engine` over Tor; `ahmia-onion` returned 932 on a second query. Full suite green. New: `tests/test_darkweb_form_token.py`
+(21 tests, incl. the ordering regression: redirected + no-JS notice must report the redirect). Docs:
+`tools/darkweb_search.html`, including a correction notice on the 07-26b section rather than a silent rewrite.
+
+**Generalisable:** check the redirect chain before believing an engine-health diagnosis, and never anchor a
+health check on a substring ordinary pages contain. Also — the log line that pointed at the wrong fix was
+itself the artifact of a previous "improve the diagnostics" pass, so a confident diagnostic is not evidence.
+
+### 2026-07-29 (later) — Torch wasn't dead either, it had MOVED: engine survey, 1 index → 3
+
+Operator: "is there any alternative to torch? i don't wanna leave it with just ahmia." Torch had been burning
+the full 38s deadline on every search while contributing nothing. Probed the configured `torchdeed…` address
+across fresh circuits: **0/10, every one a 30s timeout** — the haystak signature. But the service is ALIVE at
+`xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion` under its **Xapian Omega CGI path**
+`/cgi-bin/omega/omega?P={q}`. The old `/search?query=` path 404s *there* — so at the right address with the
+wrong path it would STILL have looked dead. That is the second "looks dead, actually moved" in one day.
+`&HITSPERPAGE=100` takes one page from 7 unique onions to 28 (parser de-dupes by host). Measured 4/4 at
+1.6-6.6s — now the FASTEST engine in the set.
+
+Added **torgle** (`no6m4wz…onion/search.php?term={q}`, 4/4, 19-20 results, 9-25s) as a third INDEPENDENT index
+— its value isn't size, it's that corroboration ranking had nothing left to corroborate against once torch
+died. Measured and rejected: tordex 1/6 (one 86-result hit, else timeout — too flaky to pay a deadline for),
+haystak/onionland/tor66 0/2 timeout, phobos 0/2 SOCKS-no-descriptor. Rejected addresses are recorded in a
+comment beside the registry so the next person re-measures instead of re-discovering.
+
+Every candidate was measured with THIS MODULE's own `_fetch_raw_html` + `_parse_onion_results` +
+`_diagnose_empty_body` over live Tor on rotated circuits — a directory page claiming an engine is up is not
+evidence that our fetch and our parser can get results out of it. Net: 1 live index → 3, and a typical search
+went from **38s (dominated by torch's timeout) to 17-28s**. Live: 'anonymous communications' 17.3s with
+ahmia+ahmia-onion+torch+torgle all answering. Docs: engine-survey table in tools/darkweb_search.html.
+
+### 2026-07-29 — Web reading was DEAD: sync drain on curl_cffi AsyncSession (+ download-tool siblings)
+
+Operator pasted a single live-log line — `RuntimeWarning: coroutine 'Queue.get' was never awaited` at
+helpers.py:325 — that turned out to be the only visible symptom of every page fetch failing. Root cause: the
+2026-07-26 streaming-cap rework in `helper_fetch_url_content` copied the sync drain pattern from the darkweb
+sibling (`_fetch_raw_html`, correctly sync `Session` in a thread) onto the **Async**Session path. AsyncSession
+responses stream through an `asyncio.Queue`, so the sync `iter_content()` yields unawaited `Queue.get()`
+coroutines → `buf.extend(coroutine)` → TypeError → every 200 fetch returned "Error reading <url>: can't
+extend bytearray with coroutine", burned 3 circuit-rotation retries each, and downstream summarize/distill
+stages processed error strings as page content. The warning fires ONCE per process (per-location dedup) and
+points at the except handler where GC destroys the coroutine — not at the bug. Live-verified broken before /
+fixed after (real fetch via Tor returns page text, `-W error::RuntimeWarning` clean).
+
+Fix: `_drain_curl` (aiter_content + byte cap) with shared `aclose_curl_response()` — `quit_now.set()` FIRST
+(write callback then returns CURL_WRITEFUNC_ERROR, aborting the transfer) then `await aclose()`; the sync
+`close()` is a silent no-op on async responses (reaps `stream_task`, never set — they set `astream_task`).
+
+Post-fix fresh-agent review of my own edits (the 07-27 lesson, again productive): fetch helper verdict clean,
+but the SAME defect class was live in `tool_download_file`'s curl branch — (1) sync `close()` on every
+redirect hop, (2) non-200 branch slept 5 s for NEWNYM while the abandoned transfer pumped into the unbounded
+response queue in RAM, (3) the >50 MB overflow break never aborted the stream. All three now route through
+`aclose_curl_response()` (hops, SSRF-reject, non-200/oversize, `finally` around the write loop).
+
+WHY TESTS WERE GREEN: the shared `make_streaming_resp` mock gave every response a bytes-returning sync
+`iter_content` — a faithful mock of the WRONG class. It now models the async surface (aiter_content/aclose/
+quit_now) and its sync `iter_content` is a TRIPWIRE (raises), so a sync-drain regression on any async path
+fails loudly. New regression tests: helpers (sync-drain tripwire, cap-abort ordering quit_now→aclose,
+reject-branch abort) + download (hop close, non-200 abort, overflow abort). Full suite 9700 green. Docs:
+tools/search.html + tools/file_system.html. DEPLOYED (supervisor restart).
+
 ### 2026-07-27 (later 14) — uncertainty_pressure de-zeroed (ordering bug) + feature-health verdicts made honest
 
 Follow-up to the operator's learning-report evaluation: the two real to-dos it surfaced.

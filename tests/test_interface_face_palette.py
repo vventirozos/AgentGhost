@@ -104,6 +104,10 @@ def test_vortex_self_similar_swallow(graph_js):
     # The center stays DARK RED: damped hue wave/drift + screen-radial dim.
     assert "uWaveAmp" in graph_js
     assert "uCenterXY" in graph_js
+    # Background-blend luminance: EVERY form emits ~half the light
+    # (introduced for vortex, extended to all faces same day).
+    assert "uFormDim" in graph_js
+    assert "formDim = 0.55" in graph_js
     # The camera must never travel in this form.
     assert "camera.position.z = CAMERA_REST_Z;" in graph_js
     assert "vortexTravel * 7.4" not in graph_js, "camera travel must stay dead"
@@ -112,13 +116,16 @@ def test_vortex_self_similar_swallow(graph_js):
     # Procedural shape field: three incommensurate harmonics.
     for coeff in ("a2", "a3", "a5"):
         assert f"{coeff} = " in graph_js, f"harmonic {coeff} missing"
-    # The swallow dominates; busy HALVES the spin (2026-07-28 tuning:
-    # idle +25%, busy −50%, idle pulse cut to 20%).
+    # Final motion contract (2026-07-28): idle = drift + slight rotation
+    # with NO pulse; busy = flow surge + moderate spin acceleration with
+    # a slight (35%) pulse riding the feeding gulps.
     assert "0.19 * travelNorm" in graph_js, "flow surge missing"
-    assert "0.125" in graph_js and "- 0.050 * Math.max(workingState" in graph_js, \
-        "spin tuning missing"
-    assert "vPulseScale = 0.2 + 0.8 * Math.max(engage, drive)" in graph_js, \
-        "idle pulse damping missing"
+    assert "0.125" in graph_js and "+ 0.025 * Math.max(workingState" in graph_js, \
+        "busy spin must accelerate only GENTLY (three 'too fast' reports)"
+    assert "(1.0 - dOut) * 0.35" in graph_js, \
+        "spiral wind must stay near-nothing — flow multiplies it into rotation"
+    assert "vPulseScale = 0.35 * Math.max(engage, drive)" in graph_js, \
+        "idle pulse must be OFF (busy-only slight pulse)"
     # Denser membrane: vortex-only link-radius multiplier.
     assert "formIndex === 3 ? 1.5 : 1.0" in graph_js
 

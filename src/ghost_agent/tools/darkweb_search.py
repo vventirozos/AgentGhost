@@ -91,26 +91,60 @@ _ONION_RE = re.compile(
 # Ahmia also filters known-abuse material at the index level — useful as a
 # sane primary even in the personal/experimental posture this tool is built
 # for.
+#
+# ``form_token_from`` (optional) names a page whose search FORM carries a
+# hidden input that must ride the query string — see `_form_token`. Ahmia
+# added one (measured 2026-07-28): without it `/search/?q=…` 302-redirects to
+# `/` and serves the homepage, which parses to zero results.
 _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
-    {"name": "ahmia", "url": "https://ahmia.fi/search/?q={q}", "index": "ahmia"},
+    {
+        "name": "ahmia",
+        "url": "https://ahmia.fi/search/?q={q}",
+        "index": "ahmia",
+        "form_token_from": "https://ahmia.fi/",
+    },
     {
         "name": "ahmia-onion",
         "url": "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/search/?q={q}",
         "index": "ahmia",
+        "form_token_from": "http://juhanurmihxlp77nkq76byazcldy2hlmovfu2epvl5ankdibsot4csyd.onion/",
     },
     {
+        # Torch, re-pointed 2026-07-29. The previous `torchdeed…` address was
+        # dead (0/10 across fresh circuits, every one a 30s timeout — the same
+        # signature that got haystak dropped), which cost the tool a full
+        # deadline on EVERY search. The service is alive at this address under
+        # its Xapian Omega CGI path; `/search?query=` there returns 404, so
+        # the old path would have looked dead even at the right address.
+        # HITSPERPAGE lifts one page from 7 unique onions to 28 (the parser
+        # de-dupes by host, so this is 100 hits collapsing to 28 hosts).
+        # Measured 4/4 reachable at 1.6-6.6s — the fastest engine in the set.
         "name": "torch",
-        "url": "http://torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd.onion/search?query={q}",
+        "url": "http://xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion"
+               "/cgi-bin/omega/omega?P={q}&HITSPERPAGE=100",
         "index": "torch",
     },
-    # NOTE: haystak was dropped from the DEFAULT set after live functional
-    # testing (2026-06/07): its v3 endpoint failed 0/8 across many rotated
-    # circuits (SOCKS5 connect / timeout), i.e. the hidden service itself is
-    # down, not an exit-node block — and its retry could burn a full
-    # `_ONION_TIMEOUT` on the 2nd attempt, inflating the tail latency of the
-    # whole (concurrent) call. Re-add it, or any replacement onion engine,
-    # via the GHOST_ONION_ENGINES env override once a live endpoint is known:
-    #   http://haystak5njsmn2hqkewecpaxetahtwhsbsa64jom2k22z5afxhnpxfid.onion/?q={q}
+    {
+        # Torgle — added 2026-07-29 as a third INDEPENDENT index, so
+        # corroboration ranking has something to corroborate with when torch
+        # or ahmia is having a bad day. Measured 4/4 reachable, 19-20 results,
+        # but slow (9-25s), which is why it is worth having and not worth
+        # relying on alone.
+        "name": "torgle",
+        "url": "http://no6m4wzdexe3auiupv2zwif7rm6qwxcyhslkcnzisxgeiw6pvjsgafad.onion"
+               "/search.php?term={q}",
+        "index": "torgle",
+    },
+    # Measured and REJECTED 2026-07-29, all over live Tor with this module's
+    # own fetch+parse (re-measure before believing any of these again —
+    # onion endpoints rotate constantly):
+    #   haystak   0/2  timeout   (still down; dropped 2026-06/07 for the same)
+    #   onionland 0/2  timeout
+    #   tor66     0/2  timeout
+    #   phobos    0/2  SOCKS "cannot complete" = descriptor not found
+    #   tordex    1/6  one 86-result hit, otherwise timeout — too flaky to pay
+    #             a deadline for; re-add via GHOST_ONION_ENGINES if it settles
+    #             http://tordexu73joywapk2txdr54jed4imqledpcvcuf75qsas2gwdgksvnyd.onion/search?query={q}
 ]
 
 # Per-request timeout. Onion search engines are slow — a healthy round trip
@@ -121,9 +155,65 @@ _DEFAULT_ONION_ENGINES: List[Dict[str, str]] = [
 _ONION_TIMEOUT = 30
 
 # Marker text an engine serves when its results are JS-rendered (no
-# server-side HTML to parse). Ahmia's non-JS notice contains this; a
-# raw-HTML fetch can never extract results from such a page.
-_JS_ONLY_MARKER = "javascript"
+# server-side HTML to parse). A raw-HTML fetch can never extract results from
+# such a page, so it is worth naming — but ONLY when the page actually says
+# so. This was a bare ``"javascript"`` substring test, which is present in
+# almost every modern page (a <script> tag, an analytics blurb, a hidden
+# "no-JS" notice meant for someone else) and produced a confidently WRONG
+# diagnosis: Ahmia's *homepage* carries a display:none non-JS warning, so
+# after a 302 bounced us there we told the operator to swap engines when the
+# real fix was one query parameter. Anchor on the sentence a page shows when
+# it genuinely needs JS, and treat a redirect-away as the better explanation
+# when both are true (see `_diagnose_empty_body`).
+# NOTE: no bare ``<noscript>`` alternative here, tempting as it is — plenty of
+# working pages wrap an analytics pixel in one, and mislabelling those would
+# just re-create this bug with a different trigger. Only an explicit sentence
+# counts, and only with the right POLARITY: privacy-focused engines — exactly
+# the population this tool scans — advertise "works without JavaScript" and
+# "No JavaScript required" in their footers, so a polarity-blind pattern turns
+# the engines most likely to WORK into the ones we declare broken. Every
+# alternative below is a demand for JS, not a mention of it.
+_JS_ONLY_RE = re.compile(
+    r"(?:please\s+)?(?:enable|activate|turn\s+on)\s+javascript"
+    r"|javascript\s+(?:must\s+be|has\s+to\s+be)\s+enabled"
+    r"|(?<!no\s)(?<!not\s)javascript\s+is\s+(?:required|disabled)"
+    r"|requires\s+javascript\s+to"
+    r"|(?:does\s+not|doesn't)\s+support\s+javascript",
+    re.IGNORECASE,
+)
+
+# A page that genuinely cannot render without JS is a SHELL: a little markup
+# and a notice. Ahmia's real results page is >1 MB and carries the same
+# JS-toggled banner in its site-wide template, so the sentence alone can never
+# carry the claim — the page also has to be small enough to plausibly contain
+# nothing but that notice. This structural check is the reliable half; the
+# wording check is the fragile half.
+_JS_SHELL_MAX_BYTES = 32 * 1024
+
+# Explicit "your query matched nothing" phrasing. This is by far the most
+# common reason a healthy engine returns an empty result set, and the old code
+# had no branch for it at all — so a normal no-hits query was reported as
+# engine breakage.
+_NO_HITS_RE = re.compile(
+    r"(?:could\s*n[o']?t|did\s+not|didn't|unable\s+to)\s+find"
+    r"|no\s+(?:results?|matches|hits)\b"
+    r"|nothing\s+(?:was\s+)?found"
+    r"|0\s+results?\s+found",
+    re.IGNORECASE,
+)
+
+# Some engines gate their search endpoint behind a hidden form field (an
+# anti-scraping token) and redirect the request away when it is missing. The
+# pair is scraped from the engine's own form and cached briefly: it is stable
+# in practice but must be re-read rather than hard-coded, since the whole
+# point of such a token is that the operator can rotate it.
+_FORM_TOKEN_TTL = 1800.0
+_FORM_TOKEN_CACHE: Dict[str, Tuple[float, Optional[Tuple[str, str]]]] = {}
+# Deliberately tighter than `_ONION_TIMEOUT`: this fetch is a small homepage
+# and it spends the SAME per-engine deadline the actual search needs, so a
+# hanging token fetch must not be able to starve the query it exists to
+# enable.
+_FORM_TOKEN_TIMEOUT = 12.0
 
 # Per-onion-page fetch ceiling during the research (deep-read) phase. Onion
 # content pages are slower still than the search engines; give them room.
@@ -165,7 +255,9 @@ def _load_engines() -> List[Dict[str, str]]:
 
     An override entry may carry an ``index`` to mark it as sharing a search
     index with another endpoint; if omitted it defaults to the entry's own
-    name (i.e. treated as an independent index)."""
+    name (i.e. treated as an independent index). It may also carry a
+    ``form_token_from`` URL if the engine gates its search endpoint behind a
+    hidden form field (see `_form_token`)."""
     raw = os.getenv("GHOST_ONION_ENGINES")
     if not raw:
         return [dict(e) for e in _DEFAULT_ONION_ENGINES]
@@ -191,7 +283,11 @@ def _load_engines() -> List[Dict[str, str]]:
                 )
                 continue
             name = str(e["name"])
-            engines.append({"name": name, "url": url, "index": str(e.get("index") or name)})
+            entry = {"name": name, "url": url, "index": str(e.get("index") or name)}
+            token_from = e.get("form_token_from")
+            if token_from:
+                entry["form_token_from"] = str(token_from)
+            engines.append(entry)
         return engines or [dict(e) for e in _DEFAULT_ONION_ENGINES]
     except Exception:
         pretty_log(
@@ -320,6 +416,247 @@ def _parse_onion_results(html: str, exclude_hosts: Optional[set] = None) -> List
     return results
 
 
+def _parse_form_token(html: str) -> Optional[Tuple[str, str]]:
+    """Extract the (name, value) of a search form's hidden anti-scraping field.
+
+    Prefers the hidden input that lives inside a form whose action looks like
+    a search endpoint, so we can't pick up an unrelated hidden field (a CSRF
+    token on a newsletter box, say). Falls back to the first hidden input on
+    the page when no form context is available. Returns ``None`` when the page
+    carries no hidden field — which is the normal case for every engine that
+    doesn't gate its endpoint, so callers must treat ``None`` as "no token
+    needed", not as an error."""
+    if not html:
+        return None
+
+    def _from_input(tag) -> Optional[Tuple[str, str]]:
+        name, value = tag.get("name"), tag.get("value")
+        # A nameless or valueless hidden input carries nothing we can send.
+        if not name or value is None:
+            return None
+        return str(name), str(value)
+
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(html, "html.parser")
+        forms = [f for f in soup.find_all("form")
+                 if "search" in (f.get("action", "") + " " + " ".join(
+                     f.get("class") or []) + " " + (f.get("id") or "")).lower()]
+        for form in forms or soup.find_all("form"):
+            for tag in form.find_all("input", attrs={"type": "hidden"}):
+                found = _from_input(tag)
+                if found:
+                    return found
+        for tag in soup.find_all("input", attrs={"type": "hidden"}):
+            found = _from_input(tag)
+            if found:
+                return found
+        return None
+    except Exception:
+        # BeautifulSoup unavailable or blew up — regex fallback, attribute
+        # order agnostic (name may precede or follow value).
+        for m in re.finditer(r"<input[^>]*type=[\"']hidden[\"'][^>]*>", html, re.I):
+            tag = m.group(0)
+            name = re.search(r"name=[\"']([^\"']+)[\"']", tag, re.I)
+            value = re.search(r"value=[\"']([^\"']*)[\"']", tag, re.I)
+            if name and value:
+                return name.group(1), value.group(1)
+        return None
+
+
+async def _form_token(token_url: str, proxy: Optional[str],
+                      label: str = "engine") -> Optional[Tuple[str, str]]:
+    """Fetch and cache the hidden form token an engine requires, or ``None``.
+
+    Ahmia (measured live 2026-07-28) 302-redirects ``/search/?q=…`` to ``/``
+    unless the query string also carries the hidden field from its search
+    form; with it, the same endpoint returns a full results page. The token is
+    stateless — no cookie or session is involved — so a scraped pair can be
+    reused across circuits and requests, which is what makes caching it sound.
+
+    Fails OPEN: on any error the engine is queried without a token, i.e.
+    exactly the pre-token behaviour.
+
+    ONLY a successful read is cached. A ``None`` from a page we actually
+    fetched means "this engine needs no token" and is worth remembering; a
+    ``None`` because Tor timed out means nothing, and caching it would take a
+    transient blip and turn it into 30 minutes of an engine silently querying
+    without the token it requires — i.e. 30 minutes of zero results, which is
+    the very failure this function exists to end. Same discipline as the rest
+    of the project: never record a failed measurement as a neutral value."""
+    now = time.monotonic()
+    cached = _FORM_TOKEN_CACHE.get(token_url)
+    if cached and (now - cached[0]) < _FORM_TOKEN_TTL:
+        return cached[1]
+    try:
+        status, body = await _fetch_raw_html(token_url, proxy, _FORM_TOKEN_TIMEOUT)
+    except Exception as exc:  # noqa: BLE001
+        status, body = None, ""
+        pretty_log(
+            "Darkweb Engine Token",
+            f"{label}: could not read the search-form token "
+            f"({type(exc).__name__}) — querying without it",
+            level="WARNING", icon=Icons.WARN,
+        )
+    if status != 200 or not body:
+        if status is not None:
+            pretty_log(
+                "Darkweb Engine Token",
+                f"{label}: search-form page returned {status} — querying "
+                "without a token (not cached; will retry)",
+                level="WARNING", icon=Icons.WARN,
+            )
+        return None
+    token = _parse_form_token(body)
+    _FORM_TOKEN_CACHE[token_url] = (now, token)
+    return token
+
+
+def _invalidate_form_token(token_url: str) -> None:
+    """Drop a cached token so the next attempt re-scrapes it.
+
+    Called when a query still gets redirected away: the most likely cause is
+    that the engine rotated the token under us, and a fresh scrape on the next
+    (already circuit-rotated) attempt is the self-heal."""
+    _FORM_TOKEN_CACHE.pop(token_url, None)
+
+
+def _apply_form_token(url: str, token: Optional[Tuple[str, str]]) -> str:
+    """Append a scraped hidden form field to an already-built query URL.
+
+    Two guards, both learned from how this could fail silently:
+
+    * The token goes before any ``#fragment`` — appended after one it would
+      never be sent, so the engine would keep redirecting and we would keep
+      re-scraping a token that could not possibly work.
+    * A name already present in the query is NOT appended. A hidden field
+      named like the engine's own query parameter (``q``) would otherwise be
+      appended as a duplicate, and frameworks that take the LAST value would
+      see an empty search — which looks like "no hits", never like a bad
+      token, so nothing would ever invalidate it."""
+    if not token:
+        return url
+    name, value = token
+    head, sep_frag, frag = url.partition("#")
+    try:
+        if name in parse_qs(urlparse(head).query, keep_blank_values=True):
+            return url
+    except Exception:
+        pass
+    sep = "&" if "?" in head else "?"
+    head = f"{head}{sep}{quote_plus(name)}={quote_plus(value)}"
+    return head + sep_frag + frag
+
+
+def _diagnose_empty_body(body: str, requested_url: str,
+                         final_url: Optional[str]) -> Tuple[str, str]:
+    """Explain a 200-with-zero-parseable-results. Returns (kind, message).
+
+    Ordered by how much the evidence actually supports, NOT by how interesting
+    the explanation is — these signals are not mutually exclusive, and the
+    wrong one is worse than none, because each message ends in different
+    operator action. In order:
+
+    1. ``redirected`` — we were served a different location than we asked for.
+       Whatever that page says is evidence about a page we never requested.
+    2. ``no-hits`` — the engine explicitly says the query matched nothing.
+       This is the ordinary case and it is NOT breakage; the old code had no
+       branch for it, so a normal empty query was reported as a broken engine.
+    3. ``js-only`` — a small shell that demands JavaScript. Requires BOTH the
+       wording and the size, because Ahmia's full results page carries a
+       JS-toggled banner in its site-wide template: the sentence alone once
+       told operators to replace a working engine on a zero-hit query.
+    4. ``parser`` — none of the above; the format may have drifted.
+    """
+    body = body or ""
+    if final_url and _redirected_away(requested_url, final_url):
+        return "redirected", (
+            f"redirected to {_display_target(final_url)} and served that page "
+            "instead of results — the search endpoint changed or is rejecting "
+            "the query (a missing/rotated form token does exactly this)"
+        )
+    if _NO_HITS_RE.search(body):
+        return "no-hits", (
+            "the engine reports no matches for this query — it answered "
+            "normally, so this is a query result, not a broken engine"
+        )
+    if _JS_ONLY_RE.search(body) and len(body) <= _JS_SHELL_MAX_BYTES:
+        # When the redirect chain is UNKNOWN we cannot rule out that this
+        # notice belongs to some other page we were bounced to — which is
+        # precisely how the old detector lied. Say what we don't know rather
+        # than repeat a confident claim we can't support.
+        if not final_url:
+            return "js-only", (
+                "page says it needs JavaScript, but the redirect chain is "
+                "unknown, so this may be a page we were bounced to rather "
+                "than the engine itself — check where the search URL leads "
+                "before changing GHOST_ONION_ENGINES"
+            )
+        return "js-only", (
+            f"{len(body)} bytes with no results and a notice demanding "
+            "JavaScript — a raw-HTML fetch cannot read this engine (set "
+            "GHOST_ONION_ENGINES to a working engine)"
+        )
+    return "parser", (
+        f"{len(body)} bytes served, but the parser found no onion "
+        "links — the engine's result format may have drifted"
+    )
+
+
+def _norm_host(netloc: str) -> str:
+    """Host in a comparable form: lowercased, credentials and default port
+    stripped, ``www.`` folded away. Without this, three redirects that change
+    nothing — ``www.`` stripping, ``:80``/``:443`` normalisation, a case
+    difference — read as "the engine sent us somewhere else" and cost a token
+    eviction plus a wasted retry on every query."""
+    host = (netloc or "").lower()
+    if "@" in host:
+        host = host.rsplit("@", 1)[1]
+    for suffix in (":80", ":443"):
+        if host.endswith(suffix):
+            host = host[: -len(suffix)]
+            break
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _redirected_away(requested_url: str, final_url: str) -> bool:
+    """True when the response came from a materially different location.
+
+    Compares normalised host + path only: engines legitimately rewrite the
+    query string (reordering params, adding defaults), and neither a scheme
+    upgrade nor a cosmetic host rewrite is a redirect *away*. A changed PATH
+    means we were served something other than what we asked for.
+
+    Deliberately conservative — a false positive here evicts a good token and
+    buys a wasted retry, so when in doubt this says "not a redirect"."""
+    try:
+        a, b = urlparse(requested_url), urlparse(final_url)
+    except Exception:
+        return False
+    if not b.netloc:
+        return False
+    return ((_norm_host(a.netloc), a.path.rstrip("/").lower())
+            != (_norm_host(b.netloc), b.path.rstrip("/").lower()))
+
+
+def _display_target(url: str) -> str:
+    """Host + path of a redirect target, for the operator's log.
+
+    The HOST is the load-bearing part — "we ended up on a different site" and
+    "we ended up on this site's homepage" call for completely different
+    responses, and a path alone can't tell them apart. Onion hostnames are
+    scrubbed downstream by the log redactor, so including it leaks nothing;
+    the query string is dropped because it carries the search terms."""
+    try:
+        pr = urlparse(url)
+        return f"{pr.netloc}{pr.path}" if pr.netloc else (pr.path or "/")
+    except Exception:
+        return "(unparseable URL)"
+
+
 def _cap_body(status: Optional[int], content_type: Optional[str],
               content_length: Any, text: Optional[str]) -> Tuple[Optional[int], str]:
     """Apply the untrusted-body guards to a fetched response.
@@ -343,7 +680,24 @@ def _cap_body(status: Optional[int], content_type: Optional[str],
     return status, text
 
 
-async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tuple[Optional[int], str]:
+def _record_final_url(meta: Optional[Dict[str, Any]], response: Any) -> None:
+    """Stash the URL a response was actually served from into ``meta``.
+
+    Both HTTP clients expose ``.url``, but as their own URL objects rather
+    than str. Never raises — losing this datum must degrade the diagnosis,
+    not the fetch."""
+    if meta is None:
+        return
+    try:
+        url = getattr(response, "url", None)
+        if url:
+            meta["final_url"] = str(url)
+    except Exception:
+        pass
+
+
+async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float,
+                          *, meta: Optional[Dict[str, Any]] = None) -> Tuple[Optional[int], str]:
     """Fetch RAW HTML (tags intact) through the Tor SOCKS proxy.
 
     Unlike `helper_fetch_url_content`, this does NOT strip tags — the search
@@ -353,7 +707,14 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
     httpx. The body is size-capped (`_cap_body`) and the blocking request runs
     on a dedicated bounded pool so a post-deadline lingering fetch can't
     exhaust the shared executor. Returns (status_code, body); (None, "") on
-    transport failure."""
+    transport failure.
+
+    Redirects are followed, so the status alone cannot tell you whether the
+    body came from the URL you asked for. Pass a ``meta`` dict to receive the
+    ``final_url`` the body was actually served from — without it, a dead
+    endpoint that 302s to a working homepage is indistinguishable from a live
+    endpoint serving an unparseable page, which is exactly how the Ahmia
+    breakage stayed misdiagnosed for weeks."""
 
     # Read at most this many BYTES off the wire regardless of Content-Length.
     # An untrusted onion engine can send a chunked body with no (or a lying)
@@ -401,6 +762,7 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
                 finally:
                     try: r.close()
                     except Exception: pass
+                _record_final_url(meta, r)
                 return _cap_body(r.status_code, r.headers.get("content-type"),
                                  r.headers.get("content-length"), _decode(bytes(buf), r.headers.get("content-type")))
         except ImportError:
@@ -413,6 +775,7 @@ async def _fetch_raw_html(url: str, proxy: Optional[str], timeout: float) -> Tup
                         buf.extend(chunk)
                         if len(buf) >= _STREAM_LIMIT:
                             break
+                    _record_final_url(meta, r)
                     return _cap_body(r.status_code, r.headers.get("content-type"),
                                      r.headers.get("content-length"), _decode(bytes(buf), r.headers.get("content-type")))
 
@@ -475,11 +838,23 @@ async def _query_engine(
     (possibly empty); never raises."""
 
     async def _attempts() -> List[Dict[str, str]]:
-        url = engine["url"].format(q=quote_plus(query))
+        base_url = engine["url"].format(q=quote_plus(query))
+        token_from = engine.get("form_token_from")
         for attempt in range(2):
             proxy = _proxy_for_attempt(tor_proxy, f"{engine['name']}:{query}", attempt)
+            # Re-read per attempt: a retry after a redirect-away has dropped
+            # the cached token, so this is where a rotated one gets picked up.
+            url = base_url
+            token_applied = False
+            if token_from:
+                url = _apply_form_token(
+                    base_url,
+                    await _form_token(token_from, proxy, engine["name"]))
+                token_applied = url != base_url
             try:
-                status, body = await _fetch_raw_html(url, proxy, _ONION_TIMEOUT)
+                meta: Dict[str, Any] = {}
+                status, body = await _fetch_raw_html(
+                    url, proxy, _ONION_TIMEOUT, meta=meta)
                 if status == 200 and body:
                     parsed = _parse_onion_results(body, exclude_hosts)
                     if parsed:
@@ -490,21 +865,25 @@ async def _query_engine(
                         )
                         return parsed
                     # 200 but ZERO parseable results. This was silent — a
-                    # broken/JS-only engine looked identical to "no onion
-                    # index has this query," so the tool blamed the query.
-                    # Ahmia now serves a JS-only template (all results are
-                    # client-rendered), unparseable by a raw-HTML fetch —
-                    # detect and name that so the operator knows to set
-                    # GHOST_ONION_ENGINES to a working engine.
-                    _js_only = _JS_ONLY_MARKER in body.lower()
+                    # broken engine looked identical to "no onion index has
+                    # this query," so the tool blamed the query. Name the
+                    # actual cause instead; see `_diagnose_empty_body` for
+                    # why the ordering of those causes matters.
+                    kind, detail = _diagnose_empty_body(
+                        body, url, meta.get("final_url"))
+                    if (kind == "redirected" and token_applied
+                            and attempt == 0):
+                        # A token we DID send still got bounced: most likely
+                        # rotated, so re-scrape on the retry. Gated on
+                        # attempt 0 (a re-scrape after the last attempt only
+                        # bills the next search) and on having actually sent
+                        # one — otherwise any redirect, including a captcha
+                        # or exit-ban page, throws away a good token.
+                        _invalidate_form_token(token_from)
                     pretty_log(
                         "Darkweb Engine Empty",
-                        f"{engine['name']}: HTTP 200 but 0 parseable results"
-                        + (" — engine serves a JS-only page (no non-JS "
-                           "results; set GHOST_ONION_ENGINES to a working "
-                           "engine)" if _js_only
-                           else f" ({len(body)} bytes; parser found no onion "
-                                "links — engine format may have drifted)"),
+                        f"{engine['name']}: HTTP 200 but 0 parseable results "
+                        f"— {detail}",
                         level="WARNING", icon=Icons.WARN,
                     )
             except Exception as e:  # noqa: BLE001
@@ -520,8 +899,21 @@ async def _query_engine(
                 await asyncio.sleep(0.5)
         return []
 
+    # The deadline was sized for ONE full search attempt plus a short window
+    # for a fast second circuit. A token engine spends a fetch of its own
+    # inside that budget, so without this extension a cold-cache attempt
+    # (12s token + 30s search = 42s) would be guillotined at 38s and return
+    # nothing — the deadline killing searches that were about to succeed, the
+    # same shape as the mojeek-timeout bug in search.py. Extend by the token
+    # budget rather than shrinking the search timeout: a shortened search
+    # timeout guillotines slow-but-alive engines, which is the failure we
+    # already learned not to re-introduce. Scaled by min() so a test that
+    # shrinks the deadline still gets a proportionally small total.
+    deadline = _ONION_ENGINE_DEADLINE
+    if engine.get("form_token_from"):
+        deadline += min(_FORM_TOKEN_TIMEOUT, _ONION_ENGINE_DEADLINE)
     try:
-        return await asyncio.wait_for(_attempts(), timeout=_ONION_ENGINE_DEADLINE)
+        return await asyncio.wait_for(_attempts(), timeout=deadline)
     except asyncio.TimeoutError:
         # The underlying fetch runs in a worker thread (curl_cffi/httpx has
         # its own timeout), so it isn't force-killed here — but cancelling the
@@ -530,7 +922,7 @@ async def _query_engine(
         # shared pool.
         pretty_log(
             "Darkweb Engine Error",
-            f"{engine['name']}: exceeded {_ONION_ENGINE_DEADLINE:.0f}s deadline — skipped",
+            f"{engine['name']}: exceeded {deadline:.0f}s deadline — skipped",
             level="WARNING",
             icon=Icons.WARN,
         )

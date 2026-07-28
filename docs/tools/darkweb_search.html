@@ -60,13 +60,36 @@
   <ul>
     <li><code>ahmia</code> — the clearnet mirror <code>ahmia.fi</code> (still fetched over Tor); indexes onion services and filters known-abuse material at the index level.</li>
     <li><code>ahmia-onion</code> — Ahmia's own <code>.onion</code> endpoint. Listed alongside the clearnet mirror on purpose: the two have <em>independent</em> reachability, so one is often up when the other is blocked. They serve the <em>same</em> search index, though, so both carry <code>index:&nbsp;"ahmia"</code> — reaching Ahmia over two transports must not be mistaken for independent corroboration (see ranking below).</li>
-    <li><code>torch</code> — a broad unfiltered onion index, for reach.</li>
+    <li><code>torch</code> — a broad unfiltered onion index, for reach. Re-pointed 2026-07-29 (see below); the fastest engine in the set at 1.6–6.6&nbsp;s.</li>
+    <li><code>torgle</code> — added 2026-07-29 as a third <em>independent</em> index. Slower (9–25&nbsp;s) and smaller, but its value is not its size: with only Ahmia and Torch alive, one engine having a bad day left corroboration ranking with nothing to corroborate against.</li>
   </ul>
   <p>
     <strong>On dead endpoints:</strong> <code>haystak</code> was in the initial default set but was dropped after live functional testing — its v3 endpoint failed on <strong>every</strong> attempt across many rotated Tor circuits (SOCKS5 connect / timeout), i.e. the hidden service is down rather than exit-node blocked, and its retry could burn a full <code>_ONION_TIMEOUT</code> and inflate the tail latency of the whole (concurrent) call. It — or any replacement onion engine — can be re-added via <code>GHOST_ONION_ENGINES</code> once a live endpoint is known. This is the expected maintenance mode for onion engines, which rotate and die far more often than clearnet ones.
   </p>
+
+  <h2 id="engine-survey-2026-07-29">Engine survey (2026-07-29): Torch was not dead, it had moved</h2>
   <p>
-    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"[,"index"]}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). The optional <code>index</code> marks endpoints that share one underlying search index so they count once in corroboration ranking; omitted, it defaults to the entry's own <code>name</code> (treated as an independent index). A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search, and an individual entry whose URL carries a stray placeholder other than <code>{q}</code> (which would raise a <code>KeyError</code> in <code>.format</code> on every query and be silently skipped) is <strong>rejected at load with a warning</strong> instead.
+    Torch had been timing out on every search, costing the tool a full <code>_ONION_ENGINE_DEADLINE</code> (38&nbsp;s) on <em>every</em> call while contributing nothing. Probing the configured <code>torchdeed…</code> address across fresh circuits gave <strong>0/10, every one a 30&nbsp;s timeout</strong> — the same signature that got haystak dropped. But the service was not gone: it is alive at <code>xmh57jrknzkhv6y3ls3ubitzfqnkrwxhopf5aygthi7d6rplyvk3noyd.onion</code> under its <strong>Xapian Omega CGI path</strong>, <code>/cgi-bin/omega/omega?P={q}</code>. The old <code>/search?query=</code> path returns <strong>404 there</strong> — so at the right address with the wrong path it would still have looked dead. Adding <code>&amp;HITSPERPAGE=100</code> lifts one page from 7 unique onions to 28 (the parser de-dupes by host, so 100 hits collapse to 28 hosts). Measured 4/4 reachable at 1.6–6.6&nbsp;s.
+  </p>
+  <p>
+    Candidates were measured with <em>this module's own</em> <code>_fetch_raw_html</code> + <code>_parse_onion_results</code> + <code>_diagnose_empty_body</code>, over live Tor on rotated circuits — not by reading engine lists. A directory page saying an engine is up is not evidence that our fetch and our parser can get results out of it.
+  </p>
+  <div style="overflow-x:auto">
+  <table>
+    <tr><th>Engine</th><th>Reachable</th><th>Result</th></tr>
+    <tr><td><code>torch</code> (new address + Omega path)</td><td>4/4</td><td><strong>Adopted</strong> — 28 onions/page, 1.6–6.6&nbsp;s, fastest in the set</td></tr>
+    <tr><td><code>torgle</code></td><td>4/4</td><td><strong>Adopted</strong> — 19–20 onions, 9–25&nbsp;s, third independent index</td></tr>
+    <tr><td><code>tordex</code></td><td>1/6</td><td>Rejected — one 86-result hit, otherwise timeout; too flaky to pay a deadline for</td></tr>
+    <tr><td><code>torch</code> (old <code>torchdeed…</code>)</td><td>0/10</td><td>Removed — dead service</td></tr>
+    <tr><td><code>haystak</code>, <code>onionland</code>, <code>tor66</code></td><td>0/2 each</td><td>Rejected — timeout</td></tr>
+    <tr><td><code>phobos</code></td><td>0/2</td><td>Rejected — SOCKS "cannot complete", i.e. no descriptor</td></tr>
+  </table>
+  </div>
+  <p>
+    Net effect: three independent indexes instead of one, and a typical search dropped from <strong>38&nbsp;s</strong> (dominated by torch's timeout) to <strong>17–28&nbsp;s</strong>. The rejected addresses are recorded in a comment beside the registry so the next person re-measures rather than re-discovers them; all of them are re-addable via <code>GHOST_ONION_ENGINES</code> if they come back.
+  </p>
+  <p>
+    The whole set is overridable at runtime via the <code>GHOST_ONION_ENGINES</code> env var (a JSON list of <code>{"name","url"[,"index"][,"form_token_from"]}</code> objects, where <code>url</code> contains a single <code>{q}</code> placeholder). The optional <code>index</code> marks endpoints that share one underlying search index so they count once in corroboration ranking; omitted, it defaults to the entry's own <code>name</code> (treated as an independent index). The optional <code>form_token_from</code> names a page whose search form carries a hidden field the engine requires on the query string — see <a href="#ahmia-form-token">the form-token section</a>. A malformed override <strong>falls back to the built-in default</strong> rather than silently disabling dark-web search, and an individual entry whose URL carries a stray placeholder other than <code>{q}</code> (which would raise a <code>KeyError</code> in <code>.format</code> on every query and be silently skipped) is <strong>rejected at load with a warning</strong> instead.
   </p>
 
   <h2>Circuit rotation + timeouts (reused from search.py)</h2>
@@ -132,7 +155,40 @@
 
 
   <h2>Dead-engine detection + charset (bug-hunt 2026-07-26b, HIGH)</h2>
-  <p>Two of the three DEFAULT onion engines — both Ahmia endpoints — now serve a JS-only static template (all results client-rendered), unparseable by a raw-HTML fetch; live-confirmed a 4727-byte page with zero result links. So <code>darkweb_search</code> was silently degraded to torch-only (flaky) while the tool blamed the query ("transient downtime / too-specific"). Root mechanism was a SILENT empty-parse: a 200 that parses to zero results was indistinguishable from an unreachable engine — no log. Now a 200-with-zero-results logs a distinct diagnostic, and a JS-only body (<code>_JS_ONLY_MARKER</code>) is named explicitly with a pointer to set <code>GHOST_ONION_ENGINES</code> to a working engine. Separately, <code>_fetch_raw_html</code> honoured the declared charset instead of force-utf-8 decoding (Cyrillic/CJK onion content — a large fraction of the darknet — came back as mojibake).</p>
+  <p>Both Ahmia endpoints stopped returning parseable results, silently degrading <code>darkweb_search</code> to torch-only (flaky) while the tool blamed the query ("transient downtime / too-specific"). Root mechanism was a SILENT empty-parse: a 200 that parses to zero results was indistinguishable from an unreachable engine — no log. Now a 200-with-zero-results logs a distinct diagnostic. Separately, <code>_fetch_raw_html</code> honoured the declared charset instead of force-utf-8 decoding (Cyrillic/CJK onion content — a large fraction of the darknet — came back as mojibake).</p>
+  <p class="note"><strong>The diagnosis in this section was wrong, and the correction is instructive</strong> — see <a href="#ahmia-form-token">the form-token entry</a> below. Ahmia was never serving a JS-only template. The "live-confirmed 4727-byte page with zero result links" was Ahmia's <em>homepage</em>, reached by a 302 the fetcher silently followed; the JS-only label came from a <code>display:none</code> notice on that homepage matching a bare <code>"javascript"</code> substring test. The engine was healthy the whole time.</p>
+
+  <h2 id="ahmia-form-token">Ahmia form token + honest empty-body diagnosis (2026-07-28)</h2>
+  <p>
+    Ahmia gates its search endpoint behind a <strong>hidden form field</strong>: <code>/search/?q=…</code> <strong>302-redirects to <code>/</code></strong> unless the query string also carries the <code>&lt;input type="hidden"&gt;</code> pair from its search form. Measured live over both the clearnet mirror and the onion endpoint — the redirect is not Tor-, exit-node-, user-agent-, cookie-, or referer-dependent; it is purely the missing parameter. With the token appended, the same endpoint returns a full results page (~1.1&nbsp;MB, ~2900 onion links).
+  </p>
+  <p>
+    An engine entry may now declare <code>form_token_from</code> (a URL whose search form carries the field); both Ahmia entries do. <code>_form_token</code> scrapes the pair via <code>_parse_form_token</code> — preferring a form whose action/id/class looks like a search endpoint, so an unrelated CSRF field on a newsletter box can't be mistaken for it — and caches it for <code>_FORM_TOKEN_TTL</code> (30&nbsp;min). The token is <strong>stateless</strong> (no cookie or session is involved), which is what makes caching it across circuits sound. <strong>Only a successful read is cached.</strong> A <code>None</code> from a page we actually fetched means "this engine needs no token" and is worth remembering; a <code>None</code> because Tor timed out or the page returned 503 means nothing, and caching it would turn one transient blip into 30 minutes of the engine querying without the token it requires — 30 minutes of zero results, the exact failure the token exists to end. Same discipline the rest of the project applies to measurement: never record a failed measurement as a neutral value. It is scraped rather than hard-coded because the entire point of such a token is that the operator can rotate it; if a query is still redirected away, the cached pair is dropped so the next (already circuit-rotated) attempt re-scrapes. The fetch <strong>fails open</strong> — on any error the engine is queried exactly as before — and runs under a tighter <code>_FORM_TOKEN_TIMEOUT = 12&nbsp;s</code> than the search itself, since it spends the same per-engine deadline the query needs.
+  </p>
+  <p>
+    <strong>Why the old diagnosis was confidently wrong.</strong> <code>_fetch_raw_html</code> follows redirects, so the status code alone cannot tell you whether the body came from the URL you asked for: a dead endpoint that 302s to a live homepage is indistinguishable from a live endpoint serving an unparseable page. The empty-body branch then tested for the bare substring <code>"javascript"</code> — present in almost every modern page — and Ahmia's homepage happens to carry a <code>display:none</code> notice reading "we have not deployd non-JavaScript version of Ahmia yet", intended for non-Tor-Browser visitors. Two independent weaknesses lined up to produce a specific, plausible, actionable, and entirely incorrect instruction to the operator: swap engines, when the real fix was one query parameter. That message stood in these docs for two days.
+  </p>
+  <p>
+    The fix is structural rather than a better guess. <code>_fetch_raw_html</code> accepts a <code>meta</code> dict and reports the <code>final_url</code> a body was actually served from, and <code>_diagnose_empty_body</code> ranks the possible explanations by <em>how much the evidence actually supports</em>, because each message ends in a different operator action:
+  </p>
+  <ol>
+    <li><code>redirected</code> — we were served a different location than we asked for. Whatever that page says is evidence about a page we never requested, so this has to win over anything read out of the body.</li>
+    <li><code>no-hits</code> — the engine explicitly says the query matched nothing (<code>_NO_HITS_RE</code>). This is the <em>ordinary</em> case and it is not breakage.</li>
+    <li><code>js-only</code> — requires <strong>both</strong> a needs-JavaScript sentence (<code>_JS_ONLY_RE</code>) <strong>and</strong> a body under <code>_JS_SHELL_MAX_BYTES</code> (32&nbsp;KB), since a page that genuinely cannot render without JS is a shell.</li>
+    <li><code>parser</code> — none of the above; the result format may have drifted.</li>
+  </ol>
+  <p class="note warn">
+    <strong>The first version of this fix did not go far enough, and the review that caught it is worth recording.</strong> Two independent reviewers found that the <code>js-only</code> branch still produced the original lie by a different route: Ahmia's no-JS banner is in its <strong>site-wide template</strong>, not just the homepage, so a perfectly healthy <em>zero-hit</em> search — token accepted, no redirect, engine fine — still matched the wording and still told the operator to replace the engine. Verified against a live zero-hit page. Three things were wrong: there was <em>no branch at all</em> for the most common cause (the query simply had no matches); the wording test was <strong>polarity-blind</strong>, so <code>"works without JavaScript"</code> and <code>"No JavaScript required"</code> — precisely the boasts privacy-focused onion engines put in their footers — matched as evidence of breakage; and the sentence alone was allowed to carry a conclusion it cannot support without the structural size check. The lesson generalises past this file: <em>tightening a heuristic is not the same as bounding what it is allowed to conclude.</em>
+  </p>
+  <p>
+    <code>_redirected_away</code> is likewise deliberately conservative, normalising host case, <code>www.</code>, default ports and path case before comparing — a false positive there is not merely a bad message, it evicts a good token and buys a wasted retry on every query. Token eviction is further gated on having actually <em>sent</em> a token and on being the first attempt, so a captcha or exit-ban page cannot throw away a working one. Redirect messages name host + path (the host is the load-bearing part — a foreign host and this site's homepage call for different responses) but never the query string, which carries the search terms; onion hostnames are scrubbed downstream by the log redactor.
+  </p>
+  <p>
+    <strong>Deadline accounting.</strong> A token engine spends an extra fetch inside the per-engine deadline, so <code>_ONION_ENGINE_DEADLINE</code> is extended by the token budget for those engines. Shrinking the <em>search</em> timeout instead would guillotine slow-but-alive engines — the failure mode <code>search.py</code>'s mojeek timeout already taught this project once.
+  </p>
+  <p>
+    The generalisable lesson for the next engine that breaks: <strong>check the redirect chain before believing an engine-health diagnosis</strong>, never anchor a health check on a substring ordinary pages contain, and make sure a diagnostic has a branch for "nothing is wrong". Covered by <code>tests/test_darkweb_form_token.py</code>, including the ordering regression, the live-verified zero-hit page, the polarity boasts, cosmetic redirects, fragment and duplicate-parameter URL assembly, and the deadline headroom.
+  </p>
 
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>

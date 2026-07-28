@@ -134,6 +134,24 @@ def socks_url_with_identity(tor_proxy: Optional[str], identity: str) -> Optional
     except Exception:
         return tor_proxy
 
+async def aclose_curl_response(resp) -> None:
+    """Abort + reap a curl_cffi ASYNC streaming response.
+
+    The sync ``close()`` is a silent no-op on these: it reaps ``stream_task``,
+    which AsyncSession responses never set (they set ``astream_task``).
+    Setting ``quit_now`` first makes the curl write callback abort the
+    transfer, so ``aclose()`` isn't left awaiting a body we decided to drop.
+    Safe after a completed stream (awaiting a finished task is a no-op).
+    Shared by ``helper_fetch_url_content`` and the file_system download tool.
+    """
+    try:
+        if getattr(resp, "quit_now", None) is not None:
+            resp.quit_now.set()
+        await resp.aclose()
+    except Exception:
+        pass
+
+
 async def helper_fetch_url_content(
     url: str, *, proxy_override: Optional[str] = None, renew_identity: bool = True,
 ) -> str:
@@ -206,17 +224,21 @@ async def helper_fetch_url_content(
             from urllib.parse import urlparse
             url_path = urlparse(url).path.lower()
 
-            def _drain_sync(resp):
+            async def _drain_curl(resp):
+                # AsyncSession responses stream through an asyncio.Queue and
+                # MUST be drained with aiter_content(); the sync
+                # iter_content() on the same object returns unawaited
+                # Queue.get() coroutines instead of bytes (every fetch died
+                # with "can't extend bytearray with coroutine").
                 buf = bytearray()
                 try:
-                    for chunk in resp.iter_content():
+                    async for chunk in resp.aiter_content():
                         if chunk:
                             buf.extend(chunk)
                             if len(buf) >= _STREAM_LIMIT:
                                 break
                 finally:
-                    try: resp.close()
-                    except Exception: pass
+                    await aclose_curl_response(resp)
                 return bytes(buf)
 
             async def _drain_async(resp):
@@ -251,10 +273,9 @@ async def helper_fetch_url_content(
                     _encoding = getattr(resp, "encoding", None) or "utf-8"
                     _is_binary, _oversize, _want = _classify(status_code, content_type, _cl)
                     if _want:
-                        _raw = await asyncio.to_thread(_drain_sync, resp)
+                        _raw = await _drain_curl(resp)
                     else:
-                        try: resp.close()
-                        except Exception: pass
+                        await aclose_curl_response(resp)
             else:
                 # Fallback to httpx if curl_cffi is missing for some reason
                 async with httpx.AsyncClient(proxy=_attempt_proxy, timeout=20.0, follow_redirects=True) as client:

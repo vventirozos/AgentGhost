@@ -333,6 +333,7 @@ attribute float aSeed;
 uniform float uTime;
 uniform float uCenterDim;
 uniform float uCenterXY;
+uniform float uFormDim;
 uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
@@ -421,6 +422,10 @@ void main() {
     // 3D origin.
     float cdist = mix(length(instancePos), length(instancePos.xy), uCenterXY);
     col *= mix(1.0, smoothstep(0.2, 1.3, cdist), uCenterDim);
+    // Per-form master luminance: forms meant to BLEND into the
+    // background (vortex) emit less light overall — structure and
+    // motion carry the visibility, not brightness.
+    col *= uFormDim;
     vColor = col;
 }
 `;
@@ -475,6 +480,7 @@ const lineFragmentShader = `
 uniform float uTime;
 uniform float uCenterDim;
 uniform float uCenterXY;
+uniform float uFormDim;
 uniform float uWorkingState;
 uniform float uErrorState;
 uniform float uPulseT;
@@ -530,7 +536,10 @@ void main() {
     // the main additive pile-up; keep it dark so hues stay saturated.
     float ldist = mix(length(vLinePos), length(vLinePos.xy), uCenterXY);
     float centerFade = mix(1.0, smoothstep(0.15, 1.25, ldist), uCenterDim);
-    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim * vLineNear * diveDim * centerFade, alpha * diveDim * centerFade * mix(1.0, 0.55, vLineDepth));
+    // Master per-form luminance: color scales fully, alpha partially so
+    // faint far links don't vanish entirely.
+    float formA = mix(1.0, uFormDim, 0.6);
+    gl_FragColor = vec4(col * (1.0 + uPulseT * 0.3) * depthDim * vLineNear * diveDim * centerFade * uFormDim, alpha * diveDim * centerFade * formA * mix(1.0, 0.55, vLineDepth));
 }
 `;
 
@@ -1008,6 +1017,7 @@ export function init() {
             uWaveAmp: { value: 1.0 },
             uCenterDim: { value: 0.0 },
             uCenterXY: { value: 0.0 },
+            uFormDim: { value: 1.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -1045,6 +1055,7 @@ export function init() {
             uWaveAmp: { value: 1.0 },
             uCenterDim: { value: 0.0 },
             uCenterXY: { value: 0.0 },
+            uFormDim: { value: 1.0 },
             uWorkingState: { value: 0.0 },
             uErrorState: { value: 0.0 },
             uPulseT: { value: 0.0 },
@@ -1352,12 +1363,13 @@ function animate() {
         tunnelFlow += (1 / 60) * (0.008
             + 0.014 * Math.max(workingState, activity)
             + 0.19 * travelNorm) * flowTurb * CALM;
-        // Swirl (2026-07-28 tuning): idle raised +25% (0.10 → 0.125),
-        // and busy HALVES the rate rather than raising it — work
-        // de-emphasizes rotation entirely so the surging swallow owns
-        // the busy state without competition.
+        // Swirl (final direction 2026-07-28): idle keeps its slight
+        // rotation (0.125); busy ACCELERATES it moderately (+60%)
+        // alongside the flow surge — falling faster AND spinning
+        // faster, but nowhere near the early "way too fast" rates
+        // (that culprit was wind-coupling, long since fixed).
         vortexSpin += (1 / 60) * (0.125
-            - 0.050 * Math.max(workingState, activity, travelNorm)) * CALM;
+            + 0.025 * Math.max(workingState, activity, travelNorm)) * CALM;
     } else {
         vortexTravel = 0.0;
     }
@@ -1589,10 +1601,11 @@ function animate() {
         //    never-repeating shapes — the "procedurally generated
         //    content" being consumed — swelling while a turn runs.
         const engage = Math.min(vortexTravel / Math.max(IMMERSION_CAP, 0.001), 1.0);
-        // Idle pulsing cut to 20% (2026-07-28 tuning): at rest the hole
-        // barely breathes; the pulse returns in full with engagement or
-        // ambient drive.
-        const vPulseScale = 0.2 + 0.8 * Math.max(engage, drive);
+        // Pulsing OFF at idle (final direction 2026-07-28): the resting
+        // vortex only drifts and turns. A SLIGHT pulse (35%) is allowed
+        // while busy — it rides the feeding gulps and keeps the surge
+        // from feeling like a conveyor.
+        const vPulseScale = 0.35 * Math.max(engage, drive);
         const a2 = (0.10 + 0.20 * engage) * Math.sin(time * 0.110);
         const a3 = (0.08 + 0.16 * engage) * Math.sin(time * 0.073 + 2.1);
         const a5 = (0.05 + 0.11 * engage) * Math.sin(time * 0.047 + 0.7);
@@ -1630,12 +1643,15 @@ function animate() {
                 // from the hole (hottest at the center).
                 const dOut = _fract(bp.d0 + tunnelFlow * bp.flowScale);
                 const L = VORTEX_LMIN * Math.exp(VORTEX_KOUT * dOut);
-                // Spiral wind cut 4.2 → 1.2: the wind is traversed by the
-                // flow, so at busy flow rates it alone corkscrewed the
-                // whole scene ~48°/s — THIS was the "fast rotation while
-                // busy", not vortexSpin.
-                const theta = bp.theta0 + (1.0 - dOut) * 1.2
-                    + vortexSpin * (1.5 - dOut);
+                // Spiral wind cut 4.2 → 1.2 → 0.35 across three "too
+                // fast" reports: the wind is traversed by the FLOW, so
+                // any busy surge multiplies into apparent rotation —
+                // keep it near-nothing. The differential is flattened
+                // too (0.9→0.5 center→rim, was 1.5): the center is
+                // where the eye rests, so it must not spin fastest by
+                // much. Busy total ≈ 13°/s near the hole vs ~6°/s idle.
+                const theta = bp.theta0 + (1.0 - dOut) * 0.35
+                    + vortexSpin * (0.9 - 0.4 * dOut);
                 // Organic cross-section morph — the procedural content.
                 const shape = 1.0
                     + a2 * Math.sin(2.0 * theta + dOut * 5.0)
@@ -1816,12 +1832,18 @@ function animate() {
     const centerXY = formIndex === 3 ? 1.0 : 0.0;
     const waveAmp = formIndex === 3 ? 0.3 : 1.0;
     const hueDriftOut = hueDrift * (formIndex === 3 ? 0.3 : 1.0);
+    // Master luminance: EVERY form emits ~half the light so the face
+    // BLENDS into the background (operator: "too bright and
+    // distracting", then extended to all faces) — structure and motion
+    // carry visibility, not brightness.
+    const formDim = 0.55;
 
     const nUniforms = instancedMesh.material.uniforms;
     nUniforms.uTime.value = time;
     nUniforms.uCenterDim.value = centerDim;
     nUniforms.uCenterXY.value = centerXY;
     nUniforms.uWaveAmp.value = waveAmp;
+    nUniforms.uFormDim.value = formDim;
     nUniforms.uWorkingState.value = workingState;
     nUniforms.uErrorState.value = errorState;
     nUniforms.uPulseT.value = pulseT;
@@ -1834,6 +1856,7 @@ function animate() {
     lUniforms.uCenterDim.value = centerDim;
     lUniforms.uCenterXY.value = centerXY;
     lUniforms.uWaveAmp.value = waveAmp;
+    lUniforms.uFormDim.value = formDim;
     lUniforms.uWorkingState.value = workingState;
     lUniforms.uErrorState.value = errorState;
     lUniforms.uPulseT.value = pulseT;
@@ -1863,8 +1886,9 @@ function animate() {
     // medusa is meant to sit BACK — present, not clamoring — and its
     // locally dense anatomy stacks additive light. Working/activity
     // response unchanged, so a busy agent still visibly glows.
+    // Background-blend bloom (×0.65, all forms — see formDim above).
     bloomPass.strength = (0.88 + workingState * 0.3 + activity * 0.35
-        + errorState * 0.5) * BLOOM_SCALE * (1.0 - 0.5 * dive);
+        + errorState * 0.5) * BLOOM_SCALE * (1.0 - 0.5 * dive) * 0.65;
 
     composer.render();
 }

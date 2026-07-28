@@ -2566,6 +2566,7 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
     # check on the non-Tor WEB path; under Tor the SOCKS proxy already can't
     # reach link-local/metadata).
     from ..utils.helpers import url_ssrf_reason as _url_ssrf_reason
+    from ..utils.helpers import aclose_curl_response as _aclose_curl
     _ssrf = _url_ssrf_reason(url)
     if _ssrf:
         return f"Error: {_ssrf}"
@@ -2600,18 +2601,24 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
                         resp = await client.get(cur_url, stream=True, allow_redirects=False)
                         _next, _rerr = _download_redirect_target(
                             resp.status_code, resp.headers, cur_url, _url_ssrf_reason)
+                        # AsyncSession streaming responses need the ASYNC
+                        # close (quit_now + aclose): the sync close() reaps
+                        # stream_task, which async responses never set, so it
+                        # silently left every hop's transfer running.
                         if _rerr:
-                            try: resp.close()
-                            except Exception: pass
+                            await _aclose_curl(resp)
                             return _rerr
                         if _next is None:
                             break  # final (non-redirect) response
-                        try: resp.close()
-                        except Exception: pass
+                        await _aclose_curl(resp)
                         cur_url = _next
                     else:
                         return "Error: too many redirects (possible redirect loop)."
                     if resp.status_code != 200:
+                        # Abort the transfer BEFORE the identity-renew sleep:
+                        # an open streaming response pumps its body into the
+                        # unbounded response queue in RAM the whole 5s.
+                        await _aclose_curl(resp)
                         if resp.status_code in [401, 403, 503] and mode == "TOR":
                             await asyncio.to_thread(request_new_tor_identity)
                             await asyncio.sleep(5)
@@ -2620,26 +2627,33 @@ async def tool_download_file(url: str, sandbox_dir: Path, tor_proxy: str, filena
 
                     clength = resp.headers.get("Content-Length")
                     if clength and int(clength) > 50000000:
+                        await _aclose_curl(resp)
                         return f"Error: File is too large ({int(clength)/1000000:.1f}MB). Download limit is 50MB."
-                    
+
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     _MAX_DL = 50_000_000
                     _total = 0
                     _overflow = False
-                    with open(target_path, "wb") as f:
-                        buffer = bytearray()
-                        async for chunk in resp.aiter_content():
-                            if chunk:
-                                buffer.extend(chunk)
-                                _total += len(chunk)
-                                if _total > _MAX_DL:
-                                    _overflow = True
-                                    break
-                                if len(buffer) >= 1024 * 1024:
-                                    await asyncio.to_thread(f.write, buffer)
-                                    buffer.clear()
-                        if buffer and not _overflow:
-                            await asyncio.to_thread(f.write, buffer)
+                    try:
+                        with open(target_path, "wb") as f:
+                            buffer = bytearray()
+                            async for chunk in resp.aiter_content():
+                                if chunk:
+                                    buffer.extend(chunk)
+                                    _total += len(chunk)
+                                    if _total > _MAX_DL:
+                                        _overflow = True
+                                        break
+                                    if len(buffer) >= 1024 * 1024:
+                                        await asyncio.to_thread(f.write, buffer)
+                                        buffer.clear()
+                            if buffer and not _overflow:
+                                await asyncio.to_thread(f.write, buffer)
+                    finally:
+                        # On the overflow break the transfer is still live —
+                        # abort it instead of letting it stream into the
+                        # queue until session teardown.
+                        await _aclose_curl(resp)
                     if _overflow:
                         try: target_path.unlink()
                         except Exception: pass

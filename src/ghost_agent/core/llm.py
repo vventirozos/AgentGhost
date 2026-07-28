@@ -198,6 +198,21 @@ def _is_node_fault(exc) -> bool:
     return True
 
 
+def _node_error_detail(exc) -> str:
+    """One-line diagnosis for a node-failure log. For an HTTPStatusError the
+    bare class name hides the actual cause (a 400 'unsupported image format'
+    reads identically to a 500 crash), so include the status code and a
+    bounded body snippet; every other exception keeps its class name."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        detail = f"HTTP {exc.response.status_code}"
+        try:
+            body = " ".join((exc.response.text or "").split())[:160]
+        except Exception:
+            body = ""
+        return f"{detail} — {body}" if body else detail
+    return type(exc).__name__
+
+
 class NodeCircuitBreaker:
     """Circuit breaker for LLM nodes.
 
@@ -944,7 +959,7 @@ class LLMClient:
                         except Exception as e:
                             if _is_node_fault(e):
                                 self.circuit_breaker.record_failure(node["url"])
-                            pretty_log("Vision Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
+                            pretty_log("Vision Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
                             target_model = None
                             node = self.get_vision_node(target_model)
                             continue
@@ -1008,7 +1023,7 @@ class LLMClient:
                             logger.debug("keepalive worker %s failed: %s",
                                          node.get("model"), type(e).__name__)
                         else:
-                            pretty_log("Worker Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
+                            pretty_log("Worker Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_worker_node(target_model)
                         continue
@@ -1072,7 +1087,7 @@ class LLMClient:
                     except Exception as e:
                         if _is_node_fault(e):
                             self.circuit_breaker.record_failure(node["url"])
-                        pretty_log("Critic Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
+                        pretty_log("Critic Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_critic_node(target_model)
                         continue
@@ -1123,7 +1138,7 @@ class LLMClient:
                     except Exception as e:
                         if _is_node_fault(e):
                             self.circuit_breaker.record_failure(node["url"])
-                        pretty_log("Coding Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
+                        pretty_log("Coding Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_coding_node(target_model)
                         continue
@@ -1177,7 +1192,7 @@ class LLMClient:
                     except Exception as e:
                         if _is_node_fault(e):
                             self.circuit_breaker.record_failure(node["url"])
-                        pretty_log("Swarm Node Failed", f"{node['model']}: {type(e).__name__} — trying next", level="WARNING", icon=Icons.WARN)
+                        pretty_log("Swarm Node Failed", f"{node['model']}: {_node_error_detail(e)} — trying next", level="WARNING", icon=Icons.WARN)
                         target_model = None
                         node = self.get_swarm_node(target_model)
                         continue

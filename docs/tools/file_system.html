@@ -256,6 +256,9 @@ SyntaxError: Unexpected identifier 't'</pre>
   </ul>
   <p>Covered by <code>tests/test_file_system_write_corruption_guards.py</code> and
   <code>tests/test_file_replace_auto_promote.py</code>.</p>
+
+  <h2>Download: async close on the curl_cffi path (2026-07-29)</h2>
+  <p>Sibling of the <a href="search.html">page-fetch async-drain fix (2026-07-28)</a>, found by the post-fix "grep the other siblings" review. <code>tool_download_file</code>'s curl_cffi branch uses <code>AsyncSession(stream=True)</code>, whose responses must be closed with the ASYNC sequence — <code>quit_now.set()</code> (the curl write callback then aborts the transfer) followed by <code>await aclose()</code>. The sync <code>close()</code> reaps <code>stream_task</code>, which AsyncSession responses never set (they set <code>astream_task</code>), so it was a silent no-op: every redirect hop left its transfer running; the non-200 branch slept 5&nbsp;s for Tor identity renewal while the abandoned body pumped into the response's unbounded <code>asyncio.Queue</code> in RAM; and the &gt;50&nbsp;MB overflow break never aborted the stream at all — the body kept downloading until session teardown. All three now go through the shared <code>utils.helpers.aclose_curl_response()</code> (redirect hops, SSRF-reject, non-200/oversize returns, and a <code>finally</code> around the write loop). Covered by the curl-async download tests in <code>tests/test_download_redirect_ssrf.py</code>; the shared streaming mock's sync <code>iter_content</code> is now a tripwire (raises), so any async path regressing to a sync drain fails loudly instead of staying green.</p>
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

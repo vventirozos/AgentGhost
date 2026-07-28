@@ -43,6 +43,61 @@ _SNIFFABLE_MIMES = frozenset(
     {mime for _, mime in _IMAGE_MAGIC} | {"image/webp"}
 )
 
+# Formats every deployed vision server decodes natively. llama.cpp-based
+# nodes decode images with stb_image, which has NO webp/tiff support — a
+# webp shipped as-is makes the node reject the request with an HTTP error
+# and the whole path reads as "vision node offline". Anything outside this
+# set is re-encoded to PNG before shipping.
+_NODE_SAFE_MIMES = frozenset({"image/png", "image/jpeg", "image/gif", "image/bmp"})
+
+
+def _normalize_for_node(mime_type, file_bytes):
+    """Return (mime, bytes) the vision node can decode natively.
+
+    Node-safe formats pass through untouched. Everything else (webp, tiff,
+    ...) is re-encoded to PNG — first frame only for animations. If Pillow
+    is missing or cannot decode the bytes (e.g. SVG), the original data
+    ships unchanged with a warning, so the request behaves exactly as it
+    did before this guard existed instead of dying here.
+    """
+    if mime_type in _NODE_SAFE_MIMES:
+        return mime_type, file_bytes
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(file_bytes)) as img:
+            # PNG cannot hold CMYK/YCbCr/etc.; flatten exotic modes, keeping
+            # alpha where the source may carry it (palette modes included).
+            if img.mode in ("P", "PA"):
+                img = img.convert("RGBA")
+            elif img.mode not in ("RGB", "RGBA", "L", "LA", "1"):
+                img = img.convert("RGB")
+            # Bound the OUTPUT, not just the input: a 10 MB webp can decode
+            # to a 100+ MB PNG. Same pixel budget as PDF rasterisation —
+            # far above what vision models sample at.
+            w, h = img.size
+            if w * h > _MAX_PDF_PAGE_PIXELS:
+                scale = (_MAX_PDF_PAGE_PIXELS / (w * h)) ** 0.5
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+        pretty_log("Vision Transcode", f"{mime_type} → image/png (node-safe)", icon=Icons.TOOL_DEEP)
+        return "image/png", buf.getvalue()
+    except Exception as e:
+        pretty_log("Vision Transcode",
+                   f"cannot convert {mime_type} to PNG ({type(e).__name__}) — sending original bytes",
+                   level="WARNING", icon=Icons.WARN)
+        return mime_type, file_bytes
+
+
+async def _normalize_for_node_async(mime_type, file_bytes):
+    """Thread-dispatching wrapper: node-safe formats skip the hop entirely;
+    only an actual transcode (PIL decode+encode is CPU-bound) leaves the
+    event loop."""
+    if mime_type in _NODE_SAFE_MIMES:
+        return mime_type, file_bytes
+    return await asyncio.to_thread(_normalize_for_node, mime_type, file_bytes)
+
 # Raster budget for PDF pages: the 50 MB *file* cap cannot bound get_pixmap —
 # a KB-sized vector PDF declaring a 10000x10000pt page allocates
 # (w*zoom)·(h*zoom)·3 bytes (1.2 GB at 2x) per page. Cap pixels instead and
@@ -150,7 +205,8 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                     return (f"Error: '{target}' claims content-type '{content_type}' but the "
                             f"downloaded bytes carry no image signature — refusing to send "
                             f"non-image data to the vision model.")
-                b64_images.append((content_type, base64.b64encode(file_bytes).decode("utf-8")))
+                content_type, _norm_bytes = await _normalize_for_node_async(content_type, file_bytes)
+                b64_images.append((content_type, base64.b64encode(_norm_bytes).decode("utf-8")))
         else:
             path = _get_safe_path(sandbox_dir, target)
             # Root fallback: when a project is active, sandbox_dir is scoped to
@@ -197,7 +253,8 @@ async def tool_vision_analysis(action: str = None, target: str = None, llm_clien
                             f"vision_analysis reads images and PDFs — for a text file "
                             f"use file_system(operation='read') instead."
                         )
-                b64_images.append((mime_type, base64.b64encode(file_bytes).decode("utf-8")))
+                mime_type, _norm_bytes = await _normalize_for_node_async(mime_type, file_bytes)
+                b64_images.append((mime_type, base64.b64encode(_norm_bytes).decode("utf-8")))
 
         # PDF rasterisation is gated on the file ACTUALLY being a PDF.
         # Previously `action='extract_text_pdf'` forced this branch for ANY
