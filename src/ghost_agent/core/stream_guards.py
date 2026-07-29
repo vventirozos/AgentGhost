@@ -125,10 +125,32 @@ def _tail_has_stop_marker(buf: str, new_token: str) -> bool:
     ENTIRE accumulated buffer on every chunk (O(n) per token → O(n²) over a
     long thinking stream, plus GB of transient string allocation on the event
     loop). A marker can straddle at most one chunk boundary, so scanning a tail
-    of ``len(new_token) + 16`` chars is sufficient and O(1) per token."""
+    of ``len(new_token) + 16`` chars is sufficient and O(1) per token.
+
+    QUOTED-MENTION GUARD (2026-07-29 log audit): reasoning that QUOTES the
+    rule text — ``the constraint says "Emit EXACTLY ONE `<tool_call>`
+    block"`` — used to latch the mute mid-sentence, silently dropping every
+    later thinking token of the turn from the log (the visible symptom was
+    thinking lines cut right before a backtick). A marker immediately
+    preceded by a backtick or quote character is a MENTION, not a stream
+    transition; skip it. A real transition later in the same stream still
+    latches — this check runs on every chunk."""
     window = len(new_token) + 16
-    tail = buf[-window:].lower()
-    return any(m in tail for m in _STREAM_STOP_MARKERS)
+    # +1 char of look-behind so the quote check works for a marker sitting
+    # at the exact front of the scan window.
+    tail = buf[-(window + 1):].lower()
+    for m in _STREAM_STOP_MARKERS:
+        idx = tail.find(m)
+        while idx != -1:
+            if idx == 0 and len(buf) > len(tail):
+                # Marker starts before the look-behind char — predecessor
+                # unknown. Conservative: treat as a real transition.
+                return True
+            prev = tail[idx - 1] if idx > 0 else ""
+            if prev not in ("`", '"', "'"):
+                return True
+            idx = tail.find(m, idx + 1)
+    return False
 
 
 def _detect_tool_call_loop(buf: str) -> bool:

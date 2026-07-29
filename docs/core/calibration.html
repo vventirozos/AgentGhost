@@ -181,6 +181,16 @@
   guard refuses any fit with slope below 0.5 and logs why. The machinery engages the moment a
   predictive feature exists — pinned by a test using an informative-but-compressed corpus, where
   it is adopted and beats the base rate.</p>
+  <p><strong>The rejection is now visible in every status surface (2026-07-29):</strong>
+  <code>FittedParams.map_status</code> records what happened to the map —
+  <code>applied&nbsp;|&nbsp;rejected_inverted</code> (slope ≤ 0) <code>|&nbsp;rejected_step</code>
+  (slope &gt; 50 backstop) <code>|&nbsp;discarded_worse</code> (calibrated Brier no better than
+  raw) — persisted in <code>calibration_params.json</code> (legacy files load as
+  <code>applied</code>) and threaded into the idle-refit metacog line (previously
+  <code>refit=ok</code> in the very cycle whose map was REJECTED — now
+  <code>refit=map_rejected_inverted</code>), the boot <code>loaded=startup</code> line
+  (<code>map=…</code>), the activity-ledger record, and <code>tracker.stats()</code>. Tests:
+  <code>tests/test_log_audit_fixes_2026_07_29.py::TestCalibMapStatus</code>.</p>
 
   <h3>Feature health: 0 of 3 inputs are alive</h3>
   <p>Recalibration cannot fix a score with nothing in it. Measuring each input for whether it

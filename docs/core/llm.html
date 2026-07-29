@@ -240,6 +240,17 @@
   prefix cache (<code>cache_prompt</code> + <code>--cache-ram</code>) then
   serves it, and the first real request pays only its unique tail (hydrated
   memory + dynamic state + query ≈ 20-25&nbsp;s).</p>
+  <p><strong>Verifiable from the log (2026-07-29):</strong> the warmup line
+  and the live per-turn <code>Prefill Cache</code> line used to measure
+  different segments in different units (~22k <em>tokens</em> of rendered
+  head vs. chars of the tail <em>injection</em> block), so whether the
+  warmed bytes were the live bytes could not be checked. Both lines now log
+  the SYSTEM-SLOT sha1 in the same form (<code>sys h=… chars=…</code>;
+  warmup adds <code>tools h=…</code>) — equal <code>sys h=</code> values
+  prove the warmed head is byte-identical to what the live request sends; a
+  differing value means the warmup bought nothing and names the buster. The
+  tools hash legitimately varies per conversation (query-routed
+  acquired-skill tail) and only shortens the match.</p>
   <p><strong>Byte-exactness is the contract:</strong> the warmup builds its
   system slot and tools through the SAME code paths a live request uses
   (<code>_RequestState.get_profile_str()</code> → <code>SYSTEM_PROMPT</code>

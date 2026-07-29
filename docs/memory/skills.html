@@ -78,6 +78,15 @@
   <p>The dream heuristics loop had an actionability gate since 2026-07-13, but it lived <em>inside</em> dream — so self-play and other producers bypassed it, and observations still leaked in. Measured on the live playbook: 23 of 50 lessons were mistake-less pseudo-entries and they drew <strong>28% of all retrievals</strong> — the single most-retrieved item being a dream chess-persona note (<em>"When playing live chess against Vasilis, provide continuous coaching commentary"</em>, 84 retrievals), alongside self-play observations (<em>"On a regex_parse task that has a familiar shape…"</em>) and user preferences (<em>"The user prefers ripgrep"</em>) that match no real query.</p>
   <p>The gate now runs at <code>learn_lesson</code> — the single write chokepoint, so it covers <em>every</em> producer (dream, self-play, reflection, episode consolidation). The logic (<code>memory/lesson_quality.py</code>, a leaf module shared with <code>core.dream</code> to avoid an import cycle): a lesson that records a <strong>real mistake</strong> is a genuine correction and always passes; a <strong>mistake-less</strong> entry is a rule/observation, so its <code>solution</code> must read as an actionable heuristic (<code>_is_actionable_heuristic</code> — imperative starter, or conditional + modal). <code>verified</code> gets no bypass — it would only ever exempt a verified <em>observation</em> (a verified fix has a mistake; a verified actionable rule passes anyway). The 11 non-actionable lessons on the live playbook were pruned retroactively (50 → 39; backup at <code>skills_playbook.json.pre-quality-prune-20260716</code>), and their orphaned vector twins were then deleted in-process via <code>VectorMemory.delete_skill_twins</code> (POST <code>/api/memory/delete_skill_twin</code> — a second PersistentClient against the live Chroma dir risks HNSW corruption, so the delete must run inside the owning process; 11 twins removed, 7315 → 7304 docs, verified idempotent). This is the content-quality complement to the 2026-07-15 retrieval-<em>routing</em> fix: routing now surfaces lessons (mediation ~1% → ~85% in B4), and this stops ~a quarter of what surfaces from being noise. Tests: <code>tests/test_lesson_quality_gate.py</code>, <code>tests/test_delete_skill_twins.py</code>.</p>
 
+  <p><strong>Trivial tool-routing floor (2026-07-29):</strong> a mistake-less rule whose entire content is
+  a bare topic→tool mapping — <em>"When asked about the weather, use the system_utility tool."</em>, minted by
+  REM from a single one-shot success — is rejected by <code>_TRIVIAL_TOOL_ROUTING_RE</code> inside
+  <code>_is_actionable_heuristic</code>. The tool registry / router already encodes that mapping (the agent
+  routed the minting turn correctly WITHOUT the lesson, which is exactly how the lesson got minted); such
+  entries dilute retrieval without adding behaviour. Rules that add anything past the tool name
+  (<em>"…use system_utility with location defaulting to Athens"</em>) still pass, and real-mistake lessons are
+  untouched. Tests: <code>tests/test_log_audit_fixes_2026_07_29.py::TestTrivialToolRoutingFloor</code>.</p>
+
   <h2>Conversational-trigger gate (2026-07-18)</h2>
   <p>The 2026-07-16 gate waved through <em>any</em> lesson carrying a real mistake. The 2026-07-17 overnight REM cycle showed the gap: genuine mistakes attached to TRIGGERS lifted verbatim from user chat — <em>"proceed with the next task"</em>, <em>"it still does the same. the game never starts, notify me in slack when…"</em>. A trigger is the lesson's retrieval key; raw conversation fragments are keys no future query will match, so such entries are permanent playbook noise however real the mistake was.</p>
   <p><code>_is_conversational_trigger</code> (in <code>memory/lesson_quality.py</code>) now also gates mistake-bearing lessons. Default-ACCEPT — only unambiguous chat tells reject: pronoun-initial fragments with no antecedent (<em>"it still does…"</em>, <em>"that didn't work…"</em>), short bare turn-level commands (<em>"proceed"</em>, <em>"try again"</em>, ≤&nbsp;60 chars), and direct-address phrases (<em>"notify me in slack"</em>, <em>"let me know"</em>). Deliberately NOT rejected: user-question triggers (<em>"How do I parse JSON?"</em>, <em>"Please parse JSON!"</em>) — the paraphrase-normalised dedup counts on them recurring — and "you"-phrasing, which is legitimate rule language addressed to the agent. Tests: <code>tests/test_lesson_quality_gate.py::TestConversationalTrigger</code>.</p>
@@ -107,6 +116,20 @@
 
   <h2>Dedup</h2>
   <p>Vector similarity check (distance &lt; 0.15; <strong>&lt; 0.25 for mistake-less rules</strong> since 2026-07-20 — dream/reflection re-emit the same "When X, do Y" heuristic reworded every cycle, and rewordings measure 0.07–0.17 apart on the live bge-small store while genuinely distinct rules stay ≥ 0.29, so the single 0.15 cutoff let the reworded tail through: 10+ copies of two rules saved overnight 07-19→20; override with <code>GHOST_RULE_DEDUP_DIST</code>, tests <code>tests/test_skill_dedup.py::TestMistakeLessWideThreshold</code>) or a <strong>normalized trigger match</strong> merges <code>frequency</code> + <code>solution</code> instead of inserting a duplicate. The JSON fallback no longer requires an exact lowercased string: <code>_normalize_trigger()</code> lowercases, strips punctuation, drops stopwords and sorts the remaining significant tokens, so paraphrased triggers (<em>"How do I parse JSON?"</em> ≡ <em>"parse JSON"</em>) collapse onto the same key and <code>frequency</code> actually accumulates toward graduation.</p>
+  <p><strong>Vector-hit twin lookup + orphan self-heal (2026-07-29):</strong> the vector-dedup bump used to
+  search the playbook under the <em>incoming</em> trigger only — but a reworded near-duplicate's JSON twin is
+  stored under <em>its own</em> trigger, so every reworded re-learn logged "no JSON twin to bump" and silently
+  dropped, starving the frequency counter. The bump now retries under the stored duplicate's own trigger
+  (recovered from the vector hit's <code>trigger</code> metadata, falling back to the document's
+  <code>SITUATION:</code> line via <code>_dup_trigger_from_vector_text</code>). When NEITHER trigger matches a
+  playbook row, the vector entry is a TRUE orphan (residue of a partial scrub) — previously it vetoed that
+  lesson on every future attempt; now the orphan is deleted and the lesson written fresh
+  (<code>learn_lesson</code> returns <code>"written"</code>), leaving both stores consistent. A bulk sweep,
+  <code>reconcile_vector_orphans(memory_system, limit=2000)</code>, runs as a rider on the skills-auto idle
+  cooldown (wired in <code>agent.py</code>): it scans <code>type="skill"</code> vector entries and deletes those
+  with no playbook twin — the twin test is token-<em>subset</em> so a metadata trigger truncated at 200 chars
+  still matches its full twin, and entries with no recoverable trigger are never deleted blind.
+  Tests: <code>tests/test_log_audit_fixes_2026_07_29.py</code>, <code>tests/test_skill_dedup.py</code>.</p>
 
   <h2>Listing lessons (user-facing surface)</h2>
   <p><code>list_lessons(scope, source, limit)</code> returns lessons filtered by time window and source, most-recent first. Boundaries use <strong>local wall-clock</strong>:</p>

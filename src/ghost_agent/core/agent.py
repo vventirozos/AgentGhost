@@ -1429,6 +1429,40 @@ def _is_single_self_play_command(text: str) -> bool:
     return len(lc.split()) <= 6
 
 
+def _challenge_output_prefixes(challenge_text) -> list:
+    """Extract literal output-line prefixes a self-play challenge pins down.
+
+    Challenges frequently specify their expected output as a backtick-quoted
+    template with an explicit placeholder, e.g. ``Output:
+    `TotalAllocatedQuantity: <sum>` ``. The literal label before the
+    placeholder is a cheap, high-precision fingerprint of the required
+    format: a correct solution's stdout MUST contain it verbatim.
+
+    Only templates of the shape ``Label: <value>`` / ``Label = {value}``
+    are mined — the label must end in ``:`` or ``=`` right before a
+    ``<...>``/``{...}`` placeholder. Anything looser (a bare ``<value>``,
+    a column sketch like `user_id net_balance`, code fragments with ``<``
+    comparisons) is ignored: without an unambiguous literal we cannot
+    tell format text from prose, and a false "literal" would wrongly veto
+    the short-circuit. Conservative by construction — the result is used
+    only to KEEP the confirmation turn, never to fail a run.
+    """
+    if not challenge_text:
+        return []
+    prefixes: list = []
+    for span in re.findall(r"`([^`\n]{4,160})`", str(challenge_text)):
+        m = re.match(r"^([^<{]{0,80}?[:=])\s*[<{]", span)
+        if not m:
+            continue
+        literal = m.group(1).strip()
+        # Require a real anchor: ≥3 chars including a letter, so a lone
+        # ":" or "=" fragment can never become a veto token.
+        if len(literal) >= 3 and re.search(r"[A-Za-z]", literal):
+            if literal not in prefixes:
+                prefixes.append(literal)
+    return prefixes
+
+
 # Phrases that, when they DOMINATE a short user message, mean "run a memory-
 # consolidation (dream) cycle now". `dream_mode` is the other terminal tool
 # subject to the same replay bug as `self_play` (its summary is persisted as
@@ -3161,6 +3195,12 @@ class GhostAgent:
             self._last_journal_at = datetime.datetime.min
         if not hasattr(self, '_last_dream_at'):
             self._last_dream_at = datetime.datetime.min
+        if not hasattr(self, '_dream_skip_streak'):
+            # Consecutive REM entries that skipped on the freshness gate
+            # ("only N new fragments"). Backs the cooldown off linearly so
+            # a quiet afternoon doesn't re-wake the dreamer every 30 min
+            # to print a skip line (4× churn, 2026-07-29 log audit).
+            self._dream_skip_streak = 0
         if not hasattr(self, '_last_reflection_at'):
             self._last_reflection_at = datetime.datetime.min
         if not hasattr(self, '_last_postmortem_at'):
@@ -3265,7 +3305,14 @@ class GhostAgent:
         if (self._bio_scaled(600) < idle_secs <= self._bio_scaled(3600)
                 and getattr(ctx.args, "no_dream", False) is not True):
             since_last_dream = (datetime.datetime.now() - self._last_dream_at).total_seconds()
-            if since_last_dream >= self._DREAM_COOLDOWN:
+            # Skip-streak backoff: each consecutive freshness-gate skip
+            # stretches the effective cooldown (30→60→90→120 min, capped),
+            # so quiet stretches stop re-waking the dreamer just to skip.
+            # Any dream that actually runs (or produces side-pass output)
+            # resets the streak below.
+            _dream_cooldown_eff = self._DREAM_COOLDOWN * (
+                1 + min(int(getattr(self, "_dream_skip_streak", 0)), 3))
+            if since_last_dream >= _dream_cooldown_eff:
                 try:
                     res = await asyncio.to_thread(
                         ctx.memory_system.collection.get,
@@ -3321,10 +3368,26 @@ class GhostAgent:
                         # for synthetic self-play below.
                         self._last_dream_at = datetime.datetime.now()
                         try:
-                            await dreamer.dream(model_name=getattr(ctx.args, 'model', 'default'))
-                            self._record_autonomous_activity(
-                                "dream",
-                                "REM cycle ran (memory consolidation / heuristic harvest)")
+                            _dream_msg = str(await dreamer.dream(
+                                model_name=getattr(ctx.args, 'model', 'default')) or "")
+                            _dream_skipped = (
+                                "Skipping REM" in _dream_msg
+                                or "Not enough entropy" in _dream_msg)
+                            _side_output = any(
+                                k in _dream_msg for k in
+                                ("Episodic pass", "Distilled", "digest"))
+                            if _dream_skipped and not _side_output:
+                                self._dream_skip_streak = getattr(
+                                    self, "_dream_skip_streak", 0) + 1
+                            else:
+                                self._dream_skip_streak = 0
+                            # Only ledger a cycle that actually did work —
+                            # "REM cycle ran" on a skip tick made the
+                            # activity digest overcount consolidation.
+                            if not _dream_skipped:
+                                self._record_autonomous_activity(
+                                    "dream",
+                                    "REM cycle ran (memory consolidation / heuristic harvest)")
                         finally:
                             # Do NOT reset ctx.last_activity_time here —
                             # see the comment in phase 1. Resetting it
@@ -3657,6 +3720,20 @@ class GhostAgent:
                         logger.warning(f"Skills auto-extraction failed: {e}")
                     finally:
                         self._last_skills_auto_at = datetime.datetime.now()
+                    # Store-hygiene rider on the same cooldown: drop vector
+                    # skill entries whose JSON playbook twin is gone. An
+                    # orphan wins the vector-dedup race and vetoes every
+                    # future re-learn of that lesson ("no JSON twin to
+                    # bump", 2026-07-29 log audit). Cheap bounded scan;
+                    # never raises.
+                    try:
+                        _sk = getattr(ctx, "skill_memory", None)
+                        _ms = getattr(ctx, "memory_system", None)
+                        if _sk is not None and hasattr(_sk, "reconcile_vector_orphans"):
+                            await asyncio.to_thread(
+                                _sk.reconcile_vector_orphans, _ms)
+                    except Exception as e:
+                        logger.debug(f"skill-store orphan reconcile skipped: {e}")
 
         # Phase 2.7: PRM retrain on accumulated trajectories
         # (every ~3 hours during idle, configurable via
@@ -3939,19 +4016,28 @@ class GhostAgent:
                         mc = getattr(ctx, 'metacog', None)
                         if mc is not None and getattr(mc, 'confidence', None) is not None:
                             mc.confidence.apply_fitted(params)
+                        # `refit=ok` used to be unconditional — reading as a
+                        # healthy calibration in the very cycle whose map was
+                        # REJECTED as anti-correlated (2026-07-29 log audit).
+                        # Surface the map verdict in the summary line.
+                        _map_status = getattr(params, "map_status", "applied")
                         _mc_emit(
-                            _mc_ss.CALIB, refit="ok",
+                            _mc_ss.CALIB,
+                            refit=("ok" if _map_status == "applied"
+                                   else f"map_{_map_status}"),
                             threshold=params.threshold,
                             w_entropy=params.w_entropy,
                             lam=params.lambda_uncertainty,
                             brier=params.brier, n=params.n_samples,
                         )
+                        _map_note = ("" if _map_status == "applied"
+                                     else f", map {_map_status}")
                         self._record_autonomous_activity(
                             "calibration",
                             f"confidence recalibrated "
                             f"(τ={params.threshold:.2f}, "
                             f"Brier={params.brier:.3f}, "
-                            f"n={params.n_samples})")
+                            f"n={params.n_samples}{_map_note})")
                     else:
                         logger.debug("calibration refit produced no fit (thin/single-class)")
                 except Exception as e:
@@ -4405,6 +4491,23 @@ class GhostAgent:
         processed = 0
         _done_digests = []  # per-item digests for the consolidation summary
         requeue = []  # items that failed upstream-transiently → back to the journal
+
+        def _ack_terminal(entry):
+            # Confirm a TERMINAL disposition (consolidated, or deliberately
+            # dropped) against the in-flight staging file. Without this, a
+            # COMPLETED batch stayed staged until the next non-empty drain —
+            # the idle loop only calls this drain when pending_count() > 0,
+            # so the last batch of a busy period sat "in-flight" for hours
+            # and recover_inflight() replayed it on every restart (2026-07-29:
+            # six deploy restarts re-consolidated the same items up to 6x).
+            # Re-queued items (transient failure / user-return suspension)
+            # are NOT acked: their staged copy is the crash backstop until
+            # the requeued copy is durably back in the queue file.
+            try:
+                self.context.journal.ack([entry])
+            except Exception as _ack_exc:
+                logger.debug("journal ack failed (non-fatal): %s", _ack_exc)
+
         for i, item in enumerate(items):
             if respect_idle:
                 idle_secs = (datetime.datetime.now() - self.context.last_activity_time).total_seconds()
@@ -4429,6 +4532,7 @@ class GhostAgent:
                         f"{item['type']}: {' '.join(_src.split())[:50]}")
                 except Exception:
                     _done_digests.append(str(item.get("type", "?")))
+                await asyncio.to_thread(_ack_terminal, item)
             except _RetryableConsolidation as e:
                 # The item was already popped, so dropping it here is
                 # PERMANENT — the fact never reaches memory and nothing
@@ -4452,9 +4556,13 @@ class GhostAgent:
                         f"failed re-queues: {e}",
                         level="WARNING", icon=Icons.WARN,
                     )
+                    await asyncio.to_thread(_ack_terminal, item)
             except Exception as e:
                 import logging
                 logging.getLogger("GhostAgent").error(f"Journal processing error: {e}")
+                # Non-retryable error → the item is dropped by design; ack it
+                # so a restart does not resurrect a poison item forever.
+                await asyncio.to_thread(_ack_terminal, item)
             await asyncio.sleep(0.5)
 
         if requeue:
@@ -5076,10 +5184,24 @@ class GhostAgent:
 
             _est_tokens = (len(base_prompt)
                            + len(json.dumps(payload.get("tools", [])))) // 4
+            # Log the warmed system-slot hash in the SAME form the live
+            # "Prefill Cache … sys h=…" line uses (2026-07-29): the two
+            # lines used to report different segments in different units
+            # (tokens-of-head vs chars-of-injection), so warmup
+            # effectiveness could not be checked from the log. Equal
+            # hashes = the warmed bytes are the live bytes; the tools hash
+            # legitimately varies per conversation (query-routed
+            # acquired-skill tail) and only shortens the match.
+            _sys_h = hashlib.sha1(
+                base_prompt.encode("utf-8", "ignore")).hexdigest()[:8]
+            _tools_h = hashlib.sha1(json.dumps(
+                payload.get("tools", []), sort_keys=True,
+            ).encode("utf-8", "ignore")).hexdigest()[:8]
             pretty_log(
                 "Main Prefix Warmup",
                 f"prefilling ~{_est_tokens} tokens of byte-stable request head "
-                f"(system slot + tool schemas) into the main node's cache",
+                f"(system slot + tool schemas) into the main node's cache · "
+                f"sys h={_sys_h} chars={len(base_prompt)} · tools h={_tools_h}",
                 icon=Icons.BOOT_AWAKE,
             )
             # Generous timeout: this IS the ~70s prefill we're absorbing.
@@ -8916,7 +9038,38 @@ class GhostAgent:
                                 # EXECUTION RESULT header and check
                                 # the body has real content.
                                 _body = str_res.split("STDOUT/STDERR:", 1)[-1].strip()
+                                # FORMAT GATE (2026-07-29): exit 0 +
+                                # non-empty stdout is NOT "matches the
+                                # spec". When the challenge pins an
+                                # explicit literal output prefix
+                                # (`Label: <value>`), require it in
+                                # stdout before skipping the
+                                # confirmation turn — otherwise KEEP
+                                # the turn so the model can compare
+                                # its output to the spec and fix the
+                                # print format. (Log-eval: per-resource
+                                # debug lines shipped straight to the
+                                # validator and failed the attempt
+                                # because exit 0 short-circuited the
+                                # turn that would have fixed them.)
+                                _format_ok = True
                                 if _ran_solution and len(_body) > 0:
+                                    _user_txt = " ".join(
+                                        str(_m.get("content") or "")
+                                        for _m in messages
+                                        if _m.get("role") == "user"
+                                    )
+                                    _want = _challenge_output_prefixes(_user_txt)
+                                    if _want and not any(p in _body for p in _want):
+                                        _format_ok = False
+                                        pretty_log(
+                                            "Self-Play Short-Circuit",
+                                            "kept confirmation turn — stdout lacks the "
+                                            f"challenge's pinned output prefix {_want[0]!r} "
+                                            "(format mismatch?).",
+                                            level="WARNING", icon=Icons.WARN,
+                                        )
+                                if _ran_solution and len(_body) > 0 and _format_ok:
                                     final_ai_content = (
                                         "solution.py executed successfully (exit 0)."
                                     )
@@ -12673,8 +12826,21 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                     # remaining buster. Cheap (one sha1 of already-built text).
                     try:
                         _sp_hash = hashlib.sha1(_stable_injection.encode("utf-8", "ignore")).hexdigest()[:8]
+                        # `sys h=` is the SYSTEM-SLOT hash, directly
+                        # comparable to the boot "Main Prefix Warmup …
+                        # sys h=…" line — a differing value means the warmed
+                        # head is NOT the bytes this request sends and the
+                        # warmup bought nothing (2026-07-29: the two log
+                        # lines measured different segments in different
+                        # units, so this was previously unverifiable).
+                        _sys_slot = next(
+                            (str(m.get("content") or "") for m in req_messages
+                             if m.get("role") == "system"), "")
+                        _sys_h = hashlib.sha1(
+                            _sys_slot.encode("utf-8", "ignore")).hexdigest()[:8]
                         pretty_log(
                             "Prefill Cache",
+                            f"sys h={_sys_h} chars={len(_sys_slot)} · "
                             f"stable-prefix h={_sp_hash} len={len(_stable_injection)} · "
                             f"volatile dyn_state len={len(dynamic_state)}",
                             icon=Icons.BRAIN_CTX,

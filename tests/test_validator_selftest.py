@@ -55,10 +55,20 @@ class TestInstrumentValidator:
         """)
         assert _instrument_validator_for_self_test(src) is None
 
-    def test_inserts_probe_and_truncates_solution_run(self):
+    def test_inserts_probe_before_solution_run(self):
         """The probe must (a) include expected_output construction and
-        (b) replace the `subprocess.run(solution.py)` tail so the probe
-        exits without actually running the solver."""
+        (b) fire BEFORE the `subprocess.run(solution.py)` statement so the
+        solver is never actually invoked.
+
+        Contract CHANGED 2026-07-29: the probe is INSERTED (the run line
+        survives textually, unreachable behind SystemExit) instead of
+        truncating the tail — required so a validator wrapped in
+        ``def main(): ... / main()`` can be instrumented inside the
+        function body without amputating the trailing ``main()`` call.
+        The no-solver guarantee is now dynamic, asserted below by
+        executing the probed source: it must raise SystemExit(42) without
+        ever reaching subprocess.run.
+        """
         src = dedent("""
             import subprocess
             expected_output = "42"
@@ -71,15 +81,16 @@ class TestInstrumentValidator:
         assert "GHOST SELFTEST PROBE" in probed
         assert _SELFTEST_DUMP_START in probed
         assert _SELFTEST_DUMP_END in probed
-        # Probe must SHORT-CIRCUIT: the original subprocess.run line is
-        # replaced by the probe that raises SystemExit(42) — so
-        # `subprocess.run(` on solution.py must NOT survive in the
-        # probed source. (A surviving subprocess.run would re-invoke
-        # the solver, defeating the whole gate.)
-        assert "subprocess.run(" not in probed
-        # But the expected_output construction above the run call must
-        # survive — that's what we're dumping.
+        # The probe must sit BEFORE the (kept, unreachable) run line.
+        assert probed.index("GHOST SELFTEST PROBE") < probed.index("subprocess.run(")
+        # The expected_output construction above the run call survives —
+        # that's what we're dumping.
         assert 'expected_output = "42"' in probed
+        # Dynamic no-solver guarantee: executing the probed source raises
+        # SystemExit(42) before subprocess.run could ever fire.
+        with pytest.raises(SystemExit) as exc:
+            exec(compile(probed, "<probed>", "exec"), {"__name__": "__main__"})
+        assert exc.value.code == _SELFTEST_PROBE_EXIT_CODE
 
     def test_probe_is_syntactically_valid_python(self):
         src = dedent("""

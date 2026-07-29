@@ -346,6 +346,16 @@ class FittedParams:
     # deliberately — the number makes that visible instead of leaving an
     # operator to wonder why the weight never moves.
     n_entropy_observed: int = 0
+    # What happened to the Platt probability map in this fit:
+    #   "applied"            — map adopted;
+    #   "rejected_inverted"  — slope <= 0 (composite anti-correlated),
+    #                          identity map kept;
+    #   "rejected_step"      — slope > _MAX_SLOPE backstop, identity kept;
+    #   "discarded_worse"    — calibrated Brier no better than raw.
+    # The refit summary line must surface this — logging `refit=ok` while
+    # the map was rejected reads as a healthy calibration when the score
+    # is in fact predicting nothing (2026-07-29 log audit).
+    map_status: str = "applied"
 
 
 @dataclass
@@ -696,6 +706,7 @@ class CalibrationTracker:
         # over a 0.02-wide range moves probabilities less than a = 0.3 over
         # the full unit interval.
         _MAX_SLOPE = 50.0
+        map_status = "applied"
         if platt_a <= 0.0:
             logger.warning(
                 "calibration: REJECTED the probability map (slope %.3f <= 0)."
@@ -706,6 +717,7 @@ class CalibrationTracker:
             platt_a, platt_b = 1.0, 0.0
             calibrated = composites
             brier = brier_raw
+            map_status = "rejected_inverted"
         elif platt_a > _MAX_SLOPE:
             logger.warning(
                 "calibration: REJECTED the probability map (slope %.1f > %.1f)."
@@ -716,6 +728,7 @@ class CalibrationTracker:
             platt_a, platt_b = 1.0, 0.0
             calibrated = composites
             brier = brier_raw
+            map_status = "rejected_step"
         elif brier_cal <= brier_raw:
             brier = brier_cal
         else:
@@ -725,6 +738,7 @@ class CalibrationTracker:
             platt_a, platt_b = 1.0, 0.0
             calibrated = composites
             brier = brier_raw
+            map_status = "discarded_worse"
         if brier > brier_base:
             logger.warning(
                 "calibration: fitted model (Brier %.4f) is WORSE than always "
@@ -753,6 +767,7 @@ class CalibrationTracker:
             brier_base_rate=round(brier_base, 6),
             w_effort=round(w_eff, 4),
             n_effort_observed=len(eff_observed),
+            map_status=map_status,
         )
         self._save_params(params)
         return params
@@ -789,6 +804,7 @@ class CalibrationTracker:
                 brier_base_rate=float(d.get("brier_base_rate", -1.0)),
                 w_effort=float(d.get("w_effort", 0.0)),
                 n_effort_observed=int(d.get("n_effort_observed", 0)),
+                map_status=str(d.get("map_status", "applied")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             logger.debug("calibration params malformed: %s", exc)
@@ -827,6 +843,8 @@ class CalibrationTracker:
             "threshold": params.threshold if params else None,
             "w_entropy": params.w_entropy if params else None,
             "lambda_uncertainty": params.lambda_uncertainty if params else None,
+            "map_status": (getattr(params, "map_status", "applied")
+                           if params else None),
         }
 
 

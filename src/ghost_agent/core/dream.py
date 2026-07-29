@@ -79,6 +79,7 @@ _MOCK_FILE_EXTS = (
 # that resolves wins.
 _EXPECTED_VAR_NAMES = (
     "expected_output",
+    "expected_output_lines",
     "expected_lines",
     "expected",
     "expected_text",
@@ -97,6 +98,146 @@ _SELFTEST_DUMP_END = "<<<__GHOST_SELFTEST_EXPECTED_END__>>>"
 _SELFTEST_PROBE_EXIT_CODE = 42
 
 
+_CHALLENGE_BOILERPLATE_RE = re.compile(
+    r"^\s*you are (?:given|tasked with(?: analyzing)?|provided(?: with)?)"
+    r"[^.]*?named\s+`?([\w./-]+)`?\s*\.\s*", re.I)
+_CHALLENGE_FILENAME_RE = re.compile(
+    r"[\w./-]+\.(?:csv|tsv|json|jsonl|db|sqlite|txt|log|parquet|xml|yaml|yml)\b",
+    re.I)
+
+
+def _challenge_fingerprint(head: str, max_len: int = 110) -> str:
+    """Compress a recent-challenge head into a `filename — gist` line for
+    the generator's negative-example block. Quoting full prose heads gave
+    the model a dozen in-context copies of the exact skeleton the block
+    bans; a fingerprint carries the don't-reuse signal without modelling
+    the shape (2026-07-29)."""
+    head = " ".join(str(head or "").split())
+    if not head:
+        return ""
+    files = _CHALLENGE_FILENAME_RE.findall(head)
+    gist = _CHALLENGE_BOILERPLATE_RE.sub("", head)
+    prefix = f"{files[0]} — " if files else ""
+    return (prefix + gist)[:max_len]
+
+
+def _record_selftest_skip(context, reason: str, detail: str = "") -> None:
+    """Ledger a validator-selftest skip so the gate's dark time is
+    countable (introspect action='activity' / learning-health report),
+    not just a WARNING line scrolling past in the stream. Never raises —
+    telemetry must not break challenge generation."""
+    try:
+        from .autonomous_activity import get_activity_log
+        log = get_activity_log(context)
+        if log is not None:
+            log.record("selfplay_selftest_skip",
+                       f"{reason}: {detail}" if detail else reason)
+    except Exception:
+        pass
+
+
+def _is_solution_run_call(node) -> bool:
+    """True when `node` is a `subprocess.run(...)` call whose first
+    positional argument references `solution.py`."""
+    import ast
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "run"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "subprocess"):
+        return False
+    if not node.args:
+        return False
+    try:
+        return "solution.py" in ast.unparse(node.args[0])
+    except Exception:
+        return False
+
+
+def _innermost_stmt_with_solution_run(body):
+    """Depth-first: the innermost *statement* whose subtree contains the
+    solution.py subprocess.run call, or None. Descends into compound
+    statements (if/for/while/try/with) AND function bodies, so a
+    validator that wraps its logic in ``def main(): ...`` gets the probe
+    inserted inside the function — where its local ``expected_*`` vars
+    are actually visible — instead of uselessly before the ``def`` line
+    (2026-07-29: that shape was a guaranteed exit-43 skip)."""
+    import ast
+    for stmt in body:
+        if not any(_is_solution_run_call(c) for c in ast.walk(stmt)):
+            continue
+        for field in ("body", "orelse", "finalbody"):
+            inner = getattr(stmt, field, None)
+            if isinstance(inner, list) and inner:
+                deeper = _innermost_stmt_with_solution_run(inner)
+                if deeper is not None:
+                    return deeper
+        for handler in getattr(stmt, "handlers", []) or []:
+            deeper = _innermost_stmt_with_solution_run(handler.body)
+            if deeper is not None:
+                return deeper
+        return stmt
+    return None
+
+
+def _discover_expected_names(tree) -> list:
+    """Names assigned anywhere in the validator that LOOK like an
+    expected-output holder (``exp_out``, ``want_lines``, ``target_output``
+    …) but aren't in the canonical `_EXPECTED_VAR_NAMES` list. Fed to the
+    probe as second-tier candidates: dumping a slightly-wrong variable is
+    safe (a mismatched echo lands on the non-blocking INCONCLUSIVE path),
+    while not dumping anything is a guaranteed skipped gate."""
+    import ast
+    import re as _re
+    pat = _re.compile(r"expected|expect|exp_|exp\b|golden|correct|want|"
+                      r"reference|target_out", _re.IGNORECASE)
+    found: list = []
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for t in targets:
+            if isinstance(t, ast.Name) and pat.search(t.id):
+                if t.id not in found and t.id not in _EXPECTED_VAR_NAMES:
+                    found.append(t.id)
+    return found
+
+
+def _mine_expected_compare_expr(tree):
+    """The unparsed source of the first string-literal / f-string operand
+    used in a ``==`` / ``!=`` comparison — the shape of a validator that
+    builds its expected line INLINE (``if out != f"Total: {n}":``) and
+    never binds an ``expected_*`` name at all (2026-07-29: the other
+    guaranteed exit-43 shape). The probe eval()s it best-effort; if its
+    inputs only exist after the solution run, the eval fails quietly and
+    the probe falls through to exit 43 as before."""
+    import ast
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+            continue
+        for side in [node.left] + list(node.comparators):
+            is_str_literal = (
+                isinstance(side, ast.JoinedStr)
+                or (isinstance(side, ast.Constant) and isinstance(side.value, str))
+            )
+            if not is_str_literal:
+                continue
+            # A bare constant like "" or "FAIL" is not an output template.
+            try:
+                rendered = ast.unparse(side)
+            except Exception:
+                continue
+            if isinstance(side, ast.Constant) and len(str(side.value).strip()) < 4:
+                continue
+            return rendered
+    return None
+
+
 def _instrument_validator_for_self_test(validator_src: str):
     """Return an instrumented copy of `validator_src` that dumps its
     `expected_*` variable to stdout with sentinel markers and exits
@@ -105,6 +246,17 @@ def _instrument_validator_for_self_test(validator_src: str):
     treats "couldn't instrument" as "skip gate, don't block
     generation", so a validator whose structure we don't recognise
     still proceeds through normal quality gates.
+
+    Widened 2026-07-29 (exit-43 skips were recurring live):
+      * the probe is inserted before the INNERMOST statement containing
+        the solution.py run — including inside ``def main():`` bodies;
+      * loosely-named expected holders (``exp_out``, ``want`` …) are
+        second-tier dump candidates;
+      * an inline compare template (``if out != f"Total: {n}":``) is
+        eval()'d as a last resort before giving up with exit 43;
+      * the probe is INSERTED (rest of file kept) rather than truncating
+        the tail — required for in-function insertion, equivalent at top
+        level because the probe raises SystemExit.
     """
     import ast
     try:
@@ -112,44 +264,18 @@ def _instrument_validator_for_self_test(validator_src: str):
     except SyntaxError:
         return None
 
-    # Find the FIRST top-level statement that contains a
-    # subprocess.run(...) call whose first positional argument
-    # references `solution.py`. We insert our probe right before that
-    # statement — at that point every `expected_*` variable the
-    # validator builds is fully populated (including `expected_lines`
-    # after all `.append()` calls).
-    target_lineno = None
-    for stmt in tree.body:
-        for sub in ast.walk(stmt):
-            if not isinstance(sub, ast.Call):
-                continue
-            # Match `subprocess.run(...)` specifically.
-            func = sub.func
-            is_subprocess_run = (
-                isinstance(func, ast.Attribute)
-                and func.attr == "run"
-                and isinstance(func.value, ast.Name)
-                and func.value.id == "subprocess"
-            )
-            if not is_subprocess_run:
-                continue
-            if not sub.args:
-                continue
-            try:
-                first_src = ast.unparse(sub.args[0])
-            except Exception:
-                continue
-            if "solution.py" in first_src:
-                target_lineno = stmt.lineno
-                break
-        if target_lineno is not None:
-            break
-
-    if target_lineno is None:
+    target_stmt = _innermost_stmt_with_solution_run(tree.body)
+    if target_stmt is None:
         return None
+    target_lineno = target_stmt.lineno
+    indent = " " * getattr(target_stmt, "col_offset", 0)
+
+    candidates = list(_EXPECTED_VAR_NAMES) + _discover_expected_names(tree)
+    mined_expr = _mine_expected_compare_expr(tree)
 
     lines = validator_src.splitlines()
     before = lines[: target_lineno - 1]
+    after = lines[target_lineno - 1:]
 
     # Probe snippet: try each candidate variable name, dump the first
     # one that's defined and non-empty. Use both locals() and
@@ -159,7 +285,7 @@ def _instrument_validator_for_self_test(validator_src: str):
         "",
         "# === GHOST SELFTEST PROBE (auto-inserted, not user code) ===",
         "import sys as _ghost_sys",
-        f"_ghost_candidates = {list(_EXPECTED_VAR_NAMES)!r}",
+        f"_ghost_candidates = {candidates!r}",
         "_ghost_scope = {}",
         "_ghost_scope.update(globals())",
         "_ghost_scope.update(locals())",
@@ -170,6 +296,16 @@ def _instrument_validator_for_self_test(validator_src: str):
         "        if _ghost_val:",
         "            _ghost_dump = _ghost_val",
         "            break",
+    ]
+    if mined_expr:
+        probe += [
+            "if _ghost_dump is None:",
+            "    try:",
+            f"        _ghost_dump = eval({mined_expr!r}, dict(_ghost_scope))",
+            "    except Exception:",
+            "        _ghost_dump = None",
+        ]
+    probe += [
         "if _ghost_dump is None:",
         "    _ghost_sys.stderr.write('GHOST_SELFTEST_NO_EXPECTED_VAR\\n')",
         "    raise SystemExit(43)",
@@ -184,8 +320,9 @@ def _instrument_validator_for_self_test(validator_src: str):
         f"raise SystemExit({_SELFTEST_PROBE_EXIT_CODE})",
         "# === END GHOST SELFTEST PROBE ===",
     ]
+    probe = [indent + p if p else p for p in probe]
 
-    return "\n".join(before) + "\n" + "\n".join(probe) + "\n"
+    return "\n".join(before) + "\n" + "\n".join(probe) + "\n" + "\n".join(after) + "\n"
 
 
 def _extract_selftest_dump(stdout: str):
@@ -218,6 +355,81 @@ def _looks_like_validator_crash(stdout_or_stderr: str) -> bool:
     # `.validator.py` shows up there, the innermost frame is in the
     # validator itself.
     return ".validator.py" in stdout_or_stderr[-800:]
+
+
+# `.split("\n")` written with a LITERAL backslash-n (the two characters
+# `\` `n`) never splits real multi-line output — the whole stdout stays one
+# "line" and every solution fails with "expected N lines, got 1" no matter
+# what it prints (2026-07-29 overnight run: 3/3 correct solutions rejected).
+# Scanned on comment-stripped (but string-preserving) source: the bug lives
+# inside a string literal — which _strip_python_comments_and_strings would
+# remove — while a defensive comment quoting the anti-pattern must NOT
+# re-trigger the lint (the reject reason feeds back into the regen prompt).
+# Covers the escaped form (`"\\n"` in source) and the raw-string form
+# (`r"\n"`, identical at runtime). `re.split("\n", ...)` is excluded via
+# lookbehind: the regex engine interprets that escape as a real newline.
+_LITERAL_BACKSLASH_SPLIT_RE = re.compile(
+    r"""(?<!re)\.split(?:lines)?\(\s*(?:(['"])(?:\\\\[nrt])+\1|[rR](['"])(?:\\[nrt])+\2)""")
+
+
+def _strip_python_comments(source: str) -> str:
+    """Remove comments — and ONLY comments — from Python source. String
+    literals survive (unlike ``_strip_python_comments_and_strings``), so
+    marker scans that target code-level string arguments still see them.
+    Best-effort: malformed source is returned unchanged."""
+    if not source:
+        return ""
+    try:
+        import io
+        import tokenize
+        out_tokens = [
+            tok for tok in tokenize.generate_tokens(io.StringIO(source).readline)
+            if tok.type != tokenize.COMMENT
+        ]
+        return tokenize.untokenize(out_tokens)
+    except Exception:
+        return source
+
+
+def _has_literal_backslash_split(source: str) -> bool:
+    """True when `source` splits on a literal backslash-escape string —
+    ``.split("\\\\n")`` or ``.split(r"\\n")`` in source text — a line-split
+    that can never match real newlines in captured output."""
+    return bool(_LITERAL_BACKSLASH_SPLIT_RE.search(
+        _strip_python_comments(source or "")))
+
+
+_FEEDBACK_EXPECTED_RE = re.compile(r"Expected[^\[]{0,80}(\[.*?\])", re.DOTALL)
+_FEEDBACK_ACTUAL_RE = re.compile(r"Actual[^\[]{0,80}(\[.*?\])", re.DOTALL)
+
+
+def _feedback_shows_joined_actual(feedback: str) -> bool:
+    """True when validator feedback proves the solution's output was
+    CORRECT but captured as a single un-split element: the "actual" list
+    has exactly one string whose lines equal the expected list. That is
+    the signature of a validator whose line-split is broken (literal
+    backslash-n split) — no retry can fix a hidden validator, so the
+    attempt loop should abort as validator-infra instead of recording a
+    false failure. Best-effort: any parse problem returns False."""
+    if not feedback or "Expected" not in feedback or "Actual" not in feedback:
+        return False
+    try:
+        import ast as _ast
+        m_exp = _FEEDBACK_EXPECTED_RE.search(feedback)
+        m_act = _FEEDBACK_ACTUAL_RE.search(feedback)
+        if not m_exp or not m_act:
+            return False
+        expected = _ast.literal_eval(m_exp.group(1))
+        actual = _ast.literal_eval(m_act.group(1))
+        if not isinstance(expected, (list, tuple)) or not isinstance(actual, (list, tuple)):
+            return False
+        if len(actual) != 1 or not isinstance(actual[0], str) or len(expected) <= 1:
+            return False
+        actual_lines = [l.strip() for l in actual[0].splitlines() if l.strip()]
+        expected_lines = [str(x).strip() for x in expected]
+        return actual_lines == expected_lines
+    except Exception:
+        return False
 
 # Patterns that, when present in a validator, indicate it is generating
 # its own data from scratch (random seed) instead of reading what the
@@ -454,6 +666,24 @@ def validate_challenge_quality(setup_script: str, validation_script: str) -> tup
             return False, (
                 f"setup_script has SyntaxError at line {e.lineno}: {e.msg}."
             )
+
+    # A line-split written with a LITERAL backslash-n (`.split("\\n")` in
+    # source) never splits real captured output — every solution collapses
+    # to "1 line" and fails regardless of correctness (2026-07-29 overnight
+    # run: 3/3 correct solutions rejected). Deterministic and statically
+    # visible, so reject at generation with the exact fix.
+    if _has_literal_backslash_split(validation_script):
+        # Do NOT quote the offending snippet back: the reason is injected
+        # into the regen prompt, and a model that echoes it (even in a
+        # comment or string) would re-introduce the very pattern.
+        return False, (
+            "validation_script splits captured output on a LITERAL "
+            "backslash sequence (a backslash character followed by the "
+            "letter n) instead of a real newline, so the split never "
+            "fires and every solution collapses to one line. Use "
+            "`.splitlines()` to split output into lines — do not pass "
+            "any backslash-containing separator to split()."
+        )
 
     # Datetime import-style misuse is a deterministic runtime crash the
     # syntax check can't see — and it killed two cycles in one overnight
@@ -1389,7 +1619,11 @@ class Dreamer:
         if not self.memory or not self.memory.collection:
             return "Memory system not available."
 
-        pretty_log("Dream Mode", "Entering REM cycle (Consolidating Memory & Extracting Heuristics)...", icon=Icons.DREAM)
+        # Entry is announced AFTER the freshness gate below (2026-07-29):
+        # announcing here meant every idle wakeup printed "Entering REM
+        # cycle… / pool thin — dreaming over 40 digests…" and then
+        # immediately "Skipping REM — only 2 new fragments" (4× in one
+        # morning). On a skip tick the skip line is now the only line.
 
         # NOTE (2026-07-20): dream no longer drains the short-term journal.
         # The old drain wrote raw `smart_memory` text straight into the
@@ -1488,6 +1722,7 @@ class Dreamer:
         ids = results['ids']
         documents = results['documents']
         seeded_from_trajectories = False
+        _pool_thin_note = None
 
         if len(documents) < 3:
             # Trajectory fallback (2026-07-09): the auto-memory pool is
@@ -1504,12 +1739,13 @@ class Dreamer:
                 seeded_from_trajectories = True
                 ids = t_ids + sp_ids
                 documents = t_docs + sp_docs
-                pretty_log(
-                    "Dream Mode",
+                # Deferred to after the freshness gate (2026-07-29) —
+                # "dreaming over N digests" right before "Skipping REM"
+                # was the churn signature.
+                _pool_thin_note = (
                     f"Auto-memory pool thin ({len(results['ids'])}) — "
                     f"dreaming over {len(t_docs)} trajectory + "
-                    f"{len(sp_docs)} self-play digests instead",
-                    icon=Icons.DREAM,
+                    f"{len(sp_docs)} self-play digests instead"
                 )
             else:
                 msg = ("Not enough entropy to dream. (Need ≥3 auto-memories "
@@ -1578,6 +1814,12 @@ class Dreamer:
                 msg += f" Wrote {project_digests} project digest(s)."
             pretty_log("Dream Mode", msg, icon=Icons.SKIP)
             return msg
+
+        # Freshness gate passed — NOW announce the cycle (see the note at
+        # the top of this method).
+        pretty_log("Dream Mode", "Entering REM cycle (Consolidating Memory & Extracting Heuristics)...", icon=Icons.DREAM)
+        if _pool_thin_note:
+            pretty_log("Dream Mode", _pool_thin_note, icon=Icons.DREAM)
 
         mem_list = [f"ID:{i} | {doc}" for i, doc in zip(ids, documents)]
         mem_block = "\n".join(mem_list[:150])
@@ -3099,7 +3341,12 @@ Return ONLY a JSON object with:
                 logger.warning(f"Frontier seed pick failed: {e}")
         if seed.get("hint"):
             system_message += f"\n\n### FRONTIER SEED (curiosity-driven curriculum)\n{seed['hint']}"
-            pretty_log("Self-Play Frontier", f"Targeting cluster '{seed.get('cluster_key')}' (mode={seed['mode']})", icon=Icons.BRAIN_AIM)
+            # Exploration seeds carry a hint but no cluster — don't render
+            # the literal string 'None' as a cluster name.
+            _seed_cluster = seed.get("cluster_key")
+            _seed_desc = (f"Targeting cluster '{_seed_cluster}'"
+                          if _seed_cluster else "No target cluster")
+            pretty_log("Self-Play Frontier", f"{_seed_desc} (mode={seed['mode']})", icon=Icons.BRAIN_AIM)
         else:
             pretty_log("Self-Play Frontier", f"Mode={seed['mode']} (no frontier seed)", icon=Icons.BRAIN_AIM)
 
@@ -3118,8 +3365,16 @@ Return ONLY a JSON object with:
             except Exception:
                 _recent_heads = []
             if _recent_heads:
+                # Compact FINGERPRINTS, not prose heads (2026-07-29): the
+                # old block quoted 12 full "You are given a file named X…"
+                # openers — a dozen in-context examples of the exact
+                # skeleton we were trying to ban, which the generator
+                # pattern-completed right back (0.62-0.80 overlap rejects
+                # kept firing WITH the steer in place). A filename + gist
+                # line carries the "don't reuse" signal without modelling
+                # the shape.
                 _themes = "\n".join(
-                    f"- {h[:160]}" for h in _recent_heads
+                    f"- {_challenge_fingerprint(h)}" for h in _recent_heads
                 )
                 system_message += (
                     "\n\n### RECENTLY GENERATED CHALLENGES (do NOT repeat)\n"
@@ -3128,6 +3383,29 @@ Return ONLY a JSON object with:
                     "mock-file name AND analytical goal — a reworded copy "
                     "will be rejected:\n" + _themes
                 )
+                # Skeleton-collapse steer: when most of the recent window
+                # shares the single-file→aggregate→print skeleton, banning
+                # themes is not enough — the next challenge must change
+                # SHAPE, not just nouns.
+                _skel = sum(
+                    1 for h in _recent_heads
+                    if re.match(r"\s*you are (?:given|tasked)", h, re.I)
+                )
+                if _skel * 2 >= len(_recent_heads):
+                    system_message += (
+                        "\n\n### SHAPE ROTATION (mandatory)\n"
+                        "Recent challenges above all share one skeleton: "
+                        "read a single generated file, aggregate, print a "
+                        "summary. Do NOT produce that skeleton again. Pick "
+                        "a structurally different task instead, e.g.: "
+                        "reconcile TWO files that partially disagree; replay "
+                        "an event stream with stateful rules (sessions, "
+                        "retries, timeouts); parse records with MALFORMED "
+                        "lines that must be detected and recovered; a graph/"
+                        "algorithmic computation (shortest path, topological "
+                        "order, interval merging); or transform one text "
+                        "format into another with strict formatting rules."
+                    )
 
         # Coverage steer (2026-07-27 log eval): when the seed doesn't pin a
         # cluster, tell the generator which clusters are starved. 82% of
@@ -3731,13 +4009,28 @@ Return ONLY a JSON object with:
                     _dup_sim, _dup_head = 0.0, ""
                 if _dup_sim >= 0.60:
                     ok = False
+                    # Name the SHARED identifier tokens explicitly — "be
+                    # different" retries kept landing 0.6+ again; a banned-
+                    # token list gives the regen a concrete target
+                    # (2026-07-29).
+                    try:
+                        _shared = sorted(
+                            frontier_tracker._challenge_token_set(challenge)
+                            & frontier_tracker._challenge_token_set(_dup_head)
+                        )[:12]
+                    except Exception:
+                        _shared = []
+                    _banned = (
+                        f" BANNED tokens for the retry (all shared with the "
+                        f"duplicate): {', '.join(_shared)}." if _shared else ""
+                    )
                     reason = (
                         f"challenge is a near-duplicate (token overlap "
                         f"{_dup_sim:.2f}) of one generated recently: "
                         f"\"{_dup_head[:140]}…\". Generate a challenge on a "
                         f"DIFFERENT theme: new domain, new file format, new "
                         f"analytical goal — do not reuse the same mock "
-                        f"dataset name or scenario."
+                        f"dataset name or scenario.{_banned}"
                     )
             if (
                 ok
@@ -4060,6 +4353,16 @@ Return ONLY a JSON object with:
                 )
 
         pretty_log("Synthetic Challenge", challenge[:80] + "...", icon=Icons.TOOL_CODE)
+
+        # PRE-VERIFIED shapes: deterministic templates (hand-written, winnable
+        # by construction) and journal-mined challenges ship without a
+        # <reference_solution> BY DESIGN. The sandbox gates below exist to
+        # police LLM-generated challenges; running their reject paths — or
+        # their "gate skipped" warnings — against a template is pure
+        # false-positive noise (a template whose expected var holds a raw
+        # answer while stdout must be SHAPED, e.g. `FOUND=blob3.txt`, fails
+        # the echo probe by construction).
+        _pre_verified_shape = bool(journal_source or _tpl is not None)
 
         class ReadOnlySkillMemory:
             # Marker: any callsite that wants to skip an expensive
@@ -4521,6 +4824,23 @@ Return ONLY a JSON object with:
                 # rather let a subtle bug through than block a
                 # legitimate challenge.
                 selftest_probe_src = _instrument_validator_for_self_test(validation_script)
+                if selftest_probe_src is None and not _pre_verified_shape:
+                    # LOUD skip (2026-07-29): a silently-skipped gate shipped a
+                    # validator that failed every correct solution. The skip
+                    # stays non-blocking, but it must be visible so a shipped
+                    # challenge can be traced to "no sandbox gate verified it".
+                    # Pre-verified shapes (templates / journal-mined) are
+                    # exempt — they never needed this gate.
+                    pretty_log(
+                        "Self-Play Validator Selftest",
+                        "SKIPPED — could not instrument the validator (no "
+                        "top-level subprocess.run('solution.py') statement "
+                        "found). The validator ships without an echo check.",
+                        level="WARNING", icon=Icons.WARN,
+                    )
+                    _record_selftest_skip(
+                        isolated_context, "not_instrumentable",
+                        "no subprocess.run('solution.py') statement found")
                 if selftest_probe_src is not None:
                     try:
                         selftest_path = Path(temp_sandbox) / ".validator_selftest.py"
@@ -4531,6 +4851,23 @@ Return ONLY a JSON object with:
                             30,
                         )
                         dumped = _extract_selftest_dump(st_out or "")
+                        if dumped is None and not _pre_verified_shape:
+                            # The probe ran but produced no expected-output
+                            # dump (exit 43 = no expected_* var in scope at
+                            # the insertion point — e.g. the validator
+                            # computes `expected` AFTER running solution.py).
+                            # Non-blocking, but LOUD (2026-07-29).
+                            pretty_log(
+                                "Self-Play Validator Selftest",
+                                "SKIPPED — probe ran but dumped no expected "
+                                "output (exit %s). The validator ships without "
+                                "an echo check. Probe tail:\n%s"
+                                % (st_code, (st_out or "")[-300:]),
+                                level="WARNING", icon=Icons.WARN,
+                            )
+                            _record_selftest_skip(
+                                isolated_context, "no_expected_var",
+                                f"probe exit {st_code}")
                         if dumped is not None:
                             # Write a probe solution.py that echoes the
                             # dumped expected output. Use repr() to get
@@ -4560,12 +4897,52 @@ Return ONLY a JSON object with:
                                 "python3 .validator.py",
                                 30,
                             )
-                            if sv_code != 0 and _looks_like_validator_crash(sv_out or ""):
+                            # A non-zero exit here is SUSPICIOUS but not proof:
+                            # the echo probe writes the expected variable
+                            # VERBATIM, so a validator that legitimately
+                            # requires SHAPED stdout (expected holds the raw
+                            # answer, output must read `FOUND=blob3.txt`), or
+                            # that compares with an exact trailing newline the
+                            # probe's dump-extraction strips, fails the echo
+                            # while being perfectly winnable. Rejecting on any
+                            # non-zero exit would forfeit those idle slots.
+                            # Reject only on EVIDENCE of an internal
+                            # contradiction: the validator crashed in its own
+                            # frame, or its own output shows the joined-actual
+                            # signature (correct content rejected as one
+                            # un-split line — the 2026-07-29 bug). Anything
+                            # else is logged as inconclusive and allowed
+                            # through, keeping the gate's stated doctrine
+                            # (false negatives > false positives).
+                            _echo_crash = _looks_like_validator_crash(sv_out or "")
+                            _echo_joined = _feedback_shows_joined_actual(sv_out or "")
+                            if (sv_code != 0 and not (_echo_crash or _echo_joined)
+                                    and not _pre_verified_shape):
+                                # Templates DO legitimately fail the echo (shaped
+                                # output) — logging that every cycle is alarm
+                                # fatigue on the most common non-LLM path.
                                 pretty_log(
                                     "Self-Play Validator Selftest",
-                                    "Validator crashes on its OWN expected_output "
+                                    "INCONCLUSIVE — validator exited "
+                                    f"{sv_code} on its own expected output with no "
+                                    "contradiction signature (it likely requires "
+                                    "SHAPED output the echo probe can't produce). "
+                                    "Allowing the challenge through.\n"
+                                    f"Validator output tail:\n{(sv_out or '')[-300:]}",
+                                    level="WARNING", icon=Icons.WARN,
+                                )
+                                _record_selftest_skip(
+                                    isolated_context, "inconclusive_echo",
+                                    f"validator exit {sv_code} on own expected output")
+                            if sv_code != 0 and (_echo_crash or _echo_joined):
+                                _mode = ("crashes" if _echo_crash
+                                         else "REJECTS its own correct output "
+                                              "(broken line-split)")
+                                pretty_log(
+                                    "Self-Play Validator Selftest",
+                                    f"Validator {_mode} on its OWN expected_output "
                                     f"(internal contradiction). Rejecting challenge.\n"
-                                    f"Validator stderr tail:\n{(sv_out or '')[-400:]}",
+                                    f"Validator output tail:\n{(sv_out or '')[-400:]}",
                                     level="ERROR", icon=Icons.STOP,
                                 )
                                 # Clean up probe artefacts so nothing
@@ -4577,11 +4954,12 @@ Return ONLY a JSON object with:
                                         pass
                                 return (
                                     "Synthetic challenge generation failed: the "
-                                    "validator crashes on its own expected_output "
-                                    "— an internal contradiction (commonly a `%` / "
-                                    "`$` / `ms` suffix in the expected format that "
-                                    "the validator then tries to parse with "
-                                    "`float()` / `int()` without stripping). The "
+                                    "validator crashes on, or rejects, its own "
+                                    "expected_output — an internal contradiction "
+                                    "(commonly a `%` / `$` / `ms` suffix parsed "
+                                    "with `float()` / `int()` without stripping, "
+                                    "or a line-split that never splits real "
+                                    "output). The "
                                     "challenge is unwinnable by construction and "
                                     "has been discarded.\n\nValidator tail:\n"
                                     f"{(sv_out or '')[-400:]}\n\nSYSTEM INSTRUCTION: "
@@ -4600,9 +4978,19 @@ Return ONLY a JSON object with:
                         except Exception:
                             pass
                     except Exception as _selftest_e:
-                        logger.debug(
-                            f"Validator self-test gate errored (non-fatal): {_selftest_e}"
+                        # Elevated from debug (2026-07-29): a gate that dies
+                        # silently is indistinguishable from a gate that
+                        # passed — the operator must be able to see that a
+                        # shipped challenge was never echo-verified.
+                        pretty_log(
+                            "Self-Play Validator Selftest",
+                            f"SKIPPED — gate errored (non-fatal): {_selftest_e}. "
+                            "The validator ships without an echo check.",
+                            level="WARNING", icon=Icons.WARN,
                         )
+                        _record_selftest_skip(
+                            isolated_context, "gate_error",
+                            str(_selftest_e)[:120])
 
                 # M5: pre-flight's `exec()` runs in the same shared
                 # sandbox the solver will later use. A validator that
@@ -4632,6 +5020,21 @@ Return ONLY a JSON object with:
                 # the answer from the setup data; it must PASS the
                 # validator or the challenge is discarded before the
                 # solver wastes attempts on it.
+                if not (reference_solution and reference_solution.strip()) and not _pre_verified_shape:
+                    # LOUD skip (2026-07-29): an LLM-GENERATED challenge
+                    # reaching this point without a reference means the
+                    # omission fail-closed guard upstream did not fire (its
+                    # trigger needs LITERAL filenames in setup_script) — the
+                    # validator then ships with NO consistency proof at all.
+                    # Templates / journal-mined shapes skip this gate BY
+                    # DESIGN and must not raise the alarm. Non-blocking, but
+                    # the trace must show it.
+                    pretty_log(
+                        "Self-Play Reference Gate",
+                        "SKIPPED — no reference_solution present; the "
+                        "validator ships without a winnability proof.",
+                        level="WARNING", icon=Icons.WARN,
+                    )
                 if reference_solution and reference_solution.strip():
                     ref_path = Path(temp_sandbox) / "solution.py"
                     try:
@@ -4923,7 +5326,26 @@ Return ONLY a JSON object with:
                                 validator_infra_crash = True
                                 pretty_log("Self-Play Abort", f"Validator script crashed or has syntax errors. Aborting (infra — not charged to the agent). Feedback:\n{feedback[:250]}", level="ERROR", icon=Icons.STOP)
                                 break
-                                
+
+                            # Broken line-split backstop (2026-07-29): when the
+                            # feedback itself proves the solution's output was
+                            # CORRECT but captured as one un-split element
+                            # (actual == '\n'.join(expected)), retrying cannot
+                            # help — the bug is in the hidden validator. Route
+                            # it to the same infra path as a crash so no false
+                            # failure is charged to the agent or the frontier.
+                            if _feedback_shows_joined_actual(feedback):
+                                validator_infra_crash = True
+                                pretty_log(
+                                    "Self-Play Abort",
+                                    "Validator line-split is broken: 'actual' is one "
+                                    "un-split element equal to the joined expected "
+                                    "lines. The solution is correct; aborting (infra "
+                                    f"— not charged to the agent). Feedback:\n{feedback[:250]}",
+                                    level="ERROR", icon=Icons.STOP,
+                                )
+                                break
+
                             if len(feedback) > 1500:
                                 feedback = feedback[:1500] + "\n...[TRUNCATED FOR LENGTH]"
                                 

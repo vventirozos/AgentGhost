@@ -64,6 +64,22 @@ _HEURISTIC_MODAL_RE = re.compile(
 # as single starter tokens (em/en dashes still split).
 _HEURISTIC_FIRST_WORD_RE = re.compile(r"[\s,:;—–]+")
 
+# Trivial tool-routing restatement (2026-07-29 log audit): REM minted
+# "When asked about the weather, use the system_utility tool." as a skill
+# from one one-shot success. A rule whose ENTIRE content is topic→tool
+# ("when asked about X, use the Y tool") restates what the tool
+# descriptions / router already encode — the agent routed that turn
+# correctly WITHOUT the lesson, which is how the lesson got minted. Rules
+# that add anything past the tool name ("…use the Y tool WITH mode=…",
+# "…and verify …") carry real content and still pass.
+_TRIVIAL_TOOL_ROUTING_RE = re.compile(
+    r"^(?:when(?:ever)?|if)\s+(?:the\s+user\s+|a\s+user\s+|you\s+are\s+|"
+    r"someone\s+)?asks?(?:ed)?\s+(?:about|for|to)?[^,]{0,80},\s*"
+    r"(?:always\s+|first\s+)?(?:use|call|invoke|prefer|run)\s+"
+    r"(?:the\s+)?[`'\"]?[\w.]+[`'\"]?(?:\s+tool)?\s*\.?$",
+    re.IGNORECASE,
+)
+
 
 def _is_actionable_heuristic(text) -> bool:
     """True iff ``text`` reads as an imperative behavioural rule.
@@ -79,6 +95,10 @@ def _is_actionable_heuristic(text) -> bool:
         return False
     low = t.lower()
     if any(low.startswith(prefix) for prefix in _HEURISTIC_SUBJECT_BLOCKLIST):
+        return False
+    if _TRIVIAL_TOOL_ROUTING_RE.match(t):
+        # Bare topic→tool routing with no qualifier — see the constant's
+        # comment. The tool registry already encodes this mapping.
         return False
     first = _HEURISTIC_FIRST_WORD_RE.split(low, 1)[0]
     if first in _HEURISTIC_IMPERATIVE_STARTERS:
@@ -211,4 +231,5 @@ __all__ = [
     "is_actionable_lesson",
     "_is_mistake_less",
     "_is_conversational_trigger",
+    "_TRIVIAL_TOOL_ROUTING_RE",
 ]

@@ -60,6 +60,7 @@ _PHASE_LABELS = {
     "router_train": "router",
     "calibration": "calibration",
     "self_play": "self-play",
+    "selfplay_selftest_skip": "self-play validator-selftest skip",
     "scheduled_task": "scheduled task",
     "agent_message": "message from the agent",
     "open_questions": "open questions",

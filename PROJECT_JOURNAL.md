@@ -1167,6 +1167,85 @@ skills_auto graduation wiring). Residuals in §4C.
 
 ## 6. Session history (newest first)
 
+### 2026-07-29 (later 3) — Daytime-log audit: the two ungated self-play spots compounded
+
+Read the morning's `ghost-agent.log` (boots 09:47/09:49 → 12:38) for bugs/corner cases/improvements. Headline:
+the guards shipped over the last weeks all fired and did their jobs (loud selftest skip, consistency discard,
+calibration rejection, tool-call repair) — today's failure concentrated in the two spots WITHOUT a gate, and
+they compounded: the selftest instrumenter exit-43'd on the generated validator's shape (echo gate dark), and
+the sim short-circuit then shipped a wrong-FORMAT solution to that unverified validator on exit 0 alone
+(request `9D`: per-resource debug lines vs `TotalAllocatedQuantity: <sum>` → judge FAIL, attempt burned).
+
+**Eleven fixes, all tested** (`tests/test_log_audit_fixes_2026_07_29.py`, 62 tests; full suite green):
+1. **Short-circuit format gate** — `_challenge_output_prefixes` mines a pinned literal output label
+   (`Label: <value>` templates only; column sketches never veto) from the challenge; short-circuit requires it
+   in stdout, else the confirmation turn is KEPT so the model can fix the print format.
+2. **Selftest instrumenter widened** — innermost-statement insertion (incl. inside `def main():`, indent-aware,
+   file kept not truncated), loosely-named holders (`exp_out`…) as second-tier candidates, inline
+   compare-template eval (`if out != f"Total: {n}":`) as last resort. All three former guaranteed-exit-43
+   shapes now echo-verify; post-run-derived expected still 43 by construction.
+3. **Selftest skips counted** — `_record_selftest_skip` ledgers `selfplay_selftest_skip` (reason+detail) on all
+   four skip/INCONCLUSIVE paths → visible in `introspect action='activity'` / learning-health.
+4. **Calibration honesty** — `FittedParams.map_status` (applied|rejected_inverted|rejected_step|
+   discarded_worse) persisted + threaded into refit emit (`refit=map_rejected_inverted`, was `refit=ok` in the
+   same cycle the map was REJECTED), boot line, activity ledger, `stats()`.
+5. **"No JSON twin" was a wrong lookup** — vector-dedup bump now retries under the STORED duplicate's own
+   trigger (metadata → SITUATION-line fallback); TRUE orphans self-heal (delete + write fresh, was: permanent
+   veto). Plus `reconcile_vector_orphans` bulk sweep on the skills-auto idle cooldown (token-subset twin match;
+   never deletes unidentifiable entries). Contract change: `learn_lesson` returns "written" on the heal path
+   (two legacy tests updated to the new contract).
+6. **Generator anti-collapse** — negative examples become `filename — gist` fingerprints (quoting 12 full
+   same-skeleton openers was in-context REINFORCEMENT of the banned shape — 0.62–0.80 rejects fired WITH the
+   steer); mandatory SHAPE-ROTATION steer when ≥½ of the window shares the single-file→aggregate→print
+   skeleton; near-dup reject feedback names the shared tokens as BANNED for the retry.
+7. **REM churn** — entry/pool-thin announcements moved AFTER the freshness gate (skip ticks print one line, was
+   3); hook `_dream_skip_streak` backoff stretches the cooldown 30→60→90→120 min (capped ×4, reset on any
+   productive cycle); skip ticks no longer ledger "REM cycle ran".
+8. **Warmup verifiability** — warmup + live `Prefill Cache` lines both log the SYSTEM-SLOT sha1 (`sys h=`);
+   equal hashes prove the warmed head is the live bytes (they previously measured different segments in
+   different units — the 22284-token vs len=8840 "mismatch" in the log was apples-vs-oranges, now checkable).
+9. **Quoted-marker mute** — thinking that QUOTED "Emit EXACTLY ONE `<tool_call>`…" latched `stop_printing` and
+   silently dropped the rest of the turn's thinking display (the mid-sentence truncations at backticks in the
+   log). `_tail_has_stop_marker` now skips markers immediately preceded by a backtick/quote (mention, not
+   transition); real transitions still latch.
+10. **Trivial tool-routing floor** — bare topic→tool rules ("When asked about the weather, use the
+    system_utility tool.") rejected at the lesson-quality gate (`_TRIVIAL_TOOL_ROUTING_RE`); qualified rules
+    still pass.
+11. **Subjective-gloss verifier rule** (+ cosmetic `Targeting cluster 'None'` fix) — both cheap-judge rubrics
+    now state a qualitative gloss of evidenced data ("warm and clear" for 27°C/0% cloud) is supported unless it
+    CONTRADICTS the evidence; kills the false-refute class that cost ~24 s of a 43 s weather turn on
+    escalation.
+
+Docs updated: `docs/audit_fixes.html` (Round 14), `docs/core/dream.html` (instrumenter, diversity guard,
+short-circuit, REM), `docs/memory/skills.html` (twin lookup/orphan heal, routing floor),
+`docs/core/agent.html` (stop-marker), `docs/core/calibration.html` (map_status), `docs/core/llm.html`
+(warmup hash), `docs/core/verifier.html` (subjective gloss), `docs/memory/frontier.html` (fingerprints).
+
+Still OPEN from the same audit (logged, not fixed here): the confidence composite still has no discriminative
+feature (map rejection is the guard working, not the cure — see §4 confidence-feature work); the 20/80
+saturation coin-flip means frontier rotation rarely happens while LLM-gen mode-collapses (mitigated by #6, not
+removed); native tool_call merge corruption still occurs upstream (repair guard load-bearing).
+
+### 2026-07-29 (later 2) — Night-log audit: the drain that never acked + the validator that failed every correct answer
+
+Overnight-log audit (18:02 → 07:50) found two silent learning-substrate corrupters; both root-caused, FIXED, tested, data scrubbed.
+
+**Journal replay on every restart.** `process_journal_queue` never called `journal.ack()` — the 2026-07-22 TAKE/ACK design relied on "rotation on next pop_all" as the implicit ack, but the idle loop gates the drain on `pending_count() > 0`, so after the last drain of a busy period no take ever rotated the staging file. A COMPLETED batch sat in `memory_journal.inflight.json` indefinitely and `recover_inflight()` replayed it at every boot: the six deploy restarts (00:04–00:55, all clean kills) re-consolidated the same items up to 6× (batch counts 3→4→9→10→11→14), re-burning ~90 s LLM per item and re-teeing post_mortems into the self-play stash. **Fix:** the drain acks per item on every terminal disposition (consolidated / dropped-at-retry-cap / non-retryable error); re-queued items keep their staged copy as the crash backstop. Mid-drain kill now replays only unprocessed items. Tests: `test_smart_memory_requeue.py` (TAKE/ACK section). Stale 01:17 consolidated inflight batch cleared.
+
+**Self-play validator failed 3/3 correct solutions.** 06:49 run: solver printed the exact expected 10 lines (exit 0) yet the LLM-generated validator said "Expected 10 lines, got 1 lines" every attempt — recovered source (counterfactual stash `8d3567930273`) shows `result.stdout.split('\\n')`: a line-split on a LITERAL backslash-n that can never match real newlines. Four gates missed it: static gate had no split lint; echo self-test probe skipped silently (expected built inside `def validate()` → out of scope at the module-level insertion point → exit 43, no log); echo verdict rejected only CRASHES, not clean non-zero exits; reference gate skipped (no reference solution + the omission fail-closed guard needs literal filenames). Cost: false `passed=false, delta=-1.0` on python_general + a wrong solver self-diagnosis. **Fixes:** (1) echo gate now rejects ANY non-zero exit on the validator's own expected output; (2) every gate skip logs a WARNING naming the consequence; (3) static lint `_has_literal_backslash_split` rejects literal-backslash splits at generation (catches the real validator); (4) solver backstop `_feedback_shows_joined_actual` routes actual=='\n'.join(expected) rejections to `validator_infra_crash` (nothing charged); (5) `expected_output_lines` added to probe var names. Tests: `test_selfplay_validator_gates.py`. **Scrub:** frontier run + recent_outcomes entry removed, cluster runs 69→68, `last_length`/`last_compression`/`last_cluster_run_at` restored to post-05:35 state, counterfactual FAILURE entry removed (backups: `*.pre_scrub_20260729`).
+
+**Fresh-eyes review of these same changes found 6 more defects — all fixed before deploy** (the [[review-your-own-changes]] pattern earning its keep again, 3rd time):
+1. **`ack([item])` deleted byte-identical TWINS** (`_dedup_key` is pure content; `append` doesn't dedup). Batch `[A, A]`: acking the first cleared BOTH staged rows, so the second twin's ~90 s consolidation ran with no staging record — a kill there lost it outright, i.e. my "fix" introduced a worse loss mode than the bug. `ack` is now **count-aware** (each acked occurrence removes exactly one staged occurrence).
+2. **Reject-on-any-non-zero echo exit false-rejected winnable challenges.** The probe echoes the expected variable VERBATIM, so a validator legitimately requiring SHAPED stdout (`FOUND=blob3.txt` — a real `challenge_templates` shape) fails the echo by construction; the strict gate would have forfeited that idle slot. Now rejects only on EVIDENCE — crash in the validator's own frame, or the joined-actual signature — and logs anything else INCONCLUSIVE + allows it through (keeps the gate's "false negatives > false positives" doctrine).
+3. Same gate: the probe always strips one trailing newline, so exact-equality validators (`expected` ending in `\n`) failed their own echo → same false-reject class, same fix.
+4. **Skip warnings fired on every template cycle** (templates ship without a reference BY DESIGN). New `_pre_verified_shape` flag (template or journal-mined) exempts them from all three new warnings — otherwise pure alarm fatigue on the most common non-LLM path.
+5. **Test fixture wasn't faithful to the real validator** (dropped the two list prints), so the backstop was pinned only against a hand-written shape. Fixture corrected + an END-TO-END test now RUNS the recovered validator against a correct solution and feeds its real stdout to the detector.
+6. **The lint matched inside comments and its reason quoted the anti-pattern back into the regen prompt** — a model echoing the constraint as a comment would be rejected again, burning every attempt. Lint now scans comment-stripped (string-preserving) source; the reason describes the fix without quoting the pattern. Also now catches the raw-string form `r"\n"` and exempts `re.split("\\n", …)` (the regex engine reads that escape as a real newline).
+
+Suite: 9776 passed / 13 skipped. Known-unfixed (pre-existing, noted): if the journal constructor's `recover_inflight()` raises, `_recovered` stays False and a concurrent `append` during a live drain can fold the in-flight batch back mid-processing.
+
+Also logged from the same audit (not yet fixed): finalize-failed-then-late-CONFIRMED outcome labels as a candidate root cause of the all-night anti-correlated calibration refits (slope −0.7…−0.9); pre-flight guard lacks a world-changed reset (blocked a `manage_services` retry after the agent freed the port, 19:04); vision "node offline" 00:19–00:32 was llama-server failing to decode WEBP with ffprobe missing from the daemon PATH (agent self-healed via PNG conversion).
+
 ### 2026-07-29 — Ahmia was never JS-only: a followed 302 + a one-word health check = a confidently wrong diagnosis
 
 Operator pasted a request log where `darkweb_search` returned ZERO results twice (burning a strike and 83 s)

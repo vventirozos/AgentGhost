@@ -1664,6 +1664,7 @@ async def lifespan(app):
                         threshold=_cp.threshold, w_entropy=_cp.w_entropy,
                         lam=_cp.lambda_uncertainty, brier=_cp.brier,
                         n=_cp.n_samples,
+                        map=getattr(_cp, "map_status", "applied"),
                     )
             except Exception as _capx:  # pragma: no cover — defensive
                 logger.debug("calibration params apply failed: %s", _capx)

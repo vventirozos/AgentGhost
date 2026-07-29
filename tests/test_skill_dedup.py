@@ -192,9 +192,12 @@ class TestLearnLessonReturnContract:
         playbook = json.loads(skill_memory.file_path.read_text())
         assert playbook[0]["frequency"] == 2
 
-    def test_vector_dedup_without_json_twin_returns_none(self, skill_memory):
+    def test_vector_dedup_without_json_twin_heals_and_writes(self, skill_memory):
         # Same setup as test_skips_vector_duplicate: near-identical vector
-        # hit, but no playbook row to bump → silent drop → falsy.
+        # hit, but no playbook row to bump under EITHER trigger. Contract
+        # CHANGED 2026-07-29 (log audit): the old silent drop (return
+        # None) let an orphan vector veto this lesson on every future
+        # attempt. Now the orphan is deleted and the lesson written fresh.
         skill_memory.save_playbook([{
             "timestamp": "2025-01-01T00:00:00",
             "task": "Other task",
@@ -202,10 +205,12 @@ class TestLearnLessonReturnContract:
             "solution": "other",
             "frequency": 1,
         }])
+        mem = self._vector_hit()
         result = skill_memory.learn_lesson(
             "Parse CSV files", "wrong encoding", "use latin-1 encoding",
-            memory_system=self._vector_hit())
-        assert result is None
+            memory_system=mem)
+        assert result == "written"
+        mem.collection.delete.assert_called_once()
 
     def test_quality_drop_returns_none(self, skill_memory):
         result = skill_memory.learn_lesson(
@@ -242,6 +247,16 @@ class TestMistakeLessWideThreshold:
 
     def test_mistakeless_rule_deduped_in_wide_band(self, skill_memory):
         # dist 0.20: past the 0.15 default, inside the 0.25 rule cutoff.
+        # The stored duplicate's JSON twin exists (as in production —
+        # since 2026-07-29 a twin-less vector hit is treated as an orphan
+        # and healed, so an EMPTY playbook no longer models "dedup").
+        skill_memory.save_playbook([{
+            "timestamp": "2025-01-01T00:00:00",
+            "task": "When querying weather, name the location",
+            "mistake": "none",
+            "solution": "name the location explicitly",
+            "frequency": 1,
+        }])
         mem = self._mem_at_distance(0.20)
         skill_memory.learn_lesson(
             "When querying weather, ensure the query names the exact "
@@ -252,7 +267,9 @@ class TestMistakeLessWideThreshold:
             memory_system=mem, source="dream",
         )
         playbook = json.loads(skill_memory.file_path.read_text())
-        assert playbook == []  # deduped — no new entry written
+        # Deduped: bumped the stored twin, wrote no new entry.
+        assert len(playbook) == 1
+        assert int(playbook[0].get("frequency", 1)) == 2
 
     def test_mistakeful_lesson_keeps_tight_threshold(self, skill_memory):
         # Same 0.20 distance, but a REAL mistake → 0.15 cutoff applies and

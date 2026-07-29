@@ -355,6 +355,17 @@ def lesson_embedding_text(lesson: dict) -> str:
     return f"SITUATION: {task}\nMISTAKE: {mistake}\nSOLUTION: {solution}"
 
 
+def _dup_trigger_from_vector_text(text: str) -> str:
+    """Recover a stored lesson's trigger from its vector document text
+    (shape: ``SITUATION: <trigger>\\nMISTAKE: ...`` — see
+    :func:`lesson_embedding_text`). Fallback for entries written before
+    the ``trigger`` metadata key existed."""
+    if not text:
+        return ""
+    m = re.match(r"^SITUATION:\s*(.*?)(?:\nMISTAKE:|\Z)", str(text), re.S)
+    return m.group(1).strip() if m else ""
+
+
 def _bm25_like_score(query: str, trigger: str) -> float:
     """Tiny keyword-overlap re-ranker. Returns a score in [0, 1] — the
     fraction of query tokens that appear in the lesson trigger.
@@ -722,10 +733,21 @@ class SkillMemory:
                 if results['distances'] and results['distances'][0]:
                     for i, dist in enumerate(results['distances'][0]):
                         if dist < vector_threshold:
+                            # Carry the stored twin's own trigger (vector
+                            # metadata) — the bump path needs it: a reworded
+                            # near-duplicate's playbook entry lives under ITS
+                            # trigger, not the incoming one (2026-07-29).
+                            _dup_trig = ""
+                            try:
+                                _metas = results.get('metadatas') or [[]]
+                                _dup_trig = str((_metas[0][i] or {}).get("trigger") or "")
+                            except (IndexError, AttributeError, TypeError):
+                                _dup_trig = ""
                             return {
                                 "id": results['ids'][0][i],
                                 "text": results['documents'][0][i],
                                 "distance": dist,
+                                "trigger": _dup_trig,
                                 "source": "vector",
                             }
             except Exception as e:
@@ -742,6 +764,72 @@ class SkillMemory:
             if existing_key and existing_key == task_key:
                 return {"index": idx, "lesson": p, "source": "json"}
         return None
+
+    def reconcile_vector_orphans(self, memory_system, limit: int = 2000) -> int:
+        """Drop vector-store skill entries whose JSON playbook twin no
+        longer exists (residue of partial scrubs/wipes — the two stores
+        are written together but deleted separately). An orphan is worse
+        than dead weight: it wins the vector-dedup race and vetoes every
+        future re-learn of that lesson ("no JSON twin to bump").
+
+        Conservative by construction: entries with no recoverable trigger
+        are left alone, and the twin test is token-SUBSET (a metadata
+        trigger truncated at 200 chars still matches its full playbook
+        twin) — we only delete clear orphans. Returns the number deleted.
+        """
+        coll = getattr(memory_system, "collection", None) if memory_system else None
+        if coll is None:
+            return 0
+        try:
+            got = coll.get(where={"type": "skill"}, limit=int(limit),
+                           include=["metadatas", "documents"])
+        except Exception as exc:
+            logger.debug("orphan reconcile: vector scan failed: %s", exc)
+            return 0
+        ids = got.get("ids") or []
+        metas = got.get("metadatas") or []
+        docs = got.get("documents") or []
+        if not ids:
+            return 0
+        with self._get_lock():
+            playbook = self._load_playbook()
+        pb_token_sets = []
+        for p in playbook:
+            toks = _trigger_token_set(p.get("task") or p.get("trigger") or "")
+            if toks:
+                pb_token_sets.append(toks)
+        orphans = []
+        for i, vid in enumerate(ids):
+            meta = metas[i] if i < len(metas) else None
+            doc = docs[i] if i < len(docs) else ""
+            raw_trig = str((meta or {}).get("trigger") or "") or \
+                _dup_trigger_from_vector_text(str(doc or ""))
+            if not raw_trig:
+                continue  # unidentifiable — never delete blind
+            if len(raw_trig) >= 200 and len(raw_trig.split()) > 1:
+                # Metadata trigger is truncated at 200 chars — the final
+                # word may be cut mid-token; drop it before tokenizing.
+                raw_trig = " ".join(raw_trig.split()[:-1])
+            toks = _trigger_token_set(raw_trig)
+            if not toks:
+                continue
+            if any(toks <= pb for pb in pb_token_sets):
+                continue  # has (or is subset of) a live twin — keep
+            orphans.append(str(vid))
+        if not orphans:
+            return 0
+        try:
+            coll.delete(ids=orphans)
+        except Exception as exc:
+            logger.debug("orphan reconcile: delete failed: %s", exc)
+            return 0
+        pretty_log(
+            "Skill Store Reconcile",
+            f"dropped {len(orphans)} orphan vector twin(s) with no playbook "
+            f"entry (scanned {len(ids)})",
+            icon=Icons.SKIP,
+        )
+        return len(orphans)
 
     def learn_lesson(
         self,
@@ -771,11 +859,12 @@ class SkillMemory:
         working unchanged.
 
         Returns a short status string on success — ``"written"`` for a new
-        playbook entry, ``"reinforced"`` for a dedup frequency bump — and
-        ``None`` on every drop path (quality gate, near-duplicate skip with
-        no JSON twin to bump, swallowed error), so callers can tell a real
-        write from a silent drop. Backward-compatible: pre-existing callers
-        ignore the return value.
+        playbook entry (including the orphan-heal path: a vector twin with
+        no playbook entry is deleted and the lesson written fresh,
+        2026-07-29), ``"reinforced"`` for a dedup frequency bump — and
+        ``None`` on every drop path (quality gate, swallowed error), so
+        callers can tell a real write from a silent drop.
+        Backward-compatible: pre-existing callers ignore the return value.
         """
         try:
             effective_trigger = trigger or task or ""
@@ -903,6 +992,7 @@ class SkillMemory:
                     # matching playbook entry (and upgrade verified/confidence)
                     # just like the JSON-dedup branch does.
                     bumped = False
+                    orphan_healed = False
                     with self._get_lock():
                         playbook = self._load_playbook()
                         key = _normalize_trigger(effective_trigger or "")
@@ -911,6 +1001,25 @@ class SkillMemory:
                              if _normalize_trigger(p.get("task") or p.get("trigger") or "") == key),
                             None,
                         )
+                        if idx is None:
+                            # Reworded twin: retry under the STORED
+                            # duplicate's own trigger (vector metadata,
+                            # falling back to the doc's SITUATION line).
+                            # The old lookup used only the INCOMING
+                            # trigger, so every reworded near-duplicate
+                            # logged "no JSON twin to bump" while its twin
+                            # sat in the playbook under its own wording
+                            # (2026-07-29 log audit).
+                            _dup_trig = (str(duplicate.get("trigger") or "")
+                                         or _dup_trigger_from_vector_text(
+                                             str(duplicate.get("text") or "")))
+                            _dup_key = _normalize_trigger(_dup_trig)
+                            if _dup_key:
+                                idx = next(
+                                    (i for i, p in enumerate(playbook)
+                                     if _normalize_trigger(p.get("task") or p.get("trigger") or "") == _dup_key),
+                                    None,
+                                )
                         if idx is not None:
                             existing = _normalize_lesson(playbook[idx])
                             existing["frequency"] = int(existing.get("frequency") or 1) + 1
@@ -942,13 +1051,33 @@ class SkillMemory:
                                 icon=Icons.MEM_REINFORCE,
                             )
                         else:
+                            # TRUE orphan: the vector index holds a skill
+                            # entry the JSON playbook doesn't (residue of a
+                            # partial scrub). Left alone it silently vetoes
+                            # this lesson on every future attempt. Self-heal:
+                            # drop the orphan vector entry and fall through
+                            # to write the lesson fresh — both stores end
+                            # the call consistent.
+                            orphan_healed = True
+                            try:
+                                if (memory_system
+                                        and getattr(memory_system, "collection", None)
+                                        and duplicate.get("id")):
+                                    memory_system.collection.delete(
+                                        ids=[str(duplicate["id"])])
+                            except Exception as _orph_e:
+                                logger.debug(
+                                    "orphan vector delete failed: %s", _orph_e)
                             pretty_log(
                                 "SKILL DEDUP",
-                                f"Skipped near-duplicate (dist={duplicate.get('distance', 0):.3f}, "
-                                f"no JSON twin to bump): {effective_trigger[:30]}...",
+                                "Orphan vector twin "
+                                f"(dist={duplicate.get('distance', 0):.3f}, no "
+                                "playbook entry under either trigger) — dropped "
+                                f"the orphan, writing fresh: {effective_trigger[:30]}...",
                                 icon=Icons.SKIP,
                             )
-                    return "reinforced" if bumped else None
+                    if not orphan_healed:
+                        return "reinforced" if bumped else None
 
             new_lesson = build_lesson(
                 task=task,

@@ -528,7 +528,16 @@ class MemoryJournal:
         ``ack()`` clears the whole staging batch. ``ack(items)`` clears
         only those entries (partial ack for a drain that processes item by
         item). Callers that never ack still get at-least-once delivery —
-        the batch is rotated away by the next take."""
+        the batch is rotated away by the next take.
+
+        Count-aware (2026-07-29): keys are pure content, and ``append``
+        does not de-duplicate, so a batch can stage byte-identical twins
+        under ONE key. A set-based partial ack removed BOTH staged twins
+        when the first was consumed — the second twin then ran its ~90 s
+        consolidation with no staging record, and a kill in that window
+        lost it permanently (the exact loss mode this lifecycle exists to
+        prevent). Each acked occurrence now removes exactly ONE staged
+        occurrence of its key."""
         with self._lock:
             if items is None:
                 self._clear_inflight()
@@ -536,15 +545,16 @@ class MemoryJournal:
             staged = self._read_inflight()
             if not staged:
                 return
-            done = set()
+            done: dict = {}
             for entry in items or []:
                 key = self._dedup_key(entry)
                 if key is not None:
-                    done.add(key)
+                    done[key] = done.get(key, 0) + 1
             remaining = []
             for entry in staged:
                 key = self._dedup_key(entry)
-                if key is not None and key in done:
+                if key is not None and done.get(key, 0) > 0:
+                    done[key] -= 1
                     continue
                 remaining.append(entry)
             if remaining:

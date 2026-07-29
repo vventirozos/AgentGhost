@@ -974,6 +974,67 @@ HEAD: &lt;tool_call&gt;` per turn, I'll start by writing the script.\n\n&lt;/thi
     and the no-think retry — recovering the spec in place instead of burning a 30-60s regeneration.</li>
   </ul>
 
+  <h2>Round 14 — daytime-log audit (2026-07-29)</h2>
+  <p>One morning's <code>ghost-agent.log</code> (boots 09:47/09:49 → 12:38), read for bugs, corner cases and
+  improvements. Headline pair: the two self-play spots WITHOUT a gate compounded — the validator-selftest
+  instrumenter exit-43'd on the generated validator's shape (echo gate dark), and the sim short-circuit then
+  shipped a wrong-FORMAT solution straight to that unverified validator on exit&nbsp;0 alone. Eleven fixes; tests in
+  <code>tests/test_log_audit_fixes_2026_07_29.py</code>:</p>
+  <ul>
+    <li><strong>Short-circuit format gate</strong> — when the challenge pins a literal output template
+    (<code>`TotalAllocatedQuantity: &lt;sum&gt;`</code>), the sim short-circuit requires the literal prefix in
+    stdout before skipping the confirmation turn (<code>_challenge_output_prefixes</code>); on mismatch the model
+    keeps the turn that would have fixed the print format. Request <code>9D</code> failed exactly here: exit 0,
+    per-resource debug lines, judge FAIL.</li>
+    <li><strong>Selftest instrumenter widened</strong> — probe now inserts before the INNERMOST statement holding
+    the <code>solution.py</code> run (including inside <code>def main():</code> bodies, with indentation; file kept,
+    not truncated — the probe's SystemExit makes them equivalent at top level); loosely-named holders
+    (<code>exp_out</code>, <code>want</code>…) are second-tier dump candidates; an inline compare template
+    (<code>if out != f"Total: {n}":</code>) is <code>eval()</code>'d best-effort before giving up with exit 43. All
+    three former guaranteed-43 shapes now echo-verify.</li>
+    <li><strong>Selftest skips are counted</strong> — every skip/INCONCLUSIVE path ledgers
+    <code>selfplay_selftest_skip</code> (reason + detail) to the activity ledger, so the gate's dark time shows up
+    in <code>introspect action='activity'</code> / learning-health instead of scrolling past as a WARNING.</li>
+    <li><strong>Calibration honesty</strong> — <code>FittedParams.map_status</code>
+    (<code>applied | rejected_inverted | rejected_step | discarded_worse</code>) persisted and threaded into the
+    refit log line (<code>refit=map_rejected_inverted</code>, no longer <code>refit=ok</code> in the same cycle the
+    map was rejected), the boot <code>loaded=startup</code> line, the activity ledger, and
+    <code>tracker.stats()</code>.</li>
+    <li><strong>"No JSON twin" was a wrong lookup</strong> — the vector-dedup bump searched the playbook under the
+    INCOMING trigger; a reworded near-duplicate's twin lives under its own trigger (now recovered from vector
+    metadata / the document's SITUATION line). TRUE orphans (vector entry, no playbook row under either trigger)
+    self-heal: the orphan is deleted and the lesson written fresh — previously the orphan vetoed that lesson
+    forever. Plus <code>reconcile_vector_orphans</code>, a bounded sweep on the skills-auto idle cooldown
+    (token-subset twin match so 200-char-truncated metadata triggers never false-orphan).</li>
+    <li><strong>Generator anti-collapse</strong> — the negative-examples block quoted 12 full "You are given a file
+    named…" openers: a dozen in-context copies of the exact skeleton it bans (0.62–0.80 overlap rejects kept firing
+    WITH the steer). Now compact <code>filename — gist</code> fingerprints (<code>_challenge_fingerprint</code>), a
+    mandatory SHAPE-ROTATION steer when ≥½ of recent heads share the single-file→aggregate→print skeleton, and the
+    near-dup reject feedback names the shared identifier tokens as BANNED for the retry.</li>
+    <li><strong>REM churn silenced</strong> — "Entering REM cycle / pool thin — dreaming over 40 digests" announced
+    BEFORE the freshness gate skipped (4× in 2.5h); announcements now follow the gate, so a skip tick prints one
+    line. Hook side: consecutive freshness-skips stretch the dream cooldown linearly (30→60→90→120&nbsp;min, capped
+    ×4), reset by any productive cycle; skip ticks no longer ledger "REM cycle ran".</li>
+    <li><strong>Warmup verifiability</strong> — the boot warmup and the live <code>Prefill Cache</code> line
+    measured different segments in different units (~22k tokens of head vs 8.8k chars of injection), so cache
+    effectiveness was unverifiable from the log. Both now log the SYSTEM-SLOT sha1 (<code>sys h=…</code>) — equal
+    hashes prove the warmed bytes are the live bytes.</li>
+    <li><strong>Quoted-marker mute</strong> — thinking that QUOTED the constraint text ("Emit EXACTLY ONE
+    <code>`&lt;tool_call&gt;`</code> block") latched <code>stop_printing</code> and silently dropped the rest of the
+    turn's thinking from the log (visible as lines cut before a backtick). A marker immediately preceded by a
+    backtick/quote is a mention, not a transition (<code>_tail_has_stop_marker</code>); real transitions still
+    latch.</li>
+    <li><strong>Trivial tool-routing floor</strong> — REM minted "When asked about the weather, use the
+    system_utility tool." from one one-shot success. Bare topic→tool rules (nothing past the tool name) are now
+    rejected at the lesson-quality gate (<code>_TRIVIAL_TOOL_ROUTING_RE</code>); qualified rules ("…with location
+    defaulting to Athens") still pass.</li>
+    <li><strong>Subjective-gloss verifier rule</strong> — the cheap judge refuted a weather reply for "'warm and
+    clear' not directly supported by the objective data" (overturned on escalation; ~24s of a 43s turn). Both the
+    single-prompt and adjudication rubrics now state: a qualitative gloss of data present in the evidence is
+    supported unless it CONTRADICTS the evidence.</li>
+    <li><strong>Cosmetic</strong> — exploration seeds no longer log <code>Targeting cluster 'None'</code>.</li>
+  </ul>
+
   <h2>Remaining by design</h2>
   <ul>
     <li><strong>Sandbox host-networking</strong> — remains the Linux default (the in-sandbox Tor proxy needs host loopback); isolation is opt-in via <code>GHOST_SANDBOX_NETWORK</code>. Not a bug; left as a deliberate, documented trade-off.</li>
