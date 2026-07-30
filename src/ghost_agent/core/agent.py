@@ -27,7 +27,11 @@ from .planning import TaskTree, TaskStatus
 # loop-breaker and the post-mortem read-loop detector agree on what
 # "the same target" means.
 from ..reflection.postmortem import primary_target_from_args
-from .triggers import RecentFailureGuard
+from .triggers import (
+    RecentFailureGuard,
+    guard_key_target,
+    looks_mutating_command,
+)
 from ..utils.logging import Icons, pretty_log, request_id_context, atomic_print
 from ..utils import logging as _glog
 from ..utils.constraints import extract_constraints, render_constraint_block
@@ -118,6 +122,14 @@ _BATCH_COLLAPSE_UNSAFE = frozenset({
     "browser", "manage_projects", "notify_operator", "delegate",
     "delegate_to_swarm", "manage_services", "manage_skills", "create_skill",
 })
+
+# manage_services actions that only OBSERVE the supervisor (plus the tool's
+# accepted aliases, pre-healing). Anything else — start/stop/restart/
+# stop-all and their aliases — is a real world mutation: on SUCCESS it
+# clears the pre-flight failure guard (see the world-changed reset at the
+# result-processing site). Keyed on the raw arg because the alias healing
+# lives inside the tool; an unknown action errors out and never resets.
+_SERVICE_READONLY_OPS = frozenset({"", "status", "logs", "log", "list", "ls"})
 
 # Headroom reserved for the per-turn injection that `_compose_injection`
 # adds to the shipped payload AFTER history pruning — tool schemas (~7-8k
@@ -2511,8 +2523,11 @@ class GhostAgent:
         self.memory_semaphore = asyncio.Semaphore(1)
         # Live pre-flight repeat-failure guard (feature 1A). Always present
         # and fed; only consulted as a hard pre-dispatch block when the flag
-        # is on (default on). Persists across turns on the long-lived agent
-        # instance, with a bounded window so stale failures age out.
+        # is on (default on). Lives on the agent instance so it survives
+        # TURN boundaries, but its memory is REQUEST-scoped: handle_chat
+        # resets it at request start, and a successful state-mutating call
+        # clears it mid-request (world-changed reset, 2026-07-30 — see
+        # RecentFailureGuard's lifecycle docstring).
         self._failure_guard = RecentFailureGuard()
         self._preflight_guard_enabled = bool(
             getattr(getattr(context, "args", None), "enable_preflight_guard", True)
@@ -2617,6 +2632,20 @@ class GhostAgent:
                 role = f"TOOL ({m.get('name', 'unknown')})"
             recent_transcript += f"{role}: {content_str[:char_limit]}\n"
         return recent_transcript
+
+    def _project_services_brief(self, project_id) -> Optional[list]:
+        """Registry-only service facts for the project briefing's SERVICES
+        line (2026-07-30, §4G). None on any failure — the briefing renders
+        without the section. Deliberately NO container execs (this runs
+        every turn a project is bound); staleness comes from the container-
+        generation stamp alone."""
+        if not project_id:
+            return None
+        try:
+            from ..tools.projects import project_services_summary
+            return project_services_summary(self.context, project_id) or None
+        except Exception:  # noqa: BLE001 — briefing must never break a turn
+            return None
 
     def process_rolling_window(self, messages: List[Dict[str, Any]], max_tokens: int) -> List[Dict[str, Any]]:
         if not messages: return []
@@ -8290,10 +8319,22 @@ class GhostAgent:
                     # and they carry no error to repeat).
                     if self._preflight_guard_enabled and not is_idempotent_setter:
                         _pf_target = primary_target_from_args(t_args)
+                        # Key target falls back to a signature of the FULL
+                        # args when no primary key is recognised (2026-07-30):
+                        # manage_services' identity lives in name/port/command
+                        # — none of them primary keys — so every start of any
+                        # service collapsed into one bucket and legitimately
+                        # CHANGED retries (new port, new command) were blocked
+                        # for three requests running. With the signature, only
+                        # a byte-identical re-issue matches, which is what the
+                        # block message has claimed all along. `_pf_target`
+                        # (the human-readable form) still drives the log/diag
+                        # text below; the sig alone would read as noise.
+                        _pf_key = guard_key_target(_pf_target, a_hash)
                         _pf_op = str(t_args.get("operation")
                                      or t_args.get("action") or "")
                         _pf_err = self._failure_guard.would_repeat(
-                            fname, _pf_target, _pf_op)
+                            fname, _pf_key, _pf_op)
                         if _pf_err:
                             pretty_log(
                                 "Pre-Flight Guard",
@@ -8377,7 +8418,30 @@ class GhostAgent:
                             tool_durations.append(None)
                             if not _collapse_unsafe:
                                 batch_seen_reads[a_hash] = len(tool_tasks) - 1
-                        tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or "")))
+                        # World-mutation hint for the pre-flight failure
+                        # guard's world-changed reset (2026-07-30). Computed
+                        # here (args in scope) but ACTED on at the result-
+                        # processing site, only when the call SUCCEEDS. Note
+                        # `is_mutating` alone is the wrong signal for
+                        # `execute` — it is blanket-True there, and clearing
+                        # the guard on every successful probe (ls/grep/curl)
+                        # would nullify it; the command heuristic keeps
+                        # probes inert. Script-content executions (no
+                        # `command` arg) conservatively don't count.
+                        _pf_world_mut = (
+                            (fname == "file_system" and is_mutating)
+                            or (fname == "manage_services"
+                                and str(t_args.get("action")
+                                        or t_args.get("operation")
+                                        or t_args.get("op") or ""
+                                        ).strip().lower()
+                                not in _SERVICE_READONLY_OPS)
+                            or (fname == "execute"
+                                and looks_mutating_command(
+                                    str(t_args.get("command")
+                                        or t_args.get("cmd") or "")))
+                        )
+                        tool_call_metadata.append((fname, tool["id"], a_hash, is_mutating, primary_target_from_args(t_args), is_idempotent_setter, str(t_args.get("operation") or t_args.get("action") or ""), str(t_args.get("path") or ""), _pf_world_mut))
                         # The DURABLE idempotency hash is recorded at
                         # the RESULT-processing site, and only when
                         # the call actually SUCCEEDED. Recording it
@@ -8490,7 +8554,7 @@ class GhostAgent:
                 # earlier failure can't latch the pivot prompt.
                 consecutive_parse_errors = 0
                 for i, result in enumerate(results):
-                    fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op, ptarget_raw = tool_call_metadata[i]
+                    fname, tool_id, a_hash, is_mutating, ptarget, _is_idem_setter, ptool_op, ptarget_raw, _pf_world_mut = tool_call_metadata[i]
                     str_res = str(result).replace("\r", "") if not isinstance(result, Exception) else f"Error: {str(result)}"
 
                     # Record this call's outcome uniformly (before the
@@ -8516,12 +8580,68 @@ class GhostAgent:
                     # 1A): remember FAILED calls keyed by (tool, primary
                     # target) — ``ptarget`` was computed at dispatch time
                     # from the same args — so an identical re-issue on a
-                    # later iteration is intercepted before dispatch.
+                    # later iteration is intercepted before dispatch. The
+                    # key MUST match the check site: same guard_key_target
+                    # fallback (args signature when no primary target).
+                    #
+                    # NOTE: `execute` failures deliberately stay OUT of the
+                    # guard's memory — shell results signal failure via an
+                    # 'EXIT CODE: N' banner, not an Error: prefix, so they
+                    # never match `_res_is_error` here. That division is
+                    # load-bearing: repeated identical shell failures are
+                    # the strike ledger's + System-3 pivot's crisis signal,
+                    # and recording them here would block the re-issue
+                    # pre-dispatch and starve the pivot (caught live by
+                    # test_system3_crisis_pivot when this was tried).
+                    # …but the same EXIT-CODE blindness must not let a
+                    # FAILED remediation (`kill` against a stale pid: exit
+                    # 1, nothing killed) count as a successful mutation and
+                    # clear the guard (2026-07-30 review). Mirrors the
+                    # execute strike branch's exit-code parse below.
+                    _pf_exec_failed = False
+                    if fname == "execute" and not _res_is_error:
+                        _pf_exit = re.search(r"EXIT CODE:\s*(\d+)", str_res)
+                        if _pf_exit is not None:
+                            _pf_exec_failed = _pf_exit.group(1) != "0"
+                        else:
+                            _pf_exec_failed = ("Error" in str_res
+                                               or "Exception" in str_res
+                                               or "Traceback" in str_res)
                     if _res_is_error:
                         try:
-                            self._failure_guard.record(fname, ptarget, str_res, ptool_op)
+                            self._failure_guard.record(
+                                fname, guard_key_target(ptarget, a_hash),
+                                str_res, ptool_op)
                         except Exception:
                             pass
+                    elif _pf_world_mut and not _pf_exec_failed:
+                        # World-changed reset (2026-07-30, solar-sim
+                        # postmortem): a SUCCESSFUL state-mutating call —
+                        # file write, service start/stop, a shell command
+                        # that kills processes or moves files — invalidates
+                        # the premise of every recorded failure ("re-running
+                        # it unchanged will fail the same way"). Without
+                        # this the guard deadlocks: a blocked call never
+                        # runs, so it can never demonstrate the fix worked,
+                        # and stale entries kept blocking a verifiably
+                        # remediated `manage_services start` (port holder
+                        # killed, port confirmed free) across three
+                        # consecutive requests. Fresh identical failures
+                        # re-arm the guard within `repeat_threshold` calls
+                        # if the change fixed nothing.
+                        try:
+                            _pf_cleared = self._failure_guard.note_world_changed()
+                        except Exception:
+                            _pf_cleared = 0
+                        if _pf_cleared:
+                            pretty_log(
+                                "Pre-Flight Guard",
+                                f"World changed (successful {fname} "
+                                f"mutation) — cleared {_pf_cleared} recorded "
+                                f"failure(s); blocked retries are allowed "
+                                f"again.",
+                                icon=Icons.RETRY,
+                            )
 
                     # One-task-per-turn gate: a manage_projects call that
                     # actually closed a task to DONE ends the interactive
@@ -12001,6 +12121,18 @@ class GhostAgent:
                 # the decay after a genuine pivot — lives in one StrikeLedger
                 # (core.strikes) instead of five interacting locals.
                 strikes = StrikeLedger()
+                # The pre-flight failure guard's memory is REQUEST-scoped
+                # (2026-07-30): it lives on the agent instance (it must
+                # survive turn boundaries), but entries from a PREVIOUS
+                # request describe a world that user input and intervening
+                # work have since changed — and blocked calls never run, so
+                # stale entries can never be refuted from inside the loop.
+                # Observed live: two `manage_services start` failures from a
+                # 16:51 request still hard-blocked the FIRST start attempt
+                # of the 17:02 request (different port!) after the cause was
+                # verifiably fixed. Cross-request pathology remains covered
+                # by the offline post-mortem fingerprint.
+                self._failure_guard.reset()
                 # Counts CONSECUTIVE `system_parse_error` events across turns
                 # within this request. Reset on any successful parse. After
                 # threshold (≥2) we pivot the recovery prompt to suggest
@@ -12740,7 +12872,14 @@ You are currently at TURN {turn+1}. Trust your CURRENT PLAN JSON to know what is
                                 # Selective loading (2026-07-24): condition the
                                 # briefing on THIS request so the model gets the
                                 # matching corner of the file map + journal.
-                                request_text=str(last_user_content or ""))
+                                request_text=str(last_user_content or ""),
+                                # SERVICES line (2026-07-30, §4G): the
+                                # project's registered services + leased
+                                # ports, so the model never re-invents
+                                # port numbers. Cheap registry facts —
+                                # no container execs.
+                                services=self._project_services_brief(
+                                    _proj_id))
                             if _briefing:
                                 dynamic_state += _briefing + "\n"
                     except Exception:

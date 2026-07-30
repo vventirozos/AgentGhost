@@ -174,6 +174,20 @@ STDOUT/STDERR:
   <h2>Compound-command re-run guard (2026-07-26c)</h2>
   <p>The file-not-found path/scope heals re-run the WHOLE command from a different cwd — safe for a simple command, but a COMPOUND whose non-final segment mutates (<code>mkdir out &amp;&amp; cat out/x</code>) would repeat the side effect: the re-run's <code>mkdir</code> fails "File exists", <code>&amp;&amp;</code> short-circuits, and that non-file-not-found output was ADOPTED, replacing the real error. <code>_rerun_unsafe</code> now skips the heal when a leading segment starts with a mutating verb (mkdir/git/rm/tee/…) or contains an output redirect; safe read-only prefixes (<code>cd</code>/<code>pwd</code>/<code>ls</code>) and simple commands still heal. (Deferred LOW.)</p>
 
+  <h2>Backgrounded-server guard (2026-07-30, §4G)</h2>
+  <p>A <code>… &amp;</code>-detached process re-parents to the container's PID 1 and SURVIVES the
+  exec — holding its port invisibly, outside the service registry's sight (solar-sim incident: an
+  autoadvance task ran <code>python3 server.py &amp;</code> and the stray holder of 8102 cost
+  three requests of thrash). <code>_daemonized_server_block</code> refuses a command only when
+  BOTH signals fire — a detach (background <code>&amp;</code>, not <code>&amp;&amp;</code>/
+  <code>2&gt;&amp;1</code>/<code>&amp;&gt;</code>; or <code>setsid</code>) AND a server-ish
+  command (<code>http.server</code>, <code>server.py</code>, uvicorn/gunicorn/flask run/node
+  server.js/npm start/php -S/<code>--port N</code>…) — steering to <code>manage_services</code>,
+  which assigns a free port ($PORT), captures logs, and keeps the process supervised. Foreground
+  servers (die with the exec timeout) and non-server background jobs pass untouched. See
+  <a href="../sandbox/services.html">sandbox/services</a> for the lease/ownership redesign this
+  completes.</p>
+
   <footer><a href="../index.html">← Back to index</a></footer>
 </main>
 </body>

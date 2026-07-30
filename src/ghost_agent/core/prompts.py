@@ -37,7 +37,8 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                            max_deliverables: int = 12,
                            suppress_next_task: bool = False,
                            graph_memory=None,
-                           request_text: str = "") -> str:
+                           request_text: str = "",
+                           services=None) -> str:
     """Render a compact project-scope briefing for the system prompt.
 
     The briefing is appended to DYNAMIC SYSTEM STATE when a project is
@@ -196,6 +197,24 @@ def build_project_briefing(store, project_id: str, max_events: int = 3,
                      "constraint):")
         for c in proj_constraints:
             lines.append(f"  ! {c}")
+
+    # SERVICES — this project's registered services (2026-07-30, §4G): the
+    # names + leased ports the model must NOT re-invent. Registry facts
+    # only — liveness is deliberately unprobed here (probing costs docker
+    # execs every turn); `stale` marks entries whose container died.
+    if services:
+        lines.append("SERVICES (this project's registered services — ports "
+                     "are LEASED to them; check liveness / start / stop via "
+                     "manage_services, never guess ports):")
+        for s in services:
+            _b = f"  - {s.get('name')}"
+            if s.get("port") is not None:
+                _b += f" · port {s['port']} (http://127.0.0.1:{s['port']})"
+            if s.get("stale"):
+                _b += " · STALE (died with old sandbox — restart on demand)"
+            if s.get("command"):
+                _b += f" · cmd: {s['command']}"
+            lines.append(_b)
 
     # DESIGN LEDGER — the durable, compact working memory the agent records
     # (file layout, key function/API names, conventions). Surfaced near the

@@ -226,6 +226,87 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   duplicate service for the same port and an "Address already in use" kill dance. Names differing
   only by case are one service; the registered spelling always wins, so no twin registry entries.</p>
 
+  <h2>Project ownership + port leases <span class="tag">2026-07-30 §4G redesign</span></h2>
+  <p><strong>Why:</strong> many projects reached for the same low port (the LLM was the port
+  allocator and has no memory of prior grants), the project↔service link was a string grep over
+  workdir/command, and daemons started outside the supervisor (execute <code>… &amp;</code> leaks)
+  held ports invisibly — the solar-sim incident burned three requests on a port the registry
+  could not see. The redesign makes the registry the single source of truth for
+  <em>who owns which port right now</em>.</p>
+  <ul>
+    <li><strong>Ports are leases, not arguments.</strong> Every <code>start</code> is granted a
+    port (services exist to expose a project's output over HTTP; <code>port=0</code> opts a rare
+    non-listening worker out). The requested port — the argument, or a literal the command names
+    (<code>extract_command_port</code>: <code>http.server N</code>, <code>--port N</code>,
+    <code>-p N</code>, <code>PORT=N</code>, <code>php -S host:N</code>) — is a
+    <em>preference</em>: granted when free (container-side <code>bind 0.0.0.0</code> probe, so
+    unregistered holders count), otherwise the allocator falls through the published range,
+    <em>says who was in the way</em> (registered owner with project attribution, or unregistered
+    pid + cmdline + inferred project), and never kills a holder. A hardcoded literal is rewritten
+    to the granted port (<code>substitute_command_port</code>); apps reading <code>$PORT</code>
+    need nothing. Dead entries keep their port (their restart contract) until the range exhausts —
+    then the first reassignable dead claim in range order is taken, noted; an EXPLICIT request for
+    a dead-reserved port is granted with a note, and the port map names the RUNNING owner, never
+    the stale reservation. <code>restart</code> gets the same preference semantics: a squatted
+    stored port moves the service and updates the registry — and a <code>port=0</code> opt-out is
+    persisted (<code>portless: true</code>), so a worker that needs no port restarts portless even
+    with the range full. A command hardcoding a RESERVED port (8080…) is allocated a free port
+    and the literal rewritten.</li>
+    <li><strong>Services are project-owned.</strong> <code>start</code> stamps the bound
+    project's id (wired from <code>context.current_project_id</code> in the tool registry);
+    registry keys are scoped <code>&lt;project&gt;:&lt;name&gt;</code> (files
+    <code>&lt;project&gt;--&lt;name&gt;.log/.pid/.cmd.sh</code>), so two projects can both run
+    "web". Resolution for stop/restart/status/logs: exact key → bound-project scope → legacy
+    unscoped → unique display-name across scopes; ambiguity lists candidates on EVERY verb
+    (stop/restart/status/logs), and a bound project's plain name prefers ITS scope over a legacy
+    unscoped key (plain-exact-first let project A stop a legacy 'web' it didn't own). START
+    resolution is deliberately scope-limited — project B's <code>start web</code> must never
+    hijack project A's running 'web'; a DEAD legacy unscoped entry is re-keyed into the bound
+    project on its next start, while a LIVE one stays untouched (the project creates its own
+    scoped twin on a fresh port instead of being blocked).
+    Default <code>workdir</code> is the bound project's workspace (a project's service serves
+    ITS output, not <code>/workspace</code>). <code>_project_service_entries</code> reads the
+    field (string match survives only for legacy entries); archive/delete stop exactly the owned
+    set.</li>
+    <li><strong>Reconcile + adopt (awareness without action).</strong> <code>reconcile()</code>
+    joins the registry against actual listeners (<code>ss -H -ltnp</code>) and names
+    <em>orphans</em> — listeners on watched ports no RUNNING entry accounts for — with pid,
+    cmdline, and a project hint from <code>/proc/&lt;pid&gt;/cwd</code>. Boot logs one read-only
+    summary line (<code>reconcile_summary</code>, main.py lifespan) — services are NEVER
+    auto-restarted on agent restart; the registry + surviving container processes carry over and
+    restart stays an explicit action. <code>status</code> appends the port map (RUNNING owner /
+    dead reservation / unregistered occupant / free) and an orphans block;
+    <code>action='adopt' name=… port=…</code> registers an existing listener (command/cwd/project
+    captured) so it becomes visible and stoppable. The ACTIVE-project briefing gets a SERVICES
+    line (registry facts only, zero container execs per turn; <code>stale</code> = container
+    generation mismatch).</li>
+    <li><strong>The orphan source is closed.</strong> execute refuses commands that background a
+    long-lived server (<code>_daemonized_server_block</code>: a detach signal — background
+    <code>&amp;</code>/<code>setsid</code> — AND a server signal) with a steer to
+    <code>manage_services</code>; short background jobs and foreground servers pass. Capacity:
+    the effective service cap is the published-range size (<code>_max_services()</code> —
+    <code>MAX_SERVICES</code> is the floor); widening <code>GHOST_SANDBOX_SERVICE_PORTS</code>
+    requires a container recreate, which kills running services.</li>
+  </ul>
+  <p><strong>Service tokens (same day, follow-up):</strong> the 2026-07-13 auth rollout silently
+  orphaned sandbox-hosted apps that integrate with the agent — the RELEASED chess coach could no
+  longer reach it at all (unkeyed <code>/api/health</code> probe 403'd, resolution fell through to
+  a wrong hardcoded URL, coaching calls 403'd; the release rehearsal's TCP probe cannot see any of
+  this). Rather than un-gating routes or smuggling the master key into the sandbox, the supervisor
+  now MINTS a per-service credential at start: <code>$GHOST_SERVICE_TOKEN</code> (stored on the
+  registry entry, exported in cmd.sh next to $PORT). The agent's <em>game routes only</em>
+  (<code>/api/game/*</code>, <code>verify_game_access</code> in api/game_routes.py) accept a live
+  token via the <code>X-Ghost-Service-Token</code> header — a token grants participant-game
+  compute, never <code>/api/chat</code> or anything else. Registry-driven like
+  <code>active_service_ports</code>: <code>stop</code>/<code>stop-all</code> revoke by removing
+  the entry, restart mints fresh, constant-time comparison, fail-closed. The briefing summary
+  never surfaces tokens.</p>
+  <p>Covered by <code>tests/test_service_port_leases.py</code> (allocator preference/fallback/
+  exhaustion, scoped identity, reconcile/adopt, briefing plumbing, the daemon guard, token
+  mint/export/revoke) plus the updated <code>tests/test_sandbox_services.py</code> and the
+  service-token auth tests in <code>tests/test_game_move_api.py</code> (including "a token never
+  unlocks /api/chat").</p>
+
   <h2>Tests</h2>
   <p><code>tests/test_sandbox_services.py</code> — port-spec parsing,
   validation rails, lifecycle (start/immediate-exit/stop-group-kill/restart/

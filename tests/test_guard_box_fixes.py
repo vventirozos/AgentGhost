@@ -45,11 +45,13 @@ class TestBlockBudgetWiring:
     def test_dispatch_passes_operation_and_budget_forces_final(self):
         import ghost_agent.core.agent as agent_mod
         src = inspect.getsource(agent_mod)
-        # would_repeat receives the operation discriminator.
+        # would_repeat receives the operation discriminator (and, since
+        # 2026-07-30, the signature-fallback key — see test_preflight_guard).
         idx = src.index("would_repeat(")
         assert "_pf_op" in src[idx:idx + 120]
-        # record() feeds the op back.
-        assert "record(fname, ptarget, str_res, ptool_op)" in src
+        # record() feeds the op back, keyed identically to the check site.
+        assert "guard_key_target(ptarget, a_hash)" in src
+        assert "str_res, ptool_op)" in src
         # Two blocks in one request force a final reply.
         assert "preflight_blocks_this_request >= 2" in src
         bidx = src.index("preflight_blocks_this_request >= 2")

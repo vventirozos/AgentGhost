@@ -402,6 +402,25 @@ async def lifespan(app):
         try:
             context.sandbox_manager = DockerSandbox(context.sandbox_dir, context.tor_proxy)
             await asyncio.to_thread(context.sandbox_manager.ensure_running)
+            # Boot-time service awareness (2026-07-30, §4G): services are
+            # detached container processes that SURVIVE agent restarts —
+            # tell the operator/model what carried over, in ONE read-only
+            # line. Deliberately never restarts anything (operator
+            # requirement: no auto-restart on agent restart); orphan
+            # listeners (started outside manage_services) are named so
+            # they can be adopted or killed instead of squatting ports
+            # invisibly.
+            try:
+                from .sandbox.services import get_service_supervisor
+                _sup = get_service_supervisor(context.sandbox_manager)
+                _svc_line = (await asyncio.to_thread(_sup.reconcile_summary)
+                             if _sup is not None else None)
+                if _svc_line:
+                    pretty_log("Service Registry", _svc_line,
+                               icon=Icons.SANDBOX_BOX)
+            except Exception:
+                logging.getLogger("GhostAgent").debug(
+                    "boot service reconcile skipped", exc_info=True)
         except Exception as e:
             pretty_log("Sandbox Failed", str(e), level="ERROR", icon=Icons.FAIL)
 

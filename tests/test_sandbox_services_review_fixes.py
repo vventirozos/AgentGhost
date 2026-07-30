@@ -133,22 +133,29 @@ class TestPortReclaimOwnership:
         sup.stop("web")
         assert any("625" in c for c in kills), kills
 
-    def test_start_refuses_port_claimed_by_live_service(self, tmp_path):
+    def test_port_claimed_by_live_service_falls_back_and_names_it(self, tmp_path):
+        # §4G lease semantics superseded the old hard refusal: a port
+        # claimed by a RUNNING service is skipped by the allocator, the
+        # claimant is NAMED, and the start succeeds on the next free port
+        # — the original hazard (probing the OTHER service's port and
+        # reporting a false "listening ✓") stays impossible because the
+        # probe now runs against the GRANTED port, never the claimed one.
         def handler(cmd):
+            if "nohup" in cmd:
+                return ("300\n", 0)
             if "kill -0" in cmd:
-                return ("", 0 if "111" in cmd else 1)   # chess alive
+                return ("", 0)          # chess (111) alive; 300 alive too
+            if "s.bind" in cmd:
+                return ("", 0)          # other ports free to bind
             return ("", 0)
 
         _write_registry(tmp_path, {"chess": _entry("chess", 111, port=8100)})
         sup = ServiceSupervisor(FakeSandbox(tmp_path, handler))
         out = sup.start("other", "python3 x.py", port=8100)
-        assert out.startswith("Error:")
-        assert "already claimed" in out and "chess" in out
-        assert "other" not in sup._load()               # nothing registered
-        # A different port is fine.
-        sb2 = FakeSandbox(tmp_path, happy_handler())
-        assert "RUNNING" in ServiceSupervisor(sb2).start(
-            "other", "python3 x.py", port=8101)
+        assert "RUNNING" in out
+        assert "claimed by RUNNING service 'chess'" in out
+        assert sup._load()["other"]["port"] == 8101     # moved, not stolen
+        assert sup._load()["chess"]["port"] == 8100     # untouched
 
     def test_start_flags_port_answered_by_foreign_process(self, tmp_path):
         """listening ✓ must not be claimed when the identified holder is
@@ -206,6 +213,8 @@ class TestContainerGenerationStamp:
                 return ("100\n", 0)
             if "kill -0" in cmd:
                 return ("", 0)          # the NUMBER is alive (recycled pid)
+            if "s.bind" in cmd:
+                return ("", 0)          # allocator: ports free (§4G lease)
             if "python3 -c" in cmd:
                 return ("", 1)          # nothing listening in new container
             return ("", 0)

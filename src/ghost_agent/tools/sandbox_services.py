@@ -16,13 +16,15 @@ from ..utils.logging import pretty_log, Icons
 
 logger = logging.getLogger("GhostAgent")
 
-_VALID_ACTIONS = ("start", "stop", "restart", "status", "logs", "stop-all")
+_VALID_ACTIONS = ("start", "stop", "restart", "status", "logs", "stop-all",
+                  "adopt")
 
 
 async def tool_manage_services(action: str = None, name: str = None,
                                command: str = None, port=None,
                                lines=None, workdir: str = None,
-                               sandbox_manager=None, **kwargs):
+                               sandbox_manager=None, project_id=None,
+                               **kwargs):
     # --- PARAMETER HALLUCINATION HEALING (matches execute.py style) ---
     action = (action or kwargs.get("operation") or kwargs.get("op") or "")
     action = str(action).strip().lower()
@@ -51,26 +53,33 @@ async def tool_manage_services(action: str = None, name: str = None,
     # Mutating service ops are real cross-turn side effects (a server left
     # running, a port reclaimed) — make them visible; they were silent before,
     # only failures logged. status/logs are read-only, so skip them.
-    if action in ("start", "stop", "restart", "stop-all"):
+    if action in ("start", "stop", "restart", "stop-all", "adopt"):
         _detail = action + (f" {name}" if name else "")
         if action == "start" and command:
             _detail += f" · {command}" + (f" :{port}" if port else "")
+        if project_id and action in ("start", "adopt"):
+            _detail += f" · project {project_id}"
         pretty_log("Service", _detail, icon=Icons.SANDBOX_BOX)
 
     try:
         if action == "start":
             return await asyncio.to_thread(
-                sup.start, name, command, port=port, workdir=workdir)
+                sup.start, name, command, port=port, workdir=workdir,
+                project_id=project_id)
         if action == "stop":
-            return await asyncio.to_thread(sup.stop, name)
+            return await asyncio.to_thread(sup.stop, name, project_id)
         if action == "restart":
-            return await asyncio.to_thread(sup.restart, name)
+            return await asyncio.to_thread(sup.restart, name, project_id)
         if action == "stop-all":
             return await asyncio.to_thread(sup.stop_all)
+        if action == "adopt":
+            return await asyncio.to_thread(
+                lambda: sup.adopt(name, port, project_id=project_id))
         if action == "logs":
             return await asyncio.to_thread(
-                sup.logs, name, lines if lines is not None else 60)
-        return await asyncio.to_thread(sup.status, name)
+                sup.logs, name, lines if lines is not None else 60,
+                project_id)
+        return await asyncio.to_thread(sup.status, name, project_id)
     except Exception as e:  # noqa: BLE001 — tool contract: return, don't raise
         logger.warning("manage_services %s failed: %s", action, e)
         return f"Error: manage_services {action} failed: {type(e).__name__}: {e}"
@@ -83,9 +92,16 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
         "description": (
             "Run LONG-LIVED background services (web servers, daemons) "
             "inside the sandbox that KEEP RUNNING across turns — unlike "
-            "execute, which kills its process at the timeout. Start a dev "
-            "server, then open http://127.0.0.1:<port> with the browser "
-            "tool to drive/verify it. Logs are captured per service."
+            "execute, which kills its process at the timeout. NEVER start "
+            "a server by backgrounding it in execute ('cmd &') — that "
+            "leaks an invisible port-holder; use this tool. Services are "
+            "owned by the active project (stopped when it is archived/"
+            "deleted) and PORTS ARE ASSIGNED FOR YOU: the requested port "
+            "is a preference — if it is taken, a free one is granted and "
+            "reported, and the app receives it as $PORT. Start a dev "
+            "server, then open http://127.0.0.1:<granted port> with the "
+            "browser tool to drive/verify it. Logs are captured per "
+            "service."
         ),
         "parameters": {
             "type": "object",
@@ -93,8 +109,13 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                 "action": {
                     "type": "string",
                     "enum": ["start", "stop", "restart", "status", "logs",
-                             "stop-all"],
-                    "description": ("status lists all services + liveness. "
+                             "stop-all", "adopt"],
+                    "description": ("status lists all services + liveness + "
+                                    "the port map (who holds which port, "
+                                    "incl. unregistered listeners). "
+                                    "adopt registers an EXISTING "
+                                    "unregistered listener (name + port) so "
+                                    "it becomes visible/stoppable. "
                                     "stop-all stops EVERY service, reclaims "
                                     "their ports, and clears the registry — "
                                     "the one-shot cleanup for accumulated or "
@@ -109,28 +130,36 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                     "description": (
                         "start only: foreground shell command, e.g. "
                         "'python3 -m http.server 8100' or "
-                        "'cd app && node server.js'."
+                        "'cd app && node server.js'. Prefer reading the "
+                        "port from $PORT; a hardcoded port literal is "
+                        "rewritten automatically if the lease lands on a "
+                        "different port."
                     ),
                 },
                 "port": {
                     "type": "integer",
                     "description": (
-                        "start only (recommended): TCP port the service "
-                        f"listens on — enables the health probe and browser "
-                        f"access. Use {SUGGESTED_PORTS} "
-                        "(8000/8080/8088/9050 are reserved). This value is "
-                        "also exported to the command as the PORT env var, so "
-                        "the app should bind it "
-                        "(`port=int(os.environ.get('PORT', <default>))`) rather "
-                        "than hardcoding a port that would mismatch this one."
+                        "start: OPTIONAL preferred TCP port — omit it (or "
+                        "if the command names its own port, that is used as "
+                        "the preference) and a free port from "
+                        f"{SUGGESTED_PORTS} is assigned automatically; if "
+                        "the preferred port is taken the service starts on "
+                        "the next free one and the report says so. The "
+                        "granted port is exported as the PORT env var — "
+                        "bind that (`port=int(os.environ.get('PORT', "
+                        "<default>))`). Pass 0 ONLY for a service that "
+                        "listens on no port at all. adopt: REQUIRED — the "
+                        "port the existing listener holds. "
+                        "(8000/8080/8088/9050/9051 are reserved.)"
                     ),
                 },
                 "workdir": {
                     "type": "string",
                     "description": (
                         "start only: directory the command runs IN, relative "
-                        "to /workspace (e.g. 'projects/30d5d5b65c38'). Defaults "
-                        "to /workspace. Use this to run an app that lives in a "
+                        "to /workspace (e.g. 'projects/30d5d5b65c38'). "
+                        "Defaults to the ACTIVE project's workspace (else "
+                        "/workspace). Use this to run an app that lives in a "
                         "subdirectory — pass workdir instead of prefixing the "
                         "command with 'cd <dir> &&'."
                     ),

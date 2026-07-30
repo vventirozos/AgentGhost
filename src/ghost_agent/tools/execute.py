@@ -29,6 +29,76 @@ _SHELL_MUTATION_RE = re.compile(
 )
 
 
+# Backgrounded-server guard (2026-07-30, §4G). A `… &`-detached process
+# re-parents to the container's PID 1 and SURVIVES the exec — holding its
+# port invisibly, outside the service registry's sight (the solar-sim
+# incident: an autoadvance task ran `python3 server.py &`, and the stray
+# holder of port 8102 cost three requests of thrash). Block only when BOTH
+# signals fire — a detach (`&` background / setsid) AND a server-ish
+# command — so short-lived background jobs and foreground servers (which
+# die with the exec timeout anyway) pass untouched. False negatives are
+# acceptable: the supervisor's reconcile/status names surviving orphans.
+_BG_AMP_RE = re.compile(r"(?<![&>])&(?!\s*[&>])")
+_SERVERISH_RE = re.compile(
+    r"\bhttp\.server\b|\bserver\.py\b|\bflask\s+run\b|\buvicorn\b"
+    r"|\bgunicorn\b|\bnode\s+\S*(?:server|app)\.js\b"
+    r"|\bnpm\s+(?:start|run\s+(?:dev|serve|start))\b"
+    r"|\byarn\s+(?:start|dev)\b|\bstreamlit\s+run\b"
+    r"|\bmanage\.py\s+runserver\b"
+    r"|\bphp\s+-S\b|--port[=\s]\d|\bhttpd\b|\bnginx\b",
+    re.IGNORECASE)
+_SH_C_PAYLOAD_RE = re.compile(
+    r"\b(?:ba|z|da)?sh\s+(?:-\S+\s+)*-c\s+(?:'([^']*)'|\"([^\"]*)\")")
+_QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+_DAEMON_BLOCK_MSG = (
+    "SYSTEM BLOCK: this command backgrounds a long-lived server "
+    "('… &' / setsid) inside the sandbox — NOT executed. Detached "
+    "processes survive the exec and hold their port INVISIBLY: the "
+    "service registry cannot see, stop, or report them (this exact "
+    "leak caused the port-8102 incident). Start it as a SUPERVISED "
+    "service instead: manage_services action='start' name='<name>' "
+    "command='<the same command without the & and without setsid/"
+    "nohup>' — a free port is assigned automatically (exported as "
+    "$PORT), logs are captured, and it keeps running across turns. "
+    "Foreground and short-lived commands are unaffected."
+)
+
+
+def _detached_server_signals(text: str) -> bool:
+    return bool(_SERVERISH_RE.search(text)
+                and (_BG_AMP_RE.search(text)
+                     or re.search(r"\bsetsid\b", text)))
+
+
+def _daemonized_server_block(command: str):
+    """Refusal message when a shell command would detach a long-lived
+    server inside the sandbox, else None.
+
+    Precision rails (review 2026-07-30, same class the egress guard hit on
+    2026-07-08): heredoc BODIES are data being written, not commands —
+    stripped via the shared ``_strip_data_heredocs``; quoted strings are
+    data too (`git commit -m "fix server.py & restart"`), EXCEPT a nested
+    shell's ``-c`` payload, which is itself a command and gets its own
+    scan. A command that job-kills its background child (`… & curl …;
+    kill %1` — the smoke-test idiom) does not outlive the exec and passes."""
+    cmd = str(command or "")
+    if not cmd:
+        return None
+    try:
+        cmd = _strip_data_heredocs(cmd)
+    except Exception:  # noqa: BLE001 — guard must not crash the tool
+        pass
+    if re.search(r"\bkill\s+%", cmd):
+        return None
+    for m in _SH_C_PAYLOAD_RE.finditer(cmd):
+        inner = m.group(1) or m.group(2) or ""
+        if inner and _detached_server_signals(inner):
+            return _DAEMON_BLOCK_MSG
+    if _detached_server_signals(_QUOTED_RE.sub(" ", cmd)):
+        return _DAEMON_BLOCK_MSG
+    return None
+
+
 def _released_shell_block(project_store, command: str):
     """Refusal message when a shell command would mutate a RELEASED
     project's workspace, else None. Heuristic by necessity (shell), so it
@@ -590,6 +660,12 @@ async def tool_execute(filename: str = None, content: str = None, sandbox_dir: P
                     kwargs.get("project_store"), command)
                 if _rb:
                     return _format_error(_rb)
+                # Backgrounded-server guard (2026-07-30, §4G): a detached
+                # server must go through manage_services, or it becomes an
+                # invisible port-holder the registry can't see or stop.
+                _db = _daemonized_server_block(command)
+                if _db:
+                    return _format_error(_db)
         except Exception as _vexc:
             logging.getLogger("GhostAgent").debug("shell validator crashed: %s", _vexc)
             _shell_ok, _shell_reason = True, ""

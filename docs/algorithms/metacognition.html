@@ -168,6 +168,39 @@
     idempotency guard above already covers them.
   </p>
   <p>
+    <strong>Lifecycle &amp; keying hardening (2026-07-30).</strong> The
+    threshold rationale above has a blind spot: it only protects a fix made
+    <em>between</em> the two failures. Fix the cause <em>after</em> the
+    second identical failure and the retry is blocked pre-dispatch — it can
+    never run, so it can never refute the stale entries, and the guard
+    deadlocks (observed live: the model killed the process holding a port
+    and confirmed it free, then three consecutive requests were boxed in
+    re-attempting a <code>manage_services start</code> that would have
+    succeeded). Three changes close this: (1)&nbsp;<strong>world-changed
+    reset</strong> — a successful state-mutating call (file_system mutation,
+    mutating manage_services action, or an <code>execute</code> command
+    matching <code>looks_mutating_command</code>: kills, file-mutation
+    verbs, service-manager subcommands, bare redirects — not probes) clears
+    the guard via <code>note_world_changed()</code>; fresh identical
+    failures re-arm it at the threshold. "Successful" is execute-aware:
+    shell results carry an <code>EXIT CODE:</code> banner rather than an
+    <code>Error:</code> prefix, so the world-changed branch parses it — a
+    failed <code>kill</code> (exit 1) must not clear the guard. Execute
+    failures still are not <em>recorded</em> into the guard, deliberately:
+    repeated identical shell failures are the strike ledger's / System-3
+    pivot's crisis signal, and pre-dispatch blocking would starve the pivot.
+    (2)&nbsp;<strong>signature
+    keying</strong> — when <code>primary_target_from_args</code> recognises
+    no key (manage_services' identity is <code>name</code>/<code>port</code>/
+    <code>command</code>), <code>guard_key_target</code> keys on an
+    <code>args#</code> SHA-1 of the full canonical call, so only a
+    byte-identical re-issue counts as a repeat and changed-arg retries stay
+    legal. (3)&nbsp;<strong>request scoping</strong> — the guard resets at
+    request start; entries no longer leak from a previous request's world.
+    Cross-request pathology remains the offline fingerprint's job. See
+    <code>docs/core/agent.html</code> for the full postmortem.
+  </p>
+  <p>
     The guard is <strong>independent of <code>--enable-metacog</code></strong>:
     it ships on by default and is governed by its own
     <code>--enable-preflight-guard</code> / <code>--no-enable-preflight-guard</code>

@@ -62,7 +62,11 @@ def happy_handler(pid="12345", port_listens=True):
             return (f"{pid}\n", 0)
         if "kill -0" in cmd:
             return ("", 0)  # alive
-        if "python3 -c" in cmd:  # port probe
+        if "s.bind" in cmd:      # allocator bind probe → port is free
+            return ("", 0)
+        if "ss -H -ltnp" in cmd:  # listener scan → nothing listening
+            return ("", 0)
+        if "python3 -c" in cmd:  # connect probe (post-launch health)
             return ("", 0 if port_listens else 1)
         return ("", 0)
     return handler
@@ -206,13 +210,26 @@ class TestSupervisorLifecycle:
         assert "export GHOST_SERVICE_HOST=0.0.0.0" in script
         assert script.index("export HOST=0.0.0.0") < script.index("python3 app.py")
 
-    def test_start_no_port_no_env_export(self, tmp_path):
+    def test_port_zero_opts_out_of_lease_and_env_export(self, tmp_path):
+        # §4G: omission AUTO-ASSIGNS (services expose project output over
+        # HTTP by definition); port=0 is the explicit opt-out for the rare
+        # non-listening worker — no lease, no PORT/HOST export.
         sup = ServiceSupervisor(FakeSandbox(tmp_path, happy_handler()))
-        sup.start("daemon", "python3 worker.py")   # no port
+        sup.start("daemon", "python3 worker.py", port=0)
         script = (tmp_path / ".services" / "daemon.cmd.sh").read_text()
         assert "PORT=" not in script
-        # No port -> nothing published -> no host-bind export either.
         assert "HOST=" not in script
+        assert sup._load()["daemon"]["port"] is None
+
+    def test_omitted_port_is_auto_assigned(self, tmp_path):
+        # §4G: no port argument and no literal in the command → the
+        # allocator grants the first free published port and exports it.
+        sup = ServiceSupervisor(FakeSandbox(tmp_path, happy_handler()))
+        out = sup.start("web", "python3 worker.py")
+        assert sup._load()["web"]["port"] == 8100
+        assert "assigned free port 8100" in out
+        script = (tmp_path / ".services" / "web.cmd.sh").read_text()
+        assert "PORT=8100" in script
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -307,8 +324,10 @@ class TestRemoteAccessHint:
                 return ("555\n", 0)
             if "kill -0" in cmd:
                 return ("", 0)          # process ALIVE
+            if "s.bind" in cmd:
+                return ("", 0)          # allocator: the port IS free to bind
             if "python3 -c" in cmd:
-                return ("", 1)          # port NEVER listening
+                return ("", 1)          # port NEVER listening post-launch
             return ("", 0)
         sup = ServiceSupervisor(FakeSandbox(tmp_path, handler))
         out = sup.start("web", "python3 app.py", port=8100)
@@ -598,7 +617,7 @@ class TestZombiesAndWorkdirValidation:
     def test_active_ports_registry_driven(self, tmp_path):
         sup = ServiceSupervisor(FakeSandbox(tmp_path, happy_handler()))
         sup.start("a", "cmd", port=8100)
-        sup.start("b", "cmd")          # no port
+        sup.start("b", "cmd", port=0)      # explicit portless opt-out (§4G)
         assert sup.active_ports() == frozenset({8100})
         # Helper is fail-safe without a sandbox.
         assert active_service_ports(None) == frozenset()

@@ -20,12 +20,14 @@ need history do the same in their adapter's ``load``.
 """
 
 import logging
+import secrets
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Security
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from .routes import get_agent, verify_api_key
+from .routes import api_key_header, get_agent, verify_api_key
 from .games import (
     GameDependencyError,
     GameStateError,
@@ -40,8 +42,45 @@ from ..utils.logging import Icons, pretty_log
 
 logger = logging.getLogger("GhostAgent")
 
+_service_token_header = APIKeyHeader(name="X-Ghost-Service-Token",
+                                     auto_error=False)
+
+
+async def verify_game_access(
+        request: Request,
+        api_key: str = Security(api_key_header),
+        service_token: str = Security(_service_token_header)):
+    """Master API key OR a live supervisor-minted service token.
+
+    Sandbox-hosted apps (the chess coach) are participant clients by
+    design — they call /api/game/move for the agent's moves/coaching —
+    but they must never hold the master key inside the sandbox. The
+    ServiceSupervisor mints $GHOST_SERVICE_TOKEN at service start
+    (2026-07-30; the 2026-07-13 auth rollout had silently orphaned this
+    app class), and this dependency accepts it for the GAME routes only:
+    a token grants participant-game compute, nothing else. Validity is
+    registry-driven — stop revokes. Failures fall through to
+    verify_api_key so the standard auth-rejected logging + 403 applies.
+    """
+    agent = get_agent(request)
+    configured = agent.context.args.api_key
+    if not configured:
+        return None
+    if api_key and secrets.compare_digest(
+            str(api_key).encode("utf-8", "ignore"),
+            str(configured).encode("utf-8", "ignore")):
+        return api_key
+    if service_token:
+        from ..sandbox.services import valid_service_token
+        if valid_service_token(
+                getattr(agent.context, "sandbox_manager", None),
+                service_token):
+            return service_token
+    return await verify_api_key(request, api_key)
+
+
 game_router = APIRouter(prefix="/api/game",
-                        dependencies=[Security(verify_api_key)])
+                        dependencies=[Security(verify_game_access)])
 
 _MAX_MOVE_ATTEMPTS = 3
 

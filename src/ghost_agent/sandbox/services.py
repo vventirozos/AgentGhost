@@ -38,6 +38,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shlex
 import threading
 import time
@@ -181,6 +182,72 @@ def default_service_ports(spec: Optional[str] = None) -> list:
                    if 1024 <= p <= 65535 and p not in BLOCKED_PORTS})[:32]
 
 
+# ── Project-scoped identity + port-lease helpers (2026-07-30, §4G) ────
+#
+# Services are PROJECT-OWNED resources: registry keys are scoped
+# "<project_id>:<name>" (plain "<name>" for project-less utilities), so two
+# projects can both run a "web" without colliding, and lifecycle coupling
+# (archive/delete stops MY services) reads a first-class field instead of
+# grepping the command string. Ports are LEASES the supervisor grants —
+# the registry is the single source of truth for "who owns which port".
+
+_PROJ_HINT_RE = re.compile(r"projects/([0-9a-f]{6,32})(?:/|\b)")
+
+# Conservative "the command names its own port" patterns — used when the
+# port argument is omitted so the allocator can treat the hardcoded number
+# as the PREFERENCE (and substitute it if the lease lands elsewhere).
+_CMD_PORT_RES = (
+    re.compile(r"\bhttp\.server\s+(\d{4,5})\b"),
+    re.compile(r"--port[=\s]+(\d{4,5})\b"),
+    re.compile(r"(?<![\w-])-p\s+(\d{4,5})\b"),
+    re.compile(r"\bPORT=(\d{4,5})\b"),
+    re.compile(r"\bphp\s+-S\s+[\w.]+:(\d{4,5})\b"),
+)
+
+
+def entry_key(project_id, name) -> str:
+    """Registry key for a service: ``<project_id>:<name>`` when owned,
+    plain ``<name>`` for project-less services (also the legacy shape)."""
+    pid = str(project_id or "").strip()
+    return f"{pid}:{name}" if pid else str(name)
+
+
+def split_key(key) -> tuple:
+    """Inverse of :func:`entry_key` → ``(project_id | None, name)``."""
+    key = str(key or "")
+    if ":" in key:
+        pid, name = key.split(":", 1)
+        return (pid or None), name
+    return None, key
+
+
+def _file_stem(key) -> str:
+    """Per-service filename stem (cmd.sh / log / pid). ':' is shell-hostile
+    inside the container, so scoped keys map to ``<project>--<name>``."""
+    return str(key).replace(":", "--")
+
+
+def extract_command_port(command) -> Optional[int]:
+    """Port literal the command itself binds, per the conservative patterns
+    above; None when the command doesn't name one."""
+    for rx in _CMD_PORT_RES:
+        m = rx.search(str(command or ""))
+        if m:
+            try:
+                return int(m.group(1))
+            except ValueError:
+                continue
+    return None
+
+
+def substitute_command_port(command, old_port, new_port) -> str:
+    """Rewrite a hardcoded port literal when the lease lands elsewhere —
+    ``http.server 8102`` must become ``http.server 8103`` or the app binds
+    the port the report doesn't name. Word-boundary, all occurrences."""
+    return re.sub(rf"\b{int(old_port)}\b", str(int(new_port)),
+                  str(command or ""))
+
+
 class ServiceSupervisor:
     """Manage named detached processes in the sandbox container.
 
@@ -222,11 +289,11 @@ class ServiceSupervisor:
 
     def list_entries(self) -> list:
         """Public read-only snapshot of the registered services
-        (``[{name, command, port, workdir, pid, …}]``). Added for the
-        project release rehearsal (2026-07-25), which needs to enumerate a
-        project's services to cold-start and probe them without parsing the
-        prose ``status()`` output."""
-        return [dict(e) for e in self._load().values()]
+        (``[{name, command, port, workdir, pid, project_id, key, …}]``).
+        Added for the project release rehearsal (2026-07-25); ``key`` is the
+        registry key — pass it to stop/restart for exact addressing across
+        project scopes (2026-07-30)."""
+        return [{**e, "key": k} for k, e in self._load().items()]
 
     # -- container helpers ---------------------------------------------------
 
@@ -270,6 +337,73 @@ class ServiceSupervisor:
               "else 1)")
         _, code = self._exec(f"python3 -c {shlex.quote(py)}", timeout=15)
         return code == 0
+
+    def _port_bindable(self, port) -> bool:
+        """Can a service BIND 0.0.0.0:<port> in the container right now?
+        The allocator's probe — distinct from ``_port_listening`` (which
+        asks whether something answers): a service binds 0.0.0.0 (the HOST
+        export), so this is exactly the question a failed
+        "exited immediately: address already in use" would answer later,
+        asked BEFORE the launch instead."""
+        py = ("import socket,sys; s=socket.socket(); "
+              "s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); "
+              f"s.bind((\"0.0.0.0\",{int(port)})); s.close(); sys.exit(0)")
+        _, code = self._exec(f"python3 -c {shlex.quote(py)}", timeout=15)
+        return code == 0
+
+    def _listeners(self) -> list:
+        """``[(port, pid|None), …]`` for every TCP listener in the container
+        (``ss`` is baked into the sandbox image). Best-effort; [] on any
+        failure."""
+        out, code = self._exec(
+            "sh -c 'ss -H -ltnp 2>/dev/null'", timeout=15)
+        if code != 0 or not out:
+            return []
+        found = []
+        for line in out.splitlines():
+            cols = line.split()
+            if len(cols) < 4:
+                continue
+            addr = cols[3]
+            port_s = addr.rsplit(":", 1)[-1]
+            if not port_s.isdigit():
+                continue
+            m = re.search(r"pid=(\d+)", line)
+            found.append((int(port_s), int(m.group(1)) if m else None))
+        return found
+
+    def _proc_cmdline(self, pid) -> str:
+        try:
+            out, code = self._exec(
+                f"sh -c 'tr \"\\0\" \" \" < /proc/{int(pid)}/cmdline'",
+                timeout=10)
+        except (TypeError, ValueError):
+            return ""
+        return out.strip() if code == 0 else ""
+
+    def _proc_cwd(self, pid) -> str:
+        try:
+            out, code = self._exec(
+                f"readlink /proc/{int(pid)}/cwd", timeout=10)
+        except (TypeError, ValueError):
+            return ""
+        return out.strip() if code == 0 else ""
+
+    def _proc_project_hint(self, pid) -> Optional[str]:
+        """Project id inferred from an arbitrary pid's cwd/cmdline — the
+        attribution for listeners that bypassed this supervisor."""
+        m = _PROJ_HINT_RE.search(self._proc_cwd(pid) or "")
+        if not m:
+            m = _PROJ_HINT_RE.search(self._proc_cmdline(pid) or "")
+        return m.group(1) if m else None
+
+    def _max_services(self) -> int:
+        """Effective concurrent-service cap: the published-port range size
+        when one is configured (each host-visible service needs a published
+        port — the two numbers were silently the same 5 before), else the
+        MAX_SERVICES floor."""
+        n = len(default_service_ports())
+        return n if n > 0 else MAX_SERVICES
 
     def _container_generation(self) -> Optional[str]:
         """Id of the LIVE sandbox container, or None when unknown (no
@@ -381,49 +515,219 @@ class ServiceSupervisor:
                     f"(suggested: {SUGGESTED_PORTS}).")
         return None
 
+    # -- port leases ---------------------------------------------------------
+
+    def _port_block_reason(self, port, reg, alive_map,
+                           self_key=None) -> Optional[str]:
+        """Why ``port`` cannot be granted right now, or None when it can.
+        Checks live registry claims first (no container round-trip), then
+        the container bind probe — which also catches UNREGISTERED holders,
+        the class the old claim-check missed (solar-sim: an execute-leaked
+        `python3 server.py &` held 8102 invisibly)."""
+        port = int(port)
+        for k, e in reg.items():
+            if k == self_key or e.get("port") != port:
+                continue
+            if alive_map.get(k):
+                proj = e.get("project_id")
+                return (f"claimed by RUNNING service "
+                        f"'{e.get('name') or k}'"
+                        + (f" of project {proj}" if proj else ""))
+        if not self._port_bindable(port):
+            holder = self._holder_pid(port)
+            if holder is not None:
+                extra = ""
+                cl = self._proc_cmdline(holder)
+                if cl:
+                    extra += f" `{cl[:60]}`"
+                hint = self._proc_project_hint(holder)
+                if hint:
+                    extra += f" (project {hint})"
+                return (f"held by an UNREGISTERED process — "
+                        f"pid {holder}{extra}")
+            return "not bindable (held by an unknown process)"
+        return None
+
+    def _allocate_port(self, reg, requested=None, self_key=None):
+        """Grant a port lease: ``(port | None, notes)``.
+
+        ``requested`` is a PREFERENCE — honored when grantable, otherwise
+        the allocator falls through the published range and the notes say
+        who was in the way (the report must explain a moved port, never
+        silently relocate). Ports claimed by other REGISTERED entries are
+        skipped even when those entries are dead — a dead service's port is
+        its restart contract — unless nothing else is free, in which case
+        the first reassignable dead claim in range order is taken (noted).
+        Holders are NEVER killed. Returns ``(None, notes)`` when nothing
+        is grantable."""
+        notes = []
+        alive_map = {k: self._entry_alive(e) for k, e in reg.items()
+                     if k != self_key}
+        if requested is not None:
+            why = self._port_block_reason(requested, reg, alive_map,
+                                          self_key)
+            if why is None:
+                # An explicit request may land on a DEAD entry's reserved
+                # port — grant it (the request wins), but SAY SO: silently
+                # double-claiming left the port map naming the dead entry
+                # as owner while another service ran there (review
+                # 2026-07-30).
+                _dead_owner = next(
+                    (k for k, e in reg.items()
+                     if k != self_key and not alive_map.get(k)
+                     and e.get("port") == int(requested)), None)
+                if _dead_owner is not None:
+                    notes.append(
+                        f"port {int(requested)} was reserved by dead "
+                        f"service '{reg[_dead_owner].get('name') or _dead_owner}'"
+                        f" — its restart will be granted a new port")
+                return int(requested), notes
+            notes.append(f"requested port {int(requested)} is "
+                         f"unavailable: {why}")
+        span = default_service_ports()
+        dead_claims = {int(e["port"]): k for k, e in reg.items()
+                       if k != self_key and not alive_map.get(k)
+                       and isinstance(e.get("port"), int)}
+        deferred = []
+        for cand in span:
+            if requested is not None and cand == int(requested):
+                continue
+            if cand in dead_claims:
+                deferred.append(cand)     # a dead service's restart contract
+                continue
+            why = self._port_block_reason(cand, reg, alive_map, self_key)
+            if why is None:
+                notes.append(f"assigned free port {cand}"
+                             + (" instead" if requested is not None else ""))
+                return cand, notes
+        for cand in deferred:
+            why = self._port_block_reason(cand, reg, alive_map, self_key)
+            if why is None:
+                notes.append(
+                    f"assigned port {cand} (was reserved for dead service "
+                    f"'{reg[dead_claims[cand]].get('name') or dead_claims[cand]}' — "
+                    f"its restart will be granted a new port)")
+                return cand, notes
+        _span_txt = (os.environ.get("GHOST_SANDBOX_SERVICE_PORTS",
+                                    SUGGESTED_PORTS)
+                     if span else "none configured")
+        notes.append(
+            f"no free port in the published range ({_span_txt}) — "
+            f"stop a service (action='status' shows the port map) or widen "
+            f"GHOST_SANDBOX_SERVICE_PORTS (needs a sandbox recreate, which "
+            f"kills running services)")
+        return None, notes
+
     # -- operations ----------------------------------------------------------
 
     def start(self, name: str, command: str, *, port=None,
-              workdir: Optional[str] = None) -> str:
+              workdir: Optional[str] = None, project_id=None) -> str:
+        # Callers (restart, project tooling) may pass a scoped KEY as the
+        # name — normalize to (project_id, display-name) first so validation
+        # and file stems see the display name. An explicit key's project
+        # WINS over the ambient bound project (review 2026-07-30: the
+        # ambiguity error tells the model to "use the full key", so the
+        # full key must not be silently re-scoped).
+        if ":" in str(name or ""):
+            _kp, _kn = split_key(name)
+            project_id = _kp or project_id
+            name = _kn
+        # port=0 (or 'none') opts out of the port lease entirely — the rare
+        # non-listening worker. Detected before validation (0 is out of the
+        # valid bind range by design).
+        _portless = port is not None and \
+            str(port).strip().lower() in ("0", "none", "no", "off")
+        if _portless:
+            port = None
         for err in (self._validate_name(name),
                     self._validate_command(command),
                     self._validate_port(port)):
             if err:
                 return err
         name = str(name)
+        project_id = str(project_id).strip() if project_id else None
         with self._lock:
             reg = self._load()
-            # A case-variant of a registered name is the SAME service —
-            # adopt the registered spelling instead of creating a twin
+            # Scope-limited resolution: the bound project's spelling of this
+            # name, or a legacy unscoped entry (adopted into the project
+            # below) — NEVER another project's service (see
+            # _resolve_for_start). Case-variants remain one service
             # (the req-43 'WebOS' vs 'webos' duplicate + port conflict).
-            key = self._resolve_name(reg, name)
+            key = self._resolve_for_start(reg, name, project_id)
             if key is not None:
-                name = key
-            entry = reg.get(name)
+                _, name = split_key(key)
+            entry = reg.get(key) if key else None
             if entry and self._entry_alive(entry):
                 return (f"Error: service '{name}' is already running "
                         f"(pid {entry.get('pid')}). Use action='restart' "
                         f"to replace it, or 'stop' first.")
-            alive = sum(1 for e in reg.values()
-                        if e.get("name") != name
-                        and self._entry_alive(e))
-            if alive >= MAX_SERVICES:
-                return (f"Error: {MAX_SERVICES} services already running — "
+            # Re-key a resolved LEGACY (unscoped) entry into the bound
+            # project's scope: the replacement entry below records the
+            # ownership the old one lacked.
+            if key is not None and project_id and ":" not in key:
+                reg.pop(key, None)
+            key = entry_key(project_id, name)
+            stem = _file_stem(key)
+            _max = self._max_services()
+            alive = sum(1 for k2, e2 in reg.items()
+                        if k2 != key and self._entry_alive(e2))
+            if alive >= _max:
+                return (f"Error: {_max} services already running — "
                         f"stop one first (action='status' to list).")
-            # A port another registered+alive service already claims can only
-            # produce a failed bind — worse, the port probe below would see
-            # the OTHER service listening and report a false "listening ✓"
-            # (review 2026-07-22). Refuse up front.
-            if port is not None:
-                _claimant = next(
-                    (n2 for n2, e2 in reg.items()
-                     if n2 != name and e2.get("port") == int(port)
-                     and self._entry_alive(e2)), None)
-                if _claimant is not None:
-                    return (f"Error: port {int(port)} is already claimed by "
-                            f"RUNNING service '{_claimant}'. Stop it first "
-                            f"(action='stop' name='{_claimant}') or pick "
-                            f"another port (suggested: {SUGGESTED_PORTS}).")
+            # ── Port lease (2026-07-30, §4G) ──
+            # Services exist to expose a project's output over HTTP
+            # (operator definition), so EVERY start is granted a lease
+            # unless explicitly opted out with port=0. The requested port
+            # (argument, or a literal the command itself names) is a
+            # PREFERENCE; the allocator grants it when free or falls
+            # through the published range, explaining any move. An occupied
+            # preferred port is no longer an error OR a doomed launch — the
+            # service starts on the granted port, $PORT tells the app, and
+            # a hardcoded literal is rewritten below.
+            _alloc_notes: list = []
+            _blocked_cmd_port = None
+            if not _portless:
+                _requested = port
+                if _requested is None:
+                    _cmd_port = extract_command_port(command)
+                    if _cmd_port is not None:
+                        if self._validate_port(_cmd_port) is None:
+                            _requested = _cmd_port
+                            _alloc_notes.append(
+                                f"no port argument — the command names "
+                                f"port {_cmd_port}, using it as the "
+                                f"preference")
+                        else:
+                            # The command hardcodes a RESERVED port (8080
+                            # etc.) — allocate elsewhere and rewrite the
+                            # literal below, or the app binds the reserved
+                            # port anyway and only the late not-listening
+                            # diagnostic would catch it (review 2026-07-30).
+                            _blocked_cmd_port = _cmd_port
+                            _alloc_notes.append(
+                                f"the command names RESERVED port "
+                                f"{_cmd_port} — a free port is assigned "
+                                f"instead")
+                port, _notes = self._allocate_port(
+                    reg, requested=_requested, self_key=key)
+                _alloc_notes.extend(_notes)
+                if port is None:
+                    return ("Error: could not grant a port for "
+                            f"'{name}': " + "; ".join(_alloc_notes)
+                            + "\n" + self._port_map_text(reg))
+                _rewrite_from = None
+                if _requested is not None and int(port) != int(_requested):
+                    _rewrite_from = _requested
+                elif _blocked_cmd_port is not None:
+                    _rewrite_from = _blocked_cmd_port
+                if _rewrite_from is not None \
+                        and re.search(rf"\b{int(_rewrite_from)}\b",
+                                      str(command)):
+                    command = substitute_command_port(
+                        command, _rewrite_from, port)
+                    _alloc_notes.append(
+                        f"rewrote the hardcoded {_rewrite_from} in the "
+                        f"command to {port}")
 
             # The command ships as a SCRIPT via the bind mount (no quoting
             # hazards), then launches detached: setsid gives it a fresh
@@ -447,6 +751,16 @@ class ServiceSupervisor:
             # through identical retries (observed live: workdir
             # '/projects/<id>' — a container-absolute path missing the
             # /workspace prefix — cost a 137s request 3 failed launches).
+            # Default workdir: the bound project's workspace when it exists
+            # (a project's service serves ITS output — `python3 -m
+            # http.server` from /workspace would serve EVERY project's
+            # files), else the sandbox root as before.
+            if workdir is None and project_id:
+                _proj_wd = f"{CONTAINER_WORKDIR}/projects/{project_id}"
+                _, _p_code = self._exec(
+                    f"test -d {shlex.quote(_proj_wd)}", timeout=10)
+                if _p_code == 0:
+                    workdir = _proj_wd
             wd = str(workdir or CONTAINER_WORKDIR)
             if not wd.startswith("/"):
                 # Relative paths are relative to /workspace by contract.
@@ -504,7 +818,7 @@ class ServiceSupervisor:
                                f"export GHOST_SERVICE_PORT={int(port)}\n"
                                f"export HOST=0.0.0.0\n"
                                f"export GHOST_SERVICE_HOST=0.0.0.0\n")
-            _pidfile_in = f"{CONTAINER_SERVICES_DIR}/{name}.pid"
+            _pidfile_in = f"{CONTAINER_SERVICES_DIR}/{stem}.pid"
             # `exec` the command so the (setsid) shell BECOMES it — same pid,
             # still the session/group leader — so the pid we record IS the real
             # process (not a wrapper the shell forked and then exited from,
@@ -514,8 +828,19 @@ class ServiceSupervisor:
             # + group kill still cover it. Prefer `workdir=` over `cd x && …`.
             _run_line = (("exec " + _cmd_str)
                          if not re.search(r"[;&|\n]", _cmd_str) else _cmd_str)
-            (self.host_dir / f"{name}.cmd.sh").write_text(
+            # Per-service credential (2026-07-30): a sandbox-hosted app is a
+            # participant client of the agent (the chess coach calls
+            # /api/game/move for its moves/coaching) but must NEVER hold the
+            # master API key. The supervisor mints a token at start, the app
+            # reads $GHOST_SERVICE_TOKEN, and the agent's game routes accept
+            # it while the registry entry exists — stop() revokes it with
+            # the entry. The auth rollout (2026-07-13) silently orphaned
+            # this app class; discovered when the released chess coach
+            # could no longer reach the agent at all.
+            _svc_token = secrets.token_hex(16)
+            (self.host_dir / f"{stem}.cmd.sh").write_text(
                 "#!/bin/sh\n" + _env_prefix
+                + f"export GHOST_SERVICE_TOKEN={_svc_token}\n"
                 + f"export GHOST_SERVICE_NAME={shlex.quote(name)}\n"
                 # Record THIS shell's pid. Under `setsid` it is the session/
                 # group leader, so `kill -- -<pid>` reaps the whole tree. With
@@ -524,26 +849,49 @@ class ServiceSupervisor:
                 # stop() used to miss, orphaning the service (2026-07-12).
                 + f"echo $$ > {_pidfile_in}\n"
                 + _run_line + "\n")
-            for _stale in (f"{name}.log", f"{name}.pid"):
+            for _stale in (f"{stem}.log", f"{stem}.pid"):
                 try:
                     (self.host_dir / _stale).unlink()
                 except OSError:
                     pass
 
+            # Persist the entry (with its credential) BEFORE the process
+            # launches (2026-07-30 follow-up): a service's FIRST act may be
+            # probing the agent with $GHOST_SERVICE_TOKEN, and validation
+            # reads THIS registry — saving only after the launch + liveness
+            # + port-probe sequence left a ~2-8s window in which the
+            # service's own startup probe was 403'd. Observed live:
+            # chess-coach-v2 resolves its base URL once at import, got
+            # rejected in that window, and permanently fell back to the
+            # wrong loopback address. pid=None marks it provisional (reads
+            # as dead); every failure return below pops it again.
+            reg[key] = {
+                "name": name, "command": _cmd_str, "pid": None,
+                "port": int(port) if port is not None else None,
+                "portless": bool(_portless),
+                "token": _svc_token,
+                "workdir": wd, "started_at": time.time(),
+                "project_id": project_id,
+                "container_id": self._container_generation(),
+            }
+            self._save(reg)
+
             inner = (
                 f"cd {shlex.quote(wd)} && "
-                f"setsid nohup sh {CONTAINER_SERVICES_DIR}/{name}.cmd.sh "
-                f"> {CONTAINER_SERVICES_DIR}/{name}.log 2>&1 & echo $!"
+                f"setsid nohup sh {CONTAINER_SERVICES_DIR}/{stem}.cmd.sh "
+                f"> {CONTAINER_SERVICES_DIR}/{stem}.log 2>&1 & echo $!"
             )
             out, code = self._exec(f"sh -c {shlex.quote(inner)}", timeout=30)
             if code != 0:
+                reg.pop(key, None)
+                self._save(reg)
                 return (f"Error: failed to launch '{name}' "
                         f"(exit {code}): {out.strip()[:400]}")
             # Prefer the pid the script recorded (the real session leader,
             # written to <name>.pid as its first action). Poll briefly for the
             # bind-mounted file to appear.
             pid = None
-            pid_path = self.host_dir / f"{name}.pid"
+            pid_path = self.host_dir / f"{stem}.pid"
             for _ in range(20):        # ~2s
                 try:
                     _txt = pid_path.read_text().strip()
@@ -560,12 +908,16 @@ class ServiceSupervisor:
                         pid = int(tok)
                         break
             if pid is None:
+                reg.pop(key, None)
+                self._save(reg)
                 return (f"Error: could not determine '{name}' pid "
                         f"from launcher output: {out.strip()[:200]!r}")
 
             time.sleep(1.2)
             if not self._pid_alive(pid):
-                tail = self._log_tail(name)
+                reg.pop(key, None)
+                self._save(reg)
+                tail = self._log_tail(stem)
                 return (f"Error: service '{name}' exited immediately.\n"
                         f"--- log tail ---\n{tail}")
 
@@ -592,10 +944,20 @@ class ServiceSupervisor:
                         self._pid_ownership(_holder, pid) is False:
                     foreign_holder = _holder
 
-            reg[name] = {
+            reg[key] = {
                 "name": name, "command": _cmd_str, "pid": pid,
                 "port": int(port) if port is not None else None,
+                # Persisted opt-out (review 2026-07-30): port=None alone is
+                # ambiguous — restart must know this worker CHOSE no port.
+                "portless": bool(_portless),
+                # The participant credential exported as $GHOST_SERVICE_TOKEN
+                # — valid while this entry exists (see valid_service_token).
+                "token": _svc_token,
                 "workdir": wd, "started_at": time.time(),
+                # Ownership (2026-07-30, §4G): the project this service
+                # exposes — lifecycle coupling and the briefing read this
+                # field; None for project-less utilities.
+                "project_id": project_id,
                 # Container generation stamp: a recreate invalidates every
                 # pid; comparing this at liveness time stops recycled pids
                 # from reading as RUNNING (review 2026-07-22).
@@ -619,7 +981,7 @@ class ServiceSupervisor:
         # check the report said "listening ✓" and the agent verified the
         # WRONG process via the browser (review 2026-07-22).
         if port is not None and foreign_holder is not None:
-            tail = self._log_tail(name)
+            tail = self._log_tail(stem)
             return (
                 f"Service '{name}' started (pid {pid}) BUT port {port} is "
                 f"answered by a DIFFERENT process (pid {foreign_holder}), not "
@@ -631,7 +993,7 @@ class ServiceSupervisor:
             )
 
         if port is not None and listening is False:
-            tail = self._log_tail(name)
+            tail = self._log_tail(stem)
             return (
                 f"Service '{name}' started (pid {pid}) but nothing is "
                 f"listening on port {port} after ~6s — it likely FAILED to "
@@ -642,11 +1004,16 @@ class ServiceSupervisor:
                 f"the app at port {port}), then action='restart' name='{name}'."
             )
 
-        lines = [f"Service '{name}' RUNNING (pid {pid})."]
+        lines = [f"Service '{name}' RUNNING (pid {pid})"
+                 + (f" — project {project_id}" if project_id else "")
+                 + "."]
+        for _n in _alloc_notes:
+            lines.append(f"Port lease: {_n}.")
         if port is not None:
             lines.append(
                 f"In-sandbox URL: http://127.0.0.1:{port} — the browser and "
-                f"execute tools reach it there (listening ✓).")
+                f"execute tools reach it there (listening ✓). The port is "
+                f"exported to the app as $PORT.")
             if is_published_port(port, published_ports=self._published_ports()):
                 lines.append(remote_access_hint(port))
         lines.append(
@@ -712,8 +1079,9 @@ class ServiceSupervisor:
             if not _other_owns:
                 reclaimed = self._kill_port_holder(port, owner_pid=pid)
         if name:
+            _stem = _file_stem(entry_key(entry.get("project_id"), name))
             try:
-                (self.host_dir / f"{name}.pid").unlink()
+                (self.host_dir / f"{_stem}.pid").unlink()
             except OSError:
                 pass
         return was_alive or reclaimed
@@ -727,38 +1095,124 @@ class ServiceSupervisor:
     # stop-all.
 
     @staticmethod
-    def _resolve_name(reg: Dict[str, dict], name: str) -> Optional[str]:
-        """Registered key for ``name`` — exact match first, then a UNIQUE
-        case-insensitive match. Req 43 (2026-07-17): the model asked to
-        restart 'WebOS' while the registry held 'webos'; the exact-only
-        miss spawned a DUPLICATE service for the same port and an
-        "Address already in use" kill dance. Names differing only by
-        case are one service to any human reading the log."""
+    def _resolve_name(reg: Dict[str, dict], name: str,
+                      project_id=None) -> Optional[str]:
+        """Registered key for ``name`` — project-aware (2026-07-30).
+
+        Order: exact key (callers may hold a scoped key already) → exact
+        within the bound project's scope → case-insensitive within scope →
+        legacy exact/case-insensitive unscoped key → UNIQUE display-name
+        match across all scopes (so "stop web" still works cross-project
+        when only one 'web' exists). Ambiguity (the same display name in
+        several projects, none of them bound) resolves to None — callers
+        list the candidates via ``_matching_keys``.
+
+        Case-insensitivity per req 43 (2026-07-17): 'WebOS' vs 'webos'
+        spawned a duplicate service and an "Address already in use" kill
+        dance — names differing only by case are one service."""
         name = str(name)
+        # Key-shaped names (they carry a ':') address exactly; a PLAIN name
+        # must try the bound project's scope FIRST — review 2026-07-30:
+        # plain-exact-first let stop('web', project=A) kill a legacy
+        # project-less 'web' while A's own 'aaa111:web' kept running.
+        if ":" in name and name in reg:
+            return name
+        if project_id:
+            scoped = f"{project_id}:{name}"
+            if scoped in reg:
+                return scoped
+            hits = [k for k in reg if k.lower() == scoped.lower()]
+            if len(hits) == 1:
+                return hits[0]
         if name in reg:
             return name
         hits = [k for k in reg if k.lower() == name.lower()]
+        if len(hits) == 1:
+            return hits[0]
+        hits = [k for k, e in reg.items()
+                if str(e.get("name") or "").lower() == name.lower()]
         return hits[0] if len(hits) == 1 else None
 
-    def stop(self, name: str) -> str:
-        err = self._validate_name(name)
-        if err:
-            return err
+    def _resolve_or_error(self, reg: Dict[str, dict], name: str,
+                          project_id=None) -> tuple:
+        """``(key, None)`` on resolution, ``(None, error_text)`` otherwise —
+        the error DISTINGUISHES ambiguity (several projects own the name;
+        candidates listed) from absence, for every verb. Review 2026-07-30:
+        only stop() listed candidates; restart/status/logs answered "no
+        service named 'web'" for an ambiguous name — actively false, and
+        the model's natural next move was to re-create the service."""
+        key = self._resolve_name(reg, name, project_id)
+        if key is not None:
+            return key, None
+        _amb = self._matching_keys(reg, str(name))
+        if len(_amb) > 1:
+            _list = ", ".join(
+                f"'{k}' (project {split_key(k)[0] or 'none'})"
+                for k in _amb)
+            return None, (f"Error: '{name}' is ambiguous — several projects "
+                          f"have a service by that name: {_list}. Use the "
+                          f"full key (e.g. name='{_amb[0]}').")
+        return None, (f"Error: no service named '{name}' "
+                      f"(action='status' lists them).")
+
+    @staticmethod
+    def _matching_keys(reg: Dict[str, dict], name: str) -> list:
+        """All keys whose display name (or key) matches ``name`` case-
+        insensitively — for the ambiguity error listing."""
+        name = str(name).lower()
+        return sorted(k for k, e in reg.items()
+                      if k.lower() == name
+                      or str(e.get("name") or "").lower() == name)
+
+    def _resolve_for_start(self, reg: Dict[str, dict], name: str,
+                           project_id=None) -> Optional[str]:
+        """Resolution for START only: scope-limited — the bound project's
+        key, or a DEAD legacy unscoped key (the pre-§4G migration path:
+        re-keyed into the project by start). NEVER another project's
+        service (a global unique match here would let project A's
+        `start web` silently replace project B's running 'web'), and
+        never a LIVE legacy entry either — that is someone's running
+        service, so the bound project creates its own scoped twin instead
+        of being blocked by "already running" (review 2026-07-30)."""
+        name = str(name)
+        primary = entry_key(project_id, name)
+        if primary in reg:
+            return primary
+        hits = [k for k in reg if k.lower() == primary.lower()]
+        if len(hits) == 1:
+            return hits[0]
+        if project_id:
+            legacy = name if name in reg else None
+            if legacy is None:
+                l_hits = [k for k in reg if k.lower() == name.lower()]
+                legacy = l_hits[0] if len(l_hits) == 1 else None
+            if legacy is not None and ":" not in legacy \
+                    and not self._entry_alive(reg[legacy]):
+                return legacy
+        return None
+
+    def stop(self, name: str, project_id=None) -> str:
+        if ":" not in str(name or ""):
+            err = self._validate_name(name)
+            if err:
+                return err
         with self._lock:
             reg = self._load()
-            key = self._resolve_name(reg, name)
-            entry = reg.pop(key, None) if key else None
+            key, _err = self._resolve_or_error(reg, name, project_id)
+            if _err:
+                return _err
+            entry = reg.pop(key, None)
             if entry is None:
                 return (f"Error: no service named '{name}' "
                         f"(action='status' lists them).")
-            name = key
+            _disp = entry.get("name") or key
             # reg no longer contains the popped entry — the remaining values
             # are exactly the services the reclaim must not harm.
             was_alive = self._kill_service(entry, others=reg.values())
             self._save(reg)
         state = "stopped" if was_alive else "was already dead; removed"
-        return (f"Service '{name}' {state}. Log kept at "
-                f"{CONTAINER_SERVICES_DIR}/{name}.log")
+        return (f"Service '{_disp}' {state}. Log kept at "
+                f"{CONTAINER_SERVICES_DIR}/{_file_stem(key)}.log")
 
     def stop_all(self) -> str:
         """Stop EVERY registered service and reclaim their ports — the
@@ -781,10 +1235,11 @@ class ServiceSupervisor:
             parts.append(f"Cleared (already dead): {', '.join(cleared)}.")
         return " ".join(parts)
 
-    def restart(self, name: str) -> str:
-        err = self._validate_name(name)
-        if err:
-            return err
+    def restart(self, name: str, project_id=None) -> str:
+        if ":" not in str(name or ""):
+            err = self._validate_name(name)
+            if err:
+                return err
         # Hold the (reentrant) lock across the whole stop→start pair: no
         # concurrent start of the same name can slip into the window, and a
         # failed relaunch can restore the registration atomically (review
@@ -793,15 +1248,28 @@ class ServiceSupervisor:
         # service's command/port/workdir).
         with self._lock:
             reg = self._load()
-            key = self._resolve_name(reg, name)
+            key, _err = self._resolve_or_error(reg, name, project_id)
+            if _err:
+                return _err if "ambiguous" in _err else (
+                    f"Error: no service named '{name}' to restart "
+                    f"(use action='start' with a command).")
             entry = dict(reg[key]) if key in reg else None
             if entry is None:
                 return (f"Error: no service named '{name}' to restart "
                         f"(use action='start' with a command).")
             self.stop(key)
+            # The stored port is a PREFERENCE like any other: if something
+            # took it while the service was down, the allocator moves the
+            # restart to a free port and the report says so. A persisted
+            # portless opt-out (port=0 at start) STAYS portless — review
+            # 2026-07-30: port=None was ambiguous, so restart force-granted
+            # a lease to workers that need none (and hard-failed when the
+            # range was full).
             out = self.start(key, entry.get("command") or "",
-                             port=entry.get("port"),
-                             workdir=entry.get("workdir"))
+                             port=(0 if entry.get("portless")
+                                   else entry.get("port")),
+                             workdir=entry.get("workdir"),
+                             project_id=entry.get("project_id"))
             if out.startswith("Error:"):
                 reg2 = self._load()
                 if key not in reg2:
@@ -812,19 +1280,21 @@ class ServiceSupervisor:
                             f"name='{key}' again.)")
             return out
 
-    def status(self, name: Optional[str] = None) -> str:
+    def status(self, name: Optional[str] = None, project_id=None) -> str:
         reg = self._load()
         if name:
-            key = self._resolve_name(reg, name)
-            if key is None:
-                return f"Error: no service named '{name}'."
+            key, _err = self._resolve_or_error(reg, name, project_id)
+            if _err:
+                return _err
             entries = {key: reg.get(key)}
         else:
             entries = reg
         if not entries:
-            return ("No services registered. Start one with action='start' "
-                    "name='...' command='...' port=... "
-                    f"(suggested ports: {SUGGESTED_PORTS}).")
+            out = ("No services registered. Start one with action='start' "
+                   "name='...' command='...' — omit 'port' to have a free "
+                   "one assigned (exported to the app as $PORT).")
+            _orph = self._orphans_text()
+            return out + ("\n" + _orph if _orph else "")
         lines = []
         _dead = 0
         for n, e in entries.items():
@@ -832,7 +1302,11 @@ class ServiceSupervisor:
             if not alive:
                 _dead += 1
             state = "RUNNING" if alive else "DEAD (exited or container recreated)"
-            part = f"- {n}: {state}, pid {e.get('pid')}"
+            _disp = e.get("name") or n
+            _proj = e.get("project_id")
+            part = (f"- {_disp}"
+                    + (f" [project {_proj}]" if _proj else "")
+                    + f": {state}, pid {e.get('pid')}")
             if e.get("port") is not None:
                 if alive:
                     _lp = self._port_listening(e['port'])
@@ -843,32 +1317,230 @@ class ServiceSupervisor:
                         part += (f" · remote: {REMOTE_SERVE_SCRIPT} "
                                  f"{e['port']}")
                 else:
-                    part += f", port {e['port']}"
+                    part += f", port {e['port']} (kept for restart)"
             up = time.time() - float(e.get("started_at") or 0)
             if alive and up > 0:
                 part += f", up {int(up // 60)}m"
             part += f" · cmd: {str(e.get('command') or '')[:80]}"
             lines.append(part)
         if _dead and name is None:
-            lines.append(f"({_dead} dead — action='stop-all' clears them and "
-                         f"reclaims any orphaned ports.)")
-        return "Services:\n" + "\n".join(lines)
+            lines.append(f"({_dead} dead — action='restart' brings one back "
+                         f"(a taken port is reassigned automatically); "
+                         f"action='stop-all' clears them and reclaims ports.)")
+        out = "Services:\n" + "\n".join(lines)
+        if name is None:
+            _map = self._port_map_text(reg)
+            if _map:
+                out += "\n" + _map
+            # Orphans surfaced on EVERY full status, not just the empty-
+            # registry branch (review 2026-07-30).
+            _orph = self._orphans_text()
+            if _orph:
+                out += "\n" + _orph
+        return out
 
-    def logs(self, name: str, lines: int = 60) -> str:
-        err = self._validate_name(name)
-        if err:
-            return err
-        key = self._resolve_name(self._load(), name)
+    def logs(self, name: str, lines: int = 60, project_id=None) -> str:
+        if ":" not in str(name or ""):
+            err = self._validate_name(name)
+            if err:
+                return err
+        _reg = self._load()
+        key, _err = self._resolve_or_error(_reg, name, project_id)
         if key is not None:
-            name = key
-        elif not (self.host_dir / f"{name}.log").exists():
+            stem = _file_stem(key)
+        elif _err and "ambiguous" in _err:
+            return _err
+        elif (self.host_dir / f"{_file_stem(str(name))}.log").exists():
+            stem = _file_stem(str(name))
+        else:
             return f"Error: no service (or log) named '{name}'."
         try:
             lines = max(1, min(int(lines), 400))
         except (TypeError, ValueError):
             lines = 60
-        tail = self._log_tail(str(name), lines=lines)
+        tail = self._log_tail(stem, lines=lines)
         return (f"--- {name} log (last {lines} lines) ---\n{tail}")
+
+    # -- reconciliation (2026-07-30, §4G) ------------------------------------
+
+    def reconcile(self) -> Dict[str, list]:
+        """READ-ONLY join of the registry against the container's actual
+        listeners. Returns ``{alive: [key…], dead: [key…], orphans:
+        [{port, pid, cmdline, project_hint}…]}`` where orphans are
+        listeners on watched ports (the published range + any registered
+        port) that no RUNNING registered service accounts for — the class
+        that held port 8102 invisibly in the solar-sim incident. Never
+        starts, stops, or mutates anything."""
+        reg = self._load()
+        alive_map = {k: self._entry_alive(e) for k, e in reg.items()}
+        watch = set(default_service_ports())
+        watch.update(e.get("port") for e in reg.values()
+                     if isinstance(e.get("port"), int))
+        alive_ports = {reg[k].get("port") for k, a in alive_map.items() if a}
+        orphans = []
+        for p, pid in self._listeners():
+            if p not in watch or p in alive_ports:
+                continue
+            o = {"port": p, "pid": pid, "cmdline": "", "project_hint": None}
+            if pid:
+                o["cmdline"] = self._proc_cmdline(pid)
+                o["project_hint"] = self._proc_project_hint(pid)
+            orphans.append(o)
+        return {"alive": sorted(k for k, a in alive_map.items() if a),
+                "dead": sorted(k for k, a in alive_map.items() if not a),
+                "orphans": orphans}
+
+    def reconcile_summary(self) -> Optional[str]:
+        """One-line boot/awareness summary of :meth:`reconcile`, or None
+        when there is nothing worth a line (empty registry, no orphans).
+        Deliberately READ-ONLY: services are never auto-restarted on agent
+        boot — this line is how the agent KNOWS without acting."""
+        try:
+            r = self.reconcile()
+        except Exception:  # noqa: BLE001 — awareness must never break boot
+            return None
+        if not r["alive"] and not r["dead"] and not r["orphans"]:
+            return None
+        bits = []
+        if r["alive"] or r["dead"]:
+            bits.append(f"{len(r['alive'])} running, {len(r['dead'])} dead "
+                        f"(registry kept — restart on demand)")
+        for o in r["orphans"]:
+            b = f"ORPHAN listener :{o['port']}"
+            if o.get("pid"):
+                b += f" pid {o['pid']}"
+            if o.get("cmdline"):
+                b += f" `{o['cmdline'][:40]}`"
+            if o.get("project_hint"):
+                b += f" (project {o['project_hint']})"
+            bits.append(b)
+        return "Services: " + "; ".join(bits)
+
+    def _orphans_text(self) -> str:
+        """Orphan-listener block for status output; '' when clean."""
+        try:
+            orphans = self.reconcile()["orphans"]
+        except Exception:  # noqa: BLE001
+            return ""
+        if not orphans:
+            return ""
+        lines = ["Unregistered listeners (started OUTSIDE manage_services — "
+                 "invisible to lifecycle/stop; adopt or kill):"]
+        for o in orphans:
+            b = f"  :{o['port']}"
+            if o.get("pid"):
+                b += f" pid {o['pid']}"
+            if o.get("cmdline"):
+                b += f" `{o['cmdline'][:60]}`"
+            if o.get("project_hint"):
+                b += f" · project {o['project_hint']}"
+            b += (f" — adopt: action='adopt' name='<name>' "
+                  f"port={o['port']}")
+            lines.append(b)
+        return "\n".join(lines)
+
+    def _port_map_text(self, reg=None) -> str:
+        """The lease table, one line per published port: RUNNING owner,
+        dead reservation, unregistered occupant, or free."""
+        reg = self._load() if reg is None else reg
+        span = default_service_ports()
+        if not span:
+            return "Port map: no published range configured."
+        listeners = {}
+        for p, pid in self._listeners():
+            listeners.setdefault(p, pid)
+        lines = ["Port map (published range — host-reachable):"]
+        for p in span:
+            # Several entries can claim one port (an explicit request over
+            # a dead reservation, noted at grant time) — the ALIVE claimant
+            # is the truth; naming the dead one made the map lie about who
+            # actually runs there (review 2026-07-30).
+            claims = [(k, e) for k, e in reg.items() if e.get("port") == p]
+            claim, alive = None, False
+            for k, e in claims:
+                if self._entry_alive(e):
+                    claim, alive = (k, e), True
+                    break
+            if claim is None and claims:
+                claim = claims[0]
+            if claim is not None:
+                k, e = claim
+                _proj = e.get("project_id")
+                _b = (f"  {p}: "
+                      + ("RUNNING" if alive else "reserved by dead")
+                      + f" '{e.get('name') or k}'"
+                      + (f" · project {_proj}" if _proj else ""))
+                if not alive and p in listeners:
+                    _sq = listeners[p]
+                    _b += (f" · currently OCCUPIED by unregistered"
+                           + (f" pid {_sq}" if _sq else ""))
+                lines.append(_b)
+            elif p in listeners:
+                pid = listeners[p]
+                b = f"  {p}: OCCUPIED by unregistered"
+                if pid:
+                    b += f" pid {pid}"
+                    cl = self._proc_cmdline(pid)
+                    if cl:
+                        b += f" `{cl[:50]}`"
+                    hint = self._proc_project_hint(pid)
+                    if hint:
+                        b += f" · project {hint}"
+                lines.append(b)
+            else:
+                lines.append(f"  {p}: free")
+        return "\n".join(lines)
+
+    def adopt(self, name: str, port, *, project_id=None) -> str:
+        """Register an EXISTING unregistered listener as a service — the
+        recovery path for daemons that were started outside the supervisor
+        (execute `… &` leaks). The process is not touched; it simply
+        becomes visible to status/stop/lifecycle. Restart uses the captured
+        cmdline, so it is best-effort for adopted entries."""
+        for err in (self._validate_name(name), self._validate_port(port)):
+            if err:
+                return err
+        if port is None:
+            return "Error: 'port' is required for adopt."
+        port = int(port)
+        with self._lock:
+            reg = self._load()
+            holder = self._holder_pid(port)
+            if holder is None:
+                return (f"Error: nothing is listening on port {port} — "
+                        f"adopt attaches an existing unregistered listener "
+                        f"to the registry (action='status' shows the port "
+                        f"map).")
+            for k2, e2 in reg.items():
+                if e2.get("port") == port and self._entry_alive(e2):
+                    return (f"Error: port {port} already belongs to "
+                            f"registered service '{e2.get('name') or k2}'"
+                            + (f" of project {e2['project_id']}"
+                               if e2.get("project_id") else "") + ".")
+            cl = self._proc_cmdline(holder)
+            cwd = self._proc_cwd(holder)
+            owner = (str(project_id).strip() if project_id
+                     else self._proc_project_hint(holder))
+            key = entry_key(owner, str(name))
+            if key in reg and self._entry_alive(reg[key]):
+                return (f"Error: service '{name}' is already registered and "
+                        f"RUNNING — pick another name.")
+            reg[key] = {
+                "name": str(name),
+                "command": cl or "(adopted — original command unknown)",
+                "pid": holder, "port": port,
+                "workdir": cwd or CONTAINER_WORKDIR,
+                "started_at": time.time(),
+                "project_id": owner,
+                "container_id": self._container_generation(),
+                "adopted": True,
+            }
+            self._save(reg)
+        return (f"Adopted pid {holder} on port {port} as service '{name}'"
+                + (f" (project {owner})" if owner else "")
+                + f". It is now visible to status/stop/lifecycle; logs were "
+                  f"not captured for its past output. Captured command: "
+                  f"{(cl or '(unknown)')[:120]}")
 
     def active_ports(self) -> FrozenSet[int]:
         """Ports of REGISTERED services (alive or not — a service that just
@@ -909,6 +1581,33 @@ def active_service_ports(sandbox_manager) -> FrozenSet[int]:
         return frozenset()
 
 
+def valid_service_token(sandbox_manager, token) -> bool:
+    """True when ``token`` matches a REGISTERED service's minted
+    ``$GHOST_SERVICE_TOKEN`` (2026-07-30). The registry is the root of
+    trust, exactly like ``active_service_ports``: only the supervisor
+    mints tokens, and stop()/stop-all revoke by removing the entry. Alive
+    or dead doesn't matter — a service that just crashed mid-game should
+    not flip auth for its own restart window. Constant-time comparison per
+    candidate; iterates ALL entries (no early exit) so timing doesn't
+    reveal which entry matched. Never raises; no sandbox → False."""
+    try:
+        if not token:
+            return False
+        sup = get_service_supervisor(sandbox_manager)
+        if sup is None:
+            return False
+        tok_b = str(token).encode("utf-8", "ignore")
+        ok = False
+        for e in sup.list_entries():
+            t = e.get("token")
+            if t and secrets.compare_digest(
+                    str(t).encode("utf-8", "ignore"), tok_b):
+                ok = True
+        return ok
+    except Exception:  # noqa: BLE001 — auth helper: fail closed
+        return False
+
+
 __all__ = [
     "BLOCKED_PORTS", "MAX_SERVICES", "SUGGESTED_PORTS",
     "CONTAINER_SERVICES_DIR", "SERVICES_DIRNAME",
@@ -916,4 +1615,6 @@ __all__ = [
     "get_service_supervisor", "active_service_ports",
     "is_published_port", "remote_access_hint",
     "REMOTE_SERVE_SCRIPT", "REMOTE_UNSERVE_SCRIPT",
+    "entry_key", "split_key", "extract_command_port",
+    "substitute_command_port", "valid_service_token",
 ]

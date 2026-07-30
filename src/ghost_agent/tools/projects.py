@@ -1174,23 +1174,67 @@ def _released_guard(store: ProjectStore, project_id) -> Optional[str]:
 
 
 def _project_service_entries(context, project_id: str) -> list:
-    """Service-registry entries whose workdir belongs to this project."""
+    """Service-registry entries owned by this project.
+
+    Ownership is the first-class ``project_id`` field stamped at start
+    (2026-07-30, §4G) — the old workdir/command string match survives only
+    as the fallback for LEGACY entries that predate the field, and an
+    entry stamped for a DIFFERENT project is never heuristic-matched (a
+    command mentioning two project paths must not be claimed twice)."""
     try:
         from ..sandbox.services import get_service_supervisor
         sup = get_service_supervisor(getattr(context, "sandbox_manager", None))
         if sup is None:
             return []
         needle = f"projects/{project_id}"
-        # Match workdir OR command: live registry entries carry
-        # workdir="/workspace" with the project path inside the COMMAND
-        # (`cd /workspace/projects/<id> && node server.js`) — observed
-        # 2026-07-25 when the v2 release rehearsal missed a running,
-        # registered service and fell back to the deliverables check.
-        return [e for e in sup.list_entries()
-                if needle in str(e.get("workdir") or "")
-                or needle in str(e.get("command") or "")]
+        out = []
+        for e in sup.list_entries():
+            owner = e.get("project_id")
+            if owner:
+                if str(owner) == str(project_id):
+                    out.append(e)
+                continue
+            # Legacy (unstamped) entry: match workdir OR command — live
+            # registries carried workdir="/workspace" with the project path
+            # inside the COMMAND (`cd /workspace/projects/<id> && node
+            # server.js`), observed 2026-07-25 when the v2 release
+            # rehearsal missed a running, registered service.
+            if needle in str(e.get("workdir") or "") \
+                    or needle in str(e.get("command") or ""):
+                out.append(e)
+        return out
     except Exception:
         return []
+
+
+def project_services_summary(context, project_id: str) -> list:
+    """Cheap (NO container execs) per-project service facts for the
+    every-turn briefing: ``[{name, port, command, started_at, stale}]``.
+    ``stale`` is True when the entry's container generation no longer
+    matches the live container — the process died with the old container.
+    Liveness beyond that is deliberately NOT probed here (it would cost
+    docker execs on every turn); the model verifies via
+    ``manage_services status`` when it matters."""
+    entries = _project_service_entries(context, project_id)
+    if not entries:
+        return []
+    _gen = None
+    try:
+        sm = getattr(context, "sandbox_manager", None)
+        _gen = str(getattr(getattr(sm, "container", None), "id", None) or "")
+    except Exception:
+        _gen = None
+    out = []
+    for e in entries:
+        stamped = str(e.get("container_id") or "")
+        out.append({
+            "name": e.get("name") or e.get("key"),
+            "port": e.get("port"),
+            "command": str(e.get("command") or "")[:80],
+            "started_at": e.get("started_at"),
+            "stale": bool(_gen and stamped and _gen != stamped),
+        })
+    return out
 
 
 def _probe_tcp(port, attempts: int = 4, delay_s: float = 1.0) -> bool:
@@ -1223,7 +1267,9 @@ def _stop_project_services(context, project_id: str) -> int:
             return 0
         for e in _project_service_entries(context, project_id):
             try:
-                sup.stop(str(e.get("name") or ""))
+                # The registry KEY addresses the exact entry across project
+                # scopes; display name kept as fallback for stub entries.
+                sup.stop(str(e.get("key") or e.get("name") or ""))
                 stopped += 1
             except Exception:
                 continue
@@ -1254,16 +1300,44 @@ def _release_rehearsal(context, store: ProjectStore, project_id: str) -> Dict[st
         sup = get_service_supervisor(getattr(context, "sandbox_manager", None))
         for e in entries:
             name = str(e.get("name") or "")
+            _addr = str(e.get("key") or name)
             port = e.get("port")
+            cmd_str = str(e.get("command") or "")
             try:
-                sup.restart(name)
+                _r_out = sup.restart(_addr)
             except Exception as ex:
                 ok = False
                 checks.append(f"{name}: restart raised {type(ex).__name__}")
                 continue
+            # The supervisor reports failures as "Error: …" strings, not
+            # exceptions — a failed restart must fail the rehearsal
+            # (review 2026-07-30: a portless service's failed restart
+            # passed as `alive=True`).
+            if isinstance(_r_out, str) and _r_out.startswith("Error:"):
+                ok = False
+                checks.append(f"{name}: restart failed — {_r_out[:120]}")
+                continue
+            # The lease may have MOVED the port on restart (preference
+            # semantics), and the substituted command moved with it — read
+            # BOTH from the fresh registry entry so the dossier records
+            # what actually runs, not the pre-restart snapshot (review
+            # 2026-07-30: dossier stored old-port command + new port).
+            try:
+                _fresh = next((e2 for e2 in sup.list_entries()
+                               if e2.get("key") == _addr), None)
+                if _fresh is not None:
+                    if _fresh.get("port") is not None:
+                        if port is not None and _fresh["port"] != port:
+                            checks.append(f"{name}: port moved "
+                                          f"{port}→{_fresh['port']} (lease)")
+                        port = _fresh.get("port")
+                    if _fresh.get("command"):
+                        cmd_str = str(_fresh["command"])
+            except Exception:
+                pass
             alive = _probe_tcp(port) if port else True
             services.append({"name": name,
-                             "command": str(e.get("command") or ""),
+                             "command": cmd_str,
                              "port": port})
             if port and not alive:
                 ok = False

@@ -19,7 +19,11 @@ from unittest.mock import patch
 
 import pytest
 
-from ghost_agent.core.triggers import RecentFailureGuard
+from ghost_agent.core.triggers import (
+    RecentFailureGuard,
+    guard_key_target,
+    looks_mutating_command,
+)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -146,6 +150,120 @@ def test_target_is_optional():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# World-changed reset + signature keying (2026-07-30 solar-sim postmortem)
+#
+# Three requests in a row were boxed in by the guard AFTER the model had
+# verifiably fixed the failure's cause (killed the process holding the
+# port, confirmed it free): blocked calls never dispatch, so the guard
+# could never learn the world had moved, and — with no primary-arg key —
+# every `manage_services start` (any port, any command) shared one bucket.
+# ──────────────────────────────────────────────────────────────────────
+
+def test_world_changed_clears_armed_guard():
+    """A successful state mutation between the failures and the retry must
+    unblock the retry — the exact live deadlock: two identical port-in-use
+    failures, then the port holder is killed, then the (now correct) retry
+    was blocked forever."""
+    g = RecentFailureGuard()  # threshold=2
+    g.record("manage_services", "args#abc", "Error: service 'solar-sim' exited immediately", "start")
+    g.record("manage_services", "args#abc", "Error: service 'solar-sim' exited immediately", "start")
+    assert g.would_repeat("manage_services", "args#abc", "start") is not None
+    cleared = g.note_world_changed()
+    assert cleared == 2
+    assert g.would_repeat("manage_services", "args#abc", "start") is None
+
+
+def test_world_changed_returns_zero_when_empty():
+    """Zero return lets the call site skip logging no-op resets."""
+    g = RecentFailureGuard()
+    assert g.note_world_changed() == 0
+
+
+def test_guard_rearms_after_world_change_if_nothing_was_fixed():
+    """The reset is not a pardon: the same failure recurring threshold
+    times AFTER the world change re-arms the block."""
+    g = RecentFailureGuard()  # threshold=2
+    g.record("execute", "x.py", "Error: boom")
+    g.record("execute", "x.py", "Error: boom")
+    g.note_world_changed()
+    g.record("execute", "x.py", "Error: boom")
+    assert g.would_repeat("execute", "x.py") is None  # one fresh failure
+    g.record("execute", "x.py", "Error: boom")
+    assert g.would_repeat("execute", "x.py") is not None  # re-armed
+
+
+def test_guard_key_target_prefers_primary():
+    assert guard_key_target("app.py", 'execute:{"path": "app.py"}') == "app.py"
+
+
+def test_guard_key_target_signature_distinguishes_changed_args():
+    """No primary target → the FULL canonical args string keys the guard,
+    so a retry with ANY changed arg (different port, different command) is
+    a different action and stays legal."""
+    h_8102 = 'manage_services:{"action": "start", "name": "solar-sim", "port": 8102}'
+    h_8103 = 'manage_services:{"action": "start", "name": "solar-sim", "port": 8103}'
+    k1, k2 = guard_key_target("", h_8102), guard_key_target("", h_8103)
+    assert k1.startswith("args#") and k2.startswith("args#")
+    assert k1 != k2
+    # Deterministic: the identical call maps to the identical key.
+    assert guard_key_target("", h_8102) == k1
+
+
+def test_guard_key_target_empty_everything_stays_empty():
+    assert guard_key_target("", "") == ""
+
+
+def test_identical_reissue_still_blocked_under_signature_keys():
+    """The signature fallback must not weaken the guard's core job: a
+    byte-identical re-issue of a twice-failed call is still intercepted."""
+    g = RecentFailureGuard()  # threshold=2
+    key = guard_key_target("", 'manage_services:{"action": "start", "port": 8102}')
+    g.record("manage_services", key, "Error: exited immediately", "start")
+    g.record("manage_services", key, "Error: exited immediately", "start")
+    assert g.would_repeat("manage_services", key, "start") is not None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# looks_mutating_command — world-mutation shell heuristic
+# ──────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("cmd", [
+    'kill -9 636 && sleep 1 && echo "Port freed"',        # the live remediation
+    "fuser -k 8102/tcp 2>/dev/null; sleep 1",             # ditto (request 92)
+    "sleep 1; kill $PID",                                  # verb after separator
+    "ps aux | grep solar | awk '{print $2}' | xargs kill -9",
+    "bash -c 'kill -9 636'",                               # nested-shell payload is a command
+    "rm -rf build/",
+    "echo hello > out.txt",                                # bare redirect writes
+    "ls -la >> listing.txt",
+    "systemctl restart nginx",
+    "launchctl bootout system/com.ghost.agent",
+    "sed -i 's/a/b/' conf.ini",
+    "for f in *.log; do rm $f; done",                      # verb after `do`
+])
+def test_mutating_commands_detected(cmd):
+    assert looks_mutating_command(cmd) is True
+
+
+@pytest.mark.parametrize("cmd", [
+    "ss -tlnp | grep 8102 || fuser 8102/tcp 2>/dev/null",  # probe: bare fuser, fd redirect
+    "kill -0 674 2>/dev/null && echo alive",               # liveness probe, not a kill
+    "pkill -0 solar-sim",                                  # pkill liveness probe
+    'curl -s -o /dev/null -w "%{http_code}" http://localhost:8102/',
+    "python3 server.py 2>&1 | head",                       # fd dup, not a file write
+    "systemctl status nginx",
+    "grep -rn services src/",
+    "grep -rn 'mkdir' src/",                               # verb as grep PATTERN, not command
+    "ls release.tar.gz && shasum foo.tar.xz",              # `tar` inside filenames
+    "awk '$3 > 100' data.txt",                              # `>` inside quotes = comparison
+    "python3 -c 'print(1 > 0)'",                            # python -c payload is code, not shell
+    "",
+])
+def test_probe_commands_not_mutating(cmd):
+    assert looks_mutating_command(cmd) is False
+
+
+# ──────────────────────────────────────────────────────────────────────
 # GhostAgent wiring — flag plumbing
 # ──────────────────────────────────────────────────────────────────────
 
@@ -202,3 +320,64 @@ def test_cli_flag_can_be_disabled():
     with patch.object(sys, "argv", ["ghost", "--no-enable-preflight-guard"]):
         args = parse_args()
     assert args.enable_preflight_guard is False
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Dispatch-loop wiring — lifecycle call sites (source introspection, the
+# same boundary style TestBlockBudgetWiring uses: the loop is too deep to
+# unit-drive, so assert the contract points exist and agree).
+# ──────────────────────────────────────────────────────────────────────
+
+def _agent_src():
+    import inspect
+
+    import ghost_agent.core.agent as agent_mod
+    return inspect.getsource(agent_mod)
+
+
+def test_wiring_check_and_record_share_signature_key():
+    """Both guard call sites key through guard_key_target, so what the
+    check site matches is exactly what the record site wrote."""
+    src = _agent_src()
+    assert "guard_key_target(_pf_target, a_hash)" in src   # check site
+    assert "guard_key_target(ptarget, a_hash)" in src      # record site
+
+
+def test_wiring_world_changed_fires_only_on_success():
+    """The world-changed reset lives on the SUCCESS branch of the result
+    processing (elif of the record-on-failure branch) and is driven by the
+    dispatch-time hint."""
+    src = _agent_src()
+    idx = src.index("elif _pf_world_mut and not _pf_exec_failed:")
+    assert "note_world_changed()" in src[idx:idx + 1600]
+    # The hint must never treat blanket-is_mutating `execute` as a world
+    # mutation — only heuristic-matched commands (probes stay inert).
+    assert "looks_mutating_command(" in src
+
+
+def test_wiring_failed_execute_never_clears_guard():
+    """`execute` failures carry an EXIT CODE banner, not an Error: prefix
+    (2026-07-30 review): without exit-code awareness a FAILED remediation
+    (`kill` on a stale pid → exit 1) counted as a successful mutation and
+    CLEARED the guard. The world-changed branch must gate on the
+    execute-aware failure verdict. Deliberately NOT symmetric: execute
+    failures are not RECORDED into the guard — repeated identical shell
+    failures are the strike ledger's + System-3 pivot's crisis signal, and
+    pre-dispatch blocking would starve the pivot (test_system3_crisis_pivot
+    caught exactly that when recording was tried)."""
+    src = _agent_src()
+    idx = src.index("_pf_exec_failed = False")
+    region = src[idx:idx + 1000]
+    assert 'fname == "execute"' in region
+    assert r"EXIT CODE:\s*(\d+)" in region
+    assert "elif _pf_world_mut and not _pf_exec_failed:" in region
+    # record() stays keyed to Error:-prefixed results only.
+    assert "if _res_is_error:" in region
+
+
+def test_wiring_per_request_reset_exists():
+    """A fresh request must not inherit failure memory recorded under a
+    previous request's world."""
+    src = _agent_src()
+    idx = src.index("strikes = StrikeLedger()")
+    assert "self._failure_guard.reset()" in src[idx:idx + 1200]

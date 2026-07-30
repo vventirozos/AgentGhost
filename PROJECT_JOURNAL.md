@@ -327,6 +327,46 @@ loop productive; the deeper "does idle output improve outcomes" question is stil
 
 ## 4. WHAT REMAINS TO DO
 
+### 4G. Project-aware services + port leases — 3-phase plan (2026-07-30) ✅ IMPLEMENTED same day
+
+> **Status 2026-07-30 (evening): all three phases SHIPPED** — see the §6 session entry for the
+> as-built record (allocator grants a lease on EVERY start unless `port=0`; adopt action;
+> scoped keys `<project>:<name>`; boot reconcile line; SERVICES briefing block; execute
+> daemon guard). NOT yet deployed to the live agent at write time.
+
+**Problem (operator, after the solar-sim guard incident):** many projects reach for the same port;
+the agent has no record of which project uses what; unregistered daemons (execute `… &` leaks) hold
+ports invisibly; a start on an occupied port thrashes instead of moving. Requirements: NO service
+auto-restart on agent restart (current behavior — keep); occupied preferred port → auto-assign a
+different one; multiple projects+services concurrently; agent aware of all of it. Services expose a
+project's output on demand and are optional per project.
+
+**Design: services are project-owned resources; ports are LEASES granted by the supervisor, never
+numbers the model picks.** The PORT/HOST env-export contract already exists — only the allocator is
+missing. Registry (`/workspace/.services/registry.json`) becomes the single source of truth for
+port ownership; briefings surface it; reconciliation keeps it honest against `ss -ltnp` reality.
+
+- **Phase 1 — ownership + leases:** `project_id` stamped on registry entries from the bound project
+  (string-heuristic `_project_service_entries` becomes legacy fallback); names project-scoped
+  (`<project_id>:<name>` key); port allocator — omitted port → first free published port (no live
+  lease + in-container bind probe); given port = PREFERENCE → if leased/held, auto-fallback to next
+  free port and SAY SO (never kill the holder); literal-port substitution in commands when the
+  requested port moves; lease release on stop/stop-all/archive/delete.
+- **Phase 2 — reconcile + awareness:** read-only `reconcile()` (registry ⋈ actual listeners) at
+  boot (one pretty_log line, NO restarts), before allocation, and on status — surfaces
+  listening-but-unregistered orphans (pid, cmdline, project inferred from /proc/<pid>/cwd) with
+  adopt-or-kill; ACTIVE-project briefings get a SERVICES line (RELEASED already has one); project
+  list shows services+ports; global status gains a port map; tool doc: "omit port to auto-assign".
+- **Phase 3 — close the orphan source + capacity:** execute-tool steer for backgrounded listeners
+  (`… &`/nohup/setsid + server patterns → use manage_services; the solar-sim leak was autoadvance
+  running `python3 server.py &`); autoadvance routes server-start steps through the supervisor;
+  derive MAX_SERVICES from the published-range size (both are 5 today, silently coupled); document
+  that widening GHOST_SANDBOX_SERVICE_PORTS needs a container recreate (which kills services).
+
+**Not changing:** no auto-restart at boot (reconcile is read-only; restart stays one explicit
+action using stored command/port/workdir); services stay optional (`project_id` nullable);
+container-recreate deaths stay honestly reported (generation stamp, existing).
+
 > **╔═ 2026-07 BUG-HUNT CYCLE CLOSED (2026-07-22) ═╗**
 > The dedicated adversarial-hunt cycle is complete. Cohorts swept, fixed, tested, and DEPLOYED this
 > cycle: **project-autonomy + turn-loop + code-correction** (07-20 three-stack), **metacognitive stack**
@@ -425,10 +465,18 @@ ENABLED since 2026-07-05) and tool descriptions (always live).
 **Phase 2 — extend to the two highest-leverage surfaces. (a) verifier prompts ✅ SHIPPED+LIVE
 2026-07-30 (§6):** optimized against verify_bench via a custom gepa adapter over the REAL two-stage
 pipeline; private gate +0.087 (0.796→0.883, n=23 never-seen trials); deployed via restart; both
-templates confirmed loading on live turns. (b) tool descriptions (`tools/registry.py`) — ⏳ STILL
-PENDING: closes improvement-ledger #7-descriptions; metric = tool-selection accuracy replayed over
-GHOST_LLM_RECORD fixtures (deterministic scoring, no live LLM). Keep staging→A/B(private)→promote.
-The `optim/__init__` exclusions (dream/watchdog/safety prompts) STAND — do not widen scope there.
+templates confirmed loading on live turns. (b) tool descriptions — ⏳ COLLECTING FIXTURES since
+2026-07-30 ~16:06: the §4E supply-first check measured ZERO usable fixtures (recordings off since
+07-17; the one day-file is a stub) — so `GHOST_LLM_RECORD=1` is now exported in the launcher
+(dated comment + removal criterion; ⚠ recordings are UNREDACTED, local-disk only) and verified
+capturing (108 KB/turn; ~43-tool payloads). MINER CONTRACT learned from live records: tool choices
+are embedded in `message.content` as parsed tool syntax (+ reasoning_content) — NOT structured
+tool_calls; the miner must reuse the agent's own content parser. RUN PLAN: after ~3-7 days of
+supply → mine fixtures (ground truth = choices from turns whose tool executed without error,
+public/private split by request_id hash) → registry read-site via optim loader (per-tool
+description artifacts, length-capped validation) → gepa multi-component optimization → private
+gate → restart deploy. Then FLIP GHOST_LLM_RECORD BACK OFF and archive/delete day-files per
+operator preference. The `optim/__init__` exclusions (dream/watchdog/safety prompts) STAND.
 
 **Phase 3 — trajectory-level test-time scaling. ✅ BUILT 2026-07-30 (§6), default-OFF pending
 measured wins.** (a) Logit-expectation probe: BUILT as a score-token probe (digit-scale + top-
@@ -477,6 +525,42 @@ learning-health snapshot, optim artifact sha256s). READING SCHEDULE: T+3d log sp
 T+7d verify_bench re-run vs t0 post-ship numbers + outcome-label trend; T+14d verdict per the
 amended acceptance rule (incl. the FPR-regression watch: if live false-refute churn is up
 noticeably, consider re-optimizing with the rebalanced clean-weighted trial mix FIRST).
+
+**═══ WHAT REMAINS — §4F snapshot, 2026-07-30 end-of-day ═══**
+
+**Two clocks running (both converge ~2026-08-02 → 08-13):**
+1. **§4F observational watch** (T0 = 2026-07-30 ~16:00, bundle `ablation_out/watch-4f/t0/`):
+   T+3d (~08-02) log spot-check — `escalated_overturn` count, correction churn, false-refute
+   complaints; T+7d (~08-06) verify_bench re-run vs t0 + graded outcome-label trend; T+14d (~08-13)
+   VERDICT per the amended acceptance rule → **decides Phase 4 (parked unless clearly positive)**.
+   Ask any session for "the 4F watch reading".
+2. **Phase 2b fixture supply** (`GHOST_LLM_RECORD=1` in the launcher since 07-30 16:06 —
+   UNREDACTED, local-only): after ~3-7 days → build miner (tool choice parsed from
+   `message.content` via the agent's own parser — NOT structured tool_calls; ground truth =
+   error-free executions; public/private by request-id hash), registry read-site via optim loader,
+   gepa run, private gate, deploy — **then flip recording OFF + archive/delete day-files**.
+
+**Queued behind evidence (do NOT start early):**
+3. Next verifier optimization round MUST use a rebalanced trial mix first (clean/NOT_REFUTED
+   weighted up — the +0.087 ship traded FPR 0.31→0.385 because REFUTED-expecting trials outnumber
+   clean ~5:1; §6 07-30).
+4. Phase 3 default flips, one at a time, enable→watch→revert: (a) probe needs a LIGHTER blend or
+   threshold-aware calibration first (as-built it neuters actionable TPR: 0.347); (b) BoN
+   (GHOST_TTS_ADAPTIVE_BON) after the probe question settles. Prereq for any flip: the
+   stable-prefix-hash regression test (§4F Phase 3 TODO).
+5. Phase 4 (context discipline): PARKED until the T+14d verdict.
+
+**Parked/dormant (documented exit conditions):**
+6. `planning.decompose` tuned artifact — consumer dark (no `--use-planning`); revive only via
+   paired ablation. tool_selection.pick / reflection.critique — need signature-specific example
+   extractors (generic trainset fits only planning).
+7. B4 synthetic battery — dormant after double saturation (33/33 single-step, 10/10 comp);
+   revivable via fork option (a) deep discovery-chains (5-8 stages, spec-in-previous-output,
+   timeout > 300 s). The 10 comp tasks + live pilot instrumentation + `--only-ring` stay in tree.
+8. Minor: two `test_thinking_loop_guards` color tests fail under FORCE_COLOR-exporting shells
+   (env artifact — pass in clean env); consider pinning env in those tests.
+
+**═══════════════════════════════════════════════**
 
 ### 4E. Negative-label supply — Tier 3 ⏳ PENDING, Tier 4 ⛔ HOLD (Tiers 1-2 DONE 2026-07-27)
 
@@ -1266,6 +1350,138 @@ skills_auto graduation wiring). Residuals in §4C.
 ---
 
 ## 6. Session history (newest first)
+
+### 2026-07-30 (later 3) — Auth orphaned sandbox apps → service tokens; a false premise looped the solver
+
+**Headline: the 2026-07-13 auth rollout silently broke every sandbox-hosted app that integrates
+with the agent — discovered via three "auth rejected" log lines, fixed with supervisor-minted
+service tokens.** The released Chess Coach's app.py never sends X-Ghost-Key: its /api/health
+probe 403'd (surfacing as `ua=Python-urllib/3.11` rejections at every service start), base-URL
+resolution then fell through to a WRONG hardcoded 127.0.0.1:8000, and every coaching call would
+403 — players get "Could not reach Ghost". The release rehearsal (TCP probe) structurally cannot
+see an app→agent auth failure. Also identified: `[own functional suite]` rejections = the
+deliberate self-test probes (working as designed), and the `/v1/images/generations` rejection =
+`interface/externals/image_generation/test_gen.py` with a hardcoded loopback JETSON_IP (patched:
+env-overridable, defaults to the Jetson's tailnet IP).
+
+**Operator-instruction postmortem (request 1d588fd5, FAILED):** the fix instruction to the agent
+claimed /api/game/* was "unauthenticated by design" — FALSE (`game_router` declares
+`Security(verify_api_key)`). The solver correctly observed 403s contradicting the instruction and
+spiraled: repeated-paragraph loop at 10k chars (aborted), then thinking cap 2x → attempt aborted.
+Guards all worked (paragraph detector, cap, native-corruption `content==replace_with` catch, edit
+churn steer, SSRF block on browsing the agent API); the §4G machinery ALSO worked (v2 fork got
+`chess-coach-v2` project-scoped on auto-granted port 8101 next to v1's 8100). Lesson: a false
+fact in an instruction is a LOOP SEED — the model can neither comply nor refute its operator.
+
+**Fix — service tokens (sandbox/services.py + api/game_routes.py):** supervisor mints
+`$GHOST_SERVICE_TOKEN` per start (32 hex, stored on the registry entry, exported in cmd.sh);
+`verify_game_access` on the game router accepts master key OR a live token via
+`X-Ghost-Service-Token` — scope is GAME routes only (token never unlocks /api/chat — test-pinned),
+registry-driven revocation (stop/stop-all; restart mints fresh), constant-time compare, fail-closed,
+briefing never surfaces tokens. The /api/game/move response already carries move + comment +
+move_explanation + critique, so the chess app's coaching maps onto the participant endpoint with
+no /api/chat need. Chess Coach v2 (ac67f4418187, service on 8101) awaits the app-side rework +
+release AFTER this deploys. Known pre-existing test-order artifact: test_sandbox_services'
+asyncio.run closes the main-thread loop → test_auth_rejection_logging fails if run AFTER it in a
+custom order (canonical alphabetical order unaffected).
+
+### 2026-07-30 (later 4) — Token race: the credential landed in the registry AFTER the app's first probe
+
+**Live verification of the v2 round-trip FAILED and exposed a race in the service-token feature:**
+start() saved the registry entry (with the minted token) only after launch + liveness + up-to-6s
+port probes — but a service's FIRST act can be probing the agent with $GHOST_SERVICE_TOKEN, and
+validation reads that registry. chess-coach-v2 resolves its base URL ONCE at import: its probe
+fired inside the ~2-8s window, got 403, and the app latched the wrong loopback fallback forever
+("Connection refused" on every move, looked like a connectivity problem). Diagnosis chain that
+nailed it: app-env token == registry token ✓, in-container curl host.docker.internal with that
+token → 200 ✓, probe code correct ✓ — only the TIMING was left. Fix: the entry (with credential)
+is persisted BEFORE the launch exec (pid=None provisional); every launch-failure return pops it.
+Regression tests capture the registry AS SEEN AT LAUNCH (`test_token_is_in_registry_BEFORE_launch`)
++ failed-launch cleanup. Lesson for the class: **when a supervisor mints credentials consumed by
+the supervised process, the credential must be valid before the process can possibly present it**
+— same shape as the pre-flight-guard deadlock (state written after the reader needed it).
+
+### 2026-07-30 (later 2) — §4G SHIPPED: services are project-owned, ports are leases
+
+**Headline: the supervisor is now the port allocator; the model never picks a port again.** All
+three §4G phases implemented, review-hardened, and test-pinned in one session (follow-on from the
+solar-sim postmortem earlier today). Files: sandbox/services.py (bulk), tools/sandbox_services.py,
+tools/registry.py, tools/projects.py, core/prompts.py, core/agent.py, main.py, tools/execute.py.
+
+- **Phase 1 — ownership + leases.** Registry keys scoped `<project>:<name>` (files
+  `<project>--<name>.*`), `project_id` stamped from the bound project (registry lambda),
+  EVERY start granted a lease (services expose output over HTTP by operator definition;
+  `port=0` = persisted portless opt-out). Requested port (arg or command literal via
+  `extract_command_port`) is a PREFERENCE: bind-probe (0.0.0.0, catches unregistered holders —
+  the class the old alive-claim check missed), fallback through the published range with
+  who-was-in-the-way notes, literal substitution when the lease moves, dead entries' ports
+  deferred as their restart contract, holders never killed. Default workdir = project workspace.
+- **Phase 2 — awareness.** `reconcile()` (registry ⋈ `ss -ltnp`; READ-ONLY — no auto-restart on
+  agent boot, by operator requirement), one-line boot summary in main.py lifespan, `adopt` action
+  registers existing unregistered listeners (cmdline/cwd/project-hint captured), `status` gains
+  port map + orphans block, ACTIVE-project briefings get a SERVICES line (registry facts only,
+  zero per-turn execs; staleness = container-generation mismatch), release rehearsal reads
+  fresh port+command after restart.
+- **Phase 3 — orphan source closed.** execute refuses detach+serverish commands
+  (`_daemonized_server_block`) with a manage_services steer — the exact autoadvance
+  `python3 server.py &` leak that caused the incident; effective service cap = published-range
+  size.
+
+**Fresh-eyes review (6 confirmed defects, all fixed + regression-pinned):** portless opt-out not
+persisted (restart force-granted a lease, hard-failed on full range); plain-exact-first resolution
+let a bound project stop a legacy 'web' it didn't own (scope now precedes); daemon guard scanned
+heredoc bodies/quoted strings (now stripped, `sh -c` payloads still scanned, `kill %1` smoke-tests
+pass); release dossier stored pre-restart command with post-restart port + ignored "Error:" restart
+returns; explicit request over a dead reservation was silent and the port map named the dead entry
+as owner; ambiguity errors said "no service named" on restart/status/logs. Plus: live legacy entry
+no longer blocks a bound project's same-name start (dead → re-keyed adopt, live → scoped twin);
+reserved-port command literals rewritten. Tests: `test_service_port_leases.py` (61) + updated
+`test_sandbox_services*.py`. Requirements verdict from review: no-auto-restart HOLDS, occupied→
+different-port HOLDS, multi-project HOLDS, never-kill-holders HOLDS. Known watch items: RELEASED
+dossiers can go stale if a post-release restart moves a port (rehearsal now notes moves at release
+time); lock held across container execs in start/restart (pre-existing pattern) serializes
+mutating service ops if docker wedges. NOT yet deployed at write time.
+
+### 2026-07-30 (later) — Pre-flight guard deadlock: the block that outlived its own remediation
+
+**Headline: the repeat-failure guard blocked a VERIFIABLY-FIXED `manage_services start` across
+three consecutive requests (A3 16:51 → 92 16:57 → E7 17:02), each request dying at the 2-block
+budget.** Arc: autoadvance left an unregistered `python3 server.py` on :8102; `start solar-sim`
+failed twice ("exited immediately", port taken) → guard armed; the model then did everything right
+(found PID 636 via `ss`, killed it, confirmed the port free) — and every subsequent start was
+blocked: same port, different port (:8103), different command. Four root causes in
+`RecentFailureGuard` (core/triggers.py), all fixed + tested + docs:
+
+- **Self-deadlock — `reset()` had ZERO callers.** A blocked call never dispatches, so it can never
+  refute stale entries; the 2026-07-18 world-changed fix only reached StrikeLedger. Now
+  `note_world_changed()` clears the guard on any SUCCESSFUL state-mutating call: file_system
+  mutation, mutating manage_services action, or an `execute` command matching the new
+  `looks_mutating_command` heuristic (kills/`fuser -k`/file verbs/service-manager subcommands/bare
+  redirects; NOT `kill -0`/`pkill -0`/fd-redirect probes; verbs must sit at command position and
+  quotes are stripped — except `sh -c '…'` payloads, scanned as commands). Deliberately global +
+  permissive: false clear = one extra real attempt (threshold re-arms), false block = this bug.
+- **Key collapse.** `primary_target_from_args` knows none of manage_services' identity args
+  (name/port/command) → every start of every service shared `(manage_services, "", start)`.
+  New `guard_key_target(primary, a_hash)` falls back to an `args#`-SHA1 of the full canonical call
+  → only byte-identical re-issues match; check site and record site share the helper.
+- **Stale cross-request memory.** Guard lives on the agent instance; entries only aged out via NEW
+  failures. Now reset at request start (next to `strikes = StrikeLedger()`); cross-request
+  pathology stays the offline post-mortem's job.
+- **(Review catch) `execute` failures wear an `EXIT CODE:` banner, not `Error:`** — so a FAILED
+  remediation (`kill` on a stale pid, exit 1) would have counted as a successful mutation and
+  CLEARED the guard. The world-changed branch now gates on `_pf_exec_failed` (mirrors the execute
+  strike branch's exit-code parse). Deliberately asymmetric: execute failures still are NOT
+  recorded into the guard — first attempt at symmetry broke `test_system3_crisis_pivot` (identical
+  failing shell re-issues are the strike ledger's / System-3 pivot's crisis signal; pre-dispatch
+  blocking starves the pivot). The fresh-eyes review agent also killed regex FPs on
+  `grep -rn 'mkdir'`, `ls *.tar.gz`, `awk '$3 > 100'`, `python3 -c 'print(1 > 0)'` — probe
+  traffic dominates, so FP-frequency = guard permanently dark.
+
+Observability: a clearing reset logs "World changed (successful <tool> mutation) — cleared N
+recorded failure(s)". Tests: `test_preflight_guard.py` (world-changed/signature/heuristic units +
+wiring introspection), `test_guard_box_fixes.py` updated. Docs: `docs/core/agent.html` (full
+postmortem section), `docs/algorithms/metacognition.html` (lifecycle paragraph). NOT yet deployed —
+live agent still runs the old code until restart.
 
 ### 2026-07-30 — §4F overnight: verifier prompts SHIPPED+LIVE (+0.087 private), Phase 3 built, B4 staged
 

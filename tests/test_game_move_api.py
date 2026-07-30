@@ -511,3 +511,80 @@ class TestChessRules:
                           json={"fen": fen, "user_move": "O-O"})
         assert res.status_code == 422
         assert "Illegal move" in res.json()["detail"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Service-token access (2026-07-30): sandbox-hosted participant apps
+# authenticate with a supervisor-minted $GHOST_SERVICE_TOKEN — the master
+# key never enters the sandbox. Registry-driven: stop revokes.
+# ──────────────────────────────────────────────────────────────────────
+
+def _write_registry(tmp_path, entries):
+    svc = tmp_path / ".services"
+    svc.mkdir(parents=True, exist_ok=True)
+    (svc / "registry.json").write_text(json.dumps(entries))
+
+
+def _make_auth_app(replies, tmp_path, api_key="master-key"):
+    """App with auth ON and a sandbox manager whose registry the
+    service-token validator reads."""
+    llm = SimpleNamespace(
+        chat_completion=AsyncMock(side_effect=[_llm_reply(r) for r in replies]))
+    sandbox = SimpleNamespace(host_workspace=tmp_path)
+    context = SimpleNamespace(args=SimpleNamespace(api_key=api_key),
+                              llm_client=llm, memory_system=MagicMock(),
+                              sandbox_manager=sandbox)
+    agent = SimpleNamespace(context=context)
+    app = FastAPI()
+    app.state.agent = agent
+    app.include_router(game_router)
+    app.include_router(main_router)
+    return TestClient(app)
+
+
+class TestServiceTokenAuth:
+    def test_master_key_still_works(self, tmp_path):
+        client = _make_auth_app(["MOVE: e4"], tmp_path)
+        res = client.post("/api/game/move", json={"fen": START_FEN},
+                          headers={"X-Ghost-Key": "master-key"})
+        assert res.status_code == 200
+
+    def test_no_credentials_rejected(self, tmp_path):
+        client = _make_auth_app([], tmp_path)
+        res = client.post("/api/game/move", json={"fen": START_FEN})
+        assert res.status_code == 403
+
+    def test_valid_service_token_accepted(self, tmp_path):
+        _write_registry(tmp_path, {
+            "p1:chess-coach": {"name": "chess-coach", "token": "tok-abc123",
+                               "port": 8100, "project_id": "p1"}})
+        client = _make_auth_app(["MOVE: e4"], tmp_path)
+        res = client.post("/api/game/move", json={"fen": START_FEN},
+                          headers={"X-Ghost-Service-Token": "tok-abc123"})
+        assert res.status_code == 200
+
+    def test_wrong_service_token_rejected(self, tmp_path):
+        _write_registry(tmp_path, {
+            "p1:chess-coach": {"name": "chess-coach", "token": "tok-abc123"}})
+        client = _make_auth_app([], tmp_path)
+        res = client.post("/api/game/move", json={"fen": START_FEN},
+                          headers={"X-Ghost-Service-Token": "tok-WRONG"})
+        assert res.status_code == 403
+
+    def test_revoked_token_rejected(self, tmp_path):
+        # stop() removes the registry entry — the token dies with it.
+        _write_registry(tmp_path, {})
+        client = _make_auth_app([], tmp_path)
+        res = client.post("/api/game/move", json={"fen": START_FEN},
+                          headers={"X-Ghost-Service-Token": "tok-abc123"})
+        assert res.status_code == 403
+
+    def test_service_token_never_unlocks_chat(self, tmp_path):
+        # The token grants GAME routes only — /api/chat stays master-key.
+        _write_registry(tmp_path, {
+            "p1:chess-coach": {"name": "chess-coach", "token": "tok-abc123"}})
+        client = _make_auth_app([], tmp_path)
+        res = client.post("/api/chat",
+                          json={"messages": [{"role": "user", "content": "x"}]},
+                          headers={"X-Ghost-Service-Token": "tok-abc123"})
+        assert res.status_code == 403
