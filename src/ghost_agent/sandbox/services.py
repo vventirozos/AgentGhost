@@ -40,6 +40,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -838,9 +839,22 @@ class ServiceSupervisor:
             # this app class; discovered when the released chess coach
             # could no longer reach the agent at all.
             _svc_token = secrets.token_hex(16)
+            # Writable per-service STATE dir (2026-07-30 "later 5"): a
+            # RELEASED workspace is chmod'd read-only by design, but apps
+            # have runtime state (saved games, uploads). State lives
+            # OUTSIDE the artifact — .services/state/<stem>/, exported as
+            # $GHOST_SERVICE_STATE_DIR — created before launch, KEPT across
+            # stop/restart (a stopped game server's saves must survive),
+            # purged only with the owning project's hard delete. Observed
+            # live: the released chess coach 500'd on every move because it
+            # wrote game_state.json into its now-immutable workspace.
+            (self.host_dir / "state" / stem).mkdir(parents=True,
+                                                   exist_ok=True)
+            _state_dir_in = f"{CONTAINER_SERVICES_DIR}/state/{stem}"
             (self.host_dir / f"{stem}.cmd.sh").write_text(
                 "#!/bin/sh\n" + _env_prefix
                 + f"export GHOST_SERVICE_TOKEN={_svc_token}\n"
+                + f"export GHOST_SERVICE_STATE_DIR={_state_dir_in}\n"
                 + f"export GHOST_SERVICE_NAME={shlex.quote(name)}\n"
                 # Record THIS shell's pid. Under `setsid` it is the session/
                 # group leader, so `kill -- -<pid>` reaps the whole tree. With
@@ -1360,6 +1374,28 @@ class ServiceSupervisor:
             lines = 60
         tail = self._log_tail(stem, lines=lines)
         return (f"--- {name} log (last {lines} lines) ---\n{tail}")
+
+    def purge_state(self, name_or_key, project_id=None) -> bool:
+        """Remove a service's writable state dir (``.services/state/<stem>``).
+
+        Deliberately NOT part of stop/restart — a stopped service's state
+        (saved games) must survive its next start. The one caller is the
+        project HARD-DELETE path, whose contract is "no files left behind";
+        archive keeps state exactly like it keeps the workspace. Accepts a
+        registry key or display name; also works for already-deregistered
+        services (stem derived from the raw key)."""
+        with self._lock:
+            reg = self._load()
+            key = self._resolve_name(reg, str(name_or_key), project_id) \
+                or str(name_or_key)
+        p = self.host_dir / "state" / _file_stem(key)
+        try:
+            if p.exists():
+                shutil.rmtree(p, ignore_errors=True)
+                return True
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            pass
+        return False
 
     # -- reconciliation (2026-07-30, §4G) ------------------------------------
 

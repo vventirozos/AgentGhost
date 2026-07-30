@@ -1,0 +1,671 @@
+#!/usr/bin/env python3
+"""
+llama-mon — real-time, human-readable monitor for llama-server logs.
+
+Tails llama-server.log and renders what the server is actually doing right now:
+server lifecycle, per-request prefill/generation rates, time-to-first-token,
+context fullness, speculative-decode acceptance, and — crucially — how many
+tokens are being WASTED re-processing a diverged prompt prefix each turn.
+
+Usage:
+    llama-mon                          # follow the default log live (like tail -f)
+    llama-mon /path/to/llama.log       # follow a specific file
+    llama-mon --from-start             # replay the whole file, then follow
+    llama-mon --no-follow --from-start # replay and exit (good for analysis)
+    llama-mon --tail 5000              # start 5000 lines back, then follow
+    tail -2000 x.log | llama-mon -     # read from stdin
+
+Options:
+    --server URL     llama-server base URL; its /props endpoint supplies the
+                     context window and server version (default
+                     http://127.0.0.1:8088, '' disables the lookup)
+    --ctx-max N      fallback context window if it cannot be detected from
+                     /props or the log (default 262144)
+    --stats-every N  print a rolling-average block every N turns (default 5)
+    --detail         show ⚠️ warning/explanation lines (hidden by default;
+                     --debug is an alias)
+    --no-color       disable ANSI color
+    --no-icons       use ASCII tags instead of emoji
+    --verbose        also echo log lines the parser does not recognize
+    --self-test      run built-in parser tests and exit
+
+The parser is pure (parse_line) so it can be unit-tested independently.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+from collections import deque
+
+DEFAULT_LOG = "/Users/vasilis/Data/AI/Logs/llama-server.log"
+DEFAULT_CTX_MAX = 262144          # fallback until /props or the log tells us
+DEFAULT_SERVER = "http://127.0.0.1:8088"
+
+
+def server_props(url, timeout=1.5):
+    """Best-effort GET /props from a running llama-server.
+
+    Returns dict(version, n_ctx, model) or None if unreachable."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/props", timeout=timeout) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    model = os.path.basename(d.get("model_path") or "")
+    model = re.sub(r"\.gguf$", "", model)
+    return dict(version=d.get("build_info"),
+                n_ctx=(d.get("default_generation_settings") or {}).get("n_ctx"),
+                model=model or None)
+
+# ----------------------------------------------------------------------------
+# Parsing — pure functions, no I/O. parse_line(text) -> (kind, data) | None
+# ----------------------------------------------------------------------------
+
+_LINE = re.compile(r"^\S+\s+([IWE])\s+(.*)$")
+
+_PATTERNS = [
+    ("system_info",   re.compile(r"system_info: n_threads = (\d+).*?/\s*(\d+)")),
+    ("load_start",    re.compile(r": loading model\b(?:\s*'([^']+)')?")),
+    ("model_loaded",  re.compile(r": model loaded\b")),
+    ("listening",     re.compile(r"server is listening on (\S+)")),
+    ("new_slot",      re.compile(r"(?:new slot,\s*n_ctx|n_ctx_slot) = (\d+)")),
+    ("mmproj",        re.compile(r"loaded multimodal model, '([^']+)'")),
+    ("spec_impl",     re.compile(r"common_speculative_impl_draft_mtp: -\s*(.*)")),
+    ("ctx_warn",      re.compile(r"n_ctx_seq \((\d+)\) < n_ctx_train \((\d+)\)")),
+    ("load_error",    re.compile(r"error loading model: (.*)")),
+    ("load_abort",    re.compile(r"exiting due to model loading error")),
+    ("chat_format",   re.compile(r"params_from_: Chat format: (\S+)")),
+    ("slot_pick",     re.compile(r"selected slot .*?sim_best = ([\d.]+)(?:.*?f_keep = ([\d.]+))?")),
+    ("reason_on",     re.compile(r"reasoning-budget: activated, budget=(\d+)")),
+    ("reason_off",    re.compile(r"reasoning-budget: deactivated \(([^)]*)\)")),
+    ("launch",        re.compile(r"launch_slot_: id\s+\d+ \| task (\d+) \| processing task")),
+    ("restored",      re.compile(r"restored context checkpoint \(pos_min = (\d+).*?n_tokens = (\d+).*?size = ([\d.]+) MiB\)")),
+    ("checkpoint",    re.compile(r"created context checkpoint (\d+) of (\d+) \(.*?n_tokens = (\d+), size = ([\d.]+) MiB\)")),
+    ("prefill_prog",  re.compile(r"prompt processing, n_tokens =\s*(\d+), progress = ([\d.]+), t =\s*([\d.]+) s / ([\d.]+) tokens per second")),
+    ("gen_prog",      re.compile(r"n_decoded =\s*(\d+), tg =\s*([\d.]+) t/s")),
+    ("pp_final",      re.compile(r"\| prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens \(\s*([\d.]+) ms per token,\s*([\d.]+) tokens per second\)")),
+    ("tg_final",      re.compile(r"\|\s+eval time =\s*([\d.]+) ms /\s*(\d+) tokens \(\s*([\d.]+) ms per token,\s*([\d.]+) tokens per second\)")),
+    ("total_time",    re.compile(r"total time =\s*([\d.]+) ms /\s*(\d+) tokens")),
+    ("draft_acc",     re.compile(r"draft acceptance = ([\d.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)")),
+    ("release",       re.compile(r"release: id\s+\d+ \| task (\d+) \| stop processing: n_tokens = (\d+), truncated = (\d+)")),
+    ("idle",          re.compile(r"update_slots: all slots are idle")),
+]
+
+
+def parse_line(text):
+    """Return (kind, data_dict) for a recognized log line, else None.
+
+    data always carries 'lvl' (I/W/E) and 'raw' (original text).
+    """
+    m = _LINE.match(text)
+    if not m:
+        return None
+    lvl, body = m.group(1), m.group(2)
+    for kind, rx in _PATTERNS:
+        g = rx.search(body)
+        if g:
+            return kind, {"lvl": lvl, "raw": text, "groups": g.groups()}
+    return ("other", {"lvl": lvl, "raw": text, "groups": ()})
+
+
+# ----------------------------------------------------------------------------
+# Presentation helpers
+# ----------------------------------------------------------------------------
+
+class Style:
+    def __init__(self, color=True):
+        self.color = color
+        codes = dict(reset="0", dim="2", bold="1", red="31", grn="32",
+                     yel="33", blu="34", mag="35", cyn="36", gry="90")
+        for name, c in codes.items():
+            setattr(self, name, ("\033[%sm" % c) if color else "")
+
+    def __call__(self, text, *styles):
+        if not self.color or not styles:
+            return text
+        return "".join(getattr(self, s) for s in styles) + text + self.reset
+
+
+def human_k(n):
+    n = float(n)
+    if n >= 1000:
+        return "%.1fk" % (n / 1000.0)
+    return "%d" % n
+
+
+def bar(frac, width=10):
+    frac = max(0.0, min(1.0, frac))
+    full = int(round(frac * width))
+    return "[" + "█" * full + "░" * (width - full) + "]"
+
+
+ZONES = [  # (label, upper bound as fraction of the context window, pp t/s, tg t/s)
+    ("short",     0.125, 700, 55),
+    ("medium",    0.30,  500, 48),
+    ("long",      0.50,  350, 38),
+    ("very-long", 0.75,  250, 30),
+    ("extreme",   None,  190, 25),
+]
+
+
+def ctx_zone(ctx, n_ctx):
+    """Speed band at a given context, with thresholds scaled to the actual
+    serving window (n_ctx). Returns (label, expected_pp, expected_tg)."""
+    frac = ctx / float(n_ctx) if n_ctx else 0.0
+    for label, hi, pp, tg in ZONES:
+        if hi is None or frac < hi:
+            return label, pp, tg
+
+
+# ----------------------------------------------------------------------------
+# Live terminal with a sticky bottom status line
+# ----------------------------------------------------------------------------
+
+class Live:
+    def __init__(self, stream, sticky):
+        self.stream = stream
+        self.sticky = sticky          # only draw transient status on a TTY
+        self.status = ""
+
+    def log(self, line):
+        if self.sticky and self.status:
+            self.stream.write("\r\033[K")
+        self.stream.write(line + "\n")
+        if self.sticky and self.status:
+            self.stream.write(self.status)
+        self.stream.flush()
+
+    def set_status(self, s):
+        self.status = s
+        if self.sticky:
+            self.stream.write("\r\033[K" + s)
+            self.stream.flush()
+
+    def clear_status(self):
+        if self.sticky and self.status:
+            self.stream.write("\r\033[K")
+            self.stream.flush()
+        self.status = ""
+
+
+# ----------------------------------------------------------------------------
+# Monitor — consumes parsed events, maintains state, renders
+# ----------------------------------------------------------------------------
+
+ICONS = {
+    "boot": "🚀", "load": "📦", "ok": "✅", "err": "⛔", "warn": "⚠️ ",
+    "turn": "📥", "rewind": "↻", "prefill": "⏳", "gen": "✍️ ", "done": "🏁",
+    "idle": "💤", "stats": "📊", "info": "·",
+}
+ASCII_TAGS = {
+    "boot": "[BOOT]", "load": "[LOAD]", "ok": "[ OK ]", "err": "[ERR ]",
+    "warn": "[WARN]", "turn": "[REQ ]", "rewind": "[RWND]", "prefill": "[PRE ]",
+    "gen": "[GEN ]", "done": "[DONE]", "idle": "[IDLE]", "stats": "[STAT]",
+    "info": "  -  ",
+}
+
+
+class Monitor:
+    def __init__(self, live, st, ctx_max, stats_every, verbose, detail=False,
+                 server=None, version=None, model=None):
+        self.live = live
+        self.st = st
+        self.ctx_max = ctx_max
+        self.stats_every = stats_every
+        self.verbose = verbose
+        self.detail = detail        # show ⚠️ warning/explanation lines
+        self.icons = True
+        self.server = server        # llama-server URL for /props re-queries
+        self.version = version      # build_info from /props, if reachable
+        self.model = model          # model name from /props, if reachable
+
+        self.n_ctx = ctx_max
+        self.last_ctx = 0            # context size at end of previous turn
+        self.pending_reuse = None    # (sim_best, f_keep) from slot_pick
+        self.reasoning = False
+        self.turn = None             # current turn accumulator
+        self.history = deque(maxlen=max(stats_every, 10))
+        self.session = dict(turns=0, prefill=0, gen=0, wasted=0, time=0.0)
+
+    # -- helpers ----------------------------------------------------------
+    def tag(self, key):
+        return (ICONS if self.icons else ASCII_TAGS)[key]
+
+    def stamp(self):
+        return self.st(time.strftime("%H:%M:%S"), "gry")
+
+    def emit(self, key, text, *styles):
+        self.live.log("%s %s %s" % (self.stamp(), self.tag(key),
+                                    self.st(text, *styles) if styles else text))
+
+    def refresh_props(self):
+        props = server_props(self.server) if self.server else None
+        if not props:
+            return
+        if props.get("n_ctx"):
+            self.n_ctx = int(props["n_ctx"])
+        if props.get("version"):
+            self.version = props["version"]
+        if props.get("model"):
+            self.model = props["model"]
+        bits = ["server %s" % (self.version or "?")]
+        if self.model:
+            bits.append(self.model)
+        bits.append("context window %s tokens" % human_k(self.n_ctx))
+        self.emit("info", " · ".join(bits), "gry")
+
+    def new_turn(self, task):
+        self.turn = dict(task=task, reuse=None, fkeep=None, restored=None,
+                         wasted=0, header=False, gen_start=None,
+                         pp_tok=None, pp_rate=None, ttft=None,
+                         tg_tok=None, tg_rate=None, gen_time=None,
+                         acc=None, total=None, reasoning=self.reasoning)
+        if self.pending_reuse is not None:
+            self.turn["reuse"], self.turn["fkeep"] = self.pending_reuse
+            self.pending_reuse = None
+
+    def turn_header(self):
+        if not self.turn or self.turn["header"]:
+            return
+        self.turn["header"] = True
+        t = self.turn
+        bits = [self.st("task %s" % t["task"], "bold")]
+        if t["reuse"] is not None:
+            bits.append("reuse %d%%" % round(t["reuse"] * 100))
+        if t["restored"] is not None:
+            bits.append("restore@%s" % human_k(t["restored"]))
+        if t["wasted"] >= 1:
+            bits.append(self.st("%s rewind %s" % (self.tag("rewind"),
+                        human_k(t["wasted"])), "yel"))
+        if t["reasoning"]:
+            bits.append(self.st("reasoning", "mag"))
+        self.emit("turn", " · ".join(bits))
+
+    # -- event dispatch ---------------------------------------------------
+    def feed(self, kind, data):
+        g = data["groups"]
+        lvl = data["lvl"]
+
+        if kind == "system_info":
+            self.emit("boot", "server process starting", "cyn")
+            self.last_ctx = 0
+            self.turn = None
+            self.live.clear_status()
+        elif kind == "load_start":
+            if g and g[0]:
+                name = re.sub(r"\.gguf$", "", os.path.basename(g[0]))
+                self.emit("load", "loading %s…" % name, "yel")
+            else:
+                self.emit("load", "loading model…", "yel")
+        elif kind == "new_slot":
+            self.n_ctx = int(g[0])
+            self.emit("info", "context window: %s tokens" % human_k(self.n_ctx), "gry")
+        elif kind == "mmproj":
+            self.emit("info", "multimodal projector loaded", "gry")
+        elif kind == "spec_impl":
+            self.emit("info", "speculative draft: %s" % g[0], "gry")
+        elif kind == "model_loaded":
+            self.emit("ok", "model loaded", "grn", "bold")
+        elif kind == "listening":
+            self.emit("ok", "listening on %s — ready" % g[0], "grn", "bold")
+            self.refresh_props()
+        elif kind == "ctx_warn":
+            self.emit("info", "model trained for %s ctx, serving %s"
+                      % (human_k(g[1]), human_k(g[0])), "gry")
+        elif kind == "load_error":
+            self.emit("err", "model load error: %s" % g[0], "red", "bold")
+        elif kind == "load_abort":
+            self.emit("err", "server aborted — model failed to load", "red", "bold")
+
+        elif kind == "slot_pick":
+            sim = float(g[0])
+            fk = float(g[1]) if g[1] else None
+            self.pending_reuse = (sim, fk)
+        elif kind == "reason_on":
+            self.reasoning = True
+        elif kind == "reason_off":
+            self.reasoning = False
+
+        elif kind == "launch":
+            self.new_turn(g[0])
+        elif kind == "restored":
+            if self.turn is None:
+                self.new_turn("?")
+            restored = int(g[1])
+            self.turn["restored"] = restored
+            if self.last_ctx and restored < self.last_ctx:
+                self.turn["wasted"] = self.last_ctx - restored
+
+        elif kind == "prefill_prog":
+            if self.turn is None:
+                self.new_turn("?")
+            self.turn_header()
+            n, prog, _t, rate = int(g[0]), float(g[1]), float(g[2]), float(g[3])
+            total = n / prog if prog > 0 else n
+            remain = max(0.0, total - n)
+            eta = remain / rate if rate > 0 else 0
+            self.live.set_status(self.st(
+                "   %s prefill %3d%%  %s/%s tok  %.0f t/s  ETA %4.1fs"
+                % (self.tag("prefill"), round(prog * 100), human_k(n),
+                   human_k(total), rate, eta), "yel"))
+
+        elif kind == "gen_prog":
+            n, rate = int(g[0]), float(g[1])
+            if self.turn is None:
+                self.new_turn("?")
+            if self.turn["gen_start"] is None:
+                self.turn["gen_start"] = time.time()
+            el = time.time() - self.turn["gen_start"]
+            self.live.set_status(self.st(
+                "   %s gen  %s tok  %.1f t/s  %4.1fs"
+                % (self.tag("gen"), human_k(n), rate, el), "cyn"))
+
+        elif kind == "pp_final":
+            if self.turn is None:
+                self.new_turn("?")
+            self.turn["ttft"] = float(g[0]) / 1000.0
+            self.turn["pp_tok"] = int(g[1])
+            self.turn["pp_rate"] = float(g[3])
+        elif kind == "tg_final":
+            if self.turn:
+                self.turn["tg_tok"] = int(g[1])
+                self.turn["tg_rate"] = float(g[3])
+        elif kind == "total_time":
+            if self.turn:
+                self.turn["total"] = float(g[0]) / 1000.0
+        elif kind == "draft_acc":
+            if self.turn:
+                self.turn["acc"] = float(g[0])
+
+        elif kind == "release":
+            ctx = int(g[1])
+            truncated = int(g[2])
+            self.finish_turn(ctx, truncated)
+        elif kind == "idle":
+            self.live.clear_status()
+            self.emit("idle", "idle — waiting for next request", "gry")
+
+        elif kind == "other" and self.verbose:
+            self.live.log("%s %s %s" % (self.stamp(), self.tag("info"),
+                                        self.st(data["raw"], "gry")))
+
+    # -- turn completion --------------------------------------------------
+    def finish_turn(self, ctx, truncated):
+        self.live.clear_status()
+        t = self.turn or {}
+        self.last_ctx = ctx
+        frac = ctx / float(self.n_ctx) if self.n_ctx else 0
+        zone, exp_pp, exp_tg = ctx_zone(ctx, self.n_ctx)
+
+        seg = []
+        seg.append(self.st("task %s" % t.get("task", "?"), "bold"))
+        seg.append("ctx %s/%s %s %d%%" % (human_k(ctx), human_k(self.n_ctx),
+                                          bar(frac, 8), round(frac * 100)))
+        if t.get("pp_tok") is not None:
+            seg.append("prefill %s tok @ %.0f t/s (%.1fs TTFT)"
+                       % (human_k(t["pp_tok"]), t["pp_rate"] or 0, t.get("ttft") or 0))
+        if t.get("tg_tok") is not None:
+            gt = (t.get("total") or 0) - (t.get("ttft") or 0)
+            seg.append("gen %s tok @ %.1f t/s (%.1fs)"
+                       % (human_k(t["tg_tok"]), t["tg_rate"] or 0, max(0, gt)))
+        if t.get("total") is not None:
+            seg.append(self.st("total %.1fs" % t["total"], "bold"))
+        if t.get("acc") is not None:
+            seg.append("draft %d%%" % round(t["acc"] * 100))
+        seg.append(self.st("zone %s" % zone, "gry"))
+
+        self.emit("done", " · ".join(seg), )
+
+        # explanations / warnings (only emitted with --detail) ------------
+        notes = []
+        wasted = t.get("wasted", 0)
+        if wasted >= 2000 and t.get("pp_rate"):
+            wsec = wasted / t["pp_rate"]
+            notes.append(self.st(
+                "%s reprocessed ~%s already-cached tokens (~%.1fs wasted): prompt "
+                "prefix diverged at pos %s. Stabilize the prefix (append-only) to avoid."
+                % (self.tag("warn"), human_k(wasted), wsec, human_k(t.get("restored") or 0)),
+                "yel"))
+        if truncated:
+            notes.append(self.st("%s context TRUNCATED — oldest tokens dropped"
+                                 % self.tag("warn"), "red", "bold"))
+        if frac >= 0.95:
+            notes.append(self.st("%s context %d%% full — near the %s limit, truncation imminent"
+                                 % (self.tag("warn"), round(frac * 100), human_k(self.n_ctx)),
+                                 "red", "bold"))
+        elif frac >= 0.85:
+            notes.append(self.st("%s context %d%% full — approaching limit; consider compacting"
+                                 % (self.tag("warn"), round(frac * 100)), "yel"))
+        if t.get("acc") is not None and t["acc"] < 0.60:
+            notes.append(self.st("%s low draft acceptance (%d%%) — speculative decode adding little"
+                                 % (self.tag("warn"), round(t["acc"] * 100)), "yel"))
+        if (t.get("pp_rate") and (t.get("pp_tok") or 0) >= 1024
+                and t["pp_rate"] < exp_pp * 0.7):
+            notes.append(self.st("%s prefill %.0f t/s is below the ~%d t/s typical for %s context"
+                                 % (self.tag("warn"), t["pp_rate"], exp_pp, zone), "yel"))
+        if self.detail:
+            for n in notes:
+                self.live.log("            %s" % n)
+
+        # rolling stats ---------------------------------------------------
+        self.session["turns"] += 1
+        self.session["prefill"] += t.get("pp_tok") or 0
+        self.session["gen"] += t.get("tg_tok") or 0
+        self.session["wasted"] += wasted
+        self.session["time"] += t.get("total") or 0
+        self.history.append(dict(pp=t.get("pp_rate"), tg=t.get("tg_rate"),
+                                 ttft=t.get("ttft"), wasted=wasted,
+                                 acc=t.get("acc")))
+        if self.stats_every and self.session["turns"] % self.stats_every == 0:
+            self.print_stats()
+        self.turn = None
+
+    def print_stats(self):
+        h = list(self.history)
+
+        def avg(key):
+            vals = [x[key] for x in h if x.get(key) is not None]
+            return sum(vals) / len(vals) if vals else 0
+
+        n = len(h)
+        s = self.session
+        wasted_pct = (100.0 * s["wasted"] / s["prefill"]) if s["prefill"] else 0
+        line = ("last %d turns — prefill %.0f t/s · gen %.1f t/s · TTFT %.1fs · "
+                "rewind %s/turn · draft %d%%   |   session: %d turns, %s gen tok, "
+                "%.0f%% of prefill wasted on reprocessing"
+                % (n, avg("pp"), avg("tg"), avg("ttft"), human_k(avg("wasted")),
+                   round(avg("acc") * 100), s["turns"], human_k(s["gen"]), wasted_pct))
+        self.emit("stats", self.st(line, "blu"))
+
+
+# ----------------------------------------------------------------------------
+# Tailing — follow a growing file, survive rotation/truncation
+# ----------------------------------------------------------------------------
+
+def tail_lines(path, from_start, follow, tail_n):
+    if path == "-":
+        for line in sys.stdin:
+            yield line.rstrip("\n")
+        return
+
+    def open_at_end(f):
+        f.seek(0, os.SEEK_END)
+
+    f = open(path, "r", errors="replace")
+    inode = os.fstat(f.fileno()).st_ino
+
+    if from_start:
+        pass  # start at byte 0
+    elif tail_n:
+        # cheap tail: read whole file, keep last N lines, then follow
+        data = f.read().splitlines()
+        for ln in data[-tail_n:]:
+            yield ln
+        # f is now at EOF
+    else:
+        open_at_end(f)
+
+    buf = ""
+    while True:
+        chunk = f.readline()
+        if chunk:
+            buf += chunk
+            if buf.endswith("\n"):
+                yield buf.rstrip("\n")
+                buf = ""
+            continue
+        # no data
+        if not follow:
+            if buf:
+                yield buf
+            return
+        time.sleep(0.25)
+        try:
+            st = os.stat(path)
+            if st.st_ino != inode or st.st_size < f.tell():
+                # rotated or truncated — reopen from start
+                f.close()
+                f = open(path, "r", errors="replace")
+                inode = os.fstat(f.fileno()).st_ino
+                buf = ""
+        except FileNotFoundError:
+            continue
+
+
+# ----------------------------------------------------------------------------
+# Self-test
+# ----------------------------------------------------------------------------
+
+SAMPLE = [
+    ("0.00.049.371 I system_info: n_threads = 10 (n_threads_batch = 10) / 14 | MTL", "system_info"),
+    ("0.02.430.393 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 131072", "new_slot"),
+    ("0.02.445.497 I srv  main: server is listening on http://0.0.0.0:8088", "listening"),
+    ("24.06.889.427 I slot get_availabl: id  0 | task -1 | selected slot by LCP similarity, sim_best = 0.932 (> 0.100 thold), f_keep = 0.932", "slot_pick"),
+    ("24.06.889.955 I slot launch_slot_: id  0 | task 6431 | processing task, is_child = 0", "launch"),
+    ("24.06.918.789 W slot update_slots: id  0 | task 6431 | restored context checkpoint (pos_min = 77263, pos_max = 77263, n_tokens = 77264, n_past = 77264, size = 215.193 MiB)", "restored"),
+    ("24.10.642.909 I slot print_timing: id  0 | task 6431 | prompt processing, n_tokens =   1024, progress = 0.94, t =   3.75 s / 272.85 tokens per second", "prefill_prog"),
+    ("24.57.383.142 I slot print_timing: id  0 | task 6461 | n_decoded =    101, tg =  26.85 t/s", "gen_prog"),
+    ("24.31.735.754 I slot print_timing: id  0 | task 6431 | prompt eval time =   22890.89 ms /  5720 tokens (    4.00 ms per token,   249.88 tokens per second)", "pp_final"),
+    ("24.31.735.756 I slot print_timing: id  0 | task 6431 |        eval time =    1954.78 ms /    59 tokens (   33.13 ms per token,    30.18 tokens per second)", "tg_final"),
+    ("24.31.735.757 I slot print_timing: id  0 | task 6431 |       total time =   24845.67 ms /  5779 tokens", "total_time"),
+    ("24.31.735.758 I slot print_timing: id  0 | task 6431 | draft acceptance = 0.84091 (   37 accepted /    44 generated)", "draft_acc"),
+    ("24.31.737.272 I slot      release: id  0 | task 6431 | stop processing: n_tokens = 83043, truncated = 0", "release"),
+    ("24.31.737.341 I srv  update_slots: all slots are idle", "idle"),
+    ("0.00.718.793 I srv    load_model: loading model '/m/Qwen3.6-35B-A3B-APEX-I-Compact.gguf'", "load_start"),
+    ("0.16.710.953 I srv    load_model: initializing, n_slots = 1, n_ctx_slot = 262144, kv_unified = 'false'", "new_slot"),
+]
+
+
+def self_test():
+    ok = True
+    for text, expect in SAMPLE:
+        got = parse_line(text)
+        kind = got[0] if got else None
+        status = "ok" if kind == expect else "FAIL"
+        if kind != expect:
+            ok = False
+        print("%-5s %-13s <- %s" % (status, kind, text[:70]))
+    # check a couple of extracted values
+    r = parse_line(SAMPLE[8][0])[1]["groups"]
+    assert r[1] == "5720" and r[3] == "249.88", r
+    r = parse_line(SAMPLE[5][0])[1]["groups"]
+    assert r[1] == "77264", r
+    r = parse_line(SAMPLE[-2][0])[1]["groups"]
+    assert r[0] == "/m/Qwen3.6-35B-A3B-APEX-I-Compact.gguf", r
+    r = parse_line(SAMPLE[-1][0])[1]["groups"]
+    assert r[0] == "262144", r
+    print("\nvalue extraction: ok")
+    assert ctx_zone(10000, 131072)[0] == "short"
+    assert ctx_zone(83043, 131072)[0] == "very-long"
+    assert ctx_zone(130000, 131072)[0] == "extreme"
+    assert ctx_zone(83043, 262144)[0] == "long"
+    print("ctx zones scale with window: ok")
+    print("ALL PASS" if ok else "SOME FAILED")
+    return 0 if ok else 1
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Real-time llama-server log monitor")
+    ap.add_argument("path", nargs="?", default=DEFAULT_LOG,
+                    help="log file (or - for stdin); default %s" % DEFAULT_LOG)
+    ap.add_argument("--from-start", action="store_true", help="replay whole file then follow")
+    ap.add_argument("--no-follow", action="store_true", help="process existing lines and exit")
+    ap.add_argument("--tail", type=int, default=0, metavar="N",
+                    help="start N lines from the end, then follow")
+    ap.add_argument("--ctx-max", type=int, default=DEFAULT_CTX_MAX,
+                    help="fallback context window if it cannot be detected")
+    ap.add_argument("--server", default=DEFAULT_SERVER, metavar="URL",
+                    help="llama-server URL for /props (context window + version); "
+                         "'' disables")
+    ap.add_argument("--stats-every", type=int, default=5)
+    ap.add_argument("--detail", "--debug", dest="detail", action="store_true",
+                    help="show ⚠️ warning/explanation lines (hidden by default)")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--no-icons", action="store_true")
+    ap.add_argument("--verbose", action="store_true", help="echo unrecognized lines")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
+
+    is_tty = sys.stdout.isatty()
+    st = Style(color=(not args.no_color) and is_tty)
+    live = Live(sys.stdout, sticky=is_tty)
+
+    # ask the live server for its context window + version; the log stays
+    # authoritative (new_slot lines overwrite n_ctx). Skipped for stdin and
+    # post-mortem (--no-follow) runs, where only the log should speak.
+    server = args.server if (args.server and args.path != "-"
+                             and not args.no_follow) else None
+    ctx_max, version, model = args.ctx_max, None, None
+    props = server_props(server) if server else None
+    if props:
+        version = props.get("version")
+        model = props.get("model")
+        if props.get("n_ctx"):
+            ctx_max = int(props["n_ctx"])
+
+    mon = Monitor(live, st, ctx_max, args.stats_every, args.verbose, args.detail,
+                  server=server, version=version, model=model)
+    mon.icons = not args.no_icons
+
+    # banner
+    origin = (" · ".join(filter(None, [model, "server %s" % version,
+                                       "ctx %s" % human_k(ctx_max)])) if version
+              else "ctx %s assumed until seen in log" % human_k(ctx_max))
+    live.log(st("llama-mon", "bold", "cyn") + st("  watching %s  (%s)"
+             % (args.path, origin), "gry"))
+    legend = "%s req  %s prefill  %s gen  %s rewind/waste  %s done  %s stats" % (
+        mon.tag("turn"), mon.tag("prefill"), mon.tag("gen"),
+        mon.tag("rewind"), mon.tag("done"), mon.tag("stats"))
+    if args.detail:
+        legend += "  %s warn" % mon.tag("warn")
+    live.log(st(legend, "gry"))
+    live.log(st("─" * 72, "gry"))
+
+    follow = not args.no_follow
+    try:
+        for raw in tail_lines(args.path, args.from_start, follow, args.tail):
+            ev = parse_line(raw)
+            if ev:
+                mon.feed(ev[0], ev[1])
+    except KeyboardInterrupt:
+        live.clear_status()
+        live.log(st("\nstopped.", "gry"))
+        if mon.session["turns"]:
+            mon.print_stats()
+    except BrokenPipeError:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

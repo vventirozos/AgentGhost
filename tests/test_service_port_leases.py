@@ -588,6 +588,52 @@ class TestServiceTokens:
         assert "exited immediately" in out
         assert "web" not in sup._load()
 
+    def test_state_dir_created_and_exported(self, tmp_path):
+        # "later 5": released workspaces are read-only, so runtime state
+        # lives in .services/state/<stem>/, exported to the app.
+        sup, _ = _sup(tmp_path)
+        sup.start("web", "cmd", port=8100, project_id="aaa111")
+        state = tmp_path / ".services" / "state" / "aaa111--web"
+        assert state.is_dir()
+        script = (tmp_path / ".services" / "aaa111--web.cmd.sh").read_text()
+        assert ("export GHOST_SERVICE_STATE_DIR="
+                "/workspace/.services/state/aaa111--web") in script
+
+    def test_state_survives_stop_and_restart(self, tmp_path):
+        # A stopped game server's saves must survive its next start.
+        sup, _ = _sup(tmp_path)
+        sup.start("web", "cmd", port=8100)
+        state = tmp_path / ".services" / "state" / "web"
+        (state / "game_state.json").write_text("{}")
+        sup.stop("web")
+        assert (state / "game_state.json").exists()
+        sup.start("web", "cmd", port=8100)
+        assert (state / "game_state.json").exists()
+
+    def test_purge_state_removes_dir(self, tmp_path):
+        sup, _ = _sup(tmp_path)
+        sup.start("web", "cmd", port=8100, project_id="aaa111")
+        state = tmp_path / ".services" / "state" / "aaa111--web"
+        (state / "save.json").write_text("{}")
+        sup.stop("web", project_id="aaa111")
+        assert sup.purge_state("aaa111:web") is True
+        assert not state.exists()
+
+    def test_project_hard_delete_purges_state_archive_keeps_it(self, tmp_path):
+        from ghost_agent.tools.projects import _stop_project_services
+        sup, sb = _sup(tmp_path)
+        ctx = SimpleNamespace(sandbox_manager=sb)
+        # Archive path: state kept.
+        sup.start("web", "cmd", port=8100, project_id="aaa111")
+        state = tmp_path / ".services" / "state" / "aaa111--web"
+        (state / "s.json").write_text("{}")
+        _stop_project_services(ctx, "aaa111")                # archive
+        assert state.exists()
+        # Delete path: state purged.
+        sup.start("web", "cmd", port=8100, project_id="aaa111")
+        _stop_project_services(ctx, "aaa111", purge_state=True)
+        assert not state.exists()
+
     def test_briefing_summary_never_leaks_token(self, tmp_path):
         from ghost_agent.tools.projects import project_services_summary
         sup, sb = _sup(tmp_path)

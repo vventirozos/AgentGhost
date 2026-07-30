@@ -133,7 +133,12 @@ MANAGE_SERVICES_TOOL_DEFINITION = {
                         "'cd app && node server.js'. Prefer reading the "
                         "port from $PORT; a hardcoded port literal is "
                         "rewritten automatically if the lease lands on a "
-                        "different port."
+                        "different port. Apps that WRITE runtime state "
+                        "(saves, uploads, databases) must write it under "
+                        "$GHOST_SERVICE_STATE_DIR, NOT into the project "
+                        "workspace — a RELEASED workspace is read-only, and "
+                        "workspace writes will crash the released app. The "
+                        "state dir survives restarts and releases."
                     ),
                 },
                 "port": {

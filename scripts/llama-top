@@ -1,0 +1,904 @@
+#!/usr/bin/env python3
+"""
+llama-top — a btop/htop-style live dashboard for llama-server logs.
+
+Full-screen curses UI that tails llama-server.log and shows, refreshing in
+place:
+  • server status + llama-server version + model + context window
+    + watch time
+  • context-fill gauge and live prefill / generation meters
+  • scrolling area graphs of prefill and generation throughput (t/s)
+  • the current task (live prefill % / generation progress)
+  • a table of the most recent completed turns
+  • a session footer (totals, averages, % of prefill wasted on reprocessing)
+
+This is standalone — it does NOT import or modify llama-mon.
+
+Usage:
+    llama-top                       # follow default log, seed graphs from history
+    llama-top /path/to/llama.log
+    llama-top --from-start          # seed graphs from the whole file
+    llama-top --tail 8000           # seed from last 8000 lines (default 4000)
+    llama-top --interval 0.1        # redraw cadence in seconds (default 0.2)
+    llama-top --server http://host:8088   # where to query /props (version, ctx)
+    llama-top --no-color
+    llama-top --self-test           # exercise parser/graph logic without a TTY
+
+Keys:  q / Esc quit   ·   c cycle color theme (C reverse)   ·   b cycle
+       background (B reverse)   ·   x clear session stats   ·   p pause
+"""
+import argparse
+import json
+import locale
+import os
+import re
+import sys
+import threading
+import time
+from collections import deque
+
+DEFAULT_LOG = "/Users/vasilis/Data/AI/Logs/llama-server.log"
+DEFAULT_CTX_MAX = 262144          # fallback until /props or the log tells us
+DEFAULT_SERVER = "http://127.0.0.1:8088"
+PP_FULL = 900.0   # prefill t/s that fills the meter bar
+TG_FULL = 95.0    # generation t/s that fills the meter bar
+
+# llama-server emits degenerate timing lines for near-empty evals (e.g.
+# "eval time = 0.00 ms / 1 tokens ( ... 1000000.00 tokens per second)");
+# samples must clear these floors/caps to count toward graphs and averages.
+SANE_MIN_TOK = 4
+SANE_MIN_MS = 50.0
+PP_SANE_MAX = 50000.0
+TG_SANE_MAX = 2000.0
+
+
+def sane_sample(tok, ms, rate, cap):
+    return bool(tok) and tok >= SANE_MIN_TOK and (ms or 0.0) >= SANE_MIN_MS \
+        and rate <= cap
+
+# ----------------------------------------------------------------------------
+# Parser (standalone copy) — parse_line(text) -> (kind, groups) | None
+# ----------------------------------------------------------------------------
+
+_LINE = re.compile(r"^\S+\s+([IWE])\s+(.*)$")
+_PATTERNS = [
+    ("system_info",  re.compile(r"system_info: n_threads = (\d+).*?/\s*(\d+)")),
+    ("load_start",   re.compile(r": loading model\b(?:\s*'([^']+)')?")),
+    ("model_loaded", re.compile(r": model loaded\b")),
+    ("listening",    re.compile(r"server is listening on (\S+)")),
+    ("new_slot",     re.compile(r"(?:new slot,\s*n_ctx|n_ctx_slot) = (\d+)")),
+    ("mmproj",       re.compile(r"loaded multimodal model, '([^']+)'")),
+    ("ctx_warn",     re.compile(r"n_ctx_seq \((\d+)\) < n_ctx_train \((\d+)\)")),
+    ("load_error",   re.compile(r"error loading model: (.*)")),
+    ("load_abort",   re.compile(r"exiting due to model loading error")),
+    ("slot_pick",    re.compile(r"selected slot .*?sim_best = ([\d.]+)(?:.*?f_keep = ([\d.]+))?")),
+    ("reason_on",    re.compile(r"reasoning-budget: activated")),
+    ("reason_off",   re.compile(r"reasoning-budget: deactivated")),
+    ("launch",       re.compile(r"launch_slot_: id\s+\d+ \| task (\d+) \| processing task")),
+    ("restored",     re.compile(r"restored context checkpoint \(pos_min = (\d+).*?n_tokens = (\d+).*?size = ([\d.]+) MiB\)")),
+    ("prefill_prog", re.compile(r"prompt processing, n_tokens =\s*(\d+), progress = ([\d.]+), t =\s*([\d.]+) s / ([\d.]+) tokens per second")),
+    ("gen_prog",     re.compile(r"n_decoded =\s*(\d+), tg =\s*([\d.]+) t/s")),
+    ("pp_final",     re.compile(r"\| prompt eval time =\s*([\d.]+) ms /\s*(\d+) tokens \(\s*([\d.]+) ms per token,\s*([\d.]+) tokens per second\)")),
+    ("tg_final",     re.compile(r"\|\s+eval time =\s*([\d.]+) ms /\s*(\d+) tokens \(\s*([\d.]+) ms per token,\s*([\d.]+) tokens per second\)")),
+    ("total_time",   re.compile(r"total time =\s*([\d.]+) ms /\s*(\d+) tokens")),
+    ("draft_acc",    re.compile(r"draft acceptance = ([\d.]+) \(\s*(\d+) accepted /\s*(\d+) generated\)")),
+    ("release",      re.compile(r"release: id\s+\d+ \| task (\d+) \| stop processing: n_tokens = (\d+), truncated = (\d+)")),
+    ("idle",         re.compile(r"update_slots: all slots are idle")),
+]
+
+
+def parse_line(text):
+    m = _LINE.match(text)
+    if not m:
+        return None
+    body = m.group(2)
+    for kind, rx in _PATTERNS:
+        g = rx.search(body)
+        if g:
+            return kind, g.groups()
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Small helpers
+# ----------------------------------------------------------------------------
+
+def human_k(n):
+    n = float(n or 0)
+    return ("%.1fk" % (n / 1000.0)) if n >= 1000 else ("%d" % n)
+
+
+ZONES = [  # (label, upper bound as fraction of the context window, pp t/s, tg t/s)
+    ("short",     0.125, 700, 55),
+    ("medium",    0.30,  500, 48),
+    ("long",      0.50,  350, 38),
+    ("very-long", 0.75,  250, 30),
+    ("extreme",   None,  190, 25),
+]
+
+
+def ctx_zone(ctx, n_ctx):
+    frac = ctx / float(n_ctx) if n_ctx else 0.0
+    for label, hi, pp, tg in ZONES:
+        if hi is None or frac < hi:
+            return label, pp, tg
+
+
+def server_props(url, timeout=1.5):
+    """Best-effort GET /props from a running llama-server.
+    Returns dict(version, n_ctx, model) or None if unreachable."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/props", timeout=timeout) as r:
+            d = json.load(r)
+    except Exception:
+        return None
+    model = os.path.basename(d.get("model_path") or "")
+    model = re.sub(r"\.gguf$", "", model)
+    return dict(version=d.get("build_info"),
+                n_ctx=(d.get("default_generation_settings") or {}).get("n_ctx"),
+                model=model or None)
+
+
+# zone fill colors, gradient green -> red across the five ctx_zone bands
+ZONE_COLOR = {
+    "short": "grn", "medium": "grn", "long": "yel",
+    "very-long": "red", "extreme": "red",
+}
+
+# ----------------------------------------------------------------------------
+# Color themes — mactop-style rotating schemes, dark-leaning 256-color values.
+# Roles: grn=ctx, mag=processing/prefill, cyn=generating, yel=warn, red=crit,
+# blu=footer/accent, gry=chrome. 'alts' are spare colors used to keep the
+# ctx/processing/generating trio distinct when a background collides.
+# ----------------------------------------------------------------------------
+
+THEMES = [
+    dict(name="classic", grn=2,   mag=5,   cyn=6,   yel=3,   red=1,
+         blu=4,   gry=245, alts=[10, 13, 14]),
+    dict(name="ember",   grn=130, mag=125, cyn=136, yel=180, red=124,
+         blu=95,  gry=101, alts=[166, 208, 88]),
+    dict(name="ocean",   grn=30,  mag=61,  cyn=38,  yel=143, red=167,
+         blu=25,  gry=60,  alts=[45, 105, 24]),
+    dict(name="forest",  grn=28,  mag=100, cyn=37,  yel=136, red=88,
+         blu=65,  gry=102, alts=[34, 71, 22]),
+    dict(name="dusk",    grn=96,  mag=61,  cyn=132, yel=180, red=125,
+         blu=104, gry=59,  alts=[139, 97, 55]),
+    # mactop built-ins. 1977: fixed retro ANSI per component (CPU green,
+    # GPU magenta, MEM blue, ANE red, gray labels) -> ctx=blue (memory),
+    # prefill=green (cpu), gen=magenta (gpu), orange accent for the '77 logo.
+    dict(name="1977",    grn=4,   mag=2,   cyn=5,   yel=3,   red=1,
+         blu=208, gry=245, alts=[166, 33, 129]),
+    # macchiato: Catppuccin Macchiato pastels, nearest xterm-256 — ctx=Green,
+    # prefill=Mauve, gen=Sapphire (mactop's primary), warn=Yellow, crit=Red,
+    # accent=Blue, chrome=Subtext0.
+    dict(name="macchiato", grn=150, mag=183, cyn=116, yel=223, red=210,
+         blu=111, gry=146, alts=[147, 218, 216]),
+]
+BACKGROUNDS = [
+    ("default", -1), ("black", 16), ("charcoal", 234),
+    ("navy", 17), ("ink", 53),
+]
+
+# 8-color terminals: single theme, default/black backgrounds only
+THEMES_BASIC = [
+    dict(name="classic", grn=2, mag=5, cyn=6, yel=3, red=1, blu=4, gry=7,
+         alts=[]),
+]
+BACKGROUNDS_BASIC = [("default", -1), ("black", 0)]
+
+
+def compose(theme, bg, limit=256):
+    """Resolve a theme against a background: ctx (grn), processing (mag) and
+    generating (cyn) must stay mutually distinct and never match the bg."""
+    out = dict(theme)
+    spare = [c for c in list(theme.get("alts", ())) + [208, 39, 205, 118, 250, 15]
+             if c < limit]
+    used = {bg}
+    for role in ("grn", "mag", "cyn"):
+        c = out[role]
+        while c in used and spare:
+            c = spare.pop(0)
+        used.add(c)
+        out[role] = c
+    for role in ("yel", "red", "blu", "gry"):
+        while out[role] == bg and spare:
+            out[role] = spare.pop(0)
+    return out
+
+
+def meter(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    f = int(round(frac * width))
+    return "▕" + "█" * f + "░" * (width - f) + "▏"
+
+
+def gauge(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    f = int(round(frac * width))
+    return "[" + "█" * f + "░" * (width - f) + "]"
+
+
+def _stat_label(win, fmt, w):
+    """'┤ peak X · avg Y · low Z ├' over the visible window (dashes if empty).
+
+    Numbers are right-padded to width w so the label keeps a fixed length and
+    stays put frame-to-frame; the ┤ ├ caps merge into the box's top border.
+    """
+    if win:
+        nums = [(fmt % v).rjust(w)
+                for v in (max(win), sum(win) / len(win), min(win))]
+    else:
+        nums = ["—".rjust(w)] * 3
+    return "┤ peak %s · avg %s · low %s ├" % (nums[0], nums[1], nums[2])
+
+
+_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+
+def graph_rows(vals, width, height, floor=1.0):
+    """Return (rows, max) for an area chart; newest sample at the right."""
+    vals = list(vals)[-width:]
+    mx = max(vals) if vals else 0.0
+    mx = max(mx, floor)
+    if len(vals) < width:
+        vals = [0.0] * (width - len(vals)) + vals
+    cols = [int(round((v / mx) * height * 8)) for v in vals]
+    rows = []
+    for r in range(height):
+        cb = (height - 1 - r) * 8
+        line = "".join(
+            "█" if (h - cb) >= 8 else (" " if (h - cb) <= 0 else _BLOCKS[h - cb])
+            for h in cols)
+        rows.append(line)
+    return rows, mx
+
+
+# ----------------------------------------------------------------------------
+# Shared state, updated by the tail thread, read by the draw loop
+# ----------------------------------------------------------------------------
+
+class State:
+    def __init__(self, ctx_max):
+        self.lock = threading.Lock()
+        self.start = time.time()
+        self.status = "INIT"
+        self.version = "?"
+        self.model = "?"
+        self.n_ctx = ctx_max
+        self.last_ctx = 0
+        self.cur_ctx = 0
+        # live request fields
+        self.task = None
+        self.reuse = None
+        self.restored = None
+        self.live_pp_n = 0
+        self.live_pp_total = 0
+        self.live_pp_rate = 0.0
+        self.live_pp_eta = 0.0
+        self.live_gen_n = 0
+        self.live_gen_rate = 0.0
+        self.gen_start = None
+        # last completed metrics
+        self.pp_rate = 0.0
+        self.tg_rate = 0.0
+        self.ttft = 0.0
+        self.draft = None
+        # pending request fields
+        self.pending_reuse = None
+        self.pend_pp_tok = None
+        self.pend_pp_rate = None
+        self.pend_pp_ms = None
+        self.pend_ttft = None
+        self.pend_tg_tok = None
+        self.pend_tg_rate = None
+        self.pend_tg_ms = None
+        self.pend_total = None
+        self.pend_acc = None
+        self.pend_wasted = 0
+        # history / table / session
+        self.pp_hist = deque(maxlen=400)
+        self.tg_hist = deque(maxlen=400)
+        self.ctx_hist = deque(maxlen=400)
+        self.turns = deque(maxlen=200)
+        self.s_turns = 0
+        self.s_gen = 0
+        self.s_prefill = 0
+        self.s_wasted = 0
+
+
+def apply_event(stt, kind, g):
+    with stt.lock:
+        if kind == "system_info":
+            stt.status = "LOADING"
+            stt.last_ctx = 0
+            stt.task = None
+        elif kind == "load_start":
+            stt.status = "LOADING"
+            if g and g[0]:
+                base = re.sub(r"\.gguf$", "", os.path.basename(g[0]))
+                stt.model = base[:48]
+        elif kind == "new_slot":
+            stt.n_ctx = int(g[0])
+        elif kind == "mmproj":
+            if stt.model == "?":  # fallback for logs without a model path
+                base = os.path.basename(g[0])
+                base = re.sub(r"\.gguf$", "", base)
+                base = re.sub(r"^mmproj-|\.mmproj$", "", base)
+                stt.model = base[:48]
+        elif kind in ("model_loaded", "listening"):
+            stt.status = "IDLE"
+        elif kind in ("load_error", "load_abort"):
+            stt.status = "ERROR"
+        elif kind == "slot_pick":
+            sim = float(g[0])
+            fk = float(g[1]) if g[1] else None
+            stt.pending_reuse = (sim, fk)
+        elif kind == "launch":
+            stt.task = g[0]
+            stt.status = "PREFILL"
+            stt.reuse = stt.pending_reuse[0] if stt.pending_reuse else None
+            stt.pending_reuse = None
+            stt.restored = None
+            stt.pend_pp_tok = stt.pend_pp_rate = stt.pend_pp_ms = None
+            stt.pend_ttft = None
+            stt.pend_tg_tok = stt.pend_tg_rate = stt.pend_tg_ms = None
+            stt.pend_total = stt.pend_acc = None
+            stt.pend_wasted = 0
+            stt.gen_start = None
+            stt.live_gen_n = 0
+        elif kind == "restored":
+            stt.restored = int(g[1])
+            if stt.last_ctx and stt.restored < stt.last_ctx:
+                stt.pend_wasted = stt.last_ctx - stt.restored
+        elif kind == "prefill_prog":
+            n, prog, _t, rate = int(g[0]), float(g[1]), float(g[2]), float(g[3])
+            total = n / prog if prog > 0 else n
+            stt.status = "PREFILL"
+            stt.live_pp_n = n
+            stt.live_pp_total = int(total)
+            stt.live_pp_rate = rate
+            stt.live_pp_eta = max(0.0, (total - n) / rate) if rate else 0.0
+        elif kind == "gen_prog":
+            stt.status = "GENERATING"
+            if stt.gen_start is None:
+                stt.gen_start = time.time()
+            stt.live_gen_n = int(g[0])
+            stt.live_gen_rate = float(g[1])
+        elif kind == "pp_final":
+            stt.pend_ttft = float(g[0]) / 1000.0
+            stt.pend_pp_tok = int(g[1])
+            stt.pend_pp_rate = float(g[3])
+            stt.pend_pp_ms = float(g[0])
+        elif kind == "tg_final":
+            stt.pend_tg_tok = int(g[1])
+            stt.pend_tg_rate = float(g[3])
+            stt.pend_tg_ms = float(g[0])
+        elif kind == "total_time":
+            stt.pend_total = float(g[0]) / 1000.0
+        elif kind == "draft_acc":
+            stt.pend_acc = float(g[0])
+        elif kind == "release":
+            ctx = int(g[1])
+            _finish(stt, ctx, int(g[2]))
+        elif kind == "idle":
+            stt.status = "IDLE"
+            stt.task = None
+
+
+def _finish(stt, ctx, truncated):
+    stt.last_ctx = ctx
+    stt.cur_ctx = ctx
+    stt.status = "IDLE"
+    zone = ctx_zone(ctx, stt.n_ctx)[0]
+    pp = stt.pend_pp_rate or 0.0
+    tg = stt.pend_tg_rate or 0.0
+    pp_ok = sane_sample(stt.pend_pp_tok, stt.pend_pp_ms, pp, PP_SANE_MAX)
+    tg_ok = sane_sample(stt.pend_tg_tok, stt.pend_tg_ms, tg, TG_SANE_MAX)
+    if pp_ok:
+        stt.pp_rate = pp
+        stt.pp_hist.append(pp)
+    if tg_ok:
+        stt.tg_rate = tg
+        stt.tg_hist.append(tg)
+    stt.ctx_hist.append(ctx)
+    stt.ttft = stt.pend_ttft or 0.0
+    stt.draft = stt.pend_acc
+    stt.turns.appendleft(dict(
+        task=stt.task or "?", ctx=ctx, pp=pp, tg=tg, pp_ok=pp_ok, tg_ok=tg_ok,
+        ttft=stt.pend_ttft or 0.0, draft=stt.pend_acc,
+        rewind=stt.pend_wasted, zone=zone, trunc=truncated))
+    stt.s_turns += 1
+    stt.s_gen += stt.pend_tg_tok or 0
+    stt.s_prefill += stt.pend_pp_tok or 0
+    stt.s_wasted += stt.pend_wasted
+    stt.task = None
+
+
+def fetch_props(stt, url):
+    """Pull version/n_ctx/model from the server's /props into shared state."""
+    props = server_props(url)
+    if not props:
+        return
+    with stt.lock:
+        if props.get("version"):
+            stt.version = props["version"]
+        if props.get("n_ctx"):
+            stt.n_ctx = int(props["n_ctx"])
+        if props.get("model") and stt.model == "?":
+            stt.model = props["model"][:48]
+
+
+# ----------------------------------------------------------------------------
+# Tail thread
+# ----------------------------------------------------------------------------
+
+def tail_thread(path, stt, from_start, tail_n, stop, server):
+    if server:
+        fetch_props(stt, server)
+    while not stop.is_set():
+        try:
+            f = open(path, "r", errors="replace")
+        except FileNotFoundError:
+            time.sleep(0.5)
+            continue
+        inode = os.fstat(f.fileno()).st_ino
+        if from_start:
+            pass
+        elif tail_n:
+            for ln in f.read().splitlines()[-tail_n:]:
+                ev = parse_line(ln)
+                if ev:
+                    apply_event(stt, ev[0], ev[1])
+        else:
+            f.seek(0, os.SEEK_END)
+        buf = ""
+        while not stop.is_set():
+            chunk = f.readline()
+            if chunk:
+                buf += chunk
+                if buf.endswith("\n"):
+                    ev = parse_line(buf.rstrip("\n"))
+                    if ev:
+                        apply_event(stt, ev[0], ev[1])
+                        if ev[0] == "listening" and server:
+                            fetch_props(stt, server)  # server (re)started
+                    buf = ""
+                continue
+            time.sleep(0.2)
+            try:
+                sres = os.stat(path)
+                if sres.st_ino != inode or sres.st_size < f.tell():
+                    break  # rotated/truncated -> reopen
+            except FileNotFoundError:
+                break
+        f.close()
+
+
+# ----------------------------------------------------------------------------
+# Curses rendering
+# ----------------------------------------------------------------------------
+
+STATUS_COLOR = {
+    "GENERATING": "cyn", "PREFILL": "mag", "IDLE": "grn",
+    "LOADING": "yel", "ERROR": "red", "INIT": "gry",
+}
+
+
+class UI:
+    def __init__(self, scr, use_color):
+        import curses
+        self.curses = curses
+        self.scr = scr
+        self.color = use_color and curses.has_colors()
+        self.pairs = {}
+        self.theme_i = 0
+        self.bg_i = 0
+        self.many = False
+        self.theme_name = ""
+        self.bg_name = ""
+        if self.color:
+            curses.start_color()
+            curses.use_default_colors()
+            self.many = curses.COLORS >= 256
+            self.apply_colors()
+
+    def apply_colors(self):
+        """(Re)build the 7 role pairs from the active theme/background; the
+        whole UI recolors on the next draw since attrs reference the pairs."""
+        curses = self.curses
+        themes = THEMES if self.many else THEMES_BASIC
+        bgs = BACKGROUNDS if self.many else BACKGROUNDS_BASIC
+        theme = themes[self.theme_i % len(themes)]
+        bg_name, bg = bgs[self.bg_i % len(bgs)]
+        colors = compose(theme, bg, curses.COLORS)
+        for i, name in enumerate(("grn", "yel", "red", "cyn", "mag", "blu",
+                                  "gry"), 1):
+            curses.init_pair(i, colors[name], bg)
+            self.pairs[name] = curses.color_pair(i) | (
+                curses.A_DIM if name == "gry" and not self.many else 0)
+        curses.init_pair(8, colors["gry"], bg)   # fills blank cells too
+        self.scr.bkgd(" ", curses.color_pair(8))
+        self.theme_name = theme["name"]
+        self.bg_name = bg_name
+
+    def cycle_theme(self, step=1):
+        if self.color:
+            self.theme_i += step
+            self.apply_colors()
+
+    def cycle_bg(self, step=1):
+        if self.color:
+            self.bg_i += step
+            self.apply_colors()
+
+    def attr(self, *styles):
+        a = 0
+        for s in styles:
+            if s == "bold":
+                a |= self.curses.A_BOLD
+            elif self.color and s in self.pairs:
+                a |= self.pairs[s]
+        return a
+
+    def aw(self, y, x, s, *styles):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        if x < 0:
+            s = s[-x:]
+            x = 0
+        s = s[:max(0, w - x)]
+        try:
+            self.scr.addstr(y, x, s, self.attr(*styles))
+        except self.curses.error:
+            pass
+
+    def box(self, y, x, h, w, title="", *styles):
+        if h < 2 or w < 2:
+            return
+        self.aw(y, x, "┌" + "─" * (w - 2) + "┐", *styles)
+        for i in range(1, h - 1):
+            self.aw(y + i, x, "│", *styles)
+            self.aw(y + i, x + w - 1, "│", *styles)
+        self.aw(y + h - 1, x, "└" + "─" * (w - 2) + "┘", *styles)
+        if title:
+            self.aw(y, x + 2, " " + title + " ", "bold", *styles)
+
+
+def draw(ui, stt, paused):
+    scr = ui.scr
+    scr.erase()
+    H, W = scr.getmaxyx()
+    if H < 14 or W < 50:
+        ui.aw(0, 0, "terminal too small (need >= 50x14)", "yel")
+        scr.noutrefresh()
+        return
+
+    with stt.lock:
+        s = _snapshot(stt)
+
+    iw = W - 4  # inner content width for full-width panels
+
+    # ---- header ----
+    title = "llama-server"
+    if s["version"] not in (None, "", "?"):
+        title += " " + s["version"]
+    ui.box(0, 0, 3, W, title, "gry")
+    dot_c = STATUS_COLOR.get(s["status"], "gry")
+    ui.aw(1, 2, "●", dot_c, "bold")
+    ui.aw(1, 4, "%-11s" % s["status"], dot_c, "bold")
+    up = int(time.time() - s["start"])
+    hdr = "model %s   ctx %s   watching %02d:%02d:%02d" % (
+        s["model"], human_k(s["n_ctx"]),
+        up // 3600, (up % 3600) // 60, up % 60)
+    ui.aw(1, 16, hdr, "gry")
+    if paused:
+        ui.aw(1, W - 10, "[PAUSED]", "yel", "bold")
+    y = 3
+    cur_h = 3
+
+    # ---- current task ----
+    ui.box(y, 0, cur_h, W, "Current task", "gry")
+    if s["status"] == "PREFILL":
+        tot = s["live_pp_total"] or 1
+        pct = min(100, round(100 * s["live_pp_n"] / tot))
+        line = "task %s  prefill %3d%% %s %s/%s tok  %.0f t/s  ETA %.1fs" % (
+            s["task"], pct, meter(pct / 100.0, min(20, iw - 50)),
+            human_k(s["live_pp_n"]), human_k(tot), s["live_pp_rate"],
+            s["live_pp_eta"])
+        ui.aw(y + 1, 2, line, "mag")
+    elif s["status"] == "GENERATING":
+        el = (time.time() - s["gen_start"]) if s["gen_start"] else 0
+        line = "task %s  generating  %s tok  %.1f t/s  %.1fs" % (
+            s["task"], human_k(s["live_gen_n"]), s["live_gen_rate"], el)
+        ui.aw(y + 1, 2, line, "cyn")
+    elif s["status"] == "LOADING":
+        ui.aw(y + 1, 2, "loading model…", "yel")
+    else:
+        ui.aw(y + 1, 2, "idle — waiting for next request", "gry")
+    y += cur_h
+
+    # ---- now panel ----
+    ui.box(y, 0, 5, W, "Now", "gry")
+    ctx = s["cur_ctx"] or s["last_ctx"]
+    frac = ctx / float(s["n_ctx"]) if s["n_ctx"] else 0
+    zone = ctx_zone(ctx, s["n_ctx"])[0]
+    fcol = "red" if frac >= 0.95 else ("yel" if frac >= 0.85 else "grn")
+    ui.aw(y + 1, 2, "context  ", "gry")
+    gline = "%s %s/%s  %d%%  " % (
+        gauge(frac, min(34, iw - 30)), human_k(ctx), human_k(s["n_ctx"]),
+        round(frac * 100))
+    ui.aw(y + 1, 11, gline, fcol)
+    ui.aw(y + 1, 11 + len(gline), "zone %s" % zone, ZONE_COLOR.get(zone, "gry"))
+    pp = s["live_pp_rate"] if s["status"] == "PREFILL" else s["pp_rate"]
+    tg = s["live_gen_rate"] if s["status"] == "GENERATING" else s["tg_rate"]
+    mw = min(28, iw - 24)
+    ui.aw(y + 2, 2, "prefill  ", "gry")
+    ui.aw(y + 2, 11, "%s %5.0f t/s" % (meter(pp / PP_FULL, mw), pp), "mag")
+    ui.aw(y + 3, 2, "gen      ", "gry")
+    extra = "  TTFT %.1fs  draft %s  reuse %s" % (
+        s["ttft"],
+        ("%d%%" % round(s["draft"] * 100)) if s["draft"] is not None else "—",
+        ("%d%%" % round(s["reuse"] * 100)) if s["reuse"] is not None else "—")
+    ui.aw(y + 3, 11, "%s %5.1f t/s" % (meter(tg / TG_FULL, mw), tg), "cyn")
+    ui.aw(y + 3, 11 + mw + 12, extra, "gry")
+    y += 5
+
+    # ---- size the three graphs + table for remaining vertical space ----
+    foot_h = 1
+    rest = H - (y + foot_h)
+    if rest < 12:
+        gh = max(3, rest // 3)
+        table_h = 0
+    else:
+        gh = max(4, min(9, (rest - 4) // 3))
+        table_h = rest - 3 * gh
+        if table_h < 4:
+            table_h = 0
+            gh = max(4, rest // 3)
+
+    # ---- recent turns table ----
+    if table_h >= 4:
+        ui.box(y, 0, table_h, W, "Recent turns", "gry")
+        cols = "%-8s %7s %8s %8s %7s %6s %7s  %s" % (
+            "task", "ctx", "pp t/s", "gen t/s", "TTFT", "draft", "rewind", "zone")
+        ui.aw(y + 1, 2, cols, "gry", "bold")
+        for i, t in enumerate(s["turns"][:table_h - 3]):
+            zc = ZONE_COLOR.get(t["zone"], "gry")
+            rw = human_k(t["rewind"]) if t["rewind"] else "—"
+            dr = ("%d%%" % round(t["draft"] * 100)) if t["draft"] is not None else "—"
+            row = "%-8s %7s %8s %8s %6.1fs %6s %7s  %s" % (
+                t["task"], human_k(t["ctx"]),
+                ("%.0f" % t["pp"]) if t.get("pp_ok", True) else "—",
+                ("%.1f" % t["tg"]) if t.get("tg_ok", True) else "—",
+                t["ttft"], dr, rw, t["zone"])
+            ui.aw(y + 2 + i, 2, row, zc)
+        y += table_h
+
+    # ---- context graph ----
+    ui.box(y, 0, gh, W, "Context over turns  tokens", "gry")
+    rows, _ = graph_rows(s["ctx_hist"], iw, gh - 2, floor=s["n_ctx"] or 1.0)
+    for i, row in enumerate(rows):
+        ui.aw(y + 1 + i, 2, row, "grn")
+    lbl = _stat_label(s["ctx_hist"][-iw:], "%.0f", 6)
+    ui.aw(y, W - len(lbl) - 2, lbl, "grn", "bold")
+    y += gh
+
+    # ---- prefill graph ----
+    ui.box(y, 0, gh, W, "Prefill throughput  t/s", "gry")
+    rows, _ = graph_rows(s["pp_hist"], iw, gh - 2, floor=PP_FULL)
+    for i, row in enumerate(rows):
+        ui.aw(y + 1 + i, 2, row, "mag")
+    lbl = _stat_label(s["pp_hist"][-iw:], "%.0f", 4)
+    ui.aw(y, W - len(lbl) - 2, lbl, "mag", "bold")
+    y += gh
+
+    # ---- gen graph ----
+    ui.box(y, 0, gh, W, "Generation throughput  t/s", "gry")
+    rows, _ = graph_rows(s["tg_hist"], iw, gh - 2, floor=TG_FULL)
+    for i, row in enumerate(rows):
+        ui.aw(y + 1 + i, 2, row, "cyn")
+    lbl = _stat_label(s["tg_hist"][-iw:], "%.1f", 5)
+    ui.aw(y, W - len(lbl) - 2, lbl, "cyn", "bold")
+    y += gh
+
+    # ---- footer ----
+    last = list(s["turns"])[:20]
+    pps = [t["pp"] for t in last if t.get("pp_ok", True)]
+    tgs = [t["tg"] for t in last if t.get("tg_ok", True)]
+    apv = sum(pps) / len(pps) if pps else 0
+    atv = sum(tgs) / len(tgs) if tgs else 0
+    wpct = (100.0 * s["s_wasted"] / s["s_prefill"]) if s["s_prefill"] else 0
+    foot = ("q quit  p pause  x clear  c theme:%s  b bg:%s   │   %d turns · "
+            "%s gen tok · avg pp %.0f · avg gen %.1f · %.0f%% prefill "
+            "reprocessed") % (
+        ui.theme_name or "-", ui.bg_name or "-",
+        s["s_turns"], human_k(s["s_gen"]), apv, atv, wpct)
+    ui.aw(H - 1, 0, foot[:W - 1], "blu")
+
+    scr.noutrefresh()
+
+
+def _snapshot(stt):
+    """Copy the fields draw() needs, under lock, into a plain dict."""
+    return dict(
+        start=stt.start, status=stt.status, version=stt.version,
+        model=stt.model,
+        n_ctx=stt.n_ctx, last_ctx=stt.last_ctx, cur_ctx=stt.cur_ctx,
+        task=stt.task, reuse=stt.reuse, restored=stt.restored,
+        live_pp_n=stt.live_pp_n, live_pp_total=stt.live_pp_total,
+        live_pp_rate=stt.live_pp_rate, live_pp_eta=stt.live_pp_eta,
+        live_gen_n=stt.live_gen_n, live_gen_rate=stt.live_gen_rate,
+        gen_start=stt.gen_start, pp_rate=stt.pp_rate, tg_rate=stt.tg_rate,
+        ttft=stt.ttft, draft=stt.draft, pp_hist=list(stt.pp_hist),
+        tg_hist=list(stt.tg_hist), ctx_hist=list(stt.ctx_hist),
+        turns=list(stt.turns), s_turns=stt.s_turns,
+        s_gen=stt.s_gen, s_prefill=stt.s_prefill, s_wasted=stt.s_wasted)
+
+
+def run(scr, args):
+    import curses
+    curses.curs_set(0)
+    scr.nodelay(True)
+    ui = UI(scr, not args.no_color)
+
+    stt = State(args.ctx_max)
+    stop = threading.Event()
+    th = threading.Thread(target=tail_thread,
+                          args=(args.path, stt, args.from_start, args.tail, stop,
+                                args.server or None),
+                          daemon=True)
+    th.start()
+
+    paused = False
+    try:
+        while True:
+            if not paused:
+                draw(ui, stt, paused)
+                curses.doupdate()
+            ch = scr.getch()
+            if ch in (ord("q"), ord("Q"), 27):
+                break
+            elif ch in (ord("p"), ord("P")):
+                paused = not paused
+                if paused:
+                    draw(ui, stt, paused)
+                    curses.doupdate()
+            elif ch in (ord("c"), ord("C")):
+                ui.cycle_theme(-1 if ch == ord("C") else 1)
+                draw(ui, stt, paused)
+                curses.doupdate()
+            elif ch in (ord("b"), ord("B")):
+                ui.cycle_bg(-1 if ch == ord("B") else 1)
+                draw(ui, stt, paused)
+                curses.doupdate()
+            elif ch in (ord("x"), ord("X")):
+                with stt.lock:
+                    stt.turns.clear()
+                    stt.pp_hist.clear()
+                    stt.tg_hist.clear()
+                    stt.ctx_hist.clear()
+                    stt.s_turns = stt.s_gen = stt.s_prefill = stt.s_wasted = 0
+            elif ch == curses.KEY_RESIZE:
+                scr.erase()
+            time.sleep(args.interval)
+    finally:
+        stop.set()
+
+
+# ----------------------------------------------------------------------------
+# Self-test (no TTY needed)
+# ----------------------------------------------------------------------------
+
+def self_test():
+    samples = [
+        "0.00.049.371 I system_info: n_threads = 10 (n_threads_batch = 10) / 14 | MTL",
+        "0.02.430.393 I slot   load_model: id  0 | task -1 | new slot, n_ctx = 131072",
+        "0.00.718.793 I srv    load_model: loading model '/m/Qwen3.6-35B-A3B-APEX-I-Compact.gguf'",
+        "0.40.416.586 I srv    load_model: loaded multimodal model, '/m/Qwen3.6-35B-A3B-APEX.mmproj.gguf'",
+        "0.02.445.497 I srv  main: server is listening on http://0.0.0.0:8088",
+        "1.00.0 I slot get_availabl: id 0 | task -1 | selected slot by LCP similarity, sim_best = 0.940 (> 0.100 thold), f_keep = 0.95",
+        "1.00.1 I slot launch_slot_: id  0 | task 6431 | processing task, is_child = 0",
+        "1.00.2 W slot update_slots: id 0 | task 6431 | restored context checkpoint (pos_min = 77263, pos_max = 77263, n_tokens = 77264, n_past = 77264, size = 215.193 MiB)",
+        "1.01.0 I slot print_timing: id 0 | task 6431 | prompt processing, n_tokens = 1024, progress = 0.50, t = 4.0 s / 256.00 tokens per second",
+        "1.02.0 I slot print_timing: id 0 | task 6431 | n_decoded = 100, tg = 30.50 t/s",
+        "1.03.0 I slot print_timing: id 0 | task 6431 | prompt eval time = 22890.00 ms / 5720 tokens ( 4.00 ms per token, 250.00 tokens per second)",
+        "1.03.1 I slot print_timing: id 0 | task 6431 |        eval time = 1954.00 ms / 59 tokens ( 33.13 ms per token, 30.18 tokens per second)",
+        "1.03.2 I slot print_timing: id 0 | task 6431 | total time = 24845.00 ms / 5779 tokens",
+        "1.03.3 I slot print_timing: id 0 | task 6431 | draft acceptance = 0.84091 ( 37 accepted / 44 generated)",
+        "1.03.4 I slot      release: id 0 | task 6431 | stop processing: n_tokens = 83043, truncated = 0",
+        "1.03.5 I srv  update_slots: all slots are idle",
+        # degenerate turn: near-zero eval times yield absurd rates that must
+        # not pollute graphs/averages
+        "2.00.0 I slot launch_slot_: id  0 | task 7000 | processing task, is_child = 0",
+        "2.01.0 I slot print_timing: id 0 | task 7000 | prompt eval time = 1.00 ms / 2 tokens ( 0.50 ms per token, 2000.00 tokens per second)",
+        "2.01.1 I slot print_timing: id 0 | task 7000 |        eval time = 0.00 ms / 1 tokens ( 0.00 ms per token, 1000000.00 tokens per second)",
+        "2.01.2 I slot print_timing: id 0 | task 7000 | total time = 1.00 ms / 3 tokens",
+        "2.01.3 I slot      release: id 0 | task 7000 | stop processing: n_tokens = 83060, truncated = 0",
+        "2.01.4 I srv  update_slots: all slots are idle",
+    ]
+    stt = State(DEFAULT_CTX_MAX)
+    parsed = 0
+    for ln in samples:
+        ev = parse_line(ln)
+        if ev:
+            parsed += 1
+            apply_event(stt, ev[0], ev[1])
+    print("parsed %d/%d lines" % (parsed, len(samples)))
+    assert stt.model.startswith("Qwen3.6"), stt.model
+    assert "mmproj" not in stt.model, stt.model  # main model, not the projector
+    assert stt.s_turns == 2
+    assert abs(stt.pp_rate - 250.0) < 1e-6, stt.pp_rate
+    assert abs(stt.tg_rate - 30.18) < 1e-6, stt.tg_rate
+    assert stt.turns[1]["ctx"] == 83043
+    assert stt.turns[1]["rewind"] == 0  # no prior ctx -> no rewind on first turn
+    assert stt.turns[1]["pp_ok"] and stt.turns[1]["tg_ok"]
+    # degenerate turn recorded but excluded from rate histories/averages
+    assert not stt.turns[0]["pp_ok"] and not stt.turns[0]["tg_ok"]
+    assert list(stt.pp_hist) == [250.0], list(stt.pp_hist)
+    assert list(stt.tg_hist) == [30.18], list(stt.tg_hist)
+    assert list(stt.ctx_hist) == [83043, 83060], list(stt.ctx_hist)
+    rows, mx = graph_rows([10, 20, 40], width=3, height=2, floor=1.0)
+    assert len(rows) == 2 and all(len(r) == 3 for r in rows), rows
+    assert mx == 40
+    assert ctx_zone(10000, 131072)[0] == "short"
+    assert ctx_zone(83043, 131072)[0] == "very-long"
+    assert ctx_zone(130000, 131072)[0] == "extreme"
+    assert ctx_zone(83043, 262144)[0] == "long"
+    for themes, bgs, lim in ((THEMES, BACKGROUNDS, 256),
+                             (THEMES_BASIC, BACKGROUNDS_BASIC, 8)):
+        for th in themes:
+            for bg_name, bg in bgs:
+                c = compose(th, bg, lim)
+                trio = {c["grn"], c["mag"], c["cyn"]}
+                assert len(trio) == 3 and bg not in trio, (th["name"], bg_name)
+                assert all(0 <= v < lim for v in c.values()
+                           if isinstance(v, int) and v != -1), (th["name"], lim)
+    print("themes: ctx/prefill/gen colors distinct on every background")
+    print("model=%s  pp=%.0f  tg=%.2f  ctx=%d  zone=%s (of %s window)" % (
+        stt.model, stt.pp_rate, stt.tg_rate, stt.turns[0]["ctx"],
+        ctx_zone(stt.turns[0]["ctx"], stt.n_ctx)[0], human_k(stt.n_ctx)))
+    print("graph rows:")
+    for r in rows:
+        print("  |%s|" % r)
+    print("ALL PASS")
+    return 0
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="btop-style llama-server log dashboard")
+    ap.add_argument("path", nargs="?", default=DEFAULT_LOG)
+    ap.add_argument("--from-start", action="store_true",
+                    help="seed graphs/stats from the whole file")
+    ap.add_argument("--tail", type=int, default=4000, metavar="N",
+                    help="seed from the last N lines (default 4000; 0 = none)")
+    ap.add_argument("--ctx-max", type=int, default=DEFAULT_CTX_MAX,
+                    help="fallback context window if it cannot be detected")
+    ap.add_argument("--server", default=DEFAULT_SERVER, metavar="URL",
+                    help="llama-server URL for /props (version, context window); "
+                         "'' disables")
+    ap.add_argument("--interval", type=float, default=0.2,
+                    help="redraw cadence in seconds (default 0.2)")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--self-test", action="store_true")
+    args = ap.parse_args(argv)
+
+    if args.self_test:
+        return self_test()
+    if not sys.stdout.isatty():
+        sys.stderr.write("llama-top needs an interactive terminal "
+                         "(use --self-test to validate logic headlessly).\n")
+        return 2
+
+    locale.setlocale(locale.LC_ALL, "")
+    import curses
+    try:
+        curses.wrapper(run, args)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1253,12 +1253,16 @@ def _probe_tcp(port, attempts: int = 4, delay_s: float = 1.0) -> bool:
     return False
 
 
-def _stop_project_services(context, project_id: str) -> int:
+def _stop_project_services(context, project_id: str,
+                           purge_state: bool = False) -> int:
     """Stop (and thereby deregister from liveness) every service whose
     workdir/command belongs to ``project_id``. Lifecycle coupling
     (2026-07-25 review H6): hard delete used to rmtree the workspace out
     from under a RUNNING service, and archiving a released project left its
-    rehearsed services up forever. Best-effort; returns services stopped."""
+    rehearsed services up forever. ``purge_state`` (2026-07-30) removes the
+    services' writable state dirs too — the HARD-DELETE contract is "no
+    files left behind"; archive passes False and keeps state exactly like
+    it keeps the workspace. Best-effort; returns services stopped."""
     stopped = 0
     try:
         from ..sandbox.services import get_service_supervisor
@@ -1269,7 +1273,10 @@ def _stop_project_services(context, project_id: str) -> int:
             try:
                 # The registry KEY addresses the exact entry across project
                 # scopes; display name kept as fallback for stub entries.
-                sup.stop(str(e.get("key") or e.get("name") or ""))
+                _addr = str(e.get("key") or e.get("name") or "")
+                sup.stop(_addr)
+                if purge_state:
+                    sup.purge_state(_addr)
                 stopped += 1
             except Exception:
                 continue
@@ -2142,8 +2149,9 @@ async def tool_manage_projects(
                 return _err(gate)
             # Stop the project's services BEFORE the workspace vanishes —
             # rmtree under a running service left orphaned processes +
-            # registry entries (review H6).
-            _stop_project_services(context, rid)
+            # registry entries (review H6). Hard delete also purges their
+            # writable state dirs ("no files left behind").
+            _stop_project_services(context, rid, purge_state=True)
             ok = store.delete_project(rid, hard=True)
             if not ok:
                 return _err(f"delete failed for {rid} — nothing was removed.")

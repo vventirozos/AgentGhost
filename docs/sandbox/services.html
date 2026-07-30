@@ -301,11 +301,20 @@ bin/unserve-remote.sh 8100    # tear down (or `… all` to reset every mapping)<
   <code>active_service_ports</code>: <code>stop</code>/<code>stop-all</code> revoke by removing
   the entry, restart mints fresh, constant-time comparison, fail-closed. The briefing summary
   never surfaces tokens.</p>
+  <p><strong>Per-service state dir (same day, "later 5"):</strong> releasing chmod's the project
+  workspace read-only (immutability by design) — but service apps have runtime state, and the
+  released chess coach 500'd on every move writing <code>game_state.json</code> into its
+  now-immutable workspace. The supervisor now creates <code>.services/state/&lt;stem&gt;/</code>
+  before launch and exports it as <code>$GHOST_SERVICE_STATE_DIR</code>: the artifact stays
+  immutable, state lives outside it. Kept across stop/restart (a stopped game server's saves
+  survive); purged only by the owning project's HARD delete (<code>purge_state</code>, wired
+  through <code>_stop_project_services(purge_state=True)</code> — archive keeps state exactly like
+  it keeps the workspace). The tool description now instructs apps to write state there.</p>
   <p>Covered by <code>tests/test_service_port_leases.py</code> (allocator preference/fallback/
   exhaustion, scoped identity, reconcile/adopt, briefing plumbing, the daemon guard, token
-  mint/export/revoke) plus the updated <code>tests/test_sandbox_services.py</code> and the
-  service-token auth tests in <code>tests/test_game_move_api.py</code> (including "a token never
-  unlocks /api/chat").</p>
+  mint/export/revoke, state-dir create/survive/purge) plus the updated
+  <code>tests/test_sandbox_services.py</code> and the service-token auth tests in
+  <code>tests/test_game_move_api.py</code> (including "a token never unlocks /api/chat").</p>
 
   <h2>Tests</h2>
   <p><code>tests/test_sandbox_services.py</code> — port-spec parsing,

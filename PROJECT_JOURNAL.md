@@ -1385,6 +1385,24 @@ release AFTER this deploys. Known pre-existing test-order artifact: test_sandbox
 asyncio.run closes the main-thread loop → test_auth_rejection_logging fails if run AFTER it in a
 custom order (canonical alphabetical order unaffected).
 
+### 2026-07-30 (later 5) — Released workspaces are read-only, but service apps write runtime state into them → $GHOST_SERVICE_STATE_DIR (supervisor half SHIPPED)
+
+Chess Coach v2 RELEASED (20:12, dossier correct: chess-coach-v2 · 8101 · URL + directions) and the
+full round-trip verified pre-release (e2e4 → e5 + coaching, twice). POST-release the app 500s on
+every move: release chmod's the workspace read-only (immutability by design) while app.py writes
+`game_state.json`/`saves/` INTO its workspace at runtime → PermissionError. v1 has the same latent
+bug. Design collision, not a regression. Recommended fix (§4G-consistent): supervisor exports a
+writable per-service state dir (e.g. `$GHOST_SERVICE_STATE_DIR` → `.services/state/<stem>/`,
+created at start, survives releases); released apps keep their artifact immutable and their state
+outside it. SHIPPED same evening (supervisor half): state dir created pre-launch + exported in
+cmd.sh; kept across stop/restart; purged only via project hard delete
+(`_stop_project_services(purge_state=True)`); tool description teaches the contract; tests in
+test_service_port_leases.py. CLOSED same night: Chess Coach v3 (48e0373aaab3) released on 8102
+with STATE_FILE/SAVES_DIR routed through the state dir; post-release round-trip verified TWICE
+(ghost's e2e4→e7e5 + coaching; operator-side d2d4→g8f6 with the state file mtime advancing under
+.services/state/ while the workspace sat read-only). ALSO: turn wrap-up gate (`force_final_response` after a task close)
+dropped the follow-up release call three times today — logged as friction, not yet changed.
+
 ### 2026-07-30 (later 4) — Token race: the credential landed in the registry AFTER the app's first probe
 
 **Live verification of the v2 round-trip FAILED and exposed a race in the service-token feature:**
